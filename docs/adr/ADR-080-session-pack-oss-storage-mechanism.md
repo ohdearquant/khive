@@ -342,13 +342,20 @@ unchanged. Platforms or filesystems that cannot provide either retain the length
    cursor untouched (the file is retried next pass) and does not block other files.
 5. **One transaction per file pass.** Message rows, the metadata touch, the message-count
    refresh, and the cursor offset-plus-identity upsert commit atomically. The identity is captured
-   from the same open file handle that produced the offset; a probe/open mismatch refuses the pass,
-   and a deferred cursor-only commit carries that captured witness rather than re-statting the path.
+   from the same open file handle that produced the offset. For line-tail sources, a probe/open
+   mismatch refuses the pass, and the service-private deferred cursor-only commit carries that
+   captured witness rather than re-statting the path. Whole-file exporters do not need the probe
+   witness: `start_offset` is only a length guard, never a range boundary, so the opened generation
+   is either skipped for one poll or replayed from byte zero and committed with its full length and
+   opened identity.
 6. **Replacement and truncation restart at zero.** Before the EOF fast path, a changed
-   file-identity witness or a file length below the stored offset resets the in-memory offset to
-   zero. A legacy NULL-witness cursor replays once when a witness first becomes available. Replay
-   is safe under invariant 2 and prevents a same-path, same-length replacement from being mistaken
-   for unchanged EOF. If in-place truncation lands between the service's metadata probe and its
+   file-identity witness or a file length below the stored offset first commits byte offset zero
+   plus the current identity, then applies that reset in memory. This durable reset happens before
+   the EOF fast path, including when the current file is empty, so stop/restart followed by regrowth
+   beyond the old offset cannot resurrect and skip from that stale position. A legacy NULL-witness
+   cursor replays once when a witness first becomes available. Replay is safe under invariant 2 and
+   prevents a same-path, same-length replacement from being mistaken for unchanged EOF. If
+   in-place truncation lands between the service's metadata probe and its
    file open, the opened-file pass carries an explicit truncation-reset disposition plus that
    handle's identity through candidate dispatch. That disposition alone permits a numerically
    lower cursor, and the service adopts the same lower offset and identity in memory after the DB

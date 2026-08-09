@@ -19,12 +19,22 @@ incrementally across multiple calls for large deltas. It is safe to call
 repeatedly on the same file; `INSERT OR IGNORE` keyed by the event UUID
 ensures idempotency.
 
+The public `mirror_file` entry point recovers the persisted identity that belongs to an exact
+`start_offset` match, so directly repeating a successful call with its returned offset detects and
+replays a same-length replacement without an external reconciliation step. An arbitrary
+caller-selected replay offset has no trustworthy identity binding and retains the strict
+length-decrease fallback. The raw deferred read/commit pair is service-private: its result keeps the
+opened identity attached to the offset all the way through the eventual cursor-only commit.
+
 The background service reconciles each persisted offset with a file-identity witness before the
 EOF fast path. A different witness resets the offset to zero even when the replacement has exactly
-the old length; a length below the offset catches in-place truncation. `read_bounded_chunk` also
-restarts directly when a caller supplies an offset beyond current EOF. The cursor stores the
-identity observed for the consumed file alongside the successfully consumed offset, while
-platforms without a portable witness retain the strict length-decrease fallback.
+the old length; a length below the offset catches in-place truncation. The reset-to-zero row and
+current identity are committed before the in-memory cursor changes. This includes an empty file:
+after stop/restart, later regrowth beyond the old offset still reloads zero and cannot skip the new
+prefix. `read_bounded_chunk` also restarts directly when a caller supplies an offset beyond current
+EOF. The cursor stores the identity observed for the consumed file alongside the successfully
+consumed offset, while platforms without a portable witness retain the strict length-decrease
+fallback.
 Unix derives the witness from stable device/inode metadata. Windows queries volume serial and file
 index through stable `GetFileInformationByHandle` on the already-open file; it does not use Rust's
 unstable Windows `MetadataExt` identity methods. The `windows:<volume>:<index>` cursor value remains
@@ -160,6 +170,14 @@ file's byte length only after a successful parse and commit — any IO, parse,
 or DB error leaves the persisted cursor untouched, so a partially-downloaded
 export is retried whole on the next tick, never half-consumed.
 
+The service's preceding metadata witness is intentionally not threaded into this whole-file
+reader. That omission is safe because `start_offset` never selects a byte range: the function opens
+one generation and either (a) returns a no-op when that opened generation's length is at or below
+the guard, allowing the next service probe to persist a replacement reset, or (b) reads that opened
+generation from byte zero and commits its full length plus identity. A replacement in the
+probe/open window can therefore cause at most one no-op or one idempotent whole-file replay; it
+cannot pair a partial old-generation offset with a new-generation identity.
+
 `DEFAULT_CHATGPT_MAX_BYTES` (256 MiB), overridable via
 `KHIVE_MIRROR_CHATGPT_MAX_BYTES`: unlike the JSONL line-tail sources, this is
 a ceiling on the _entire file_, not a per-pass delta. An export over this
@@ -186,9 +204,9 @@ message events. Every valid conversation therefore creates its create-only
 `sessions` row even when `chat_messages` is empty or contains only unsupported
 display blocks; no synthetic `session_messages` row is introduced.
 
-`WholeFileExportSpec` keeps the shared bound/read/commit mechanism in one
+`WholeFileExportSpec` keeps the service-private shared bound/read/commit mechanism in one
 place while fixing the provider-specific parser, source value, diagnostic
-name, and size environment variable at each public entry point.
+name, and size environment variable at each provider entry point.
 
 ## Write path: `write_events_and_cursor` and friends (ADR-099 D5)
 

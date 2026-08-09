@@ -160,10 +160,15 @@ device/inode (or Windows volume/file-index obtained from stable open-handle Win3
 byte zero before the EOF check; this catches
 truncation and same-length atomic replacement. Older NULL-witness cursor rows replay once when an
 identity first becomes available. Filesystems that do not expose a stable identity retain the
-length-decrease fallback. If the same file is truncated after a poll's metadata probe but before
-the ingest open, the opened-file result carries an explicit reset witness through dispatch; the
-service adopts the committed lower cursor in memory, so later regrowth past the old offset cannot
-skip the intervening bytes. An unexplained lower cursor is still rejected. Writes into `sessions` and
+length-decrease fallback. A continuity reset commits byte offset zero and the current identity
+before the in-memory cursor changes or the EOF shortcut runs; even truncate-to-empty followed by a
+daemon restart therefore reloads zero before later regrowth. If the same file is truncated after a
+poll's metadata probe but before the ingest open, the opened-file result carries an explicit reset
+witness through dispatch; the service adopts the committed lower cursor in memory, so later
+regrowth past the old offset cannot skip the intervening bytes. An unexplained lower cursor is still
+rejected. Whole-file exporters do not thread the preceding probe witness because they never tail a
+range: the opened generation is either skipped for one poll by the length guard or replayed from
+byte zero and committed with its full length and opened identity. Writes into `sessions` and
 `session_messages` are transactional and idempotent (`INSERT OR IGNORE` /
 `ON CONFLICT DO NOTHING` on stable keys), so a crash mid-write or a
 re-processed byte range does not duplicate rows. `provider_session_id`

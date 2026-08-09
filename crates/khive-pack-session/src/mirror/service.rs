@@ -115,6 +115,27 @@ impl MirrorCursorState {
     }
 }
 
+/// Persist a continuity reset before applying it to the service's in-memory
+/// cursor. The durable zero is load-bearing even when the current file is
+/// empty: after a daemon restart, later regrowth beyond the stale offset must
+/// still replay the new generation from its beginning.
+async fn reconcile_cursor_durably(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    cursor: &mut MirrorCursorState,
+    file_len: u64,
+    current_identity: Option<String>,
+) -> Result<Option<CursorResetReason>, RuntimeError> {
+    let mut reconciled = cursor.clone();
+    let reason = reconciled.reconcile(file_len, current_identity);
+    let Some(reason) = reason else {
+        return Ok(None);
+    };
+    ingest::commit_cursor_reset(runtime, path, reconciled.file_identity.as_deref()).await?;
+    *cursor = reconciled;
+    Ok(Some(reason))
+}
+
 /// Configuration for the mirror service.
 ///
 /// Loaded from environment variables at daemon boot via `MirrorConfig::from_env`.
@@ -438,8 +459,8 @@ impl CandidateDispatch {
     /// dispatch: under misconfigured overlapping roots, a wrong provider
     /// candidate could otherwise swallow bytes that a later, correct
     /// provider candidate would have parsed into rows. Its cursor commit is
-    /// deferred (`mirror_file_deferred`) and committed by the dispatch loop
-    /// only when no inserting candidate claims the span. An ordinary forward
+    /// deferred (`mirror_file_deferred_with_witness`) and committed by the
+    /// dispatch loop only when no inserting candidate claims the span. An ordinary forward
     /// empty advance is vetoed when another candidate errors; a witnessed
     /// restart instead checkpoints zero so no new-generation prefix can be
     /// skipped after regrowth.
@@ -1594,12 +1615,40 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                     file_identity: current_identity.clone(),
                 });
             let previous_offset = cursor.byte_offset;
-            if let Some(reason) = cursor.reconcile(file_len, current_identity.clone()) {
+            let reset_reason = match reconcile_cursor_durably(
+                &runtime,
+                &scheduled_file.path,
+                cursor,
+                file_len,
+                current_identity.clone(),
+            )
+            .await
+            {
+                Ok(reason) => reason,
+                Err(error) => {
+                    let crossed_threshold = discovery.record_error_poll(&scheduled_file.path);
+                    tracing::warn!(
+                        path = %scheduled_file.path.display(),
+                        error = %error,
+                        previous_offset,
+                        "session mirror: failed to persist continuity reset; holding in-memory cursor"
+                    );
+                    if crossed_threshold {
+                        tracing::warn!(
+                            path = %scheduled_file.path.display(),
+                            consecutive_error_polls = FILE_ERROR_POLLS_BEFORE_COLD,
+                            "session mirror: demoting persistently erroring file to cold"
+                        );
+                    }
+                    continue;
+                }
+            };
+            if let Some(reason) = reset_reason {
                 tracing::info!(
                     path = %scheduled_file.path.display(),
                     previous_offset,
                     ?reason,
-                    "session mirror: file continuity changed; replaying from byte zero"
+                    "session mirror: file continuity changed; durably replaying from byte zero"
                 );
             }
             let offset = cursor.byte_offset;
@@ -3038,7 +3087,7 @@ mod cursor_retry_tests {
         let mut reader = rt.sql().reader().await.expect("reader");
         reader
             .query_row(SqlStatement {
-                sql: "SELECT 1 FROM session_messages WHERE uuid = ?1".into(),
+                sql: "SELECT 1 FROM session_messages WHERE id = ?1".into(),
                 params: vec![SqlValue::Text(uuid.to_string())],
                 label: None,
             })

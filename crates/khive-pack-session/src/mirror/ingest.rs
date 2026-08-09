@@ -99,6 +99,7 @@ pub struct MirrorStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum MirrorCursorDisposition {
     Continued { file_identity: Option<String> },
+    RestartedAfterReplacement { file_identity: Option<String> },
     RestartedAfterTruncation { file_identity: Option<String> },
 }
 
@@ -106,13 +107,33 @@ impl MirrorCursorDisposition {
     pub(super) fn file_identity(&self) -> Option<&str> {
         match self {
             Self::Continued { file_identity }
+            | Self::RestartedAfterReplacement { file_identity }
             | Self::RestartedAfterTruncation { file_identity } => file_identity.as_deref(),
         }
+    }
+
+    fn restarted(&self) -> bool {
+        !matches!(self, Self::Continued { .. })
     }
 
     pub(super) fn restarted_after_truncation(&self) -> bool {
         matches!(self, Self::RestartedAfterTruncation { .. })
     }
+}
+
+/// Where the cursor's generation witness came from.
+///
+/// A persisted witness belongs to the exact byte offset supplied by a
+/// previous successful public [`mirror_file`] call. A mismatch means the
+/// same path now names a replacement and can safely replay from zero. A
+/// service probe is a point-in-time observation made immediately before the
+/// ingest open; a mismatch there is a race and must refuse the pass so the
+/// service can reconcile the new generation first.
+#[derive(Debug)]
+enum CursorContinuity {
+    Unchecked,
+    Persisted(Option<String>),
+    Probed(Option<String>),
 }
 
 /// Internal pass result used by the polling service to keep the offset and
@@ -217,12 +238,6 @@ pub(super) fn probe_file(path: &Path) -> std::io::Result<(std::fs::Metadata, Opt
     }
 }
 
-fn path_file_identity(path: &Path) -> std::io::Result<Option<String>> {
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    opened_file_identity(&file, &metadata)
-}
-
 /// Ceiling on bytes read per `mirror_file` call in production (8 MiB); bounds
 /// worst-case memory on a very large accumulated delta. See
 /// `crates/khive-pack-session/docs/api/mirror-ingest.md#mirrorlimits--per-pass-caps`.
@@ -269,6 +284,12 @@ impl MirrorLimits {
 /// (no terminating `\n`) is left for the next poll — `new_offset` is set to
 /// the byte after the last complete `\n`.
 ///
+/// Repeating this public call with the offset returned by its preceding
+/// successful pass is generation-safe: the persisted cursor binds that
+/// offset to the opened file identity, so a same-path replacement replays
+/// from zero even when its length is unchanged. Arbitrary caller-selected
+/// replay offsets retain the strict length-decrease fallback.
+///
 /// One bad file or one bad line does NOT kill the loop: per-file errors propagate
 /// to the caller (the service loop logs and continues); per-line parse failures
 /// are silently skipped (the parser returns `None`).
@@ -279,35 +300,7 @@ pub async fn mirror_file(
     source: LineTailSource,
     codex_session_id: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
-    mirror_file_with_limits(
-        runtime,
-        path,
-        start_offset,
-        source,
-        codex_session_id,
-        MirrorLimits::production(),
-    )
-    .await
-}
-
-/// Dispatch-loop variant of [`mirror_file`]: identical, except that a pass
-/// which consumed bytes but parsed no events does NOT commit the cursor
-/// itself. The caller commits it via [`commit_empty_advance`] only when
-/// dispatch ends without any candidate inserting rows for the span. This
-/// keeps the empty advance's cursor commit atomic with respect to the
-/// candidate dispatch order: bytes are never skipped ahead of a later
-/// candidate that could parse them, and an interrupt between candidates
-/// cannot leave the cursor advanced past bytes no candidate inserted. The
-/// service additionally vetoes an ordinary forward commit when ANY candidate
-/// errors during the pass. A service-only witnessed truncation instead
-/// checkpoints zero on a mixed-error pass so retry replays the new generation.
-pub async fn mirror_file_deferred(
-    runtime: &KhiveRuntime,
-    path: &Path,
-    start_offset: u64,
-    source: LineTailSource,
-    codex_session_id: Option<&str>,
-) -> Result<MirrorStats, RuntimeError> {
+    let continuity = persisted_cursor_continuity(runtime, path, start_offset).await?;
     Ok(mirror_file_inner(
         runtime,
         path,
@@ -315,8 +308,8 @@ pub async fn mirror_file_deferred(
         source,
         codex_session_id,
         MirrorLimits::production(),
-        false,
-        None,
+        true,
+        continuity,
     )
     .await?
     .stats)
@@ -346,37 +339,15 @@ pub(super) async fn mirror_file_deferred_with_witness(
         codex_session_id,
         MirrorLimits::production(),
         false,
-        expected_file_identity,
+        CursorContinuity::Probed(expected_file_identity.map(str::to_owned)),
     )
     .await
 }
 
-/// Commit the cursor for an empty advance (bytes consumed, zero rows) that
-/// [`mirror_file_deferred`] deliberately left uncommitted. Call this only
-/// when dispatch for the span ends with no inserting candidate. The commit
-/// is a single `INSERT ... ON CONFLICT DO UPDATE` on the cursor row; on
-/// failure the error propagates and the in-memory offset is not applied, so
-/// the bytes are re-read (bounded, idempotent) on a later pass instead of
-/// being silently skipped. The service-level caller also vetoes this commit
-/// when ANY candidate errored in the dispatch pass.
-pub async fn commit_empty_advance(
-    runtime: &KhiveRuntime,
-    path: &Path,
-    new_offset: u64,
-) -> Result<(), RuntimeError> {
-    let file_identity = path_file_identity(path).map_err(|error| {
-        RuntimeError::Internal(format!(
-            "mirror_file: failed to identify {:?} before cursor commit: {error}",
-            path
-        ))
-    })?;
-    write_cursor_only(runtime, path, &None, new_offset, file_identity.as_deref()).await
-}
-
 /// Commit a deferred empty advance using the identity captured from the same
-/// opened file that produced `new_offset`. Unlike [`commit_empty_advance`],
-/// this never re-stats the path and therefore cannot associate an old offset
-/// with a replacement that landed between the read and commit.
+/// opened file that produced `new_offset`. This never re-stats the path and
+/// therefore cannot associate an old offset with a replacement that landed
+/// between the read and commit.
 pub(super) async fn commit_empty_advance_with_witness(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -384,6 +355,56 @@ pub(super) async fn commit_empty_advance_with_witness(
     file_identity: Option<&str>,
 ) -> Result<(), RuntimeError> {
     write_cursor_only(runtime, path, &None, new_offset, file_identity).await
+}
+
+/// Persist a continuity reset before the service takes its EOF fast path.
+pub(super) async fn commit_cursor_reset(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    file_identity: Option<&str>,
+) -> Result<(), RuntimeError> {
+    write_cursor_only(runtime, path, &None, 0, file_identity).await
+}
+
+/// Recover the generation witness that belongs to `start_offset`.
+///
+/// Only an exact offset match is evidence that the stored identity and the
+/// caller's offset came from the same successful pass. An arbitrary replay
+/// offset remains unchecked and retains the strict length-decrease fallback.
+async fn persisted_cursor_continuity(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+) -> Result<CursorContinuity, RuntimeError> {
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|error| RuntimeError::Internal(format!("mirror_file: cursor reader: {error}")))?;
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT byte_offset, file_identity FROM session_mirror_cursor WHERE file_path=?1"
+                .into(),
+            params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
+            label: Some("mirror_cursor_continuity".into()),
+        })
+        .await
+        .map_err(|error| RuntimeError::Internal(format!("mirror_file: cursor read: {error}")))?;
+    let Some(row) = row else {
+        return Ok(CursorContinuity::Unchecked);
+    };
+    let stored_offset = match row.get("byte_offset") {
+        Some(SqlValue::Integer(offset)) => u64::try_from(*offset).ok(),
+        _ => None,
+    };
+    if stored_offset != Some(start_offset) {
+        return Ok(CursorContinuity::Unchecked);
+    }
+    let file_identity = match row.get("file_identity") {
+        Some(SqlValue::Text(identity)) => Some(identity.clone()),
+        _ => None,
+    };
+    Ok(CursorContinuity::Persisted(file_identity))
 }
 
 /// A single bounded read pass: at most `limits.max_bytes_per_pass` bytes and
@@ -481,26 +502,36 @@ fn read_bounded_chunk(
     source: LineTailSource,
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
-    expected_file_identity: Option<&str>,
+    continuity: &CursorContinuity,
 ) -> std::io::Result<MirrorChunk> {
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     let file_len = metadata.len();
     let file_identity = opened_file_identity(&file, &metadata)?;
-    // An identity differing from the service's preceding stat proves the path
-    // was replaced in the probe/open window. Refuse this pass: retrying after
-    // the next probe lets the service reset its generation state before any
-    // cursor can be written for the replacement.
-    if expected_file_identity.is_some_and(|expected| file_identity.as_deref() != Some(expected)) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "file identity changed between metadata probe and ingest open",
-        ));
-    }
+    let replaced = match continuity {
+        CursorContinuity::Persisted(previous_identity) => file_identity
+            .as_ref()
+            .is_some_and(|identity| previous_identity.as_ref() != Some(identity)),
+        CursorContinuity::Probed(Some(expected_identity))
+            if file_identity.as_ref() != Some(expected_identity) =>
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "file identity changed between metadata probe and ingest open",
+            ));
+        }
+        CursorContinuity::Unchecked
+        | CursorContinuity::Persisted(_)
+        | CursorContinuity::Probed(_) => false,
+    };
     // An offset beyond EOF proves in-place truncation (or a shorter same-path
     // replacement). Replay from the beginning; equality remains ordinary EOF
     // when the opened file is the generation the service expected.
-    let cursor_disposition = if start_offset > file_len {
+    let cursor_disposition = if replaced {
+        MirrorCursorDisposition::RestartedAfterReplacement {
+            file_identity: file_identity.clone(),
+        }
+    } else if start_offset > file_len {
         MirrorCursorDisposition::RestartedAfterTruncation {
             file_identity: file_identity.clone(),
         }
@@ -509,7 +540,7 @@ fn read_bounded_chunk(
             file_identity: file_identity.clone(),
         }
     };
-    let start_offset = if cursor_disposition.restarted_after_truncation() {
+    let start_offset = if cursor_disposition.restarted() {
         0
     } else {
         start_offset
@@ -624,6 +655,7 @@ async fn mirror_file_with_limits(
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
 ) -> Result<MirrorStats, RuntimeError> {
+    let continuity = persisted_cursor_continuity(runtime, path, start_offset).await?;
     Ok(mirror_file_inner(
         runtime,
         path,
@@ -632,18 +664,17 @@ async fn mirror_file_with_limits(
         codex_session_id,
         limits,
         true,
-        None,
+        continuity,
     )
     .await?
     .stats)
 }
 
-/// Implementation of [`mirror_file`]. When `commit_empty_advance` is false,
+/// Implementation of [`mirror_file`]. When `commit_empty_cursor` is false,
 /// a pass that consumed bytes but parsed no events does NOT commit the
-/// cursor — the dispatch loop commits it via [`commit_empty_advance`] only
-/// if no later candidate inserts rows for the same span (see
-/// `candidate_dispatch` in `service.rs`). When true (every non-dispatch
-/// caller and test), the cursor is committed immediately as before.
+/// cursor — the dispatch loop commits it with the opened-file witness only
+/// if no later candidate inserts rows for the same span. When true (every
+/// non-dispatch caller and test), the cursor is committed immediately.
 async fn mirror_file_inner(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -651,8 +682,8 @@ async fn mirror_file_inner(
     source: LineTailSource,
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
-    commit_empty_advance: bool,
-    expected_file_identity: Option<&str>,
+    commit_empty_cursor: bool,
+    continuity: CursorContinuity,
 ) -> Result<MirrorPass, RuntimeError> {
     let chunk = read_bounded_chunk(
         path,
@@ -660,7 +691,7 @@ async fn mirror_file_inner(
         source,
         codex_session_id,
         limits,
-        expected_file_identity,
+        &continuity,
     )
     .map_err(|e| {
         RuntimeError::Internal(format!(
@@ -669,8 +700,8 @@ async fn mirror_file_inner(
         ))
     })?;
 
-    let restarted_after_truncation = chunk.cursor_disposition.restarted_after_truncation();
-    if chunk.new_offset == start_offset && !restarted_after_truncation {
+    let restarted = chunk.cursor_disposition.restarted();
+    if chunk.new_offset == start_offset && !restarted {
         // Nothing was consumed this pass (EOF, or only a partial trailing
         // line was seen) — there is no advanced cursor to persist.
         return Ok(MirrorPass {
@@ -687,18 +718,18 @@ async fn mirror_file_inner(
         // Bytes were consumed, or an opened-file truncation proved the
         // supplied cursor belongs to an earlier generation, but nothing
         // parsed — e.g. a chunk made entirely of blank lines, unparseable
-        // lines, or skipped oversized lines. With `commit_empty_advance`,
+        // lines, or skipped oversized lines. With `commit_empty_cursor`,
         // apply the cursor update immediately so we don't re-read the same
         // bytes on the next call. Without it (the dispatch loop), the commit
         // is deferred to
-        // [`commit_empty_advance`], which the loop calls only when no later
+        // the witnessed cursor-only helper, which the loop calls only when no later
         // candidate inserted rows for the span — so the cursor never moves
         // past bytes another provider candidate might still parse, and an
         // interrupt between candidates cannot strand a committed empty
         // advance ahead of unconsumed rows. A failure here must propagate —
         // silently swallowing it would let the cursor and the
         // already-consumed bytes drift apart.
-        if commit_empty_advance {
+        if commit_empty_cursor {
             write_cursor_only(
                 runtime,
                 path,
@@ -815,7 +846,7 @@ fn export_max_bytes(variable: &str, default: u64) -> u64 {
 /// `chatgpt_max_bytes` is skipped (warn-logged) without ever calling
 /// `read_to_string`. See the docs guide linked above `chatgpt_max_bytes`
 /// for the full rationale.
-pub async fn mirror_chatgpt_export_file(
+pub(super) async fn mirror_chatgpt_export_file(
     runtime: &KhiveRuntime,
     path: &Path,
     start_offset: u64,
@@ -839,7 +870,7 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
 /// Read a whole claude.ai export `conversations.json`, parse its
 /// `chat_messages` arrays via [`parse::parse_claude_ai_export`], and commit
 /// the resulting sessions, messages, and cursor atomically.
-pub async fn mirror_claude_ai_export_file(
+pub(super) async fn mirror_claude_ai_export_file(
     runtime: &KhiveRuntime,
     path: &Path,
     start_offset: u64,
@@ -1583,7 +1614,7 @@ mod tests {
 
         assert_eq!(
             cursor_file_identity(&rt, &path.to_string_lossy()).await,
-            path_file_identity(&path).expect("transcript identity"),
+            probe_file(&path).expect("transcript identity").1,
             "cursor must persist the identity witness from the opened transcript"
         );
     }
@@ -2162,7 +2193,7 @@ mod tests {
     /// dispatch variant must NOT commit the cursor on an empty advance —
     /// the commit is the dispatch loop's final step, vetoable until then.
     #[tokio::test]
-    async fn deferred_empty_advance_leaves_cursor_uncommitted_until_commit_empty_advance() {
+    async fn deferred_empty_advance_leaves_cursor_uncommitted_until_witnessed_commit() {
         let (rt, _dir) = setup().await;
 
         let mut file = NamedTempFile::new().expect("tmpfile");
@@ -2172,9 +2203,18 @@ mod tests {
         let path = file.path().to_path_buf();
         let file_len = std::fs::metadata(&path).unwrap().len();
 
-        let stats = mirror_file_deferred(&rt, &path, 0, LineTailSource::ClaudeCode, None)
-            .await
-            .expect("deferred blank-line pass");
+        let expected_identity = probe_file(&path).expect("transcript probe").1;
+        let pass = mirror_file_deferred_with_witness(
+            &rt,
+            &path,
+            0,
+            LineTailSource::ClaudeCode,
+            None,
+            expected_identity.as_deref(),
+        )
+        .await
+        .expect("deferred blank-line pass");
+        let stats = &pass.stats;
         assert_eq!(stats.inserted, 0);
         assert_eq!(
             stats.new_offset, file_len,
@@ -2187,7 +2227,7 @@ mod tests {
         );
 
         // Dispatch ends without an inserting candidate: the loop commits.
-        commit_empty_advance(&rt, &path, stats.new_offset)
+        commit_empty_advance_with_witness(&rt, &path, stats.new_offset, pass.file_identity())
             .await
             .expect("end-of-dispatch commit");
         assert_eq!(
@@ -2295,9 +2335,18 @@ mod tests {
         let path = file.path().to_path_buf();
         let file_len = std::fs::metadata(&path).unwrap().len();
 
-        let stats = mirror_file_deferred(&rt, &path, 0, LineTailSource::ClaudeCode, None)
-            .await
-            .expect("deferred event pass");
+        let expected_identity = probe_file(&path).expect("transcript probe").1;
+        let pass = mirror_file_deferred_with_witness(
+            &rt,
+            &path,
+            0,
+            LineTailSource::ClaudeCode,
+            None,
+            expected_identity.as_deref(),
+        )
+        .await
+        .expect("deferred event pass");
+        let stats = pass.stats;
         assert_eq!(stats.inserted, 3);
         assert_eq!(stats.new_offset, file_len);
         assert_eq!(
