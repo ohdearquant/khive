@@ -320,14 +320,14 @@ pub struct ConnectionPool {
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
-    /// URI target used only for a clean, checkpointed persistent-WAL snapshot
-    /// with no committed WAL frames and no shared-memory index. `immutable=1`
-    /// prevents SQLite from creating fresh sidecars for that exact frozen
-    /// case. Rollback-journal databases and WAL databases with an existing
-    /// read-only `-shm` keep the ordinary path and SQLite locking/change
-    /// detection; a non-empty WAL without its index is refused because
-    /// immutable SQLite would silently omit those committed frames.
-    read_only_open_uri: Option<PathBuf>,
+    /// Canonical physical target used by every connection in a file-backed
+    /// read-only pool. Classification and open must share this exact spelling:
+    /// deriving WAL sidecars from a configured symlink while SQLite follows it
+    /// to another file can hide committed frames or a live writable `-shm`.
+    /// The value is an `immutable=1` URI only for a clean, checkpointed WAL;
+    /// rollback-journal databases and frozen WAL+SHM snapshots retain the
+    /// canonical ordinary path and SQLite locking/change detection.
+    read_only_open_target: Option<PathBuf>,
     sql_bridge_reader_slots: Arc<Semaphore>,
     sql_bridge_writer_slots: Arc<Semaphore>,
     /// The pool-wide ADR-067 Component A writer task, spawned lazily and at
@@ -563,13 +563,10 @@ impl ConnectionPool {
             );
         }
 
-        let read_only_open_uri = read_only_wal_open_uri(&config)?;
-        let writer = open_writer_connection(&config, read_only_open_uri.as_deref())?;
-        let wal_enabled = configure_writer_connection(&writer, &config)?;
-        let max_readers = effective_reader_count(&config, wal_enabled);
-
-        let readers = ArrayQueue::new(max_readers.max(1));
-
+        // Mint the physical identity before WAL classification or SQLite open.
+        // Every read-only connection below uses this same canonical path (or
+        // an immutable URI derived from it), so a symlink cannot split main-file
+        // resolution from sidecar resolution.
         let (origin, identity_path) = match config.path.as_ref() {
             Some(path) => {
                 let (identity, canonical) = mint_db_identity(path)?;
@@ -577,6 +574,12 @@ impl ConnectionPool {
             }
             None => (TxOrigin::Memory, None),
         };
+        let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
+        let writer = open_writer_connection(&config, read_only_open_target.as_deref())?;
+        let wal_enabled = configure_writer_connection(&writer, &config)?;
+        let max_readers = effective_reader_count(&config, wal_enabled);
+
+        let readers = ArrayQueue::new(max_readers.max(1));
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
@@ -585,7 +588,7 @@ impl ConnectionPool {
             readers,
             max_readers,
             config,
-            read_only_open_uri,
+            read_only_open_target,
             sql_bridge_reader_slots: Arc::new(Semaphore::new(max_readers.max(1))),
             sql_bridge_writer_slots: Arc::new(Semaphore::new(1)),
             writer_task: OnceLock::new(),
@@ -604,14 +607,16 @@ impl ConnectionPool {
                 .expect("reader queue must have capacity during pool initialization");
         }
 
-        // Best-effort, process-global: the first pool to boot in this
-        // process resolves the writer-timeout sink's log directory and
-        // spawns its heartbeat thread; every later pool's call here is a
-        // cheap no-op. See `crate::timeout_sink` module docs.
-        crate::timeout_sink::init(
-            pool.canonical_path().and_then(Path::parent),
-            &crate::timeout_sink::db_label(&pool),
-        );
+        // Best-effort, process-global diagnostics belong only to pools that
+        // can acquire a writer. A read-only inspection pool has no writer
+        // timeout to report and must neither mutate `<db_parent>/.khive-logs`
+        // nor consume the global sink claim before a later writable pool.
+        if !pool.config.read_only {
+            crate::timeout_sink::init(
+                pool.canonical_path().and_then(Path::parent),
+                &crate::timeout_sink::db_label(&pool),
+            );
+        }
 
         Ok(pool)
     }
@@ -995,7 +1000,7 @@ impl ConnectionPool {
     }
 
     fn read_connection_path(&self) -> Result<&Path, SqliteError> {
-        self.read_only_open_uri
+        self.read_only_open_target
             .as_deref()
             .or(self.config.path.as_deref())
             .ok_or_else(|| {
@@ -1233,7 +1238,7 @@ fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
 
 fn open_writer_connection(
     config: &PoolConfig,
-    read_only_open_uri: Option<&Path>,
+    read_only_open_target: Option<&Path>,
 ) -> Result<Connection, SqliteError> {
     match config.path.as_ref() {
         Some(path) => {
@@ -1242,7 +1247,15 @@ fn open_writer_connection(
             } else {
                 writer_open_flags()
             };
-            let target = read_only_open_uri.unwrap_or(path);
+            let target = if config.read_only {
+                read_only_open_target.ok_or_else(|| {
+                    SqliteError::InvalidData(
+                        "file-backed read-only pool has no canonical open target".to_string(),
+                    )
+                })?
+            } else {
+                path
+            };
             Connection::open_with_flags(target, flags).map_err(Into::into)
         }
         None => Connection::open_in_memory().map_err(Into::into),
@@ -1271,19 +1284,22 @@ fn open_writer_connection(
 /// would recover the frames but create `-shm`, violating the physical
 /// read-only contract. The operator must provide the frozen read-only `-shm`
 /// alongside that WAL (or checkpoint a writable copy first).
-fn read_only_wal_open_uri(config: &PoolConfig) -> Result<Option<PathBuf>, SqliteError> {
+fn read_only_open_target(
+    config: &PoolConfig,
+    physical_path: Option<&Path>,
+) -> Result<Option<PathBuf>, SqliteError> {
     if !config.read_only {
         return Ok(None);
     }
-    let Some(path) = config.path.as_deref() else {
+    let Some(path) = physical_path else {
         return Ok(None);
     };
-    read_only_wal_open_uri_for_path(path)
+    read_only_wal_open_target_for_path(path).map(Some)
 }
 
-fn read_only_wal_open_uri_for_path(path: &Path) -> Result<Option<PathBuf>, SqliteError> {
+fn read_only_wal_open_target_for_path(path: &Path) -> Result<PathBuf, SqliteError> {
     if !sqlite_header_uses_wal(path)? {
-        return Ok(None);
+        return Ok(path.to_path_buf());
     }
 
     let shm = sqlite_sidecar_path(path, "-shm");
@@ -1291,7 +1307,7 @@ fn read_only_wal_open_uri_for_path(path: &Path) -> Result<Option<PathBuf>, Sqlit
         Ok(metadata) if metadata.permissions().readonly() => {
             let wal = sqlite_sidecar_path(path, "-wal");
             match fs::metadata(&wal) {
-                Ok(_) => Ok(None),
+                Ok(_) => Ok(path.to_path_buf()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     Err(SqliteError::InvalidData(format!(
                         "read-only WAL snapshot {} has a shared-memory sidecar {} but no WAL \
@@ -1324,9 +1340,9 @@ fn read_only_wal_open_uri_for_path(path: &Path) -> Result<Option<PathBuf>, Sqlit
                     wal.display(),
                     shm.display(),
                 ))),
-                Ok(_) => Ok(Some(sqlite_immutable_uri(path)?)),
+                Ok(_) => sqlite_immutable_uri(path),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(Some(sqlite_immutable_uri(path)?))
+                    sqlite_immutable_uri(path)
                 }
                 Err(error) => Err(SqliteError::Io(error)),
             }
@@ -1336,9 +1352,9 @@ fn read_only_wal_open_uri_for_path(path: &Path) -> Result<Option<PathBuf>, Sqlit
 }
 
 pub(crate) fn open_read_only_snapshot_connection(path: &Path) -> Result<Connection, SqliteError> {
-    let uri = read_only_wal_open_uri_for_path(path)?;
-    Connection::open_with_flags(uri.as_deref().unwrap_or(path), reader_open_flags())
-        .map_err(Into::into)
+    let (_, physical_path) = mint_db_identity(path)?;
+    let target = read_only_wal_open_target_for_path(&physical_path)?;
+    Connection::open_with_flags(&target, reader_open_flags()).map_err(Into::into)
 }
 
 fn sqlite_header_uses_wal(path: &Path) -> Result<bool, SqliteError> {
@@ -1859,6 +1875,95 @@ mod tests {
         drop(source_conn);
     }
 
+    /// The configured spelling must not decide which WAL sidecars SQLite sees.
+    /// A symlinked snapshot is classified and opened through one canonical
+    /// physical path so committed frames beside the target remain visible and
+    /// no sidecars are ever derived beside the alias.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_frozen_wal_symlink_reads_target_frames_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("wal-source.db");
+        let snapshot = dir.path().join("frozen-target.db");
+        let alias = dir.path().join("frozen-alias.db");
+        let source_wal = sqlite_sidecar(&source, "-wal");
+        let source_shm = sqlite_sidecar(&source, "-shm");
+        let snapshot_wal = sqlite_sidecar(&snapshot, "-wal");
+        let snapshot_shm = sqlite_sidecar(&snapshot, "-shm");
+        let alias_wal = sqlite_sidecar(&alias, "-wal");
+        let alias_shm = sqlite_sidecar(&alias, "-shm");
+
+        let source_conn = Connection::open(&source).unwrap();
+        let mode: String = source_conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        source_conn
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        source_conn
+            .execute_batch(
+                "CREATE TABLE snapshot_row(id INTEGER PRIMARY KEY, body TEXT NOT NULL);\
+                 INSERT INTO snapshot_row(body) VALUES ('visible-through-target-wal');",
+            )
+            .unwrap();
+        assert!(source_wal.exists() && source_shm.exists());
+
+        std::fs::copy(&source, &snapshot).unwrap();
+        std::fs::copy(&source_wal, &snapshot_wal).unwrap();
+        std::fs::copy(&source_shm, &snapshot_shm).unwrap();
+        symlink(&snapshot, &alias).unwrap();
+        assert!(!alias_wal.exists() && !alias_shm.exists());
+
+        let snapshot_paths = [&snapshot, &snapshot_wal, &snapshot_shm];
+        let original_permissions =
+            snapshot_paths.map(|path| std::fs::metadata(path).unwrap().permissions());
+        for path in snapshot_paths {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let main_before = std::fs::read(&snapshot).unwrap();
+        let wal_before = std::fs::read(&snapshot_wal).unwrap();
+        let shm_before = std::fs::read(&snapshot_shm).unwrap();
+        let entries_before = directory_entries(dir.path());
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(alias.clone()),
+            read_only: true,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        let reader = pool.reader().unwrap();
+        let body: String = reader
+            .query_row("SELECT body FROM snapshot_row", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(body, "visible-through-target-wal");
+        drop(reader);
+        let standalone = pool.open_standalone_reader().unwrap();
+        let count: i64 = standalone
+            .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(standalone);
+        drop(pool);
+
+        assert_eq!(std::fs::read(&snapshot).unwrap(), main_before);
+        assert_eq!(std::fs::read(&snapshot_wal).unwrap(), wal_before);
+        assert_eq!(std::fs::read(&snapshot_shm).unwrap(), shm_before);
+        assert_eq!(directory_entries(dir.path()), entries_before);
+        assert!(!alias_wal.exists() && !alias_shm.exists());
+
+        for (path, permissions) in snapshot_paths.into_iter().zip(original_permissions) {
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        drop(source_conn);
+    }
+
     /// A clean persistent-WAL database has no committed frames outside the
     /// checkpointed main file. This is the narrow case where an encoded
     /// `immutable=1` URI is safe and necessary to prevent SQLite from creating
@@ -2001,6 +2106,64 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), main_before);
         assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
         assert_eq!(std::fs::read(&shm).unwrap(), shm_before);
+
+        drop(writer);
+    }
+
+    /// A symlink cannot hide a writable target `-shm`. Admission inspects the
+    /// canonical target sidecar set before SQLite opens any connection and
+    /// therefore refuses a potentially live WAL without touching either
+    /// target or alias-adjacent paths.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_live_wal_symlink_rejects_target_writable_shm_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("live-target.db");
+        let alias = dir.path().join("live-alias.db");
+        let target_wal = sqlite_sidecar(&target, "-wal");
+        let target_shm = sqlite_sidecar(&target, "-shm");
+        let alias_wal = sqlite_sidecar(&alias, "-wal");
+        let alias_shm = sqlite_sidecar(&alias, "-shm");
+
+        let writer = Connection::open(&target).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE live_row(id INTEGER PRIMARY KEY);\
+                 INSERT INTO live_row DEFAULT VALUES;",
+            )
+            .unwrap();
+        assert!(target_wal.exists() && target_shm.exists());
+        symlink(&target, &alias).unwrap();
+        assert!(!alias_wal.exists() && !alias_shm.exists());
+
+        let main_before = std::fs::read(&target).unwrap();
+        let wal_before = std::fs::read(&target_wal).unwrap();
+        let shm_before = std::fs::read(&target_shm).unwrap();
+        let entries_before = directory_entries(dir.path());
+
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(alias),
+            read_only: true,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        }) {
+            Ok(_) => panic!("a symlink must not hide the target's writable -shm"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("writable WAL shared-memory sidecar"),
+            "diagnostic must identify the canonical target's live sidecar: {error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), main_before);
+        assert_eq!(std::fs::read(&target_wal).unwrap(), wal_before);
+        assert_eq!(std::fs::read(&target_shm).unwrap(), shm_before);
+        assert_eq!(directory_entries(dir.path()), entries_before);
+        assert!(!alias_wal.exists() && !alias_shm.exists());
 
         drop(writer);
     }

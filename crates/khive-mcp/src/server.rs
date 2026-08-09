@@ -631,14 +631,20 @@ pub struct KhiveMcpServer {
     /// deployments. `None` in single-backend mode — all dispatch goes through the
     /// `VerbRegistry` unchanged (zero-change invariant).
     coordinator: Option<Arc<dyn CoordinatorService>>,
-    /// The default-backend `KhiveRuntime` this server was built from, kept so
-    /// background daemon tasks (e.g. the email outbox loop) can reach
-    /// non-wire owner APIs — such as the ADR-124-sanctioned store-level
-    /// property claim — that have no verb surface and so cannot go through
-    /// `registry.dispatch`. `None` only for servers built via
+    /// The default-backend `KhiveRuntime` this server was built from, retained
+    /// for non-wire background APIs that are genuinely default-backend scoped.
+    /// Pack-routed owner operations must use their dedicated runtime handle
+    /// below instead of assuming this one owns the row. `None` only for servers built via
     /// [`Self::from_registry`]/[`Self::from_registry_with_meta`] without an
     /// explicit [`Self::with_runtime`] call (test-only construction paths).
     runtime: Option<KhiveRuntime>,
+    /// Runtime that owns KG-routed outbox notes. The email loop's
+    /// `external_id` claim is deliberately non-wire, so it cannot rely on the
+    /// registry to route that one mutation. In a multi-backend topology this
+    /// may differ from `runtime` (the default backend); retaining the exact KG
+    /// runtime keeps list, owner claim, and delivered-at update on one store.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    channel_outbox_runtime: Option<KhiveRuntime>,
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
     /// or registry-only servers that have no persistent database.
     pool: Option<Arc<ConnectionPool>>,
@@ -853,6 +859,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            channel_outbox_runtime: Some(runtime.clone()),
             runtime: Some(runtime),
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_loop_admission,
@@ -880,6 +888,8 @@ impl KhiveMcpServer {
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            channel_outbox_runtime: None,
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_loop_admission: ChannelLoopAdmission::default(),
         }
     }
@@ -904,6 +914,8 @@ impl KhiveMcpServer {
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            channel_outbox_runtime: None,
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_loop_admission: ChannelLoopAdmission::default(),
         }
     }
@@ -913,7 +925,21 @@ impl KhiveMcpServer {
     /// the same `default_runtime` it already resolved while building the
     /// registry.
     pub fn with_runtime(mut self, runtime: KhiveRuntime) -> Self {
+        #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+        if self.channel_outbox_runtime.is_none() {
+            self.channel_outbox_runtime = Some(runtime.clone());
+        }
         self.runtime = Some(runtime);
+        self
+    }
+
+    /// Attach the exact KG-routed runtime that owns outbox note properties.
+    /// Multi-backend boot overrides the default-runtime fallback installed by
+    /// [`Self::with_runtime`]; single-backend construction already points both
+    /// handles at the same runtime.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    pub(crate) fn with_channel_outbox_runtime(mut self, runtime: Option<KhiveRuntime>) -> Self {
+        self.channel_outbox_runtime = runtime;
         self
     }
 
@@ -979,13 +1005,12 @@ impl KhiveMcpServer {
         self.registry.clone()
     }
 
-    /// Clone the default-backend `KhiveRuntime`, if this server was built with
-    /// one, for use by background tasks that need a non-wire owner API (e.g.
-    /// the email outbox loop's `external_id` claim). `KhiveRuntime` is
-    /// internally `Arc`-wrapped so this clone is cheap.
+    /// Clone the KG-routed `KhiveRuntime` retained for background tasks that
+    /// need a non-wire owner API (the email outbox loop's `external_id`
+    /// claim). `KhiveRuntime` is internally `Arc`-wrapped so this is cheap.
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    pub(crate) fn runtime_clone(&self) -> Option<KhiveRuntime> {
-        self.runtime.clone()
+    pub(crate) fn channel_outbox_runtime_clone(&self) -> Option<KhiveRuntime> {
+        self.channel_outbox_runtime.clone()
     }
 
     /// Route a `link` or `search` verb through the coordinator when in multi-backend mode.

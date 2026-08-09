@@ -22,9 +22,11 @@
 //! continuous `heartbeat` rows: a silent sink (crashed thread, rotated-away
 //! file, dead process) looks identical to a healthy quiet one unless the
 //! heartbeat cadence is also checked. The sink is never initialized for an
-//! in-memory pool (no database file to name it after) — only a file-backed
-//! pool's boot claims the process-global writer thread, so `startup`/
-//! `heartbeat` rows always carry a real, file-backed database identity.
+//! in-memory or read-only pool (neither can report a writer-admission timeout)
+//! — only a writable file-backed pool's boot claims the process-global writer
+//! thread, so `startup`/`heartbeat` rows always carry a real, writable database
+//! identity. Skipping read-only pools also prevents inspection from writing a
+//! sibling log tree or starving a later writable pool of the global claim.
 //!
 //! A short write (the OS accepting only part of a line) is treated as
 //! TERMINAL for the sink instance rather than retried: with a single writer
@@ -846,7 +848,7 @@ fn write_delay_from_env() -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-/// Initialize the process-global sink on first call from a file-backed
+/// Initialize the process-global sink on first call from a writable file-backed
 /// pool; every later call (from another pool booting in the same process)
 /// is a cheap no-op once a sink is in place. Does no filesystem I/O itself —
 /// only path resolution (pure) plus spawning the writer thread, which does
@@ -855,10 +857,10 @@ fn write_delay_from_env() -> Duration {
 /// filesystem-latency hook entirely.
 ///
 /// `db_parent` is the booting pool's database file's parent directory,
-/// `None` for an in-memory pool. An in-memory pool never claims the sink:
-/// there is no database file to name a `startup` row after, and claiming
-/// the slot first would starve out a later file-backed pool that could
-/// have supplied a real identity. `db_identity` names the claiming pool in
+/// `None` for an in-memory pool. The caller also skips this function entirely
+/// for a read-only pool. Neither kind may claim the sink: there is no possible
+/// writer timeout to report, and claiming the slot first would starve out a
+/// later writable file-backed pool. `db_identity` names the claiming pool in
 /// the `startup` row.
 pub(crate) fn init(db_parent: Option<&Path>, db_identity: &str) {
     let Some(db_parent) = db_parent else {

@@ -422,7 +422,7 @@ fn spawn_email_channel_loops(
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
-            let runtime = server.runtime_clone();
+            let runtime = server.channel_outbox_runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
             let default_actor = default_inbound_actor_from_env();
             let mut allowlist = allowed_recipients_from_env();
@@ -477,7 +477,7 @@ fn spawn_email_channel_loops(
                         }
                         None => {
                             tracing::error!(
-                                "email outbox loop was NOT started: server has no default-backend \
+                                "email outbox loop was NOT started: server has no KG-routed \
                                  runtime handle, which the loop needs to claim external_id on \
                                  outbound notes; outbound mail will not be sent"
                             );
@@ -1374,10 +1374,6 @@ async fn channel_outbox_loop(
     mailbox: String,
     allowlist: Vec<String>,
 ) {
-    use chrono::Utc;
-    use khive_channel::{Channel, ChannelEnvelope};
-    use serde_json::json;
-
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
     let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
         Ok(ns) => ns,
@@ -1393,204 +1389,201 @@ async fn channel_outbox_loop(
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        channel_outbox_once(
+            email_channel.as_ref(),
+            &registry,
+            &runtime,
+            &namespace,
+            &ingest_namespace,
+            &mailbox,
+            &domain,
+            &allowlist,
+        )
+        .await;
+    }
+}
 
-        // Query outbound messages via the registry. The note `list` handler applies
-        // the `direction` filter server-side (scanning up to its internal cap) and
-        // returns a bare JSON array of full note objects. There is no `delivered_at`
-        // or recipient-prefix filter, so the `email:` prefix and the
-        // already-delivered check are applied per-note below.
-        let list_params = json!({
-            "namespace": ingest_namespace,
-            "kind": "message",
-            "direction": "outbound",
-            "delivered": false,
-            "limit": 200,
-        });
-        let list_result = match registry.dispatch("list", list_params).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "outbox loop: list failed");
-                continue;
-            }
+/// Execute one email outbox scan. Kept separate from the five-second loop so
+/// routing and owner-claim behavior can be verified without sleeping or
+/// opening a network transport.
+#[cfg(feature = "channel-email")]
+#[allow(clippy::too_many_arguments)]
+async fn channel_outbox_once(
+    email_channel: &dyn khive_channel::Channel,
+    registry: &khive_runtime::VerbRegistry,
+    runtime: &khive_runtime::KhiveRuntime,
+    namespace: &khive_runtime::Namespace,
+    ingest_namespace: &str,
+    mailbox: &str,
+    domain: &str,
+    allowlist: &[String],
+) {
+    use chrono::Utc;
+    use khive_channel::ChannelEnvelope;
+    use serde_json::json;
+
+    // Query outbound messages via the registry. The note `list` handler applies
+    // the `direction` filter server-side (scanning up to its internal cap) and
+    // returns a bare JSON array of full note objects. There is no recipient-prefix
+    // filter, so the `email:` prefix is applied per-note below.
+    let list_params = json!({
+        "namespace": ingest_namespace,
+        "kind": "message",
+        "direction": "outbound",
+        "delivered": false,
+        "limit": 200,
+    });
+    let list_result = match registry.dispatch("list", list_params).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(error = %error, "outbox loop: list failed");
+            return;
+        }
+    };
+
+    let Some(notes) = list_result.as_array() else {
+        return;
+    };
+    for note_val in notes {
+        let props = match note_val.get("properties") {
+            Some(serde_json::Value::Object(properties)) => properties.clone(),
+            _ => continue,
         };
 
-        let notes = match list_result.as_array() {
-            Some(arr) => arr.clone(),
+        if props.get("direction").and_then(|value| value.as_str()) != Some("outbound") {
+            continue;
+        }
+        let to_actor = match props.get("to_actor").and_then(|value| value.as_str()) {
+            Some(actor) if actor.starts_with("email:") => actor.to_string(),
+            _ => continue,
+        };
+        if note_already_delivered(&props) {
+            continue;
+        }
+        let note_id = match note_val.get("id").and_then(|value| value.as_str()) {
+            Some(id) => id.to_string(),
             None => continue,
         };
+        let recipient = to_actor
+            .strip_prefix("email:")
+            .unwrap_or(to_actor.as_str())
+            .to_string();
+        if !allowlist.is_empty() && !allowlist.contains(&recipient) {
+            tracing::warn!(
+                note_id = %note_id,
+                recipient = %recipient,
+                "outbox loop: recipient not in allowlist; skipping"
+            );
+            continue;
+        }
 
-        for note_val in notes {
-            let props = match note_val.get("properties") {
-                Some(serde_json::Value::Object(m)) => m.clone(),
-                _ => continue,
-            };
+        let subject = props
+            .get("subject")
+            .and_then(|value| value.as_str())
+            .unwrap_or("(no subject)")
+            .to_string();
+        let content = match note_val.get("content").and_then(|value| value.as_str()) {
+            Some(content) => content.to_string(),
+            None => continue,
+        };
+        let thread_id = props
+            .get("thread_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let in_reply_to = props
+            .get("in_reply_to_message_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let references = props
+            .get("references_chain")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
 
-            // Only outbound direction. The `delivered=false` filter on the list query
-            // ensures only undelivered notes are returned; this check is a cheap
-            // defensive guard for any note that slips through.
-            if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
-                continue;
-            }
-
-            // Only email-addressed notes.
-            let to_actor = match props.get("to_actor").and_then(|v| v.as_str()) {
-                Some(a) if a.starts_with("email:") => a.to_string(),
-                _ => continue,
-            };
-
-            // Defensive: skip already-delivered notes in case the query filter missed any.
-            if note_already_delivered(&props) {
-                continue;
-            }
-
-            let note_id = match note_val.get("id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-
-            let recipient = to_actor
-                .strip_prefix("email:")
-                .unwrap_or(to_actor.as_str())
-                .to_string();
-
-            // Allowlist check.
-            if !allowlist.is_empty() && !allowlist.contains(&recipient) {
-                tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    "outbox loop: recipient not in allowlist; skipping"
-                );
-                continue;
-            }
-
-            let subject = props
-                .get("subject")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(no subject)")
-                .to_string();
-
-            let content = match note_val.get("content").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => continue,
-            };
-
-            let thread_id = props
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Issue #403: the parent's wire Message-ID, computed at reply time by
-            // comm.reply (khive-pack-comm) and stored on this note. Forwarded
-            // verbatim so the SMTP layer can set In-Reply-To for native MUA
-            // conversation grouping; absent for non-reply sends.
-            let in_reply_to = props
-                .get("in_reply_to_message_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Issue #403: the full References chain (parent's existing
-            // chain, if any, followed by the parent's Message-ID), computed at
-            // reply time by comm.reply. Forwarded verbatim so the SMTP layer can
-            // set References without truncating ancestry; absent for non-reply sends.
-            let references = props
-                .get("references_chain")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Mint-before-send: derive or reuse the Message-ID.
-            let message_id = match props.get("external_id").and_then(|v| v.as_str()) {
-                Some(eid) if !eid.is_empty() => eid.to_string(),
-                _ => {
-                    let mid = format!("<{note_id}@{domain}>");
-                    // Persist the claimed external_id before sending, through the
-                    // non-wire owner path: the generic `update` verb refuses any
-                    // patch naming `external_id` on a `message` note (it is an
-                    // owner-established property), so this cannot go through
-                    // `registry.dispatch`.
-                    let claim_result = match uuid::Uuid::parse_str(&note_id) {
-                        Ok(uuid) => match runtime.authorize(namespace.clone()) {
-                            Ok(token) => {
-                                runtime
-                                    .claim_outbound_message_external_id(&token, uuid, mid.clone())
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                            "note id {note_id} is not a valid UUID: {e}"
-                        ))),
-                    };
-                    if let Err(e) = claim_result {
-                        tracing::warn!(
-                            note_id = %note_id,
-                            error = %e,
-                            "outbox loop: failed to claim external_id; skipping"
-                        );
-                        continue;
-                    }
-                    mid
-                }
-            };
-
-            // Build and send the envelope.
-            let mut env = ChannelEnvelope::new(
-                format!("email:{mailbox}"),
-                format!("email:{recipient}"),
-                content,
-            )
-            .with_subject(subject)
-            .with_message_id(message_id.clone());
-
-            if let Some(tid) = thread_id {
-                env = env.with_correlation(tid);
-            }
-            if let Some(irt) = in_reply_to {
-                env = env.with_in_reply_to(irt);
-            }
-            if let Some(refs) = references {
-                env = env.with_references(refs);
-            }
-
-            match email_channel.send(env).await {
-                Ok(()) => {
-                    let delivered_at = Utc::now().to_rfc3339();
-                    let mark_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "delivered_at": delivered_at },
-                            }),
-                        )
-                        .await;
-                    match mark_result {
-                        Ok(_) => {
-                            tracing::info!(
-                                note_id = %note_id,
-                                recipient = %recipient,
-                                message_id = %message_id,
-                                "outbox loop: delivered"
-                            );
+        // Mint-before-send through the KG runtime's owner-only path. Generic
+        // `update` correctly refuses caller patches to `external_id`.
+        let message_id = match props.get("external_id").and_then(|value| value.as_str()) {
+            Some(external_id) if !external_id.is_empty() => external_id.to_string(),
+            _ => {
+                let message_id = format!("<{note_id}@{domain}>");
+                let claim_result = match uuid::Uuid::parse_str(&note_id) {
+                    Ok(uuid) => match runtime.authorize(namespace.clone()) {
+                        Ok(token) => {
+                            runtime
+                                .claim_outbound_message_external_id(
+                                    &token,
+                                    uuid,
+                                    message_id.clone(),
+                                )
+                                .await
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                note_id = %note_id,
-                                error = %e,
-                                "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                        "note id {note_id} is not a valid UUID: {error}"
+                    ))),
+                };
+                if let Err(error) = claim_result {
                     tracing::warn!(
                         note_id = %note_id,
-                        recipient = %recipient,
-                        error = %e,
-                        "outbox loop: send failed; will retry next cycle"
+                        error = %error,
+                        "outbox loop: failed to claim external_id; skipping"
                     );
+                    continue;
+                }
+                message_id
+            }
+        };
+
+        let mut envelope = ChannelEnvelope::new(
+            format!("email:{mailbox}"),
+            format!("email:{recipient}"),
+            content,
+        )
+        .with_subject(subject)
+        .with_message_id(message_id.clone());
+        if let Some(thread_id) = thread_id {
+            envelope = envelope.with_correlation(thread_id);
+        }
+        if let Some(in_reply_to) = in_reply_to {
+            envelope = envelope.with_in_reply_to(in_reply_to);
+        }
+        if let Some(references) = references {
+            envelope = envelope.with_references(references);
+        }
+
+        match email_channel.send(envelope).await {
+            Ok(()) => {
+                let delivered_at = Utc::now().to_rfc3339();
+                match registry
+                    .dispatch(
+                        "update",
+                        json!({
+                            "namespace": ingest_namespace,
+                            "id": note_id,
+                            "properties": { "delivered_at": delivered_at },
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) => tracing::info!(
+                        note_id = %note_id,
+                        recipient = %recipient,
+                        message_id = %message_id,
+                        "outbox loop: delivered"
+                    ),
+                    Err(error) => tracing::warn!(
+                        note_id = %note_id,
+                        error = %error,
+                        "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
+                    ),
                 }
             }
+            Err(error) => tracing::warn!(
+                note_id = %note_id,
+                recipient = %recipient,
+                error = %error,
+                "outbox loop: send failed; will retry next cycle"
+            ),
         }
     }
 }
@@ -2866,6 +2859,11 @@ pub fn build_server_from_multi_backend_registry(
         multi.per_pack_runtimes.get("kg").map(Arc::as_ref),
         multi.per_pack_runtimes.get("comm").map(Arc::as_ref),
     );
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    let channel_outbox_runtime = multi
+        .per_pack_runtimes
+        .get("kg")
+        .map(|runtime| runtime.as_ref().clone());
     // Wire the main backend's pool for background WAL checkpointing. The pool is
     // only present for file-backed databases; in-memory backends return None here
     // so that checkpoint_once never runs on a non-WAL connection.
@@ -2888,7 +2886,9 @@ pub fn build_server_from_multi_backend_registry(
     .with_runtime(default_runtime);
 
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    let server = server.with_channel_loop_admission(channel_loop_admission);
+    let server = server
+        .with_channel_outbox_runtime(channel_outbox_runtime)
+        .with_channel_loop_admission(channel_loop_admission);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
@@ -9209,6 +9209,176 @@ backend = "kg-backend"
                 .unwrap()
                 .clone();
             assert!(note_already_delivered(&props));
+        }
+    }
+
+    /// #1856 multi-backend regression: the owner-only `external_id` claim
+    /// must use the same KG-routed runtime as outbox list/update dispatch.
+    /// The default backend deliberately contains no message row; using its
+    /// runtime makes the claim fail and suppresses the external send.
+    #[cfg(feature = "channel-email")]
+    mod routed_email_outbox_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use khive_runtime::PackConfig;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingChannel {
+            sent: Mutex<Vec<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for RecordingChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                self.sent.lock().unwrap().push(envelope);
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(Vec::new())
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn kg_secondary_runtime_owns_external_id_claim_and_delivery_mark() {
+            let dir = tempfile::tempdir().unwrap();
+            let main_path = dir.path().join("main.db");
+            let kg_path = dir.path().join("kg-secondary.db");
+            let khive_cfg = KhiveConfig {
+                backends: vec![
+                    BackendConfig {
+                        name: BackendId::MAIN.to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(main_path.clone()),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                    BackendConfig {
+                        name: "kg-store".to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(kg_path.clone()),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                ],
+                packs: HashMap::from([
+                    (
+                        "kg".to_string(),
+                        PackConfig {
+                            backend: "kg-store".to_string(),
+                        },
+                    ),
+                    (
+                        "comm".to_string(),
+                        PackConfig {
+                            backend: "kg-store".to_string(),
+                        },
+                    ),
+                ]),
+                ..KhiveConfig::default()
+            };
+
+            let multi = build_registry_for_multi_backend_inner(
+                base_runtime_config_for_multi_backend(),
+                &khive_cfg,
+                None,
+            )
+            .expect("mixed-topology registry must build");
+            assert_eq!(
+                multi.per_pack_runtimes["kg"].backend_id().as_str(),
+                "kg-store"
+            );
+            let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+            let registry = server.verb_registry_clone();
+            let owner_runtime = server
+                .channel_outbox_runtime_clone()
+                .expect("email outbox must retain the KG-routed runtime");
+            assert_eq!(owner_runtime.backend_id().as_str(), "kg-store");
+
+            let send = registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({
+                        "to": "email:recipient@example.com",
+                        "subject": "routed owner claim",
+                        "content": "kg-secondary-outbox-probe",
+                    }),
+                )
+                .await
+                .expect("comm.send must create the outbound secondary row");
+            let note_id = send["full_id"]
+                .as_str()
+                .expect("comm.send returns full_id")
+                .to_string();
+
+            let channel = RecordingChannel::default();
+            let namespace = Namespace::parse("local").unwrap();
+            channel_outbox_once(
+                &channel,
+                &registry,
+                &owner_runtime,
+                &namespace,
+                "local",
+                "maintainer@example.com",
+                "example.com",
+                &["recipient@example.com".to_string()],
+            )
+            .await;
+            assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+            let note = registry
+                .dispatch("get", serde_json::json!({ "id": note_id }))
+                .await
+                .expect("KG-routed get must read the delivered secondary row");
+            assert!(
+                note["properties"]["external_id"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "owner claim must persist external_id on the KG backend: {note}"
+            );
+            assert!(
+                note["properties"]["delivered_at"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "successful send must persist delivered_at on the KG backend: {note}"
+            );
+
+            let main = rusqlite::Connection::open(&main_path).unwrap();
+            let main_count: i64 = main
+                .query_row(
+                    "SELECT COUNT(*) FROM notes WHERE content = 'kg-secondary-outbox-probe'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(main_count, 0, "default backend must not own the message");
+
+            let kg = rusqlite::Connection::open(&kg_path).unwrap();
+            let (external_id, delivered_at): (String, String) = kg
+                .query_row(
+                    "SELECT json_extract(properties, '$.external_id'), \
+                            json_extract(properties, '$.delivered_at') \
+                     FROM notes WHERE content = 'kg-secondary-outbox-probe' \
+                       AND json_extract(properties, '$.direction') = 'outbound'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(!external_id.is_empty());
+            assert!(!delivered_at.is_empty());
         }
     }
 
