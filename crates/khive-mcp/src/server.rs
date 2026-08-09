@@ -264,6 +264,7 @@ pub fn compute_config_id(
 /// the currently configured default SQLite reserve. Runtime-owning call sites
 /// use [`compute_config_id_with_storage_policies`] instead so neither captured
 /// policy is re-read after construction.
+#[cfg(test)]
 pub(crate) fn compute_config_id_with_ann_fresh_tail(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
