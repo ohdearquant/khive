@@ -778,6 +778,28 @@ mod tests {
     use super::*;
     use khive_storage::types::{SqlStatement, SqlValue};
 
+    /// A writable fixture backend can leave `-wal`/`-shm` sidecars behind at
+    /// scope drop (their owning connection closes asynchronously), and
+    /// read-only admission rejects a writable `-shm` as potentially live.
+    /// Freeze any lingering sidecars so the reopened path is the documented
+    /// frozen-snapshot form: read-only `-wal` plus read-only `-shm`.
+    #[cfg(unix)]
+    fn freeze_snapshot_sidecars(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn sqlite_detects_chmod_read_only_snapshot_and_core_reads_succeed() {
@@ -795,6 +817,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&path, permissions).unwrap();
+        freeze_snapshot_sidecars(&path);
 
         let read_only = StorageBackend::sqlite(&path).expect("auto-detect read-only mode");
         assert!(read_only.is_read_only());
@@ -1019,6 +1042,8 @@ mod tests {
                 .sparse("present")
                 .expect("create the optional sparse table while writable");
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
         read_only
@@ -1295,6 +1320,8 @@ mod tests {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable.graph().unwrap();
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let ro = StorageBackend::sqlite_read_only(&path).unwrap();
         let store = match ro.graph() {

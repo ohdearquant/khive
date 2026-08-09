@@ -1393,6 +1393,21 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&path, permissions).unwrap();
+        // A lingering writable `-shm` from the writable fixture's asynchronous
+        // connection close is rejected by read-only admission as potentially
+        // live; freeze any sidecars into the documented frozen-snapshot form.
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut sidecar_permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                sidecar_permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, sidecar_permissions).expect("freeze sidecar");
+            }
+        }
 
         let read_only_config = RuntimeConfig {
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
