@@ -2525,7 +2525,7 @@ fn quarantine_only_channel_to_json(
         "last_poll_attempt_at": Value::Null,
         "last_failure_at": Value::Null,
         "last_error": Value::Null,
-        "consecutive_failures": 0,
+        "consecutive_failures": Value::Null,
         "quarantined_count": quarantined_count,
     })
 }
@@ -2561,7 +2561,7 @@ pub(crate) async fn handle_health(
     }
 
     let store = runtime.notes(token)?;
-    const MAX_CHANNELS: u32 = 200;
+    const MAX_CHANNELS: usize = 200;
     let filter = NoteFilter {
         kind: Some("channel_health".to_string()),
         ..Default::default()
@@ -2571,17 +2571,17 @@ pub(crate) async fn handle_health(
             token.namespace().as_str(),
             &filter,
             PageRequest {
-                limit: MAX_CHANNELS,
+                limit: MAX_CHANNELS as u32,
                 offset: 0,
             },
         )
         .await?;
 
-    if page.items.len() == MAX_CHANNELS as usize {
+    if page.items.len() == MAX_CHANNELS {
         tracing::debug!(
             max_channels = MAX_CHANNELS,
             "comm.health: channel_health row count hit the page limit; \
-             results may be silently truncated"
+             heartbeat rows take the full response budget and later rows are omitted"
         );
     }
 
@@ -2608,17 +2608,28 @@ pub(crate) async fn handle_health(
     // A message namespace can intentionally differ from the operational
     // heartbeat namespace. Preserve those exact channel identities as
     // quarantine-only entries instead of hiding them merely because this
-    // scoped read has no heartbeat row. Sorting makes the additive entries
-    // deterministic without changing the persisted heartbeat order.
+    // scoped read has no heartbeat row. Heartbeats consume the bounded response
+    // budget first: if their page is full, an identity whose heartbeat exists
+    // beyond that page is omitted rather than misclassified as quarantine-only.
+    // When heartbeat rows leave capacity, exact quarantine-only identities fill
+    // it in deterministic lexical order without changing heartbeat order.
     let mut quarantine_only: Vec<_> = quarantine_counts.by_channel.into_iter().collect();
     quarantine_only.sort_by(|(left, _), (right, _)| left.cmp(right));
-    channels.extend(
-        quarantine_only
-            .into_iter()
-            .map(|((channel_kind, channel_slug), count)| {
-                quarantine_only_channel_to_json(channel_kind, channel_slug, count)
-            }),
-    );
+    let quarantine_capacity = MAX_CHANNELS.saturating_sub(channels.len());
+    let omitted_quarantine_channels = quarantine_only.len().saturating_sub(quarantine_capacity);
+    channels.extend(quarantine_only.into_iter().take(quarantine_capacity).map(
+        |((channel_kind, channel_slug), count)| {
+            quarantine_only_channel_to_json(channel_kind, channel_slug, count)
+        },
+    ));
+    if omitted_quarantine_channels > 0 {
+        tracing::debug!(
+            max_channels = MAX_CHANNELS,
+            omitted_quarantine_channels,
+            "comm.health: quarantine-only channel identities exceeded the capacity left after \
+             heartbeat rows; later lexical identities are omitted"
+        );
+    }
     let as_of = now.to_rfc3339();
 
     let (role, source) = if !has_heartbeat_state {

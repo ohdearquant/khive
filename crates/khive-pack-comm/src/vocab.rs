@@ -483,7 +483,11 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                        live quarantine notes. Every channel entry includes `quarantined_count`; \
                        the response also includes namespace-wide `quarantined_count` and \
                        `unattributed_quarantined_count`. Quarantine-only entries do not fabricate \
-                       daemon ownership. Heartbeat entries include their \
+                       daemon ownership: their heartbeat facts include \
+                       `consecutive_failures: null`. Returns at most 200 channels. Heartbeat rows \
+                       take precedence and retain persisted order; quarantine-only identities \
+                       fill remaining capacity in lexical channel-identity order, while top-level \
+                       counts remain namespace-wide. Heartbeat entries include their \
                        nominal `poll_interval_secs` and a nullable advisory `stalled` schedule \
                        fact. `stalled` becomes true after three missed nominal intervals; it is \
                        null for legacy/malformed rows and known failure/backoff state. This is \

@@ -194,7 +194,7 @@ must exactly match one `results[].id`; rank position never supplies a judgment.
 | `comm.mark_read` | Named bulk mark-read; optional `atomic=true` makes the cross-message mutation all-or-nothing                            | Clear a supplied inbox set without naming ambiguity         |
 | `comm.reply`     | Reply to a message (threading linkage)                                                                                  | Respond in-thread                                           |
 | `comm.thread`    | Retrieve full conversation thread                                                                                       | Read the whole conversation                                 |
-| `comm.health`    | Per-channel heartbeat and quarantine-backlog snapshot with nominal cadence and advisory staleness (no args)             | Check channel polls and parked messages                     |
+| `comm.health`    | Bounded heartbeat-first channel and quarantine-backlog snapshot with nominal cadence and advisory staleness (no args)   | Check channel polls and parked messages                     |
 | `comm.probe`     | Read-only poll for new inbound message metadata and stale unread count                                                  | Cheap wake-up check without a full inbox scan               |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,

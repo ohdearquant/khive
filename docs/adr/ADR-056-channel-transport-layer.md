@@ -38,10 +38,13 @@ quarantine counts.
 
 Every channel poller MUST pass both its `Channel::kind()` and exact
 `Channel::slug()` to `comm.ingest`. Those handler-owned properties take
-precedence over free-form adapter metadata. A live `message` note is counted as
-quarantined when `properties.quarantined` is either JSON `true` or the string
-`"true"`. `comm.health(namespace=...)` counts only live rows in that authorized
-namespace and returns:
+precedence over free-form adapter metadata. Generic `message` create and update
+paths MUST refuse caller-supplied `channel_kind`, `channel_slug`, and
+`quarantined`; only the trusted `comm.ingest` path establishes that transport
+provenance and disposition. A live `message` note is counted as quarantined
+when `properties.quarantined` is either JSON `true` or the string `"true"`.
+`comm.health(namespace=...)` counts only live rows in that authorized namespace
+and returns:
 
 - top-level `quarantined_count`, the total parked rows in scope;
 - top-level `unattributed_quarantined_count`, the subset lacking a complete
@@ -49,11 +52,18 @@ namespace and returns:
 - `quarantined_count` on every channel entry.
 
 The channel array is the union of heartbeat rows and exact channel identities
-found on quarantined messages. When message data and operational heartbeats
-use different namespaces, a scoped health read of the message namespace
-returns a quarantine-only channel entry with nullable heartbeat fields. That
-evidence does not fabricate daemon ownership: `role` and `source` continue to
-derive solely from persisted heartbeat rows.
+found on quarantined messages, bounded to 200 entries. Heartbeat rows take the
+response budget first and retain their persisted order. Only remaining capacity
+is filled by quarantine-only identities, ordered by `(channel_kind,
+channel_slug)`; later identities are omitted without changing the unbounded
+top-level counts. This precedence means a heartbeat outside a full heartbeat
+page is omitted rather than re-emitted with fabricated quarantine-only
+liveness. When message data and operational heartbeats use different
+namespaces, a scoped health read of the message namespace returns a
+quarantine-only channel entry whose heartbeat-only fields — including
+`consecutive_failures` — are null. That evidence does not fabricate daemon
+ownership: `role` and `source` continue to derive solely from persisted
+heartbeat rows.
 
 Recovery uses existing supported record operations rather than inventing an
 unsafe re-attribution shortcut. An authorized recipient inspects full

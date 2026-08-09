@@ -7931,8 +7931,161 @@ async fn health_surfaces_quarantine_channel_without_a_heartbeat_in_that_namespac
     assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
     assert_eq!(channels[0]["channel_slug"].as_str(), Some("tenant-mailbox"));
     assert_eq!(channels[0]["quarantined_count"].as_u64(), Some(1));
-    assert!(channels[0]["last_poll_attempt_at"].is_null());
-    assert!(channels[0]["stalled"].is_null());
+    for field in [
+        "poll_interval_secs",
+        "stalled",
+        "last_success_at",
+        "last_poll_attempt_at",
+        "last_failure_at",
+        "last_error",
+        "consecutive_failures",
+    ] {
+        assert!(
+            channels[0][field].is_null(),
+            "without a heartbeat, `{field}` is unknown rather than fabricated: {}",
+            channels[0]
+        );
+    }
+}
+
+async fn plant_healthy_channel_rows(rt: &KhiveRuntime, count: usize) {
+    use khive_storage::note::Note;
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+    let base = chrono::Utc::now().timestamp_micros();
+    let notes = (0..count)
+        .map(|index| {
+            let slug = format!("heartbeat-{index:03}");
+            Note {
+                id: uuid::Uuid::new_v4(),
+                namespace: "local".to_string(),
+                kind: "channel_health".to_string(),
+                status: "active".to_string(),
+                name: Some(format!("email:{slug}")),
+                content: format!("channel heartbeat: email:{slug}"),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(serde_json::json!({
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "poll_interval_secs": 5,
+                    "last_success_at": chrono::Utc::now().to_rfc3339(),
+                    "last_poll_attempt_at": chrono::Utc::now().to_rfc3339(),
+                    "last_failure_at": null,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                })),
+                created_at: base + index as i64,
+                updated_at: base + index as i64,
+                deleted_at: None,
+            }
+        })
+        .collect();
+    let summary = store
+        .upsert_notes(notes)
+        .await
+        .expect("batch healthy channel rows");
+    assert_eq!(summary.attempted, count as u64);
+    assert_eq!(summary.affected, count as u64);
+    assert_eq!(summary.failed, 0, "heartbeat seed failures: {summary:?}");
+}
+
+async fn ingest_attributed_quarantine(
+    registry: &VerbRegistry,
+    external_id: &str,
+    channel_slug: &str,
+) {
+    registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": format!("parked {external_id}"),
+                "channel_kind": "email",
+                "channel_slug": channel_slug,
+                "external_id": external_id,
+                "metadata": {"quarantined": true, "quarantine_reason": "test"},
+            }),
+        )
+        .await
+        .expect("quarantine ingest");
+}
+
+/// Heartbeats are authoritative liveness evidence and consume the bounded
+/// channel budget first. A quarantine identity that sorts before them must not
+/// displace a heartbeat or be emitted as a heartbeat-free synthetic row.
+#[tokio::test]
+async fn health_channel_limit_never_displaces_a_real_heartbeat() {
+    let (registry, rt) = build_registry_for_ns("local");
+    plant_healthy_channel_rows(&rt, 200).await;
+    ingest_attributed_quarantine(
+        &registry,
+        "quarantine-health-over-limit",
+        "000-quarantine-only",
+    )
+    .await;
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channels = health["channels"].as_array().expect("channels array");
+    assert_eq!(channels.len(), 200, "the union has one hard response bound");
+    assert_eq!(health["quarantined_count"].as_u64(), Some(1));
+    assert!(
+        channels
+            .iter()
+            .all(|channel| channel["poll_interval_secs"].as_u64() == Some(5)),
+        "all 200 returned entries must be real heartbeat rows: {channels:?}"
+    );
+    assert!(
+        channels
+            .iter()
+            .all(|channel| channel["channel_slug"] != "000-quarantine-only"),
+        "quarantine-only evidence must not displace or masquerade as a heartbeat"
+    );
+}
+
+/// Once all heartbeat rows fit, quarantine-only identities fill only the
+/// remaining capacity in stable `(channel_kind, channel_slug)` order.
+#[tokio::test]
+async fn health_channel_limit_orders_quarantine_only_fill_deterministically() {
+    let (registry, rt) = build_registry_for_ns("local");
+    plant_healthy_channel_rows(&rt, 199).await;
+    ingest_attributed_quarantine(&registry, "quarantine-health-late", "zz-last").await;
+    ingest_attributed_quarantine(&registry, "quarantine-health-first", "aa-first").await;
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channels = health["channels"].as_array().expect("channels array");
+    assert_eq!(channels.len(), 200, "the union has one hard response bound");
+    assert_eq!(health["quarantined_count"].as_u64(), Some(2));
+    assert_eq!(
+        channels[0]["channel_slug"], "heartbeat-198",
+        "heartbeat rows retain the store's newest-first order"
+    );
+    assert_eq!(
+        channels[198]["channel_slug"], "heartbeat-000",
+        "the complete heartbeat page remains ahead of synthetic entries"
+    );
+    assert_eq!(
+        channels[199]["channel_slug"], "aa-first",
+        "the lexicographically first quarantine-only identity fills the final slot"
+    );
+    assert!(
+        channels
+            .iter()
+            .all(|channel| channel["channel_slug"] != "zz-last"),
+        "later quarantine-only identities are truncated deterministically"
+    );
 }
 
 /// #1472: a silently stopped poller must be distinguishable from a healthy,
@@ -11306,6 +11459,61 @@ async fn update_admits_non_owned_properties_on_message_note() {
     );
 }
 
+/// Quarantine disposition and channel attribution are transport-owned facts.
+/// Generic update must not hide a parked message or move it between channels;
+/// the supported recovery mutation is delete/purge.
+#[tokio::test]
+async fn update_refuses_to_forge_transport_owned_quarantine_properties() {
+    let (registry, _rt) = build_registry();
+    let ingested = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": "transport-owned update guard",
+                "channel_kind": "email",
+                "channel_slug": "real-account",
+                "external_id": "transport-owned-update-guard",
+                "metadata": {"quarantined": true, "quarantine_reason": "test"},
+            }),
+        )
+        .await
+        .expect("the legitimate comm.ingest path must remain accepted");
+    let full_id = ingested["full_id"].as_str().expect("full_id").to_string();
+
+    for (key, forged_value) in [
+        ("quarantined", serde_json::json!(false)),
+        ("channel_kind", serde_json::json!("telegram")),
+        ("channel_slug", serde_json::json!("forged-account")),
+    ] {
+        let before = registry
+            .dispatch("get", serde_json::json!({"id": full_id}))
+            .await
+            .expect("get before refused update");
+        let err = registry
+            .dispatch(
+                "update",
+                serde_json::json!({"id": full_id, "properties": {key: forged_value}}),
+            )
+            .await
+            .expect_err("generic update must refuse transport-owned properties");
+        assert!(
+            err.to_string().contains(key),
+            "error must name {key}: {err}"
+        );
+        let after = registry
+            .dispatch("get", serde_json::json!({"id": full_id}))
+            .await
+            .expect("get after refused update");
+        assert_eq!(
+            after["properties"], before["properties"],
+            "refused `{key}` update must leave all message properties unchanged"
+        );
+    }
+}
+
 /// The guard fires only on pack-owned kinds: naming `from_actor` on a base
 /// kg note kind (e.g. `observation`) must succeed.
 #[tokio::test]
@@ -11375,6 +11583,45 @@ async fn update_refuses_non_object_properties_patch_on_message_note() {
 }
 
 // ---- ADR-124 note-write identity guard: CREATE-path derivation ----
+
+/// Public generic message creation cannot manufacture transport evidence that
+/// only `comm.ingest` is authorized to establish.
+#[tokio::test]
+async fn create_refuses_transport_owned_quarantine_properties() {
+    let (registry, _rt) = build_registry();
+
+    for (key, forged_value) in [
+        ("quarantined", serde_json::json!(true)),
+        ("channel_kind", serde_json::json!("email")),
+        ("channel_slug", serde_json::json!("victim-account")),
+    ] {
+        let err = registry
+            .dispatch(
+                "create",
+                serde_json::json!({
+                    "kind": "message",
+                    "content": format!("generic create forgery: {key}"),
+                    "properties": {key: forged_value},
+                }),
+            )
+            .await
+            .expect_err("generic create must refuse transport-owned properties");
+        assert!(
+            err.to_string().contains(key),
+            "error must name {key}: {err}"
+        );
+    }
+
+    let messages = registry
+        .dispatch("list", serde_json::json!({"kind": "message", "limit": 10}))
+        .await
+        .expect("list after refused creates");
+    assert_eq!(
+        messages.as_array().map(Vec::len),
+        Some(0),
+        "a refused generic create must not leave a partial message row"
+    );
+}
 
 /// FORGE arm: a generic `create(kind="message", properties={from_actor:
 /// "forged"})` call under an authenticated token for actor X must store

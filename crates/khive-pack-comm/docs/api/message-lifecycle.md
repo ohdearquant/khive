@@ -503,7 +503,11 @@ Channel pollers additionally pass handler-owned `channel_kind` and
 identifiers; a slug requires a kind. Free-form metadata cannot override or
 fabricate either field. `comm.health` uses the pair to group any generic
 `quarantined: true`/`"true"` disposition without depending on an email-only
-sender label.
+sender label. Because those three fields become operational health evidence,
+generic `create(kind="message", properties=...)` and `update` mutations refuse
+caller-supplied `channel_kind`, `channel_slug`, or `quarantined`. The internal
+`comm.ingest` subhandler remains their only supported writer; ordinary custom
+message metadata is unaffected.
 
 ## Message-ID / References header helpers (#403)
 

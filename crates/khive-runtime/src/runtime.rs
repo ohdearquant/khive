@@ -835,9 +835,11 @@ impl KhiveRuntime {
     /// by [`notes`](Self::notes). `try_create_note` is deliberately excluded —
     /// its only caller path is `comm.ingest`, where `properties.from_actor` is
     /// the external transport sender named by the `from` parameter, not the
-    /// authenticated caller; deriving it from the token here would stamp
-    /// every inbound message as the ingesting daemon and destroy inbound
-    /// attribution. The `NoteStore` accessors are a lower-level storage
+    /// authenticated caller, and where transport-owned quarantine/channel
+    /// properties are legitimately established. Running the generic validator
+    /// there would stamp every inbound message as the ingesting daemon and
+    /// reject the evidence the trusted ingest handler just derived. The
+    /// `NoteStore` accessors are a lower-level storage
     /// escape hatch with no properties-derivation contract of their own; a
     /// caller reaching storage directly is expected to have already decided
     /// what `properties` to write.

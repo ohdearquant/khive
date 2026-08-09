@@ -188,18 +188,18 @@ request(ops="comm.health()")
 
 Each entry in the returned `channels` array carries:
 
-| Field                  | Notes                                                                                                                                                      |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `channel_kind`         | e.g. `"email"`.                                                                                                                                            |
-| `channel_slug`         | Per-credential identifier (the configured mailbox address for the email channel), so two accounts of the same `channel_kind` get distinct rows.            |
-| `poll_interval_secs`   | Positive nominal/minimum poll cadence, or `null` for a legacy/malformed heartbeat row.                                                                     |
-| `stalled`              | Advisory schedule staleness: `true` after three missed nominal intervals, `false` when current, or `null` when the facts are unknown or backoff is active. |
-| `last_success_at`      | Timestamp of the most recent successful poll attempt, or `null`.                                                                                           |
-| `last_failure_at`      | Timestamp of the most recent failed poll attempt, or `null`.                                                                                               |
-| `last_poll_attempt_at` | Timestamp of the most recent poll attempt regardless of outcome.                                                                                           |
-| `last_error`           | `{class, message, at}` of the most recent failure. `class` is one of `auth`, `transport`, `config` (an open enum; callers must tolerate unknown values).   |
-| `consecutive_failures` | Resets to 0 on success, increments on failure.                                                                                                             |
-| `quarantined_count`    | Live parked messages carrying this exact channel identity.                                                                                                 |
+| Field                  | Notes                                                                                                                                                            |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `channel_kind`         | e.g. `"email"`.                                                                                                                                                  |
+| `channel_slug`         | Per-credential identifier (the configured mailbox address for the email channel), so two accounts of the same `channel_kind` get distinct rows.                  |
+| `poll_interval_secs`   | Positive nominal/minimum poll cadence, or `null` for a legacy/malformed heartbeat row.                                                                           |
+| `stalled`              | Advisory schedule staleness: `true` after three missed nominal intervals, `false` when current, or `null` when the facts are unknown or backoff is active.       |
+| `last_success_at`      | Timestamp of the most recent successful poll attempt, or `null`.                                                                                                 |
+| `last_failure_at`      | Timestamp of the most recent failed poll attempt, or `null`.                                                                                                     |
+| `last_poll_attempt_at` | Timestamp of the most recent poll attempt regardless of outcome.                                                                                                 |
+| `last_error`           | `{class, message, at}` of the most recent failure, or `null` when none was observed. `class` is an open enum (`auth`, `transport`, `config`, or a future value). |
+| `consecutive_failures` | Resets to 0 on success, increments on failure, or `null` for a quarantine-only identity with no heartbeat evidence.                                              |
+| `quarantined_count`    | Live parked messages carrying this exact channel identity.                                                                                                       |
 
 `last_error` is retained after a later success: a success updates
 `last_success_at` and resets `consecutive_failures` to 0 but never clears
@@ -238,6 +238,9 @@ Inspect parked rows with the full `comm.inbox(status="all")` view and the
 `delete(id=...)` removes one from the live parked count; `hard=true`
 permanently purges it. No automatic trusted release exists because quarantine
 means the attribution gate did not establish a sender identity.
+Generic message `create`/`update` cannot set or clear `quarantined`,
+`channel_kind`, or `channel_slug`; `comm.ingest` is the only supported writer
+for those transport-owned facts.
 
 **Known ambiguity:** an empty `channels` array cannot distinguish "no daemon
 has ever run" from "channels are configured but a poll has never completed."
@@ -252,8 +255,12 @@ heartbeating under `"local"`; its `channels` array may still contain
 quarantine-only message evidence. Check the response's `namespace` field
 before reading that role as "no daemon running."
 
-Results are capped at 200 channels. A full page logs a `tracing::debug!`
-line noting that results may be silently truncated.
+Results are capped at 200 channels. Heartbeat rows take precedence and retain
+their persisted order; quarantine-only identities fill remaining capacity in
+lexical `(channel_kind, channel_slug)` order. Later identities are omitted, but
+the top-level quarantine totals remain namespace-wide. This ordering prevents
+a real heartbeat beyond a full heartbeat page from being presented as a
+synthetic unknown-liveness row.
 
 ## The email channel
 

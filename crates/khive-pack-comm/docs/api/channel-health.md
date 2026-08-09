@@ -99,10 +99,13 @@ sees the poll loop's rows.
 ## `handlers.rs::channel_health_to_json`
 
 Projects a persisted `channel_health` note into the `comm.health()` channel
-entry shape. Missing fields (a row written before a given property existed)
-default to `null`/`0` rather than panicking — forward-compatible with rows
-written by an older heartbeat writer. Invalid or missing cadence/timestamp
-facts produce `poll_interval_secs: null` and/or `stalled: null`.
+entry shape. Missing fields on an actual heartbeat row (a row written before a
+given property existed) default to `null`/`0` rather than panicking —
+forward-compatible with rows written by an older heartbeat writer. Invalid or
+missing cadence/timestamp facts produce `poll_interval_secs: null` and/or
+`stalled: null`. Quarantine-only entries are distinct: all heartbeat facts,
+including `consecutive_failures`, are explicitly `null` because no heartbeat
+was observed.
 
 `quarantined_count` is independent of those liveness facts. It is the number
 of live `message` rows in the authorized namespace whose generic
@@ -138,10 +141,19 @@ fabricate configured-channel state from anything else.
 
 The `channels` array also includes quarantine-only identities that have parked
 messages in this namespace but no heartbeat row here. Their cadence and
-timestamp fields are null, `consecutive_failures` is zero, and their presence
-does not change `role: "client"`/`source: null`; no daemon heartbeat is
-fabricated. This matters when a deployment keeps operational heartbeats in
-`local` while routing message notes to a tenant namespace.
+timestamp fields, `last_error`, `stalled`, and `consecutive_failures` are null,
+and their presence does not change `role: "client"`/`source: null`; no daemon
+heartbeat is fabricated. Agent presentation preserves these meaningful nulls.
+This matters when a deployment keeps operational heartbeats in `local` while
+routing message notes to a tenant namespace.
+
+The union is capped at 200 channel entries. Heartbeat rows consume the response
+budget first and retain their persisted order. Quarantine-only identities fill
+only the remaining capacity in lexical `(channel_kind, channel_slug)` order.
+If the heartbeat page is full, no quarantine-only identity is emitted, so a
+real heartbeat beyond the bounded page cannot be misrepresented as a synthetic
+unknown-liveness row. Top-level quarantine totals still cover the whole
+namespace and are not truncated with the channel array.
 
 Top-level `quarantined_count` covers every live parked row in scope.
 `unattributed_quarantined_count` is the subset with a missing/blank channel
@@ -157,6 +169,9 @@ it from health counts. `delete(id=..., hard=true)` permanently purges it. No
 "release as trusted" operation exists: quarantine explicitly means sender
 attribution was not established, so automatic delivery would cross the
 ADR-056 trust boundary.
+Generic message `create` and `update` cannot establish, clear, or rewrite the
+`quarantined`, `channel_kind`, or `channel_slug` evidence; only `comm.ingest`
+writes those transport-owned fields.
 
 `namespace` in the response (khive #877) is the namespace actually read,
 echoed back so the shape is self-describing for both the unscoped and the

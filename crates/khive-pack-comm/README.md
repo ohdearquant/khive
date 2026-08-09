@@ -16,7 +16,7 @@ delivery confirmation, and channel polling observability.
 | `comm.unread`    | Count the caller's unread inbound messages without message payloads                                                                                           |
 | `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
-| `comm.health`    | Read per-channel heartbeat state, quarantine backlog counts, nominal poll cadence, and nullable advisory schedule staleness                                   |
+| `comm.health`    | Read a bounded heartbeat-first channel snapshot, quarantine backlog counts, nominal poll cadence, and nullable advisory schedule staleness                    |
 | `comm.probe`     | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
 
 The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an

@@ -8868,7 +8868,7 @@ backend = "kg-backend"
             let task = tokio::spawn(channel_poll_loop(
                 Arc::new(ch_registry),
                 registry.clone(),
-                "test-ns".to_string(),
+                "local".to_string(),
                 "actor:test".to_string(),
             ));
 
@@ -8898,7 +8898,7 @@ backend = "kg-backend"
             let inbox = registry
                 .dispatch(
                     "list",
-                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                    json!({"namespace": "local", "kind": "message", "limit": 50}),
                 )
                 .await
                 .expect("list must succeed");

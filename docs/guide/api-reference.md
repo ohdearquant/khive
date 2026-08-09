@@ -1482,7 +1482,9 @@ every known channel, including `poll_interval_secs`, nullable advisory `stalled`
 the live `quarantined_count`. Top-level `quarantined_count` covers the namespace-wide
 parked backlog; `unattributed_quarantined_count` reports legacy rows that lack a complete
 channel identity. Quarantine-only channel entries have nullable heartbeat fields and do
-not fabricate daemon ownership.
+not fabricate daemon ownership. The channel union is capped at 200: heartbeat rows take
+precedence, then quarantine-only identities fill remaining capacity in lexical channel
+identity order. Top-level quarantine totals remain namespace-wide when entries are omitted.
 For current rows with no known failure, `stalled` becomes true after three missed nominal
 intervals; it is null for legacy/malformed rows or active failure/backoff state. This is
 not a computed healthy or authoritative supervisor verdict. Health judgment belongs to
@@ -1497,6 +1499,8 @@ To recover, page `comm.inbox(status="all")`, inspect full rows for
 `properties.quarantined`, and fetch a selected row with `get(id=...)`.
 `delete(id=...)` removes it from the parked count; `delete(id=..., hard=true)`
 permanently purges it. There is deliberately no automatic "release as trusted" path.
+Generic message `create`/`update` mutations cannot set `channel_kind`, `channel_slug`, or
+`quarantined`; those transport-owned fields are established only by `comm.ingest`.
 
 No parameters.
 
