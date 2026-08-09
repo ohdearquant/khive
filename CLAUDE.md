@@ -364,7 +364,11 @@ make fmt-check  # verify without modifying
 make build      # cargo build --workspace --release
 
 # Build + verify Cargo's exact reported local artifact without installing or stopping the daemon
-make verify-local-artifact  # receipt-bound daemonless verbs() probe; requires all requested packs and >=90 verbs
+make fleet-build  # alias for the receipt-bound build + daemonless verbs() probe
+
+# Re-run only the verification step (current build receipt, or a selected executable)
+make fleet-check
+make fleet-check FLEET_ARTIFACT="$HOME/.cargo/bin/kkernel"
 
 # Build + install locally (ALWAYS use this after code changes)
 make local      # depends on verify-local-artifact, then codesigns + installs kkernel → kills stale daemon

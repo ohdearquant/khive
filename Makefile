@@ -7,8 +7,9 @@ LOCAL_VERB_FLOOR := 90
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
 LOCAL_VERIFY_STAMP := $(LOCAL_BUILD_RECEIPT).verified
+FLEET_ARTIFACT ?=
 
-.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
 
 check:
 	cd crates && cargo check --workspace
@@ -48,6 +49,28 @@ verify-local-artifact: build-local
 		--packs "$(FULL_PACKS)" \
 		--min-verbs "$(LOCAL_VERB_FLOOR)" \
 		--stamp "$(LOCAL_VERIFY_STAMP)"
+
+# Build and verify the release artifact without installing it or interrupting
+# the serving daemon. This compatibility name makes the build-only safety gate
+# discoverable independently of the local-install recipe.
+fleet-build: verify-local-artifact
+
+# Re-run the verification probe without rebuilding. By default this checks the
+# exact Cargo artifact named by the current build receipt. Set FLEET_ARTIFACT to
+# check any executable directly, including the installed kkernel binary:
+#   make fleet-check FLEET_ARTIFACT="$$HOME/.cargo/bin/kkernel"
+fleet-check:
+	@if [ -n "$(FLEET_ARTIFACT)" ]; then \
+		python3 scripts/verify_local_artifact.py \
+			--artifact "$(FLEET_ARTIFACT)" \
+			--packs "$(FULL_PACKS)" \
+			--min-verbs "$(LOCAL_VERB_FLOOR)"; \
+	else \
+		python3 scripts/verify_local_artifact.py \
+			--build-receipt "$(LOCAL_BUILD_RECEIPT)" \
+			--packs "$(FULL_PACKS)" \
+			--min-verbs "$(LOCAL_VERB_FLOOR)"; \
+	fi
 
 clean:
 	cd crates && cargo clean

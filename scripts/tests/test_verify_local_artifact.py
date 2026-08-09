@@ -1193,6 +1193,95 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertLess(staged_check, install)
         self.assertLess(install, daemon_stop)
 
+    def test_fleet_targets_split_build_verification_from_verification_only(self) -> None:
+        self.assertIn("fleet-build: verify-local-artifact\n", self.makefile)
+        self.assertIn("fleet-check:\n", self.makefile)
+        self.assertIn('if [ -n "$(FLEET_ARTIFACT)" ]; then', self.makefile)
+        self.assertIn('--artifact "$(FLEET_ARTIFACT)"', self.makefile)
+        self.assertIn('--build-receipt "$(LOCAL_BUILD_RECEIPT)"', self.makefile)
+
+        fleet_check = self.makefile[
+            self.makefile.index("fleet-check:\n") : self.makefile.index("clean:\n")
+        ]
+        self.assertNotIn("build_local_artifact.py", fleet_check)
+        self.assertNotIn("~/.cargo/bin", fleet_check)
+        self.assertNotIn("pkill", fleet_check)
+
+        fleet_build = subprocess.run(
+            ["make", "--no-print-directory", "-n", "fleet-build"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(fleet_build.returncode, 0, fleet_build.stderr)
+        self.assertIn("scripts/build_local_artifact.py", fleet_build.stdout)
+        self.assertIn("scripts/verify_local_artifact.py", fleet_build.stdout)
+        self.assertNotIn("codesign", fleet_build.stdout)
+        self.assertNotIn("pkill", fleet_build.stdout)
+
+    def test_broken_pack_registration_fails_fleet_build_before_install_or_daemon_stop(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "built kkernel"
+            artifact.write_text(textwrap.dedent(FAKE_ARTIFACT), encoding="utf-8")
+            artifact.chmod(0o755)
+
+            fake_cargo = root / "fake cargo"
+            fake_cargo.write_text(textwrap.dedent(FAKE_CARGO), encoding="utf-8")
+            fake_cargo.chmod(0o755)
+
+            installed = root / ".cargo" / "bin" / "kkernel"
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(PRE_EXISTING_INSTALL)
+
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            pkill_record = root / "pkill-record"
+            pkill = shim_dir / "pkill"
+            pkill.write_text(
+                f"#!/bin/sh\nprintf invoked > {pkill_record!s}\n",
+                encoding="utf-8",
+            )
+            pkill.chmod(0o755)
+
+            receipt = root / "state" / "build.json"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "FAKE_CARGO_ARTIFACT": str(artifact),
+                    "FAKE_CARGO_MODE": "ok",
+                    "FAKE_CARGO_RECORD": str(root / "cargo-record.json"),
+                    "FAKE_MODE": "missing-pack",
+                    "HOME": str(root),
+                    "PATH": f"{shim_dir}{os.pathsep}{environment['PATH']}",
+                }
+            )
+            completed = subprocess.run(
+                [
+                    "make",
+                    "--no-print-directory",
+                    "fleet-build",
+                    f"CARGO={fake_cargo}",
+                    f"LOCAL_BUILD_RECEIPT={receipt}",
+                    f"LOCAL_VERIFY_STAMP={receipt}.verified",
+                    f"FULL_PACKS={TEST_PACKS}",
+                    "LOCAL_VERB_FLOOR=3",
+                ],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("omitted requested packs", completed.stderr)
+            self.assertEqual(installed.read_bytes(), PRE_EXISTING_INSTALL)
+            self.assertFalse(pkill_record.exists())
+
     def test_signing_cannot_slip_unverified_bytes_past_the_install_gate(self) -> None:
         """`codesign` rewrites the staged file, so every pre-sign check is void
         for the bytes that actually get installed. The gate must therefore fail

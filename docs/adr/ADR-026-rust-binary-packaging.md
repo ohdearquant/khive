@@ -340,8 +340,11 @@ The local install contract is now build, verify, then install:
    configuration changes the target directory or adds a target-triple subdirectory; the gate
    never guesses `${target-dir}/release/kkernel`.
 2. `verify-local-artifact` depends on `build-local`, validates that receipt, and executes its
-   exact artifact. The probe runs `verbs()` with daemon and embeddings disabled, an in-memory
-   database, an empty
+   exact artifact. `fleet-build` is the public compatibility name for that build-plus-verify
+   gate. `fleet-check` runs the verification step alone: it checks the current receipt-bound
+   artifact by default or an explicitly selected executable through `FLEET_ARTIFACT` (including
+   the installed binary). Neither target installs a binary or interrupts a daemon. The probe
+   runs `verbs()` with daemon and embeddings disabled, an in-memory database, an empty
    explicit config, an isolated home/current directory, and the Makefile-owned full pack
    selection. It never reads the installed `kkernel`, touches `~/.cargo/bin`, or stops the
    daemon. A configured cross-target artifact that cannot execute on the developer host fails
