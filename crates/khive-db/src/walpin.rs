@@ -3877,6 +3877,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn housekeeping_preserves_malformed_unknown_for_no_progress_attribution() {
         let root = tempfile::tempdir().unwrap();
@@ -3904,6 +3905,7 @@ mod tests {
         assert!(!attribution.fully_attributed());
     }
 
+    #[cfg(unix)]
     #[test]
     fn housekeeping_preserves_stale_unknown_for_no_progress_attribution() {
         let root = tempfile::tempdir().unwrap();
