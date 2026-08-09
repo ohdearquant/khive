@@ -1,4 +1,8 @@
-"""Focused contract tests for stable KG list response envelopes."""
+"""Focused contract tests for stable KG list response envelopes.
+
+ADR: ADR-023
+section: Stable list response envelopes
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,9 @@ from typing import Any
 import pytest
 
 from khive_contract.schema import assert_list_response
+
+
+VERBS_UNDER_TEST = {"list"}
 
 
 LIMIT_METADATA = {
