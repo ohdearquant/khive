@@ -9,7 +9,10 @@ use khive_db::StorageBackend;
 #[cfg(test)]
 use khive_gate::AllowAllGate;
 use khive_gate::GateRequest;
-use khive_storage::{EntityStore, Event, EventStore, GraphStore, NoteStore, SqlAccess};
+use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::{
+    EntityStore, Event, EventStore, GraphStore, NoteStore, SqlAccess, VectorStore,
+};
 use khive_types::{EdgeEndpointRule, EventKind, Namespace, SubstrateKind};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
 
@@ -59,6 +62,76 @@ pub type NoteWriteValidatorFn = Arc<
         + Send
         + Sync,
 >;
+
+/// Immutable identity for a non-text vector store owned by a pack consumer.
+///
+/// This does not register an [`crate::EmbedderProvider`]. It gives a pack that
+/// performs its own governed inference a narrow path to a namespace-scoped
+/// Khive vector table while keeping model-key and dimension validation at the
+/// runtime boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedVectorIdentity {
+    model_key: String,
+    model_name: String,
+    dimensions: usize,
+}
+
+impl NamedVectorIdentity {
+    const MAX_MODEL_KEY_BYTES: usize = 128;
+    const MAX_MODEL_NAME_BYTES: usize = 512;
+
+    /// Validate and construct a named vector identity.
+    pub fn new(
+        model_key: impl Into<String>,
+        model_name: impl Into<String>,
+        dimensions: usize,
+    ) -> RuntimeResult<Self> {
+        let model_key = model_key.into();
+        let model_name = model_name.into();
+        if model_key.is_empty()
+            || model_key.len() > Self::MAX_MODEL_KEY_BYTES
+            || !model_key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "named vector model_key must be 1..={} bytes of ASCII alphanumeric/underscore",
+                Self::MAX_MODEL_KEY_BYTES
+            )));
+        }
+        if model_name.trim().is_empty()
+            || model_name.trim() != model_name
+            || model_name.len() > Self::MAX_MODEL_NAME_BYTES
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "named vector model_name must be 1..={} bytes with no surrounding whitespace",
+                Self::MAX_MODEL_NAME_BYTES
+            )));
+        }
+        if !(1..=8192).contains(&dimensions) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "named vector dimensions must be in 1..=8192, got {dimensions}"
+            )));
+        }
+        Ok(Self {
+            model_key,
+            model_name,
+            dimensions,
+        })
+    }
+
+    pub fn model_key(&self) -> &str {
+        &self.model_key
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+}
 
 pub use crate::config::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
@@ -486,6 +559,112 @@ impl KhiveRuntime {
             dims,
             token.namespace().as_str(),
         )?)
+    }
+
+    /// Get a namespace-scoped vector store for a pack-owned immutable identity.
+    ///
+    /// The table key is syntactically validated by [`NamedVectorIdentity`]. This
+    /// accessor additionally verifies the table's actual sqlite-vec dimension
+    /// declaration and every persisted `embedding_model` value before returning
+    /// the store, so reusing one key for incompatible descriptor geometry or
+    /// semantics fails before a caller can replace rows.
+    pub async fn vectors_for_named_identity(
+        &self,
+        token: &NamespaceToken,
+        identity: &NamedVectorIdentity,
+    ) -> RuntimeResult<Arc<dyn VectorStore>> {
+        let store = self.backend.vectors_for_namespace(
+            identity.model_key(),
+            identity.model_name(),
+            identity.dimensions(),
+            token.namespace().as_str(),
+        )?;
+
+        let table = format!("vec_{}", identity.model_key());
+        let mut reader = self.sql().reader().await?;
+        let dimension_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1".to_string(),
+                params: vec![SqlValue::Text(table.clone())],
+                label: Some("runtime_named_vector_dimension".to_string()),
+            })
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "named vector table {table} has no sqlite_schema declaration"
+                ))
+            })?;
+        let table_ddl = match dimension_row.get("sql") {
+            Some(SqlValue::Text(value)) => value,
+            other => {
+                return Err(RuntimeError::Internal(format!(
+                    "named vector table {table} returned invalid schema metadata: {other:?}"
+                )))
+            }
+        };
+        let declared_dimensions = vector_dimensions_from_ddl(table_ddl).ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "named vector table {table} has no parseable embedding dimension"
+            ))
+        })?;
+        if declared_dimensions != identity.dimensions() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "named vector model_key {:?} is already bound to {declared_dimensions} dimensions, expected {}",
+                identity.model_key(),
+                identity.dimensions()
+            )));
+        }
+
+        let stored_models = reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT DISTINCT embedding_model FROM {table} ORDER BY embedding_model LIMIT 2"
+                ),
+                params: vec![],
+                label: Some("runtime_named_vector_model_identity".to_string()),
+            })
+            .await?;
+        for row in stored_models {
+            let stored = match row.get("embedding_model") {
+                Some(SqlValue::Text(value)) => value,
+                other => {
+                    return Err(RuntimeError::Internal(format!(
+                        "named vector table {table} returned invalid model identity metadata: {other:?}"
+                    )))
+                }
+            };
+            if stored != identity.model_name() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "named vector model_key {:?} already contains model {stored:?}, cannot bind it to {:?}",
+                    identity.model_key(),
+                    identity.model_name()
+                )));
+            }
+        }
+
+        self.backend
+            .register_embedding_model(
+                identity.model_key(),
+                identity.model_name(),
+                identity.model_key(),
+                identity.dimensions() as u32,
+            )
+            .map_err(|error| {
+                if matches!(
+                    &error,
+                    khive_db::SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                        if code.code == rusqlite::ErrorCode::ConstraintViolation
+                ) {
+                    RuntimeError::InvalidInput(format!(
+                        "named vector model_key {:?} is already bound to a different active model identity",
+                        identity.model_key()
+                    ))
+                } else {
+                    RuntimeError::Sqlite(error)
+                }
+            })?;
+
+        Ok(store)
     }
 
     /// Output dimensions for a named embedding model, resolved from the
@@ -1184,6 +1363,16 @@ impl KhiveRuntime {
 
         Ok(records)
     }
+}
+
+fn vector_dimensions_from_ddl(ddl: &str) -> Option<usize> {
+    let lower = ddl.to_ascii_lowercase();
+    let suffix = lower.split_once("embedding float[")?.1;
+    let dimension = suffix.split_once(']')?.0;
+    if dimension.is_empty() || !dimension.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    dimension.parse().ok()
 }
 
 // INLINE TEST JUSTIFICATION: tests here cover KhiveRuntime construction helpers
@@ -2117,5 +2306,124 @@ mod tests {
             .await
             .expect("no-match ok");
         assert!(no_match.is_empty());
+    }
+
+    #[test]
+    fn named_vector_identity_rejects_ambiguous_or_unsafe_values() {
+        assert!(NamedVectorIdentity::new("", "model", 4).is_err());
+        assert!(NamedVectorIdentity::new("bad-key", "model", 4).is_err());
+        assert!(NamedVectorIdentity::new("valid_key", " model", 4).is_err());
+        assert!(NamedVectorIdentity::new("valid_key", "model", 0).is_err());
+        assert!(NamedVectorIdentity::new("valid_key", "model", 8193).is_err());
+        assert!(NamedVectorIdentity::new("k".repeat(128), "m".repeat(512), 4).is_ok());
+        assert!(NamedVectorIdentity::new("k".repeat(129), "model", 4).is_err());
+        assert!(NamedVectorIdentity::new("valid_key", "m".repeat(513), 4).is_err());
+        assert_eq!(
+            NamedVectorIdentity::new("valid_key", "model", 4)
+                .expect("valid identity")
+                .dimensions(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn named_vector_store_rejects_dimension_or_model_key_rebinding() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let original = NamedVectorIdentity::new("visual_contract", "model-a", 4).unwrap();
+        rt.vectors_for_named_identity(&token, &original)
+            .await
+            .expect("create named vector store");
+        let registered = rt
+            .list_embedding_models(Some("visual_contract"))
+            .await
+            .expect("list model registry");
+        assert!(registered.iter().any(|record| {
+            record.model_id == "model-a"
+                && record.key_version == "visual_contract"
+                && record.dimensions == 4
+        }));
+        let wrong_dimensions = NamedVectorIdentity::new("visual_contract", "model-a", 5).unwrap();
+        let Err(dimension_error) = rt
+            .vectors_for_named_identity(&token, &wrong_dimensions)
+            .await
+        else {
+            panic!("same key cannot change dimensions");
+        };
+        assert!(dimension_error.to_string().contains("dimensions"));
+
+        let wrong_model = NamedVectorIdentity::new("visual_contract", "model-b", 4).unwrap();
+        let Err(model_error) = rt.vectors_for_named_identity(&token, &wrong_model).await else {
+            panic!("same key cannot change model identity");
+        };
+        assert!(model_error.to_string().contains("already bound"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_named_vector_first_bind_has_one_immutable_winner() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let first = NamedVectorIdentity::new("visual_race", "model-a", 4).unwrap();
+        let second = NamedVectorIdentity::new("visual_race", "model-b", 4).unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            rt.vectors_for_named_identity(&token, &first),
+            rt.vectors_for_named_identity(&token, &second),
+        );
+        assert_ne!(
+            first_result.is_ok(),
+            second_result.is_ok(),
+            "the active engine_name uniqueness rule must select exactly one first binding"
+        );
+
+        let (winner, loser) = if first_result.is_ok() {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        rt.vectors_for_named_identity(&token, winner)
+            .await
+            .expect("winning identity remains idempotent");
+        let error = match rt.vectors_for_named_identity(&token, loser).await {
+            Ok(_) => panic!("losing identity cannot rebind the empty table"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already bound"));
+
+        let registered = rt
+            .list_embedding_models(Some("visual_race"))
+            .await
+            .expect("list race registry");
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].model_id, winner.model_name());
+    }
+
+    #[tokio::test]
+    async fn named_vector_registry_keeps_immutable_revisions_active_together() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let first = NamedVectorIdentity::new("visual_revision_a", "visual-model", 4).unwrap();
+        let second = NamedVectorIdentity::new("visual_revision_b", "visual-model", 4).unwrap();
+
+        rt.vectors_for_named_identity(&token, &first)
+            .await
+            .expect("open first immutable space");
+        rt.vectors_for_named_identity(&token, &second)
+            .await
+            .expect("open second immutable space");
+
+        let registered = rt.list_embedding_models(None).await.expect("list registry");
+        assert!(registered.iter().any(|record| {
+            record.engine_name == "visual_revision_a"
+                && record.model_id == "visual-model"
+                && record.key_version == "visual_revision_a"
+                && record.status == "active"
+        }));
+        assert!(registered.iter().any(|record| {
+            record.engine_name == "visual_revision_b"
+                && record.model_id == "visual-model"
+                && record.key_version == "visual_revision_b"
+                && record.status == "active"
+        }));
     }
 }
