@@ -2833,14 +2833,17 @@ mod discovery_tests {
 #[cfg(test)]
 mod cursor_retry_tests {
     use super::{
-        delete_cursors, drain_pending_cursor_deletes, ensure_cursor_identity_schema,
-        finalize_dispatch_stats, queue_cursor_deletes, tally_dispatch_errors, CursorResetReason,
-        DiscoveredKind, DiscoveryIndex, MirrorCursorState, CURSOR_DELETE_RETRY_LIMIT,
-        FILE_ERROR_POLLS_BEFORE_COLD,
+        adopt_dispatch_cursor, delete_cursors, drain_pending_cursor_deletes,
+        ensure_cursor_identity_schema, finalize_dispatch_stats, queue_cursor_deletes,
+        tally_dispatch_errors, CandidateDispatch, CursorResetReason, DiscoveredKind,
+        DiscoveryIndex, MirrorCursorState, CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
     };
     #[cfg(unix)]
     use crate::mirror::ingest::metadata_file_identity;
-    use crate::mirror::ingest::{mirror_file, LineTailSource, MirrorStats};
+    use crate::mirror::ingest::{
+        mirror_file, mirror_file_deferred_with_witness, probe_file, LineTailSource,
+        MirrorCursorDisposition, MirrorStats,
+    };
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
     use khive_runtime::{AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig};
     use khive_storage::types::{SqlStatement, SqlValue};
@@ -2914,6 +2917,35 @@ mod cursor_retry_tests {
             .await
             .expect("cursor query");
         !rows.is_empty()
+    }
+
+    async fn cursor_offset(rt: &KhiveRuntime, path: &std::path::Path) -> Option<u64> {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT byte_offset FROM session_mirror_cursor WHERE file_path = ?1".into(),
+                params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
+                label: None,
+            })
+            .await
+            .expect("cursor query")?;
+        match row.columns.first().map(|column| &column.value) {
+            Some(SqlValue::Integer(offset)) => u64::try_from(*offset).ok(),
+            _ => None,
+        }
+    }
+
+    async fn session_message_exists(rt: &KhiveRuntime, uuid: &str) -> bool {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT 1 FROM session_messages WHERE uuid = ?1".into(),
+                params: vec![SqlValue::Text(uuid.to_string())],
+                label: None,
+            })
+            .await
+            .expect("message query")
+            .is_some()
     }
 
     fn cursor_state(byte_offset: u64) -> MirrorCursorState {
@@ -3010,6 +3042,158 @@ mod cursor_retry_tests {
         .expect("mirror replacement transcript");
         assert_eq!(second.inserted, 1, "replacement prefix must be ingested");
         assert_eq!(second.new_offset, first.new_offset);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_open_truncation_reset_is_adopted_before_regrowth_crosses_old_offset() {
+        let (rt, dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+        let path = dir.path().join("probe-open-truncation.jsonl");
+        let first_uuid = "uuid-probe-open-prefix";
+        let second_uuid = "uuid-probe-open-regrown";
+        let line = |uuid: &str, text: &str| {
+            format!(
+                "{}\n",
+                format_args!(
+                    r#"{{"uuid":"{uuid}","sessionId":"sess-probe-open","type":"user","timestamp":"2026-08-09T10:00:00Z","message":{{"role":"user","content":"{text}"}}}}"#
+                )
+            )
+        };
+        let first_line = line(first_uuid, "prefix after truncation");
+        let second_line = line(second_uuid, &"regrown interval ".repeat(16));
+        let old_offset = first_line.len() as u64 + 32;
+        std::fs::write(&path, vec![b'x'; old_offset as usize + 64]).expect("original generation");
+
+        // Service probe: the original generation still extends beyond the
+        // stored cursor, so ordinary reconciliation does not reset it.
+        let (probed_metadata, probed_identity) = probe_file(&path).expect("service probe");
+        assert!(probed_metadata.len() > old_offset);
+        let mut cursor = MirrorCursorState {
+            byte_offset: old_offset,
+            file_identity: probed_identity.clone(),
+        };
+        assert_eq!(
+            cursor.reconcile(probed_metadata.len(), probed_identity.clone()),
+            None
+        );
+
+        // The same file generation is truncated after the probe but before
+        // ingest opens it. The restarted pass commits a lower DB cursor.
+        let mut truncated = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate same generation");
+        truncated
+            .write_all(first_line.as_bytes())
+            .expect("write replacement prefix");
+        drop(truncated);
+        assert!((first_line.len() as u64) < old_offset);
+        assert_eq!(
+            probe_file(&path).expect("post-truncation probe").1,
+            probed_identity,
+            "the race is an in-place truncation, not an identity replacement"
+        );
+
+        let pass = mirror_file_deferred_with_witness(
+            &rt,
+            &path,
+            old_offset,
+            LineTailSource::ClaudeCode,
+            None,
+            probed_identity.as_deref(),
+        )
+        .await
+        .expect("witnessed truncation pass");
+        let mut dispatch = CandidateDispatch::default();
+        assert!(
+            dispatch.record_mirror_pass(Ok(pass), old_offset),
+            "an inserting witnessed restart ends candidate dispatch"
+        );
+        let (stats, disposition, had_errors) = finalize_dispatch_stats(
+            &rt,
+            &path,
+            old_offset,
+            true,
+            dispatch.stats,
+            dispatch.mirror_disposition,
+            false,
+        )
+        .await;
+        assert!(!had_errors);
+        let stats = stats.expect("restarted pass selected");
+        let disposition = disposition.expect("line-tail disposition retained");
+        assert!(matches!(
+            disposition,
+            MirrorCursorDisposition::RestartedAfterTruncation { .. }
+        ));
+        assert!(stats.new_offset < old_offset);
+        assert_eq!(cursor_offset(&rt, &path).await, Some(stats.new_offset));
+        assert!(adopt_dispatch_cursor(
+            &mut cursor,
+            old_offset,
+            &stats,
+            Some(&disposition),
+        ));
+        assert_eq!(cursor.byte_offset, stats.new_offset);
+
+        // Regrow beyond the stale pre-truncation offset. Starting from that
+        // stale offset would land in the middle of this line and skip it;
+        // the witnessed lower cursor must instead consume the full interval.
+        let mut regrown = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open regrowth append");
+        regrown
+            .write_all(second_line.as_bytes())
+            .expect("append regrown interval");
+        drop(regrown);
+        let (regrown_metadata, regrown_identity) = probe_file(&path).expect("regrowth probe");
+        assert!(regrown_metadata.len() > old_offset);
+        assert_eq!(regrown_identity, probed_identity);
+        assert_eq!(
+            cursor.reconcile(regrown_metadata.len(), regrown_identity.clone()),
+            None
+        );
+        let resumed_offset = cursor.byte_offset;
+
+        let pass = mirror_file_deferred_with_witness(
+            &rt,
+            &path,
+            resumed_offset,
+            LineTailSource::ClaudeCode,
+            None,
+            regrown_identity.as_deref(),
+        )
+        .await
+        .expect("regrown interval pass");
+        let mut dispatch = CandidateDispatch::default();
+        assert!(dispatch.record_mirror_pass(Ok(pass), resumed_offset));
+        let (stats, disposition, had_errors) = finalize_dispatch_stats(
+            &rt,
+            &path,
+            resumed_offset,
+            true,
+            dispatch.stats,
+            dispatch.mirror_disposition,
+            false,
+        )
+        .await;
+        assert!(!had_errors);
+        let stats = stats.expect("regrown pass selected");
+        assert!(adopt_dispatch_cursor(
+            &mut cursor,
+            resumed_offset,
+            &stats,
+            disposition.as_ref(),
+        ));
+        assert_eq!(cursor.byte_offset, regrown_metadata.len());
+        assert!(session_message_exists(&rt, first_uuid).await);
+        assert!(
+            session_message_exists(&rt, second_uuid).await,
+            "the byte interval below the stale cursor must not be skipped after regrowth"
+        );
     }
 
     #[tokio::test]
