@@ -88,6 +88,7 @@ mod sealed {
         fn execute_and_reply_reporting_terminal(
             self: Box<Self>,
             conn: &rusqlite::Connection,
+            tx_span: Option<khive_storage::tx_registry::TxHandle>,
         ) -> Option<khive_storage::error::WriterTaskRequestState>;
 
         fn execute_and_reply_top_level_reporting_terminal(
@@ -250,12 +251,18 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
     fn execute_and_reply_reporting_terminal(
         self: Box<Self>,
         conn: &Connection,
+        tx_span: Option<khive_storage::tx_registry::TxHandle>,
     ) -> Option<WriterTaskRequestState> {
         // Keep the typed reply sender outside the unwind boundary. Calling
         // `(self.op)(conn)` directly would drop `self.reply` while unwinding,
         // leaving the active caller with only an untyped RecvError.
         let WriteRequest { op, reply, .. } = *self;
         let (result, terminal_state) = execute_wrapped_transaction(conn, "writer_task_commit", op);
+        // The reply wake can make the caller immediately observe the
+        // committed/error result. Deregister the transaction span first so
+        // tx_registry continues to mean "currently open SQL transaction",
+        // never "a transaction whose caller has already resumed" (#1790).
+        drop(tx_span);
         // The receiver may already be gone (caller dropped its future) —
         // that is not this task's problem to report.
         let _ = reply.send(result);
@@ -297,7 +304,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
 
 impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
     fn execute_and_reply(self: Box<Self>, conn: &Connection) {
-        let _ = sealed::Sealed::execute_and_reply_reporting_terminal(self, conn);
+        let _ = sealed::Sealed::execute_and_reply_reporting_terminal(self, conn, None);
     }
 
     fn execute_and_reply_top_level(self: Box<Self>, conn: &Connection) {
@@ -707,14 +714,18 @@ async fn run_writer_task(
                 acquisition_counters.record_writer_task_acquisition();
                 sealed::Sealed::execute_and_reply_top_level_reporting_terminal(request, &conn)
             } else {
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                let tx_span = khive_storage::tx_registry::register_scoped(
                     Some("writer_task_tx".to_string()),
                     origin,
                 );
                 match conn.execute_batch("BEGIN IMMEDIATE") {
                     Ok(()) => {
                         acquisition_counters.record_writer_task_acquisition();
-                        sealed::Sealed::execute_and_reply_reporting_terminal(request, &conn)
+                        sealed::Sealed::execute_and_reply_reporting_terminal(
+                            request,
+                            &conn,
+                            Some(tx_span),
+                        )
                     }
                     Err(e) => {
                         // Do NOT run the request's operation: `conn` never
@@ -727,6 +738,11 @@ async fn run_writer_task(
                             "writer task: BEGIN IMMEDIATE failed; replying an \
                              error without running the request's operation"
                         );
+                        // Although BEGIN never opened a SQL transaction, the
+                        // scoped attempt is observable in tx_registry. Drop
+                        // it before waking the caller for the same reply-side
+                        // lifecycle guarantee as successful requests (#1790).
+                        drop(tx_span);
                         request.reply_error(StorageError::Pool {
                             operation: "writer_task_begin".into(),
                             message: e.to_string(),
@@ -1574,7 +1590,7 @@ mod tests {
         };
 
         let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn, None);
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
@@ -1706,7 +1722,7 @@ mod tests {
         };
 
         let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn, None);
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
@@ -1745,7 +1761,7 @@ mod tests {
         };
 
         let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn, None);
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
