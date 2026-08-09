@@ -6924,6 +6924,8 @@ region = "us-east-1"
         )
         .expect("seed exact-current snapshots");
         drop(seeded);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&comm_path);
         let daemon = Args::parse_from(["mcp", "--daemon"]);
 
         let comm_snapshot = build_registry_for_multi_backend_inner(
@@ -6944,6 +6946,24 @@ region = "us-east-1"
             "list/update are backed by the writable kg runtime"
         );
         drop(server);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            freeze_snapshot_sidecars(&main_path);
+            // The second arm reopens comm writable, so its sidecars must thaw.
+            for suffix in ["-wal", "-shm"] {
+                let mut name = comm_path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = comm_path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o644);
+                    std::fs::set_permissions(&sidecar, permissions).expect("thaw sidecar");
+                }
+            }
+        }
 
         let kg_snapshot = build_registry_for_multi_backend_inner(
             base_runtime_config_for_multi_backend(),
