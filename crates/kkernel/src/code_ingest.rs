@@ -77,8 +77,9 @@ pub struct CodeIngestReport {
 /// Run one `kkernel code-ingest` pass: resolve config, validate the
 /// `findings.json` document as a whole (fail-closed, before any write), then
 /// persist the deterministic entity/note/edge batch record-by-record.
-/// Records whose content-derived ID already exists are reported as skipped,
-/// not overwritten: a `finding` note's lifecycle state (`kind_status`) is
+/// Records whose content-derived ID has ever existed, including soft-deleted
+/// tombstones, are reported as skipped and never overwritten or reactivated:
+/// a `finding` note's lifecycle state (`kind_status`) and deletion state are
 /// curated data, not something re-ingesting the same sweep should reset.
 pub async fn run_code_ingest(args: CodeIngestArgs) -> Result<()> {
     let human = args.human;
@@ -220,7 +221,7 @@ where
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         for entity in &batch.entities {
             let existing = entities
-                .get_entity(entity.id)
+                .get_entity_including_deleted(entity.id)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if existing.is_some() {
@@ -293,7 +294,7 @@ where
         let notes = runtime.notes(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
         for note in &batch.notes {
             let existing = notes
-                .get_note(note.id)
+                .get_note_including_deleted(note.id)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if existing.is_some() {
@@ -359,7 +360,7 @@ where
         let graph = runtime.graph(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
         for edge in &batch.edges {
             let existing = graph
-                .get_edge(edge.id)
+                .get_edge_including_deleted(edge.id)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if existing.is_some() {
@@ -503,8 +504,9 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
 /// thereby creating) a database purely to answer "does this id exist" would
 /// itself be the mutation the dry-run contract forbids.
 ///
-/// When the path exists, existence is checked against a snapshot copy of
-/// it: `StorageBackend::sqlite_read_only`'s `SQLITE_OPEN_READ_ONLY` plus
+/// When the path exists, existence (including soft-deleted rows, because a
+/// deterministic ID is never reusable) is checked against a snapshot copy
+/// of it: `StorageBackend::sqlite_read_only`'s `SQLITE_OPEN_READ_ONLY` plus
 /// `PRAGMA query_only = ON` blocks logical writes, but SQLite still performs
 /// ordinary WAL shared-memory maintenance on open, which creates or updates
 /// the `-shm` sidecar next to whatever path it is pointed at. Opening the
@@ -538,7 +540,7 @@ async fn dry_run_report(
     for entity in &batch.entities {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM entities WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                sql: "SELECT 1 FROM entities WHERE id = ?1".to_string(),
                 params: vec![SqlValue::Uuid(entity.id)],
                 label: Some("code-ingest dry-run entity existence".to_string()),
             })
@@ -553,7 +555,7 @@ async fn dry_run_report(
     for note in &batch.notes {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM notes WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                sql: "SELECT 1 FROM notes WHERE id = ?1".to_string(),
                 params: vec![SqlValue::Uuid(note.id)],
                 label: Some("code-ingest dry-run note existence".to_string()),
             })
@@ -568,7 +570,7 @@ async fn dry_run_report(
     for edge in &batch.edges {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM graph_edges WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                sql: "SELECT 1 FROM graph_edges WHERE id = ?1".to_string(),
                 params: vec![SqlValue::Uuid(uuid::Uuid::from(edge.id))],
                 label: Some("code-ingest dry-run edge existence".to_string()),
             })
