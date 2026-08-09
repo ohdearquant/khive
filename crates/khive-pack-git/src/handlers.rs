@@ -1606,21 +1606,25 @@ mod tests {
             "https://github.com/org/noncanonical-tombstone-repo",
         );
 
-        let dead = registry
-            .dispatch(
-                "create",
-                json!({
-                    "kind": "project",
-                    "name": "noncanonical-tombstone-repo-old",
-                    "properties": {
-                        "repo_url": "  https://legacy:token@github.com/org/noncanonical-tombstone-repo.git?view=old  ",
-                        "repo_slug": "org/noncanonical-tombstone-repo",
-                    },
-                }),
-            )
+        // Seed below the public secret gate: this row represents legacy data
+        // that predates URL-userinfo admission checks. The behavior under test
+        // is safe reconciliation of that already-persisted evidence, not
+        // permission for a caller to create it today.
+        let dead = khive_storage::Entity::new(
+            "local",
+            "project",
+            "noncanonical-tombstone-repo-old",
+        )
+        .with_properties(json!({
+            "repo_url": "  https://legacy:token@github.com/org/noncanonical-tombstone-repo.git?view=old  ",
+            "repo_slug": "org/noncanonical-tombstone-repo",
+        }));
+        let dead_id = dead.id;
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(dead)
             .await
-            .expect("create noncanonical tombstone anchor");
-        let dead_id = Uuid::parse_str(dead["id"].as_str().unwrap()).expect("uuid");
+            .expect("seed legacy noncanonical tombstone anchor");
         create_note_annotating(&registry, "issue", "#1708 orphan", dead_id).await;
         assert!(rt
             .delete_entity(&token, dead_id, false)
