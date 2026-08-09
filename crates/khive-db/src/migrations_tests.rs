@@ -1713,7 +1713,8 @@ fn v18_moves_legacy_zero_watermark_into_timestamped_pending_state() {
     )
     .unwrap();
 
-    assert_eq!(run_migrations(&mut conn).unwrap(), 19);
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest);
     assert!(table_exists(&conn, "ann_consumer_pending"));
     let legacy: (i64, i64) = conn
         .query_row(
