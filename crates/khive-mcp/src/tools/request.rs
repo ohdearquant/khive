@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn request_tool_schema_is_closed() {
-        let schema = schemars::schema_for!(RequestParams);
+        let schema = rmcp::schemars::schema_for!(RequestParams);
         let value = serde_json::to_value(schema).expect("serialize request schema");
 
         assert_eq!(
