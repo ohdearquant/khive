@@ -451,6 +451,7 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
                 && legacy_topology_component_is_safe(&kind)
                 && backend
                     .path
+                    .as_ref()
                     .is_none_or(|_| legacy_topology_component_is_safe(&path));
             (backend.name.clone(), kind, path, backend.read_only)
         })
