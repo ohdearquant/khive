@@ -81,12 +81,14 @@ impl StorageBackend {
         let resolved = path.as_ref().to_path_buf();
         let read_only =
             std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.permissions().readonly());
-        let config = PoolConfig {
+        let mut config = PoolConfig {
             path: Some(resolved.clone()),
             read_only,
-            write_queue_enabled: read_only.then_some(false),
             ..PoolConfig::default()
         };
+        if read_only {
+            config.write_queue_enabled = Some(false);
+        }
         let pool = ConnectionPool::new(config)?;
         Ok(Self {
             pool: Arc::new(pool),
