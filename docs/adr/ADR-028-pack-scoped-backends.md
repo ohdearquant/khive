@@ -591,3 +591,48 @@ let runtime     = if pack_cfg.backend != BackendId::MAIN {
 
 All other ADR-028 mechanics (TOML shape, 1:1 pack-to-backend assignment, schema collision
 detection, declaration-order application, cross-pack composition) are unchanged.
+
+## Amendment A2: Read-only backends are snapshot-inspection runtimes (2026-08-09)
+
+ADR-028 names `archive` as a read-only storage profile but did not define a
+write-free boot and request lifecycle. A runtime cannot claim read-only support
+if opening a store, registering a configured embedding model, applying pack
+schema, or appending the dispatch audit row still acquires the SQLite writer.
+
+The SQLite implementation therefore treats a read-only backend as an existing
+snapshot-inspection runtime. Read-only mode is selected either by an explicit
+backend option or, for normal single-backend boot, by detecting that an existing
+database file has no filesystem write bits. The pool opens every connection
+with SQLite read-only flags and additionally applies `query_only` to its writer
+slot.
+
+Boot and access obey these rules:
+
+1. The snapshot must already exist and its core schema version must equal this
+   build's latest migration. Boot validates that fact without writes; a schema
+   behind or ahead fails with instructions to migrate a writable copy or use a
+   compatible build.
+2. Boot does not register embedding models, apply pack-auxiliary schema, start a
+   writer task, checkpoint, or schedule a WAL sweep for that backend.
+3. Store acquisition does not run lazy DDL or repair DML. A requested optional
+   store table must already exist in the snapshot.
+4. Mutation semantics are unchanged: DDL and DML remain rejected by the SQLite
+   open flags and `query_only`, regardless of verb metadata.
+5. When the main audit backend is read-only, the registry deliberately omits the
+   `EventStore` instead of attempting a known-failing append. Every successful
+   non-help MCP operation carries an envelope-level advisory with stable code
+   `audit_persistence_skipped_read_only`; the verb-owned `result` is unchanged.
+   Error entries do not claim that an audit write was skipped.
+6. The effective main-backend mode is part of the warm-daemon engine identity,
+   and each declared backend's explicit `read_only` mode is part of the
+   topology fingerprint. A chmod-detected single-backend snapshot therefore
+   cannot forward through a daemon that retained a writable handle to the same
+   path. Multi-backend configurations must declare `read_only = true`
+   explicitly when a SQLite path has no write bits; boot rejects an undeclared
+   mode change instead of fingerprinting it as writable.
+
+This mode is for offline analysis of frozen snapshots. It provides neither a
+durable dispatch audit trail nor durable accounting and says so on every
+successful operation. Deployments that require ADR-103/ADR-133 audit durability
+must use a writable audit backend. These constraints preserve ADR-028's physical
+isolation and do not weaken any mutation path.

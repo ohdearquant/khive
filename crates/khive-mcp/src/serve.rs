@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use khive_runtime::{
-    config_from_env, parse_pack_list, run_migrations, runtime_config_from_khive_config,
-    BackendConfig, BackendId, BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat,
-    RuntimeConfig, StorageBackend,
+    config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
+    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat, RuntimeConfig,
+    StorageBackend,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -2127,18 +2127,25 @@ fn build_registry_for_multi_backend_inner(
         let canonical = canonical_backend_path(backend_cfg)?;
         if let Some(ref canon) = canonical {
             if let Some(existing) = path_to_backend.get(canon) {
+                if existing.is_read_only() != backend_cfg.read_only {
+                    anyhow::bail!(
+                        "backend {} aliases {} but declares read_only={} while the same \
+                         physical database was already opened with read_only={}; every alias \
+                         of one database must use the same access mode",
+                        backend_cfg.name,
+                        canon.display(),
+                        backend_cfg.read_only,
+                        existing.is_read_only(),
+                    );
+                }
                 backends.insert(backend_cfg.name.clone(), existing.clone());
                 continue;
             }
         }
         let backend = open_backend(backend_cfg)?;
-        {
-            let mut writer = backend.pool().try_writer().map_err(|e| {
-                anyhow::anyhow!("backend {}: migration writer: {e}", backend_cfg.name)
-            })?;
-            run_migrations(writer.conn_mut())
-                .map_err(|e| anyhow::anyhow!("backend {}: migration: {e}", backend_cfg.name))?;
-        }
+        backend.prepare_core_schema().map_err(|e| {
+            anyhow::anyhow!("backend {}: schema preparation: {e}", backend_cfg.name)
+        })?;
         let arc = Arc::new(backend);
         if let Some(canon) = canonical {
             path_to_backend.insert(canon, arc.clone());
@@ -2229,10 +2236,11 @@ fn build_registry_for_multi_backend_inner(
 
     let gate = default_runtime.config().gate.clone();
     let default_namespace = default_runtime.config().default_namespace.clone();
-    let config_id = crate::server::compute_config_id_with_ann_fresh_tail(
+    let config_id = crate::server::compute_config_id_with_runtime_policies(
         default_runtime.config(),
         Some(khive_cfg),
         default_runtime.ann_fresh_tail_enabled(),
+        default_runtime.is_read_only(),
     );
     let visible_namespaces = default_runtime.config().visible_namespaces.clone();
 
@@ -2242,7 +2250,9 @@ fn build_registry_for_multi_backend_inner(
     builder.with_visible_namespaces(visible_namespaces);
     builder.with_actor_id(default_runtime.config().actor_id.clone());
 
-    if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
+    if default_runtime.is_read_only() {
+        builder.with_read_only_audit_store();
+    } else if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
         if let Ok(event_store) = default_runtime.events(&tok) {
             builder.with_event_store(event_store);
         }
@@ -2554,11 +2564,12 @@ pub fn build_server_with_explicit_namespace(
 
 /// Canonicalize a SQLite backend path for deduplication (ADR-028 §8).
 ///
-/// The database file may not exist yet at boot time, so we cannot call
-/// `std::fs::canonicalize` on the file itself. Instead we canonicalize the
-/// parent directory (which must exist after `open_backend` creates it) and
-/// rejoin the file name. `None` is returned for in-memory backends, which
-/// are never deduplicated.
+/// The database file may not exist yet at boot time, so this uses the shared
+/// no-side-effect path resolver rather than creating the parent as part of
+/// identity resolution. That distinction is mandatory for a missing
+/// read-only snapshot: boot must fail without materializing either the parent
+/// or database. `None` is returned for in-memory backends, which are never
+/// deduplicated.
 fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>> {
     if cfg.kind == BackendKind::Memory {
         return Ok(None);
@@ -2567,28 +2578,9 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
         Some(p) => khive_runtime::expand_tilde(p),
         None => return Ok(None),
     };
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("backend {}: path has no parent directory", cfg.name))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("backend {}: path has no file name", cfg.name))?;
-    // Create the parent so canonicalize succeeds even before the DB file is written.
-    std::fs::create_dir_all(parent).map_err(|e| {
-        anyhow::anyhow!(
-            "backend {}: cannot create parent dir {}: {e}",
-            cfg.name,
-            parent.display()
-        )
-    })?;
-    let canon_parent = parent.canonicalize().map_err(|e| {
-        anyhow::anyhow!(
-            "backend {}: cannot canonicalize parent dir {}: {e}",
-            cfg.name,
-            parent.display()
-        )
-    })?;
-    Ok(Some(canon_parent.join(file_name)))
+    canonical_path_no_side_effects(&path)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("backend {}: cannot resolve path: {e}", cfg.name))
 }
 
 /// Bound on final-component symlink hops [`canonical_path_no_side_effects`]
@@ -2820,7 +2812,7 @@ fn secondary_file_backed_pools(multi: &MultiBackendRegistry) -> Vec<Arc<Connecti
     let mut pools = Vec::new();
     for rt in multi.per_pack_runtimes.values() {
         let backend = rt.backend();
-        if !backend.is_file_backed() {
+        if !backend.is_file_backed() || backend.is_read_only() {
             continue;
         }
         let pool = backend.pool_arc();
@@ -2886,7 +2878,7 @@ impl WiringSurface {
 /// constructor, so this derivation is no longer hand-copied at each call site
 /// (#601, #604).
 pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<ConnectionPool>> {
-    if main_backend.is_file_backed() {
+    if main_backend.is_file_backed() && !main_backend.is_read_only() {
         Some(main_backend.pool_arc())
     } else {
         None
@@ -2969,22 +2961,34 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                 )
             })?;
             let expanded = khive_runtime::expand_tilde(path);
-            if let Some(parent) = expanded.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    anyhow::anyhow!(
-                        "backend {}: cannot create parent dir {}: {e}",
-                        cfg.name,
-                        parent.display()
-                    )
-                })?;
+            if !cfg.read_only {
+                if let Some(parent) = expanded.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!(
+                            "backend {}: cannot create parent dir {}: {e}",
+                            cfg.name,
+                            parent.display()
+                        )
+                    })?;
+                }
             }
             if cfg.read_only {
                 StorageBackend::sqlite_read_only(&expanded).map_err(|e| {
                     anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name)
                 })
             } else {
-                StorageBackend::sqlite(&expanded)
-                    .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))
+                let backend = StorageBackend::sqlite(&expanded)
+                    .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))?;
+                if backend.is_read_only() {
+                    anyhow::bail!(
+                        "backend {}: path {} has no filesystem write bits; declare \
+                         `read_only = true` so backend topology and daemon config identity \
+                         describe the snapshot-inspection mode explicitly",
+                        cfg.name,
+                        expanded.display()
+                    );
+                }
+                Ok(backend)
             }
         }
     }
@@ -6400,6 +6404,72 @@ region = "us-east-1"
             result.is_err(),
             "write to a read-only backend must fail; got Ok(())"
         );
+        assert!(
+            checkpoint_pool_for(&ro).is_none(),
+            "read-only backends must not drive checkpoint or WAL sweep writers"
+        );
+    }
+
+    #[test]
+    fn read_only_backend_open_does_not_create_missing_parent_or_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("missing-parent");
+        let db_path = parent.join("missing.db");
+        let config = BackendConfig {
+            name: "archive".to_string(),
+            kind: BackendKind::Sqlite,
+            path: Some(db_path.clone()),
+            cache_mb: None,
+            journal_mode: None,
+            read_only: true,
+        };
+
+        let canonical = canonical_backend_path(&config)
+            .expect("read-only identity resolution must be lexical and side-effect free");
+        assert!(canonical.is_some());
+        assert!(
+            !parent.exists(),
+            "canonical backend identity must not create a missing read-only parent"
+        );
+
+        let error = open_backend(&config).expect_err("missing read-only snapshot must fail");
+        assert!(
+            error.to_string().contains("read-only open"),
+            "error must identify the read-only open: {error}"
+        );
+        assert!(!parent.exists(), "read-only boot must not create parents");
+        assert!(
+            !db_path.exists(),
+            "read-only boot must not create a database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_backend_requires_read_only_mode_to_be_declared_explicitly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chmod_snapshot.db");
+        drop(StorageBackend::sqlite(&db_path).expect("create snapshot source"));
+
+        let mut permissions = std::fs::metadata(&db_path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&db_path, permissions).unwrap();
+
+        let config = BackendConfig {
+            name: "archive".to_string(),
+            kind: BackendKind::Sqlite,
+            path: Some(db_path),
+            cache_mb: None,
+            journal_mode: None,
+            read_only: false,
+        };
+        let error = open_backend(&config)
+            .expect_err("an undeclared multi-backend storage-mode change must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("read_only = true"), "{message}");
+        assert!(message.contains("config identity"), "{message}");
     }
 
     /// RAII guard: redirects `HOME` and restores the prior value on drop.
@@ -6564,6 +6634,28 @@ region = "us-east-1"
                 "two backends with the same canonical path must share one Arc and boot ok; got: {e}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn duplicate_sqlite_aliases_reject_conflicting_read_only_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared-mode.db");
+        let mut khive_cfg = duplicate_sqlite_path_config(&db_path);
+        assert!(khive_cfg.backends.len() >= 2);
+        khive_cfg.backends[1].read_only = true;
+
+        let error = match build_server_multi_backend(
+            base_runtime_config_for_multi_backend(),
+            &khive_cfg,
+            None,
+        ) {
+            Ok(_) => panic!("one physical database cannot be both writable and read-only"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("same physical database"), "{message}");
+        assert!(message.contains("read_only"), "{message}");
     }
 
     /// Regression for #720: changing `HOME` after runtime-config resolution but
