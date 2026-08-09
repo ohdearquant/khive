@@ -69,11 +69,11 @@ the creator.
 
 **Recurrence specification.** `repeat` accepts:
 
-| Value                | Semantics                                                               |
-| -------------------- | ----------------------------------------------------------------------- |
-| `"daily"`            | Repeat every 24 hours from `trigger_at`                                 |
-| `"weekly"`           | Repeat every 7 days                                                     |
-| `"monthly"`          | Repeat on the same day-of-month each month                              |
+| Value       | Semantics                                  |
+| ----------- | ------------------------------------------ |
+| `"daily"`   | Repeat every 24 hours from `trigger_at`    |
+| `"weekly"`  | Repeat every 7 days                        |
+| `"monthly"` | Repeat on the same day-of-month each month |
 
 Five-field cron is rejected at creation because the pending-events runner does
 not compute cron next-fire times. The write boundary never accepts recurrence
