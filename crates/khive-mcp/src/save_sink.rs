@@ -5,6 +5,7 @@
 //! filesystem path.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -116,6 +117,238 @@ fn validate_destination(root: &Path, requested: &Path) -> anyhow::Result<PathBuf
     Ok(dest)
 }
 
+fn resolve_destination(path: &Path, restrict_to_export_root: bool) -> anyhow::Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("save_to path must not be empty");
+    }
+
+    let destination = if restrict_to_export_root {
+        let root = export_root()?;
+        validate_destination(&root, path)
+    } else {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow::anyhow!("create parent dir {}: {e}", parent.display()))?;
+            }
+        }
+        Ok(path.to_path_buf())
+    }?;
+
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) if !metadata.file_type().is_file() => anyhow::bail!(
+            "save_to destination must be absent or an existing regular file: {}",
+            destination.display()
+        ),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => anyhow::bail!(
+            "inspect save_to destination {}: {error}",
+            destination.display()
+        ),
+    }
+
+    Ok(destination)
+}
+
+struct DigestingWriter<'a> {
+    file: &'a mut std::fs::File,
+    digest: &'a mut Sha256,
+}
+
+impl std::io::Write for DigestingWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(buffer)?;
+        self.digest.update(&buffer[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Incremental form of the ordinary JSONL save sink.
+///
+/// Rows are serialized once into a securely-created sibling temp file while
+/// checksum/schema metadata is accumulated. [`finish`](Self::finish) flushes
+/// and atomically renames the complete file over the destination. Dropping an
+/// unfinished sink removes the temp file and leaves any old destination intact.
+pub struct JsonlSaveSink {
+    destination: PathBuf,
+    temp: tempfile::NamedTempFile,
+    checksum: Sha256,
+    rows: usize,
+    null_counts: BTreeMap<String, u64>,
+    seen_fields: BTreeSet<String>,
+}
+
+impl JsonlSaveSink {
+    /// Validate/preflight the destination and create the sibling temp file.
+    pub fn new(path: &Path, restrict_to_export_root: bool) -> anyhow::Result<Self> {
+        let destination = resolve_destination(path, restrict_to_export_root)?;
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temp = tempfile::Builder::new()
+            .prefix(".khive-save-")
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .map_err(|error| {
+                anyhow::anyhow!("create temp file in {}: {error}", parent.display())
+            })?;
+        Ok(Self {
+            destination,
+            temp,
+            checksum: Sha256::new(),
+            rows: 0,
+            null_counts: BTreeMap::new(),
+            seen_fields: BTreeSet::new(),
+        })
+    }
+
+    /// Append one ordered result envelope row.
+    pub fn write_row(&mut self, row: &Value) -> anyhow::Result<()> {
+        if let Some(Value::Object(object)) = row.get("result") {
+            for (key, value) in object {
+                self.seen_fields.insert(key.clone());
+                if value.is_null() {
+                    *self.null_counts.entry(key.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut writer = DigestingWriter {
+            file: self.temp.as_file_mut(),
+            digest: &mut self.checksum,
+        };
+        serde_json::to_writer(&mut writer, row)
+            .map_err(|error| anyhow::anyhow!("serialize result row: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| anyhow::anyhow!("write result row: {error}"))?;
+        self.rows = self
+            .rows
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("save sink row count overflow"))?;
+        Ok(())
+    }
+
+    /// Write every result row from an ordinary request envelope, then publish
+    /// it with the envelope summary. Constructing the sink separately lets a
+    /// caller preflight the destination before performing external writes.
+    pub fn write_envelope(mut self, results_envelope: &Value) -> anyhow::Result<Value> {
+        let results = results_envelope
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let rows = results.len();
+        let summary = results_envelope.get("summary").cloned().unwrap_or_else(|| {
+            let succeeded = results
+                .iter()
+                .filter(|row| row.get("ok").and_then(Value::as_bool) == Some(true))
+                .count();
+            json!({
+                "total": rows,
+                "succeeded": succeeded,
+                "failed": rows - succeeded,
+                "aborted": 0,
+            })
+        });
+        let failures = summary
+            .get("failures")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| failure_projection(results));
+        for row in results {
+            self.write_row(row)?;
+        }
+        self.finish_with_failures(summary, failures)
+    }
+
+    /// Publish the complete JSONL file and return its ordinary manifest.
+    pub fn finish(self, summary: Value) -> anyhow::Result<Value> {
+        let failures = summary
+            .get("failures")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.finish_with_failures(summary, failures)
+    }
+
+    fn finish_with_failures(
+        mut self,
+        summary: Value,
+        failures: Vec<Value>,
+    ) -> anyhow::Result<Value> {
+        self.temp
+            .as_file_mut()
+            .flush()
+            .map_err(|error| anyhow::anyhow!("flush temp file: {error}"))?;
+
+        let schema_input = self
+            .seen_fields
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|");
+        let schema_fingerprint = hex_sha256(schema_input.as_bytes());
+        let checksum = format!("{:x}", self.checksum.clone().finalize());
+        let rows = self.rows;
+        let null_counts = serde_json::to_value(&self.null_counts).unwrap_or_else(|_| json!({}));
+        let destination = self.destination.clone();
+
+        self.temp.persist(&destination).map_err(|error| {
+            anyhow::anyhow!(
+                "persist temp file to {}: {}",
+                destination.display(),
+                error.error
+            )
+        })?;
+        let absolute =
+            std::fs::canonicalize(&destination).unwrap_or_else(|_| destination.to_path_buf());
+        let mut manifest = json!({
+            "path": absolute.to_string_lossy(),
+            "rows": rows,
+            "per_column_null_counts": null_counts,
+            "schema_fingerprint": schema_fingerprint,
+            "checksum": checksum,
+            "summary": summary,
+        });
+        if !failures.is_empty() {
+            manifest["failures"] = Value::Array(failures);
+        }
+        Ok(manifest)
+    }
+}
+
+fn failure_projection(results: &[Value]) -> Vec<Value> {
+    results
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.get("ok").and_then(Value::as_bool) == Some(false))
+        .map(|(op_index, row)| {
+            let mut failure = json!({
+                "op_index": row
+                    .get("op_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(op_index as u64),
+                "tool": row.get("tool").and_then(Value::as_str).unwrap_or("?"),
+                "error": row
+                    .get("error")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("unknown error".to_string())),
+            });
+            if let Some(reason) = row.get("reason").and_then(Value::as_str) {
+                failure["reason"] = Value::String(reason.to_string());
+            }
+            failure
+        })
+        .collect()
+}
+
 /// Write `results_envelope` as JSONL to `path` and return the self-describing manifest.
 ///
 /// Layout of `results_envelope`:
@@ -137,9 +370,10 @@ fn validate_destination(root: &Path, requested: &Path) -> anyhow::Result<PathBuf
 /// ```
 ///
 /// `failures` is omitted for an all-successful result. It is a compact
-/// projection rather than the full result payload: `kkernel exec --save-file`
-/// callers still need structured refusal metadata in the stdout manifest,
-/// while the canonical per-op rows remain in the JSONL file.
+/// projection rather than the full result payload: callers still need stable
+/// refusal metadata in the stdout manifest while canonical per-op rows remain
+/// in the JSONL file. Incremental callers may provide an already-bounded
+/// `summary.failures` projection; that bound is preserved in the manifest.
 ///
 /// `restrict_to_export_root` gates the destination policy (root containment,
 /// `..` traversal rejection, symlink-destination rejection): `true` for the
@@ -155,147 +389,13 @@ pub fn write_and_manifest(
     path: &Path,
     restrict_to_export_root: bool,
 ) -> anyhow::Result<Value> {
-    let dest = if restrict_to_export_root {
-        let root = export_root()?;
-        validate_destination(&root, path)?
-    } else {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| anyhow::anyhow!("create parent dir {}: {e}", parent.display()))?;
-            }
-        }
-        path.to_path_buf()
-    };
-    let path = dest.as_path();
-
-    let results_arr = results_envelope
-        .get("results")
-        .and_then(Value::as_array)
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
-
-    let mut jsonl_bytes: Vec<u8> = Vec::new();
-    for row in results_arr {
-        let line =
-            serde_json::to_vec(row).map_err(|e| anyhow::anyhow!("serialize result row: {e}"))?;
-        jsonl_bytes.extend_from_slice(&line);
-        jsonl_bytes.push(b'\n');
-    }
-
-    write_atomic(path, &jsonl_bytes)?;
-
-    let rows = results_arr.len();
-
-    // Only object-shaped `.result` values contribute to the column schema;
-    // scalar/array results have no named fields to count.
-    let mut null_counts: BTreeMap<String, u64> = BTreeMap::new();
-    let mut seen_fields: BTreeSet<String> = BTreeSet::new();
-
-    for row in results_arr {
-        if let Some(Value::Object(obj)) = row.get("result") {
-            for (key, val) in obj {
-                seen_fields.insert(key.clone());
-                if val.is_null() {
-                    *null_counts.entry(key.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-
-    let schema_input = seen_fields.iter().cloned().collect::<Vec<_>>().join("|");
-    let schema_fingerprint = hex_sha256(schema_input.as_bytes());
-    let checksum = hex_sha256(&jsonl_bytes);
-    let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let null_counts_val: Value = serde_json::to_value(&null_counts).unwrap_or_else(|_| json!({}));
-
-    // Carry the envelope's op-outcome summary through: the manifest is the
-    // only output the caller sees on the save path, and without the counts a
-    // strict caller (`kkernel exec --strict --save-file`) cannot distinguish
-    // an all-green batch from one whose failures are sitting in the file.
-    let summary = results_envelope.get("summary").cloned().unwrap_or_else(|| {
-        let succeeded = results_arr
-            .iter()
-            .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
-            .count();
-        json!({
-            "total": rows,
-            "succeeded": succeeded,
-            "failed": rows - succeeded,
-            "aborted": 0,
-        })
-    });
-
-    let failures: Vec<Value> = results_arr
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| row.get("ok").and_then(Value::as_bool) == Some(false))
-        .map(|(op_index, row)| {
-            let mut failure = json!({
-                "op_index": row
-                    .get("op_index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(op_index as u64),
-                "tool": row.get("tool").and_then(Value::as_str).unwrap_or("?"),
-                "error": row
-                    .get("error")
-                    .cloned()
-                    .unwrap_or_else(|| Value::String("unknown error".to_string())),
-            });
-            if let Some(reason) = row.get("reason").and_then(Value::as_str) {
-                failure["reason"] = Value::String(reason.to_string());
-            }
-            failure
-        })
-        .collect();
-
-    let mut manifest = json!({
-        "path": abs_path.to_string_lossy(),
-        "rows": rows,
-        "per_column_null_counts": null_counts_val,
-        "schema_fingerprint": schema_fingerprint,
-        "checksum": checksum,
-        "summary": summary,
-    });
-    if !failures.is_empty() {
-        manifest["failures"] = Value::Array(failures);
-    }
-    Ok(manifest)
+    JsonlSaveSink::new(path, restrict_to_export_root)?.write_envelope(results_envelope)
 }
 
 fn hex_sha256(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     format!("{:x}", h.finalize())
-}
-
-/// Write `data` to `path` via a securely-created, randomly-named temp file in
-/// the same directory, then rename over the destination (same-filesystem,
-/// atomic). See `crates/khive-mcp/docs/save-sink.md` for the
-/// symlink/predictable-path race this closes vs. a sibling `.tmp` file.
-fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".khive-save-")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .map_err(|e| anyhow::anyhow!("create temp file in {}: {e}", parent.display()))?;
-
-    tmp.write_all(data)
-        .map_err(|e| anyhow::anyhow!("write temp file: {e}"))?;
-    tmp.flush()
-        .map_err(|e| anyhow::anyhow!("flush temp file: {e}"))?;
-
-    tmp.persist(path)
-        .map_err(|e| anyhow::anyhow!("persist temp file to {}: {}", path.display(), e.error))?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -337,9 +437,9 @@ mod tests {
             json!({ "ok": true, "tool": "stats", "result": {} }),
             json!({
                 "ok": false,
-                "tool": "not_loaded",
-                "error": "unknown verb",
-                "reason": "verb-refused"
+                "tool": "get",
+                "error": "not found",
+                "reason": "entity-not-found"
             }),
         ]);
 
@@ -348,9 +448,41 @@ mod tests {
         assert_eq!(manifest["summary"]["succeeded"], json!(1));
         assert_eq!(manifest["summary"]["failed"], json!(1));
         assert_eq!(manifest["failures"][0]["op_index"], json!(1));
-        assert_eq!(manifest["failures"][0]["tool"], json!("not_loaded"));
-        assert_eq!(manifest["failures"][0]["error"], json!("unknown verb"));
-        assert_eq!(manifest["failures"][0]["reason"], json!("verb-refused"));
+        assert_eq!(manifest["failures"][0]["tool"], json!("get"));
+        assert_eq!(manifest["failures"][0]["error"], json!("not found"));
+        assert_eq!(manifest["failures"][0]["reason"], json!("entity-not-found"));
+    }
+
+    #[test]
+    fn incremental_sink_preserves_bounded_summary_failures() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("bounded.jsonl");
+        let mut sink = JsonlSaveSink::new(&path, false).unwrap();
+        sink.write_row(&json!({
+            "ok": false,
+            "tool": "get",
+            "error": "full canonical row",
+            "reason": "entity-not-found"
+        }))
+        .unwrap();
+        let manifest = sink
+            .finish(json!({
+                "total": 2_000,
+                "succeeded": 0,
+                "failed": 2_000,
+                "aborted": 0,
+                "failures": [{
+                    "op_index": 0,
+                    "tool": "get",
+                    "error": "bounded detail",
+                    "reason": "entity-not-found"
+                }],
+                "failure_details_omitted": 1_999
+            }))
+            .unwrap();
+        assert_eq!(manifest["failures"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["failures"][0]["error"], "bounded detail");
+        assert_eq!(manifest["summary"]["failure_details_omitted"], 1_999);
     }
 
     #[test]
@@ -420,6 +552,49 @@ mod tests {
         let m2 = write_and_manifest(&envelope, &path, false).unwrap();
         assert_eq!(m1["checksum"], m2["checksum"]);
         assert_eq!(m1["schema_fingerprint"], m2["schema_fingerprint"]);
+    }
+
+    #[test]
+    fn unfinished_incremental_sink_leaves_existing_destination_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("existing.jsonl");
+        std::fs::write(&path, b"old-complete-output\n").unwrap();
+
+        {
+            let mut sink = JsonlSaveSink::new(&path, false).unwrap();
+            sink.write_row(&json!({
+                "ok": true,
+                "tool": "get",
+                "result": {"id": "new"}
+            }))
+            .unwrap();
+            // Simulate a later chunk/dispatch failure: no finish/publish.
+        }
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"old-complete-output\n");
+        let siblings: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, vec![std::ffi::OsString::from("existing.jsonl")]);
+    }
+
+    #[test]
+    fn deterministic_invalid_operator_destinations_fail_during_preflight() {
+        let tmp = TempDir::new().unwrap();
+
+        let empty_error = JsonlSaveSink::new(Path::new(""), false)
+            .err()
+            .expect("empty path must fail");
+        assert!(empty_error.to_string().contains("must not be empty"));
+
+        let directory_error = JsonlSaveSink::new(tmp.path(), false)
+            .err()
+            .expect("directory destination must fail");
+        assert!(directory_error
+            .to_string()
+            .contains("absent or an existing regular file"));
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
     }
 
     #[test]

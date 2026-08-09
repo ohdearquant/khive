@@ -17,16 +17,24 @@
 //!
 //! `kkernel exec --ops-file batch.jsonl` reads a JSONL file where each
 //! non-blank line is a JSON op object `{"tool":"verb","args":{...}}`.  All
-//! lines are parsed first; a malformed line aborts before any writes.  Valid
-//! ops are dispatched in chunks of 100 (`OPS_FILE_CHUNK_SIZE`) through the same
+//! lines are validated first into a bounded temporary snapshot; a malformed
+//! line aborts before any writes without retaining the whole file in memory.
+//! Physical lines are capped at 96 MiB and the file at 512 MiB. Valid ops are
+//! dispatched in chunks of at most 100 and 32 MiB (one larger op runs alone)
+//! through the same
 //! in-process runtime path (daemon fast-path is intentionally skipped for
 //! bulk apply — the daemon is warm-state optimised, not throughput optimised).
-//! A progress line is printed per chunk.  `--dry-run` validates every line and
-//! prints a per-verb summary without writing anything.
+//! A progress line is printed per chunk. `--save-file` streams ordered rows to
+//! a sink whose final-file publication is atomic; the database chunks commit
+//! incrementally. After dispatch begins, success and failure both print a
+//! reconciliation manifest. An aborted manifest names confirmed committed
+//! chunks and any dispatched chunk whose response could not be verified.
+//! Without `--save-file`, validated row payloads are discarded after aggregation.
+//! `--dry-run` validates every line and prints a per-verb summary without writes.
 
 use std::collections::BTreeMap;
-use std::io::BufRead as _;
-use std::path::PathBuf;
+use std::io::{BufRead as _, Read as _, Seek as _, Write as _};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -330,6 +338,22 @@ pub(crate) fn acquire_local_construction_guard(
 /// [`khive_request::MAX_OPS`] so the batch always fits inside the parser limit.
 const OPS_FILE_CHUNK_SIZE: usize = 100;
 
+/// Large payloads reduce the op count per dispatch so a 100-op chunk cannot
+/// duplicate/stringify the entire accepted input snapshot at once. One op may
+/// exceed this budget (up to the physical-line ceiling) and runs alone.
+const OPS_FILE_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// A single JSONL op may carry one 64 MiB Moodboard object as base64 plus its
+/// bounded metadata, but cannot grow without limit before JSON validation.
+const MAX_OPS_FILE_LINE_BYTES: usize = 96 * 1024 * 1024;
+
+/// The validated on-disk snapshot bounds both disk amplification and the
+/// all-in-memory atomic path. Non-atomic execution retains only one chunk.
+const MAX_OPS_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+const MAX_OPS_FILE_FAILURE_DETAILS: usize = 1_000;
+const MAX_OPS_FILE_FAILURE_ERROR_BYTES: usize = 4 * 1024;
+
 /// Arguments for `kkernel exec` — execute a verb DSL expression against a chosen
 /// database and namespace, the same syntax accepted by the MCP `request` tool.
 #[derive(Parser, Debug)]
@@ -404,6 +428,11 @@ pub struct ExecArgs {
     /// Valid values: `json` (compact, lossless — default), `auto` (shape-aware:
     /// markdown table for record arrays, key-value block for single records),
     /// `table` (force markdown table).
+    ///
+    /// The legacy `--ops-file` path without `--save-file` keeps its established
+    /// aggregate JSON summary and does not forward this override to transient
+    /// rows. Combined bulk save always persists lossless JSON rows, matching
+    /// inline save.
     #[arg(long, value_name = "FORMAT")]
     pub output_format: Option<String>,
 
@@ -416,7 +445,13 @@ pub struct ExecArgs {
     /// The manifest (`{path, rows, per_column_null_counts, schema_fingerprint,
     /// checksum, summary, failures?}`) is printed to stdout instead of the raw
     /// results. Optional `failures` entries project each failed row's error and
-    /// any stable reason. Parent directories are created if absent.
+    /// any stable reason. With `--ops-file`, ordered per-op envelopes from every
+    /// chunk are retained in one JSONL file. Database chunks commit incrementally;
+    /// after dispatch begins every exit prints a reconciliation manifest. A
+    /// post-dispatch failure prints `status="aborted"`, the confirmed committed
+    /// chunks, and any dispatched-but-unverified chunk. Its incomplete temp file
+    /// is discarded, so a prior destination remains unchanged. Parent directories
+    /// are created if absent.
     ///
     /// Note: `--save-file` always runs in-process and bypasses the warm daemon,
     /// so ANN-dependent verbs (e.g. `knowledge.suggest`, `knowledge.compose`) may
@@ -424,7 +459,7 @@ pub struct ExecArgs {
     ///
     /// Example:
     ///   kkernel exec 'list(kind="entity")' --save-file /tmp/entities.jsonl
-    #[arg(long)]
+    #[arg(long, conflicts_with = "dry_run")]
     pub save_file: Option<String>,
 
     /// JSONL file of ops to apply in bulk.
@@ -434,8 +469,15 @@ pub struct ExecArgs {
     /// parsed before any write.  A malformed line prints the line number and
     /// error, then aborts without writing.
     ///
-    /// Progress is printed per chunk to stderr; the final aggregate summary is
-    /// printed to stdout.
+    /// The source is capped at 512 MiB total and 96 MiB per physical line, then
+    /// spooled to a validated temporary snapshot before writes. Dispatch chunks
+    /// are capped at 100 ops and 32 MiB (one larger op runs alone). Progress is
+    /// printed per chunk to stderr; the final aggregate summary is printed to
+    /// stdout, or `--save-file` incrementally writes ordered JSONL rows to a
+    /// sibling temp file. Success atomically publishes the complete file and
+    /// prints its ordinary manifest. A later failure leaves database effects
+    /// incremental, discards the incomplete temp file, and prints an aborted
+    /// reconciliation manifest before returning non-zero.
     ///
     /// Mutually exclusive with the positional `ops` argument.
     #[arg(long, value_name = "PATH")]
@@ -479,10 +521,208 @@ pub struct ExecArgs {
 }
 
 /// A single parsed op entry from an ops-file line.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct OpsFileEntry {
     pub(crate) tool: String,
     pub(crate) args: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct ValidatedOpsFile {
+    snapshot: std::fs::File,
+    total: usize,
+    per_verb: BTreeMap<String, usize>,
+}
+
+fn parse_ops_file_line(raw: &str, line_num: usize) -> Result<Option<OpsFileEntry>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let obj: serde_json::Value = serde_json::from_str(trimmed).map_err(|error| {
+        refusal_error(
+            RefusalReason::ParseError,
+            format!("ops-file line {line_num}: invalid JSON: {error}"),
+        )
+    })?;
+    let obj = obj.as_object().ok_or_else(|| {
+        refusal_error(
+            RefusalReason::ParseError,
+            format!(
+                "ops-file line {line_num}: expected a JSON object \
+                 {{\"tool\":...,\"args\":...}}, got a non-object value"
+            ),
+        )
+    })?;
+    let tool = obj
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            refusal_error(
+                RefusalReason::ParseError,
+                format!("ops-file line {line_num}: missing or non-string \"tool\" field"),
+            )
+        })?
+        .to_owned();
+    let args = match obj.get("args") {
+        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(v) if v.is_object() => v.clone(),
+        Some(v) => {
+            return Err(refusal_error(
+                RefusalReason::ParseError,
+                format!("ops-file line {line_num}: \"args\" must be a JSON object, got {v}"),
+            ))
+        }
+    };
+    Ok(Some(OpsFileEntry { tool, args }))
+}
+
+fn read_bounded_ops_line<R: std::io::BufRead>(
+    reader: &mut R,
+    line_num: usize,
+) -> Result<Option<String>> {
+    read_bounded_ops_line_with_limit(reader, line_num, MAX_OPS_FILE_LINE_BYTES)
+}
+
+fn read_bounded_ops_line_with_limit<R: std::io::BufRead>(
+    reader: &mut R,
+    line_num: usize,
+    limit: usize,
+) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let read = {
+        let mut limited = (&mut *reader).take((limit + 1) as u64);
+        limited
+            .read_until(b'\n', &mut bytes)
+            .with_context(|| format!("read ops-file line {line_num}"))?
+    };
+    if read == 0 {
+        return Ok(None);
+    }
+    if read > limit {
+        anyhow::bail!("ops-file line {line_num} exceeds the {limit}-byte physical-line limit");
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("ops-file line {line_num} is not valid UTF-8: {error}"))
+}
+
+/// Validate the complete source before runtime construction or writes, while
+/// spooling a stable bounded snapshot instead of retaining all argument Values.
+fn validate_ops_file(path: &Path) -> Result<ValidatedOpsFile> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("open ops-file {}", path.display()))?;
+    let metadata_len = file
+        .metadata()
+        .with_context(|| format!("stat ops-file {}", path.display()))?
+        .len();
+    if metadata_len > MAX_OPS_FILE_BYTES {
+        anyhow::bail!(
+            "ops-file {} is {metadata_len} bytes, exceeding the {MAX_OPS_FILE_BYTES}-byte total limit",
+            path.display()
+        );
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut snapshot = tempfile::tempfile().context("create validated ops-file snapshot")?;
+    let mut total = 0_usize;
+    let mut total_bytes = 0_u64;
+    let mut per_verb = BTreeMap::new();
+    let mut line_num = 1_usize;
+    while let Some(raw) = read_bounded_ops_line(&mut reader, line_num)? {
+        total_bytes = total_bytes
+            .checked_add(raw.len() as u64)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("ops-file byte count overflow"))?;
+        if total_bytes > MAX_OPS_FILE_BYTES {
+            anyhow::bail!(
+                "ops-file exceeds the {MAX_OPS_FILE_BYTES}-byte total limit while reading line {line_num}"
+            );
+        }
+        if let Some(op) = parse_ops_file_line(&raw, line_num)? {
+            *per_verb.entry(op.tool).or_insert(0) += 1;
+            snapshot
+                .write_all(raw.trim().as_bytes())
+                .context("write validated ops-file snapshot")?;
+            snapshot
+                .write_all(b"\n")
+                .context("write validated ops-file snapshot newline")?;
+            total += 1;
+        }
+        line_num += 1;
+    }
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot")?;
+    Ok(ValidatedOpsFile {
+        snapshot,
+        total,
+        per_verb,
+    })
+}
+
+fn parse_validated_snapshot<R>(snapshot: &mut R) -> Result<Vec<OpsFileEntry>>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot")?;
+    let mut reader = std::io::BufReader::new(snapshot);
+    let mut ops = Vec::new();
+    let mut line_num = 1_usize;
+    while let Some(raw) = read_bounded_ops_line(&mut reader, line_num)? {
+        if let Some(op) = parse_ops_file_line(&raw, line_num)? {
+            ops.push(op);
+        }
+        line_num += 1;
+    }
+    Ok(ops)
+}
+
+fn validated_tool_names<R>(snapshot: &mut R) -> Result<Vec<String>>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot")?;
+    let mut reader = std::io::BufReader::new(snapshot);
+    let mut tools = Vec::new();
+    let mut line_num = 1_usize;
+    while let Some(raw) = read_bounded_ops_line(&mut reader, line_num)? {
+        if let Some(op) = parse_ops_file_line(&raw, line_num)? {
+            tools.push(op.tool);
+        }
+        line_num += 1;
+    }
+    Ok(tools)
+}
+
+/// Enforce the atomic operation ceiling before the validated snapshot is
+/// parsed into owned JSON values. The second guard in `atomic_apply` remains
+/// defense in depth for callers that bypass this CLI transport seam.
+fn parse_atomic_validated_snapshot<R>(
+    snapshot: &mut R,
+    total: usize,
+    max_ops: usize,
+) -> Result<Vec<OpsFileEntry>>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    if total > max_ops {
+        anyhow::bail!(
+            "--atomic op count {total} exceeds the configured maximum {max_ops}; \
+             split the file or raise --atomic-max-ops"
+        );
+    }
+    parse_validated_snapshot(snapshot)
 }
 
 /// Parse a JSONL ops-file.
@@ -493,71 +733,10 @@ pub(crate) struct OpsFileEntry {
 /// Each line must be a JSON object `{"tool":"verb","args":{...}}`.  `"args"`
 /// is optional and defaults to an empty object.  Any other top-level keys are
 /// silently ignored so the format is forward-compatible.
-pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("open ops-file {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
-
-    let mut ops: Vec<OpsFileEntry> = Vec::new();
-
-    for (line_idx, result) in reader.lines().enumerate() {
-        let line_num = line_idx + 1;
-        let raw = result.with_context(|| format!("read ops-file line {line_num}"))?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Parse as a JSON object.
-        let obj: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-            refusal_error(
-                RefusalReason::ParseError,
-                format!("ops-file line {line_num}: invalid JSON: {e}"),
-            )
-        })?;
-
-        let obj = obj.as_object().ok_or_else(|| {
-            refusal_error(
-                RefusalReason::ParseError,
-                format!(
-                    "ops-file line {line_num}: expected a JSON object \
-                     {{\"tool\":...,\"args\":...}}, got a non-object value"
-                ),
-            )
-        })?;
-
-        // "tool" is required.
-        let tool = obj
-            .get("tool")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                refusal_error(
-                    RefusalReason::ParseError,
-                    format!("ops-file line {line_num}: missing or non-string \"tool\" field"),
-                )
-            })?
-            .to_owned();
-
-        // "args" defaults to an empty object.
-        let args = match obj.get("args") {
-            None => serde_json::Value::Object(serde_json::Map::new()),
-            Some(v) => {
-                if !v.is_object() {
-                    return Err(refusal_error(
-                        RefusalReason::ParseError,
-                        format!(
-                            "ops-file line {line_num}: \"args\" must be a JSON object, got {v}"
-                        ),
-                    ));
-                }
-                v.clone()
-            }
-        };
-
-        ops.push(OpsFileEntry { tool, args });
-    }
-
-    Ok(ops)
+#[cfg(test)]
+pub(crate) fn parse_ops_file(path: &Path) -> Result<Vec<OpsFileEntry>> {
+    let mut validated = validate_ops_file(path)?;
+    parse_validated_snapshot(&mut validated.snapshot)
 }
 
 /// Extract the failed entries of one dispatched chunk as `{op_index, tool,
@@ -565,9 +744,18 @@ pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
 /// without the per-op reason strings is unactionable: a gate rejection, a
 /// schema error, and a transient failure all look identical, and pipelines
 /// that trust the counts alone lose records silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpsFileReportMode {
+    /// Preserve the pre-save-file CLI wire exactly for compatibility.
+    LegacyNoSave,
+    /// Bound durable manifest diagnostics independently from saved rows.
+    BoundedSave,
+}
+
 fn collect_op_failures(
     parsed: &serde_json::Value,
     applied_before: usize,
+    mode: OpsFileReportMode,
 ) -> Vec<serde_json::Value> {
     let Some(results) = parsed["results"].as_array() else {
         return Vec::new();
@@ -579,6 +767,7 @@ fn collect_op_failures(
         .map(|(i, entry)| {
             let error = match &entry["error"] {
                 serde_json::Value::Null => serde_json::Value::from("unknown error"),
+                other if mode == OpsFileReportMode::BoundedSave => bounded_failure_error(other),
                 other => other.clone(),
             };
             let mut failure = serde_json::json!({
@@ -586,107 +775,653 @@ fn collect_op_failures(
                 "tool": entry["tool"].as_str().unwrap_or("?"),
                 "error": error,
             });
-            if let Some(reason) = entry["reason"].as_str().and_then(RefusalReason::from_token) {
-                failure["reason"] = serde_json::json!(reason.as_str());
+            if mode == OpsFileReportMode::BoundedSave {
+                failure["aborted"] =
+                    serde_json::Value::Bool(entry["aborted"].as_bool().unwrap_or(false));
+                if let Some(reason) = entry["reason"].as_str().and_then(RefusalReason::from_token) {
+                    failure["reason"] = serde_json::json!(reason.as_str());
+                }
             }
             failure
         })
         .collect()
 }
 
+fn retain_failure_detail(
+    mode: OpsFileReportMode,
+    failure: serde_json::Value,
+    failures: &mut Vec<serde_json::Value>,
+    omitted: &mut usize,
+) -> bool {
+    if mode == OpsFileReportMode::BoundedSave && failures.len() >= MAX_OPS_FILE_FAILURE_DETAILS {
+        *omitted += 1;
+        false
+    } else {
+        failures.push(failure);
+        true
+    }
+}
+
+fn ops_file_progress_line(
+    mode: OpsFileReportMode,
+    applied: usize,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    aborted: usize,
+) -> String {
+    match mode {
+        OpsFileReportMode::LegacyNoSave => {
+            format!("applied {applied}/{total} (ok={succeeded}, failed={failed})")
+        }
+        OpsFileReportMode::BoundedSave => format!(
+            "applied {applied}/{total} (ok={succeeded}, failed={failed}, aborted={aborted})"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ops_file_summary(
+    mode: OpsFileReportMode,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    aborted: usize,
+    failures: Vec<serde_json::Value>,
+    failure_details_omitted: usize,
+) -> serde_json::Value {
+    let mut summary = match mode {
+        OpsFileReportMode::LegacyNoSave => serde_json::json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+        }),
+        OpsFileReportMode::BoundedSave => serde_json::json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "aborted": aborted,
+        }),
+    };
+    if !failures.is_empty() {
+        summary["failures"] = serde_json::Value::Array(failures);
+    }
+    if mode == OpsFileReportMode::BoundedSave && failure_details_omitted > 0 {
+        summary["failure_details_omitted"] = serde_json::json!(failure_details_omitted);
+    }
+    summary
+}
+
+fn bounded_failure_error(error: &serde_json::Value) -> serde_json::Value {
+    let mut writer = CountingWriter::default();
+    if serde_json::to_writer(&mut writer, error).is_ok()
+        && writer.bytes <= MAX_OPS_FILE_FAILURE_ERROR_BYTES
+    {
+        error.clone()
+    } else {
+        serde_json::Value::String(format!(
+            "error detail omitted: exceeds {MAX_OPS_FILE_FAILURE_ERROR_BYTES}-byte ops-file diagnostic limit"
+        ))
+    }
+}
+
+fn required_summary_count(parsed: &serde_json::Value, field: &str) -> Result<usize> {
+    let value = parsed
+        .pointer(&format!("/summary/{field}"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("dispatch result is missing integer summary.{field}"))?;
+    usize::try_from(value).context("dispatch summary count does not fit usize")
+}
+
+fn classify_ordered_chunk(
+    chunk: &[OpsFileEntry],
+    results: &[serde_json::Value],
+) -> Result<(usize, usize, usize)> {
+    if results.len() != chunk.len() {
+        anyhow::bail!(
+            "ordered chunk result count {} does not match input count {}",
+            results.len(),
+            chunk.len()
+        );
+    }
+    let mut succeeded = 0_usize;
+    let mut failed = 0_usize;
+    let mut aborted = 0_usize;
+    for (index, (op, row)) in chunk.iter().zip(results).enumerate() {
+        let object = row
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} is not a JSON object"))?;
+        let returned_tool = object
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} has no string tool"))?;
+        if returned_tool != op.tool {
+            anyhow::bail!(
+                "dispatch result row {index} tool mismatch: expected {:?}, got {:?}",
+                op.tool,
+                returned_tool
+            );
+        }
+        let ok = object
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} has no boolean ok"))?;
+        let row_aborted = match object.get("aborted") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                anyhow::anyhow!("dispatch result row {index} has non-boolean aborted")
+            })?,
+        };
+        match (ok, row_aborted) {
+            (true, false) => {
+                if !object.contains_key("result") {
+                    anyhow::bail!(
+                        "dispatch result row {index} is successful but has no result field"
+                    );
+                }
+                if object.contains_key("error") {
+                    anyhow::bail!(
+                        "dispatch result row {index} is successful but also has an error field"
+                    );
+                }
+                succeeded += 1;
+            }
+            (false, false) => {
+                if !object.contains_key("error") {
+                    anyhow::bail!("dispatch result row {index} failed but has no error field");
+                }
+                if object.contains_key("result") {
+                    anyhow::bail!("dispatch result row {index} failed but also has a result field");
+                }
+                failed += 1;
+            }
+            (false, true) => {
+                if !object.contains_key("error") {
+                    anyhow::bail!("dispatch result row {index} aborted but has no error field");
+                }
+                if object.contains_key("result") {
+                    anyhow::bail!(
+                        "dispatch result row {index} aborted but also has a result field"
+                    );
+                }
+                aborted += 1;
+            }
+            (true, true) => {
+                anyhow::bail!("dispatch result row {index} cannot be both successful and aborted")
+            }
+        }
+    }
+    Ok((succeeded, failed, aborted))
+}
+
+fn validate_ordered_chunk_envelope(
+    chunk: &[OpsFileEntry],
+    parsed: &serde_json::Value,
+    chunk_number: usize,
+) -> Result<(usize, usize, usize)> {
+    let results = parsed
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("dispatch chunk {chunk_number} returned no results array")
+        })?;
+    let chunk_total = required_summary_count(parsed, "total")?;
+    let chunk_succeeded = required_summary_count(parsed, "succeeded")?;
+    let chunk_failed = required_summary_count(parsed, "failed")?;
+    let chunk_aborted = required_summary_count(parsed, "aborted")?;
+    let (derived_succeeded, derived_failed, derived_aborted) =
+        classify_ordered_chunk(chunk, results)?;
+    if chunk_total != chunk.len()
+        || chunk_succeeded != derived_succeeded
+        || chunk_failed != derived_failed
+        || chunk_aborted != derived_aborted
+    {
+        anyhow::bail!(
+            "dispatch chunk {chunk_number} summary disagrees with ordered rows: expected total {}, summary total {}, derived/summary succeeded {derived_succeeded}/{chunk_succeeded}, failed {derived_failed}/{chunk_failed}, aborted {derived_aborted}/{chunk_aborted}",
+            chunk.len(),
+            chunk_total,
+        );
+    }
+    let status = parsed
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("dispatch chunk {chunk_number} returned no string status")
+        })?;
+    let expected_status = if derived_failed == 0 && derived_aborted == 0 {
+        "success"
+    } else {
+        "partial"
+    };
+    if status != expected_status {
+        anyhow::bail!(
+            "dispatch chunk {chunk_number} status disagrees with ordered rows: expected {expected_status:?}, got {status:?}"
+        );
+    }
+    Ok((chunk_succeeded, chunk_failed, chunk_aborted))
+}
+
+fn should_defer_chunk_entry(current_count: usize, current_bytes: usize, next_bytes: usize) -> bool {
+    current_count > 0
+        && (current_count >= OPS_FILE_CHUNK_SIZE
+            || current_bytes.saturating_add(next_bytes) > OPS_FILE_CHUNK_MAX_BYTES)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.checked_add(buffer.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::FileTooLarge, "JSON byte count overflow")
+        })?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct AbortedOpsFileError {
+    message: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    manifest: serde_json::Value,
+}
+
+impl std::fmt::Display for AbortedOpsFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AbortedOpsFileError {}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_aborted_ops_file_manifest(
+    error: anyhow::Error,
+    save_path: &str,
+    requested_total: usize,
+    confirmed_ops: usize,
+    committed_chunks: &[usize],
+    dispatched_chunk: Option<usize>,
+    summary: serde_json::Value,
+) -> anyhow::Error {
+    let message = format!("{error:#}");
+    let mut manifest = serde_json::json!({
+        "status": "aborted",
+        "path": save_path,
+        "file_published": false,
+        "requested_total": requested_total,
+        "confirmed_ops": confirmed_ops,
+        "unconfirmed_ops": requested_total.saturating_sub(confirmed_ops),
+        "committed_chunks": committed_chunks,
+        "summary": summary,
+        "error": message.clone(),
+    });
+    if let Some(chunk_number) = dispatched_chunk {
+        manifest["dispatched_chunk"] = serde_json::json!(chunk_number);
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&manifest).expect("serialize aborted ops-file manifest")
+    );
+    anyhow::Error::new(AbortedOpsFileError { message, manifest })
+}
+
 /// Apply a parsed ops-file against the given server, printing progress to
-/// stderr and the final summary to stdout.
+/// stderr and either the final summary or a success/aborted save manifest.
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_reader<R: std::io::BufRead>(
+    server: &KhiveMcpServer,
+    reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+) -> Result<serde_json::Value> {
+    apply_ops_file_reader_with_response_transform(
+        server,
+        reader,
+        total,
+        presentation,
+        _output_format,
+        save_file,
+        strict,
+        |_, raw| raw,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_reader_with_response_transform<R, F>(
+    server: &KhiveMcpServer,
+    mut reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    mut response_transform: F,
+) -> Result<serde_json::Value>
+where
+    R: std::io::BufRead,
+    F: FnMut(usize, String) -> String,
+{
+    let report_mode = if save_file.is_some() {
+        OpsFileReportMode::BoundedSave
+    } else {
+        OpsFileReportMode::LegacyNoSave
+    };
+    let mut total_succeeded: usize = 0;
+    let mut total_failed: usize = 0;
+    let mut total_aborted: usize = 0;
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    let mut failure_details_omitted = 0_usize;
+    // Preflight the destination before the first chunk can commit. Rows then
+    // stream to its sibling temp file. Success publishes it atomically; after
+    // dispatch begins, failure drops it and emits a reconciliation manifest.
+    let save_path = save_file.clone();
+    let mut save_sink = save_file
+        .as_deref()
+        .map(|path| khive_mcp::save_sink::JsonlSaveSink::new(Path::new(path), false))
+        .transpose()?;
+    let mut processed = 0_usize;
+    let mut snapshot_line = 1_usize;
+    let mut chunk_idx = 0_usize;
+    let mut eof = false;
+    let mut pending: Option<(OpsFileEntry, usize)> = None;
+    let mut confirmed_ops = 0_usize;
+    let mut committed_chunks = Vec::new();
+    let mut dispatched_chunk = None;
+
+    let execution_result: Result<()> = async {
+        while !eof {
+            let mut chunk = Vec::with_capacity(OPS_FILE_CHUNK_SIZE);
+            let mut chunk_bytes = 0_usize;
+            if let Some((op, bytes)) = pending.take() {
+                chunk_bytes = bytes;
+                chunk.push(op);
+            }
+            while chunk.len() < OPS_FILE_CHUNK_SIZE {
+                let Some(raw) = read_bounded_ops_line(&mut reader, snapshot_line)? else {
+                    eof = true;
+                    break;
+                };
+                let physical_bytes = raw.len().saturating_add(1);
+                if let Some(op) = parse_ops_file_line(&raw, snapshot_line)? {
+                    if should_defer_chunk_entry(chunk.len(), chunk_bytes, physical_bytes) {
+                        pending = Some((op, physical_bytes));
+                        snapshot_line += 1;
+                        break;
+                    }
+                    chunk_bytes = chunk_bytes.saturating_add(physical_bytes);
+                    chunk.push(op);
+                }
+                snapshot_line += 1;
+            }
+            if chunk.is_empty() {
+                break;
+            }
+            let applied_before = processed;
+
+            // Serialize the typed entries directly; avoid a second Value tree that
+            // would clone every base64 argument before producing the request text.
+            let batch_json = serde_json::to_string(&chunk).context("serialize chunk to JSON")?;
+
+            let params = RequestParams {
+                ops: batch_json,
+                presentation: presentation.clone(),
+                presentation_per_op: None,
+                save_to: None,
+                // Inline --save-file writes raw results before format rendering.
+                // Reproduce that lossless shape for the combined bulk save. The
+                // no-save path deliberately preserves its pre-PR behavior, which
+                // did not forward the CLI output-format override to each chunk.
+                format: if save_sink.is_some() {
+                    Some("json".to_string())
+                } else {
+                    None
+                },
+                format_per_op: None,
+                request_id: None,
+            };
+
+            let chunk_number = chunk_idx + 1;
+            dispatched_chunk = Some(chunk_number);
+            let raw = server
+                .dispatch_request_local(params)
+                .await
+                .map_err(|e| anyhow::anyhow!("dispatch chunk {chunk_number}: {e}"))?;
+            let raw = response_transform(chunk_number, raw);
+
+            let mut parsed: serde_json::Value =
+                serde_json::from_str(&raw).context("parse dispatch result")?;
+            annotate_and_emit_refusals(&mut parsed, strict);
+            let (chunk_succeeded, chunk_failed, chunk_aborted) =
+                validate_ordered_chunk_envelope(&chunk, &parsed, chunk_number)?;
+            let chunk_results = parsed["results"]
+                .as_array()
+                .expect("validated ordered results array");
+
+            total_succeeded += chunk_succeeded;
+            total_failed += chunk_failed;
+            total_aborted += chunk_aborted;
+            confirmed_ops += chunk.len();
+            committed_chunks.push(chunk_number);
+            dispatched_chunk = None;
+
+            for failure in collect_op_failures(&parsed, applied_before, report_mode) {
+                let reason = match &failure["error"] {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let op_index = failure["op_index"].clone();
+                let tool = failure["tool"].as_str().unwrap_or("?").to_string();
+                if retain_failure_detail(
+                    report_mode,
+                    failure,
+                    &mut failures,
+                    &mut failure_details_omitted,
+                ) {
+                    eprintln!("op {} ({}) failed: {reason}", op_index, tool,);
+                }
+            }
+
+            if let Some(save_sink) = save_sink.as_mut() {
+                for row in chunk_results {
+                    save_sink.write_row(row)?;
+                }
+            }
+
+            processed += chunk.len();
+            let applied_now = processed;
+            eprintln!(
+                "{}",
+                ops_file_progress_line(
+                    report_mode,
+                    applied_now,
+                    total,
+                    total_succeeded,
+                    total_failed,
+                    total_aborted,
+                )
+            );
+            chunk_idx += 1;
+        }
+        if processed != total {
+            anyhow::bail!(
+                "validated ops-file snapshot changed: expected {total} ops, read {}",
+                processed
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = execution_result {
+        if let Some(path) = save_path
+            .as_deref()
+            .filter(|_| !committed_chunks.is_empty() || dispatched_chunk.is_some())
+        {
+            drop(save_sink.take());
+            let summary = ops_file_summary(
+                report_mode,
+                confirmed_ops,
+                total_succeeded,
+                total_failed,
+                total_aborted,
+                failures,
+                failure_details_omitted,
+            );
+            return Err(emit_aborted_ops_file_manifest(
+                error,
+                path,
+                total,
+                confirmed_ops,
+                &committed_chunks,
+                dispatched_chunk,
+                summary,
+            ));
+        }
+        return Err(error);
+    }
+
+    let summary = ops_file_summary(
+        report_mode,
+        total,
+        total_succeeded,
+        total_failed,
+        total_aborted,
+        failures,
+        failure_details_omitted,
+    );
+    let output = if let Some(save_sink) = save_sink {
+        let manifest = match save_sink.finish(summary.clone()) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let path = save_path
+                    .as_deref()
+                    .expect("save sink exists only when save path exists");
+                return Err(emit_aborted_ops_file_manifest(
+                    error,
+                    path,
+                    total,
+                    confirmed_ops,
+                    &committed_chunks,
+                    None,
+                    summary,
+                ));
+            }
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&manifest).expect("serialize save manifest")
+        );
+        manifest
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).expect("serialize summary")
+        );
+        summary
+    };
+    if total > 0 && total_succeeded == 0 {
+        match report_mode {
+            OpsFileReportMode::LegacyNoSave => anyhow::bail!(
+                "every op failed: {total_failed} op(s) failed out of {total}, 0 succeeded (see printed summary above)"
+            ),
+            OpsFileReportMode::BoundedSave => anyhow::bail!(
+                "every op failed: {total_failed} failed, {total_aborted} aborted out of {total}, 0 succeeded (see printed output above)"
+            ),
+        }
+    }
+    if strict {
+        match report_mode {
+            OpsFileReportMode::LegacyNoSave if total_failed > 0 => anyhow::bail!(
+                "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
+            ),
+            OpsFileReportMode::BoundedSave if total_failed > 0 || total_aborted > 0 => {
+                anyhow::bail!(
+                    "--strict: {total_failed} op(s) failed, {total_aborted} op(s) aborted out of {total} (see printed output above)"
+                )
+            }
+            _ => {}
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
 async fn apply_ops_file(
     server: &KhiveMcpServer,
     ops: Vec<OpsFileEntry>,
     presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
     strict: bool,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     let total = ops.len();
-    let mut total_succeeded: usize = 0;
-    let mut total_failed: usize = 0;
-    let mut failures: Vec<serde_json::Value> = Vec::new();
-
-    for (chunk_idx, chunk) in ops.chunks(OPS_FILE_CHUNK_SIZE).enumerate() {
-        let applied_before = (chunk_idx * OPS_FILE_CHUNK_SIZE).min(total);
-
-        // Build the JSON array string for this chunk.
-        let batch_arr: Vec<serde_json::Value> = chunk
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "tool": e.tool,
-                    "args": e.args,
-                })
-            })
-            .collect();
-        let batch_json = serde_json::to_string(&batch_arr).context("serialize chunk to JSON")?;
-
-        let params = RequestParams {
-            ops: batch_json,
-            presentation: presentation.clone(),
-            presentation_per_op: None,
-            save_to: None,
-            format: None,
-            format_per_op: None,
-            request_id: None,
-        };
-
-        let raw = server
-            .dispatch_request_local(params)
-            .await
-            .map_err(|e| anyhow::anyhow!("dispatch chunk {}: {}", chunk_idx + 1, e))?;
-
-        let mut parsed: serde_json::Value =
-            serde_json::from_str(&raw).context("parse dispatch result")?;
-        annotate_and_emit_refusals(&mut parsed, strict);
-
-        let chunk_succeeded = parsed["summary"]["succeeded"].as_u64().unwrap_or(0) as usize;
-        let chunk_failed = parsed["summary"]["failed"].as_u64().unwrap_or(0) as usize;
-
-        total_succeeded += chunk_succeeded;
-        total_failed += chunk_failed;
-
-        for failure in collect_op_failures(&parsed, applied_before) {
-            let reason = match &failure["error"] {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            eprintln!(
-                "op {} ({}) failed: {reason}",
-                failure["op_index"],
-                failure["tool"].as_str().unwrap_or("?"),
-            );
-            failures.push(failure);
-        }
-
-        let applied_now = applied_before + chunk.len();
-        eprintln!("applied {applied_now}/{total} (ok={total_succeeded}, failed={total_failed})");
+    let mut encoded = Vec::new();
+    for op in ops {
+        serde_json::to_writer(
+            &mut encoded,
+            &serde_json::json!({"tool": op.tool, "args": op.args}),
+        )
+        .context("serialize test ops-file entry")?;
+        encoded.push(b'\n');
     }
+    apply_ops_file_reader(
+        server,
+        std::io::Cursor::new(encoded),
+        total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+    )
+    .await
+}
 
-    let mut summary = serde_json::json!({
-        "total": total,
-        "succeeded": total_succeeded,
-        "failed": total_failed,
-    });
-    if !failures.is_empty() {
-        summary["failures"] = serde_json::Value::Array(failures);
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_with_response_transform<F>(
+    server: &KhiveMcpServer,
+    ops: Vec<OpsFileEntry>,
+    presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    response_transform: F,
+) -> Result<serde_json::Value>
+where
+    F: FnMut(usize, String) -> String,
+{
+    let total = ops.len();
+    let mut encoded = Vec::new();
+    for op in ops {
+        serde_json::to_writer(
+            &mut encoded,
+            &serde_json::json!({"tool": op.tool, "args": op.args}),
+        )
+        .context("serialize test ops-file entry")?;
+        encoded.push(b'\n');
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&summary).expect("serialize summary")
-    );
-    if total > 0 && total_succeeded == 0 {
-        anyhow::bail!(
-            "every op failed: {total_failed} op(s) failed out of {total}, 0 succeeded (see printed summary above)"
-        );
-    }
-    if strict && total_failed > 0 {
-        anyhow::bail!(
-            "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
-        );
-    }
-    Ok(())
+    apply_ops_file_reader_with_response_transform(
+        server,
+        std::io::Cursor::new(encoded),
+        total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+        response_transform,
+    )
+    .await
 }
 
 /// Execute the DSL expression, routing through the warm daemon when available.
@@ -831,6 +1566,8 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 path,
                 cfg,
                 args.presentation,
+                args.output_format,
+                args.save_file,
                 args.dry_run,
                 db_context,
                 args.atomic,
@@ -1040,7 +1777,7 @@ fn preflight_inline_ops(ops: &str) -> Result<()> {
 fn preflight_exec_mode(mode: &ExecMode) -> Result<()> {
     match mode {
         ExecMode::Inline(ops) => preflight_inline_ops(ops),
-        ExecMode::OpsFile(path) => match parse_ops_file(path) {
+        ExecMode::OpsFile(path) => match validate_ops_file(path) {
             Ok(_) => Ok(()),
             Err(error) => {
                 if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
@@ -1073,9 +1810,11 @@ fn report_mode_refusal(
             let tools = request.ops.into_iter().map(|op| op.tool).collect();
             (tools, chain)
         }),
-        ExecMode::OpsFile(path) => parse_ops_file(path)
-            .ok()
-            .map(|ops| (ops.into_iter().map(|op| op.tool).collect::<Vec<_>>(), false)),
+        ExecMode::OpsFile(path) => validate_ops_file(path).ok().and_then(|mut validated| {
+            validated_tool_names(&mut validated.snapshot)
+                .ok()
+                .map(|tools| (tools, false))
+        }),
     };
     match parsed {
         Some((tools, chain)) if !tools.is_empty() => {
@@ -1404,15 +2143,19 @@ async fn run_exec_ops_file(
     path: PathBuf,
     cfg: RuntimeConfig,
     presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
     dry_run: bool,
     db_context: ExecDbContext,
     atomic: bool,
     atomic_max_ops: Option<usize>,
     strict: bool,
 ) -> Result<()> {
-    // Parse the whole file first — fail before any writes if any line is bad.
-    let ops = match parse_ops_file(&path) {
-        Ok(ops) => ops,
+    // Validate the whole file and spool a stable bounded snapshot before any
+    // runtime construction or writes. Non-atomic dispatch retains only one
+    // request chunk plus ordered result envelopes in memory.
+    let mut validated = match validate_ops_file(&path) {
+        Ok(validated) => validated,
         Err(error) => {
             if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
                 return Err(report_unscoped_refusal(
@@ -1424,20 +2167,15 @@ async fn run_exec_ops_file(
         }
     };
 
-    if ops.is_empty() {
+    if validated.total == 0 {
         anyhow::bail!("ops-file is empty (no non-blank lines): {}", path.display());
     }
 
     if dry_run {
-        // Count ops per verb and report — no dispatch.
-        let mut per_verb: BTreeMap<String, usize> = BTreeMap::new();
-        for op in &ops {
-            *per_verb.entry(op.tool.clone()).or_insert(0) += 1;
-        }
         let summary = serde_json::json!({
             "dry_run": true,
-            "total": ops.len(),
-            "per_verb": per_verb,
+            "total": validated.total,
+            "per_verb": validated.per_verb,
         });
         println!(
             "{}",
@@ -1452,8 +2190,9 @@ async fn run_exec_ops_file(
     // `[[backends]]` multi-backend topology exactly like the daemon-fallback
     // path — see `build_local_fallback_server`.
     if let Err(error) = enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs) {
+        let tools = validated_tool_names(&mut validated.snapshot)?;
         return Err(report_tools_refusal(
-            ops.iter().map(|op| op.tool.clone()).collect(),
+            tools,
             false,
             RefusalReason::AnonymousActor,
             error.to_string(),
@@ -1477,6 +2216,15 @@ async fn run_exec_ops_file(
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
+        let ops =
+            parse_atomic_validated_snapshot(&mut validated.snapshot, validated.total, max_ops)?;
+        // Preflight a deterministic save target before the atomic unit can
+        // commit. An execution error drops the unfinished sibling temp file
+        // and leaves any prior complete destination untouched.
+        let save_sink = save_file
+            .as_deref()
+            .map(|path| khive_mcp::save_sink::JsonlSaveSink::new(Path::new(path), false))
+            .transpose()?;
         let mut envelope =
             match crate::atomic_apply::execute_atomic_ops_file(ops, cfg, &khive_cfg, max_ops).await
             {
@@ -1497,10 +2245,13 @@ async fn run_exec_ops_file(
                 }
             };
         annotate_and_emit_refusals(&mut envelope, strict);
-        println!(
-            "{}",
+        let output = if let Some(save_sink) = save_sink {
+            let manifest = save_sink.write_envelope(&envelope)?;
+            serde_json::to_string(&manifest).expect("serialize atomic save manifest")
+        } else {
             serde_json::to_string_pretty(&envelope).expect("serialize atomic envelope")
-        );
+        };
+        println!("{output}");
         return Ok(());
     }
 
@@ -1511,7 +2262,21 @@ async fn run_exec_ops_file(
         db_context.anchor.as_deref(),
     )?;
 
-    apply_ops_file(&server, ops, presentation, strict).await
+    validated
+        .snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot for dispatch")?;
+    apply_ops_file_reader(
+        &server,
+        std::io::BufReader::new(validated.snapshot),
+        validated.total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -1533,7 +2298,7 @@ mod tests {
             ],
             "summary": {"total": 3, "succeeded": 1, "failed": 2}
         });
-        let failures = collect_op_failures(&parsed, 500);
+        let failures = collect_op_failures(&parsed, 500, OpsFileReportMode::LegacyNoSave);
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0]["op_index"], 501);
         assert_eq!(failures[0]["tool"], "create");
@@ -1557,7 +2322,7 @@ mod tests {
             ],
             "summary": {"total": 1, "succeeded": 0, "failed": 1}
         });
-        let failures = collect_op_failures(&parsed, 0);
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
         assert_eq!(
             failures[0]["error"],
             serde_json::json!({"kind": "invalid_input", "message": "content rejected"}),
@@ -1578,9 +2343,14 @@ mod tests {
             ],
             "summary": {"total": 1, "succeeded": 0, "failed": 1}
         });
-        let failures = collect_op_failures(&parsed, 9);
+        let failures = collect_op_failures(&parsed, 9, OpsFileReportMode::BoundedSave);
         assert_eq!(failures[0]["reason"], "verb-refused");
         assert_eq!(failures[0]["op_index"], 9);
+        let legacy = collect_op_failures(&parsed, 9, OpsFileReportMode::LegacyNoSave);
+        assert!(
+            legacy[0].get("reason").is_none(),
+            "legacy no-save summary must retain its pre-reason wire shape"
+        );
     }
 
     #[test]
@@ -1589,8 +2359,156 @@ mod tests {
             "results": [{"ok": true, "tool": "stats", "result": {}}],
             "summary": {"total": 1, "succeeded": 1, "failed": 0}
         });
-        assert!(collect_op_failures(&all_ok, 0).is_empty());
-        assert!(collect_op_failures(&serde_json::json!({}), 0).is_empty());
+        assert!(collect_op_failures(&all_ok, 0, OpsFileReportMode::LegacyNoSave).is_empty());
+        assert!(
+            collect_op_failures(&serde_json::json!({}), 0, OpsFileReportMode::LegacyNoSave)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_save_reporting_matches_exact_legacy_golden() {
+        let parsed = serde_json::json!({
+            "results": [
+                {"ok": true, "tool": "create", "result": {}},
+                {"ok": false, "tool": "search", "error": "boom"},
+            ],
+        });
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].get("aborted").is_none());
+        let summary = ops_file_summary(OpsFileReportMode::LegacyNoSave, 2, 1, 1, 0, failures, 0);
+
+        assert_eq!(
+            ops_file_progress_line(OpsFileReportMode::LegacyNoSave, 2, 2, 1, 1, 0),
+            "applied 2/2 (ok=1, failed=1)"
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&summary).unwrap(),
+            concat!(
+                "{\n",
+                "  \"failed\": 1,\n",
+                "  \"failures\": [\n",
+                "    {\n",
+                "      \"error\": \"boom\",\n",
+                "      \"op_index\": 1,\n",
+                "      \"tool\": \"search\"\n",
+                "    }\n",
+                "  ],\n",
+                "  \"succeeded\": 1,\n",
+                "  \"total\": 2\n",
+                "}"
+            )
+        );
+        assert!(summary.get("aborted").is_none());
+        assert!(summary.get("failure_details_omitted").is_none());
+    }
+
+    #[test]
+    fn no_save_reporting_retains_more_than_one_thousand_failures() {
+        let parsed = serde_json::json!({
+            "results": (0..=MAX_OPS_FILE_FAILURE_DETAILS)
+                .map(|index| serde_json::json!({
+                    "ok": false,
+                    "tool": "create",
+                    "error": format!("failure-{index}"),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let mut retained = Vec::new();
+        let mut omitted = 0;
+        for failure in collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave) {
+            assert!(retain_failure_detail(
+                OpsFileReportMode::LegacyNoSave,
+                failure,
+                &mut retained,
+                &mut omitted,
+            ));
+        }
+        assert_eq!(retained.len(), MAX_OPS_FILE_FAILURE_DETAILS + 1);
+        assert_eq!(omitted, 0);
+
+        let summary = ops_file_summary(
+            OpsFileReportMode::LegacyNoSave,
+            retained.len(),
+            0,
+            retained.len(),
+            0,
+            retained,
+            omitted,
+        );
+        assert_eq!(
+            summary["failures"].as_array().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_DETAILS + 1
+        );
+        assert!(summary.get("failure_details_omitted").is_none());
+    }
+
+    #[test]
+    fn no_save_reporting_retains_error_larger_than_four_kib() {
+        let large_error = "x".repeat(MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1);
+        let parsed = serde_json::json!({
+            "results": [{"ok": false, "tool": "create", "error": large_error}],
+        });
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
+        assert_eq!(
+            failures[0]["error"].as_str().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1
+        );
+        assert_eq!(failures[0]["error"], large_error);
+    }
+
+    #[test]
+    fn save_reporting_bounds_failure_count_and_error_detail() {
+        let large_error = "x".repeat(MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1);
+        let parsed = serde_json::json!({
+            "results": (0..=MAX_OPS_FILE_FAILURE_DETAILS)
+                .map(|index| serde_json::json!({
+                    "ok": false,
+                    "tool": "create",
+                    "aborted": index % 2 == 0,
+                    "error": if index == 0 {
+                        serde_json::Value::String(large_error.clone())
+                    } else {
+                        serde_json::Value::String(format!("failure-{index}"))
+                    },
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let mut retained = Vec::new();
+        let mut omitted = 0;
+        for failure in collect_op_failures(&parsed, 0, OpsFileReportMode::BoundedSave) {
+            retain_failure_detail(
+                OpsFileReportMode::BoundedSave,
+                failure,
+                &mut retained,
+                &mut omitted,
+            );
+        }
+        assert_eq!(retained.len(), MAX_OPS_FILE_FAILURE_DETAILS);
+        assert_eq!(omitted, 1);
+        assert_eq!(retained[0]["aborted"], true);
+        assert_eq!(
+            retained[0]["error"],
+            format!(
+                "error detail omitted: exceeds {MAX_OPS_FILE_FAILURE_ERROR_BYTES}-byte ops-file diagnostic limit"
+            )
+        );
+
+        let summary = ops_file_summary(
+            OpsFileReportMode::BoundedSave,
+            MAX_OPS_FILE_FAILURE_DETAILS + 1,
+            0,
+            MAX_OPS_FILE_FAILURE_DETAILS + 1,
+            0,
+            retained,
+            omitted,
+        );
+        assert_eq!(summary["failure_details_omitted"], 1);
+        assert_eq!(
+            summary["failures"].as_array().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_DETAILS
+        );
     }
 
     // ── HOME isolation for local-fallback tests ───────────────────────────────
@@ -2950,7 +3868,7 @@ id = "lambda:fallback"
         f.write_all(b"{\"tool\":\"stats\",\"args\":{}}\n").unwrap();
         f.write_all(b"\n").unwrap(); // blank
         f.write_all(b"{\"tool\":\"stats\",\"args\":{}}\n").unwrap();
-        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        let ops = parse_ops_file(f.path()).unwrap();
         assert_eq!(ops.len(), 2);
     }
 
@@ -2960,7 +3878,7 @@ id = "lambda:fallback"
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"{\"tool\":\"stats\",\"args\":{}}\n").unwrap();
         f.write_all(b"not-json\n").unwrap(); // line 2 is bad
-        let err = parse_ops_file(&f.path().to_path_buf()).unwrap_err();
+        let err = parse_ops_file(f.path()).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ExecRefusal>().map(|error| error.reason),
             Some(RefusalReason::ParseError)
@@ -2977,13 +3895,203 @@ id = "lambda:fallback"
         use std::io::Write as _;
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"{\"notool\":\"x\",\"args\":{}}\n").unwrap();
-        let err = parse_ops_file(&f.path().to_path_buf()).unwrap_err();
+        let err = parse_ops_file(f.path()).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ExecRefusal>().map(|error| error.reason),
             Some(RefusalReason::ParseError)
         );
         let msg = format!("{err:#}");
         assert!(msg.contains("line 1"), "should report line number: {msg}");
+    }
+
+    #[test]
+    fn atomic_op_limit_is_checked_before_snapshot_materialization() {
+        struct PanicOnSnapshotAccess;
+
+        impl std::io::Read for PanicOnSnapshotAccess {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("over-limit atomic snapshot must not be read or materialized")
+            }
+        }
+
+        impl std::io::Seek for PanicOnSnapshotAccess {
+            fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+                panic!("over-limit atomic snapshot must not be rewound or materialized")
+            }
+        }
+
+        let error = parse_atomic_validated_snapshot(&mut PanicOnSnapshotAccess, 2, 1)
+            .expect_err("the validated op count exceeds the configured atomic ceiling");
+        assert!(
+            error
+                .to_string()
+                .contains("op count 2 exceeds the configured maximum 1"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn ops_file_physical_line_and_total_caps_are_fail_closed() {
+        let mut within = std::io::Cursor::new(b"1234567\n".to_vec());
+        assert_eq!(
+            read_bounded_ops_line_with_limit(&mut within, 1, 8)
+                .unwrap()
+                .unwrap(),
+            "1234567"
+        );
+        let mut over = std::io::Cursor::new(b"12345678\n".to_vec());
+        let error = read_bounded_ops_line_with_limit(&mut over, 7, 8).unwrap_err();
+        assert!(error.to_string().contains("line 7"));
+
+        let oversized = NamedTempFile::new().unwrap();
+        oversized.as_file().set_len(MAX_OPS_FILE_BYTES + 1).unwrap();
+        let error = validate_ops_file(oversized.path()).unwrap_err();
+        assert!(error.to_string().contains("total limit"));
+    }
+
+    #[test]
+    fn large_ops_file_payload_is_read_from_path_not_argv() {
+        let mut file = NamedTempFile::new().unwrap();
+        let payload = "x".repeat(1024 * 1024);
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({"tool":"stats","args":{"payload":payload}}),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let path = file.path().to_str().unwrap();
+        let args = ExecArgs::try_parse_from(["exec", "--ops-file", path]).unwrap();
+        assert!(args.ops.is_none());
+        assert_eq!(args.ops_file.as_deref(), Some(file.path()));
+        assert_eq!(validate_ops_file(file.path()).unwrap().total, 1);
+    }
+
+    #[test]
+    fn chunk_byte_boundary_is_exact() {
+        assert!(!should_defer_chunk_entry(
+            0,
+            0,
+            OPS_FILE_CHUNK_MAX_BYTES + 1
+        ));
+        assert!(!should_defer_chunk_entry(
+            1,
+            OPS_FILE_CHUNK_MAX_BYTES - 1,
+            1
+        ));
+        assert!(should_defer_chunk_entry(1, OPS_FILE_CHUNK_MAX_BYTES, 1));
+    }
+
+    #[test]
+    fn ordered_chunk_contract_rejects_tool_or_summary_drift() {
+        let ops = vec![
+            OpsFileEntry {
+                tool: "first".to_string(),
+                args: serde_json::json!({}),
+            },
+            OpsFileEntry {
+                tool: "second".to_string(),
+                args: serde_json::json!({}),
+            },
+            OpsFileEntry {
+                tool: "third".to_string(),
+                args: serde_json::json!({}),
+            },
+        ];
+        let valid = serde_json::json!({
+            "results": [
+                {"ok":true,"tool":"first","result":{}},
+                {"ok":false,"tool":"second","error":"no"},
+                {"ok":false,"tool":"third","aborted":true,"error":"not attempted"}
+            ],
+            "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
+            "status":"partial"
+        });
+        assert_eq!(
+            validate_ordered_chunk_envelope(&ops, &valid, 1).unwrap(),
+            (1, 1, 1)
+        );
+
+        let mut wrong_tool = valid.clone();
+        wrong_tool["results"][1]["tool"] = serde_json::json!("third");
+        assert!(validate_ordered_chunk_envelope(&ops, &wrong_tool, 1).is_err());
+
+        let mut lying_summary = valid;
+        lying_summary["summary"]["succeeded"] = serde_json::json!(2);
+        lying_summary["summary"]["failed"] = serde_json::json!(0);
+        assert!(validate_ordered_chunk_envelope(&ops, &lying_summary, 1).is_err());
+
+        let mut missing_result = serde_json::json!({
+            "results": [
+                {"ok":true,"tool":"first"},
+                {"ok":false,"tool":"second","error":"no"},
+                {"ok":false,"tool":"third","aborted":true,"error":"not attempted"}
+            ],
+            "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
+            "status":"partial"
+        });
+        assert!(validate_ordered_chunk_envelope(&ops, &missing_result, 1).is_err());
+        missing_result["results"][0]["result"] = serde_json::Value::Null;
+        missing_result["results"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("error");
+        assert!(validate_ordered_chunk_envelope(&ops, &missing_result, 1).is_err());
+
+        let mut contradictory = serde_json::json!({
+            "results": [
+                {"ok":true,"tool":"first","result":null,"error":null},
+                {"ok":false,"tool":"second","error":"no","result":null},
+                {"ok":false,"tool":"third","aborted":true,"error":"not attempted"}
+            ],
+            "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
+            "status":"partial"
+        });
+        assert!(validate_ordered_chunk_envelope(&ops, &contradictory, 1).is_err());
+        contradictory["results"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("error");
+        assert!(validate_ordered_chunk_envelope(&ops, &contradictory, 1).is_err());
+    }
+
+    fn status_contract_fixture(status: &str) -> (Vec<OpsFileEntry>, serde_json::Value) {
+        (
+            vec![
+                OpsFileEntry {
+                    tool: "first".to_string(),
+                    args: serde_json::json!({}),
+                },
+                OpsFileEntry {
+                    tool: "second".to_string(),
+                    args: serde_json::json!({}),
+                },
+            ],
+            serde_json::json!({
+                "results": [
+                    {"ok":true,"tool":"first","result":{}},
+                    {"ok":false,"tool":"second","error":"no"}
+                ],
+                "summary":{"total":2,"succeeded":1,"failed":1,"aborted":0},
+                "status":status
+            }),
+        )
+    }
+
+    #[test]
+    fn ordered_chunk_truthful_status_passes() {
+        let (ops, envelope) = status_contract_fixture("partial");
+        assert_eq!(
+            validate_ordered_chunk_envelope(&ops, &envelope, 1).unwrap(),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn ordered_chunk_contradicting_status_is_rejected() {
+        let (ops, envelope) = status_contract_fixture("success");
+        let error = validate_ordered_chunk_envelope(&ops, &envelope, 1).unwrap_err();
+        assert!(error.to_string().contains("status"));
     }
 
     // ── integration: bulk apply (isolated DB) ─────────────────────────────────
@@ -3004,9 +4112,17 @@ id = "lambda:fallback"
             f.write_all(line.as_bytes()).unwrap();
         }
 
-        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        let ops = parse_ops_file(f.path()).unwrap();
         assert_eq!(ops.len(), 3);
-        apply_ops_file(&server, ops, None, false).await.unwrap();
+        let summary = apply_ops_file(&server, ops, None, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(summary["total"], 3);
+        assert_eq!(summary["succeeded"], 3);
+        assert_eq!(summary["failed"], 0);
+        assert!(summary.get("aborted").is_none());
+        assert!(summary.get("failure_details_omitted").is_none());
+        assert!(summary.get("results").is_none());
 
         // Verify all 3 entities are present.
         let params = RequestParams {
@@ -3029,6 +4145,294 @@ id = "lambda:fallback"
         assert_eq!(
             count, 3,
             "all 3 entities should be present after apply\nraw: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_save_retains_order_rows_checksum_and_json_override() {
+        use sha2::Digest as _;
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path)
+            .with_default_output_format(khive_runtime::OutputFormat::Table);
+        let ops: Vec<OpsFileEntry> = (0..=OPS_FILE_CHUNK_SIZE)
+            .map(|index| OpsFileEntry {
+                tool: "create".to_string(),
+                args: serde_json::json!({
+                    "kind": "concept",
+                    "name": format!("ordered-{index:03}"),
+                }),
+            })
+            .collect();
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("ordered.jsonl");
+
+        let manifest = apply_ops_file(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let manifest_keys: std::collections::BTreeSet<_> = manifest
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            manifest_keys,
+            std::collections::BTreeSet::from([
+                "checksum",
+                "path",
+                "per_column_null_counts",
+                "rows",
+                "schema_fingerprint",
+                "summary",
+            ]),
+            "the successful manifest shape must remain unchanged"
+        );
+        assert_eq!(manifest["rows"], OPS_FILE_CHUNK_SIZE + 1);
+        assert_eq!(manifest["summary"]["total"], OPS_FILE_CHUNK_SIZE + 1);
+        assert_eq!(manifest["summary"]["succeeded"], OPS_FILE_CHUNK_SIZE + 1);
+        assert_eq!(manifest["summary"]["failed"], 0);
+        assert_eq!(manifest["summary"]["aborted"], 0);
+
+        let bytes = std::fs::read(&save_path).unwrap();
+        let checksum = format!("{:x}", sha2::Sha256::digest(&bytes));
+        assert_eq!(manifest["checksum"], checksum);
+        let rows: Vec<serde_json::Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), OPS_FILE_CHUNK_SIZE + 1);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["tool"], "create");
+            assert_eq!(row["ok"], true);
+            assert_eq!(row["result"]["name"], format!("ordered-{index:03}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_later_chunk_emits_aborted_manifest_for_prior_commits() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let ops: Vec<OpsFileEntry> = (0..=OPS_FILE_CHUNK_SIZE)
+            .map(|index| OpsFileEntry {
+                tool: "create".to_string(),
+                args: serde_json::json!({
+                    "kind": "concept",
+                    "name": format!("abort-manifest-{index:03}"),
+                }),
+            })
+            .collect();
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("must-not-publish.jsonl");
+
+        let error = apply_ops_file_with_response_transform(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+            |chunk_number, raw| {
+                if chunk_number == 2 {
+                    "{malformed-response".to_string()
+                } else {
+                    raw
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let aborted = error
+            .downcast_ref::<AbortedOpsFileError>()
+            .expect("post-dispatch failure must carry its emitted manifest");
+        assert_eq!(aborted.manifest["status"], "aborted");
+        assert_eq!(aborted.manifest["committed_chunks"], serde_json::json!([1]));
+        assert_eq!(aborted.manifest["dispatched_chunk"], 2);
+        assert_eq!(aborted.manifest["file_published"], false);
+        assert_eq!(
+            aborted.manifest["summary"]["succeeded"],
+            OPS_FILE_CHUNK_SIZE
+        );
+        assert_eq!(aborted.manifest["summary"]["total"], OPS_FILE_CHUNK_SIZE);
+        assert_eq!(aborted.manifest["summary"]["aborted"], 0);
+        assert_eq!(aborted.manifest["unconfirmed_ops"], 1);
+        assert!(
+            !save_path.exists(),
+            "an aborted run must not publish partial JSONL"
+        );
+
+        // `committed_chunks: [1]` is a claim about DURABLE STATE, and the manifest
+        // asserting it is assembled locally. Every assertion above would still pass
+        // if chunk 1's writes had been rolled back or never reached storage, because
+        // the bookkeeping would simply agree with itself. Read it back through the
+        // same server so the reconciliation record is checked against the database
+        // it describes. The requested limit stays under the entity list cap, so the
+        // handler returns a bare array rather than a clamp-wrapped object.
+        let params = RequestParams {
+            ops: r#"list(kind="concept", limit=200)"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+        let raw = server.dispatch_request_local(params).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let rows = response["results"][0]["result"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "read-back must return a bare array under the entity list cap; got {}",
+                    response["results"][0]["result"]
+                )
+            });
+        // A row that carries no string name is an unreadable instrument, not an
+        // absent entity, so it panics here rather than being dropped silently.
+        let mut observed: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row["name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("read-back row carries no string name: {row}"))
+                    .to_owned()
+            })
+            .collect();
+        // An empty or unparsed read-back is an instrument failure, not a pass.
+        assert!(
+            !observed.is_empty(),
+            "read-back yielded no rows; result was {}",
+            response["results"][0]["result"]
+        );
+        observed.sort_unstable();
+
+        // Enumerate the two legal outcomes instead of bounding a count. Entity
+        // names carry no uniqueness constraint and the upsert is keyed by UUID,
+        // so any count of distinct names is a proxy: a duplicate row satisfies
+        // it while the property it stands for is broken. Comparing the whole
+        // sorted list pins which rows are present, and how many of each.
+        let committed: Vec<String> = (0..OPS_FILE_CHUNK_SIZE)
+            .map(|index| format!("abort-manifest-{index:03}"))
+            .collect();
+        // Chunk 2 was dispatched without a verified response, so its single op
+        // may or may not have landed. The manifest reports it as unconfirmed
+        // rather than committed precisely because both outcomes are legal here.
+        let mut with_unconfirmed = committed.clone();
+        with_unconfirmed.push(format!("abort-manifest-{OPS_FILE_CHUNK_SIZE:03}"));
+
+        assert!(
+            observed == committed || observed == with_unconfirmed,
+            "manifest reports chunk 1 committed and chunk 2 unconfirmed, so the database must \
+             hold exactly the {OPS_FILE_CHUNK_SIZE} confirmed rows, optionally plus the one \
+             unconfirmed row; found {} rows: {observed:?}",
+            observed.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_save_directory_is_rejected_before_any_op_side_effect() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let output_dir = tempfile::tempdir().unwrap();
+        let ops = vec![OpsFileEntry {
+            tool: "create".to_string(),
+            args: serde_json::json!({"kind":"concept","name":"must-not-exist"}),
+        }];
+
+        let error = apply_ops_file(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(output_dir.path().to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("absent or an existing regular file"));
+
+        let params = RequestParams {
+            ops: r#"list(kind="concept")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+        let raw = server.dispatch_request_local(params).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["results"][0]["result"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn save_manifest_preserves_partial_summary_and_strict_writes_rows() {
+        fn partial_ops(success_name: &str) -> Vec<OpsFileEntry> {
+            vec![
+                OpsFileEntry {
+                    tool: "create".to_string(),
+                    args: serde_json::json!({"kind":"concept","name":success_name}),
+                },
+                OpsFileEntry {
+                    tool: "search".to_string(),
+                    args: serde_json::json!({"kind":"not_a_real_kind","query":"x"}),
+                },
+            ]
+        }
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("partial.jsonl");
+        let manifest = apply_ops_file(
+            &server,
+            partial_ops("partial-ok"),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest["rows"], 2);
+        assert_eq!(manifest["summary"]["succeeded"], 1);
+        assert_eq!(manifest["summary"]["failed"], 1);
+        assert_eq!(manifest["summary"]["aborted"], 0);
+
+        let strict_path = output_dir.path().join("strict-partial.jsonl");
+        let error = apply_ops_file(
+            &server,
+            partial_ops("strict-partial-ok"),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(strict_path.to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("--strict"));
+        assert_eq!(
+            std::fs::read_to_string(strict_path)
+                .unwrap()
+                .lines()
+                .count(),
+            2
         );
     }
 
@@ -3172,10 +4576,10 @@ id = "lambda:fallback"
         )
         .unwrap();
 
-        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        let ops = parse_ops_file(f.path()).unwrap();
         assert_eq!(ops.len(), 2);
 
-        let err = apply_ops_file(&server, ops, None, true)
+        let err = apply_ops_file(&server, ops, None, None, None, true)
             .await
             .expect_err("strict mode must surface the per-op failure as a process error");
         assert!(format!("{err}").contains("1 op(s) failed"));
@@ -3194,8 +4598,8 @@ id = "lambda:fallback"
         )
         .unwrap();
 
-        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
-        let err = apply_ops_file(&server, ops, None, false)
+        let ops = parse_ops_file(f.path()).unwrap();
+        let err = apply_ops_file(&server, ops, None, None, None, false)
             .await
             .expect_err("a fully-failed ops-file must exit non-zero even without --strict");
         assert!(format!("{err}").contains("every op failed"));
@@ -3347,6 +4751,8 @@ id = "lambda:fallback"
         run_exec_ops_file(
             path.clone(),
             cfg.clone(),
+            None,
+            None,
             None,
             true,
             ExecDbContext::default(),
@@ -4815,6 +6221,181 @@ backend = "sessions"
         assert!(
             x_resp["results"][0]["result"]["deleted_at"].is_null(),
             "x must NOT be deleted — the whole unit must have rolled back: {x_resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_rollback_preserves_zero_exit_with_or_without_save_and_strict() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let (x_id, y_id) = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="AtomicExitX"), create(kind="concept", name="AtomicExitY")]"#,
+            )
+            .await;
+            (
+                response["results"][0]["result"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                response["results"][1]["result"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+        let mut file = NamedTempFile::new().unwrap();
+        for op in [
+            serde_json::json!({"tool":"delete","args":{"id":x_id.clone(),"hard":true}}),
+            serde_json::json!({
+                "tool":"link",
+                "args":{"source_id":y_id,"target_id":x_id,"relation":"extends"}
+            }),
+        ] {
+            serde_json::to_writer(&mut file, &op).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let db_context = || ExecDbContext {
+            raw: Some(db_path.clone()),
+            anchor: Some(PathBuf::from(&db_path)),
+            config: Some(config_path.clone()),
+        };
+
+        run_exec_ops_file(
+            file.path().to_path_buf(),
+            atomic_cfg(&db_path),
+            None,
+            None,
+            None,
+            false,
+            db_context(),
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("atomic rollback remains a successful CLI seam even with --strict");
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("atomic-rollback.jsonl");
+        run_exec_ops_file(
+            file.path().to_path_buf(),
+            atomic_cfg(&db_path),
+            None,
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            false,
+            db_context(),
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("atomic save preserves the existing rollback exit contract");
+        assert_eq!(
+            std::fs::read_to_string(save_path).unwrap().lines().count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_invalid_save_directory_is_rejected_before_commit() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let mut file = NamedTempFile::new().unwrap();
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "tool":"create",
+                "args":{"kind":"concept","name":"atomic-must-not-exist"}
+            }),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let save_directory = tempfile::tempdir().unwrap();
+        let error = run_exec_ops_file(
+            file.path().to_path_buf(),
+            atomic_cfg(&db_path),
+            None,
+            Some("json".to_string()),
+            Some(save_directory.path().to_string_lossy().into_owned()),
+            false,
+            ExecDbContext {
+                raw: Some(db_path.clone()),
+                anchor: Some(PathBuf::from(&db_path)),
+                config: Some(config_path),
+            },
+            true,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("absent or an existing regular file"));
+
+        let server = isolated_server(&db_path);
+        let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
+        assert_eq!(response["results"][0]["result"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn atomic_preflighted_save_keeps_prior_file_on_execution_error() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let mut file = NamedTempFile::new().unwrap();
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "tool":"create",
+                "args":{"kind":"concept","name":"atomic-rejected"}
+            }),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("prior.jsonl");
+        std::fs::write(&save_path, b"prior-complete-output\n").unwrap();
+
+        let error = run_exec_ops_file(
+            file.path().to_path_buf(),
+            atomic_cfg(&db_path),
+            None,
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            false,
+            ExecDbContext {
+                raw: Some(db_path),
+                anchor: Some(PathBuf::from(db_file.path())),
+                config: Some(config_path),
+            },
+            true,
+            Some(1),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--atomic rejected"),
+            "unexpected atomic execution error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&save_path).unwrap(),
+            b"prior-complete-output\n"
         );
     }
 

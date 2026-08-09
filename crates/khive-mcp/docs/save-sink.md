@@ -8,7 +8,7 @@ and returns a self-describing manifest instead of the raw results.
 
 A sink that self-reports null counts catches bulk export corruption (e.g.
 `content=null` across 10,000 rows) in one second rather than after a
-downstream agent fleet has graded blind. `write_and_manifest` computes
+downstream agent fleet has graded blind. `JsonlSaveSink`/`write_and_manifest` compute
 `per_column_null_counts`, a `schema_fingerprint` (SHA-256 of sorted field
 names), and a file `checksum` so a caller can sanity-check a large export
 without re-reading it. The manifest also carries the dispatch `summary` and,
@@ -21,6 +21,11 @@ defined in `crates/kkernel/docs/usage.md`. For `kkernel exec --strict
 `strict-op-failure` reasons before this sink serializes anything, so the
 manifest projection, canonical JSONL rows, and checksum all describe the same
 classified data.
+
+`write_and_manifest` derives that projection from its in-memory envelope.
+Incremental callers pass their already-bounded `summary.failures` projection to
+`finish`; the sink promotes exactly those entries to top-level `failures`
+without re-buffering or expanding the streamed rows.
 
 ## Why the destination policy matters
 
@@ -45,10 +50,43 @@ path inside this root. The trusted operator CLI path
 check entirely and may write anywhere the operator points it — that is
 documented CLI behavior, not an oversight.
 
-## Why `write_atomic` uses a random temp file
+## Why the incremental sink uses a random temp file
 
-`write_atomic` uses `tempfile::Builder::tempfile_in` instead of a
+`JsonlSaveSink` uses `tempfile::Builder::tempfile_in` instead of a
 predictable `path.with_extension("tmp")` sibling. This closes the
 symlink-following / predictable-path race the previous sibling-tmp approach
 was open to, and the temp file always lives in the same directory as the
 destination so the final rename is same-filesystem and atomic.
+
+Rows are serialized directly to that sibling while the SHA-256 checksum,
+schema field set, and null counts are accumulated. `finish` flushes and
+renames only after every row is present; dropping an unfinished sink removes
+the temp and leaves any prior destination intact. `write_and_manifest` uses
+this same incremental implementation, so large exports do not require a
+second complete JSONL buffer in memory.
+
+For `kkernel exec --ops-file --save-file`, destination validation and temp-file
+creation happen before the first operation chunk is dispatched. Each validated
+ordered result row is then written before the next chunk begins. Only final-file
+publication is atomic: non-atomic database effects commit incrementally by
+chunk, and file I/O plus database commits cannot form one cross-resource
+transaction.
+
+Once dispatch begins, every termination prints a reconciliation manifest.
+Success retains the ordinary manifest shape and publishes the complete JSONL.
+A post-dispatch error that prevents the manifest from being finalized instead
+prints `status="aborted"`,
+`file_published=false`, the confirmed `committed_chunks`, and, when its response
+could not be verified, `dispatched_chunk`. Its `summary` covers confirmed rows
+only; `unconfirmed_ops` accounts for the remainder without falsely classifying
+them as aborted. That dispatched chunk can have database effects even though it
+is not listed as confirmed. The incomplete temp file is discarded and any old
+destination remains unchanged.
+
+Policy exits are different and keep the ordinary manifest. When the batch runs
+to completion and the manifest is published, a non-zero exit from `--strict` or
+from an all-failed file happens after that publication. The outcome of every op
+is known in those cases, so the ordinary manifest is the correct reconciliation
+record and no aborted manifest is emitted. Callers reconcile
+the manifest before applying the per-op/idempotency contracts to a retry;
+atomic ops-files retain their separate all-or-nothing database contract.
