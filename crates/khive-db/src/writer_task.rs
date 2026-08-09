@@ -39,8 +39,11 @@
 //! rows are exempt by design and never emit that row.
 
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use khive_storage::error::{StorageError, WriterTaskRequestState};
@@ -58,6 +61,117 @@ use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
 /// nested-transaction rule and return `SQLITE_ERROR: cannot start a
 /// transaction within a transaction` (ADR-067 lines 271-276).
 type WriteOp<R> = Box<dyn FnOnce(&Connection) -> Result<R, StorageError> + Send>;
+
+/// Latest completed writer-task span for one database, decomposed at the
+/// boundaries an operator can act on (#1849). A zero value means that phase
+/// did not run (top-level/early-failure request) or completed below the
+/// microsecond clock resolution; `total_micros` retains the full span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterStageObservation {
+    pub queue_wait_micros: u64,
+    pub transaction_acquire_micros: u64,
+    pub body_micros: u64,
+    pub commit_micros: u64,
+    pub total_micros: u64,
+    pub queue_depth_at_entry: u64,
+    pub observed_at_unix_ms: u64,
+}
+
+static WRITER_STAGE_OBSERVATIONS: OnceLock<
+    Mutex<HashMap<Option<PathBuf>, WriterStageObservation>>,
+> = OnceLock::new();
+
+fn writer_stage_observations() -> &'static Mutex<HashMap<Option<PathBuf>, WriterStageObservation>> {
+    WRITER_STAGE_OBSERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn writer_db_key_from_path(path: Option<&Path>) -> Option<PathBuf> {
+    path.map(Path::to_path_buf)
+}
+
+fn writer_db_key(pool: &ConnectionPool) -> Option<PathBuf> {
+    writer_db_key_from_path(pool.canonical_path())
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn observed_at_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Pure in-memory read of the most recently completed writer-task span for
+/// this exact backend. It acquires no SQLite connection and performs no I/O.
+pub fn last_writer_stage_observation(pool: &ConnectionPool) -> Option<WriterStageObservation> {
+    writer_stage_observations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&writer_db_key(pool))
+        .cloned()
+}
+
+struct WriteTelemetry {
+    backend_key: Option<PathBuf>,
+    db: String,
+    submitted_at: Instant,
+    queue_depth_at_entry: usize,
+    slow_write_threshold: Option<Duration>,
+}
+
+impl WriteTelemetry {
+    fn new(
+        backend_key: Option<PathBuf>,
+        db: String,
+        queue_depth_at_entry: usize,
+        slow_write_threshold: Option<Duration>,
+    ) -> Self {
+        Self {
+            backend_key,
+            db,
+            submitted_at: Instant::now(),
+            queue_depth_at_entry,
+            slow_write_threshold,
+        }
+    }
+
+    fn queue_wait(&self) -> Duration {
+        self.submitted_at.elapsed()
+    }
+
+    fn finish(
+        self,
+        queue_wait: Duration,
+        transaction_acquire: Duration,
+        body: Duration,
+        commit: Duration,
+    ) {
+        let total = self.submitted_at.elapsed();
+        let observation = WriterStageObservation {
+            queue_wait_micros: duration_micros(queue_wait),
+            transaction_acquire_micros: duration_micros(transaction_acquire),
+            body_micros: duration_micros(body),
+            commit_micros: duration_micros(commit),
+            total_micros: duration_micros(total),
+            queue_depth_at_entry: self.queue_depth_at_entry as u64,
+            observed_at_unix_ms: observed_at_unix_ms(),
+        };
+        writer_stage_observations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.backend_key, observation.clone());
+
+        if self
+            .slow_write_threshold
+            .is_some_and(|threshold| total >= threshold)
+        {
+            crate::timeout_sink::emit_slow_write(&self.db, &observation);
+        }
+    }
+}
 
 /// One write request awaiting execution by the writer task.
 ///
@@ -77,6 +191,7 @@ pub struct WriteRequest<R: Send + 'static> {
     op: WriteOp<R>,
     reply: oneshot::Sender<Result<R, StorageError>>,
     top_level: bool,
+    telemetry: WriteTelemetry,
 }
 
 mod sealed {
@@ -89,12 +204,22 @@ mod sealed {
             self: Box<Self>,
             conn: &rusqlite::Connection,
             tx_span: Option<khive_storage::tx_registry::TxHandle>,
+            queue_wait: std::time::Duration,
+            transaction_acquire: std::time::Duration,
         ) -> Option<khive_storage::error::WriterTaskRequestState>;
 
         fn execute_and_reply_top_level_reporting_terminal(
             self: Box<Self>,
             conn: &rusqlite::Connection,
+            queue_wait: std::time::Duration,
         ) -> Option<khive_storage::error::WriterTaskRequestState>;
+
+        fn reply_error_after_begin(
+            self: Box<Self>,
+            err: khive_storage::error::StorageError,
+            queue_wait: std::time::Duration,
+            transaction_acquire: std::time::Duration,
+        );
     }
 }
 
@@ -146,6 +271,10 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
     /// [`Self::execute_and_reply_top_level`] (no transaction wrap) instead
     /// of [`Self::execute_and_reply`] (wrapped in `BEGIN IMMEDIATE`).
     fn is_top_level(&self) -> bool;
+
+    /// Time from the caller constructing this request (before bounded-channel
+    /// admission) until the writer task dequeued it.
+    fn queue_wait(&self) -> Duration;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,46 +318,92 @@ pub(crate) fn execute_wrapped_transaction<R, F>(
 where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
-    match catch_unwind(AssertUnwindSafe(|| operation(conn))) {
-        Ok(Ok(value)) => match conn.execute_batch("COMMIT") {
-            Ok(()) if conn.is_autocommit() => (Ok(value), None),
-            Ok(()) => {
-                tracing::error!(
+    let profiled = execute_wrapped_transaction_profiled(conn, commit_operation, operation);
+    (profiled.result, profiled.terminal_state)
+}
+
+struct ProfiledWrappedTransaction<R> {
+    result: Result<R, StorageError>,
+    terminal_state: Option<WriterTaskRequestState>,
+    body: Duration,
+    commit: Duration,
+}
+
+fn execute_wrapped_transaction_profiled<R, F>(
+    conn: &Connection,
+    commit_operation: &'static str,
+    operation: F,
+) -> ProfiledWrappedTransaction<R>
+where
+    F: FnOnce(&Connection) -> Result<R, StorageError>,
+{
+    let body_started = Instant::now();
+    let operation_outcome = catch_unwind(AssertUnwindSafe(|| operation(conn)));
+    let body = body_started.elapsed();
+
+    match operation_outcome {
+        Ok(Ok(value)) => {
+            let commit_started = Instant::now();
+            let commit_outcome = conn.execute_batch("COMMIT");
+            let commit = commit_started.elapsed();
+            match commit_outcome {
+                Ok(()) if conn.is_autocommit() => ProfiledWrappedTransaction {
+                    result: Ok(value),
+                    terminal_state: None,
+                    body,
+                    commit,
+                },
+                Ok(()) => {
+                    tracing::error!(
                     "writer transaction: COMMIT returned success but the connection is still in \
                      a transaction; request side effects are unknown"
                 );
-                let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                (
-                    Err(writer_task_terminated(request_state)),
-                    Some(request_state),
-                )
-            }
-            Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
-                RollbackDisposition::RolledBack => (
-                    Err(StorageError::Pool {
-                        operation: commit_operation.into(),
-                        message: commit_error.to_string(),
-                    }),
-                    None,
-                ),
-                RollbackDisposition::SideEffectsUnknown => {
                     let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                    (
-                        Err(writer_task_terminated(request_state)),
-                        Some(request_state),
-                    )
+                    ProfiledWrappedTransaction {
+                        result: Err(writer_task_terminated(request_state)),
+                        terminal_state: Some(request_state),
+                        body,
+                        commit,
+                    }
                 }
-            },
-        },
+                Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
+                    RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
+                        result: Err(StorageError::Pool {
+                            operation: commit_operation.into(),
+                            message: commit_error.to_string(),
+                        }),
+                        terminal_state: None,
+                        body,
+                        commit,
+                    },
+                    RollbackDisposition::SideEffectsUnknown => {
+                        let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                        ProfiledWrappedTransaction {
+                            result: Err(writer_task_terminated(request_state)),
+                            terminal_state: Some(request_state),
+                            body,
+                            commit,
+                        }
+                    }
+                },
+            }
+        }
         Ok(Err(operation_error)) => {
             match rollback_after_failure(conn, "request operation failure") {
-                RollbackDisposition::RolledBack => (Err(operation_error), None),
+                RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
+                    result: Err(operation_error),
+                    terminal_state: None,
+                    body,
+                    commit: Duration::ZERO,
+                },
                 RollbackDisposition::SideEffectsUnknown => {
                     let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                    (
-                        Err(writer_task_terminated(request_state)),
-                        Some(request_state),
-                    )
+                    ProfiledWrappedTransaction {
+                        result: Err(writer_task_terminated(request_state)),
+                        terminal_state: Some(request_state),
+                        body,
+                        commit: Duration::ZERO,
+                    }
                 }
             }
         }
@@ -239,10 +414,12 @@ where
                     WriterTaskRequestState::SideEffectsUnknown
                 }
             };
-            (
-                Err(writer_task_terminated(request_state)),
-                Some(request_state),
-            )
+            ProfiledWrappedTransaction {
+                result: Err(writer_task_terminated(request_state)),
+                terminal_state: Some(request_state),
+                body,
+                commit: Duration::ZERO,
+            }
         }
     }
 }
@@ -252,29 +429,52 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         self: Box<Self>,
         conn: &Connection,
         tx_span: Option<khive_storage::tx_registry::TxHandle>,
+        queue_wait: Duration,
+        transaction_acquire: Duration,
     ) -> Option<WriterTaskRequestState> {
         // Keep the typed reply sender outside the unwind boundary. Calling
         // `(self.op)(conn)` directly would drop `self.reply` while unwinding,
         // leaving the active caller with only an untyped RecvError.
-        let WriteRequest { op, reply, .. } = *self;
-        let (result, terminal_state) = execute_wrapped_transaction(conn, "writer_task_commit", op);
+        let WriteRequest {
+            op,
+            reply,
+            telemetry,
+            ..
+        } = *self;
+        let profiled = execute_wrapped_transaction_profiled(conn, "writer_task_commit", op);
         // The reply wake can make the caller immediately observe the
         // committed/error result. Deregister the transaction span first so
         // tx_registry continues to mean "currently open SQL transaction",
         // never "a transaction whose caller has already resumed" (#1790).
         drop(tx_span);
+        telemetry.finish(
+            queue_wait,
+            transaction_acquire,
+            profiled.body,
+            profiled.commit,
+        );
         // The receiver may already be gone (caller dropped its future) —
         // that is not this task's problem to report.
-        let _ = reply.send(result);
-        terminal_state
+        let _ = reply.send(profiled.result);
+        profiled.terminal_state
     }
 
     fn execute_and_reply_top_level_reporting_terminal(
         self: Box<Self>,
         conn: &Connection,
+        queue_wait: Duration,
     ) -> Option<WriterTaskRequestState> {
-        let WriteRequest { op, reply, .. } = *self;
-        match catch_unwind(AssertUnwindSafe(|| op(conn))) {
+        let WriteRequest {
+            op,
+            reply,
+            telemetry,
+            ..
+        } = *self;
+        let body_started = Instant::now();
+        let outcome = catch_unwind(AssertUnwindSafe(|| op(conn)));
+        let body = body_started.elapsed();
+        telemetry.finish(queue_wait, Duration::ZERO, body, Duration::ZERO);
+        match outcome {
             Ok(outcome) if conn.is_autocommit() => {
                 // No COMMIT/ROLLBACK here: this request explicitly did not
                 // open a transaction, so there is nothing to close.
@@ -300,25 +500,55 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             }
         }
     }
+
+    fn reply_error_after_begin(
+        self: Box<Self>,
+        err: StorageError,
+        queue_wait: Duration,
+        transaction_acquire: Duration,
+    ) {
+        let WriteRequest {
+            reply, telemetry, ..
+        } = *self;
+        telemetry.finish(
+            queue_wait,
+            transaction_acquire,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let _ = reply.send(Err(err));
+    }
 }
 
 impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
     fn execute_and_reply(self: Box<Self>, conn: &Connection) {
-        let _ = sealed::Sealed::execute_and_reply_reporting_terminal(self, conn, None);
+        let queue_wait = self.queue_wait();
+        let _ = sealed::Sealed::execute_and_reply_reporting_terminal(
+            self,
+            conn,
+            None,
+            queue_wait,
+            Duration::ZERO,
+        );
     }
 
     fn execute_and_reply_top_level(self: Box<Self>, conn: &Connection) {
-        let _ = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(self, conn);
+        let queue_wait = self.queue_wait();
+        let _ =
+            sealed::Sealed::execute_and_reply_top_level_reporting_terminal(self, conn, queue_wait);
     }
 
     fn reply_error(self: Box<Self>, err: StorageError) {
-        // Same "receiver may already be gone" reasoning as above — send and
-        // move on regardless of outcome.
-        let _ = self.reply.send(Err(err));
+        let queue_wait = self.queue_wait();
+        sealed::Sealed::reply_error_after_begin(self, err, queue_wait, Duration::ZERO);
     }
 
     fn is_top_level(&self) -> bool {
         self.top_level
+    }
+
+    fn queue_wait(&self) -> Duration {
+        self.telemetry.queue_wait()
     }
 }
 
@@ -332,6 +562,9 @@ fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError
 #[derive(Clone, Debug)]
 pub struct WriterTaskHandle {
     tx: mpsc::Sender<Box<dyn AnyWriteRequest + Send>>,
+    /// Exact canonical backend identity used by the in-memory stage registry.
+    /// Kept separate from `db`, whose lossy display form is logging-only.
+    backend_key: Option<PathBuf>,
     /// This handle's pool's writer-timeout sink identity (`timeout_sink::db_label`),
     /// captured at spawn so `send_with_timeout`'s `WriteQueueFull` path can
     /// report a `queue_saturation` sink row (ADR-136 D1 gate 6a) without
@@ -404,10 +637,17 @@ impl WriterTaskHandle {
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let telemetry = WriteTelemetry::new(
+            self.backend_key.clone(),
+            self.db.clone(),
+            self.queue_depth(),
+            self.slow_write_threshold,
+        );
         let request = WriteRequest {
             op: Box::new(op),
             reply: reply_tx,
             top_level,
+            telemetry,
         };
 
         self.tx
@@ -429,13 +669,10 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue(op).await?;
-        let result = reply_rx
+        reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
-        self.finish_latency_observation(observation);
-        result
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Like [`Self::send`], but bounds the wait for the bounded channel to
@@ -461,7 +698,6 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let observation = self.begin_latency_observation();
         let reply_rx = match tokio::time::timeout(timeout, self.enqueue(op)).await {
             Ok(Ok(reply_rx)) => reply_rx,
             Ok(Err(e)) => return Err(e),
@@ -472,11 +708,9 @@ impl WriterTaskHandle {
             }
         };
 
-        let result = reply_rx
+        reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
-        self.finish_latency_observation(observation);
-        result
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Like [`Self::send`], but bounds the enqueue-capacity wait with this
@@ -513,13 +747,10 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue_inner(op, true).await?;
-        let result = reply_rx
+        reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
-        self.finish_latency_observation(observation);
-        result
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Like [`Self::send_top_level`], but bounds the enqueue-capacity wait
@@ -531,7 +762,6 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let observation = self.begin_latency_observation();
         let reply_rx =
             match tokio::time::timeout(self.enqueue_timeout, self.enqueue_inner(op, true)).await {
                 Ok(Ok(reply_rx)) => reply_rx,
@@ -543,42 +773,9 @@ impl WriterTaskHandle {
                 }
             };
 
-        let result = reply_rx
+        reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
-        self.finish_latency_observation(observation);
-        result
-    }
-
-    /// Snapshot the start instant and the queue backlog for one send, if
-    /// slow-write observation is enabled for this handle. The depth is
-    /// captured at send START — after completion the drain loop has already
-    /// consumed this request, so a completion-time read would systematically
-    /// understate the backlog the caller actually waited behind.
-    fn begin_latency_observation(&self) -> Option<(std::time::Instant, usize)> {
-        self.slow_write_threshold
-            .map(|_| (std::time::Instant::now(), self.queue_depth()))
-    }
-
-    /// Emit a `slow_write` sink row if this send's whole span met the
-    /// threshold. Called on the reply path — success or typed error alike,
-    /// since the caller experienced the latency either way. Never called
-    /// when the reply channel itself is severed (writer-task terminated),
-    /// which is reported through its own retirement row.
-    fn finish_latency_observation(&self, observation: Option<(std::time::Instant, usize)>) {
-        let (Some(threshold), Some((start, depth_at_entry))) =
-            (self.slow_write_threshold, observation)
-        else {
-            return;
-        };
-        let elapsed = start.elapsed();
-        if elapsed >= threshold {
-            crate::timeout_sink::emit_slow_write(
-                &self.db,
-                elapsed.as_millis() as u64,
-                depth_at_entry,
-            );
-        }
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Current write-queue backlog depth: requests enqueued but not yet
@@ -628,6 +825,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     let conn = pool.open_standalone_writer_untracked()?;
     let acquisition_counters = pool.writer_acquisition_counters();
     let origin = pool.origin();
+    let backend_key = writer_db_key(pool);
     let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
     let join = tokio::spawn(run_writer_task(
@@ -643,6 +841,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     pool.set_writer_task_join(join);
     Ok(WriterTaskHandle {
         tx,
+        backend_key,
         db,
         slow_write_threshold: crate::timeout_sink::slow_write_threshold(),
         enqueue_timeout: std::time::Duration::from_millis(
@@ -686,6 +885,10 @@ async fn run_writer_task(
     acquisition_counters: Arc<WriterAcquisitionCounters>,
 ) {
     while let Some(request) = rx.recv().await {
+        // The bounded-channel wait ends at this exact dequeue boundary.
+        // Sampling inside the blocking closure would misattribute a saturated
+        // Tokio blocking pool to writer-queue contention (#1849).
+        let queue_wait = request.queue_wait();
         let origin = origin.clone();
         let acquisition_counters = Arc::clone(&acquisition_counters);
         let outcome = tokio::task::spawn_blocking(move || {
@@ -712,19 +915,26 @@ async fn run_writer_task(
                 // this same drain loop, so the single-writer guarantee
                 // holds; only the transaction wrap is skipped.
                 acquisition_counters.record_writer_task_acquisition();
-                sealed::Sealed::execute_and_reply_top_level_reporting_terminal(request, &conn)
+                sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
+                    request, &conn, queue_wait,
+                )
             } else {
                 let tx_span = khive_storage::tx_registry::register_scoped(
                     Some("writer_task_tx".to_string()),
                     origin,
                 );
-                match conn.execute_batch("BEGIN IMMEDIATE") {
+                let transaction_acquire_started = Instant::now();
+                let begin_outcome = conn.execute_batch("BEGIN IMMEDIATE");
+                let transaction_acquire = transaction_acquire_started.elapsed();
+                match begin_outcome {
                     Ok(()) => {
                         acquisition_counters.record_writer_task_acquisition();
                         sealed::Sealed::execute_and_reply_reporting_terminal(
                             request,
                             &conn,
                             Some(tx_span),
+                            queue_wait,
+                            transaction_acquire,
                         )
                     }
                     Err(e) => {
@@ -743,10 +953,15 @@ async fn run_writer_task(
                         // it before waking the caller for the same reply-side
                         // lifecycle guarantee as successful requests (#1790).
                         drop(tx_span);
-                        request.reply_error(StorageError::Pool {
-                            operation: "writer_task_begin".into(),
-                            message: e.to_string(),
-                        });
+                        sealed::Sealed::reply_error_after_begin(
+                            request,
+                            StorageError::Pool {
+                                operation: "writer_task_begin".into(),
+                                message: e.to_string(),
+                            },
+                            queue_wait,
+                            transaction_acquire,
+                        );
                         None
                     }
                 }
@@ -1173,6 +1388,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -1212,6 +1428,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -1537,11 +1754,13 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: true,
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
             Box::new(request),
             &conn,
+            Duration::ZERO,
         );
         assert_eq!(
             terminal_state,
@@ -1580,10 +1799,16 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
-        let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn, None);
+        let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
+            Box::new(request),
+            &conn,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
@@ -1712,10 +1937,16 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
-        let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn, None);
+        let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
+            Box::new(request),
+            &conn,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
@@ -1751,10 +1982,16 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
-        let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn, None);
+        let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
+            Box::new(request),
+            &conn,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
@@ -2016,6 +2253,7 @@ mod tests {
 
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -2042,6 +2280,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -2066,5 +2305,134 @@ mod tests {
 
         assert_writer_task_terminal_state(result, WriterTaskRequestState::SideEffectsUnknown);
         assert!(!request_ran.load(Ordering::SeqCst));
+    }
+
+    /// #1849: writer telemetry uses the same canonical OS-path identity as
+    /// the pool. A lossy display string would merge these distinct backends.
+    #[cfg(unix)]
+    #[test]
+    fn writer_stage_backend_key_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_a =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/khive-writer-\x80.db".to_vec()));
+        let path_b =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/khive-writer-\x81.db".to_vec()));
+        assert_eq!(
+            path_a.display().to_string(),
+            path_b.display().to_string(),
+            "fixture must reproduce the lossy display-label collision"
+        );
+        assert_ne!(
+            writer_db_key_from_path(Some(&path_a)),
+            writer_db_key_from_path(Some(&path_b)),
+            "backend keys must retain the canonical path's exact OS bytes"
+        );
+    }
+
+    /// #1849: a deliberately slow transaction body with no queue backlog or
+    /// lock contention must be attributed to `body`, not flattened into one
+    /// opaque send-to-reply duration.
+    #[tokio::test]
+    async fn writer_stage_sample_attributes_a_slow_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_stage_sample.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).unwrap();
+
+        handle
+            .send(|conn| {
+                std::thread::sleep(Duration::from_millis(60));
+                conn.execute("INSERT INTO t VALUES (1)", [])
+                    .map_err(|error| StorageError::Pool {
+                        operation: "writer_stage_sample".into(),
+                        message: error.to_string(),
+                    })
+            })
+            .await
+            .unwrap();
+
+        let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
+        assert!(
+            sample.body_micros >= 50_000,
+            "the synthetic delay must land in the body stage: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.queue_wait_micros,
+            "fast queueing must not receive the body's delay: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.transaction_acquire_micros,
+            "an uncontended BEGIN must not receive the body's delay: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.commit_micros,
+            "a fast COMMIT must not receive the body's delay: {sample:?}"
+        );
+        assert!(sample.observed_at_unix_ms > 0);
+    }
+
+    /// #1849: bounded-channel queue wait ends when the drain loop receives
+    /// the request. Saturation in Tokio's blocking pool happens after that
+    /// boundary and must remain in `total - named_stages`, never be relabeled
+    /// as writer-queue contention.
+    #[test]
+    fn writer_queue_wait_excludes_blocking_pool_scheduling_delay() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("writer_dequeue_boundary.db");
+            let pool = file_pool(&path);
+            let handle = spawn(&pool, 8).unwrap();
+
+            let (blocker_started_tx, blocker_started_rx) = std_mpsc::sync_channel(0);
+            let (release_blocker_tx, release_blocker_rx) = std_mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).unwrap();
+                release_blocker_rx.recv().unwrap();
+            });
+            blocker_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("sole blocking worker must be occupied");
+
+            let reply = handle
+                .enqueue(|_conn| Ok::<(), StorageError>(()))
+                .await
+                .expect("request must enter the bounded writer channel");
+            let dequeue_deadline = Instant::now() + Duration::from_secs(1);
+            while handle.queue_depth() != 0 {
+                assert!(
+                    Instant::now() < dequeue_deadline,
+                    "writer drain never dequeued the accepted request"
+                );
+                tokio::task::yield_now().await;
+            }
+
+            let scheduling_delay = Duration::from_millis(150);
+            tokio::time::sleep(scheduling_delay).await;
+            release_blocker_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            reply.await.unwrap().unwrap();
+
+            let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
+            assert!(
+                sample.total_micros.saturating_sub(sample.queue_wait_micros) >= 100_000,
+                "the post-dequeue blocking-pool delay must not inflate queue_wait: {sample:?}"
+            );
+        });
     }
 }
