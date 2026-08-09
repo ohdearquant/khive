@@ -19,7 +19,7 @@ provider, while a visual descriptor must be derived from decoded raster bytes un
 explicit preprocessing contract. A separate application database would duplicate Khive's
 asset, provenance, namespace, and retrieval responsibilities.
 
-The Qwen3.5 pooled descriptor available in `lattice-embed` 0.7.1 is experimental retrieval
+The Qwen3.5 pooled descriptor available in `lattice-embed` 0.8.0 is experimental retrieval
 machinery. Its own contract says retrieval quality for the base instruct checkpoint is
 unvalidated. This pack must expose that machinery honestly, not market it as a state-of-the-art
 style model or collapse compatibility, cohesion, diversity, and uncertainty into one score.
@@ -63,7 +63,7 @@ Every response contains a nested `descriptor` object with this closed v1 shape:
   "model_name": "qwen3.5-vlm-pooled-visual",
   "model_revision": "<operator-pinned revision>",
   "checkpoint_sha256": "<64 lowercase hexadecimal characters>",
-  "inference": { "provider": "lattice-embed", "version": "0.7.1" },
+  "inference": { "provider": "lattice-embed", "version": "0.8.0" },
   "preprocessing": {
     "revision": "moodboard-qwen35-srgb-pad32-max448-v1",
     "max_side": 448,
@@ -105,7 +105,7 @@ paths, non-file entries, and more than 100000 files fail closed. This deliberate
 directory identity includes auxiliary files and layout as well as all configuration, tokenizer,
 manifest, and resolved weight bytes. A one-byte mutation cannot reuse the vector table identity.
 
-The workspace pins `lattice-embed = "=0.7.1"`, matching `inference.version`; a lock refresh cannot
+The workspace pins `lattice-embed = "=0.8.0"`, matching `inference.version`; a lock refresh cannot
 silently run different inference code under the same descriptor fingerprint.
 
 Each response also carries top-level `experimental: true`. Exact result shapes are:
@@ -302,19 +302,23 @@ expected attestation checked against the always-computed canonical digest.
 
 The load-free characterization successfully derived a 2048-dimensional descriptor from a local
 Qwen3.5-2B fixture. Inference did not start for that fixture because it contains a single
-`model.safetensors`, while `lattice-embed` 0.7.1 requires `model.safetensors.index.json` or
+`model.safetensors`, while `lattice-embed` 0.8.0 requires `model.safetensors.index.json` or
 `quantize_index.json` to locate `model.visual.*` tensors. This remains an explicit upstream
 checkpoint-layout friction ([lattice#1381](https://github.com/ohdearquant/lattice/issues/1381)).
 
-The same ignored inference gate passed against an indexed local Qwen3.5-0.8B fixture: the output
-was 1024-dimensional, checkpoint digest
-`a2b07345b0196bc20273bba8486097fd94dcab1c284d96bdc0306f03ae8f567e`, and descriptor fingerprint
-`e8e331665e5e81145844a61eb2b955163a094189345e2c9b7267dfe7f6ec4e85`. Cold load plus post-load
-verification took 382,975 ms; three serialized inferences took 169,434 ms, 145,887 ms, and 93,878
-ms. The output L2 norm was `1.000000047`, repeat maximum coordinate delta `0`, and trailing-prompt
-maximum coordinate delta `0`. These timings characterize that local debug-build run, not a
-performance commitment. The result characterizes the pinned implementation and confirms the
-prompt-independent causal layout; it is not retrieval-quality evidence.
+The same ignored inference gate passed against the materialized indexed Qwen3.5-0.8B fixture with
+operator revision
+`hf-Qwen-Qwen3.5-0.8B-2fc06364715b967f1860aea9cf38778875588b17`. Published
+`lattice-embed` 0.8.0 produced a 1024-dimensional descriptor with checkpoint digest
+`6dca0d0e661696b36985cbce8f89e1a91377822065de31eac94e90a0e45d43d3`, fingerprint
+`40be6f4ae97057e6a0b5c0d011db6e5a37f26c46b787df3e19ddf0fec1e3c9b9`, and model key
+`moodboard_40be6f4ae97057e6a0b5c0d011db6e5a37f26c46b787df3e19ddf0fec1e3c9b9_1024`.
+Load-free descriptor discovery took 98,776 ms. Cold load plus post-load verification took 297,380
+ms; three serialized inferences took 279,305 ms, 294,164 ms, and 170,919 ms. The output L2 norm was
+`1.000000047`, repeat maximum coordinate delta `0`, and trailing-prompt maximum coordinate delta
+`0`. These timings characterize that contended local debug-build run, not a performance
+commitment. The result characterizes the pinned implementation and confirms the prompt-independent
+causal layout; it is not retrieval-quality evidence.
 
 ## References
 

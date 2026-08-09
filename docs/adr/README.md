@@ -155,6 +155,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-146](ADR-146-forge-native-kg-review.md)                            | Forge-Native KG Review — Pull Requests and Issues as the Collaboration Surface                             |
 | [ADR-147](ADR-147-repo-showcase-bundle.md)                              | Repository Showcase Bundle — `khive.repo.v1`                                                               |
 | [ADR-148](ADR-148-moodboard-visual-retrieval-pack.md)                   | Moodboard Visual Retrieval Pack                                                                            |
+| [ADR-150](ADR-150-single-write-owner-topology.md)                       | Single Write-Owner Topology — Bounded Admission, Read Admission, and Query Interruption                    |
 
 <!-- END GENERATED ADR CATALOG -->
 

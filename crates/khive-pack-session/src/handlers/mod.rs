@@ -40,6 +40,7 @@ pub(crate) struct SessionRecord {
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionSummary {
     pub id: String,
+    pub full_id: String,
     pub kind: &'static str,
     pub title: Option<String>,
     pub provider: Option<String>,
@@ -124,6 +125,7 @@ pub(crate) fn to_session_summary(note: &Note) -> SessionSummary {
     let properties = note.properties.clone().unwrap_or_else(|| json!({}));
     SessionSummary {
         id: note.id.as_hyphenated().to_string(),
+        full_id: note.id.as_hyphenated().to_string(),
         kind: SESSION_KIND,
         title: note.name.clone(),
         provider: string_property(&properties, "provider"),

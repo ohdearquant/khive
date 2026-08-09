@@ -351,7 +351,8 @@ This ADR is accepted with the following binding conditions:
 
 ADR-096 Fork 1 makes the daemon request frame the authority for request identity. Therefore
 `config_id` is an engine-coherence key only: it covers the pack set, database target, primary and
-additional embedding models, backend topology/routing, and construction-baked outbound policy.
+additional embedding models, construction-baked ADR-118 fresh-tail serving policy, backend
+topology/routing, and construction-baked outbound policy.
 
 Identity-derived fields are excluded from `config_id`: `namespace`, `actor_id`, and
 `visible_namespaces`, including the actor namespace that ADR-007 Rev 4 folds into
@@ -362,6 +363,10 @@ are consumed when dispatch mints the request token.
 construction-baked and is not carried in `RequestIdentity`. Excluding it before outbound policy is
 threaded per request would allow a client with stricter outbound policy to reuse a daemon built
 with a broader outbound allowlist.
+
+The ADR-118 fresh-tail policy is likewise part of `config_id`: it is sampled when each
+`KhiveRuntime` is constructed and is not carried per request. Runtimes with opposite policies
+must not share a warm daemon because they provide different committed-write visibility guarantees.
 
 ---
 

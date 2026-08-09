@@ -83,55 +83,18 @@ fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     Ok(parsed)
 }
 
-/// Validates a repeat spec: `daily`/`weekly`/`monthly`, or a limited 5-field
-/// `MIN HOUR DOM MON DOW` cron-lite form (no steps/ranges/lists — issue
-/// #481). See `docs/api/replay-validation.md#validate_repeat` for field ranges
-/// and rationale.
+/// Validates the recurrence aliases the executor can advance. Accepting a
+/// recurrence that the drain cannot compute would silently consume it as a
+/// one-shot, so unsupported cron text is rejected at this write boundary.
 fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
     match repeat {
-        "daily" | "weekly" | "monthly" => return Ok(()),
-        _ => {}
+        "daily" | "weekly" | "monthly" => Ok(()),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "invalid repeat expression {repeat:?}: supported values are \"daily\", \
+             \"weekly\", and \"monthly\"; five-field cron is not executable and is \
+             rejected instead of degrading to a one-shot"
+        ))),
     }
-
-    let fields: Vec<&str> = repeat.split_whitespace().collect();
-    if fields.len() != 5 {
-        return Err(RuntimeError::InvalidInput(format!(
-            "invalid repeat expression {repeat:?}: must be \"daily\", \"weekly\", \
-             \"monthly\", or a limited 5-field form (MIN HOUR DOM MON DOW) where each \
-             field is '*' or one in-range integer; cron operators such as steps, \
-             ranges, and lists are not accepted"
-        )));
-    }
-
-    // (field_name, min_val, max_val)
-    let ranges: [(&str, u64, u64); 5] = [
-        ("minute", 0, 59),
-        ("hour", 0, 23),
-        ("day-of-month", 1, 31),
-        ("month", 1, 12),
-        ("day-of-week", 0, 7),
-    ];
-    for (field, (name, lo, hi)) in fields.iter().zip(ranges.iter()) {
-        if *field == "*" {
-            continue;
-        }
-        match field.parse::<u64>() {
-            Ok(v) if v >= *lo && v <= *hi => {}
-            Ok(v) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "invalid repeat expression {repeat:?}: cron {name} field {v} is out of \
-                     range {lo}–{hi}"
-                )));
-            }
-            Err(_) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "invalid repeat expression {repeat:?}: cron {name} field {field:?} is not \
-                     \"*\" or a non-negative integer"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Validates `action` parses as DSL via `khive_request::parse_request`,

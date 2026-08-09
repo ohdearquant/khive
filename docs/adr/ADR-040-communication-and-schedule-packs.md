@@ -1,7 +1,7 @@
 # ADR-040: Communication and Schedule Packs
 
-**Status**: accepted (amended 2026-08-06 — named atomic mark-read)\
-**Date**: 2026-05-23 (amended 2026-08-06)\
+**Status**: accepted (amended 2026-08-07 — executable schedule recurrence)\
+**Date**: 2026-05-23 (amended 2026-08-07)\
 **Authors**: khive maintainers
 
 ## Context
@@ -367,20 +367,15 @@ delayed execution does not grant access to internal subhandlers.
 
 `repeat` accepts:
 
-| Value                | Semantics                                                               |
-| -------------------- | ----------------------------------------------------------------------- |
-| `"daily"`            | Repeat every 24 hours from `trigger_at`                                 |
-| `"weekly"`           | Repeat every 7 days                                                     |
-| `"monthly"`          | Repeat on the same day-of-month each month                              |
-| limited 5-field form | Each field is `*` or one in-range integer: `"0 9 * * 1"` (Monday 09:00) |
+| Value       | Semantics                                  |
+| ----------- | ------------------------------------------ |
+| `"daily"`   | Repeat every 24 hours from `trigger_at`    |
+| `"weekly"`  | Repeat every 7 days                        |
+| `"monthly"` | Repeat on the same day-of-month each month |
 
-No sub-minute precision. The pack validates this limited 5-field form (not standard
-cron: steps, ranges, and lists such as `*/15`, `9-17`, `0,30` are rejected — issue
-#481) at write time and returns `RuntimeError::InvalidInput` for malformed or
-unsupported expressions. `kkernel`'s pending-events runner does not yet compute
-next-fire times for the 5-field form; such events are stored and validated but fire
-one-shot rather than advancing to their next occurrence until next-occurrence
-computation lands.
+The pack returns `RuntimeError::InvalidInput` for every other expression. In particular,
+five-field cron is rejected because the pending-events executor cannot compute its next
+occurrence; accepted recurrence must never degrade silently to a one-shot.
 
 #### Trigger evaluation and execution
 
@@ -629,11 +624,10 @@ standard `delete(id)` path.
    Generic `update` is not sufficient because it would expose executable intent and creator
    authority to confused-deputy substitution.
 
-3. **Repeat semantics after firing**: For recurring events, the execution environment
-   calculates the next `trigger_at` from the `repeat` rule and creates a new `scheduled_event`
-   note. Alternatively, the existing note is updated in-place. The correct behavior for
-   `cancel` on a recurring event (cancel just the next occurrence vs. all future occurrences)
-   is unspecified in v1.
+3. **Repeat semantics after firing (resolved by ADR-106)**: Named recurring events update the
+   existing note in place, advancing `trigger_at` and returning it to `pending`. Cancelling that
+   row cancels the recurring schedule. Unsupported recurrence, including five-field cron, is
+   rejected at the write boundary rather than silently degrading to one-shot delivery.
 
 4. **Message namespace write path**: `comm.send(to="agent:khive")` must resolve `agent:khive` to
    a namespace and write a note into that namespace. The exact resolution contract (namespace
@@ -649,7 +643,7 @@ standard `delete(id)` path.
 - `crates/khive-pack-schedule/src/lib.rs`: `SchedulePack` struct + `Pack` / `PackRuntime`
   impls.
 - `crates/khive-pack-schedule/src/handlers.rs`: `remind`, `schedule`, `agenda`, `cancel`
-  handlers; cron validation; trigger-time payload storage.
+  handlers; executable recurrence validation; trigger-time payload storage.
 - `crates/khive-pack-schedule/src/schema.rs`: `idx_schedule_trigger` DDL.
 - `crates/kkernel/src/server.rs` (or pack registration): conditional `CommPack` and
   `SchedulePack` registration from `RuntimeConfig::packs`.
@@ -796,3 +790,12 @@ This amendment does not change ADR-057's actor or legacy-row decisions. In parti
 both names; newly attributed messages remain addressee-gated. Target-validation errors remain fatal
 before either mutation mode, matching the shipped #1572 contract rather than introducing a second,
 per-entry authorization-error envelope only on the new spelling.
+
+## Amendment (2026-08-07): executable schedule recurrence
+
+The recurrence grammar is narrowed to `daily`, `weekly`, and `monthly`, exactly the
+forms the executor can advance. All cron expressions are rejected at intent creation;
+legacy cron rows fail closed before dispatch. This supersedes the earlier limited
+five-field grammar in this ADR. Durable occurrence/invocation receipts, renewable
+dispatch leases, crash reconciliation, and failed one-shot recovery are governed by
+[ADR-106 Amendment F](ADR-106-schedule-pack-executor.md#amendment-f-durable-dispatch-receipts-and-renewable-leases-2026-08-07).

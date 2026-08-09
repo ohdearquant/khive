@@ -91,7 +91,12 @@ absence or closed state, so another process cannot make a retired cache serve st
 For a pathless bridge captured during the initial install-before-activation window, the guard first
 waits on the per-model publication lock and revalidates the pending row. A completed activation may
 continue; a row that remains closed, disappears, or errors still evicts the candidate. No-index
-recalls do not take this wait, preserving their bounded readiness timeout.
+recalls do not take this wait, preserving their bounded readiness timeout. Their capped exact leg
+first performs the cheap log-only empty-tail probe required by ADR-118. For a non-empty tail, one
+SQLite statement counts the live corpus, selects the corpus-relative retained-log suffix, joins each
+subject's current vector, and evaluates live-note membership. That replay statement is the snapshot
+boundary on both standalone and pool-backed readers: a concurrent commit is wholly visible or wholly
+invisible, never a log row from one state combined with a vector or note row from another.
 File-backed checkpoint writers serialize the segment, UUID sidecar, registry transition, and mmap
 re-adoption with `<segment-dir>/.bridge-checkpoint.lock`. After acquiring that lock, a writer
 revalidates that its candidate watermark is not behind the durable row before touching the segment;

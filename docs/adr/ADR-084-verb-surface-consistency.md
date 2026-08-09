@@ -73,9 +73,10 @@ added, each individually small, collectively a memorization tax:
 
 - **Param-name divergence**: `query` vs `q`, `at` (not `due`), `id` (not `thread_id`),
   `ids` (not `slugs`) -- correct names are operational folklore, not a stated convention.
-- **ID-resolution divergence**: most `id`-typed params accept a short unique prefix;
-  `brain.feedback` requires a full UUID; `knowledge.get` accepts slug or full UUID but
-  not a prefix.
+- **ID-resolution divergence**: most `id`-typed params accept a short unique prefix, while
+  `brain.feedback` requires a full UUID. `knowledge.get` was another violator at this
+  snapshot; its later fix preserves the Rule 1 order: full UUID, exact registered slug,
+  then short unique prefix.
 - **Silent enum coercion**: `parse_direction` (`khive-pack-kg/src/handlers/common.rs`)
   maps any unrecognized `direction` value to `Direction::Out` (`Some(_) => Direction::Out`)
   instead of erroring -- a direct violation of the codebase's own "never silently coerce
@@ -107,7 +108,8 @@ grandfathered exceptions.
 resolves, in order: full UUID → registered slug (where the verb declares slug support) →
 short unique hex prefix. A prefix that matches zero or multiple records is an error naming
 the ambiguity. Violators at ratification: `brain.feedback` (full UUID only),
-`knowledge.get` (slug or full UUID, no prefix).
+`knowledge.get` (slug or full UUID, no prefix). The latter was resolved after this proposal's
+snapshot; it now implements this order while keeping UUID/prefix reads namespace-agnostic.
 
 **Rule 2 -- no silent enum coercion.** A parameter with a closed value set rejects
 unrecognized values with an error listing the valid values. Defaulting applies only to
@@ -274,9 +276,10 @@ DSL section (§5). The grammar itself is unchanged (see Alternatives §6).
 
 **3d. Tracked conformance failures (Rules 1-3).** `brain.feedback` full-UUID-only,
 `knowledge.get` missing prefix resolution, `parse_direction` silent coercion, and the
-`neighbors` help/default mismatch are recorded as conformance issues at ratification.
-Their fixes are ordinary bugfix PRs referencing this ADR; none of them is gated on the
-`schema` verb landing.
+`neighbors` help/default mismatch were recorded as conformance issues at ratification.
+`knowledge.get` has since been resolved with full UUID → exact scoped slug → unique prefix
+precedence. The remaining fixes are ordinary bugfix PRs referencing this ADR; none is gated
+on the `schema` verb landing.
 
 ### 4. The conformance test -- two declared phases
 

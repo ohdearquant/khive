@@ -86,7 +86,7 @@ impl DescriptorIdentity {
             checkpoint_sha256,
             inference: InferenceIdentity {
                 provider: "lattice-embed",
-                version: "0.7.1",
+                version: "0.8.0",
             },
             preprocessing: PreprocessingIdentity {
                 revision: PREPROCESSING_REVISION,
@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
         assert_eq!(value["dimensions"], 4);
         assert_eq!(value["prompt"]["revision"], PROMPT_REVISION);
-        assert_eq!(value["inference"]["version"], "0.7.1");
+        assert_eq!(value["inference"]["version"], "0.8.0");
     }
 
     #[test]
@@ -784,7 +784,7 @@ mod tests {
             checkpoint_sha256: "1".repeat(64),
             inference: InferenceIdentity {
                 provider: "lattice-embed",
-                version: "0.7.1",
+                version: "0.8.0",
             },
             preprocessing: PreprocessingIdentity {
                 revision: PREPROCESSING_REVISION,
@@ -804,11 +804,11 @@ mod tests {
         let fingerprint = sha256_hex(&canonical_json_bytes(&core).unwrap());
         assert_eq!(
             fingerprint,
-            "88a9b26b399d878c77c3a4743dc38d2f538a951874b3c2fb6eb3d62d9cfbfd1c"
+            "32d7e52301b0383e0d4db0b145809ad789dc04c8db6b4ac2af8c14a2d68dce7a"
         );
         assert_eq!(
             format!("moodboard_{fingerprint}_4"),
-            "moodboard_88a9b26b399d878c77c3a4743dc38d2f538a951874b3c2fb6eb3d62d9cfbfd1c_4"
+            "moodboard_32d7e52301b0383e0d4db0b145809ad789dc04c8db6b4ac2af8c14a2d68dce7a_4"
         );
 
         let production_prompt =
@@ -819,11 +819,26 @@ mod tests {
         );
         assert_eq!(
             production_prompt.fingerprint,
-            "59f1ababe9229fe1a2e871a92172d7f84461d28729172bbba5f7c55c4ccd0a53"
+            "2f5dca0e2eed947ef1ed1a6fb2af12206ce1838b7778678f2a99fea576b2310a"
         );
         assert_eq!(
             production_prompt.model_key,
-            "moodboard_59f1ababe9229fe1a2e871a92172d7f84461d28729172bbba5f7c55c4ccd0a53_4"
+            "moodboard_2f5dca0e2eed947ef1ed1a6fb2af12206ce1838b7778678f2a99fea576b2310a_4"
+        );
+
+        let indexed_qwen_08 = DescriptorIdentity::build(
+            "hf-Qwen-Qwen3.5-0.8B-2fc06364715b967f1860aea9cf38778875588b17".to_string(),
+            "6dca0d0e661696b36985cbce8f89e1a91377822065de31eac94e90a0e45d43d3".to_string(),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            indexed_qwen_08.fingerprint,
+            "40be6f4ae97057e6a0b5c0d011db6e5a37f26c46b787df3e19ddf0fec1e3c9b9"
+        );
+        assert_eq!(
+            indexed_qwen_08.model_key,
+            "moodboard_40be6f4ae97057e6a0b5c0d011db6e5a37f26c46b787df3e19ddf0fec1e3c9b9_1024"
         );
     }
 

@@ -738,9 +738,9 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report writer-contention and WAL/checkpoint diagnostics for the main database: build identity,
-the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a
-WAL-pin holder census. Takes no parameters.
+Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
+database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
+sidecar file size, and a WAL-pin holder census. Takes no parameters.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
@@ -781,6 +781,16 @@ deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded
 `unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
 `unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
 holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are cleanup-enumeration
+measurements: this request deliberately does not run that mutating enumeration, so both fields are
+omitted rather than reporting fabricated `false`/`0` values.
+
+`graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
+`graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
+count is the legacy cross-namespace duplicate-ID state that can make a multi-namespace edge cursor
+walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
+intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
+live edge table. `graph_edge_integrity_error` explains a missing integrity section.
 Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
 explicit reasons rather than being silently omitted.
 
@@ -953,6 +963,11 @@ Each result carries `serve_attribution` (`profile`, `unattributed`, or
 `unspecified`). `profile` also carries `served_by_profile_id`; `unattributed`
 means a selected profile record was unreadable and downstream feedback must not
 fall back to a current binding/default.
+Each result also carries canonical `full_id`; pass it directly to
+`memory.feedback(target_id=...)` in a later request without an extra `get`.
+`full_id` is present when the resolved output format is `json`, the builtin
+default, under any presentation mode. The `auto` and `table` formats omit it
+unless the request sets `presentation=verbose`.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1501,11 +1516,11 @@ Time-triggered reminders and deferred verb dispatch. Optional; load with
 
 Create a time-triggered reminder.
 
-| Param     | Type   | Required | Notes                                                                                                                                            |
-| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `content` | string | yes      | Non-empty reminder message.                                                                                                                      |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                                                            |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, or a limited 5-field cron form using only `*` or one in-range integer per field (steps/ranges/lists not accepted). |
+| Param     | Type   | Required | Notes                                                                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
+| `content` | string | yes      | Non-empty reminder message.                                                                           |
+| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                 |
+| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`. Cron expressions are rejected because the executor cannot advance them. |
 
 ```
 request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
@@ -1517,7 +1532,7 @@ Schedule a future verb dispatch.
 
 | Param    | Type   | Required | Notes                                                               |
 | -------- | ------ | -------- | ------------------------------------------------------------------- |
-| `action` | string | yes      | Verb dispatch payload, e.g. `"schedule.remind(content=\"hello\")"`. |
+| `action` | string | yes      | One replayable verb call, e.g. `"gtd.assign(title=\"follow up\")"`. |
 | `at`     | string | yes      | RFC 3339 trigger time.                                              |
 | `repeat` | string | no       | Same recurrence grammar as `schedule.remind`.                       |
 
@@ -1586,11 +1601,13 @@ request(ops="[{\"tool\":\"knowledge.upsert_domains\",\"args\":{\"domains\":[{\"s
 
 ### `knowledge.get` — Assertive
 
-Fetch a single atom or domain by UUID or slug.
+Fetch a single atom or domain by full UUID, exact slug, or unique short prefix, in that
+order. Exact slug lookup uses the caller namespace; UUID and prefix forms are
+namespace-agnostic by-ID reads.
 
 | Param              | Type   | Required | Notes                                                                                                                                                                                                                                                                           |
 | ------------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`               | string | yes      | Atom/domain UUID or slug.                                                                                                                                                                                                                                                       |
+| `id`               | string | yes      | Atom/domain full UUID, exact caller-namespace slug, or unique 8+ hex UUID prefix.                                                                                                                                                                                               |
 | `include_sections` | bool   | no       | Include the atom's sections under a `sections` key (ignored for domains). Each section: `id, atom_id, namespace, section_type, heading, content, content_hash, status, tokens, sort_order, created_at, updated_at`, ordered by `sort_order`, `created_at`, `id`. Default false. |
 
 ```
@@ -1866,6 +1883,10 @@ request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pa
 ### `session.list` — Assertive
 
 List stored sessions newest first.
+Every summary includes canonical `full_id` for direct reuse with
+`session.resume` or `session.export` across requests. As with other records,
+`full_id` is present under the default `json` output format and is omitted by
+`format=auto` and `format=table` unless the request sets `presentation=verbose`.
 
 | Param      | Type    | Required | Notes                                               |
 | ---------- | ------- | -------- | --------------------------------------------------- |
