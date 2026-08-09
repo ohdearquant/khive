@@ -181,7 +181,7 @@ must exactly match one `results[].id`; rank position never supplies a judgment.
 | `comm.inbox`     | Page/filter inbound or caller-authored sent messages; `wait_ms?` enables a bounded long poll; optionally project fields | Triage inbox, wait for what's next, or inspect sent history |
 | `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                                       | Cheap unread check without listing                          |
 | `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`)                  | Acknowledge receipt (recipient action)                      |
-| `comm.mark_read` | Named bulk mark-read; optional `atomic=true` makes the cross-message mutation all-or-nothing                           | Clear a supplied inbox set without naming ambiguity         |
+| `comm.mark_read` | Named bulk mark-read; optional `atomic=true` makes the cross-message mutation all-or-nothing                            | Clear a supplied inbox set without naming ambiguity         |
 | `comm.reply`     | Reply to a message (threading linkage)                                                                                  | Respond in-thread                                           |
 | `comm.thread`    | Retrieve full conversation thread                                                                                       | Read the whole conversation                                 |
 | `comm.health`    | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                                       | Check daemon channel-poll state                             |
