@@ -442,6 +442,95 @@ impl SqliteVecStore {
             .map_err(|e| StorageError::driver(StorageCapability::Vectors, op, e))?
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_one(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+        record_ann_delta: bool,
+        operation: &'static str,
+        savepoint_name: &'static str,
+    ) -> Result<(), StorageError> {
+        if vectors.len() != 1 {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: operation.into(),
+                message: "sqlite-vec supports exactly one vector per record".into(),
+            });
+        }
+        let embedding = vectors.into_iter().next().expect("len checked");
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        let namespace = namespace.to_string();
+        let field = field.to_string();
+        let kind_str = kind.to_string();
+        let embedding_model = self.embedding_model.clone();
+
+        if embedding.len() == dims {
+            if let Some(index) = non_finite_index(&embedding) {
+                return Err(non_finite_vector_error(operation, index, embedding[index]));
+            }
+        }
+
+        let failpoint_flag = current_failpoint();
+        if let Some(writer_task) = self.current_writer_task() {
+            let table_for_write = table.clone();
+            let namespace_for_write = namespace.clone();
+            let field_for_write = field.clone();
+            let kind_for_write = kind_str.clone();
+            let model_for_write = embedding_model.clone();
+            let embedding_for_write = embedding.clone();
+            return writer_task
+                .send_bounded(move |connection| {
+                    vec_upsert_atomic_dml(
+                        connection,
+                        &table_for_write,
+                        dims,
+                        subject_id,
+                        &kind_for_write,
+                        &namespace_for_write,
+                        &field_for_write,
+                        &model_for_write,
+                        &embedding_for_write,
+                        savepoint_name,
+                        record_ann_delta,
+                        failpoint_flag,
+                    )
+                    .map_err(|error| map_err(error, operation))
+                })
+                .await;
+        }
+
+        let origin = self.pool.origin();
+        self.with_writer(operation, move |connection| {
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some(format!("{operation}_tx")),
+                origin,
+            );
+            let transaction = connection.unchecked_transaction()?;
+            replace_vector_row_dml(
+                &transaction,
+                &table,
+                dims,
+                VectorRowRef {
+                    subject_id,
+                    namespace: &namespace,
+                    kind: &kind_str,
+                    field: &field,
+                    embedding_model: &embedding_model,
+                    embedding: &embedding,
+                },
+                record_ann_delta,
+                failpoint_flag,
+            )?;
+            transaction.commit()
+        })
+        .await
+    }
 }
 
 /// One vector row's identity + payload for [`replace_vector_row_dml`] (#546).
@@ -464,6 +553,7 @@ fn replace_vector_row_dml(
     table: &str,
     dims: usize,
     row: VectorRowRef<'_>,
+    record_ann_delta: bool,
     failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), rusqlite::Error> {
     if row.embedding.len() != dims {
@@ -493,8 +583,14 @@ fn replace_vector_row_dml(
         ],
     )?;
     if deleted_same_identity == 0 {
-        let logged = log_vector_deletes(conn, table, "subject_id = ?1", &[&subject_id])?;
-        if logged > 0 {
+        if record_ann_delta {
+            let logged = log_vector_deletes(conn, table, "subject_id = ?1", &[&subject_id])?;
+            if logged > 0 {
+                let delete_prior_identity_sql =
+                    format!("DELETE FROM {table} WHERE subject_id = ?1");
+                conn.execute(&delete_prior_identity_sql, rusqlite::params![&subject_id])?;
+            }
+        } else {
             let delete_prior_identity_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
             conn.execute(&delete_prior_identity_sql, rusqlite::params![&subject_id])?;
         }
@@ -531,19 +627,21 @@ fn replace_vector_row_dml(
         ],
     )?;
 
-    // Delta record for the ANN restart classifier; rides the caller's
-    // savepoint/transaction so a rolled-back upsert leaves no log row.
-    conn.execute(
-        "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')",
-        rusqlite::params![
-            row.namespace,
-            row.embedding_model,
-            row.kind,
-            row.field,
-            &subject_id
-        ],
-    )?;
+    if record_ann_delta {
+        // Delta record for the ANN restart classifier; rides the caller's
+        // savepoint/transaction so a rolled-back upsert leaves no log row.
+        conn.execute(
+            "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')",
+            rusqlite::params![
+                row.namespace,
+                row.embedding_model,
+                row.kind,
+                row.field,
+                &subject_id
+            ],
+        )?;
+    }
 
     Ok(())
 }
@@ -695,6 +793,7 @@ fn batch_insert_vectors_dml(
                 embedding_model: store_embedding_model,
                 embedding,
             },
+            true,
             failpoint_flag.clone(),
         );
         match result {
@@ -741,6 +840,7 @@ fn vec_upsert_atomic_dml(
     embedding_model: &str,
     embedding: &[f32],
     savepoint_name: &'static str,
+    record_ann_delta: bool,
     failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), rusqlite::Error> {
     conn.execute_batch(&format!("SAVEPOINT {savepoint_name}"))?;
@@ -756,6 +856,7 @@ fn vec_upsert_atomic_dml(
             embedding_model,
             embedding,
         },
+        record_ann_delta,
         failpoint_flag,
     );
 
@@ -907,99 +1008,37 @@ impl VectorStore for SqliteVecStore {
         field: &str,
         vectors: Vec<Vec<f32>>,
     ) -> Result<(), StorageError> {
-        if vectors.len() != 1 {
-            return Err(StorageError::Unsupported {
-                capability: StorageCapability::Vectors,
-                operation: "vec_insert".into(),
-                message: "sqlite-vec supports exactly one vector per record".into(),
-            });
-        }
-        let embedding = vectors.into_iter().next().expect("len checked");
+        self.insert_one(
+            subject_id,
+            kind,
+            namespace,
+            field,
+            vectors,
+            true,
+            "vec_insert",
+            "vec_insert_atomic",
+        )
+        .await
+    }
 
-        let table = self.table_name.clone();
-        let dims = self.dimensions;
-        let namespace = namespace.to_string();
-        let field = field.to_string();
-        let kind_str = kind.to_string();
-        let embedding_model = self.embedding_model.clone();
-
-        if embedding.len() == dims {
-            if let Some(idx) = non_finite_index(&embedding) {
-                return Err(non_finite_vector_error("vec_insert", idx, embedding[idx]));
-            }
-        }
-
-        // Capture the failpoint Arc (if any) from the thread-local on the
-        // calling thread before handing the closure to spawn_blocking.
-        let failpoint_flag = current_failpoint();
-
-        // ADR-067 Component A (Fork C slice 2): when the write queue is
-        // enabled, route through the pool-wide WriterTask. DML-only
-        // closure — atomicity is provided by `vec_upsert_atomic_dml`'s
-        // named SAVEPOINT rather than `conn.unchecked_transaction()`,
-        // which would attempt a nested `BEGIN` and fail under the
-        // WriterTask's already-open transaction.
-        if let Some(writer_task) = self.current_writer_task() {
-            let table2 = table.clone();
-            let namespace2 = namespace.clone();
-            let field2 = field.clone();
-            let kind_str2 = kind_str.clone();
-            let embedding_model2 = embedding_model.clone();
-            let embedding2 = embedding.clone();
-            return writer_task
-                .send_bounded(move |conn| {
-                    vec_upsert_atomic_dml(
-                        conn,
-                        &table2,
-                        dims,
-                        subject_id,
-                        &kind_str2,
-                        &namespace2,
-                        &field2,
-                        &embedding_model2,
-                        &embedding2,
-                        "vec_insert_atomic",
-                        failpoint_flag,
-                    )
-                    .map_err(|e| map_err(e, "vec_insert"))
-                })
-                .await;
-        }
-
-        // Explicitly disabled or degraded fallback path: the closure owns its own transaction via
-        // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
-        // shared helper the WriterTask/batch paths use (#546), so this path
-        // now also exercises the post-delete failpoint in tests.
-        let origin = self.pool.origin();
-        self.with_writer("vec_insert", move |conn| {
-            // ADR-091 Plank 0: register the span before opening the transaction so
-            // the handle (declared first) drops AFTER `tx` (declared second) —
-            // locals drop in reverse declaration order, so `tx`'s own Drop (which
-            // rolls back if uncommitted) runs while the registry entry is still
-            // present.
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("vec_insert_tx".to_string()),
-                origin,
-            );
-            let tx = conn.unchecked_transaction()?;
-
-            replace_vector_row_dml(
-                &tx,
-                &table,
-                dims,
-                VectorRowRef {
-                    subject_id,
-                    namespace: &namespace,
-                    kind: &kind_str,
-                    field: &field,
-                    embedding_model: &embedding_model,
-                    embedding: &embedding,
-                },
-                failpoint_flag,
-            )?;
-
-            tx.commit()
-        })
+    async fn insert_exact_only(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<(), StorageError> {
+        self.insert_one(
+            subject_id,
+            kind,
+            namespace,
+            field,
+            vectors,
+            false,
+            "vec_insert_exact_only",
+            "vec_insert_exact_only_atomic",
+        )
         .await
     }
 
@@ -1129,6 +1168,7 @@ impl VectorStore for SqliteVecStore {
                         &embedding_model2,
                         &embedding2,
                         "vec_update_atomic",
+                        true,
                         failpoint_flag,
                     )
                     .map_err(|e| map_err(e, "vec_update"))
@@ -1161,6 +1201,7 @@ impl VectorStore for SqliteVecStore {
                     embedding_model: &embedding_model,
                     embedding: &embedding,
                 },
+                true,
                 failpoint_flag,
             )?;
 
@@ -1795,6 +1836,80 @@ mod batch_exists_tests {
             .unwrap();
         assert_eq!(search_hits.len(), 1);
         assert_eq!(search_hits[0].score, DeterministicScore::from_f64(-1.0));
+    }
+
+    #[tokio::test]
+    async fn exact_only_insert_replaces_rows_without_ann_deltas() {
+        let pool = make_vec_pool();
+        let raw_pool = Arc::clone(&pool);
+        let model_key = "exact_only_no_ann_delta";
+        let namespace = "ns:exact-only";
+        create_vec_table(&pool, model_key, 2);
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            2,
+            namespace.to_string(),
+        )
+        .unwrap();
+        let exact_id = Uuid::from_u128(1);
+
+        store
+            .insert_exact_only(
+                exact_id,
+                SubstrateKind::Entity,
+                namespace,
+                "visual.descriptor",
+                vec![vec![1.0, 0.0]],
+            )
+            .await
+            .unwrap();
+        store
+            .insert_exact_only(
+                exact_id,
+                SubstrateKind::Entity,
+                "ns:exact-only-repaired",
+                "visual.descriptor",
+                vec![vec![0.0, 1.0]],
+            )
+            .await
+            .unwrap();
+
+        let writer = raw_pool.try_writer().expect("pool writer");
+        let deltas: i64 = writer
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(deltas, 0);
+        let repaired_namespace: String = writer
+            .conn()
+            .query_row(
+                &format!("SELECT namespace FROM vec_{model_key} WHERE subject_id = ?1"),
+                [exact_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired_namespace, "ns:exact-only-repaired");
+        drop(writer);
+
+        store
+            .insert(
+                Uuid::from_u128(2),
+                SubstrateKind::Entity,
+                namespace,
+                "body",
+                vec![vec![1.0, 0.0]],
+            )
+            .await
+            .unwrap();
+        let writer = raw_pool.try_writer().expect("pool writer");
+        let deltas: i64 = writer
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(deltas, 1, "generic inserts must retain ANN logging");
     }
 
     /// sqlite-vec's own `distance_cosine_float` (sqlite-vec.c) accumulates

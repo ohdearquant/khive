@@ -2298,12 +2298,15 @@ dependencies = [
  "khive-storage",
  "khive-types",
  "lattice-embed",
+ "lattice-inference",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 //! Moodboard verb handlers.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -154,6 +155,11 @@ async fn materialize_hits(
     top_k: u32,
 ) -> Result<Vec<Value>, RuntimeError> {
     let mut hits = Vec::with_capacity(top_k as usize);
+    let authorized_namespaces: BTreeSet<&str> = token
+        .visible_namespaces()
+        .iter()
+        .map(|namespace| namespace.as_str())
+        .collect();
     for hit in raw_hits {
         let score = validated_cosine_score(&hit)?;
         if hit.subject_id == query_asset_id || hits.len() == top_k as usize {
@@ -164,7 +170,7 @@ async fn materialize_hits(
             Err(error) if is_stale_candidate_error(&error) => continue,
             Err(error) => return Err(error),
         };
-        if candidate.namespace != token.namespace().as_str()
+        if !authorized_namespaces.contains(candidate.namespace.as_str())
             || candidate.kind != "artifact"
             || candidate.entity_type.as_deref() != Some("visual_asset")
         {
@@ -548,7 +554,7 @@ async fn index_embedding(
     validate_embedding(embedding, descriptor)?;
     let store = exact_store(runtime, token, descriptor).await?;
     store
-        .insert(
+        .insert_exact_only(
             asset_id,
             SubstrateKind::Entity,
             token.namespace().as_str(),
@@ -568,19 +574,52 @@ async fn search_embedding(
 ) -> Result<Vec<VectorSearchHit>, RuntimeError> {
     validate_embedding(embedding, descriptor)?;
     let store = exact_store(runtime, token, descriptor).await?;
-    let request = VectorSearchRequest {
-        query_vectors: vec![embedding.to_vec()],
-        top_k,
-        namespace: Some(token.namespace().as_str().to_string()),
-        kind: Some(SubstrateKind::Entity),
-        embedding_model: Some(descriptor.model_name.to_string()),
-        filter: None,
-        backend_hints: None,
-    };
-    request
-        .validate()
-        .map_err(|error| RuntimeError::Internal(format!("moodboard vector query: {error}")))?;
-    store.search(request).await.map_err(Into::into)
+    let namespaces: BTreeSet<String> = token
+        .visible_namespaces()
+        .iter()
+        .map(|namespace| namespace.as_str().to_string())
+        .collect();
+    let mut merged = BTreeMap::<Uuid, VectorSearchHit>::new();
+    for namespace in namespaces {
+        let request = VectorSearchRequest {
+            query_vectors: vec![embedding.to_vec()],
+            top_k,
+            namespace: Some(namespace),
+            kind: Some(SubstrateKind::Entity),
+            embedding_model: Some(descriptor.model_name.to_string()),
+            filter: None,
+            backend_hints: None,
+        };
+        request
+            .validate()
+            .map_err(|error| RuntimeError::Internal(format!("moodboard vector query: {error}")))?;
+        for hit in store.search(request).await? {
+            match merged.entry(hit.subject_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(hit);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if hit.score > entry.get().score =>
+                {
+                    entry.insert(hit);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+
+    let mut hits: Vec<_> = merged.into_values().collect();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.subject_id.cmp(&right.subject_id))
+    });
+    hits.truncate(top_k as usize);
+    for (index, hit) in hits.iter_mut().enumerate() {
+        hit.rank = u32::try_from(index + 1).expect("top_k is bounded to u32");
+    }
+    Ok(hits)
 }
 
 #[cfg(test)]
@@ -657,6 +696,32 @@ mod tests {
         let secondary = KhiveRuntime::from_backend(secondary_backend, secondary_config)
             .with_core_backend(main_backend);
         (main, secondary)
+    }
+
+    async fn moodboard_ann_delta_count(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        descriptor: &DescriptorIdentity,
+    ) -> i64 {
+        let mut reader = runtime.sql().reader().await.expect("sql reader");
+        match reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log \
+                      WHERE namespace = ?1 AND embedding_model = ?2 AND field = ?3"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(token.namespace().as_str().to_string()),
+                    SqlValue::Text(descriptor.model_name.to_string()),
+                    SqlValue::Text(VISUAL_FIELD.to_string()),
+                ],
+                label: Some("moodboard_ann_delta_count".to_string()),
+            })
+            .await
+            .expect("ann_write_log count")
+        {
+            Some(SqlValue::Integer(count)) => count,
+            other => panic!("unexpected ann_write_log count: {other:?}"),
+        }
     }
 
     #[test]
@@ -755,6 +820,29 @@ mod tests {
         )
         .await
         .unwrap();
+        index_embedding(
+            &runtime,
+            &token,
+            &descriptor,
+            opposite,
+            &[0.0, -1.0, 0.0, 0.0],
+        )
+        .await
+        .unwrap();
+        index_embedding(
+            &runtime,
+            &token,
+            &descriptor,
+            opposite,
+            &[-1.0, 0.0, 0.0, 0.0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            moodboard_ann_delta_count(&runtime, &token, &descriptor).await,
+            0,
+            "permanently exact Moodboard inserts and replacements must not leak unconsumed ANN deltas"
+        );
 
         let hits = search_embedding(&runtime, &token, &descriptor, &[1.0, 0.0, 0.0, 0.0], 2)
             .await
@@ -766,6 +854,127 @@ mod tests {
             .find(|hit| hit.subject_id == opposite)
             .expect("opposite vector hit");
         assert!((opposite_hit.score.to_f64() + 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn visual_search_fans_out_over_visible_namespaces_but_narrow_token_does_not() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let primary_namespace = Namespace::local();
+        let extra_namespace = Namespace::parse("lambda:moodboard-visible").unwrap();
+        let narrow = runtime
+            .authorize(primary_namespace.clone())
+            .expect("narrow token");
+        let extra = runtime
+            .authorize(extra_namespace.clone())
+            .expect("extra token");
+        let wide = runtime
+            .authorize_with_visibility(primary_namespace, vec![extra_namespace])
+            .expect("wide token");
+        let descriptor = DescriptorIdentity::fixture(4);
+        let extra_id = Uuid::from_u128(1);
+        let primary_id = Uuid::from_u128(2);
+
+        index_embedding(
+            &runtime,
+            &narrow,
+            &descriptor,
+            primary_id,
+            &[1.0, 0.0, 0.0, 0.0],
+        )
+        .await
+        .unwrap();
+        index_embedding(
+            &runtime,
+            &extra,
+            &descriptor,
+            extra_id,
+            &[1.0, 0.0, 0.0, 0.0],
+        )
+        .await
+        .unwrap();
+
+        let wide_hits = search_embedding(&runtime, &wide, &descriptor, &[1.0, 0.0, 0.0, 0.0], 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            wide_hits
+                .iter()
+                .map(|hit| hit.subject_id)
+                .collect::<Vec<_>>(),
+            vec![extra_id, primary_id],
+            "equal scores use a stable UUID tie-break across namespace queries"
+        );
+        assert_eq!(
+            wide_hits.iter().map(|hit| hit.rank).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let narrow_hits =
+            search_embedding(&runtime, &narrow, &descriptor, &[1.0, 0.0, 0.0, 0.0], 2)
+                .await
+                .unwrap();
+        assert_eq!(
+            narrow_hits
+                .iter()
+                .map(|hit| hit.subject_id)
+                .collect::<Vec<_>>(),
+            vec![primary_id],
+            "an explicit namespace token stays narrow"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).unwrap());
+        runtime.install_blob_store(blob_store.clone());
+        let primary_ref = blob_store.put(b"primary".to_vec()).await.unwrap();
+        let extra_ref = blob_store.put(b"extra".to_vec()).await.unwrap();
+        let mut primary_entity =
+            Entity::new(narrow.namespace().as_str(), "artifact", "primary candidate")
+                .with_entity_type(Some("visual_asset"))
+                .with_content_ref(primary_ref.to_string());
+        primary_entity.id = primary_id;
+        runtime
+            .entities(&narrow)
+            .unwrap()
+            .upsert_entity(primary_entity)
+            .await
+            .unwrap();
+        let mut extra_entity =
+            Entity::new(extra.namespace().as_str(), "artifact", "extra candidate")
+                .with_entity_type(Some("visual_asset"))
+                .with_content_ref(extra_ref.to_string());
+        extra_entity.id = extra_id;
+        runtime
+            .entities(&extra)
+            .unwrap()
+            .upsert_entity(extra_entity)
+            .await
+            .unwrap();
+
+        let materialized = materialize_hits(
+            &runtime,
+            &wide,
+            blob_store.as_ref(),
+            Uuid::new_v4(),
+            wide_hits.clone(),
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(materialized[0]["asset_id"], extra_id.to_string());
+
+        let narrow_materialized = materialize_hits(
+            &runtime,
+            &narrow,
+            blob_store.as_ref(),
+            Uuid::new_v4(),
+            wide_hits,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(narrow_materialized.len(), 1);
+        assert_eq!(narrow_materialized[0]["asset_id"], primary_id.to_string());
     }
 
     #[tokio::test]

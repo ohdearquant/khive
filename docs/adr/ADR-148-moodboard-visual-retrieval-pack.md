@@ -96,7 +96,9 @@ the canonical digest and uses that computed value in the descriptor; when the va
 it must be exactly 64 lowercase hexadecimal characters and match or discovery/load fails closed.
 The digest covers every regular file (including file symlink targets) below the model directory.
 File symlinks are accepted only when their canonical targets remain inside the canonical model
-directory; directory and escaping symlinks fail closed.
+directory; directory and escaping symlinks fail closed. Snapshot copy resolves the path of each
+opened file handle and rechecks it against that root, so swapping a source entry or ancestor to an
+escaping symlink between enumeration and open also fails closed.
 The framing starts with
 ASCII `khive-moodboard-checkpoint-v1` plus one NUL byte, then a big-endian `u64` file count and, for each lexicographically
 sorted UTF-8 `/`-separated relative path: big-endian `u64` path length, path bytes, big-endian
@@ -105,8 +107,9 @@ paths, non-file entries, and more than 100000 files fail closed. This deliberate
 directory identity includes auxiliary files and layout as well as all configuration, tokenizer,
 manifest, and resolved weight bytes. A one-byte mutation cannot reuse the vector table identity.
 
-The workspace pins `lattice-embed = "=0.8.0"`, matching `inference.version`; a lock refresh cannot
-silently run different inference code under the same descriptor fingerprint.
+The published pack graph directly and exactly pins both `lattice-embed = "=0.8.0"` and its
+inference engine `lattice-inference = "=0.8.0"`, matching `inference.version`; a lock refresh cannot
+silently float the transitive math implementation under the same descriptor fingerprint.
 
 Each response also carries top-level `experimental: true`. Exact result shapes are:
 
@@ -209,15 +212,29 @@ equivalent spaces today, but prevents a silent identity collision if Lattice lat
 placement or attention semantics under a new inference version. A gated real-checkpoint
 characterization test verifies the present prompt-invariance expectation.
 
-`moodboard.model` discovers the descriptor by validating environment identity, config geometry and
-hidden size, and the canonical checkpoint digest without constructing Qwen weights. Ingest/search
-perform the full verified load once per pack process, then re-read geometry and re-hash the tree
-after Lattice returns from weight construction; any mutation between discovery and load is
-rejected. The remaining local-filesystem assumption is that the operator does not mutate a
-checkpoint after final verification (read-only deployment is recommended); loaded in-memory
-weights are the v1 inference source. Inference is guarded by a pack-owned
+`moodboard.model` prepares the descriptor by copying the validated source tree into a private
+random temporary directory, then derives config geometry, hidden size, canonical digest, and the
+optional expected attestation from those copied bytes without constructing Qwen weights. File
+symlinks are materialized as regular files in the snapshot. Descriptor preparation and model load
+are two process-lifetime, cancellation-independent single-flight stages: cancelling the first
+awaiting request does not cancel or duplicate an active blocking copy/hash/load, and all later
+callers observe the same terminal result. Ingest/search load Lattice only from that prepared
+snapshot, re-read geometry and re-hash it after weight construction, compare the complete
+descriptor again at publication, and retain the snapshot for the loaded model's entire lifetime so
+memory maps cannot outlive their source. Atomic replacement or restoration of the operator's
+original path after preparation therefore cannot make a trusted digest name different loaded
+bytes.
+
+This binding costs one full checkpoint-sized temporary copy plus two linear snapshot verification
+reads (before and after load). The private snapshot tree is sealed read-only after attestation, is
+created once per pack process, and is unsealed for deletion only after both the model state and
+loaded model release it; the system temporary filesystem must have corresponding free capacity.
+Inference is guarded
+by a pack-owned
 semaphore: `KHIVE_MOODBOARD_INFERENCE_CONCURRENCY` defaults to 1 and must be an integer in 1–4,
 preventing one parallel ops-file chunk from launching unbounded Qwen activation memory.
+The owned semaphore permit is moved into the blocking inference closure, so cancellation of an
+awaiting request cannot release capacity while native Lattice inference is still running.
 Raster byte decode and governed preprocessing have a separate pack-owned single-permit gate,
 acquired before base64 decode or BlobStore hydration and held until the original byte buffer and
 large decoded intermediates have been consumed/dropped. This bounds the ordinary 100-op parallel
@@ -234,8 +251,14 @@ digest so imported/repointed assets and backend races cannot bypass the ingest c
 
 V1 uses Khive's sqlite-vec store, which performs a brute-force exact cosine scan. The by-ID query
 asset lookup is namespace-agnostic after Gate authorization, as required by ADR-007 Rev 6. The
-multi-record vector query applies the token namespace as an attribution filter, alongside
-`SubstrateKind::Entity` and the descriptor's exact `model_name`; the query asset is excluded. A
+multi-record vector query fans out deterministically across every namespace in the authorized
+token visibility set. The ordinary default token therefore searches its primary local namespace
+plus configured `visible_namespaces`, while an explicit namespace token remains precisely scoped
+to that namespace. Each exact query also filters by `SubstrateKind::Entity` and the descriptor's
+exact `model_name`; results are deduplicated by subject, globally reranked by descending canonical
+score with ascending UUID tie-break, and truncated to the shared candidate budget. Materialization
+accepts only entities whose namespace belongs to that same authorized set. The query asset is
+excluded. A
 backend whose reported index kind is not
 `SqliteVec`/exact is rejected rather than silently weakening the wire claim. `top_k` defaults to
 20 and is bounded to 1–100. Search requests at most `4 * top_k + 1` candidates, then drops self,
@@ -248,6 +271,11 @@ is verified when an asset is fetched as a query. Only an exact entity-not-found 
 namespace-mismatch condition is treated as a stale row; storage, query, authorization, and
 internal failures propagate instead of being disguised as underfill. Every backend score is
 checked as finite and in `[-1,1]` before filtering or serialization.
+
+Moodboard writes use the storage layer's explicit permanently-exact insert seam. It preserves the
+generic `VectorStore::insert` ANN-delta behavior for identities that may later acquire an ANN
+consumer, but transactionally skips `ann_write_log` for this exact-only identity. Initial ingest,
+replacement, and metadata repair therefore cannot accumulate deltas with no consumer watermark.
 
 Vector validation is fail-closed: length must equal `dimensions`, every coordinate must be finite,
 and L2 norm must be finite and within `1e-3` of 1.0. Khive persists the Lattice-produced normalized
@@ -284,8 +312,9 @@ probability separate from conformal/coherence statistics.
 
 ### Negative
 
-- Model descriptor discovery streams the full checkpoint digest; first ingest/search additionally
-  pays a large synchronous Qwen cold load inside a blocking worker.
+- Model descriptor preparation copies and verifies the full checkpoint in temporary storage;
+  first ingest/search additionally pays a large synchronous Qwen cold load inside a blocking
+  worker.
 - Separate Khive processes can still race a duplicate first ingest; the in-process lock cannot
   provide a distributed uniqueness guarantee.
 - Re-searching an existing asset rehydrates and re-embeds it because `VectorStore` has no get-row
@@ -313,8 +342,10 @@ operator revision
 `6dca0d0e661696b36985cbce8f89e1a91377822065de31eac94e90a0e45d43d3`, fingerprint
 `40be6f4ae97057e6a0b5c0d011db6e5a37f26c46b787df3e19ddf0fec1e3c9b9`, and model key
 `moodboard_40be6f4ae97057e6a0b5c0d011db6e5a37f26c46b787df3e19ddf0fec1e3c9b9_1024`.
-Load-free descriptor discovery took 98,776 ms. Cold load plus post-load verification took 297,380
-ms; three serialized inferences took 279,305 ms, 294,164 ms, and 170,919 ms. The output L2 norm was
+Before the private-snapshot hardening amendment, load-free descriptor discovery took 98,776 ms and
+cold load plus post-load verification took 297,380 ms; those timings are a historical direct-source
+baseline and do not include the new copy lifecycle. Three serialized inferences took 279,305 ms,
+294,164 ms, and 170,919 ms. The output L2 norm was
 `1.000000047`, repeat maximum coordinate delta `0`, and trailing-prompt maximum coordinate delta
 `0`. These timings characterize that contended local debug-build run, not a performance
 commitment. The result characterizes the pinned implementation and confirms the prompt-independent

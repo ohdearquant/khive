@@ -1,12 +1,12 @@
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use lattice_embed::vision::{PoolingStrategy, VisionEmbeddingModel};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 use khive_runtime::{NamedVectorIdentity, RuntimeError};
 
@@ -140,6 +140,9 @@ impl DescriptorIdentity {
 pub(crate) struct LoadedVisionModel {
     model: VisionEmbeddingModel,
     descriptor: DescriptorIdentity,
+    // Lattice may retain memory maps into the checkpoint. Keep the private,
+    // attested snapshot alive until the model itself is dropped.
+    _checkpoint: Arc<PreparedCheckpoint>,
 }
 
 impl LoadedVisionModel {
@@ -156,9 +159,145 @@ impl LoadedVisionModel {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CachedRuntimeErrorKind {
+    InvalidInput,
+    Unconfigured,
+    Internal,
+}
+
+#[derive(Clone)]
+struct CachedRuntimeError {
+    kind: CachedRuntimeErrorKind,
+    message: String,
+}
+
+impl CachedRuntimeError {
+    fn from_runtime(error: RuntimeError) -> Self {
+        match error {
+            RuntimeError::InvalidInput(message) => Self {
+                kind: CachedRuntimeErrorKind::InvalidInput,
+                message,
+            },
+            RuntimeError::Unconfigured(message) => Self {
+                kind: CachedRuntimeErrorKind::Unconfigured,
+                message,
+            },
+            RuntimeError::Internal(message) => Self {
+                kind: CachedRuntimeErrorKind::Internal,
+                message,
+            },
+            other => Self {
+                kind: CachedRuntimeErrorKind::Internal,
+                message: other.to_string(),
+            },
+        }
+    }
+
+    fn to_runtime(&self) -> RuntimeError {
+        match self.kind {
+            CachedRuntimeErrorKind::InvalidInput => {
+                RuntimeError::InvalidInput(self.message.clone())
+            }
+            CachedRuntimeErrorKind::Unconfigured => {
+                RuntimeError::Unconfigured(self.message.clone())
+            }
+            CachedRuntimeErrorKind::Internal => RuntimeError::Internal(self.message.clone()),
+        }
+    }
+}
+
+enum BlockingStageState<T> {
+    Idle,
+    Running,
+    Ready(Result<Arc<T>, CachedRuntimeError>),
+}
+
+/// A cancellation-independent, single-flight blocking computation.
+///
+/// The caller only awaits a watch notification. The owned Tokio task and its
+/// `spawn_blocking` child outlive any cancelled waiter and publish exactly one
+/// terminal result for all current and future callers.
+struct BlockingStage<T> {
+    state: Mutex<BlockingStageState<T>>,
+    changed: watch::Sender<u64>,
+}
+
+impl<T> Default for BlockingStage<T> {
+    fn default() -> Self {
+        let (changed, _receiver) = watch::channel(0);
+        Self {
+            state: Mutex::new(BlockingStageState::Idle),
+            changed,
+        }
+    }
+}
+
+impl<T> BlockingStage<T>
+where
+    T: Send + Sync + 'static,
+{
+    async fn get_or_start<F>(
+        self: &Arc<Self>,
+        operation: &'static str,
+        job: F,
+    ) -> Result<Arc<T>, RuntimeError>
+    where
+        F: FnOnce() -> Result<T, RuntimeError> + Send + 'static,
+    {
+        let mut changed = self.changed.subscribe();
+        let mut job = Some(job);
+        loop {
+            let should_start = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &*state {
+                    BlockingStageState::Ready(Ok(value)) => return Ok(Arc::clone(value)),
+                    BlockingStageState::Ready(Err(error)) => return Err(error.to_runtime()),
+                    BlockingStageState::Running => false,
+                    BlockingStageState::Idle => {
+                        *state = BlockingStageState::Running;
+                        true
+                    }
+                }
+            };
+
+            if should_start {
+                let stage = Arc::clone(self);
+                let job = job.take().expect("idle stage owns one starter job");
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(job)
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::Internal(format!("joining {operation}: {error}"))
+                        })
+                        .and_then(|result| result)
+                        .map(Arc::new)
+                        .map_err(CachedRuntimeError::from_runtime);
+                    {
+                        let mut state = stage
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *state = BlockingStageState::Ready(result);
+                    }
+                    let next = (*stage.changed.borrow()).wrapping_add(1);
+                    stage.changed.send_replace(next);
+                });
+            }
+
+            changed.changed().await.map_err(|_| {
+                RuntimeError::Internal(format!("{operation} result channel closed"))
+            })?;
+        }
+    }
+}
+
 pub(crate) struct VisionModelState {
-    loaded: OnceCell<Arc<LoadedVisionModel>>,
-    descriptor: OnceCell<DescriptorIdentity>,
+    prepared: Arc<BlockingStage<PreparedCheckpoint>>,
+    loaded: Arc<BlockingStage<LoadedVisionModel>>,
     preprocessing_gate: Arc<Semaphore>,
     inference_gate: Result<Arc<Semaphore>, String>,
 }
@@ -169,8 +308,8 @@ impl Default for VisionModelState {
         let inference_gate = parse_inference_concurrency(configured.as_deref())
             .map(|limit| Arc::new(Semaphore::new(limit)));
         Self {
-            loaded: OnceCell::new(),
-            descriptor: OnceCell::new(),
+            prepared: Arc::new(BlockingStage::default()),
+            loaded: Arc::new(BlockingStage::default()),
             preprocessing_gate: Arc::new(Semaphore::new(1)),
             inference_gate,
         }
@@ -179,48 +318,34 @@ impl Default for VisionModelState {
 
 impl VisionModelState {
     pub(crate) async fn describe(&self) -> Result<DescriptorIdentity, RuntimeError> {
-        if let Some(model) = self.loaded.get() {
-            return Ok(model.descriptor().clone());
-        }
-        self.descriptor
-            .get_or_try_init(|| async {
-                tokio::task::spawn_blocking(discover_descriptor_from_environment)
-                    .await
-                    .map_err(|error| {
-                        RuntimeError::Internal(format!(
-                            "joining moodboard descriptor discovery: {error}"
-                        ))
-                    })?
-            })
-            .await
-            .cloned()
+        let prepared = self
+            .prepared
+            .get_or_start(
+                "moodboard checkpoint preparation",
+                prepare_checkpoint_from_environment,
+            )
+            .await?;
+        Ok(prepared.descriptor.clone())
     }
 
     pub(crate) async fn get(&self) -> Result<Arc<LoadedVisionModel>, RuntimeError> {
-        let expected_descriptor = self.descriptor.get().cloned();
+        let prepared = self
+            .prepared
+            .get_or_start(
+                "moodboard checkpoint preparation",
+                prepare_checkpoint_from_environment,
+            )
+            .await?;
+        let expected_descriptor = prepared.descriptor.clone();
+        let load_checkpoint = Arc::clone(&prepared);
         let loaded = self
             .loaded
-            .get_or_try_init(|| async {
-                tokio::task::spawn_blocking(load_from_environment)
-                    .await
-                    .map_err(|error| {
-                        RuntimeError::Internal(format!("joining moodboard model loader: {error}"))
-                    })?
-                    .and_then(|loaded| {
-                        if let Some(expected) = &expected_descriptor {
-                            if loaded.descriptor() != expected {
-                                return Err(RuntimeError::Unconfigured(
-                                    "moodboard model identity changed between descriptor discovery and checkpoint load"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                        Ok(Arc::new(loaded))
-                    })
+            .get_or_start("moodboard model loader", move || {
+                load_prepared_checkpoint(load_checkpoint)
             })
             .await?;
-        let _ = self.descriptor.set(loaded.descriptor().clone());
-        Ok(Arc::clone(loaded))
+        verify_descriptor_commit(&expected_descriptor, loaded.descriptor())?;
+        Ok(loaded)
     }
 
     pub(crate) async fn infer(
@@ -238,12 +363,11 @@ impl VisionModelState {
         image_png: Vec<u8>,
         prompt: String,
     ) -> Result<Vec<f32>, RuntimeError> {
-        let _permit = self.acquire_inference_permit().await?;
-        tokio::task::spawn_blocking(move || model.embed_with_prompt(&image_png, &prompt))
-            .await
-            .map_err(|error| {
-                RuntimeError::Internal(format!("joining moodboard inference worker: {error}"))
-            })?
+        let permit = self.acquire_inference_permit().await?;
+        spawn_blocking_with_permit(permit, "moodboard inference worker", move || {
+            model.embed_with_prompt(&image_png, &prompt)
+        })
+        .await
     }
 
     async fn acquire_inference_permit(&self) -> Result<OwnedSemaphorePermit, RuntimeError> {
@@ -266,6 +390,23 @@ impl VisionModelState {
                 RuntimeError::Internal("moodboard preprocessing semaphore closed".to_string())
             })
     }
+}
+
+async fn spawn_blocking_with_permit<T, F>(
+    permit: OwnedSemaphorePermit,
+    operation: &'static str,
+    job: F,
+) -> Result<T, RuntimeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RuntimeError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        job()
+    })
+    .await
+    .map_err(|error| RuntimeError::Internal(format!("joining {operation}: {error}")))?
 }
 
 fn parse_inference_concurrency(value: Option<&str>) -> Result<usize, String> {
@@ -315,91 +456,409 @@ pub(crate) fn validate_embedding(
     Ok(())
 }
 
-fn load_from_environment() -> Result<LoadedVisionModel, RuntimeError> {
-    let discovered = discover_environment()?;
-    let model = VisionEmbeddingModel::from_directory(&discovered.model_dir).map_err(|error| {
-        RuntimeError::Unconfigured(format!(
-            "loading moodboard Qwen3.5 checkpoint from {}: {error}",
-            discovered.model_dir.display()
-        ))
+fn load_prepared_checkpoint(
+    checkpoint: Arc<PreparedCheckpoint>,
+) -> Result<LoadedVisionModel, RuntimeError> {
+    let model = load_from_prepared_snapshot(&checkpoint, |model_dir| {
+        let model = VisionEmbeddingModel::from_directory(model_dir).map_err(|error| {
+            RuntimeError::Unconfigured(format!(
+                "loading moodboard Qwen3.5 checkpoint from {}: {error}",
+                model_dir.display()
+            ))
+        })?;
+        if model.dimensions() != checkpoint.descriptor.dimensions {
+            return Err(RuntimeError::Unconfigured(format!(
+                "moodboard checkpoint loaded with {} dimensions but config identity declared {}",
+                model.dimensions(),
+                checkpoint.descriptor.dimensions
+            )));
+        }
+        Ok(model)
     })?;
-    if model.dimensions() != discovered.descriptor.dimensions {
-        return Err(RuntimeError::Unconfigured(format!(
-            "moodboard checkpoint loaded with {} dimensions but config identity declared {}",
-            model.dimensions(),
-            discovered.descriptor.dimensions
-        )));
-    }
-    verify_environment_unchanged_after_load(&discovered)?;
     Ok(LoadedVisionModel {
         model,
-        descriptor: discovered.descriptor,
+        descriptor: checkpoint.descriptor.clone(),
+        _checkpoint: checkpoint,
     })
 }
 
-fn verify_environment_unchanged_after_load(
-    discovered: &DiscoveredEnvironment,
+fn load_from_prepared_snapshot<T, F>(
+    checkpoint: &PreparedCheckpoint,
+    loader: F,
+) -> Result<T, RuntimeError>
+where
+    F: FnOnce(&Path) -> Result<T, RuntimeError>,
+{
+    let loaded = loader(checkpoint.model_dir())?;
+    let committed_descriptor = descriptor_for_checkpoint_directory(
+        checkpoint.model_dir(),
+        checkpoint.descriptor.model_revision.clone(),
+        Some(&checkpoint.descriptor.checkpoint_sha256),
+    )?;
+    verify_descriptor_commit(&checkpoint.descriptor, &committed_descriptor)?;
+    Ok(loaded)
+}
+
+fn verify_descriptor_commit(
+    expected: &DescriptorIdentity,
+    committed: &DescriptorIdentity,
 ) -> Result<(), RuntimeError> {
-    let config = read_checkpoint_config(&discovered.model_dir)?;
-    validate_checkpoint_geometry(&config)?;
-    let dimensions = checkpoint_dimensions(&config)?;
-    if dimensions != discovered.descriptor.dimensions {
+    if committed != expected {
         return Err(RuntimeError::Unconfigured(format!(
-            "moodboard checkpoint dimensions changed during load: discovered {}, post-load {dimensions}",
-            discovered.descriptor.dimensions
-        )));
-    }
-    let digest = canonical_checkpoint_sha256(&discovered.model_dir)?;
-    if digest != discovered.descriptor.checkpoint_sha256 {
-        return Err(RuntimeError::Unconfigured(format!(
-            "moodboard checkpoint bytes changed during load: discovered {}, post-load {digest}",
-            discovered.descriptor.checkpoint_sha256
+            "moodboard model identity changed between checkpoint preparation and model publication: expected {}, committed {}",
+            expected.fingerprint, committed.fingerprint
         )));
     }
     Ok(())
 }
 
-struct DiscoveredEnvironment {
-    model_dir: PathBuf,
+struct PreparedCheckpoint {
+    snapshot: tempfile::TempDir,
     descriptor: DescriptorIdentity,
 }
 
-fn discover_descriptor_from_environment() -> Result<DescriptorIdentity, RuntimeError> {
-    discover_environment().map(|discovered| discovered.descriptor)
+impl PreparedCheckpoint {
+    fn model_dir(&self) -> &Path {
+        self.snapshot.path()
+    }
 }
 
-fn discover_environment() -> Result<DiscoveredEnvironment, RuntimeError> {
+impl Drop for PreparedCheckpoint {
+    fn drop(&mut self) {
+        // TempDir cannot remove read-only files on every platform. Restore
+        // owner write permission only for this private tree immediately before
+        // its normal recursive cleanup.
+        let _ = set_snapshot_tree_readonly(self.snapshot.path(), false);
+    }
+}
+
+fn prepare_checkpoint_from_environment() -> Result<PreparedCheckpoint, RuntimeError> {
     let model_dir = required_env_path("KHIVE_MOODBOARD_MODEL_DIR")?;
     let model_revision = required_env("KHIVE_MOODBOARD_MODEL_REVISION")?;
     let expected_checkpoint_sha256 = optional_checkpoint_attestation()?;
-    discover_environment_from_inputs(
+    prepare_checkpoint_from_inputs(
         model_dir,
         model_revision,
         expected_checkpoint_sha256.as_deref(),
     )
 }
 
-fn discover_environment_from_inputs(
+fn prepare_checkpoint_from_inputs(
     model_dir: PathBuf,
     model_revision: String,
     expected_checkpoint_sha256: Option<&str>,
-) -> Result<DiscoveredEnvironment, RuntimeError> {
-    if !model_dir.is_dir() {
+) -> Result<PreparedCheckpoint, RuntimeError> {
+    let root_metadata = std::fs::symlink_metadata(&model_dir).map_err(|error| {
+        RuntimeError::Unconfigured(format!(
+            "reading KHIVE_MOODBOARD_MODEL_DIR={} metadata: {error}",
+            model_dir.display()
+        ))
+    })?;
+    if metadata_is_checkpoint_link(&root_metadata) || !root_metadata.is_dir() {
         return Err(RuntimeError::Unconfigured(format!(
-            "KHIVE_MOODBOARD_MODEL_DIR={} is not a directory",
+            "KHIVE_MOODBOARD_MODEL_DIR={} must be a non-symlink directory",
             model_dir.display()
         )));
     }
-    let config = read_checkpoint_config(&model_dir)?;
+
+    let snapshot = tempfile::Builder::new()
+        .prefix("khive-moodboard-checkpoint-")
+        .tempdir()
+        .map_err(|error| {
+            RuntimeError::Unconfigured(format!(
+                "creating private moodboard checkpoint snapshot: {error}"
+            ))
+        })?;
+    copy_checkpoint_tree(&model_dir, snapshot.path())?;
+    let descriptor = descriptor_for_checkpoint_directory(
+        snapshot.path(),
+        model_revision,
+        expected_checkpoint_sha256,
+    )?;
+    let prepared = PreparedCheckpoint {
+        snapshot,
+        descriptor,
+    };
+    set_snapshot_tree_readonly(prepared.model_dir(), true)?;
+    Ok(prepared)
+}
+
+fn descriptor_for_checkpoint_directory(
+    model_dir: &Path,
+    model_revision: String,
+    expected_checkpoint_sha256: Option<&str>,
+) -> Result<DescriptorIdentity, RuntimeError> {
+    let config = read_checkpoint_config(model_dir)?;
     validate_checkpoint_geometry(&config)?;
     let dimensions = checkpoint_dimensions(&config)?;
-    let checkpoint_sha256 = canonical_checkpoint_sha256(&model_dir)?;
+    let checkpoint_sha256 = canonical_checkpoint_sha256(model_dir)?;
     verify_checkpoint_attestation(expected_checkpoint_sha256, &checkpoint_sha256)?;
-    let descriptor = DescriptorIdentity::build(model_revision, checkpoint_sha256, dimensions)?;
-    Ok(DiscoveredEnvironment {
-        model_dir,
-        descriptor,
-    })
+    DescriptorIdentity::build(model_revision, checkpoint_sha256, dimensions)
+}
+
+fn copy_checkpoint_tree(source_root: &Path, destination_root: &Path) -> Result<(), RuntimeError> {
+    copy_checkpoint_tree_with(source_root, destination_root, |_| Ok(()))
+}
+
+fn copy_checkpoint_tree_with<F>(
+    source_root: &Path,
+    destination_root: &Path,
+    mut before_open: F,
+) -> Result<(), RuntimeError>
+where
+    F: FnMut(&Path) -> Result<(), RuntimeError>,
+{
+    let canonical_root = std::fs::canonicalize(source_root).map_err(|error| {
+        RuntimeError::Unconfigured(format!(
+            "canonicalizing moodboard checkpoint root {}: {error}",
+            source_root.display()
+        ))
+    })?;
+    let mut files = Vec::new();
+    collect_checkpoint_files(source_root, source_root, &mut files)?;
+    if files.len() > 100_000 {
+        return Err(RuntimeError::Unconfigured(format!(
+            "moodboard checkpoint contains {} files, exceeding the 100000-file snapshot limit",
+            files.len()
+        )));
+    }
+    files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    for (relative, source_path) in files {
+        let destination_path = destination_root.join(&relative);
+        let parent = destination_path.parent().ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "deriving private checkpoint parent for {}",
+                destination_path.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            RuntimeError::Unconfigured(format!(
+                "creating private checkpoint directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+
+        before_open(&source_path)?;
+        // The opened handle, rather than the earlier directory entry, is the
+        // security boundary. Resolve that handle after open and reject it
+        // unless the actual file object is still rooted in the canonical
+        // model directory. A symlink/directory swap between collection and
+        // open therefore fails closed; later renames cannot change the bytes
+        // read through this handle.
+        let mut source = open_checkpoint_source(&canonical_root, &source_path)?;
+        let source_size = source
+            .metadata()
+            .map_err(|error| {
+                RuntimeError::Unconfigured(format!(
+                    "reading checkpoint source metadata {}: {error}",
+                    source_path.display()
+                ))
+            })?
+            .len();
+        let mut destination = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&destination_path)
+            .map_err(|error| {
+                RuntimeError::Unconfigured(format!(
+                    "creating private checkpoint file {}: {error}",
+                    destination_path.display()
+                ))
+            })?;
+        let copied = std::io::copy(&mut source, &mut destination).map_err(|error| {
+            RuntimeError::Unconfigured(format!(
+                "copying checkpoint source {} into private snapshot: {error}",
+                source_path.display()
+            ))
+        })?;
+        if copied != source_size {
+            return Err(RuntimeError::Unconfigured(format!(
+                "checkpoint source {} changed while snapshotting (metadata {source_size} bytes, copied {copied})",
+                source_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn open_checkpoint_source(
+    canonical_root: &Path,
+    source_path: &Path,
+) -> Result<std::fs::File, RuntimeError> {
+    let source = std::fs::File::open(source_path).map_err(|error| {
+        RuntimeError::Unconfigured(format!(
+            "opening checkpoint source {} for private snapshot: {error}",
+            source_path.display()
+        ))
+    })?;
+    let metadata = source.metadata().map_err(|error| {
+        RuntimeError::Unconfigured(format!(
+            "reading opened checkpoint source metadata {}: {error}",
+            source_path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(RuntimeError::Unconfigured(format!(
+            "opened checkpoint source is not a regular file: {}",
+            source_path.display()
+        )));
+    }
+    let opened_path = opened_file_path(&source).map_err(|error| {
+        RuntimeError::Unconfigured(format!(
+            "resolving opened checkpoint source {}: {error}",
+            source_path.display()
+        ))
+    })?;
+    if !opened_path.starts_with(canonical_root) {
+        return Err(RuntimeError::Unconfigured(format!(
+            "opened checkpoint source escapes model directory: {} -> {}",
+            source_path.display(),
+            opened_path.display()
+        )));
+    }
+    Ok(source)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut bytes = vec![0_u8; libc::PATH_MAX as usize];
+    // SAFETY: `file` owns a live descriptor and `bytes` is a writable
+    // PATH_MAX-sized buffer for F_GETPATH. fcntl writes a NUL-terminated path
+    // on success and does not retain the pointer.
+    let result = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_GETPATH,
+            bytes.as_mut_ptr().cast::<libc::c_void>(),
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let length = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "F_GETPATH returned no NUL terminator",
+        )
+    })?;
+    Ok(PathBuf::from(OsStr::from_bytes(&bytes[..length])))
+}
+
+#[cfg(windows)]
+fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+
+    let mut path = vec![0_u16; 260];
+    loop {
+        // SAFETY: `file` owns a live handle and `path` exposes the writable
+        // buffer and length passed to the Win32 API for this call only.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let length = length as usize;
+        if length < path.len() {
+            path.truncate(length);
+            return Ok(PathBuf::from(OsString::from_wide(&path)));
+        }
+        path.resize(length.saturating_add(1), 0);
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn opened_file_path(_file: &std::fs::File) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure opened-file path resolution is unsupported on this Unix target",
+    ))
+}
+
+fn set_snapshot_tree_readonly(root: &Path, readonly: bool) -> Result<(), RuntimeError> {
+    fn collect_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        paths.push(directory.to_path_buf());
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                collect_paths(&path, paths)?;
+            } else {
+                paths.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    collect_paths(root, &mut paths).map_err(|error| {
+        RuntimeError::Unconfigured(format!(
+            "walking private checkpoint snapshot {}: {error}",
+            root.display()
+        ))
+    })?;
+    // Seal children before parents. During cleanup, restore parent traversal
+    // and mutation permission before touching children.
+    paths.sort_by_key(|path| path.components().count());
+    if readonly {
+        paths.reverse();
+    }
+    for path in paths {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            RuntimeError::Unconfigured(format!(
+                "reading private checkpoint permissions {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let owner_write = if readonly { 0 } else { 0o200 };
+            permissions.set_mode((permissions.mode() & !0o222) | owner_write);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(readonly);
+        std::fs::set_permissions(&path, permissions).map_err(|error| {
+            RuntimeError::Unconfigured(format!(
+                "{} private checkpoint path {}: {error}",
+                if readonly { "sealing" } else { "unsealing" },
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn checkpoint_dimensions(config: &serde_json::Value) -> Result<usize, RuntimeError> {
@@ -548,17 +1007,19 @@ fn collect_checkpoint_files(
             ))
         })?;
         let path = entry.path();
-        let file_type = entry.file_type().map_err(|error| {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
             RuntimeError::Unconfigured(format!(
                 "reading moodboard checkpoint file type {}: {error}",
                 path.display()
             ))
         })?;
-        if file_type.is_dir() {
+        let file_type = metadata.file_type();
+        let is_link = metadata_is_checkpoint_link(&metadata);
+        if file_type.is_dir() && !is_link {
             collect_checkpoint_files(root, &path, files)?;
             continue;
         }
-        if file_type.is_symlink() {
+        if is_link {
             let target = std::fs::metadata(&path).map_err(|error| {
                 RuntimeError::Unconfigured(format!(
                     "resolving moodboard checkpoint symlink {}: {error}",
@@ -634,6 +1095,21 @@ fn collect_checkpoint_files(
         }
     }
     Ok(())
+}
+
+fn metadata_is_checkpoint_link(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn required_env(name: &str) -> Result<String, RuntimeError> {
@@ -898,7 +1374,91 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_discovery_accepts_omitted_checkpoint_attestation() {
+    fn canonical_checkpoint_digest_matches_independent_nested_golden() {
+        let checkpoint = tempfile::tempdir().unwrap();
+        std::fs::create_dir(checkpoint.path().join("weights")).unwrap();
+        std::fs::write(checkpoint.path().join("config.json"), b"config\n").unwrap();
+        std::fs::write(checkpoint.path().join("tokenizer.json"), b"tokenizer").unwrap();
+        std::fs::write(
+            checkpoint.path().join("weights/model.bin"),
+            b"\x00\x01weights\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            canonical_checkpoint_sha256(checkpoint.path()).unwrap(),
+            "6dfb8c119af6525c58247ef3021e9143ded6de7019be0daed595acd477a41f8e"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_symlink_policy_accepts_internal_files_and_rejects_boundaries() {
+        use std::os::unix::fs::symlink;
+
+        let checkpoint = tempfile::tempdir().unwrap();
+        std::fs::write(checkpoint.path().join("weights.bin"), b"internal").unwrap();
+        symlink("weights.bin", checkpoint.path().join("alias.bin")).unwrap();
+        canonical_checkpoint_sha256(checkpoint.path()).expect("internal file symlink is accepted");
+        let snapshot = tempfile::tempdir().unwrap();
+        copy_checkpoint_tree(checkpoint.path(), snapshot.path())
+            .expect("internal file symlink is materialized into the snapshot");
+        assert_eq!(
+            std::fs::read(snapshot.path().join("alias.bin")).unwrap(),
+            b"internal"
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside.bin"), b"outside").unwrap();
+        symlink(
+            outside.path().join("outside.bin"),
+            checkpoint.path().join("escape.bin"),
+        )
+        .unwrap();
+        let error = canonical_checkpoint_sha256(checkpoint.path()).unwrap_err();
+        assert!(error.to_string().contains("escapes model directory"));
+        std::fs::remove_file(checkpoint.path().join("escape.bin")).unwrap();
+
+        std::fs::create_dir(checkpoint.path().join("nested")).unwrap();
+        symlink("nested", checkpoint.path().join("nested-link")).unwrap();
+        let error = canonical_checkpoint_sha256(checkpoint.path()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("directory symlinks are unsupported"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_copy_rejects_escape_swapped_in_after_collection() {
+        use std::os::unix::fs::symlink;
+
+        let checkpoint = tempfile::tempdir().unwrap();
+        std::fs::write(checkpoint.path().join("config.json"), b"config").unwrap();
+        let victim = checkpoint.path().join("weights.bin");
+        std::fs::write(&victim, b"trusted").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.bin");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+        let mut swapped = false;
+
+        let error = copy_checkpoint_tree_with(checkpoint.path(), snapshot.path(), |source_path| {
+            if source_path == victim && !swapped {
+                std::fs::remove_file(source_path).unwrap();
+                symlink(&outside_file, source_path).unwrap();
+                swapped = true;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(swapped, "test must swap the source after collection");
+        assert!(error
+            .to_string()
+            .contains("opened checkpoint source escapes model directory"));
+    }
+
+    #[test]
+    fn checkpoint_preparation_accepts_omitted_attestation() {
         let checkpoint = tempfile::tempdir().unwrap();
         std::fs::write(
             checkpoint.path().join("config.json"),
@@ -910,41 +1470,74 @@ mod tests {
         .unwrap();
         std::fs::write(checkpoint.path().join("model.safetensors"), b"fixture").unwrap();
 
-        let discovered = discover_environment_from_inputs(
+        let prepared = prepare_checkpoint_from_inputs(
             checkpoint.path().to_path_buf(),
             "fixture-r1".to_string(),
             None,
         )
         .unwrap();
-        assert_eq!(discovered.descriptor.dimensions, 4);
+        assert_eq!(prepared.descriptor.dimensions, 4);
         assert_eq!(
-            discovered.descriptor.checkpoint_sha256,
+            prepared.descriptor.checkpoint_sha256,
             canonical_checkpoint_sha256(checkpoint.path()).unwrap()
         );
+        assert_ne!(prepared.model_dir(), checkpoint.path());
     }
 
     #[test]
-    fn post_load_verification_rejects_mutation_after_discovery() {
-        let checkpoint = tempfile::tempdir().unwrap();
+    fn private_snapshot_binds_identity_across_atomic_source_replacement() {
+        let parent = tempfile::tempdir().unwrap();
+        let checkpoint = parent.path().join("checkpoint");
+        std::fs::create_dir(&checkpoint).unwrap();
         std::fs::write(
-            checkpoint.path().join("config.json"),
+            checkpoint.join("config.json"),
             br#"{
                 "vision_config":{"patch_size":16,"spatial_merge_size":2},
                 "text_config":{"hidden_size":4}
             }"#,
         )
         .unwrap();
-        std::fs::write(checkpoint.path().join("model.safetensors"), b"fixture-v1").unwrap();
-        let discovered = discover_environment_from_inputs(
-            checkpoint.path().to_path_buf(),
-            "fixture-r1".to_string(),
-            None,
+        std::fs::write(checkpoint.join("model.safetensors"), b"trusted-v1").unwrap();
+        let prepared =
+            prepare_checkpoint_from_inputs(checkpoint.clone(), "fixture-r1".to_string(), None)
+                .unwrap();
+
+        let retired = parent.path().join("checkpoint-retired");
+        std::fs::rename(&checkpoint, &retired).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        std::fs::write(
+            checkpoint.join("config.json"),
+            br#"{
+                "vision_config":{"patch_size":16,"spatial_merge_size":2},
+                "text_config":{"hidden_size":4}
+            }"#,
         )
         .unwrap();
+        std::fs::write(checkpoint.join("model.safetensors"), b"untrusted-v2").unwrap();
 
-        std::fs::write(checkpoint.path().join("model.safetensors"), b"fixture-v2").unwrap();
-        let error = verify_environment_unchanged_after_load(&discovered).unwrap_err();
-        assert!(error.to_string().contains("changed during load"));
+        let loaded_bytes = load_from_prepared_snapshot(&prepared, |model_dir| {
+            std::fs::read(model_dir.join("model.safetensors"))
+                .map_err(|error| RuntimeError::Internal(format!("fake snapshot loader: {error}")))
+        })
+        .unwrap();
+        assert_eq!(loaded_bytes, b"trusted-v1");
+        assert_eq!(
+            canonical_checkpoint_sha256(prepared.model_dir()).unwrap(),
+            prepared.descriptor.checkpoint_sha256
+        );
+        assert_ne!(
+            canonical_checkpoint_sha256(&checkpoint).unwrap(),
+            prepared.descriptor.checkpoint_sha256
+        );
+    }
+
+    #[test]
+    fn descriptor_commit_rejects_mismatched_publication() {
+        let expected = DescriptorIdentity::fixture(4);
+        let committed =
+            DescriptorIdentity::build("other-revision".to_string(), "a".repeat(64), 4).unwrap();
+        let error = verify_descriptor_commit(&expected, &committed).unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
     }
 
     #[test]
@@ -957,10 +1550,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocking_stage_survives_first_waiter_cancellation_without_duplicate_work() {
+        let stage = Arc::new(BlockingStage::<usize>::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let first_stage = Arc::clone(&stage);
+        let first_calls = Arc::clone(&calls);
+        let first_entered = Arc::clone(&entered);
+        let first_release = Arc::clone(&release);
+        let first = tokio::spawn(async move {
+            first_stage
+                .get_or_start("fake single-flight job", move || {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    first_entered.store(true, Ordering::SeqCst);
+                    while !first_release.load(Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                    Ok(7)
+                })
+                .await
+        });
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        let _ = first.await;
+
+        release.store(true, Ordering::SeqCst);
+        let second_calls = Arc::clone(&calls);
+        let value = stage
+            .get_or_start("fake single-flight job", move || {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(9)
+            })
+            .await
+            .unwrap();
+        assert_eq!(*value, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn inference_gate_bounds_fake_peak_concurrency() {
         let state = Arc::new(VisionModelState {
-            loaded: OnceCell::new(),
-            descriptor: OnceCell::new(),
+            prepared: Arc::new(BlockingStage::default()),
+            loaded: Arc::new(BlockingStage::default()),
             preprocessing_gate: Arc::new(Semaphore::new(1)),
             inference_gate: Ok(Arc::new(Semaphore::new(1))),
         });
@@ -986,10 +1621,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_inference_waiter_does_not_release_native_work_permit() {
+        let state = Arc::new(VisionModelState {
+            prepared: Arc::new(BlockingStage::default()),
+            loaded: Arc::new(BlockingStage::default()),
+            preprocessing_gate: Arc::new(Semaphore::new(1)),
+            inference_gate: Ok(Arc::new(Semaphore::new(1))),
+        });
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_state = Arc::clone(&state);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let worker = tokio::spawn(async move {
+            let permit = worker_state.acquire_inference_permit().await.unwrap();
+            spawn_blocking_with_permit(permit, "fake inference", move || {
+                worker_entered.store(true, Ordering::SeqCst);
+                while !worker_release.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                Ok(())
+            })
+            .await
+        });
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state.inference_gate.as_ref().unwrap().available_permits(),
+            0
+        );
+        worker.abort();
+        let _ = worker.await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state.inference_gate.as_ref().unwrap().available_permits(),
+            0,
+            "caller cancellation must not release a permit still owned by native work"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        let permit = state.acquire_inference_permit().await.unwrap();
+        drop(permit);
+    }
+
+    #[tokio::test]
     async fn preprocessing_gate_bounds_fake_peak_concurrency() {
         let state = Arc::new(VisionModelState {
-            loaded: OnceCell::new(),
-            descriptor: OnceCell::new(),
+            prepared: Arc::new(BlockingStage::default()),
+            loaded: Arc::new(BlockingStage::default()),
             preprocessing_gate: Arc::new(Semaphore::new(1)),
             inference_gate: Ok(Arc::new(Semaphore::new(1))),
         });
@@ -1016,7 +1696,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires KHIVE_MOODBOARD_* and a real Qwen3.5 checkpoint"]
-    async fn real_checkpoint_descriptor_discovery_is_load_free() {
+    async fn real_checkpoint_preparation_is_model_load_free() {
         let started = std::time::Instant::now();
         let descriptor = VisionModelState::default().describe().await.unwrap();
         assert_eq!(descriptor.schema_version, SCHEMA_VERSION);
