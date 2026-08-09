@@ -346,7 +346,7 @@ impl SubstrateCoordinator {
         relation: EdgeRelation,
         weight: f64,
         metadata: Option<serde_json::Value>,
-    ) -> Result<khive_storage::Edge, String> {
+    ) -> Result<khive_runtime::LinkWriteOutcome, String> {
         let src_located = self
             .locate_endpoint(source_id, namespace)
             .await
@@ -428,7 +428,7 @@ impl SubstrateCoordinator {
             None
         };
 
-        let edge = src_runtime
+        let outcome = src_runtime
             .link_with_target_backend(
                 &token,
                 source_id,
@@ -441,7 +441,7 @@ impl SubstrateCoordinator {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(edge)
+        Ok(outcome)
     }
 
     // ---- D4: Fan-out search ----

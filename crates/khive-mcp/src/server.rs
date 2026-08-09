@@ -1445,6 +1445,10 @@ async fn dispatch_via_coordinator_inner(
                             .map_err(RuntimeError::from)?;
                         let mut raw = serde_json::to_value(&coord_result.edge)
                             .unwrap_or_else(|e| json!({"error": format!("serialize edge: {e}")}));
+                        if let Some(obj) = raw.as_object_mut() {
+                            obj.insert("created".to_string(), json!(coord_result.created));
+                            obj.insert("reused".to_string(), json!(!coord_result.created));
+                        }
                         if relation.is_symmetric() {
                             if let Some(obj) = raw.as_object_mut() {
                                 obj.insert("source_id".to_string(), json!(source_id.to_string()));

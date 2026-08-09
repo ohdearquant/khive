@@ -8,8 +8,8 @@ use crate::capability::StorageCapability;
 use crate::error::StorageError;
 use crate::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedWriteOutcome, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder, StorageResult,
+    EdgeSortField, EdgeUpsertOutcome, GraphPath, GuardedBatchOutcome, GuardedWriteOutcome, LinkId,
+    NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder, StorageResult,
     TraversalRequest,
 };
 
@@ -18,6 +18,21 @@ use crate::types::{
 pub trait GraphStore: Send + Sync + 'static {
     /// Insert or update a single edge.
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
+    /// Insert or update one edge and return the persisted row plus whether the
+    /// candidate row was newly inserted. The outcome must be materialized by
+    /// the writes inside their transaction; a post-commit read cannot satisfy
+    /// this contract because another writer may delete or replace the row first.
+    ///
+    /// This unguarded form supports coordinator writes whose target endpoint
+    /// lives on another backend. Same-backend public `link` uses
+    /// [`GraphStore::upsert_edge_guarded`] instead.
+    async fn upsert_edge_with_outcome(&self, _edge: Edge) -> StorageResult<EdgeUpsertOutcome> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "upsert_edge_with_outcome".into(),
+            message: "this backend does not implement atomic edge upsert outcomes".into(),
+        })
+    }
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
     /// Insert or update a single edge, re-checking that both endpoints still

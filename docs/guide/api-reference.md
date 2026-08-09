@@ -478,7 +478,8 @@ request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"ext
 The singleton response is the persisted edge plus `created` and `reused` booleans. Exactly one is
 true: a new natural-key row reports `created: true`; an existing or soft-delete-revived row keeps
 its persisted id and reports `reused: true`. The disposition is derived from the atomic upsert and
-readback, not from a racy preflight lookup.
+write-side `RETURNING` rows inside the writer transaction, not from a racy preflight or post-commit
+lookup.
 
 Bulk `links=[...]` responses separate rows already present in storage from duplicates within the
 request: `created` and `reused` count persisted dispositions, while `skipped` counts request-local

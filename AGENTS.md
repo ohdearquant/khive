@@ -102,7 +102,8 @@ request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_c
 `link` is an idempotent natural-key upsert. Singleton results include `created` and `reused`
 booleans (exactly one true) and always return the persisted edge id; relinking or reviving a row is
 `reused`. Bulk results count persisted `created` and `reused` rows separately, while `skipped`
-continues to mean duplicate entries removed within that one request.
+continues to mean duplicate entries removed within that one request. Dispositions and persisted ids
+come from write-side `RETURNING` rows inside the writer transaction, never a post-commit readback.
 
 ### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 

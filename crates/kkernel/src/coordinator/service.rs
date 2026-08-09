@@ -70,11 +70,12 @@ impl CoordinatorService for SubstrateCoordinatorService {
         self.inner
             .link_cross_backend(namespace, source_id, target_id, relation, weight, metadata)
             .await
-            .map(|edge| {
-                let cross_backend = edge.target_backend.is_some();
-                let target_backend_id = edge.target_backend.as_deref().map(BackendId::new);
+            .map(|outcome| {
+                let cross_backend = outcome.edge.target_backend.is_some();
+                let target_backend_id = outcome.edge.target_backend.as_deref().map(BackendId::new);
                 CoordLinkResult {
-                    edge,
+                    edge: outcome.edge,
+                    created: outcome.created,
                     cross_backend,
                     target_backend_id,
                 }

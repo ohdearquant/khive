@@ -1353,7 +1353,12 @@ async fn t2_cross_backend_link_stamps_target_backend() {
         "T2: cross-backend link must succeed: {:?}",
         result.err()
     );
-    let edge = result.unwrap();
+    let first = result.unwrap();
+    assert!(
+        first.created,
+        "T2: the first natural-key write must be created"
+    );
+    let edge = first.edge;
 
     // The edge must be written on "main" (source backend) with target_backend="lore".
     assert_eq!(
@@ -1363,6 +1368,17 @@ async fn t2_cross_backend_link_stamps_target_backend() {
     );
     assert_eq!(edge.source_id, src.id, "T2: correct source_id");
     assert_eq!(edge.target_id, tgt.id, "T2: correct target_id");
+
+    let reused = coord
+        .link_cross_backend(&ns, src.id, tgt.id, EdgeRelation::Implements, 0.7, None)
+        .await
+        .expect("T2: repeated cross-backend link must succeed");
+    assert!(
+        !reused.created,
+        "T2: repeated natural key must report reuse"
+    );
+    assert_eq!(reused.edge.id, edge.id, "T2: reuse must preserve stored id");
+    assert_eq!(reused.edge.weight, 0.7, "T2: reuse returns updated row");
 }
 
 // ---- T2b: Cross-backend link rejects an illegal entity pair without persisting ----

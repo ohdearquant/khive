@@ -321,8 +321,10 @@ transcript event: uuid key, session id, per-session `seq`, parent uuid, sidechai
 role, type, masked text, masked raw, timestamp), and `session_mirror_cursor` (one row per
 watched file: byte offset, nullable platform file-identity witness, session id, updated-at).
 Existing cursor tables are upgraded in place with a guarded nullable-column migration. On Unix
-the witness is device plus inode; on Windows it is volume serial plus file index. Platforms or
-filesystems that cannot provide either retain the length-only fallback.
+the witness is device plus inode. On Windows the stable Win32 open-handle API
+`GetFileInformationByHandle` supplies volume serial plus file index; the unstable Rust
+`MetadataExt` accessors are not used, and the existing `windows:<volume>:<index>` cursor encoding is
+unchanged. Platforms or filesystems that cannot provide either retain the length-only fallback.
 
 #### Invariants (normative for every source)
 

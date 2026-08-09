@@ -260,7 +260,10 @@ origin, issue #1670); `get(edge_id)` is the supported direction read.
 **Upsert disposition (normative response contract).** A singleton `link` result carries exactly
 one true boolean across `created` and `reused`. Inserting a new natural-key row yields
 `created=true`; updating or reviving an existing row yields `reused=true` and returns that row's
-persisted id. The decision is made from the atomic upsert/readback outcome, never a preflight read.
+persisted id. The write path obtains the persisted row from SQLite `RETURNING` output inside its
+writer transaction: a successful insert proves creation, while the conflict update/revival proves
+reuse. The decision never uses either a preflight read or a post-commit natural-key lookup that
+another writer could race.
 For bulk calls, `created` and `reused` are counts of those persisted outcomes; `skipped` remains the
 separate count of duplicate natural keys removed within the request before persistence.
 

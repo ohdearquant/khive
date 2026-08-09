@@ -25,6 +25,11 @@ the old length; a length below the offset catches in-place truncation. `read_bou
 restarts directly when a caller supplies an offset beyond current EOF. The cursor stores the
 identity observed for the consumed file alongside the successfully consumed offset, while
 platforms without a portable witness retain the strict length-decrease fallback.
+Unix derives the witness from stable device/inode metadata. Windows queries volume serial and file
+index through stable `GetFileInformationByHandle` on the already-open file; it does not use Rust's
+unstable Windows `MetadataExt` identity methods. The `windows:<volume>:<index>` cursor value remains
+byte-for-byte compatible with existing rows. A Windows filesystem that declines that query uses the
+same documented length-only fallback.
 If the identity changes between the service's metadata probe and the ingest file-open, that pass is
 refused and retried after reconciliation. Deferred cursor-only advances carry the opened file's
 witness through the commit instead of re-statting the path, so replacement cannot pair an old

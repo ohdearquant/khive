@@ -5711,8 +5711,9 @@ async fn search_missing_kind_lists_registry_kinds_including_other_packs() {
 //
 // Before this fix, each call generated a fresh UUID before the insert; the
 // losing calls returned their locally-generated IDs even though the database
-// stored a different (winning) row ID.  After the fix, link() reads back the
-// persisted row by natural key so every caller receives the same stored ID.
+// stored a different (winning) row ID. After the fix, each link write returns
+// its persisted row and disposition before releasing the writer transaction,
+// so every caller receives the same stored ID and exactly one reports creation.
 #[tokio::test]
 async fn parallel_link_same_triple_returns_identical_ids() {
     let pack = pack();
@@ -5761,6 +5762,30 @@ async fn parallel_link_same_triple_returns_identical_ids() {
     assert!(
         !id1.is_empty() && id1 == id2 && id2 == id3,
         "H1: all three parallel link() calls must return the same edge ID; got: {id1:?}, {id2:?}, {id3:?}"
+    );
+    let outcomes = [&edge1, &edge2, &edge3];
+    assert!(outcomes.iter().all(|edge| matches!(
+        (
+            edge.get("created").and_then(Value::as_bool),
+            edge.get("reused").and_then(Value::as_bool)
+        ),
+        (Some(true), Some(false)) | (Some(false), Some(true))
+    )));
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|edge| edge.get("created").and_then(Value::as_bool) == Some(true))
+            .count(),
+        1,
+        "H1: exactly one concurrent write must report creation: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|edge| edge.get("reused").and_then(Value::as_bool) == Some(true))
+            .count(),
+        2,
+        "H1: both conflict updates must report reuse: {outcomes:?}"
     );
 
     // Exactly one edge row must exist for this triple.

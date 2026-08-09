@@ -1469,8 +1469,8 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
         let mut rows_inserted: u64 = 0;
 
         for scheduled_file in scheduled {
-            let metadata = match std::fs::metadata(&scheduled_file.path) {
-                Ok(metadata) => metadata,
+            let (metadata, current_identity) = match ingest::probe_file(&scheduled_file.path) {
+                Ok(probe) => probe,
                 Err(e) => {
                     let missing = e.kind() == io::ErrorKind::NotFound;
                     discovery.record_probe_error(
@@ -1496,7 +1496,6 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             };
             let file_len = metadata.len();
             let modified = metadata.modified().ok();
-            let current_identity = ingest::metadata_file_identity(&metadata);
             let cursor = cursors
                 .entry(scheduled_file.path.clone())
                 .or_insert_with(|| MirrorCursorState {
@@ -2839,7 +2838,9 @@ mod cursor_retry_tests {
         DiscoveredKind, DiscoveryIndex, MirrorCursorState, CURSOR_DELETE_RETRY_LIMIT,
         FILE_ERROR_POLLS_BEFORE_COLD,
     };
-    use crate::mirror::ingest::{metadata_file_identity, mirror_file, LineTailSource, MirrorStats};
+    #[cfg(unix)]
+    use crate::mirror::ingest::metadata_file_identity;
+    use crate::mirror::ingest::{mirror_file, LineTailSource, MirrorStats};
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
     use khive_runtime::{AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig};
     use khive_storage::types::{SqlStatement, SqlValue};

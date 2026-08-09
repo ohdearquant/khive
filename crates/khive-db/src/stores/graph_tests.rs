@@ -3734,12 +3734,118 @@ async fn upsert_edge_guarded_succeeds_when_both_endpoints_exist() {
     let edge_id = edge.id;
     let outcome = store.upsert_edge_guarded(edge).await.unwrap();
 
-    assert_eq!(
-        outcome,
-        khive_storage::GuardedWriteOutcome::Written,
-        "guarded write must succeed when both endpoints exist"
+    let written = match outcome {
+        khive_storage::GuardedWriteOutcome::Written(written) => written,
+        other => panic!("guarded write must succeed when both endpoints exist, got {other:?}"),
+    };
+    assert!(
+        written.created,
+        "the first natural-key write must be created"
     );
+    assert_eq!(written.edge.id, edge_id);
     assert!(store.get_edge(edge_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn guarded_upsert_returns_the_persisted_reuse_disposition_from_its_write() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+
+    let first_candidate = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let first_candidate_id = first_candidate.id;
+    let first = match store.upsert_edge_guarded(first_candidate).await.unwrap() {
+        khive_storage::GuardedWriteOutcome::Written(written) => written,
+        other => panic!("first guarded upsert must write, got {other:?}"),
+    };
+    assert!(first.created);
+    assert_eq!(first.edge.id, first_candidate_id);
+
+    let second_candidate = make_edge(source, target, EdgeRelation::Extends, 0.4);
+    let second_candidate_id = second_candidate.id;
+    let second = match store.upsert_edge_guarded(second_candidate).await.unwrap() {
+        khive_storage::GuardedWriteOutcome::Written(written) => written,
+        other => panic!("second guarded upsert must write, got {other:?}"),
+    };
+    assert!(
+        !second.created,
+        "the existing natural key must report reuse"
+    );
+    assert_ne!(second.edge.id, second_candidate_id);
+    assert_eq!(
+        second.edge.id, first.edge.id,
+        "reuse must preserve the stored id"
+    );
+    assert_eq!(
+        second.edge.weight, 0.4,
+        "the returned row must be the updated row"
+    );
+
+    assert!(store
+        .delete_edge(second.edge.id, khive_storage::DeleteMode::Soft)
+        .await
+        .unwrap());
+    assert!(store.get_edge(second.edge.id).await.unwrap().is_none());
+    let revived_candidate = make_edge(source, target, EdgeRelation::Extends, 0.7);
+    let revived = match store.upsert_edge_guarded(revived_candidate).await.unwrap() {
+        khive_storage::GuardedWriteOutcome::Written(written) => written,
+        other => panic!("revival must write, got {other:?}"),
+    };
+    assert!(!revived.created, "soft-delete revival is reuse");
+    assert_eq!(revived.edge.id, first.edge.id);
+    assert!(revived.edge.deleted_at.is_none());
+    assert_eq!(revived.edge.weight, 0.7);
+
+    // A mutation after the upsert cannot invalidate or replace the disposition:
+    // the witness is already materialized from the write statement itself.
+    assert!(store
+        .delete_edge(revived.edge.id, khive_storage::DeleteMode::Hard)
+        .await
+        .unwrap());
+    assert_eq!(revived.edge.id, first.edge.id);
+    assert!(!revived.created);
+}
+
+#[tokio::test]
+async fn unguarded_upsert_returns_atomic_disposition_for_cross_backend_linking() {
+    let store = setup_memory_store();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let first_candidate = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let first_id = first_candidate.id;
+
+    let first = store
+        .upsert_edge_with_outcome(first_candidate)
+        .await
+        .unwrap();
+    assert!(first.created);
+    assert_eq!(first.edge.id, first_id);
+
+    let mut same_id_candidate = make_edge(source, target, EdgeRelation::Extends, 0.9);
+    same_id_candidate.id = first_id;
+    let same_id_reused = store
+        .upsert_edge_with_outcome(same_id_candidate)
+        .await
+        .unwrap();
+    assert!(
+        !same_id_reused.created,
+        "an id conflict is an update, even though candidate and persisted ids match"
+    );
+    assert_eq!(same_id_reused.edge.id, first_id);
+    assert_eq!(same_id_reused.edge.weight, 0.9);
+
+    let second_candidate = make_edge(source, target, EdgeRelation::Extends, 0.8);
+    let second_id = second_candidate.id;
+    let reused = store
+        .upsert_edge_with_outcome(second_candidate)
+        .await
+        .unwrap();
+    assert!(!reused.created);
+    assert_ne!(reused.edge.id, second_id);
+    assert_eq!(reused.edge.id, first_id);
+    assert_eq!(reused.edge.weight, 0.8);
 }
 
 /// Reproduces #769's failure scenario at the layer where the bug actually
@@ -3827,10 +3933,60 @@ async fn upsert_edges_guarded_succeeds_when_all_endpoints_exist() {
     assert_eq!(outcome.summary.attempted, 2);
     assert_eq!(outcome.summary.affected, 2);
     assert!(outcome.refused.is_none());
+    assert_eq!(outcome.writes.len(), 2);
+    assert!(outcome.writes.iter().all(|write| write.created));
+    assert_eq!(
+        outcome
+            .writes
+            .iter()
+            .map(|write| write.edge.id)
+            .collect::<Vec<_>>(),
+        ids,
+        "batch outcomes must stay in request order and carry persisted ids"
+    );
 
     for id in ids {
         assert!(store.get_edge(id).await.unwrap().is_some());
     }
+}
+
+#[tokio::test]
+async fn guarded_batch_returns_mixed_atomic_dispositions_in_request_order() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let reused_target = Uuid::new_v4();
+    let created_target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, reused_target);
+    insert_live_entity(&pool, created_target);
+
+    let seeded = make_edge(source, reused_target, EdgeRelation::Extends, 1.0);
+    let seeded_id = seeded.id;
+    let seeded = match store.upsert_edge_guarded(seeded).await.unwrap() {
+        khive_storage::GuardedWriteOutcome::Written(written) => written,
+        other => panic!("seed upsert must write, got {other:?}"),
+    };
+    assert!(seeded.created);
+
+    let reuse_candidate = make_edge(source, reused_target, EdgeRelation::Extends, 0.6);
+    let reuse_candidate_id = reuse_candidate.id;
+    let create_candidate = make_edge(source, created_target, EdgeRelation::Extends, 0.8);
+    let create_candidate_id = create_candidate.id;
+    let outcome = store
+        .upsert_edges_guarded(vec![reuse_candidate, create_candidate])
+        .await
+        .unwrap();
+
+    assert!(outcome.refused.is_none());
+    assert_eq!(outcome.summary.attempted, 2);
+    assert_eq!(outcome.summary.affected, 2);
+    assert_eq!(outcome.writes.len(), 2);
+    assert!(!outcome.writes[0].created);
+    assert_eq!(outcome.writes[0].edge.id, seeded_id);
+    assert_ne!(outcome.writes[0].edge.id, reuse_candidate_id);
+    assert_eq!(outcome.writes[0].edge.weight, 0.6);
+    assert!(outcome.writes[1].created);
+    assert_eq!(outcome.writes[1].edge.id, create_candidate_id);
 }
 
 /// Batch form of #769's regression: one edge in the batch targets an
@@ -3864,6 +4020,10 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
     assert_eq!(
         outcome.summary.affected, 0,
         "no edge from the batch may be persisted when any endpoint is missing"
+    );
+    assert!(
+        outcome.writes.is_empty(),
+        "a refused all-or-nothing batch must expose no persisted write outcomes"
     );
     let refusal = outcome
         .refused

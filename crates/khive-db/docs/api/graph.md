@@ -13,35 +13,49 @@ Routes a single-row write through the pool-wide `WriterTask` when
 `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise falls back to the
 legacy standalone-connection / pool-mutex path. This is the ONE routing
 point for every `with_writer` caller in this store (`upsert_edge`,
-`delete_edge`, `purge_incident_edges`). `f` must be DML-only — on the
-flag-on path it runs inside the WriterTask's own transaction, so a bare
-`BEGIN IMMEDIATE` would violate SQLite's nested-transaction rule.
-`upsert_edges` (the batch method) does its own flag check and returns early
-on `Some`, so its fallback call into this helper only ever executes on the
-flag-off path (`self.writer_task` is `None` by construction whenever that
-call is reached) — no double-routing.
+`upsert_edge_with_outcome`, `upsert_edge_guarded`, `delete_edge`,
+`purge_incident_edges`). Single-statement callers pass DML-only closures; on
+the flag-on path those run inside the WriterTask's own transaction, so a bare
+`BEGIN IMMEDIATE` would violate SQLite's nested-transaction rule. Transactional
+methods (`upsert_edge_with_outcome`, `upsert_edge_guarded`, `upsert_edges`, and
+`upsert_edges_guarded`) first check the WriterTask and send it only their DML helper. Their
+fallback call into `with_writer` is reached only when `self.writer_task` is
+`None`, and its closure owns the explicit `BEGIN IMMEDIATE`/commit/rollback —
+no nested transaction or double routing.
 
 ## `edge_insert_guarded_by_endpoints_statement` — commit-time endpoint guard (ADR-099 §B3)
 
 See `crates/khive-db/src/stores/graph.rs` — `edge_insert_guarded_by_endpoints_statement`.
 
-The atomic `link` op's variant of `edge_upsert_statement`. Shares the SAME
+The guarded `link` variant of `edge_upsert_statement`, shared by canonical
+singleton link and atomic-apply link. It shares the SAME
 `EDGE_NATURAL_KEY_CONFLICT_SET` conflict-arm text — the two builders cannot
 diverge on write behavior — but wraps the `INSERT` in a guarded `SELECT ...
 WHERE EXISTS(...)` that re-probes both endpoints for existence INSIDE the
 transaction, at commit time, rather than trusting prepare-time validation
 alone.
 
-This guard is atomic-`link`-specific, not an `edge_upsert_statement`
-concern: `LinkPlan`'s own doc comment (`khive-runtime::atomic_plan`) records
-why it must be commit-time, not prepare-time — a `link` op's async prepare
-pass (`validate_edge_relation_endpoints`) can run and pass BEFORE an earlier
-op in the SAME atomic unit (e.g. `delete(X, hard)`) removes that very
-endpoint; only a commit-time, in-transaction guard closes that intra-batch
-ordering hazard (ADR-099 acceptance criteria: `[delete(X, hard), link(A,
-X)]` must fail, not silently create a dangling edge). Canonical `link` has
-no equivalent need — it executes and commits standalone, with no other op's
-write interleaved between its own validation and its own write.
+Atomic apply needs the commit-time check because prepare can pass before an
+earlier op in the SAME atomic unit removes the endpoint. Canonical link has
+the equivalent cross-request window between async validation and its later
+write, so it uses the same guarded statement. In both paths, endpoint facts
+and the edge write share one writer transaction.
+
+## `edge_upsert_returning` — atomic persisted row and disposition (#1761)
+
+`edge_upsert_returning` first executes the candidate insert with `ON CONFLICT
+DO NOTHING RETURNING ...`; a returned row proves creation. On conflict it
+executes the canonical update/revival upsert with the same `RETURNING` columns,
+which proves reuse and supplies the persisted row. Both write statements run
+inside one writer transaction. This also classifies an id collision correctly;
+comparing candidate and persisted ids alone would not. The returned edge and
+boolean are therefore fixed before the writer transaction is released.
+
+`upsert_edge_with_outcome` uses this form for coordinator writes whose target
+lives on another backend. `upsert_edge_guarded` uses it after the endpoint
+predicate, and `batch_upsert_edges_guarded` collects one outcome per input in
+the same all-or-nothing transaction. None of these callers performs a later
+natural-key read that a concurrent delete or relink could race.
 
 ## `batch_upsert_edges` — shared DML loop (ADR-067 Component A)
 
@@ -90,8 +104,9 @@ split but pre-checks every edge's endpoints with `edge_endpoints_exist`
 BEFORE issuing any `INSERT` — if any endpoint is missing, the function
 returns immediately with `affected: 0` and issues no writes at all, so the
 caller's enclosing transaction has nothing to roll back (#769). Only once
-every edge has been confirmed does it fall through to the plain
-`edge_upsert_statement` writes, identical to `batch_upsert_edges`. The
+every edge has been confirmed does it execute the ordinary
+`edge_upsert_statement` SQL through `edge_upsert_returning`, preserving input
+order while capturing each persisted id and disposition. The
 refusing entry's index and its `MissingEndpoints` are captured by this same
 pre-check pass and returned as `GuardedBatchOutcome::refused` — the runtime
 layer no longer re-probes endpoints after the fact.

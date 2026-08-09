@@ -13,12 +13,12 @@ use crate::error::StorageError;
 pub type StorageResult<T> = Result<T, StorageError>;
 
 pub use graph::{
-    DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage, EdgeSortField, GraphPath,
-    GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome, LinkId, MissingEndpoints,
-    NeighborHit, NeighborQuery, PathNode, SortDirection, SortOrder, TimeRange,
-    TraversalExecutionBudget, TraversalOptions, TraversalRequest, DEFAULT_TRAVERSAL_LIMIT,
-    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
-    MAX_TRAVERSAL_WORK,
+    DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage, EdgeSortField,
+    EdgeUpsertOutcome, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
+    LinkId, MissingEndpoints, NeighborHit, NeighborQuery, PathNode, SortDirection, SortOrder,
+    TimeRange, TraversalExecutionBudget, TraversalOptions, TraversalRequest,
+    DEFAULT_TRAVERSAL_LIMIT, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
+    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
 };
 pub use pagination::{Page, PageRequest, SeekCursor, SeekPage};
 pub use sparse::{

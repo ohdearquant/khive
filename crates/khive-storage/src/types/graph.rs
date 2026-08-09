@@ -651,12 +651,27 @@ impl MissingEndpoints {
     }
 }
 
+/// Persisted edge plus its natural-key upsert disposition, materialized by
+/// the write path itself before the writer transaction is released.
+///
+/// `created` is true exactly when the candidate row was inserted. A conflict
+/// on either id or natural key, including soft-delete revival, returns the
+/// persisted row with `created=false`; callers never need a post-commit
+/// natural-key lookup.
+#[derive(Clone, Debug)]
+pub struct EdgeUpsertOutcome {
+    pub edge: Edge,
+    pub created: bool,
+}
+
 /// Outcome of [`crate::GraphStore::upsert_edge_guarded`], determined entirely
 /// inside the guard's own storage transaction.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum GuardedWriteOutcome {
-    /// The edge was inserted or updated; both endpoints existed at write time.
-    Written,
+    /// The edge was inserted or updated; both endpoints existed at write time,
+    /// and the persisted row plus disposition came from that same write path
+    /// and writer transaction.
+    Written(EdgeUpsertOutcome),
     /// The write was refused; `MissingEndpoints` names which endpoint(s) were
     /// gone at write time.
     Refused(MissingEndpoints),
@@ -678,6 +693,9 @@ pub struct GuardedBatchRefusal {
 pub struct GuardedBatchOutcome {
     pub summary: BatchWriteSummary,
     pub refused: Option<GuardedBatchRefusal>,
+    /// One atomic write outcome per input edge, in input order. Empty when the
+    /// all-or-nothing endpoint guard refused the batch.
+    pub writes: Vec<EdgeUpsertOutcome>,
 }
 
 #[cfg(test)]

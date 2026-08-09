@@ -2319,9 +2319,9 @@ impl KhiveRuntime {
     /// Link one natural-key triple and report whether this call inserted its row.
     ///
     /// A conflict reuses the persisted edge id (including soft-delete revival)
-    /// and returns `created = false`; the decision is derived from the candidate
-    /// id versus the row read back after the atomic upsert, so no preflight read
-    /// can race the write.
+    /// and returns `created = false`; SQLite returns the persisted row from the
+    /// insert-or-update write path, so neither a preflight nor post-commit read
+    /// can race the disposition.
     pub async fn link_with_outcome(
         &self,
         token: &NamespaceToken,
@@ -2368,7 +2368,6 @@ impl KhiveRuntime {
             metadata,
             target_backend: None,
         };
-        let candidate_id = edge.id;
         // `upsert_edge_guarded` re-checks both endpoints exist as part of the same
         // write, not the separate `validate_edge_relation_endpoints` read above: a
         // concurrent hard-delete landing between that read and this write can no
@@ -2378,8 +2377,8 @@ impl KhiveRuntime {
         // fact: a second concurrent write landing between the refusal and a
         // post-hoc read could otherwise misreport which endpoint was actually
         // missing at write time.
-        match self.graph(token)?.upsert_edge_guarded(edge).await? {
-            khive_storage::GuardedWriteOutcome::Written => {}
+        let written = match self.graph(token)?.upsert_edge_guarded(edge).await? {
+            khive_storage::GuardedWriteOutcome::Written(written) => written,
             khive_storage::GuardedWriteOutcome::Refused(missing) => {
                 return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
                     entry_index: None,
@@ -2387,36 +2386,12 @@ impl KhiveRuntime {
                     missing_target: missing.target.then_some(target_id),
                 }));
             }
-        }
-
-        // Read back the persisted row by natural key so the returned
-        // edge ID is always the one stored in the database, not the locally
-        // generated UUID that was displaced by an ON CONFLICT DO UPDATE.
-        // Under parallel calls for the same triple, every caller now returns
-        // the same persisted edge ID — the winner's insert or the updated row.
-        let persisted = self
-            .list_edges(
-                token,
-                crate::curation::EdgeListFilter {
-                    source_id: Some(source_id),
-                    target_id: Some(target_id),
-                    relations: vec![relation],
-                    ..Default::default()
-                },
-                1,
-                0,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                crate::RuntimeError::Internal(format!(
-                    "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
-                ))
-            })?;
+        };
+        #[cfg(test)]
+        tests::link_disposition_seam::hook((source_id, target_id, relation));
         Ok(LinkWriteOutcome {
-            created: persisted.id == candidate_id,
-            edge: persisted,
+            created: written.created,
+            edge: written.edge,
         })
     }
 
@@ -2436,7 +2411,7 @@ impl KhiveRuntime {
         weight: f64,
         metadata: Option<serde_json::Value>,
         target_backend: Option<String>,
-    ) -> RuntimeResult<Edge> {
+    ) -> RuntimeResult<LinkWriteOutcome> {
         validate_edge_weight(weight)?;
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
         validate_edge_metadata(relation, metadata.as_ref())?;
@@ -2455,28 +2430,11 @@ impl KhiveRuntime {
             metadata,
             target_backend,
         };
-        self.graph(token)?.upsert_edge(edge).await?;
-        let persisted = self
-            .list_edges(
-                token,
-                crate::curation::EdgeListFilter {
-                    source_id: Some(source_id),
-                    target_id: Some(target_id),
-                    relations: vec![relation],
-                    ..Default::default()
-                },
-                1,
-                0,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                crate::RuntimeError::Internal(format!(
-                    "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
-                ))
-            })?;
-        Ok(persisted)
+        let written = self.graph(token)?.upsert_edge_with_outcome(edge).await?;
+        Ok(LinkWriteOutcome {
+            edge: written.edge,
+            created: written.created,
+        })
     }
 
     /// Returns `true` if `id` resolves to a live substrate record in the
@@ -5693,14 +5651,14 @@ impl KhiveRuntime {
     /// All edges are validated and constructed with `build_edge` before any
     /// write. If validation fails for any entry the entire batch is rejected
     /// (no writes occur). On success, all edges are persisted in a single
-    /// atomic transaction via `upsert_edges`.
+    /// atomic transaction via `upsert_edges_guarded`.
     ///
-    /// After the bulk upsert, each edge is read back by its natural key
-    /// (namespace, source_id, target_id, relation) so that the returned IDs
-    /// are always the persisted row IDs, not the locally-generated UUIDs that
-    /// may have been displaced by an ON CONFLICT DO UPDATE. This mirrors the
-    /// same read-back applied to singleton `link()` and prevents phantom-ID
-    /// exposure when callers upsert overlapping triples with `verbose=true`.
+    /// Each link's insert-or-update write path returns its persisted row inside
+    /// the same writer transaction, so returned IDs are never locally generated
+    /// UUIDs displaced by `ON CONFLICT DO UPDATE`, and no post-commit lookup can
+    /// race another writer. This mirrors singleton `link()` and prevents
+    /// phantom-ID exposure when callers upsert overlapping triples with
+    /// `verbose=true`.
     ///
     /// All specs must share the same namespace; the namespace is taken from
     /// `token` (or validated against it if `spec.namespace` is set).
@@ -5719,9 +5677,9 @@ impl KhiveRuntime {
 
     /// Atomic batch form of [`Self::link_with_outcome`].
     ///
-    /// Outcome order matches input order, and each `created` bit is decided by
-    /// comparing the generated candidate id with the persisted natural-key row
-    /// after the one guarded batch upsert.
+    /// Outcome order matches input order. Each successful candidate insert
+    /// proves `created`; each conflict update/revival proves `reused`, with its
+    /// persisted row returned inside the one guarded batch transaction.
     pub async fn link_many_with_outcomes(
         &self,
         token: &NamespaceToken,
@@ -5765,38 +5723,22 @@ impl KhiveRuntime {
                 outcome.summary.first_error
             )));
         }
-
-        // Read back each persisted edge by natural key so callers always
-        // receive the stored row ID, not the pre-upsert generated UUID.
-        let mut persisted = Vec::with_capacity(edges.len());
-        for edge in &edges {
-            let row = self
-                .list_edges(
-                    token,
-                    crate::curation::EdgeListFilter {
-                        source_id: Some(edge.source_id),
-                        target_id: Some(edge.target_id),
-                        relations: vec![edge.relation],
-                        ..Default::default()
-                    },
-                    1,
-                    0,
-                )
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    crate::RuntimeError::Internal(format!(
-                        "upsert_edges succeeded but natural-key lookup for ({}, {}, {}) returned nothing",
-                        edge.source_id, edge.target_id, edge.relation.as_str()
-                    ))
-                })?;
-            persisted.push(LinkWriteOutcome {
-                created: row.id == edge.id,
-                edge: row,
-            });
+        if outcome.writes.len() != edges.len() {
+            return Err(RuntimeError::Internal(format!(
+                "link_many: storage reported {} affected edges but returned {} atomic outcomes",
+                outcome.summary.affected,
+                outcome.writes.len()
+            )));
         }
-        Ok(persisted)
+
+        Ok(outcome
+            .writes
+            .into_iter()
+            .map(|written| LinkWriteOutcome {
+                edge: written.edge,
+                created: written.created,
+            })
+            .collect())
     }
 
     /// Create a batch of entities atomically.
@@ -5980,6 +5922,52 @@ mod tests {
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// Deterministic rendezvous after a singleton link's storage write has
+    /// committed but before the runtime returns its disposition. A competing
+    /// delete at this seam made the former post-commit readback fail; an
+    /// outcome returned by the write itself remains valid.
+    pub(super) mod link_disposition_seam {
+        use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+        use std::sync::Mutex;
+        use uuid::Uuid;
+
+        struct Barrier {
+            key: (Uuid, Uuid, khive_types::EdgeRelation),
+            reached_tx: SyncSender<()>,
+            proceed_rx: Receiver<()>,
+        }
+
+        static BARRIER: Mutex<Option<Barrier>> = Mutex::new(None);
+
+        pub(crate) fn install(
+            key: (Uuid, Uuid, khive_types::EdgeRelation),
+        ) -> (Receiver<()>, SyncSender<()>) {
+            let (reached_tx, reached_rx) = sync_channel(0);
+            let (proceed_tx, proceed_rx) = sync_channel(0);
+            *BARRIER.lock().unwrap() = Some(Barrier {
+                key,
+                reached_tx,
+                proceed_rx,
+            });
+            (reached_rx, proceed_tx)
+        }
+
+        pub(crate) fn hook(key: (Uuid, Uuid, khive_types::EdgeRelation)) {
+            let barrier = {
+                let mut guard = BARRIER.lock().unwrap();
+                match guard.as_ref() {
+                    Some(barrier) if barrier.key == key => guard.take(),
+                    _ => None,
+                }
+            };
+            let Some(barrier) = barrier else {
+                return;
+            };
+            let _ = barrier.reached_tx.send(());
+            let _ = barrier.proceed_rx.recv();
+        }
+    }
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
@@ -8845,6 +8833,75 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn link_disposition_survives_a_hard_delete_after_write_before_response() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let source = rt
+            .create_entity(&tok, "concept", None, "RaceSource", None, None, vec![])
+            .await
+            .unwrap();
+        let target = rt
+            .create_entity(&tok, "concept", None, "RaceTarget", None, None, vec![])
+            .await
+            .unwrap();
+        let source_id = source.id;
+        let target_id = target.id;
+        let key = (source_id, target_id, EdgeRelation::Extends);
+        let (reached_rx, proceed_tx) = link_disposition_seam::install(key);
+
+        let link_rt = Arc::clone(&rt);
+        let link_tok = tok.clone();
+        let link_task = tokio::spawn(async move {
+            link_rt
+                .link_with_outcome(
+                    &link_tok,
+                    source_id,
+                    target_id,
+                    EdgeRelation::Extends,
+                    1.0,
+                    None,
+                )
+                .await
+        });
+
+        tokio::task::spawn_blocking(move || {
+            reached_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .expect("seam waiter must not panic")
+        .expect("link must pause after its write and before returning");
+
+        let persisted = rt
+            .list_edges(
+                &tok,
+                EdgeListFilter {
+                    source_id: Some(source_id),
+                    target_id: Some(target_id),
+                    relations: vec![EdgeRelation::Extends],
+                    ..Default::default()
+                },
+                1,
+                0,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .expect("the write must already be committed at the seam");
+        assert!(rt
+            .delete_edge(&tok, Uuid::from(persisted.id), true)
+            .await
+            .unwrap());
+        proceed_tx.send(()).expect("link must still be paused");
+
+        let outcome = link_task
+            .await
+            .expect("link task must not panic")
+            .expect("post-write deletion must not invalidate the captured outcome");
+        assert!(outcome.created);
+        assert_eq!(outcome.edge.id, persisted.id);
+    }
+
     #[tokio::test]
     async fn link_many_writes_nothing_when_one_target_vanishes_before_write() {
         let rt = rt();
@@ -9000,14 +9057,14 @@ mod tests {
             .unwrap();
 
         let edge = raw_edge(a.id, x.id, tok.namespace().as_str());
-        assert_eq!(
+        assert!(matches!(
             rt.graph(&tok)
                 .unwrap()
                 .upsert_edge_guarded(edge)
                 .await
                 .unwrap(),
-            khive_storage::GuardedWriteOutcome::Written
-        );
+            khive_storage::GuardedWriteOutcome::Written(_)
+        ));
 
         assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
         assert_no_edges_touch(&rt, &tok, x.id).await;
@@ -9070,14 +9127,14 @@ mod tests {
             .unwrap();
 
         let edge = raw_edge(a.id, n.id, tok.namespace().as_str());
-        assert_eq!(
+        assert!(matches!(
             rt.graph(&tok)
                 .unwrap()
                 .upsert_edge_guarded(edge)
                 .await
                 .unwrap(),
-            khive_storage::GuardedWriteOutcome::Written
-        );
+            khive_storage::GuardedWriteOutcome::Written(_)
+        ));
 
         assert!(rt.delete_note(&tok, n.id, true).await.unwrap());
         assert_no_edges_touch(&rt, &tok, n.id).await;
@@ -9160,14 +9217,14 @@ mod tests {
         // An edge whose TARGET is another edge — the "edge-as-node" case
         // `delete_edge`'s cascade must sweep.
         let annotating = raw_edge(n.id, base_edge_id, tok.namespace().as_str());
-        assert_eq!(
+        assert!(matches!(
             rt.graph(&tok)
                 .unwrap()
                 .upsert_edge_guarded(annotating)
                 .await
                 .unwrap(),
-            khive_storage::GuardedWriteOutcome::Written
-        );
+            khive_storage::GuardedWriteOutcome::Written(_)
+        ));
 
         assert!(rt.delete_edge(&tok, base_edge_id, true).await.unwrap());
         assert_no_edges_touch(&rt, &tok, base_edge_id).await;
@@ -9281,15 +9338,14 @@ mod tests {
         // Write lands fully committed while X is still live — squarely
         // inside the window before the delete's cascade runs.
         let edge = raw_edge(a.id, x.id, tok.namespace().as_str());
-        assert_eq!(
+        assert!(matches!(
             rt.graph(&tok)
                 .unwrap()
                 .upsert_edge_guarded(edge)
                 .await
                 .unwrap(),
-            khive_storage::GuardedWriteOutcome::Written,
-            "write must succeed while both endpoints are still live"
-        );
+            khive_storage::GuardedWriteOutcome::Written(_)
+        ));
 
         assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
         assert_no_edges_touch(rt, &tok, x.id).await;
@@ -12054,7 +12110,7 @@ mod tests {
         let persisted_id: Uuid = first[0].id.into();
 
         // Second call — same natural-key triple; ON CONFLICT updates, preserving the
-        // existing row ID. link_many must read back the row and return that same ID.
+        // existing row ID. The upsert's RETURNING row must expose that same ID.
         let second = rt.link_many(&tok, vec![spec()]).await.unwrap();
         assert_eq!(second.len(), 1);
         let second_id: Uuid = second[0].id.into();

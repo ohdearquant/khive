@@ -24,6 +24,12 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.7.0", path = "../khive-pack-kg" }

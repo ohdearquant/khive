@@ -156,9 +156,11 @@ warning logged in both cases.
 Each mirrored file is tracked in `session_mirror_cursor` by file path, byte
 offset, and a nullable platform file-identity witness, so re-running the service resumes tailing
 from where it left off without trusting the path alone. A shorter file or a changed Unix
-device/inode (Windows volume/file-index) restarts at byte zero before the EOF check; this catches
+device/inode (or Windows volume/file-index obtained from stable open-handle Win32 APIs) restarts at
+byte zero before the EOF check; this catches
 truncation and same-length atomic replacement. Older NULL-witness cursor rows replay once when an
-identity first becomes available. Writes into `sessions` and
+identity first becomes available. Filesystems that do not expose a stable identity retain the
+length-decrease fallback. Writes into `sessions` and
 `session_messages` are transactional and idempotent (`INSERT OR IGNORE` /
 `ON CONFLICT DO NOTHING` on stable keys), so a crash mid-write or a
 re-processed byte range does not duplicate rows. `provider_session_id`

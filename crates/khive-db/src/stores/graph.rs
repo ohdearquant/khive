@@ -11,10 +11,10 @@ use uuid::Uuid;
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
-    MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor,
-    SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget,
-    TraversalOptions, TraversalRequest,
+    EdgeSortField, EdgeUpsertOutcome, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal,
+    GuardedWriteOutcome, MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode,
+    SeekCursor, SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue,
+    TraversalExecutionBudget, TraversalOptions, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -57,6 +57,12 @@ const EDGE_NATURAL_KEY_CONFLICT_SET: &str = "weight = excluded.weight, \
      deleted_at = NULL, \
      metadata = excluded.metadata, \
      target_backend = excluded.target_backend";
+
+/// Column order consumed by [`read_edge`]. Appending this `RETURNING` list to
+/// an edge upsert materializes the exact persisted row before the statement's
+/// writer transaction is released.
+const EDGE_RETURNING_COLUMNS: &str = "namespace, id, source_id, target_id, relation, weight, \
+     created_at, updated_at, deleted_at, metadata, target_backend";
 
 /// A `WHERE`-clause fragment asserting the id bound to `id_param` (an SQL
 /// placeholder like `?3`) resolves to a live edge endpoint — an
@@ -127,25 +133,20 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
     }
 }
 
-/// The atomic `link` op's variant of [`edge_upsert_statement`] (ADR-099
-/// §B3). Shares the SAME
+/// The guarded `link` variant of [`edge_upsert_statement`] (ADR-099 §B3,
+/// issue #769), shared by canonical singleton link and atomic-apply link. It shares the SAME
 /// `EDGE_NATURAL_KEY_CONFLICT_SET` conflict-arm text — the two builders
 /// cannot diverge on write behavior — but wraps the `INSERT` in a guarded
 /// `SELECT ... WHERE EXISTS(...)` that re-probes both endpoints for
 /// existence INSIDE the transaction, at commit time, rather than trusting
 /// prepare-time validation alone.
 ///
-/// This guard is atomic-`link`-specific, not a `edge_upsert_statement`
-/// concern: `LinkPlan`'s own doc comment (`khive-runtime::atomic_plan`)
-/// records why it must be commit-time, not prepare-time — a `link` op's
-/// async prepare pass (`validate_edge_relation_endpoints`) can run and pass
-/// BEFORE an earlier op in the SAME atomic unit (e.g. `delete(X, hard)`)
-/// removes that very endpoint; only a commit-time, in-transaction guard
-/// closes that intra-batch ordering hazard (ADR-099 acceptance criteria:
-/// `[delete(X, hard), link(A, X)]` must fail, not silently create a
-/// dangling edge). Canonical `link` has no equivalent need — it executes
-/// and commits standalone, with no other op's write interleaved between its
-/// own validation and its own write.
+/// `LinkPlan`'s own doc comment (`khive-runtime::atomic_plan`) records why
+/// atomic apply needs the commit-time check: prepare can pass before an
+/// earlier op in the SAME unit deletes an endpoint. Canonical link has the
+/// same class of cross-request window between async validation and its later
+/// write, so it uses this guarded statement too. In both paths, the endpoint
+/// fact and edge write share one writer transaction.
 #[allow(clippy::too_many_arguments)]
 pub fn edge_insert_guarded_by_endpoints_statement(
     namespace: &str,
@@ -941,6 +942,52 @@ fn edge_endpoints_exist(
     )
 }
 
+/// Execute one edge upsert and return the persisted row plus disposition from
+/// SQLite write-side `RETURNING` rows.
+///
+/// The first statement is the candidate insert with `ON CONFLICT DO NOTHING`.
+/// A returned row proves creation. On conflict, the canonical upsert statement
+/// performs the update/revival and returns that persisted row, proving reuse.
+/// Both statements run under the caller's one writer transaction. This split
+/// also classifies a (vanishingly unlikely but valid) conflict on the candidate
+/// id itself correctly; comparing candidate and returned ids cannot do that.
+/// A guarded `INSERT ... SELECT ... WHERE` produces no row from either statement
+/// when its endpoint predicate refuses the write.
+fn edge_upsert_returning(
+    conn: &rusqlite::Connection,
+    statement: &SqlStatement,
+) -> Result<Option<EdgeUpsertOutcome>, rusqlite::Error> {
+    let (insert_sql, _) = statement
+        .sql
+        .split_once(" ON CONFLICT")
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let insert_sql =
+        format!("{insert_sql} ON CONFLICT DO NOTHING RETURNING {EDGE_RETURNING_COLUMNS}");
+    let mut insert = conn.prepare(&insert_sql)?;
+    bind_params(&mut insert, &statement.params)?;
+    let mut inserted_rows = insert.raw_query();
+    if let Some(row) = inserted_rows.next()? {
+        return Ok(Some(EdgeUpsertOutcome {
+            edge: read_edge(row)?,
+            created: true,
+        }));
+    }
+    drop(inserted_rows);
+    drop(insert);
+
+    let sql = format!("{} RETURNING {EDGE_RETURNING_COLUMNS}", statement.sql);
+    let mut stmt = conn.prepare(&sql)?;
+    bind_params(&mut stmt, &statement.params)?;
+    let mut rows = stmt.raw_query();
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(EdgeUpsertOutcome {
+        edge: read_edge(row)?,
+        created: false,
+    }))
+}
+
 /// DML-only guarded single-row insert shared by both the legacy (flag-off)
 /// and WriterTask-routed (flag-on) `upsert_edge_guarded` paths.
 ///
@@ -957,10 +1004,8 @@ fn edge_insert_guarded(
     source_id: Uuid,
     target_id: Uuid,
 ) -> Result<GuardedWriteOutcome, rusqlite::Error> {
-    let mut stmt = conn.prepare(&statement.sql)?;
-    bind_params(&mut stmt, &statement.params)?;
-    if stmt.raw_execute()? > 0 {
-        return Ok(GuardedWriteOutcome::Written);
+    if let Some(outcome) = edge_upsert_returning(conn, statement)? {
+        return Ok(GuardedWriteOutcome::Written(outcome));
     }
     // Test-only observation point for the exact insert-to-probe seam this
     // function's doc comment describes: a no-op in every non-test build,
@@ -1005,16 +1050,18 @@ fn batch_upsert_edges_guarded(
                     entry_index: index,
                     missing,
                 }),
+                writes: Vec::new(),
             });
         }
     }
 
     let mut affected = 0u64;
+    let mut writes = Vec::with_capacity(edges.len());
     for edge in edges {
         let statement = edge_upsert_statement(edge);
-        let mut stmt = conn.prepare(&statement.sql)?;
-        bind_params(&mut stmt, &statement.params)?;
-        stmt.raw_execute()?;
+        let outcome =
+            edge_upsert_returning(conn, &statement)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        writes.push(outcome);
         affected += 1;
     }
 
@@ -1026,6 +1073,7 @@ fn batch_upsert_edges_guarded(
             first_error: String::new(),
         },
         refused: None,
+        writes,
     })
 }
 
@@ -1280,6 +1328,48 @@ impl GraphStore for SqlGraphStore {
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn upsert_edge_with_outcome(
+        &self,
+        edge: Edge,
+    ) -> Result<EdgeUpsertOutcome, StorageError> {
+        let statement = edge_upsert_statement(&edge);
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send_bounded(move |conn| {
+                    edge_upsert_returning(conn, &statement)
+                        .and_then(|outcome| outcome.ok_or(rusqlite::Error::QueryReturnedNoRows))
+                        .map_err(|e| map_err(e, "upsert_edge_with_outcome"))
+                })
+                .await;
+        }
+
+        let origin = self.pool.origin();
+        self.with_writer("upsert_edge_with_outcome", move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("graph_upsert_edge_with_outcome".to_string()),
+                origin,
+            );
+            let outcome = match edge_upsert_returning(conn, &statement) {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            };
+            if let Err(e) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+            Ok(outcome)
         })
         .await
     }

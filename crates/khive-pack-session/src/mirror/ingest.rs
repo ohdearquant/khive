@@ -96,36 +96,92 @@ pub(super) struct MirrorPass {
     pub(super) file_identity: Option<String>,
 }
 
-/// Stable identity witness for the file represented by `metadata`.
+/// Stable identity witness available directly from portable metadata.
 ///
 /// A path is not an identity: editors and log rotators commonly replace a
-/// file atomically while retaining its path and length. Unix device/inode and
-/// Windows volume/file-index pairs let the polling service distinguish that
-/// replacement from an unchanged file. Unsupported filesystems return `None`
-/// and retain the length-only truncation fallback.
+/// file atomically while retaining its path and length. Unix exposes the
+/// device/inode pair through stable `std`; Windows identity instead comes from
+/// [`opened_file_identity`] because its corresponding `std::fs::MetadataExt`
+/// methods remain unstable.
+#[cfg(unix)]
 pub(super) fn metadata_file_identity(metadata: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+/// Stable identity for an already-open file handle. Keeping the handle and
+/// its metadata together binds the witness to the same generation whose
+/// length and bytes the caller observes.
+pub(super) fn opened_file_identity(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<Option<String>> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        return Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()));
+        let _ = file;
+        Ok(metadata_file_identity(metadata))
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-        return metadata
-            .volume_serial_number()
-            .zip(metadata.file_index())
-            .map(|(volume, index)| format!("windows:{volume}:{index}"));
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let _ = metadata;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live handle for the duration of this call and
+        // `info` is the correctly sized writable result structure.
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+        if ok == 0 {
+            // Some remote/custom filesystems do not expose a stable file id.
+            // Preserve mirroring with the documented length-only fallback.
+            Ok(None)
+        } else {
+            let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            // Preserve the pre-existing cursor wire format exactly so moving
+            // off unstable `MetadataExt` does not force a one-time replay.
+            Ok(Some(format!(
+                "windows:{}:{file_index}",
+                info.dwVolumeSerialNumber
+            )))
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = metadata;
-        None
+        let _ = (file, metadata);
+        Ok(None)
+    }
+}
+
+/// Probe one path's length/mtime and identity from a single file generation.
+/// Windows must open the file because stable `MetadataExt` lacks file ids;
+/// Unix can obtain all three values from one `stat` result.
+pub(super) fn probe_file(path: &Path) -> std::io::Result<(std::fs::Metadata, Option<String>)> {
+    #[cfg(windows)]
+    {
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let identity = opened_file_identity(&file, &metadata)?;
+        Ok((metadata, identity))
+    }
+    #[cfg(unix)]
+    {
+        let metadata = std::fs::metadata(path)?;
+        let identity = metadata_file_identity(&metadata);
+        Ok((metadata, identity))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let metadata = std::fs::metadata(path)?;
+        Ok((metadata, None))
     }
 }
 
 fn path_file_identity(path: &Path) -> std::io::Result<Option<String>> {
-    std::fs::metadata(path).map(|metadata| metadata_file_identity(&metadata))
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    opened_file_identity(&file, &metadata)
 }
 
 /// Ceiling on bytes read per `mirror_file` call in production (8 MiB); bounds
@@ -387,7 +443,7 @@ fn read_bounded_chunk(
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     let file_len = metadata.len();
-    let file_identity = metadata_file_identity(&metadata);
+    let file_identity = opened_file_identity(&file, &metadata)?;
     // An identity differing from the service's preceding stat proves the path
     // was replaced in the probe/open window. Refuse this pass: retrying after
     // the next probe lets the service reset its generation state before any
@@ -768,7 +824,12 @@ async fn mirror_whole_file_export(
         RuntimeError::Internal(format!("{}: failed to stat {path:?}: {e}", spec.operation))
     })?;
     let file_len = metadata.len();
-    let file_identity = metadata_file_identity(&metadata);
+    let file_identity = opened_file_identity(&file, &metadata).map_err(|e| {
+        RuntimeError::Internal(format!(
+            "{}: failed to identify {path:?}: {e}",
+            spec.operation
+        ))
+    })?;
 
     if file_len <= start_offset {
         return Ok(MirrorStats {
@@ -1268,6 +1329,27 @@ mod tests {
     use super::*;
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_comes_from_a_stable_open_handle_api() {
+        let file = NamedTempFile::new().expect("temporary transcript");
+        let first_handle = std::fs::File::open(file.path()).expect("open first handle");
+        let first_metadata = first_handle.metadata().expect("first metadata");
+        let first = opened_file_identity(&first_handle, &first_metadata)
+            .expect("Windows handle identity query");
+
+        let second_handle = std::fs::File::open(file.path()).expect("open second handle");
+        let second_metadata = second_handle.metadata().expect("second metadata");
+        let second = opened_file_identity(&second_handle, &second_metadata)
+            .expect("second Windows handle identity query");
+
+        assert_eq!(first, second, "two handles to one file must agree");
+        if let Some(first) = first {
+            assert!(first.starts_with("windows:"), "unexpected witness: {first}");
+            assert_eq!(first.split(':').count(), 3, "unexpected witness: {first}");
+        }
+    }
+
     /// Build a file-backed runtime (exercises the real `atomic_unit`
     /// single-writer path) and apply the session schema. Caller must keep
     /// the returned `TempDir` alive.
@@ -1447,7 +1529,7 @@ mod tests {
 
         assert_eq!(
             cursor_file_identity(&rt, &path.to_string_lossy()).await,
-            metadata_file_identity(&std::fs::metadata(&path).expect("transcript metadata")),
+            path_file_identity(&path).expect("transcript identity"),
             "cursor must persist the identity witness from the opened transcript"
         );
     }

@@ -18,6 +18,9 @@ use khive_storage::{Edge, EdgeRelation};
 pub struct CoordLinkResult {
     /// The edge that was written (on the source backend).
     pub edge: Edge,
+    /// True when the edge natural key inserted a new persisted row; false
+    /// when the existing row was updated or revived.
+    pub created: bool,
     /// True when source and target are on different backends.
     pub cross_backend: bool,
     /// The target backend id when `cross_backend` is true.
@@ -172,6 +175,9 @@ pub(crate) mod tests {
     /// Minimal mock for server-routing tests (T6 in the test plan).
     pub struct MockCoordinator {
         pub link_called: std::sync::atomic::AtomicBool,
+        /// Successful link disposition returned by this mock. `None` keeps
+        /// the historical unknown-node error fixture.
+        pub link_created: Option<bool>,
         pub search_called: std::sync::atomic::AtomicBool,
         pub single_backend: bool,
         pub failed_backend: Option<BackendId>,
@@ -192,6 +198,21 @@ pub(crate) mod tests {
         pub fn multi_backend() -> Arc<Self> {
             Arc::new(Self {
                 link_called: std::sync::atomic::AtomicBool::new(false),
+                link_created: None,
+                search_called: std::sync::atomic::AtomicBool::new(false),
+                single_backend: false,
+                failed_backend: None,
+                empty_hits: false,
+                last_search_request: std::sync::Mutex::new(None),
+                last_limit: std::sync::atomic::AtomicU32::new(0),
+                last_extra_visible: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        pub fn multi_backend_link_outcome(created: bool) -> Arc<Self> {
+            Arc::new(Self {
+                link_called: std::sync::atomic::AtomicBool::new(false),
+                link_created: Some(created),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
                 failed_backend: None,
@@ -208,6 +229,7 @@ pub(crate) mod tests {
         pub fn empty_multi_backend() -> Arc<Self> {
             Arc::new(Self {
                 link_called: std::sync::atomic::AtomicBool::new(false),
+                link_created: None,
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
                 failed_backend: None,
@@ -221,6 +243,7 @@ pub(crate) mod tests {
         pub fn degraded_multi_backend(failed_backend: &str) -> Arc<Self> {
             Arc::new(Self {
                 link_called: std::sync::atomic::AtomicBool::new(false),
+                link_created: None,
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
                 failed_backend: Some(BackendId::new(failed_backend)),
@@ -236,6 +259,7 @@ pub(crate) mod tests {
         pub fn degraded_empty_multi_backend(failed_backend: &str) -> Arc<Self> {
             Arc::new(Self {
                 link_called: std::sync::atomic::AtomicBool::new(false),
+                link_created: None,
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
                 failed_backend: Some(BackendId::new(failed_backend)),
@@ -249,6 +273,7 @@ pub(crate) mod tests {
         pub fn single_backend_instance() -> Arc<Self> {
             Arc::new(Self {
                 link_called: std::sync::atomic::AtomicBool::new(false),
+                link_created: None,
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: true,
                 failed_backend: None,
@@ -275,14 +300,35 @@ pub(crate) mod tests {
         async fn link(
             &self,
             _namespace: &Namespace,
-            _source_id: Uuid,
-            _target_id: Uuid,
-            _relation: EdgeRelation,
-            _weight: f64,
-            _metadata: Option<serde_json::Value>,
+            source_id: Uuid,
+            target_id: Uuid,
+            relation: EdgeRelation,
+            weight: f64,
+            metadata: Option<serde_json::Value>,
         ) -> Result<CoordLinkResult, CoordError> {
             self.link_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(created) = self.link_created {
+                let now = chrono::Utc::now();
+                return Ok(CoordLinkResult {
+                    edge: Edge {
+                        id: Uuid::new_v4().into(),
+                        namespace: "local".to_string(),
+                        source_id,
+                        target_id,
+                        relation,
+                        weight,
+                        created_at: now,
+                        updated_at: now,
+                        deleted_at: None,
+                        metadata,
+                        target_backend: Some("archive".to_string()),
+                    },
+                    created,
+                    cross_backend: true,
+                    target_backend_id: Some(BackendId::new("archive")),
+                });
+            }
             Err(CoordError::UnknownNode { id: Uuid::new_v4() })
         }
 
@@ -481,6 +527,40 @@ pub(crate) mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "T6a: coordinator.link must be called when a link op is dispatched through a multi-backend server"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_backend_full_uuid_link_preserves_created_reused_response_parity() {
+        for created in [true, false] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend_link_outcome(created);
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let source_id = Uuid::new_v4();
+            let target_id = Uuid::new_v4();
+
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: format!(
+                        r#"link(source_id="{source_id}", target_id="{target_id}", relation="implements")"#
+                    ),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("coordinator link must produce a successful response");
+            let response: Value = serde_json::from_str(&raw).expect("JSON response");
+            let entry = &response["results"][0];
+            assert_eq!(entry["ok"], json!(true), "unexpected response: {entry}");
+            assert_eq!(entry["result"]["created"], json!(created), "{entry}");
+            assert_eq!(entry["result"]["reused"], json!(!created), "{entry}");
+            assert_eq!(entry["result"]["source_id"], json!(source_id.to_string()));
+            assert_eq!(entry["result"]["target_id"], json!(target_id.to_string()));
+        }
     }
 
     /// T6b: a multi-backend server MUST route `search` through the coordinator.
