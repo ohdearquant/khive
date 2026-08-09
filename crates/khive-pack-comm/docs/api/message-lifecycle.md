@@ -498,6 +498,13 @@ without breaking existing deployments; the `namespace` key is consumed by
 called, and the handler uses `token` directly rather than reading `namespace`
 from the struct.
 
+Channel pollers additionally pass handler-owned `channel_kind` and
+`channel_slug` provenance (#1383). Both are trimmed, nonblank transport
+identifiers; a slug requires a kind. Free-form metadata cannot override or
+fabricate either field. `comm.health` uses the pair to group any generic
+`quarantined: true`/`"true"` disposition without depending on an email-only
+sender label.
+
 ## Message-ID / References header helpers (#403)
 
 - `message_id_match_candidates`: outbound mail stores its Message-ID in wire

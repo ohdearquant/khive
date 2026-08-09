@@ -357,6 +357,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 description: "Channel kind identifier (e.g. `email`).",
             },
             ParamDef {
+                name: "channel_slug",
+                param_type: "string",
+                required: false,
+                description: "Stable channel credential/account identity returned by `Channel::slug`. Channel pollers supply it with `channel_kind` so quarantine health can be grouped without trusting free-form metadata (khive #1383).",
+            },
+            ParamDef {
                 name: "external_id",
                 param_type: "string",
                 required: false,
@@ -472,8 +478,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.health",
-        description: "Read-only per-channel health snapshot (khive #606, #1472). Returns the \
-                       daemon-persisted heartbeat row for every known channel, including its \
+        description: "Read-only per-channel health snapshot (khive #606, #1383, #1472). Returns \
+                       daemon-persisted heartbeat rows plus exact channel identities found on \
+                       live quarantine notes. Every channel entry includes `quarantined_count`; \
+                       the response also includes namespace-wide `quarantined_count` and \
+                       `unattributed_quarantined_count`. Quarantine-only entries do not fabricate \
+                       daemon ownership. Heartbeat entries include their \
                        nominal `poll_interval_secs` and a nullable advisory `stalled` schedule \
                        fact. `stalled` becomes true after three missed nominal intervals; it is \
                        null for legacy/malformed rows and known failure/backoff state. This is \
@@ -485,14 +495,14 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                        the namespace heartbeat rows are persisted under; a call with an \
                        explicit non-local `namespace=` sees only that namespace's rows, never \
                        \"local\"'s. The response carries a `namespace` field naming the \
-                       namespace actually read, so `role: \"client\"` with empty `channels` is \
-                       unambiguous: it means no heartbeat rows exist under THAT namespace, not \
+                       namespace actually read, so `role: \"client\"` means no heartbeat rows \
+                       exist under THAT namespace (even if quarantine-only channels exist), not \
                        necessarily that no daemon exists anywhere. `comm.heartbeat` (khive #917) \
                        persists under the caller's dispatch-authorized namespace, so a \
                        non-local `namespace=` scope returns that namespace's rows once an \
-                       authorized per-tenant writer has run; it returns empty channels only \
-                       when no such writer has been authorized for that namespace yet, even \
-                       while the local poll loop is actively heartbeating under \"local\".",
+                       authorized per-tenant writer has run. Without a heartbeat it may still \
+                       return quarantine-only channel evidence while the local poll loop is \
+                       actively heartbeating under \"local\".",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],

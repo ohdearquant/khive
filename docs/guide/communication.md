@@ -179,7 +179,8 @@ projection vocabulary as `comm.inbox`; omission returns the full thread view.
 polling state, keyed by `(channel_kind, channel_slug)`. It never returns a
 computed `healthy` boolean. It does expose the nominal cadence and a narrower,
 nullable schedule-staleness advisory; overall health judgment stays with the
-caller.
+caller. Quarantine counts are orthogonal: a successful poll can remain current
+while one or more terminally parked messages require operator attention.
 
 ```
 request(ops="comm.health()")
@@ -198,6 +199,7 @@ Each entry in the returned `channels` array carries:
 | `last_poll_attempt_at` | Timestamp of the most recent poll attempt regardless of outcome.                                                                                           |
 | `last_error`           | `{class, message, at}` of the most recent failure. `class` is one of `auth`, `transport`, `config` (an open enum; callers must tolerate unknown values).   |
 | `consecutive_failures` | Resets to 0 on success, increments on failure.                                                                                                             |
+| `quarantined_count`    | Live parked messages carrying this exact channel identity.                                                                                                 |
 
 `last_error` is retained after a later success: a success updates
 `last_success_at` and resets `consecutive_failures` to 0 but never clears
@@ -219,14 +221,23 @@ regardless of `KHIVE_EMAIL_INGEST_NAMESPACE`; an authorized per-tenant writer
 can instead write its own namespace. `comm.health` reads from the caller's
 injected namespace, the same `namespace=` escape / `"local"` default every
 other comm verb resolves. A scoped read never falls back to `"local"`. The
-response carries a `namespace` field naming the namespace actually read.
+response carries a `namespace` field naming the namespace actually read. It
+also carries namespace-wide `quarantined_count` and
+`unattributed_quarantined_count` totals. A quarantine identity with no
+heartbeat row in that namespace is included as a channel entry with nullable
+heartbeat fields.
 
 The `role` field is `"daemon"` (with `source: "daemon-heartbeat"`) whenever
 any persisted heartbeat row exists **in the namespace read**, and `"client"`
-with an empty `channels` array otherwise. This distinguishes who owns the
-channel loops, not which process answered the call: any persisted row means
-some daemon owns the loops, even when this particular call was served by a
-different, non-daemon process.
+otherwise. A client-role response can contain quarantine-only channel entries;
+those rows are message evidence, not fabricated daemon ownership. This
+distinguishes who owns the channel loops, not which process answered the call.
+
+Inspect parked rows with the full `comm.inbox(status="all")` view and the
+`properties.quarantined` marker, then use `get(id=...)` for detail.
+`delete(id=...)` removes one from the live parked count; `hard=true`
+permanently purges it. No automatic trusted release exists because quarantine
+means the attribution gate did not establish a sender identity.
 
 **Known ambiguity:** an empty `channels` array cannot distinguish "no daemon
 has ever run" from "channels are configured but a poll has never completed."
@@ -235,10 +246,11 @@ The comm pack has no visibility into channel configuration (that lives in
 `channels` array means only "no daemon heartbeat state exists in the
 namespace read," not "nothing is configured." The `namespace` field
 disambiguates which namespace that is. A call scoped to a non-local
-`namespace=` returns `role: "client"` with empty `channels` until an authorized
-writer has produced heartbeat state there, even while the shipped local loop
-is actively heartbeating under `"local"` — check the response's `namespace`
-field before reading that as "no daemon running."
+`namespace=` returns `role: "client"` until an authorized writer has produced
+heartbeat state there, even while the shipped local loop is actively
+heartbeating under `"local"`; its `channels` array may still contain
+quarantine-only message evidence. Check the response's `namespace` field
+before reading that role as "no daemon running."
 
 Results are capped at 200 channels. A full page logs a `tracing::debug!`
 line noting that results may be silently truncated.

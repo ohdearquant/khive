@@ -508,6 +508,10 @@ mod help_tests {
             "comm.ingest must declare correlation_external_id param for thread resolution"
         );
         assert!(
+            h.params.iter().any(|p| p.name == "channel_slug"),
+            "comm.ingest must declare channel_slug so quarantine health provenance is discoverable"
+        );
+        assert!(
             h.params.iter().any(|p| p.name == "wire_message_id"),
             "comm.ingest must declare wire_message_id param (IngestParams carries it; \
              metadata must stay in sync per issue #403)"

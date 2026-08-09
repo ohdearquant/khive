@@ -104,6 +104,11 @@ default to `null`/`0` rather than panicking — forward-compatible with rows
 written by an older heartbeat writer. Invalid or missing cadence/timestamp
 facts produce `poll_interval_secs: null` and/or `stalled: null`.
 
+`quarantined_count` is independent of those liveness facts. It is the number
+of live `message` rows in the authorized namespace whose generic
+`properties.quarantined` marker is JSON `true` or string `"true"` and whose
+exact `(channel_kind, channel_slug)` matches this entry.
+
 ## `handlers.rs::handle_health`
 
 Read-only per-channel health snapshot (khive #606).
@@ -125,12 +130,33 @@ the cloud data plane (#877).
 persisted row means some daemon owns the channel loops, so `role` is reported
 as `"daemon"` with `source: "daemon-heartbeat"` regardless of whether THIS
 process is that daemon. `role: "client"` with an empty `channels` array is
-correct both when no daemon heartbeat state exists at all (fresh install, or a
-daemon that has never completed a poll tick) and when the caller's injected
-namespace has no heartbeat rows of its own — the comm pack has no visibility
-into which channels are configured (that lives in `khive-mcp`/
-`khive-channel-email`), so an empty result is the only fact-based response
-available at this layer.
+correct when no daemon heartbeat state and no attributed quarantine rows exist
+in scope (fresh install, or a daemon that has never completed a poll tick).
+When only parked message evidence exists, `role` remains `"client"` but
+quarantine-only channel entries are present; the comm pack still does not
+fabricate configured-channel state from anything else.
+
+The `channels` array also includes quarantine-only identities that have parked
+messages in this namespace but no heartbeat row here. Their cadence and
+timestamp fields are null, `consecutive_failures` is zero, and their presence
+does not change `role: "client"`/`source: null`; no daemon heartbeat is
+fabricated. This matters when a deployment keeps operational heartbeats in
+`local` while routing message notes to a tenant namespace.
+
+Top-level `quarantined_count` covers every live parked row in scope.
+`unattributed_quarantined_count` is the subset with a missing/blank channel
+kind or slug; it stays visible but is never guessed onto an account. Soft- or
+hard-deleting a parked note removes it from the next snapshot.
+
+### Inspect and purge parked messages
+
+An authorized recipient can page `comm.inbox(status="all")` and inspect the
+full `properties` object for `quarantined: true`/`"true"`; use `get(id=...)`
+for the full record. `delete(id=...)` soft-deletes the parked note and removes
+it from health counts. `delete(id=..., hard=true)` permanently purges it. No
+"release as trusted" operation exists: quarantine explicitly means sender
+attribution was not established, so automatic delivery would cross the
+ADR-056 trust boundary.
 
 `namespace` in the response (khive #877) is the namespace actually read,
 echoed back so the shape is self-describing for both the unscoped and the
@@ -142,9 +168,10 @@ rows are what a scoped read observes, and an empty `channels` array for a
 scoped read means no writer has been authorized for that namespace yet, not
 that the feature is unreachable. A caller reading `namespace: "tenant-a"`
 alongside `role: "client"` can tell "no daemon anywhere" (unscoped call,
-`namespace: "local"`) apart from "no rows written under my scope yet" (scoped
-call, `namespace: "tenant-a"`) without khive silently falling back to `"local"`
-to paper over the difference.
+`namespace: "local"`) apart from "no heartbeat rows written under my scope
+yet" (scoped call, `namespace: "tenant-a"`) without khive silently falling
+back to `"local"` to paper over the difference. Quarantine-only entries may
+still appear in the scoped response.
 
 Never returns a computed `healthy: bool`; overall health and alerting judgment
 still belong to the caller. Issue #1472 adds two narrower channel fields:

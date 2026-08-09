@@ -6907,6 +6907,8 @@ async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
             "from": "email:quarantine",
             "to": "email:maintainer@example.com",
             "content": "spoofed body",
+            "channel_kind": "email",
+            "channel_slug": "account-1",
             "external_id": "imap:mail:3:1",
             "namespace": "local",
             "metadata": {
@@ -6917,6 +6919,8 @@ async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
                 "subject": ["not", "a", "string"],
                 "outbound_ref": "fabricated-twin",
                 "sent_by_process": "fabricated-process",
+                "channel_kind": "telegram",
+                "channel_slug": "spoofed-account",
             },
         }),
     )
@@ -6949,6 +6953,42 @@ async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
         props.get("sent_by_process").is_none(),
         "adapter metadata must not fabricate originating-process provenance; got props={props}"
     );
+    assert_eq!(props["channel_kind"].as_str(), Some("email"));
+    assert_eq!(props["channel_slug"].as_str(), Some("account-1"));
+}
+
+#[tokio::test]
+async fn ingest_rejects_ambiguous_channel_identity() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    for (extra, field) in [
+        (serde_json::json!({"channel_kind": "  "}), "channel_kind"),
+        (
+            serde_json::json!({"channel_kind": "email", "channel_slug": "  "}),
+            "channel_slug",
+        ),
+        (
+            serde_json::json!({"channel_slug": "account-1"}),
+            "channel_kind",
+        ),
+    ] {
+        let mut args = serde_json::json!({
+            "namespace": "local",
+            "from": "email:quarantine",
+            "to": "local",
+            "content": "invalid provenance",
+        });
+        args.as_object_mut()
+            .expect("args object")
+            .extend(extra.as_object().expect("extra object").clone());
+        let err = registry
+            .dispatch("comm.ingest", args)
+            .await
+            .expect_err("ambiguous channel identity must fail closed");
+        assert!(
+            err.to_string().contains(field),
+            "error must name {field}: {err}"
+        );
+    }
 }
 
 // ── Issue #479a: comm.ingest must reject malformed thread_id ─────────────────
@@ -7580,6 +7620,8 @@ async fn health_reports_client_role_when_no_heartbeat_state_exists() {
     assert_eq!(result["role"].as_str(), Some("client"));
     assert!(result["source"].is_null());
     assert!(result["as_of"].as_str().is_some());
+    assert_eq!(result["quarantined_count"].as_u64(), Some(0));
+    assert_eq!(result["unattributed_quarantined_count"].as_u64(), Some(0));
     assert_eq!(
         result["channels"]
             .as_array()
@@ -7824,6 +7866,27 @@ async fn health_counts_live_quarantines_by_channel_without_marking_polling_faile
         assert_eq!(channel["stalled"].as_bool(), Some(false));
         assert_eq!(channel["quarantined_count"].as_u64(), Some(expected));
     }
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({"status": "all", "limit": 50}),
+        )
+        .await
+        .expect("full inbox is the supported quarantine inspection path");
+    let visible_parked = inbox["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|message| {
+            let marker = &message["properties"]["quarantined"];
+            marker.as_bool() == Some(true) || marker.as_str() == Some("true")
+        })
+        .count();
+    assert_eq!(
+        visible_parked, 4,
+        "the same live rows counted by health must be inspectable with their full properties"
+    );
 }
 
 /// A deployment may intentionally keep operational heartbeats in `local`

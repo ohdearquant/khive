@@ -702,6 +702,7 @@ async fn channel_poll_loop(
                             "content": env.content,
                             "subject": env.subject,
                             "channel_kind": kind,
+                            "channel_slug": slug,
                             "external_id": env.external_id,
                             "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
                             "correlation_external_id": env.correlation_external_id,
@@ -1397,6 +1398,7 @@ async fn telegram_poll_loop(
         match telegram_channel.poll(Utc::now()).await {
             Ok(envelopes) => {
                 let kind = telegram_channel.kind();
+                let slug = telegram_channel.slug();
                 let mut all_ingested = true;
                 for env in envelopes {
                     let params = json!({
@@ -1405,6 +1407,7 @@ async fn telegram_poll_loop(
                         "to": env.to,
                         "content": env.content,
                         "channel_kind": kind,
+                        "channel_slug": &slug,
                         "external_id": env.external_id,
                         "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
                     });

@@ -12,11 +12,11 @@ delivery confirmation, and channel polling observability.
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
 | `comm.inbox`     | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
 | `comm.read`      | Mark one or up to 500 inbound messages as read (best-effort: inspect each result's `read`/`mark_error`)                                                       |
-| `comm.mark_read` | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                               |
+| `comm.mark_read` | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                                |
 | `comm.unread`    | Count the caller's unread inbound messages without message payloads                                                                                           |
 | `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
-| `comm.health`    | Read per-channel heartbeat state, nominal poll cadence, and nullable advisory schedule staleness                                                              |
+| `comm.health`    | Read per-channel heartbeat state, quarantine backlog counts, nominal poll cadence, and nullable advisory schedule staleness                                   |
 | `comm.probe`     | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
 
 The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an
