@@ -677,6 +677,13 @@ embed warmup call proceeds unaffected by the authorization outcome. This preserv
 infallible: any errors are logged internally, not propagated to the caller"
 (`crates/khive-runtime/src/pack.rs:230-231`).
 
+ADR-028 Amendment A2 narrows the persistence side of this rule for read-only
+snapshot runtimes: the embedder warm invocation may still run, but the shared
+phase emitter returns before `EventStore` resolution and emits no start or
+terminal row. A known-rejected append is not considered read-only telemetry;
+it would still enter a writer-bearing path. Writable runtimes retain the exact
+pair contract above.
+
 This is Stage 1 work: it extends Decision (c) with two additional emission sites, and
 requires no `work_class` enum amendment, no `EventKind` amendment, and no schema
 migration. It is a wiring gap in two `warm()` implementations, closed by reusing an

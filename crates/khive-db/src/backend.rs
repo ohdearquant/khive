@@ -15,6 +15,45 @@ use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
 use crate::stores::{agents, blob, entity, event, graph, note, sparse, text, vectors};
 
+fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, SqliteError> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(SqliteError::Rusqlite)
+}
+
+fn validate_vector_table_columns(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> Result<(), SqliteError> {
+    let pragma = format!("PRAGMA table_xinfo({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    let mut has_field = false;
+    let mut has_embedding_model = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "field" {
+            has_field = true;
+        }
+        if name == "embedding_model" {
+            has_embedding_model = true;
+        }
+    }
+    if !has_field || !has_embedding_model {
+        return Err(SqliteError::InvalidData(format!(
+            "vec0 table '{table}' is missing required column(s) (field={has_field}, \
+             embedding_model={has_embedding_model}); this is a pre-v0.2.8 vector schema and is \
+             not supported — recreate the database"
+        )));
+    }
+    Ok(())
+}
+
 /// Concrete storage backend providing capability traits.
 pub struct StorageBackend {
     pool: Arc<ConnectionPool>,
@@ -378,6 +417,30 @@ impl StorageBackend {
         crate::extension::ensure_extensions_loaded();
 
         let table = format!("vec_{}", model_key);
+
+        if self.is_read_only() {
+            // Snapshot inspection must not check schema through the pool's
+            // query-only writer slot: even a SELECT there is a writer-class
+            // acquisition and violates ADR-028 A2's write-free lifecycle.
+            let reader = self.pool.reader()?;
+            if !sqlite_table_exists(reader.conn(), &table)? {
+                return Err(SqliteError::InvalidData(format!(
+                    "read-only database has no vector table '{table}'; create and populate it in \
+                     a writable copy before opening the snapshot"
+                )));
+            }
+            validate_vector_table_columns(reader.conn(), &table)?;
+            drop(reader);
+            return Ok(Arc::new(vectors::SqliteVecStore::new(
+                Arc::clone(&self.pool),
+                self.is_file_backed,
+                model_key.to_string(),
+                embedding_model.to_string(),
+                dimensions,
+                namespace.trim().to_string(),
+            )?));
+        }
+
         let writer = self.pool.try_writer()?;
 
         // Detect old-schema vec0 tables that predate the `field` column.
@@ -386,16 +449,7 @@ impl StorageBackend {
         // callers can re-embed from the source record after the table is rebuilt.
         // Use pragma_table_info to check columns directly; substring matching on the
         // CREATE DDL is fragile (a model_key containing "field" would false-match).
-        let table_exists: bool = writer
-            .conn()
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-                rusqlite::params![&table],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(SqliteError::Rusqlite)?
-            .is_some();
+        let table_exists = sqlite_table_exists(writer.conn(), &table)?;
 
         if table_exists {
             // V17 migration (vector_embedding_model_tag_preserving_rebuild) adds
@@ -403,33 +457,7 @@ impl StorageBackend {
             // migration time.  If this table still lacks either column post-migration
             // that indicates the database was not migrated — return a hard error
             // rather than silently dropping data.
-            let pragma = format!("PRAGMA table_xinfo({})", table);
-            let mut stmt = writer.conn().prepare(&pragma)?;
-            let mut rows = stmt.query([])?;
-            let mut has_field = false;
-            let mut has_embedding_model = false;
-            while let Some(row) = rows.next()? {
-                let name: String = row.get(1)?;
-                if name == "field" {
-                    has_field = true;
-                }
-                if name == "embedding_model" {
-                    has_embedding_model = true;
-                }
-            }
-            if !has_field || !has_embedding_model {
-                return Err(SqliteError::InvalidData(format!(
-                    "vec0 table '{}' is missing required column(s) (field={}, \
-                     embedding_model={}); this is a pre-v0.2.8 vector schema and is \
-                     not supported — recreate the database",
-                    table, has_field, has_embedding_model,
-                )));
-            }
-        } else if self.is_read_only() {
-            return Err(SqliteError::InvalidData(format!(
-                "read-only database has no vector table '{table}'; create and populate it in a \
-                 writable copy before opening the snapshot"
-            )));
+            validate_vector_table_columns(writer.conn(), &table)?;
         }
 
         // Ensure the _embedding_models registry table exists.
@@ -440,39 +468,37 @@ impl StorageBackend {
         // creates the registry via V14; this is a belt-and-suspenders fallback.
         // Schema is defined in `migrations::EMBEDDING_MODELS_DDL` (single source of
         // truth) to prevent the two copies from silently drifting.
-        if !self.is_read_only() {
-            writer
-                .conn()
-                .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
+        writer
+            .conn()
+            .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
 
-            // Same guarantee for the ANN write log: vector write paths append to it
-            // in the same transaction as the vec0 mutation, so it must exist in any
-            // database that hosts vec_* tables.
-            writer
-                .conn()
-                .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)?;
-            writer
-                .conn()
-                .execute_batch(crate::migrations::ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL)?;
-            writer
-                .conn()
-                .execute_batch(crate::migrations::ANN_CONSUMER_PENDING_DDL)?;
+        // Same guarantee for the ANN write log: vector write paths append to it
+        // in the same transaction as the vec0 mutation, so it must exist in any
+        // database that hosts vec_* tables.
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)?;
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL)?;
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_CONSUMER_PENDING_DDL)?;
 
-            // Create the vec0 virtual table. Idempotent on fresh databases and after the
-            // old-schema rebuild above.
-            let ddl = format!(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
-                 subject_id TEXT PRIMARY KEY, \
-                 namespace TEXT NOT NULL, \
-                 kind TEXT NOT NULL, \
-                 field TEXT NOT NULL, \
-                 embedding_model TEXT NOT NULL, \
-                 embedding float[{}] distance_metric=cosine\
-                 )",
-                model_key, dimensions
-            );
-            writer.conn().execute_batch(&ddl)?;
-        }
+        // Create the vec0 virtual table. Idempotent on fresh databases and after the
+        // old-schema rebuild above.
+        let ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
+             subject_id TEXT PRIMARY KEY, \
+             namespace TEXT NOT NULL, \
+             kind TEXT NOT NULL, \
+             field TEXT NOT NULL, \
+             embedding_model TEXT NOT NULL, \
+             embedding float[{}] distance_metric=cosine\
+             )",
+            model_key, dimensions
+        );
+        writer.conn().execute_batch(&ddl)?;
 
         Ok(Arc::new(vectors::SqliteVecStore::new(
             Arc::clone(&self.pool),
@@ -560,7 +586,16 @@ impl StorageBackend {
             ));
         }
 
-        if !self.is_read_only() {
+        if self.is_read_only() {
+            let table = format!("sparse_{model_key}");
+            let reader = self.pool.reader()?;
+            if !sqlite_table_exists(reader.conn(), &table)? {
+                return Err(SqliteError::InvalidData(format!(
+                    "read-only database has no sparse table '{table}'; create and populate it in \
+                     a writable copy before opening the snapshot"
+                )));
+            }
+        } else {
             let writer = self.pool.try_writer()?;
             sparse::ensure_sparse_schema(writer.conn(), model_key)
                 .map_err(SqliteError::Rusqlite)?;
@@ -633,7 +668,16 @@ impl StorageBackend {
              )",
             table_key, tokenizer
         );
-        if !self.is_read_only() {
+        if self.is_read_only() {
+            let table = format!("fts_{table_key}");
+            let reader = self.pool.reader()?;
+            if !sqlite_table_exists(reader.conn(), &table)? {
+                return Err(SqliteError::InvalidData(format!(
+                    "read-only database has no text-search table '{table}'; create and populate \
+                     it in a writable copy before opening the snapshot"
+                )));
+            }
+        } else {
             let writer = self.pool.try_writer()?;
             writer.conn().execute_batch(&ddl)?;
         }
@@ -941,6 +985,96 @@ mod tests {
         assert!(
             !path.exists(),
             "opening a missing path read-only must not create the file"
+        );
+    }
+
+    #[test]
+    fn sqlite_read_only_sparse_store_requires_existing_table_without_writer_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_sparse_tables.db");
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable
+                .sparse("present")
+                .expect("create the optional sparse table while writable");
+        }
+
+        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        let before = read_only.pool().writer_acquisition_snapshot();
+        read_only
+            .sparse("present")
+            .expect("an existing sparse table must open read-only");
+        let missing = match read_only.sparse("missing") {
+            Ok(_) => panic!("a missing sparse table must fail during store acquisition"),
+            Err(error) => error,
+        };
+        assert!(
+            missing.to_string().contains("sparse_missing"),
+            "the diagnostic must name the absent table: {missing}"
+        );
+        assert_eq!(
+            read_only.pool().writer_acquisition_snapshot(),
+            before,
+            "read-only optional-table inspection must use a reader connection"
+        );
+    }
+
+    #[test]
+    fn sqlite_read_only_text_store_requires_existing_table_without_writer_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_text_tables.db");
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable
+                .text("present")
+                .expect("create the optional FTS table while writable");
+        }
+
+        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        let before = read_only.pool().writer_acquisition_snapshot();
+        read_only
+            .text("present")
+            .expect("an existing FTS table must open read-only");
+        let missing = match read_only.text("missing") {
+            Ok(_) => panic!("a missing FTS table must fail during store acquisition"),
+            Err(error) => error,
+        };
+        assert!(
+            missing.to_string().contains("fts_missing"),
+            "the diagnostic must name the absent table: {missing}"
+        );
+        assert_eq!(
+            read_only.pool().writer_acquisition_snapshot(),
+            before,
+            "read-only optional-table inspection must use a reader connection"
+        );
+    }
+
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn sqlite_read_only_vector_store_schema_check_uses_no_writer_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_vector_tables.db");
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable
+                .vectors("present", "present", 3)
+                .expect("create the optional vector table while writable");
+        }
+
+        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        let before = read_only.pool().writer_acquisition_snapshot();
+        read_only
+            .vectors("present", "present", 3)
+            .expect("an existing vector table must open read-only");
+        assert!(
+            read_only.vectors("missing", "missing", 3).is_err(),
+            "a missing vector table must fail during store acquisition"
+        );
+        assert_eq!(
+            read_only.pool().writer_acquisition_snapshot(),
+            before,
+            "read-only vector schema inspection must use a reader connection"
         );
     }
 

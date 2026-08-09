@@ -333,11 +333,25 @@ SQLite file has no filesystem write bits. Explicit read-only configuration
 does not create a missing database or its parent directory.
 
 Read-only boot is an inspection path, not a migration path. It requires the
-snapshot's core schema to match the build's latest migration exactly and emits
-an actionable error for snapshots that are behind or ahead. It skips configured
+snapshot's core migration ledger to be the exact contiguous canonical sequence
+through the build's latest migration; a missing middle row or foreign version
+is rejected even when `MAX(version)` matches. It skips configured
 embedding-model registration, lazy store-schema/repair writes, pack schema
-application, writer-task startup, checkpointing, and WAL sweeps. Prepare and
-migrate a writable copy before inspection if validation fails.
+application, writer-task startup, checkpointing, and WAL sweeps. Optional
+vector, sparse, and text tables are checked through reader connections and must
+already exist. Read-only ANN cache misses do not enqueue registration or
+rebuild work; memory uses exact sqlite-vec fallback and knowledge retains FTS
+plus its load-only fresh-tail path. Prepare and migrate a writable copy before
+inspection if validation fails.
+
+Daemon background work follows the assigned backend, not a blanket main-mode
+switch. Writer-bearing memory/knowledge ANN warm and session mirroring do not
+run for a read-only pack runtime, and warm phase telemetry does not append to a
+read-only event store; neither does lazy embedder-initialization telemetry. The
+schedule ticker is omitted only when the schedule
+pack's own runtime is read-only: it remains enabled on a writable secondary
+beside a read-only main, and remains disabled on a read-only secondary beside a
+writable main.
 
 The explicit `read_only` value participates in the backend-topology portion of
 the warm-daemon `config_id`. In multi-backend configuration it must agree with

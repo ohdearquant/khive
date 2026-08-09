@@ -608,14 +608,26 @@ slot.
 
 Boot and access obey these rules:
 
-1. The snapshot must already exist and its core schema version must equal this
-   build's latest migration. Boot validates that fact without writes; a schema
-   behind or ahead fails with instructions to migrate a writable copy or use a
-   compatible build.
+1. The snapshot must already exist and its core migration ledger must be the
+   exact contiguous canonical sequence through this build's latest migration.
+   Matching only `MAX(version)` is insufficient: missing middle rows, foreign
+   versions, renamed rows, behind ledgers, and ahead ledgers all fail without
+   writes and with an actionable compatibility diagnostic.
 2. Boot does not register embedding models, apply pack-auxiliary schema, start a
-   writer task, checkpoint, or schedule a WAL sweep for that backend.
+   writer task, checkpoint, or schedule a WAL sweep for that backend. Daemon
+   warm hooks remain per-pack-runtime aware: writer-bearing ANN warm and session
+   mirroring are suppressed on a read-only assigned backend, and warm phase
+   telemetry and lazy embedder-initialization telemetry perform no event append
+   there. The schedule ticker is admitted
+   only when the schedule pack's own assigned backend is writable; a read-only
+   main does not disable a schedule pack routed to a writable secondary, nor
+   does a writable main enable a read-only schedule secondary.
 3. Store acquisition does not run lazy DDL or repair DML. A requested optional
-   store table must already exist in the snapshot.
+   vector, sparse, or text-search table must already exist in the snapshot and
+   is checked through a reader connection, never the pool's query-only writer
+   slot. An ANN cache miss does not enqueue registration, rebuild, checkpoint,
+   or compaction work: memory recall uses its exact sqlite-vec reader fallback,
+   while knowledge search retains its FTS and load-only fresh-tail paths.
 4. Mutation semantics are unchanged: DDL and DML remain rejected by the SQLite
    open flags and `query_only`, regardless of verb metadata.
 5. When the main audit backend is read-only, the registry deliberately omits the
