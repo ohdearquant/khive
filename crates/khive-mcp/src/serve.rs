@@ -6443,6 +6443,180 @@ region = "us-east-1"
         assert!(message.contains("config identity"), "{message}");
     }
 
+    #[test]
+    #[serial]
+    fn multi_backend_read_only_construction_and_pack_schema_paths_acquire_no_writer() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-snapshot.db");
+        let comm_path = dir.path().join("comm-snapshot.db");
+        let config_for = |read_only: bool| KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only,
+                },
+                BackendConfig {
+                    name: "comm-store".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(comm_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only,
+                },
+            ],
+            packs: HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "comm-store".to_string(),
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let writable = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(false),
+            None,
+        )
+        .expect("prepare exact-current core and pack schemas");
+        drop(writable);
+
+        for path in [&main_path, &comm_path] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mode: String = conn
+                .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "delete");
+        }
+
+        let snapshot = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(true),
+            None,
+        )
+        .expect("open both declared backends for inspection");
+
+        assert_eq!(
+            snapshot
+                .default_runtime
+                .backend()
+                .pool()
+                .writer_acquisition_snapshot(),
+            khive_db::pool::WriterAcquisitionSnapshot::default(),
+            "main snapshot construction, exact-ledger validation, and kg pack boot must stay \
+             writer-free"
+        );
+        assert!(
+            snapshot.default_runtime.backend().pool().max_readers() > 0,
+            "the main rollback-journal snapshot must retain a dedicated reader pool"
+        );
+        for (pack, runtime) in &snapshot.per_pack_runtimes {
+            assert_eq!(
+                runtime.backend().pool().writer_acquisition_snapshot(),
+                khive_db::pool::WriterAcquisitionSnapshot::default(),
+                "pack {pack:?} snapshot boot must keep its construction-inclusive writer \
+                 baseline at zero"
+            );
+            assert!(
+                runtime.backend().pool().max_readers() > 0,
+                "pack {pack:?} must read its rollback-journal snapshot through a dedicated \
+                 reader"
+            );
+        }
+    }
+
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[test]
+    #[serial]
+    fn mixed_topology_channel_admission_follows_the_runtime_that_backs_each_loop() {
+        use clap::Parser;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-channel.db");
+        let comm_path = dir.path().join("comm-channel.db");
+        let config_for = |main_read_only: bool, comm_read_only: bool| KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: main_read_only,
+                },
+                BackendConfig {
+                    name: "comm-store".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(comm_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: comm_read_only,
+                },
+            ],
+            packs: HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "comm-store".to_string(),
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let seeded = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(false, false),
+            None,
+        )
+        .expect("seed exact-current snapshots");
+        drop(seeded);
+        let daemon = Args::parse_from(["mcp", "--daemon"]);
+
+        let comm_snapshot = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(false, true),
+            None,
+        )
+        .expect("writable kg plus read-only comm topology");
+        let server =
+            build_server_from_multi_backend_registry(comm_snapshot, &config_for(false, true), None);
+        let admission = channel_loop_plan(&server, &daemon);
+        assert!(
+            !admission.inbound_poll,
+            "comm.ingest/cursor/heartbeat are backed by the read-only comm runtime"
+        );
+        assert!(
+            admission.outbound_delivery,
+            "list/update are backed by the writable kg runtime"
+        );
+        drop(server);
+
+        let kg_snapshot = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(true, false),
+            None,
+        )
+        .expect("read-only kg plus writable comm topology");
+        let server =
+            build_server_from_multi_backend_registry(kg_snapshot, &config_for(true, false), None);
+        let admission = channel_loop_plan(&server, &daemon);
+        assert!(
+            admission.inbound_poll,
+            "comm.ingest/cursor/heartbeat are backed by the writable comm runtime"
+        );
+        assert!(
+            !admission.outbound_delivery,
+            "a read-only kg runtime cannot durably claim or mark delivery, so no external send \
+             task may start"
+        );
+    }
+
     /// RAII guard: redirects `HOME` and restores the prior value on drop.
     struct HomeGuard {
         original: Option<std::ffi::OsString>,
@@ -8831,6 +9005,47 @@ backend = "kg-backend"
             );
         }
 
+        #[test]
+        fn email_plan_gates_poll_and_outbox_on_daemon_role_and_backing_runtime_modes() {
+            use clap::Parser;
+
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("email-read-only.db");
+            let config = RuntimeConfig {
+                db_path: Some(path),
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+            KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            let snapshot = KhiveRuntime::new_readonly(config).expect("open read-only snapshot");
+            let server = KhiveMcpServer::new(snapshot).expect("build snapshot server");
+
+            let daemon = Args::parse_from(["mcp", "--daemon"]);
+            let admitted = channel_loop_plan(&server, &daemon);
+            assert!(
+                !admitted.inbound_poll,
+                "email polling must not start when comm.ingest/cursor/heartbeat resolve to a \
+                 read-only runtime"
+            );
+            assert!(
+                !admitted.outbound_delivery,
+                "email delivery must not start when list/update resolve to a read-only runtime"
+            );
+
+            let writable = KhiveRuntime::memory().expect("writable runtime");
+            let server =
+                KhiveMcpServer::with_packs(writable, &["kg".to_string(), "comm".to_string()])
+                    .expect("build writable server");
+            let admitted = channel_loop_plan(&server, &daemon);
+            assert!(admitted.inbound_poll);
+            assert!(admitted.outbound_delivery);
+
+            let client = Args::parse_from(["mcp"]);
+            let admitted = channel_loop_plan(&server, &client);
+            assert!(!admitted.inbound_poll);
+            assert!(!admitted.outbound_delivery);
+        }
+
         #[tokio::test]
         #[serial]
         async fn daemon_role_gate_spawns_without_panic() {
@@ -8876,6 +9091,48 @@ backend = "kg-backend"
             // Client role: the wrapper must take the skip branch and never
             // attempt to construct an EmailChannel at all.
             spawn_email_channel_loops_if_daemon(&server, &args);
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    mod telegram_channel_loop_admission_tests {
+        use super::*;
+
+        #[test]
+        fn telegram_plan_gates_poll_and_outbox_on_backing_runtime_modes() {
+            use clap::Parser;
+
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("telegram-read-only.db");
+            let config = RuntimeConfig {
+                db_path: Some(path),
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+            KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            let snapshot = KhiveRuntime::new_readonly(config).expect("open read-only snapshot");
+            let server = KhiveMcpServer::new(snapshot).expect("build snapshot server");
+            let daemon = Args::parse_from(["mcp", "--daemon"]);
+
+            let admitted = channel_loop_plan(&server, &daemon);
+            assert!(
+                !admitted.inbound_poll,
+                "Telegram getUpdates must not start when comm.ingest resolves to a read-only \
+                 runtime"
+            );
+            assert!(
+                !admitted.outbound_delivery,
+                "Telegram sendMessage must not start when delivered_at cannot be durably \
+                 recorded by list/update's runtime"
+            );
+
+            let writable = KhiveRuntime::memory().expect("writable runtime");
+            let server =
+                KhiveMcpServer::with_packs(writable, &["kg".to_string(), "comm".to_string()])
+                    .expect("build writable server");
+            let admitted = channel_loop_plan(&server, &daemon);
+            assert!(admitted.inbound_poll);
+            assert!(admitted.outbound_delivery);
         }
     }
 

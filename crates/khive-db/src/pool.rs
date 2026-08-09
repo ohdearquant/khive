@@ -1479,6 +1479,46 @@ mod tests {
     }
 
     #[test]
+    fn read_only_rollback_journal_pool_keeps_a_dedicated_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read_only_delete_journal.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE snapshot_row(id INTEGER PRIMARY KEY);")
+                .unwrap();
+            let mode: String = conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "delete");
+        }
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            read_only: true,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        assert!(
+            pool.max_readers() > 0,
+            "a read-only rollback-journal snapshot must use a genuine read-only reader, not \
+             alias reader() onto the query-only writer slot"
+        );
+        let reader = pool.reader().expect("dedicated read-only reader checkout");
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(reader);
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot::default(),
+            "constructing and reading a rollback-journal snapshot must never acquire the writer"
+        );
+    }
+
+    #[test]
     #[serial]
     fn pool_config_default_values_match_constants() {
         // Ensure defaults are not accidentally changed. The process env may

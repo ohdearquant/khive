@@ -1401,6 +1401,11 @@ mod tests {
         let runtime = KhiveRuntime::new(read_only_config)
             .expect("read-only boot must validate instead of migrating/registering");
         assert!(runtime.is_read_only());
+        assert_eq!(
+            runtime.backend().pool().writer_acquisition_snapshot(),
+            khive_db::pool::WriterAcquisitionSnapshot::default(),
+            "the construction-inclusive acquisition baseline must stay at zero"
+        );
         assert!(
             runtime
                 .list_embedding_models(None)
@@ -1433,6 +1438,12 @@ mod tests {
 
         let runtime = KhiveRuntime::new_readonly(config).expect("explicit read-only boot");
         assert!(runtime.is_read_only());
+        assert_eq!(
+            runtime.backend().pool().writer_acquisition_snapshot(),
+            khive_db::pool::WriterAcquisitionSnapshot::default(),
+            "explicit read-only construction must validate through a reader without ever \
+             acquiring the writer"
+        );
     }
 
     /// A `~/`-prefixed `--db`/`KHIVE_DB` override must resolve, boot, and

@@ -995,12 +995,17 @@ mod tests {
         {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable
+                .prepare_core_schema()
+                .expect("migrate snapshot source");
+            writable
                 .sparse("present")
                 .expect("create the optional sparse table while writable");
         }
 
         let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
-        let before = read_only.pool().writer_acquisition_snapshot();
+        read_only
+            .prepare_core_schema()
+            .expect("validate exact current migration ledger");
         read_only
             .sparse("present")
             .expect("an existing sparse table must open read-only");
@@ -1014,8 +1019,9 @@ mod tests {
         );
         assert_eq!(
             read_only.pool().writer_acquisition_snapshot(),
-            before,
-            "read-only optional-table inspection must use a reader connection"
+            crate::pool::WriterAcquisitionSnapshot::default(),
+            "construction, exact-ledger validation, and optional sparse-table inspection must \
+             use reader connections only"
         );
     }
 
@@ -1026,12 +1032,17 @@ mod tests {
         {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable
+                .prepare_core_schema()
+                .expect("migrate snapshot source");
+            writable
                 .text("present")
                 .expect("create the optional FTS table while writable");
         }
 
         let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
-        let before = read_only.pool().writer_acquisition_snapshot();
+        read_only
+            .prepare_core_schema()
+            .expect("validate exact current migration ledger");
         read_only
             .text("present")
             .expect("an existing FTS table must open read-only");
@@ -1045,8 +1056,9 @@ mod tests {
         );
         assert_eq!(
             read_only.pool().writer_acquisition_snapshot(),
-            before,
-            "read-only optional-table inspection must use a reader connection"
+            crate::pool::WriterAcquisitionSnapshot::default(),
+            "construction, exact-ledger validation, and optional FTS inspection must use reader \
+             connections only"
         );
     }
 
@@ -1058,12 +1070,17 @@ mod tests {
         {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable
+                .prepare_core_schema()
+                .expect("migrate snapshot source");
+            writable
                 .vectors("present", "present", 3)
                 .expect("create the optional vector table while writable");
         }
 
         let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
-        let before = read_only.pool().writer_acquisition_snapshot();
+        read_only
+            .prepare_core_schema()
+            .expect("validate exact current migration ledger");
         read_only
             .vectors("present", "present", 3)
             .expect("an existing vector table must open read-only");
@@ -1073,8 +1090,9 @@ mod tests {
         );
         assert_eq!(
             read_only.pool().writer_acquisition_snapshot(),
-            before,
-            "read-only vector schema inspection must use a reader connection"
+            crate::pool::WriterAcquisitionSnapshot::default(),
+            "construction, exact-ledger validation, and optional vector inspection must use \
+             reader connections only"
         );
     }
 
