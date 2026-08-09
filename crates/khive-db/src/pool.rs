@@ -1769,16 +1769,13 @@ mod tests {
         for error in [
             constrained
                 .try_writer()
-                .err()
-                .expect("pooled guard must refuse"),
+                .expect_err("pooled guard must refuse"),
             constrained
                 .try_writer_nowait()
-                .err()
-                .expect("zero-wait pooled guard must refuse"),
+                .expect_err("zero-wait pooled guard must refuse"),
             constrained
                 .open_standalone_writer()
-                .err()
-                .expect("standalone guard must refuse"),
+                .expect_err("standalone guard must refuse"),
         ] {
             match error {
                 SqliteError::DiskCapacityFloor {
@@ -1852,8 +1849,7 @@ mod tests {
             disk_reserve_bytes: u64::MAX,
             ..PoolConfig::default()
         })
-        .err()
-        .expect("impossible reserve must reject first open");
+        .expect_err("impossible reserve must reject first open");
         assert!(matches!(
             error,
             SqliteError::DiskCapacityFloor {
@@ -1885,8 +1881,7 @@ mod tests {
             disk_reserve_bytes: u64::MAX,
             ..PoolConfig::default()
         })
-        .err()
-        .expect("the impossible reserve must refuse before following the link to create SQL");
+        .expect_err("the impossible reserve must refuse before following the link to create SQL");
 
         let canonical_target = target_dir.canonicalize().unwrap().join("real.db");
         match error {
@@ -1929,8 +1924,7 @@ mod tests {
 
         let error = pool
             .try_writer()
-            .err()
-            .expect("the path-bound target-volume sample must refuse the write");
+            .expect_err("the path-bound target-volume sample must refuse the write");
         assert!(matches!(
             error,
             SqliteError::DiskCapacityFloor {
