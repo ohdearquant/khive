@@ -3937,6 +3937,7 @@ mod tests {
         assert!(!attribution.fully_attributed());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_dead_beacon() {
         let root = tempfile::tempdir().unwrap();
