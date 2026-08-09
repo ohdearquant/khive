@@ -2075,3 +2075,76 @@ fn post_v19_name_mismatch_fails_loud() {
         "error must name the expected canonical name: {msg}"
     );
 }
+
+// ── V20: durable blob-GC claims (#1850) ──────────────────────────────────
+
+#[test]
+fn v20_blob_gc_claims_block_new_live_references_until_cleanup() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("fresh migrate to latest (includes V20)");
+
+    assert!(
+        table_exists(&conn, "blob_gc_claims"),
+        "V20 must install the durable claim table"
+    );
+
+    let claimed = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    conn.execute(
+        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+         VALUES ('root-a', ?1, 1)",
+        [claimed],
+    )
+    .expect("install active claim");
+
+    let insert_err = conn
+        .execute(
+            "INSERT INTO entities \
+             (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+             VALUES ('blocked', 'local', 'document', 'blocked', '[]', 1, 1, ?1)",
+            [claimed],
+        )
+        .expect_err("a live entity must not acquire a claimed content_ref");
+    assert!(
+        insert_err.to_string().contains("active blob sweep"),
+        "unexpected trigger error: {insert_err}"
+    );
+
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('unrelated', 'local', 'document', 'unrelated', '[]', 1, 1, \
+                 'blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')",
+        [],
+    )
+    .expect("an unrelated content_ref remains writable");
+
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, deleted_at, content_ref) \
+         VALUES ('tombstone', 'local', 'document', 'tombstone', '[]', 1, 1, 1, ?1)",
+        [claimed],
+    )
+    .expect("a tombstoned row is not a live blob reference");
+
+    let update_err = conn
+        .execute(
+            "UPDATE entities SET content_ref = ?1 WHERE id = 'unrelated'",
+            [claimed],
+        )
+        .expect_err("an update must not acquire a claimed content_ref");
+    assert!(
+        update_err.to_string().contains("active blob sweep"),
+        "unexpected update trigger error: {update_err}"
+    );
+
+    conn.execute(
+        "DELETE FROM blob_gc_claims WHERE root_key = 'root-a' AND content_ref = ?1",
+        [claimed],
+    )
+    .expect("release active claim");
+    conn.execute(
+        "UPDATE entities SET content_ref = ?1 WHERE id = 'unrelated'",
+        [claimed],
+    )
+    .expect("the reference becomes writable after claim cleanup");
+}

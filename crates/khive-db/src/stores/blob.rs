@@ -1136,6 +1136,91 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transactional_orphan_sweep_releases_sqlite_writer_before_physical_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        let root = dir.path().join("blobs");
+        let store = std::sync::Arc::new(
+            FsBlobStore::new(root.clone(), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let orphan = store
+            .put(b"claim then delete outside sqlite".to_vec())
+            .await
+            .unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let (claimed, release_delete, _done) = sync_hook::install(&canonical_root);
+
+        let sweep = {
+            let store = store.clone();
+            let sql = backend.sql();
+            tokio::spawn(async move { store.transactional_orphan_sweep(sql.as_ref(), false).await })
+        };
+        assert!(
+            recv_blocking(claimed).await,
+            "sweep must durably claim the orphan before physical deletion"
+        );
+        assert!(
+            store.exists(&orphan).await.unwrap(),
+            "the test seam must pause before the physical delete"
+        );
+
+        // The destructive filesystem phase is deliberately paused. An
+        // unrelated SQLite writer must nevertheless complete now: this is
+        // the hold-time proof that external I/O is no longer inside the
+        // sweep's BEGIN IMMEDIATE span.
+        let unrelated = rusqlite::Connection::open(&db_path).unwrap();
+        unrelated.busy_timeout(Duration::from_millis(100)).unwrap();
+        unrelated
+            .execute(
+                "INSERT INTO entities \
+                 (id, namespace, kind, name, tags, created_at, updated_at) \
+                 VALUES ('unrelated-writer', 'local', 'concept', 'unrelated', '[]', 1, 1)",
+                [],
+            )
+            .expect("external filesystem work must not retain SQLite's writer lock");
+
+        // The claim trigger is the cross-resource fence: while the file is
+        // selected for deletion, a concurrent entity writer cannot make it
+        // newly live in the released-writer window.
+        let claimed_err = unrelated
+            .execute(
+                "INSERT INTO entities \
+                 (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+                 VALUES ('racing-reference', 'local', 'document', 'racing', '[]', 1, 1, ?1)",
+                [orphan.as_str()],
+            )
+            .expect_err("a claimed content_ref must fail closed before deletion");
+        assert!(
+            claimed_err.to_string().contains("active blob sweep"),
+            "unexpected claim error: {claimed_err}"
+        );
+
+        release_delete.send(()).unwrap();
+        let result = sweep.await.unwrap().unwrap();
+        assert_eq!(result.deleted, 1);
+        assert!(!store.exists(&orphan).await.unwrap());
+
+        let remaining_claims: i64 = unrelated
+            .query_row(
+                "SELECT COUNT(*) FROM blob_gc_claims WHERE content_ref = ?1",
+                [orphan.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_claims, 0,
+            "successful deletion releases the claim"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transactional_orphan_sweep_republishes_deduplicated_external_put() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
