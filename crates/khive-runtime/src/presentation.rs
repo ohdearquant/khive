@@ -508,8 +508,10 @@ fn transform_agent(
                     scores,
                     payload_timestamps,
                     now,
-                    child_inside_properties,
-                    preserve_list_envelope,
+                    AgentFieldContext {
+                        inside_properties: child_inside_properties,
+                        preserve_list_envelope,
+                    },
                 );
                 match transformed {
                     None => {} // drop
@@ -551,6 +553,12 @@ fn transform_agent(
 /// such as the `trigger_at` returned directly in a `schedule.remind`/
 /// `schedule.schedule` create response (#871). Metadata timestamps at the top
 /// level (`created_at`, `updated_at`) are still compacted.
+#[derive(Clone, Copy)]
+struct AgentFieldContext {
+    inside_properties: bool,
+    preserve_list_envelope: bool,
+}
+
 fn transform_field_agent(
     key: &str,
     value: Value,
@@ -558,13 +566,14 @@ fn transform_field_agent(
     scores: &HashSet<&str>,
     payload_timestamps: &HashSet<&str>,
     now: i64,
-    inside_properties: bool,
-    preserve_list_envelope: bool,
+    context: AgentFieldContext,
 ) -> Option<Value> {
     match &value {
         // Preserve lifecycle and stable-envelope nulls; drop other nulls.
         Value::Null => {
-            if preserved_nulls.contains(key) || (preserve_list_envelope && key == "next_after") {
+            if preserved_nulls.contains(key)
+                || (context.preserve_list_envelope && key == "next_after")
+            {
                 Some(value)
             } else {
                 None
@@ -572,7 +581,9 @@ fn transform_field_agent(
         }
         // Stable page-envelope arrays remain present even when empty.
         Value::Array(a)
-            if preserve_list_envelope && a.is_empty() && EMPTY_ARRAY_PRESERVE.contains(&key) =>
+            if context.preserve_list_envelope
+                && a.is_empty()
+                && EMPTY_ARRAY_PRESERVE.contains(&key) =>
         {
             Some(value)
         }
@@ -595,7 +606,9 @@ fn transform_field_agent(
         // Compact ISO-8601 timestamps unless inside a caller-supplied payload
         // object, or the field is a named payload timestamp at any nesting.
         Value::String(s)
-            if !inside_properties && !payload_timestamps.contains(key) && looks_like_iso8601(s) =>
+            if !context.inside_properties
+                && !payload_timestamps.contains(key)
+                && looks_like_iso8601(s) =>
         {
             Some(Value::String(compact_timestamp(s, now)))
         }
@@ -606,7 +619,7 @@ fn transform_field_agent(
             scores,
             payload_timestamps,
             now,
-            inside_properties,
+            context.inside_properties,
         )),
         // Everything else passes through.
         _ => Some(value),
