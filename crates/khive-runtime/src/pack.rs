@@ -6855,7 +6855,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+        assert!(matches!(err, RuntimeError::UnknownVerb(_)));
 
         let ev = first_event(&store).await;
         assert_eq!(ev.outcome, EventOutcome::Error);
