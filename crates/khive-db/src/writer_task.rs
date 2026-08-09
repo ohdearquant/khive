@@ -41,6 +41,7 @@
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -76,11 +77,20 @@ pub struct WriterStageObservation {
     pub observed_at_unix_ms: u64,
 }
 
-static WRITER_STAGE_OBSERVATIONS: OnceLock<Mutex<HashMap<String, WriterStageObservation>>> =
-    OnceLock::new();
+static WRITER_STAGE_OBSERVATIONS: OnceLock<
+    Mutex<HashMap<Option<PathBuf>, WriterStageObservation>>,
+> = OnceLock::new();
 
-fn writer_stage_observations() -> &'static Mutex<HashMap<String, WriterStageObservation>> {
+fn writer_stage_observations() -> &'static Mutex<HashMap<Option<PathBuf>, WriterStageObservation>> {
     WRITER_STAGE_OBSERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn writer_db_key_from_path(path: Option<&Path>) -> Option<PathBuf> {
+    path.map(Path::to_path_buf)
+}
+
+fn writer_db_key(pool: &ConnectionPool) -> Option<PathBuf> {
+    writer_db_key_from_path(pool.canonical_path())
 }
 
 fn duration_micros(duration: Duration) -> u64 {
@@ -97,15 +107,15 @@ fn observed_at_unix_ms() -> u64 {
 /// Pure in-memory read of the most recently completed writer-task span for
 /// this exact backend. It acquires no SQLite connection and performs no I/O.
 pub fn last_writer_stage_observation(pool: &ConnectionPool) -> Option<WriterStageObservation> {
-    let db = crate::timeout_sink::db_label(pool);
     writer_stage_observations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&db)
+        .get(&writer_db_key(pool))
         .cloned()
 }
 
 struct WriteTelemetry {
+    backend_key: Option<PathBuf>,
     db: String,
     submitted_at: Instant,
     queue_depth_at_entry: usize,
@@ -114,11 +124,13 @@ struct WriteTelemetry {
 
 impl WriteTelemetry {
     fn new(
+        backend_key: Option<PathBuf>,
         db: String,
         queue_depth_at_entry: usize,
         slow_write_threshold: Option<Duration>,
     ) -> Self {
         Self {
+            backend_key,
             db,
             submitted_at: Instant::now(),
             queue_depth_at_entry,
@@ -150,7 +162,7 @@ impl WriteTelemetry {
         writer_stage_observations()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(self.db.clone(), observation.clone());
+            .insert(self.backend_key, observation.clone());
 
         if self
             .slow_write_threshold
@@ -550,6 +562,9 @@ fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError
 #[derive(Clone, Debug)]
 pub struct WriterTaskHandle {
     tx: mpsc::Sender<Box<dyn AnyWriteRequest + Send>>,
+    /// Exact canonical backend identity used by the in-memory stage registry.
+    /// Kept separate from `db`, whose lossy display form is logging-only.
+    backend_key: Option<PathBuf>,
     /// This handle's pool's writer-timeout sink identity (`timeout_sink::db_label`),
     /// captured at spawn so `send_with_timeout`'s `WriteQueueFull` path can
     /// report a `queue_saturation` sink row (ADR-136 D1 gate 6a) without
@@ -623,6 +638,7 @@ impl WriterTaskHandle {
     {
         let (reply_tx, reply_rx) = oneshot::channel();
         let telemetry = WriteTelemetry::new(
+            self.backend_key.clone(),
             self.db.clone(),
             self.queue_depth(),
             self.slow_write_threshold,
@@ -809,6 +825,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     let conn = pool.open_standalone_writer_untracked()?;
     let acquisition_counters = pool.writer_acquisition_counters();
     let origin = pool.origin();
+    let backend_key = writer_db_key(pool);
     let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
     let join = tokio::spawn(run_writer_task(
@@ -824,6 +841,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     pool.set_writer_task_join(join);
     Ok(WriterTaskHandle {
         tx,
+        backend_key,
         db,
         slow_write_threshold: crate::timeout_sink::slow_write_threshold(),
         enqueue_timeout: std::time::Duration::from_millis(
@@ -1377,6 +1395,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -1416,6 +1435,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -1741,7 +1761,7 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: true,
-            telemetry: WriteTelemetry::new("test".to_string(), 0, None),
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
@@ -1786,7 +1806,7 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
-            telemetry: WriteTelemetry::new("test".to_string(), 0, None),
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -1924,7 +1944,7 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
-            telemetry: WriteTelemetry::new("test".to_string(), 0, None),
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -1969,7 +1989,7 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
-            telemetry: WriteTelemetry::new("test".to_string(), 0, None),
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
@@ -2240,6 +2260,7 @@ mod tests {
 
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -2266,6 +2287,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -2290,6 +2312,30 @@ mod tests {
 
         assert_writer_task_terminal_state(result, WriterTaskRequestState::SideEffectsUnknown);
         assert!(!request_ran.load(Ordering::SeqCst));
+    }
+
+    /// #1849: writer telemetry uses the same canonical OS-path identity as
+    /// the pool. A lossy display string would merge these distinct backends.
+    #[cfg(unix)]
+    #[test]
+    fn writer_stage_backend_key_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_a =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/khive-writer-\x80.db".to_vec()));
+        let path_b =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/khive-writer-\x81.db".to_vec()));
+        assert_eq!(
+            path_a.display().to_string(),
+            path_b.display().to_string(),
+            "fixture must reproduce the lossy display-label collision"
+        );
+        assert_ne!(
+            writer_db_key_from_path(Some(&path_a)),
+            writer_db_key_from_path(Some(&path_b)),
+            "backend keys must retain the canonical path's exact OS bytes"
+        );
     }
 
     /// #1849: a deliberately slow transaction body with no queue backlog or

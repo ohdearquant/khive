@@ -98,17 +98,19 @@ pub struct RoutineWalObservation {
 /// Latest routine observation by canonical database identity. Checkpoint
 /// tasks fan out per backend, so a single process-global "last task wins"
 /// gauge would misattribute a secondary backend to the main metrics frame.
-static ROUTINE_WAL_OBSERVATIONS: OnceLock<Mutex<HashMap<String, RoutineWalObservation>>> =
+static ROUTINE_WAL_OBSERVATIONS: OnceLock<Mutex<HashMap<Option<PathBuf>, RoutineWalObservation>>> =
     OnceLock::new();
 
-fn routine_wal_observations() -> &'static Mutex<HashMap<String, RoutineWalObservation>> {
+fn routine_wal_observations() -> &'static Mutex<HashMap<Option<PathBuf>, RoutineWalObservation>> {
     ROUTINE_WAL_OBSERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn checkpoint_db_label(pool: &ConnectionPool) -> String {
-    pool.canonical_path()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "memory".to_string())
+fn checkpoint_db_key_from_path(path: Option<&Path>) -> Option<PathBuf> {
+    path.map(Path::to_path_buf)
+}
+
+fn checkpoint_db_key(pool: &ConnectionPool) -> Option<PathBuf> {
+    checkpoint_db_key_from_path(pool.canonical_path())
 }
 
 fn observed_at_unix_ms() -> u64 {
@@ -144,7 +146,7 @@ fn record_routine_wal_observation(
     routine_wal_observations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(checkpoint_db_label(pool), observation.clone());
+        .insert(checkpoint_db_key(pool), observation.clone());
     observation
 }
 
@@ -154,7 +156,7 @@ pub fn routine_wal_observation(pool: &ConnectionPool) -> Option<RoutineWalObserv
     routine_wal_observations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&checkpoint_db_label(pool))
+        .get(&checkpoint_db_key(pool))
         .cloned()
 }
 
@@ -6179,6 +6181,29 @@ mod tests {
         // Either an explicit error or a nonsensical negative `log` value is
         // acceptable here — the requirement is just "does not panic".
         let _ = query_wal_pin_depth(writer.conn());
+    }
+
+    /// #1849: a canonical filesystem identity is an OS path, not a display
+    /// label. Distinct non-UTF-8 Unix paths can render to the same lossy
+    /// string and must still occupy distinct backend telemetry slots.
+    #[cfg(unix)]
+    #[test]
+    fn routine_wal_backend_key_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_a = PathBuf::from(OsString::from_vec(b"/tmp/khive-wal-\x80.db".to_vec()));
+        let path_b = PathBuf::from(OsString::from_vec(b"/tmp/khive-wal-\x81.db".to_vec()));
+        assert_eq!(
+            path_a.display().to_string(),
+            path_b.display().to_string(),
+            "fixture must reproduce the lossy display-label collision"
+        );
+        assert_ne!(
+            checkpoint_db_key_from_path(Some(&path_a)),
+            checkpoint_db_key_from_path(Some(&path_b)),
+            "backend keys must retain the canonical path's exact OS bytes"
+        );
     }
 
     /// #1849: the periodic checkpoint's own PASSIVE row is the monitoring
