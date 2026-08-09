@@ -649,6 +649,15 @@ pub(crate) mod tests {
             );
             assert_eq!(search["partial"], json!(true));
             assert_eq!(search["missing_backends"], json!(["archive"]));
+            assert_eq!(
+                search["backend_errors"],
+                json!({
+                    "archive": {
+                        "kind": "backend_error",
+                        "message": "injected search failure"
+                    }
+                })
+            );
             assert_eq!(response["status"], json!("success"));
         }
     }
@@ -682,6 +691,7 @@ pub(crate) mod tests {
         assert_eq!(search["result"], json!([]));
         assert!(search.get("partial").is_none());
         assert!(search.get("missing_backends").is_none());
+        assert!(search.get("backend_errors").is_none());
     }
 
     /// ADR-130 §1 completeness contract, degraded-empty case: a backend
@@ -716,6 +726,15 @@ pub(crate) mod tests {
         assert_eq!(search["error"]["kind"], json!("search_incomplete"));
         assert_eq!(search["error"]["retryable"], json!(false));
         assert_eq!(search["error"]["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            search["error"]["backend_errors"],
+            json!({
+                "archive": {
+                    "kind": "backend_error",
+                    "message": "injected search failure"
+                }
+            })
+        );
         assert!(search["error"]["message"].as_str().is_some());
     }
 
@@ -747,6 +766,10 @@ pub(crate) mod tests {
         assert_eq!(search["ok"], json!(false), "unexpected response: {search}");
         assert_eq!(search["error"]["kind"], json!("search_incomplete"));
         assert_eq!(search["error"]["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            search["error"]["backend_errors"]["archive"]["message"],
+            json!("injected search failure")
+        );
     }
 
     /// MIN-1: the coordinator's serialized entity/note rows must carry the

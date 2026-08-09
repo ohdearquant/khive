@@ -3385,12 +3385,22 @@ mod tests {
             "status": "partial",
             "partial": true,
             "missing_backends": ["archive"],
+            "backend_errors": {
+                "archive": {
+                    "kind": "backend_error",
+                    "message": "storage unavailable"
+                }
+            },
         }));
 
         assert_eq!(omitted["ok"], json!(true));
         assert_eq!(omitted["status"], json!("partial"));
         assert_eq!(omitted["partial"], json!(true));
         assert_eq!(omitted["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            omitted["backend_errors"]["archive"]["message"],
+            json!("storage unavailable")
+        );
         assert!(omitted.get("result").is_none());
         assert!(omitted.get("result_omitted").is_some());
     }
@@ -3420,6 +3430,12 @@ mod tests {
             "message": "no-match was not established because selected backends failed",
             "retryable": false,
             "missing_backends": ["archive"],
+            "backend_errors": {
+                "archive": {
+                    "kind": "backend_error",
+                    "message": "storage unavailable"
+                }
+            },
         });
         let omitted = frame_budget_omission(&json!({
             "ok": false,
