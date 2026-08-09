@@ -4217,7 +4217,10 @@ mod tests {
 
         let detected = compute_config_id(&runtime, None);
         assert_ne!(writable, detected);
-        assert!(detected.contains("backend=main:read_only"), "{detected}");
+        assert!(
+            detected.contains(&format!("backend={:?}:read_only", runtime.backend_id)),
+            "{detected}"
+        );
         assert_eq!(
             detected,
             compute_config_id_with_storage_mode(&runtime, None, true),
