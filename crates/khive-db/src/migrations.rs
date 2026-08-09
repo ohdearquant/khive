@@ -572,12 +572,13 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     Ok(applied_version)
 }
 
-/// Preserve a versioned migration's raw SQLite source and emit the same
-/// ERROR-class FULL escalation as ordinary stores before any outer layer can
-/// render or otherwise flatten the failure.
+/// Emit the same ERROR-class FULL escalation as ordinary stores while the
+/// SQLite result code is still typed, then preserve ADR-015's public string
+/// error contract when wrapping the versioned migration failure.
 fn migration_error(version: u32, operation: &'static str, source: rusqlite::Error) -> SqliteError {
     crate::error::log_sqlite_full(operation, &source);
-    SqliteError::Migration { version, source }
+    let error = source.to_string();
+    SqliteError::Migration { version, error }
 }
 
 #[derive(Debug)]

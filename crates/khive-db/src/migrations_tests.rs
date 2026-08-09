@@ -6,7 +6,7 @@ fn open_memory() -> Connection {
 }
 
 #[test]
-fn migration_failure_preserves_the_raw_sqlite_full_source() {
+fn migration_failure_preserves_the_public_string_contract_after_full_escalation() {
     let error = migration_error(
         7,
         "migration_body",
@@ -17,24 +17,20 @@ fn migration_failure_preserves_the_raw_sqlite_full_source() {
     );
 
     match &error {
-        SqliteError::Migration { version, source } => {
+        SqliteError::Migration { version, error } => {
             assert_eq!(*version, 7);
-            assert!(matches!(
-                source,
-                rusqlite::Error::SqliteFailure(code, _)
-                    if code.code == rusqlite::ErrorCode::DiskFull
-            ));
+            assert!(error.contains("database or disk is full"));
         }
         other => panic!("expected migration error, got {other:?}"),
     }
-    let source = std::error::Error::source(&error)
-        .and_then(|source| source.downcast_ref::<rusqlite::Error>())
-        .expect("migration error must retain the raw rusqlite source");
-    assert!(matches!(
-        source,
-        rusqlite::Error::SqliteFailure(code, _)
-            if code.code == rusqlite::ErrorCode::DiskFull
-    ));
+    assert!(
+        std::error::Error::source(&error).is_none(),
+        "the accepted public Migration variant stores display text, not a driver source"
+    );
+    assert!(
+        error.to_string().contains("migration v7 failed"),
+        "the stable migration display prefix must remain intact"
+    );
 }
 
 #[test]
@@ -44,7 +40,7 @@ fn every_versioned_migration_error_uses_the_full_escalating_mapper() {
         .split_once("fn run_migrations_locked(")
         .expect("migration runner source")
         .1
-        .split_once("/// Preserve a versioned migration's raw SQLite source")
+        .split_once("\nfn migration_error(")
         .expect("end of migration runner source")
         .0;
     assert_eq!(
@@ -66,6 +62,20 @@ fn every_versioned_migration_error_uses_the_full_escalating_mapper() {
     assert!(
         mapper.contains("crate::error::log_sqlite_full(operation, &source)"),
         "the common migration mapper must ERROR-escalate SQLITE_FULL before wrapping it"
+    );
+    let log_position = mapper
+        .find("crate::error::log_sqlite_full(operation, &source)")
+        .expect("raw FULL logging call");
+    let stringify_position = mapper
+        .find("source.to_string()")
+        .expect("accepted Migration error String conversion");
+    assert!(
+        log_position < stringify_position,
+        "raw SQLITE_FULL must be escalated before the driver error is flattened"
+    );
+    assert!(
+        mapper.contains("SqliteError::Migration { version, error }"),
+        "the mapper must preserve ADR-015's public { version, error: String } shape"
     );
 }
 
