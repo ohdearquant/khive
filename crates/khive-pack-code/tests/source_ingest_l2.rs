@@ -840,6 +840,115 @@ async fn wire_malformed_tiers_rejected_before_db_open() {
     }
 }
 
+/// An explicit target is an operator claim that the map database already
+/// exists and is current. A typo must not be interpreted as permission to
+/// create and migrate a new SQLite file at that path.
+#[tokio::test]
+async fn wire_explicit_missing_db_is_rejected_without_creation() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_missing_target");
+    let db = root.path().join("mistyped").join("map.db");
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+
+    let error = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": root.path().join("pkg_missing_target").to_string_lossy(),
+            "db": db.to_string_lossy(),
+            "languages": ["rust"],
+            "tiers": [],
+        }),
+    )
+    .await
+    .expect_err("an explicit missing target must fail closed");
+
+    assert!(
+        matches!(error, RuntimeError::InvalidInput(_)),
+        "target refusal must be InvalidInput, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("existing") && error.to_string().contains("map database"),
+        "the remedy must explain the explicit-target contract: {error}"
+    );
+    assert!(
+        !db.exists() && !db.parent().expect("parent").exists(),
+        "a mistyped explicit target must create neither the database nor its parent"
+    );
+}
+
+/// Merely finding a SQLite-compatible file is not enough: an explicit map
+/// target must already carry the current khive schema. Validation happens
+/// before migrations or write-intent sidecars can mutate that file.
+#[tokio::test]
+async fn wire_explicit_unmigrated_db_is_rejected_byte_identically() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_unmigrated_target");
+    let db = root.path().join("unmigrated.db");
+    std::fs::write(&db, []).expect("create empty SQLite-compatible target");
+    let before = std::fs::read(&db).expect("read target before dispatch");
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+
+    let error = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": root.path().join("pkg_unmigrated_target").to_string_lossy(),
+            "db": db.to_string_lossy(),
+            "languages": ["rust"],
+            "tiers": [],
+        }),
+    )
+    .await
+    .expect_err("an explicit unmigrated target must fail closed");
+
+    assert!(
+        error.to_string().contains("schema") && error.to_string().contains("migrate"),
+        "the refusal must identify the schema remedy: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("read target after dispatch"),
+        before,
+        "target validation must not migrate or otherwise rewrite the file"
+    );
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db.as_os_str().to_owned();
+        sidecar.push(suffix);
+        assert!(
+            !std::path::PathBuf::from(sidecar).exists(),
+            "target validation must not create the {suffix} sidecar"
+        );
+    }
+}
+
+/// The workspace-local default remains an intentional creation surface. The
+/// guard applies only when the caller supplies `db` explicitly.
+#[tokio::test]
+async fn wire_omitted_db_still_initializes_workspace_map() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_default_target");
+    let package = root.path().join("pkg_default_target");
+    let expected_db = package.join(".khive").join("code-map.db");
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+
+    dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": package.to_string_lossy(),
+            "languages": ["rust"],
+            "tiers": [],
+        }),
+    )
+    .await
+    .expect("the documented workspace-local default remains creatable");
+
+    assert!(
+        expected_db.exists(),
+        "omitting db must still initialize the workspace-local map database"
+    );
+}
+
 /// Duplicate tier entries dedupe to the same flags as the deduplicated set.
 #[tokio::test]
 async fn wire_duplicate_tiers_canonicalize() {
