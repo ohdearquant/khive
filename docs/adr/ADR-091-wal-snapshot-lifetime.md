@@ -1207,3 +1207,58 @@ invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
 `sidecar_entries_cleanup_would_reap` members are optional and omitted when enumeration did not
 run. A background checkpoint tick may independently perform its normal cleanup, but the
 diagnostic request itself never converts an unmeasured value into a clean-looking zero.
+
+### 2026-08-09 amendment (Amendment 7): write-transaction external-work audit
+
+**Motivation.** WAL mode admits one writer. Queue time therefore depends on both mean writer hold
+time and its variance; a filesystem call, network request, blocking wait, or expensive compute
+step inside `BEGIN IMMEDIATE` extends every competing writer's wait while remaining invisible to
+queue-side admission telemetry. The earlier inventory proved transaction lifetimes were scoped,
+but did not enumerate what actually ran inside each write scope. The audit for #1850 found one
+real violation: `FsBlobStore::transactional_orphan_sweep` performed file metadata checks and
+unbounded file deletion inside `SqlAccess::atomic_unit`.
+
+**Normative invariant.** From `BEGIN IMMEDIATE` until COMMIT/ROLLBACK, application code may execute
+SQLite statements plus bounded in-memory binding/result bookkeeping only. It MUST NOT perform
+filesystem/process/network I/O, sleep or block on a non-SQL synchronization primitive, call another
+subsystem, or perform model/embedding/unbounded computation. SQLite's own database/WAL/VFS work is
+of course part of statement execution and is not “external work” in this rule.
+
+**Complete production write-scope audit (current tree).** The owner row is the review unit; every
+production caller named in that row was inspected through its commit/rollback edge.
+
+| Transaction owner                               | Production scopes/callers                                                                                 | Work inside the transaction                                                   | Verdict                                 |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------- |
+| `run_migrations_locked` and `apply_schema_plan` | Core versioned migrations; pack service migrations                                                        | Migration DDL/DML and ledger insert                                           | SQL-only                                |
+| `WriterGuard::transaction`                      | Pack auxiliary DDL; runtime symmetric edge update; entity/note merge fallback                             | Synchronous statement sequences over one borrowed connection                  | SQL-only                                |
+| `writer_task::drain_loop`                       | All `send`/`send_bounded` store mutations, queue-backed `SqlBridge` batches, and `atomic_unit` requests   | The request's prepared SQL statements and bounded row/result folding          | SQL-only after the blob-GC repair below |
+| `SqlBridge` manual owners                       | Standalone and pool-backed `execute_batch`; flag-off `run_manual_atomic_unit`                             | Pre-prepared parameterized statements, commit/rollback, poisoning bookkeeping | SQL-only                                |
+| Store flag-off batch owners                     | `entity`, `note`, `event`, `graph`, `text`, `sparse`, `vectors`, and `agents` batch/upsert/delete methods | Bounded per-item SQL loops and result counters                                | SQL-only                                |
+| Vector-store private IMMEDIATE transactions     | Vector batch upsert/delete/orphan reconciliation                                                          | sqlite-vec/ordinary table statements and bounded row binding                  | SQL-only                                |
+| Runtime/pack `AtomicUnitOp` callers             | Runtime atomic runner and ANN registry; brain fold/persist; session mirror ingest; blob claim/cleanup     | DML/query statements and bounded validation/folding                           | SQL-only                                |
+| Blob physical GC (outside owner)                | `FsBlobStore::transactional_orphan_sweep`                                                                 | Root walk, metadata, advisory locking, and file deletion                      | Explicitly outside SQLite transactions  |
+
+**Blob cross-resource repair.** The sweep now prepares its file candidates before SQLite opens a
+writer transaction. Its first short atomic unit anti-joins live `entities.content_ref` values and
+commits durable `blob_gc_claims`. V20 entity INSERT/UPDATE triggers reject any new live reference
+to a claimed digest. Only after commit does the sweep delete files under its process-local and
+cross-process root locks; a second short atomic unit removes the claims. A crash between those
+units leaves the trigger fence durable and fail-closed for the next sweep to recover. This keeps
+the stronger ADR-111 liveness guarantee without retaining SQLite's single writer across external
+I/O. `transactional_orphan_sweep_releases_sqlite_writer_before_physical_delete` pauses at that exact
+boundary, proves an unrelated writer commits while deletion is parked, and proves a racing claimed
+reference is rejected.
+
+**Review guard.** This table is normative and exhaustive. Any PR that adds or widens a
+`BEGIN IMMEDIATE`, `TransactionBehavior::Immediate`, `WriterGuard::transaction`, writer-task
+request body, or `SqlAccess::atomic_unit` caller MUST update the applicable row (or add one) and
+show that all inputs/external results are prepared before the transaction opens. The
+`AtomicUnitOp` trait documentation repeats this requirement because first-poll enforcement catches
+async suspension but cannot detect synchronous filesystem calls. Reviewers must reject a new site
+whose table entry is absent or whose body violates the invariant.
+
+The hold-time regression parks physical deletion indefinitely after the claim commit and gives an
+unrelated writer a 100 ms SQLite busy bound. The unrelated commit succeeds inside that bound while
+deletion is still parked; under the former one-transaction implementation it remained behind the
+parked filesystem phase and reached the busy timeout. This is the measured boundary for #1850:
+external deletion contributes zero time to SQLite's exclusive writer hold.

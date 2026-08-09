@@ -139,6 +139,8 @@ const V18_UP: &str = include_str!("../sql/018-ann-consumer-pending.sql");
 
 const V19_UP: &str = include_str!("../sql/019-list-cursor-backfill-repair.sql");
 
+const V20_UP: &str = include_str!("../sql/020-blob-gc-claims.sql");
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -265,6 +267,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 19,
         name: "list_cursor_backfill_repair",
         up: V19_UP,
+    },
+    VersionedMigration {
+        version: 20,
+        name: "blob_gc_claims",
+        up: V20_UP,
     },
 ];
 

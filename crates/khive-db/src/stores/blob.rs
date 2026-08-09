@@ -21,7 +21,7 @@ use async_trait::async_trait;
 
 use khive_storage::blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};
 use khive_storage::error::StorageError;
-use khive_storage::types::{SqlStatement, SqlValue, StorageResult};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue, StorageResult};
 use khive_storage::{AtomicUnitOp, SqlAccess, StorageCapability};
 
 use crate::error::SqliteError;
@@ -35,6 +35,30 @@ fn map_io_err(e: std::io::Error, op: &'static str) -> StorageError {
 fn shard_path(root: &Path, content_ref: &ContentRef) -> PathBuf {
     let hex = content_ref.as_str();
     root.join(&hex[0..2]).join(&hex[2..4]).join(hex)
+}
+
+/// Collision-resistant identity for one canonical blob root.
+///
+/// Paths are not required to be UTF-8. Hash the platform-native path bytes
+/// rather than a lossy display spelling so two distinct roots cannot share a
+/// durable GC claim namespace.
+fn blob_root_key(root: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        root.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt;
+        root.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let bytes = root.to_string_lossy().as_bytes().to_vec();
+    blake3::hash(&bytes).to_hex().to_string()
 }
 
 /// Resolve the blob store root directory.
@@ -265,6 +289,61 @@ fn sweep_blob_candidates(
         }
     }
     Ok(result)
+}
+
+#[derive(Debug)]
+struct PreparedTransactionalSweep {
+    result: BlobOrphanSweepResult,
+    candidates: Vec<(ContentRef, bool)>,
+}
+
+/// Perform every filesystem-dependent part of candidate classification before
+/// SQLite's writer transaction opens.
+fn prepare_transactional_sweep(
+    files: Vec<(ContentRef, PathBuf)>,
+    grace_period: Duration,
+) -> PreparedTransactionalSweep {
+    let now = SystemTime::now();
+    let mut result = BlobOrphanSweepResult::default();
+    let mut candidates = Vec::with_capacity(files.len());
+    for (content_ref, path) in files {
+        result.scanned += 1;
+        let within_grace = within_publish_grace(&path, now, grace_period);
+        candidates.push((content_ref, within_grace));
+    }
+    PreparedTransactionalSweep { result, candidates }
+}
+
+#[derive(Debug)]
+struct BlobGcClaimOutcome {
+    result: BlobOrphanSweepResult,
+    claimed: Vec<ContentRef>,
+}
+
+#[derive(Debug)]
+struct BlobGcClaimRows {
+    result: BlobOrphanSweepResult,
+    claimed_rows: Vec<SqlRow>,
+}
+
+fn required_nonnegative_count(
+    value: Option<SqlValue>,
+    operation: &'static str,
+) -> StorageResult<u64> {
+    match value {
+        Some(SqlValue::Integer(value)) if value >= 0 => Ok(value as u64),
+        other => Err(StorageError::Internal(format!(
+            "{operation} returned an invalid count: {other:?}"
+        ))),
+    }
+}
+
+fn invalid_content_ref(message: String) -> StorageError {
+    StorageError::InvalidInput {
+        capability: StorageCapability::Blob,
+        operation: "transactional_orphan_sweep".into(),
+        message,
+    }
 }
 
 fn sweep_blob_files(
@@ -510,6 +589,13 @@ impl BlobStore for FsBlobStore {
     // is still exposed to this method deleting the blob out from under it --
     // callers with an unusually slow publish path should widen the grace
     // period (`FsBlobStore::with_orphan_sweep_grace`) accordingly.
+    //
+    // Cross-resource ordering (#1850): filesystem walk/metadata happen
+    // before the first SQL-only atomic unit; that unit commits durable claim
+    // rows whose entity triggers fence new live references; physical deletion
+    // happens after COMMIT; a second SQL-only unit releases the claims. The
+    // root locks span all phases, but SQLite's single writer never spans
+    // external I/O.
     async fn transactional_orphan_sweep(
         &self,
         sql: &dyn SqlAccess,
@@ -519,11 +605,15 @@ impl BlobStore for FsBlobStore {
         let root = self.root.clone();
         let scan_root = root.clone();
         let grace_period = self.orphan_sweep_grace;
-        let (write_guards, candidates) = tokio::task::spawn_blocking(move || {
-            let root_write_guard = acquire_root_write_lock(&scan_root)?;
-            let candidates = walk_blob_files(&scan_root)
+        let (write_guards, canonical_root, prepared) = tokio::task::spawn_blocking(move || {
+            let canonical_root = scan_root
+                .canonicalize()
+                .map_err(|e| map_io_err(e, "transactional_orphan_sweep_root"))?;
+            let root_write_guard = acquire_root_write_lock(&canonical_root)?;
+            let candidates = walk_blob_files(&canonical_root)
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_walk"))?;
-            Ok::<_, StorageError>(((owned_guard, root_write_guard), candidates))
+            let prepared = prepare_transactional_sweep(candidates, grace_period);
+            Ok::<_, StorageError>(((owned_guard, root_write_guard), canonical_root, prepared))
         })
         .await
         .map_err(|e| {
@@ -533,59 +623,267 @@ impl BlobStore for FsBlobStore {
                 e,
             )
         })??;
-        #[cfg(test)]
-        let hook = sync_hook::take(&root);
+        let root_key = blob_root_key(&canonical_root);
+        let claimed_at = chrono::Utc::now().timestamp_micros();
+        // Serialize the filesystem-derived candidate sets before SQLite's
+        // writer is admitted. The atomic unit below has a fixed statement
+        // shape regardless of the number of files: JSON1 performs the
+        // anti-join and claim insertion inside SQLite rather than an
+        // application loop extending the exclusive writer hold.
+        let eligible_refs = prepared
+            .candidates
+            .iter()
+            .filter(|(_, within_grace)| !within_grace)
+            .map(|(content_ref, _)| content_ref.to_string())
+            .collect::<Vec<_>>();
+        let grace_refs = prepared
+            .candidates
+            .iter()
+            .filter(|(_, within_grace)| *within_grace)
+            .map(|(content_ref, _)| content_ref.to_string())
+            .collect::<Vec<_>>();
+        let eligible_json = serde_json::to_string(&eligible_refs).map_err(|error| {
+            StorageError::Internal(format!(
+                "failed to prepare blob GC eligible candidates: {error}"
+            ))
+        })?;
+        let grace_json = serde_json::to_string(&grace_refs).map_err(|error| {
+            StorageError::Internal(format!(
+                "failed to prepare blob GC grace candidates: {error}"
+            ))
+        })?;
+        let initial_result = prepared.result;
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {
-                let _write_guards = write_guards;
-                let rows = writer
-                    .query_all(SqlStatement {
-                        sql: "SELECT DISTINCT content_ref FROM entities \
-                              WHERE deleted_at IS NULL AND content_ref IS NOT NULL"
+                // Corrupt liveness/claim evidence must fail closed before
+                // any claim is removed or file is selected for deletion.
+                // The SQL predicate is the exact ContentRef wire grammar:
+                // 64 lowercase hexadecimal bytes.
+                let invalid_live = writer
+                    .query_row(SqlStatement {
+                        sql: "SELECT content_ref FROM entities \
+                              WHERE deleted_at IS NULL AND content_ref IS NOT NULL \
+                                AND (typeof(content_ref) <> 'text' \
+                                  OR length(content_ref) <> 64 \
+                                  OR content_ref GLOB '*[^0-9a-f]*') \
+                              LIMIT 1"
                             .to_string(),
                         params: vec![],
-                        label: Some("blob_live_refs".to_string()),
+                        label: Some("blob_gc_validate_live_refs".to_string()),
                     })
                     .await?;
-                let mut live_refs = std::collections::HashSet::with_capacity(rows.len());
-                for row in rows {
-                    let raw = match row.get("content_ref") {
-                        Some(SqlValue::Text(raw)) => raw,
-                        _ => {
-                            return Err(StorageError::InvalidInput {
-                                capability: StorageCapability::Blob,
-                                operation: "transactional_orphan_sweep".into(),
-                                message: "entities.content_ref contained a non-text value".into(),
-                            });
-                        }
-                    };
-                    let content_ref = ContentRef::from_hex(raw.clone()).map_err(|message| {
-                        StorageError::InvalidInput {
-                            capability: StorageCapability::Blob,
-                            operation: "transactional_orphan_sweep".into(),
-                            message,
-                        }
-                    })?;
-                    live_refs.insert(content_ref);
+                if invalid_live.is_some() {
+                    return Err(invalid_content_ref(
+                        "entities.content_ref contained a non-canonical value".into(),
+                    ));
                 }
-                #[cfg(test)]
-                if let Some(hook) = &hook {
-                    let _ = hook.reached.send(());
-                    let _ = hook.release.recv();
+
+                let invalid_claim = writer
+                    .query_row(SqlStatement {
+                        sql: "SELECT content_ref FROM blob_gc_claims \
+                              WHERE root_key = ?1 \
+                                AND (typeof(content_ref) <> 'text' \
+                                  OR length(content_ref) <> 64 \
+                                  OR content_ref GLOB '*[^0-9a-f]*') \
+                              LIMIT 1"
+                            .to_string(),
+                        params: vec![SqlValue::Text(root_key.clone())],
+                        label: Some("blob_gc_validate_existing_claims".to_string()),
+                    })
+                    .await?;
+                if invalid_claim.is_some() {
+                    return Err(invalid_content_ref(
+                        "blob_gc_claims.content_ref contained a non-canonical value".into(),
+                    ));
                 }
-                let result = sweep_blob_candidates(candidates, &live_refs, dry_run, grace_period)?;
-                Ok(Box::new(result) as Box<dyn std::any::Any + Send>)
+
+                let grace_period_skipped = required_nonnegative_count(
+                    writer
+                        .query_scalar(SqlStatement {
+                            sql: "SELECT COUNT(*) FROM json_each(?1) AS candidate \
+                                  WHERE NOT EXISTS ( \
+                                    SELECT 1 FROM entities \
+                                    WHERE deleted_at IS NULL \
+                                      AND content_ref = candidate.value \
+                                  )"
+                            .to_string(),
+                            params: vec![SqlValue::Text(grace_json)],
+                            label: Some("blob_gc_count_grace_candidates".to_string()),
+                        })
+                        .await?,
+                    "blob_gc_count_grace_candidates",
+                )?;
+
+                let mut result = initial_result;
+                result.grace_period_skipped = grace_period_skipped;
+
+                if dry_run {
+                    result.would_delete = required_nonnegative_count(
+                        writer
+                            .query_scalar(SqlStatement {
+                                sql: "SELECT COUNT(*) FROM json_each(?1) AS candidate \
+                                      WHERE NOT EXISTS ( \
+                                        SELECT 1 FROM entities \
+                                        WHERE deleted_at IS NULL \
+                                          AND content_ref = candidate.value \
+                                      )"
+                                .to_string(),
+                                params: vec![SqlValue::Text(eligible_json)],
+                                label: Some("blob_gc_count_dry_run_candidates".to_string()),
+                            })
+                            .await?,
+                        "blob_gc_count_dry_run_candidates",
+                    )?;
+                    return Ok(Box::new(BlobGcClaimRows {
+                        result,
+                        claimed_rows: Vec::new(),
+                    }) as Box<dyn std::any::Any + Send>);
+                }
+
+                // The root locks serialize every sweep for this physical
+                // root. Replacing its prior claims in the same transaction
+                // is therefore safe: SQLite excludes a concurrent entity
+                // writer until the fresh anti-joined claims are committed.
+                writer
+                    .execute(SqlStatement {
+                        sql: "DELETE FROM blob_gc_claims WHERE root_key = ?1".to_string(),
+                        params: vec![SqlValue::Text(root_key.clone())],
+                        label: Some("blob_gc_release_stale_claims".to_string()),
+                    })
+                    .await?;
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                              SELECT ?1, candidate.value, ?3 \
+                              FROM json_each(?2) AS candidate \
+                              WHERE NOT EXISTS ( \
+                                SELECT 1 FROM entities \
+                                WHERE deleted_at IS NULL \
+                                  AND content_ref = candidate.value \
+                              )"
+                        .to_string(),
+                        params: vec![
+                            SqlValue::Text(root_key.clone()),
+                            SqlValue::Text(eligible_json),
+                            SqlValue::Integer(claimed_at),
+                        ],
+                        label: Some("blob_gc_claim_candidates".to_string()),
+                    })
+                    .await?;
+
+                let claimed_rows = writer
+                    .query_all(SqlStatement {
+                        sql: "SELECT content_ref FROM blob_gc_claims \
+                              WHERE root_key = ?1 ORDER BY content_ref"
+                            .to_string(),
+                        params: vec![SqlValue::Text(root_key)],
+                        label: Some("blob_gc_claimed_candidates".to_string()),
+                    })
+                    .await?;
+                Ok(Box::new(BlobGcClaimRows {
+                    result,
+                    claimed_rows,
+                }) as Box<dyn std::any::Any + Send>)
             })
         });
-        let result = sql.atomic_unit(op).await?;
-        result
-            .downcast::<BlobOrphanSweepResult>()
-            .map(|result| *result)
-            .map_err(|_| {
-                StorageError::Internal(
-                    "transactional orphan sweep returned an unexpected result type".into(),
-                )
-            })
+        let claimed_rows = sql.atomic_unit(op).await?;
+        let claimed_rows = claimed_rows.downcast::<BlobGcClaimRows>().map_err(|_| {
+            StorageError::Internal(
+                "transactional orphan sweep returned an unexpected claim-row type".into(),
+            )
+        })?;
+        let BlobGcClaimRows {
+            mut result,
+            claimed_rows,
+        } = *claimed_rows;
+        let mut claimed_refs = Vec::with_capacity(claimed_rows.len());
+        for row in claimed_rows {
+            let raw = match row.get("content_ref") {
+                Some(SqlValue::Text(raw)) => raw.clone(),
+                _ => {
+                    return Err(invalid_content_ref(
+                        "blob_gc_claims.content_ref contained a non-text value".into(),
+                    ));
+                }
+            };
+            claimed_refs.push(ContentRef::from_hex(raw).map_err(invalid_content_ref)?);
+        }
+        if !dry_run {
+            result.would_delete = claimed_refs.len() as u64;
+        }
+        let mut claimed = BlobGcClaimOutcome {
+            result,
+            claimed: claimed_refs,
+        };
+        if dry_run {
+            drop(write_guards);
+            return Ok(claimed.result);
+        }
+
+        #[cfg(test)]
+        let hook = sync_hook::take(&root);
+        #[cfg(not(test))]
+        let hook: Option<()> = None;
+        let delete_root = canonical_root.clone();
+        let delete_refs = claimed.claimed.clone();
+        let (write_guards, claimed, delete_error, hook) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                let _ = hook.reached.send(());
+                let _ = hook.release.recv();
+            }
+
+            let mut first_error = None;
+            for content_ref in delete_refs {
+                let path = shard_path(&delete_root, &content_ref);
+                match fs::remove_file(&path) {
+                    Ok(()) => claimed.result.deleted += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        first_error = Some(map_io_err(error, "transactional_orphan_sweep_delete"));
+                        break;
+                    }
+                }
+            }
+            (write_guards, claimed, first_error, hook)
+        })
+        .await
+        .map_err(|error| {
+            StorageError::driver(
+                StorageCapability::Blob,
+                "transactional_orphan_sweep_delete",
+                error,
+            )
+        })?;
+        #[cfg(not(test))]
+        let _ = hook;
+
+        if !claimed.claimed.is_empty() {
+            let cleanup_root_key = blob_root_key(&canonical_root);
+            let cleanup: AtomicUnitOp = Box::new(move |writer| {
+                Box::pin(async move {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "DELETE FROM blob_gc_claims WHERE root_key = ?1".to_string(),
+                            params: vec![SqlValue::Text(cleanup_root_key)],
+                            label: Some("blob_gc_release_claims".to_string()),
+                        })
+                        .await?;
+                    Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+                })
+            });
+            sql.atomic_unit(cleanup).await?;
+        }
+
+        drop(write_guards);
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            let _ = hook.done.send(());
+        }
+        if let Some(error) = delete_error {
+            return Err(error);
+        }
+        Ok(claimed.result)
     }
 }
 
@@ -1217,6 +1515,132 @@ mod tests {
         assert_eq!(
             remaining_claims, 0,
             "successful deletion releases the claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_orphan_sweep_recovers_stale_claims_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        let root = dir.path().join("blobs");
+        let store = FsBlobStore::new(root.clone(), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::from_secs(60));
+        let bytes = b"republished after a crashed claim".to_vec();
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let root_key = blob_root_key(&canonical_root);
+        let absent_ref = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                     VALUES (?1, ?2, 1), (?1, ?3, 1)",
+                    rusqlite::params![root_key, content_ref.as_str(), absent_ref],
+                )
+                .unwrap();
+        }
+
+        // A publisher that recovered after the claiming process crashed
+        // refreshes the digest's grace witness before its entity write. The
+        // next sweep must clear both this protected claim and the claim whose
+        // file was already removed, never resume deletion blindly.
+        assert_eq!(store.put(bytes).await.unwrap(), content_ref);
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+        assert_eq!(result.deleted, 0);
+        assert_eq!(result.grace_period_skipped, 1);
+        assert!(store.exists(&content_ref).await.unwrap());
+
+        let remaining: i64 = backend
+            .pool()
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = ?1",
+                [blob_root_key(&canonical_root)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "the next sweep recovers stale claims");
+    }
+
+    #[tokio::test]
+    async fn transactional_orphan_sweep_refuses_corrupt_liveness_and_claim_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+        }
+        let root = dir.path().join("blobs");
+        let store = FsBlobStore::new(root.clone(), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::ZERO);
+        let orphan = store
+            .put(b"must survive corrupt evidence".to_vec())
+            .await
+            .unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+             VALUES ('corrupt-live', 'local', 'document', 'corrupt', '[]', 1, 1, \
+                     'not-a-content-ref')",
+            [],
+        )
+        .unwrap();
+        let live_error = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .expect_err("corrupt live evidence must fail closed");
+        assert!(matches!(live_error, StorageError::InvalidInput { .. }));
+        assert!(
+            store.exists(&orphan).await.unwrap(),
+            "no file may be removed after corrupt live evidence"
+        );
+
+        conn.execute("DELETE FROM entities WHERE id = 'corrupt-live'", [])
+            .unwrap();
+        let root_key = blob_root_key(&root.canonicalize().unwrap());
+        conn.execute(
+            "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+             VALUES (?1, 'also-not-a-content-ref', 1)",
+            [root_key.as_str()],
+        )
+        .unwrap();
+        let claim_error = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .expect_err("corrupt durable claim evidence must fail closed");
+        assert!(matches!(claim_error, StorageError::InvalidInput { .. }));
+        assert!(
+            store.exists(&orphan).await.unwrap(),
+            "no file may be removed after corrupt claim evidence"
+        );
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blob_gc_claims \
+                 WHERE root_key = ?1 AND content_ref = 'also-not-a-content-ref'",
+                [root_key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "corrupt claim evidence is not silently erased"
         );
     }
 

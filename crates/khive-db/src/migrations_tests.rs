@@ -1967,7 +1967,7 @@ fn v19_repairs_divergent_cursor_ledgers() {
         [],
     )
     .unwrap();
-    conn.execute("DELETE FROM _schema_migrations WHERE version = 19", [])
+    conn.execute("DELETE FROM _schema_migrations WHERE version >= 19", [])
         .unwrap();
     conn.execute("DELETE FROM entities_seq WHERE entity_id = 'e1'", [])
         .unwrap();
@@ -2088,7 +2088,7 @@ fn v20_blob_gc_claims_block_new_live_references_until_cleanup() {
         "V20 must install the durable claim table"
     );
 
-    let claimed = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let claimed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     conn.execute(
         "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
          VALUES ('root-a', ?1, 1)",
@@ -2113,7 +2113,7 @@ fn v20_blob_gc_claims_block_new_live_references_until_cleanup() {
         "INSERT INTO entities \
          (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
          VALUES ('unrelated', 'local', 'document', 'unrelated', '[]', 1, 1, \
-                 'blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')",
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')",
         [],
     )
     .expect("an unrelated content_ref remains writable");

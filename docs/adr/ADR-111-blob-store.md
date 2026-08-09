@@ -264,15 +264,22 @@ traffic alternative for backends that can coordinate both stores. The filesystem
 
 1. acquires the canonical-root in-process and advisory write locks and captures the complete blob
    candidate set while publishers are excluded;
-2. enters `SqlAccess::atomic_unit` (`BEGIN IMMEDIATE` on SQLite), selects distinct references from
-   non-deleted entities, and retains the entity-writer boundary through physical deletion; and
-3. deletes only candidates absent from that transaction's live-reference set.
+2. outside SQLite, evaluates file age and prepares the complete candidate set;
+3. enters a short, SQL-only `SqlAccess::atomic_unit` (`BEGIN IMMEDIATE` on SQLite), selects
+   distinct references from non-deleted entities, and durably claims only absent candidates in
+   `blob_gc_claims`;
+4. after that transaction commits, deletes claimed files while retaining both root write locks;
+   entity INSERT/UPDATE triggers reject a newly live reference to any active claim; and
+5. removes the claims in a second short SQL-only atomic unit before releasing the root locks.
 
 This yields two concurrency guarantees pinned by tests. A blob published after candidate capture
-is not in the sweep set and survives. A committed entity reference cannot appear or disappear
-between the liveness query and physical deletion because both occur under the entity writer's
-transaction. Invalid stored `content_ref` values fail closed rather than making the sweep delete
-against an incomplete live set.
+is not in the sweep set and survives. A committed entity reference cannot appear between the
+liveness query and physical deletion: SQLite's writer lock covers the anti-join plus claim commit,
+then the durable trigger fence covers the external deletion phase without monopolizing SQLite's
+single writer. Invalid stored `content_ref` or claim values fail closed rather than making the
+sweep delete against an incomplete live set. A crash after claim commit leaves a durable
+fail-closed row; the next sweep clears claims whose object is missing, live, or grace-protected and
+resumes eligible work.
 
 The guarantee still has a bounded publish gap. `put(bytes)` and the later entity write that stores
 its returned reference are separate client steps, outside one shared transaction. A candidate with

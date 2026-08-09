@@ -26,6 +26,8 @@
   array.
 - V6/V7/V8 are frozen no-op slots; their `name` strings appear in the
   production `_schema_migrations` table and must not change.
+- V20 adds durable `blob_gc_claims` plus entity INSERT/UPDATE trigger fences
+  for ADR-091 Amendment 7's external-I/O-free transactional blob sweep.
 
 ### Pack Standard — Pack-Auxiliary Schema (ADR-017)
 
@@ -103,6 +105,21 @@ that already wraps every request in its own transaction.
 
 See `crates/khive-db/docs/api/pool.md` and `crates/khive-db/docs/api/vectors.md`
 for the per-function routing rules and the tests that pin them down.
+
+### Write-transaction external-work invariant (ADR-091 Amendment 7)
+
+SQLite write transactions contain database statement execution and bounded
+in-memory preparation only. They never contain filesystem/process/network I/O,
+sleeps, blocking waits, embedding/model work, or another subsystem call. The
+enumerated owner/caller audit lives in ADR-091 and is a review invariant: adding
+or widening any `BEGIN IMMEDIATE`, `WriterGuard::transaction`, writer-task
+request, or `SqlAccess::atomic_unit` scope requires updating that table.
+
+Filesystem blob GC is the cross-resource reference design. It commits durable
+`blob_gc_claims` under a short SQL-only transaction, releases SQLite's writer,
+performs deletion under the blob-root locks, then removes claims in a second
+short SQL-only transaction. Entity triggers reject claimed references in the
+released-writer interval.
 
 ## Consistency Notes
 
