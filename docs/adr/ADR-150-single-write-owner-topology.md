@@ -102,8 +102,8 @@ each independently shippable:
   | Surface                          | Today                                     | Under this ADR                                                                                                           |
   | -------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
   | Daemon verb dispatch             | primary writer                            | the owner                                                                                                                |
-  | `kkernel mcp` bridge fallback    | direct writer pool on mismatch            | read-only open + typed retryable refusal for writes                                                                      |
-  | `kkernel exec` CLI               | daemon socket first, own pool on fallback | same as bridge: no direct write path                                                                                     |
+  | `kkernel mcp` bridge fallback    | direct writer pool on mismatch            | read-only open under the out-of-authority reader discipline (component 3) + typed retryable refusal for writes           |
+  | `kkernel exec` CLI               | daemon socket first, own pool on fallback | same as bridge: no direct write path, reads bounded by the same discipline                                               |
   | Maintenance CLI (reindex/import) | direct pool                               | daemon verb, or explicit `--exclusive` mode that requires the daemon stopped and takes the owner role for the invocation |
   | Scheduled backup replication     | long read TX on live file                 | reads a checkpointed snapshot or runs as a daemon-admitted registered holder (see 4)                                     |
   | Test/dev harnesses               | direct pools on scratch stores            | unchanged — scratch stores, never the production file                                                                    |
@@ -131,6 +131,27 @@ each independently shippable:
   "snapshot released" within a bounded interval. This closes the orphaned-query pin
   class regardless of topology and is the highest-priority component to ship.
 - Long/exact exports become durable jobs against a snapshot, not long live-file reads.
+- **Out-of-authority readers are a bounded, detected class — never an ungoverned one.**
+  Direct read-only opens exist for exactly one state: the owner is unreachable (socket
+  absent or version/namespace mismatch). A reader in that state cannot pass through the
+  owner's admission authority, and mechanical claim 4 applies to it in full — a long
+  read transaction pins the WAL whoever holds it. The class is therefore bounded by
+  construction on the reader's side and detected on the owner's side:
+  - _Discipline on the opener_: fallback reads run statement-scoped (autocommit) or
+    keyset-paginated with a per-page transaction — never a read transaction held
+    across pages — and the read-only opener enforces a hard per-transaction duration
+    ceiling via its own progress-handler watchdog. Work that expects to exceed the
+    ceiling requires the owner (census registration, component 4) and is refused with
+    a typed error while the owner is away, not silently degraded into a long pin.
+  - _Detection of violators_: the owner's WAL-pin holder attribution (the pin
+    attribution machinery landed in #1816) names any pinning pid outside the
+    registered holder set as an out-of-authority pin — metered, logged with the
+    pid, and surfaced by the checkpointer's pressure signal in place of an
+    anonymous stall.
+  - _Residual risk, named_: a non-conforming external process can always open the
+    file read-only and pin the WAL; no in-repo discipline reaches it. The mitigation
+    is visibility (the census names it) plus deferral of maintenance around it — not
+    prevention, which SQLite's file-level access model does not offer.
 
 ### 4. Holder census as a first-class contract
 
@@ -188,7 +209,14 @@ which is the invariant, not a failure of it.
    reaches a writer open.
 3. **Bounded admission with classes** (component 2). Acceptance: a saturating bulk
    ingest beside interactive verbs shows interactive p95 within its envelope and a
-   non-zero, attributed rejection count — no silent interleaved timeouts.
+   non-zero, attributed rejection count — no silent interleaved timeouts. A second
+   run exercises the design criterion itself at its stated scale: **at least 100
+   concurrent OS client processes** issuing real verb traffic against the owner
+   (interactive verbs beside a saturating bulk ingest), accepted with interactive
+   p95 within its envelope, every refusal typed and attributed to its admission
+   class, and zero write loss — every acknowledged write subsequently readable,
+   every unacknowledged write refused with a typed outcome, reconciled by
+   end-to-end accounting across all clients.
 4. **Holder registry + disk guard** (component 4). Acceptance: a backup pass appears in
    the census with identity and ETA while it runs; a synthetic disk-pressure run refuses
    writes with the typed error before the space floor, and the checkpointer log names
