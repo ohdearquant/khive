@@ -586,10 +586,17 @@ failure list and use `--strict` when any failed op must produce a non-zero exit.
 against an idle daemon or in a maintenance window. A plan-level rollback prints
 `atomic.committed=false` but currently exits zero even with `--strict`; inspect that field rather
 than relying on process status. Admissibility, prepare, and atomic-unit seam errors instead exit
-non-zero before printing an atomic result envelope. For `--save-file`, stdout is a manifest whose
-`summary` carries failure counts; the saved JSONL rows carry the per-op error details. Retry only
-after checking the complete result, and only when the operations are known to be idempotent. The
-normative rationale and mode-by-mode exit contract are in
+non-zero before printing an atomic result envelope. For combined non-atomic
+`--ops-file --save-file`, file publication is atomic but database chunks commit incrementally.
+Every exit after dispatch prints a reconciliation manifest: success uses the ordinary shape;
+failure uses `status="aborted"`, lists confirmed `committed_chunks`, and identifies any unverified
+`dispatched_chunk` that may still have database effects. Its `summary` covers confirmed rows and
+`unconfirmed_ops` accounts for the remainder. An abort discards the incomplete temp file and leaves
+any prior destination unchanged. For successful `--save-file`, the manifest `summary`
+carries failure counts and the saved JSONL rows carry per-op error details. Retry only after
+checking the manifest and the result file when one was published, and only when the operations are
+known to be idempotent.
+The normative rationale and mode-by-mode exit contract are in
 [the kkernel design note](../crates/kkernel/docs/design.md#exec-daemon-bypass-second-writer-contract-548-adr-067-adr-099).
 
 ### `exec --pending-events`: cron drain for scheduled events

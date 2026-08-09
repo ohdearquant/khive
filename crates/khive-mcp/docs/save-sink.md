@@ -67,10 +67,19 @@ second complete JSONL buffer in memory.
 
 For `kkernel exec --ops-file --save-file`, destination validation and temp-file
 creation happen before the first operation chunk is dispatched. Each validated
-ordered result row is then written before the next chunk begins. File I/O and
-database commits cannot form one cross-resource transaction: a later disk/full
-I/O failure can still occur after an earlier non-atomic chunk committed. That
-failure exits non-zero, never publishes a partial file, and leaves any old
-destination unchanged. Callers must use the per-op/idempotency contracts when
-retrying after this explicit boundary; atomic ops-files retain their separate
-all-or-nothing database contract.
+ordered result row is then written before the next chunk begins. Only final-file
+publication is atomic: non-atomic database effects commit incrementally by
+chunk, and file I/O plus database commits cannot form one cross-resource
+transaction.
+
+Once dispatch begins, every termination prints a reconciliation manifest.
+Success retains the ordinary manifest shape and publishes the complete JSONL.
+A post-dispatch error instead prints `status="aborted"`,
+`file_published=false`, the confirmed `committed_chunks`, and, when its response
+could not be verified, `dispatched_chunk`. Its `summary` covers confirmed rows
+only; `unconfirmed_ops` accounts for the remainder without falsely classifying
+them as aborted. That dispatched chunk can have database effects even though it
+is not listed as confirmed. The incomplete temp file is discarded and any old
+destination remains unchanged. Callers reconcile
+the manifest before applying the per-op/idempotency contracts to a retry;
+atomic ops-files retain their separate all-or-nothing database contract.

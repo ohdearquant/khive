@@ -118,9 +118,9 @@ for that entry. An invocation-level actor refusal emits one line and returns
 the same normal `results`/`summary` JSON shape over every parsed operation
 without dispatching. Those failed rows and the `summary.failed` count describe
 not-attempted operations, not per-operation execution failures. A malformed
-expression or JSONL line has no operation
-list, so it preserves the parse-before-envelope boundary and prints a dedicated
-invocation error instead of inventing a tool:
+input expression or source JSONL line has no operation list, so it preserves
+the parse-before-envelope boundary and prints a dedicated invocation error
+instead of inventing a tool:
 
 ```json
 {
@@ -139,13 +139,26 @@ invocation is malformed and would also fail any of those later preflights,
 `parse-error` is therefore the deterministic first classification for inline
 DSL and JSONL alike.
 
-With `--strict --save-file`, classification happens before the save sink writes
-or hashes rows. The stdout manifest's `failures[].reason` is consequently an
-exact projection of the corresponding reason in the checksummed JSONL row.
+For a completed, published `--strict --save-file` result, classification happens
+before the save sink writes or hashes rows. The stdout manifest's
+`failures[].reason` is consequently an exact projection of the corresponding
+reason in the checksummed JSONL row.
 The non-atomic ops-file path without `--save-file` retains its pre-existing
 aggregate summary shape, so its compatibility `failures` objects do not gain a
 `reason` field; stable classifications still appear on stderr. Use
 `--save-file` when automation needs reasons correlated with durable rows.
+
+Combined `--ops-file --save-file` has two separate commit boundaries. The
+destination file is published by one atomic rename, while non-atomic database
+chunks commit incrementally. After dispatch starts, success emits the ordinary
+manifest unchanged. Any later error, including malformed JSON or a structurally
+self-contradictory response envelope, emits an aborted manifest before the
+non-zero exit. Its `committed_chunks` are the structurally confirmed prefix;
+`dispatched_chunk`, when present, is unverified and may still have database
+effects. Its `summary` covers confirmed rows, while `unconfirmed_ops` accounts
+for the remainder without calling them aborted. `file_published=false` means
+the incomplete temp JSONL was discarded and any previous destination was
+preserved.
 
 Atomic ops-file preflight and prepare failures use the real per-operation
 `results` shape: an unknown or unloaded verb receives `verb-refused`, while a
