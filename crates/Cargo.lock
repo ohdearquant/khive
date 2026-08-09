@@ -2298,6 +2298,7 @@ dependencies = [
  "khive-storage",
  "khive-types",
  "lattice-embed",
+ "lattice-fann",
  "lattice-inference",
  "libc",
  "serde",

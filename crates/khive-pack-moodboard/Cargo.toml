@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Experimental Khive-native raster asset ingest and exact visual retrieval"
+description = "Experimental Khive-native visual retrieval and pairwise preference learning"
 
 [dependencies]
 khive-types = { version = "0.7.0", path = "../khive-types", features = ["serde"] }
@@ -22,6 +22,7 @@ image = { workspace = true }
 inventory = { workspace = true }
 lattice-embed = { workspace = true }
 lattice-inference = { workspace = true }
+lattice-fann = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
