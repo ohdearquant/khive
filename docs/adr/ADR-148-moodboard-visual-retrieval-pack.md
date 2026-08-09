@@ -2,7 +2,8 @@
 
 **Status**: accepted\
 **Date**: 2026-08-08\
-**Authors**: khive maintainers
+**Authors**: khive maintainers\
+**Amended by**: ADR-149
 
 ## Context
 
@@ -42,12 +43,13 @@ The pack requires no auxiliary SQL schema. It uses the shared entity substrate, 
 configuration is an attributable `Unconfigured` error. `blob` is not a vocabulary dependency and
 therefore is not in `REQUIRES`; the capability can be installed without exposing the blob verbs.
 
-The pack exposes exactly three non-CRUD verbs:
+This ADR-148 visual slice exposes exactly three non-CRUD verbs; ADR-149 additively extends the
+same pack with four preference-learning verbs:
 
-| Verb | Contract |
-| --- | --- |
-| `moodboard.model` | Discover/validate the configured identity without constructing model weights and return its immutable descriptor. |
-| `moodboard.ingest` | Validate a raster, publish original bytes, attach/reuse a `visual_asset`, infer and persist its descriptor. |
+| Verb               | Contract                                                                                                                   |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `moodboard.model`  | Discover/validate the configured identity without constructing model weights and return its immutable descriptor.          |
+| `moodboard.ingest` | Validate a raster, publish original bytes, attach/reuse a `visual_asset`, infer and persist its descriptor.                |
 | `moodboard.search` | Re-derive one asset's descriptor and perform exact cosine nearest-neighbor search in the same identity-bound vector store. |
 
 Boards and model artifacts otherwise use the generic KG verbs. The pack does not duplicate CRUD.
@@ -263,13 +265,13 @@ probability separate from conformal/coherence statistics.
 
 ## Alternatives Considered
 
-| Alternative | Why rejected |
-| --- | --- |
-| Keep assets and vectors in the Moodboard application | Duplicates Khive's CAS, artifact identity, attribution, and retrieval substrate. |
-| Register Qwen vision as a text embedder | Text entity/note creation would fan strings into an image contract and pollute the visual table. |
-| Store only normalized PNG bytes | Loses the original byte identity and makes preprocessing revisions destructive. |
-| Claim one vector is aesthetic coherence | Conflates retrieval compatibility with cohesion, diversity, uncertainty, and learned preference. |
-| Add FANN/LoRA in v1 | Couples an unvalidated base descriptor to training before the durable asset/retrieval contract is measured. |
+| Alternative                                          | Why rejected                                                                                                |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Keep assets and vectors in the Moodboard application | Duplicates Khive's CAS, artifact identity, attribution, and retrieval substrate.                            |
+| Register Qwen vision as a text embedder              | Text entity/note creation would fan strings into an image contract and pollute the visual table.            |
+| Store only normalized PNG bytes                      | Loses the original byte identity and makes preprocessing revisions destructive.                             |
+| Claim one vector is aesthetic coherence              | Conflates retrieval compatibility with cohesion, diversity, uncertainty, and learned preference.            |
+| Add FANN/LoRA in v1                                  | Couples an unvalidated base descriptor to training before the durable asset/retrieval contract is measured. |
 
 ## Consequences
 
