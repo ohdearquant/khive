@@ -1207,3 +1207,30 @@ invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
 `sidecar_entries_cleanup_would_reap` members are optional and omitted when enumeration did not
 run. A background checkpoint tick may independently perform its normal cleanup, but the
 diagnostic request itself never converts an unmeasured value into a clean-looking zero.
+
+### 2026-08-09 amendment (Amendment 7): admitted cached-reader snapshots
+
+**Correction.** The original inventory predates the file-backed `SqlBridge` connection cache.
+`SqlAccess::reader()` and queue-backed `SqlWriter` reads now retain a read-only connection across
+calls; connection lifetime alone is not a snapshot lifetime, but an unfinalized statement or
+unadmitted transaction on that cache would reproduce the multi-hour WAL pin this ADR governs.
+Issue #1828 also showed that charging an idle cached connection against `max_readers` exhausts the
+process-local admission budget even when the connection is correctly in autocommit.
+
+**Decision.** An idle cached reader owns no reader permit and must be in autocommit. Each ordinary
+query acquires a permit for its blocking SQLite operation and releases it only after the statement
+is finalized and autocommit is verified. One explicit top-level deferred read transaction is
+allowed as one logical read operation: its successful `BEGIN` transfers the operation permit onto
+the handle; queries reuse it; `COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite
+reports autocommit. Immediate/exclusive starts and nested transaction controls remain rejected.
+Cancellation or handle drop destroys the connection before its retained transaction permit, so
+there is never an idle WAL snapshot outside admission. See ADR-005's 2026-08-09 amendment for the
+full raw-SQL capability contract.
+
+**Checkpoint acceptance.** The integration regression
+`multiple_long_lived_idle_bridge_sessions_allow_bounded_checkpoint_progress` retains eight idle
+bridge sessions against a two-reader budget while repeated write cycles run with SQLite
+autocheckpoint disabled. The dedicated Amendment 5 checkpoint connection copies every WAL frame
+on each PASSIVE cycle and the WAL file remains bounded. This covers #1460's long-lived bridge
+session and #1812's concurrent retained-session shapes without depending on a zero-reader
+TRUNCATE window and without reintroducing per-writer autocheckpoint (#1848).

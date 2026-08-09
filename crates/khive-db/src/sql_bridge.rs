@@ -163,8 +163,8 @@ fn execute_prepared_batch<'conn>(
 /// inside the writer task's per-request transaction), so a caller-supplied
 /// statement that itself starts, ends, or branches a transaction can commit
 /// or roll back early and break the batch's all-or-nothing contract. Cached
-/// read-only handles use the same classification because caller-owned
-/// transactions could outlive their operation-scoped permit and pin WAL.
+/// read-only handles use the same lexical classification to drive their
+/// separately admitted single-level read-transaction state machine below.
 /// `START` is classified as the alternate transaction-opening spelling so
 /// callers get a typed boundary error; `END` is SQLite's `COMMIT` spelling.
 const TRANSACTION_CONTROL_KEYWORDS: [&str; 7] = [
@@ -177,14 +177,9 @@ const TRANSACTION_CONTROL_KEYWORDS: [&str; 7] = [
     "RELEASE",
 ];
 
-/// Return the transaction-control keyword heading `sql`, if any.
-///
-/// Tolerates leading whitespace, UTF-8 BOMs, empty statements (`;`), and `--`
-/// line / `/* */` block comments (SQLite skips all of them before an executable
-/// statement) and matches the keyword case-insensitively with a word-boundary
-/// check, so e.g. an identifier beginning with `begin` never matches.
-fn transaction_control_head(sql: &str) -> Option<&'static str> {
-    let mut rest: &[u8] = sql.as_bytes();
+/// Skip the same leading whitespace, UTF-8 BOMs, empty statements (`;`), and
+/// line/block comments SQLite accepts before an executable statement.
+fn skip_sqlite_empty_prefix(mut rest: &[u8]) -> &[u8] {
     loop {
         let mut idx = 0;
         while idx < rest.len() && rest[idx].is_ascii_whitespace() {
@@ -225,19 +220,132 @@ fn transaction_control_head(sql: &str) -> Option<&'static str> {
         }
         break;
     }
+    rest
+}
+
+/// Return one ASCII SQL token after SQLite whitespace/comments/BOM trivia.
+/// Empty-statement separators are deliberately not trivia here: callers use
+/// this only after the executable statement head has already been consumed.
+fn next_sqlite_token(mut rest: &[u8]) -> Option<(&[u8], &[u8])> {
+    loop {
+        let mut idx = 0;
+        while idx < rest.len() && rest[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        rest = &rest[idx..];
+        if let Some(tail) = rest.strip_prefix(b"\xEF\xBB\xBF") {
+            rest = tail;
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix(b"--") {
+            let mut idx = 0;
+            while idx < tail.len() && tail[idx] != b'\n' {
+                idx += 1;
+            }
+            rest = if idx < tail.len() {
+                &tail[idx + 1..]
+            } else {
+                &[]
+            };
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix(b"/*") {
+            let mut idx = 0;
+            while idx + 1 < tail.len() && !(tail[idx] == b'*' && tail[idx + 1] == b'/') {
+                idx += 1;
+            }
+            rest = if idx + 1 < tail.len() {
+                &tail[idx + 2..]
+            } else {
+                &[]
+            };
+            continue;
+        }
+        break;
+    }
+
+    let len = rest
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+        .count();
+    (len != 0).then_some((&rest[..len], &rest[len..]))
+}
+
+/// Return a transaction-control keyword and the bytes following it, if any.
+/// Matching is case-insensitive and requires a word boundary, so an identifier
+/// that merely starts with `begin` or `commit` never matches.
+fn transaction_control_parts(sql: &str) -> Option<(&'static str, &[u8])> {
+    let rest = skip_sqlite_empty_prefix(sql.as_bytes());
     TRANSACTION_CONTROL_KEYWORDS
         .iter()
         .copied()
-        .find(|keyword| {
+        .find_map(|keyword| {
             let kw = keyword.as_bytes();
             if rest.len() < kw.len() || !rest[..kw.len()].eq_ignore_ascii_case(kw) {
-                return false;
+                return None;
             }
-            match rest.get(kw.len()) {
+            let boundary = match rest.get(kw.len()) {
                 Some(next) => !(next.is_ascii_alphanumeric() || *next == b'_'),
                 None => true,
-            }
+            };
+            boundary.then_some((keyword, &rest[kw.len()..]))
         })
+}
+
+/// Return the transaction-control keyword heading `sql`, if any.
+fn transaction_control_head(sql: &str) -> Option<&'static str> {
+    transaction_control_parts(sql).map(|(keyword, _)| keyword)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedReadTransactionControl {
+    /// `BEGIN`, `BEGIN TRANSACTION`, or their explicitly `DEFERRED` form.
+    BeginDeferred,
+    /// A transaction-ending control statement and its diagnostic keyword.
+    Finish(&'static str),
+    /// Transaction control that cannot be represented by the single-level
+    /// admitted read-transaction state machine.
+    Unsupported(&'static str),
+}
+
+/// Classify transaction control for a cached read-only connection.
+///
+/// A cached reader may own exactly one top-level deferred read transaction.
+/// Immediate/exclusive starts could reserve write-side locks, while nested
+/// savepoint/rollback-to controls would require a second lifecycle level, so
+/// both remain rejected. Batch/write paths continue using
+/// [`transaction_control_head`] and reject every variant without exception.
+fn cached_read_transaction_control(sql: &str) -> Option<CachedReadTransactionControl> {
+    let (keyword, tail) = transaction_control_parts(sql)?;
+    match keyword {
+        "BEGIN" => match next_sqlite_token(tail).map(|(token, _)| token) {
+            None => Some(CachedReadTransactionControl::BeginDeferred),
+            Some(token)
+                if token.eq_ignore_ascii_case(b"DEFERRED")
+                    || token.eq_ignore_ascii_case(b"TRANSACTION") =>
+            {
+                Some(CachedReadTransactionControl::BeginDeferred)
+            }
+            Some(_) => Some(CachedReadTransactionControl::Unsupported(keyword)),
+        },
+        "COMMIT" | "END" => Some(CachedReadTransactionControl::Finish(keyword)),
+        "ROLLBACK" => {
+            let first = next_sqlite_token(tail);
+            let rollback_target = match first {
+                Some((token, rest)) if token.eq_ignore_ascii_case(b"TRANSACTION") => {
+                    next_sqlite_token(rest).map(|(token, _)| token)
+                }
+                Some((token, _)) => Some(token),
+                None => None,
+            };
+            if rollback_target.is_some_and(|token| token.eq_ignore_ascii_case(b"TO")) {
+                Some(CachedReadTransactionControl::Unsupported(keyword))
+            } else {
+                Some(CachedReadTransactionControl::Finish(keyword))
+            }
+        }
+        _ => Some(CachedReadTransactionControl::Unsupported(keyword)),
+    }
 }
 
 /// Reject transaction-control statements in `statements` with a typed
@@ -616,9 +724,15 @@ struct StandaloneHandle {
     conn: rusqlite::Connection,
     /// Present only for a standalone read-write handle, whose one-permit
     /// connection budget remains handle-scoped. Read-only connections are
-    /// cached without a retained permit; each read operation acquires the
-    /// shared reader permit before moving this handle onto a blocking thread.
+    /// cached without a retained permit; each ordinary read operation acquires
+    /// the shared permit, while an explicit read transaction retains that
+    /// operation's permit in `read_transaction_slot` until its terminal call.
     _retained_slot: Option<OwnedSemaphorePermit>,
+    /// Present only while a cached read-only connection owns one explicit
+    /// multi-call read transaction. Field order is load-bearing: Rust drops
+    /// `conn` before this permit, so cancellation or handle drop closes the
+    /// SQLite transaction before returning reader admission.
+    read_transaction_slot: Option<OwnedSemaphorePermit>,
 }
 
 impl StandaloneHandle {
@@ -626,6 +740,10 @@ impl StandaloneHandle {
     /// writer connection covered by the handle-scoped writer permit.
     fn is_cached_reader(&self) -> bool {
         self._retained_slot.is_none()
+    }
+
+    fn has_read_transaction(&self) -> bool {
+        self.read_transaction_slot.is_some()
     }
 }
 
@@ -648,23 +766,26 @@ async fn open_cached_reader_handle(
     Ok(StandaloneHandle {
         conn,
         _retained_slot: None,
+        read_transaction_slot: None,
     })
 }
 
 /// Run one file-backed read while coupling its connection state to the active
 /// reader permit.
 ///
-/// Cached read-only connections must be autocommit at both operation
-/// boundaries: transaction control is rejected, an unexpectedly open
-/// transaction is rolled back, and an uncleanable connection is closed before
-/// the permit is released. Standalone read-write handles are intentionally
-/// exempt from that postcondition because their separate writer permit remains
-/// held across legitimate manual atomic transactions.
+/// An ordinary cached read is admitted for one call and must return to
+/// autocommit before its permit is released. A successful top-level deferred
+/// `BEGIN` instead moves that operation permit into the handle; subsequent
+/// reads reuse it until `COMMIT`/`END`/`ROLLBACK` restores autocommit. The
+/// connection is declared before that retained permit, so dropping or
+/// cancelling the handle closes SQLite first and releases admission second.
+/// Standalone read-write handles are intentionally exempt because their
+/// separate writer permit remains held across legitimate manual transactions.
 async fn execute_standalone_read<R, F>(
     handle: &mut Option<StandaloneHandle>,
     pool: Arc<ConnectionPool>,
     operation: &'static str,
-    transaction_control: Option<&'static str>,
+    transaction_control: Option<CachedReadTransactionControl>,
     read: F,
 ) -> khive_storage::types::StorageResult<R>
 where
@@ -677,12 +798,21 @@ where
             message: "connection already consumed".into(),
         });
     }
-    let operation_slot = acquire_handle_slot(
-        pool.sql_bridge_reader_slots(),
-        pool.config().checkout_timeout,
-        "sql_bridge.reader_operation",
-    )
-    .await?;
+    let active_read_transaction = handle
+        .as_ref()
+        .is_some_and(|handle| handle.is_cached_reader() && handle.has_read_transaction());
+    let mut operation_slot = if active_read_transaction {
+        None
+    } else {
+        Some(
+            acquire_handle_slot(
+                pool.sql_bridge_reader_slots(),
+                pool.config().checkout_timeout,
+                "sql_bridge.reader_operation",
+            )
+            .await?,
+        )
+    };
     let Some(owned_handle) = handle.take() else {
         return Err(StorageError::Pool {
             operation: operation.into(),
@@ -690,9 +820,23 @@ where
         });
     };
     let (owned_handle, result) = tokio::task::spawn_blocking(move || {
+        let mut owned_handle = owned_handle;
         let cached_reader = owned_handle.is_cached_reader();
+        let entered_with_transaction = owned_handle.has_read_transaction();
+        let entered_autocommit = owned_handle.conn.is_autocommit();
         let mut restore_handle = true;
-        let mut result = if cached_reader && !owned_handle.conn.is_autocommit() {
+        let mut result = if cached_reader && entered_with_transaction && entered_autocommit {
+            // A connection cannot pin a snapshot in autocommit. Repair the
+            // admission state before returning the invariant failure.
+            drop(owned_handle.read_transaction_slot.take());
+            Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: operation.into(),
+                message: "cached read-only handle retained transaction admission after SQLite \
+                          had already returned to autocommit; the stale permit was released"
+                    .into(),
+            })
+        } else if cached_reader && !entered_with_transaction && !entered_autocommit {
             Err(StorageError::InvalidInput {
                 capability: StorageCapability::Sql,
                 operation: operation.into(),
@@ -700,24 +844,111 @@ where
                           its transaction was rolled back before releasing the reader permit"
                     .into(),
             })
+        } else if cached_reader && entered_with_transaction {
+            match transaction_control {
+                None | Some(CachedReadTransactionControl::Finish(_)) => {
+                    read(&owned_handle.conn).map_err(|error| map_rusqlite_err(error, operation))
+                }
+                Some(CachedReadTransactionControl::BeginDeferred) => {
+                    Err(StorageError::InvalidInput {
+                        capability: StorageCapability::Sql,
+                        operation: operation.into(),
+                        message: "cached read-only handle already owns an admitted read \
+                                  transaction; nested BEGIN is not supported"
+                            .into(),
+                    })
+                }
+                Some(CachedReadTransactionControl::Unsupported(keyword)) => {
+                    Err(StorageError::InvalidInput {
+                        capability: StorageCapability::Sql,
+                        operation: operation.into(),
+                        message: format!(
+                            "cached read-only transaction does not support nested or \
+                             write-locking transaction control ({keyword})"
+                        ),
+                    })
+                }
+            }
         } else if cached_reader {
-            if let Some(keyword) = transaction_control {
-                Err(StorageError::InvalidInput {
-                    capability: StorageCapability::Sql,
-                    operation: operation.into(),
-                    message: format!(
-                        "cached read-only handles reject transaction control ({keyword}); \
-                         transactions may outlive one operation and pin a WAL snapshot"
-                    ),
-                })
-            } else {
-                read(&owned_handle.conn).map_err(|error| map_rusqlite_err(error, operation))
+            match transaction_control {
+                None | Some(CachedReadTransactionControl::BeginDeferred) => {
+                    read(&owned_handle.conn).map_err(|error| map_rusqlite_err(error, operation))
+                }
+                Some(CachedReadTransactionControl::Finish(keyword))
+                | Some(CachedReadTransactionControl::Unsupported(keyword)) => {
+                    Err(StorageError::InvalidInput {
+                        capability: StorageCapability::Sql,
+                        operation: operation.into(),
+                        message: format!(
+                            "cached read-only handle has no admitted transaction for \
+                             transaction control ({keyword})"
+                        ),
+                    })
+                }
             }
         } else {
             read(&owned_handle.conn).map_err(|error| map_rusqlite_err(error, operation))
         };
 
-        if cached_reader && !owned_handle.conn.is_autocommit() {
+        if cached_reader && entered_with_transaction {
+            if owned_handle.conn.is_autocommit() {
+                // SQLite has ended the snapshot; release only after observing
+                // that terminal state. This also fails closed if an ordinary
+                // statement unexpectedly ended the transaction.
+                drop(owned_handle.read_transaction_slot.take());
+                if result.is_ok()
+                    && !matches!(
+                        transaction_control,
+                        Some(CachedReadTransactionControl::Finish(_))
+                    )
+                {
+                    result = Err(StorageError::InvalidInput {
+                        capability: StorageCapability::Sql,
+                        operation: operation.into(),
+                        message: "cached read-only operation unexpectedly ended its admitted \
+                                  transaction; reader admission was released after autocommit"
+                            .into(),
+                    });
+                }
+            } else if result.is_ok()
+                && matches!(
+                    transaction_control,
+                    Some(CachedReadTransactionControl::Finish(_))
+                )
+            {
+                result = Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Sql,
+                    operation: operation.into(),
+                    message: "transaction-ending control completed but the cached reader \
+                              remained outside autocommit; its reader permit remains retained"
+                        .into(),
+                });
+            }
+        } else if cached_reader
+            && entered_autocommit
+            && matches!(
+                transaction_control,
+                Some(CachedReadTransactionControl::BeginDeferred)
+            )
+            && result.is_ok()
+        {
+            if owned_handle.conn.is_autocommit() {
+                result = Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Sql,
+                    operation: operation.into(),
+                    message: "deferred BEGIN completed without opening a read transaction".into(),
+                });
+            } else {
+                owned_handle.read_transaction_slot = operation_slot.take();
+            }
+        }
+
+        // Any non-autocommit state without its retained admission is stale or
+        // was opened by a statement the transaction classifier did not admit.
+        if cached_reader
+            && owned_handle.read_transaction_slot.is_none()
+            && !owned_handle.conn.is_autocommit()
+        {
             match owned_handle.conn.execute_batch("ROLLBACK") {
                 Ok(()) if owned_handle.conn.is_autocommit() => {
                     if result.is_ok() {
@@ -762,6 +993,9 @@ where
             drop(owned_handle);
             None
         };
+        // For ordinary reads and rejected controls this is the operation
+        // permit. A successful BEGIN moved it into `owned_handle`; poisoned
+        // handles were closed above before this remaining permit is released.
         drop(operation_slot);
         (owned_handle, result)
     })
@@ -777,7 +1011,7 @@ impl khive_storage::SqlReader for SqliteReader {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        let transaction_control = transaction_control_head(&statement.sql);
+        let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
@@ -792,7 +1026,7 @@ impl khive_storage::SqlReader for SqliteReader {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        let transaction_control = transaction_control_head(&statement.sql);
+        let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
@@ -808,7 +1042,7 @@ impl khive_storage::SqlReader for SqliteReader {
         statement: SqlStatement,
         page: PageRequest,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        let transaction_control = transaction_control_head(&statement.sql);
+        let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
@@ -854,9 +1088,10 @@ struct SqliteWriter {
     /// live, not just a capability formality. An eagerly opened read-write
     /// connection retains its one-permit writer budget for the handle's
     /// lifetime. A lazily opened read-only connection is cached without a
-    /// permit; every query acquires a reader permit for exactly the blocking
-    /// operation and carries it into that blocking closure, so cancellation
-    /// cannot release the active-read cap before SQLite finishes.
+    /// permit; every ordinary query acquires one for exactly the blocking
+    /// operation. An explicit deferred read transaction retains its opening
+    /// permit across queries until terminal control. In either state,
+    /// cancellation cannot release admission before SQLite finishes/closes.
     handle: Option<StandaloneHandle>,
     /// ADR-067 Component A: when the write queue is enabled, `execute_batch`
     /// routes the whole caller-supplied statement list through the
@@ -896,8 +1131,8 @@ impl SqliteWriter {
     /// pool-wide READER permit rather than the one-permit writer budget:
     /// the connection cannot write, and charging it against the writer
     /// budget would let a queue-backed handle's reads block standalone
-    /// writers. Like the eagerly opened writer connection's permit, the
-    /// reader permit covers the open itself, then each query independently.
+    /// writers. The reader permit covers the open itself, then each ordinary
+    /// query independently or one admitted explicit read-transaction lifetime.
     /// Associated function rather than a `&self` method so the caller can
     /// pass a cloned pool handle and keep no borrow of `SqliteWriter` live
     /// across the permit await — `&SqliteWriter` is not `Sync` (the held
@@ -919,7 +1154,7 @@ impl khive_storage::SqlReader for SqliteWriter {
         if self.handle.is_none() && self.writer_task.is_some() {
             self.handle = Some(Self::ensure_conn(Arc::clone(&self.pool)).await?);
         }
-        let transaction_control = transaction_control_head(&statement.sql);
+        let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
@@ -937,7 +1172,7 @@ impl khive_storage::SqlReader for SqliteWriter {
         if self.handle.is_none() && self.writer_task.is_some() {
             self.handle = Some(Self::ensure_conn(Arc::clone(&self.pool)).await?);
         }
-        let transaction_control = transaction_control_head(&statement.sql);
+        let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
@@ -956,7 +1191,7 @@ impl khive_storage::SqlReader for SqliteWriter {
         if self.handle.is_none() && self.writer_task.is_some() {
             self.handle = Some(Self::ensure_conn(Arc::clone(&self.pool)).await?);
         }
-        let transaction_control = transaction_control_head(&statement.sql);
+        let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
@@ -1682,10 +1917,10 @@ async fn run_manual_atomic_unit(
 /// Bridges `ConnectionPool` to `khive_storage::SqlAccess`.
 ///
 /// Dispatches based on whether the pool is file-backed or in-memory:
-/// - File-backed: cached standalone reader connections with operation-scoped
-///   read admission, plus standalone writer connections capped at one live
-///   handle; atomic units drive a single registered raw transaction span
-///   instead of a caller-held per-tx connection.
+/// - File-backed: cached standalone reader connections with ordinary
+///   operation-scoped admission and explicitly admitted multi-call read
+///   transactions, plus standalone writer connections capped at one live
+///   handle; atomic units drive a single registered raw transaction span.
 /// - In-memory: pool-backed connections per query (single shared connection).
 pub struct SqlBridge {
     pool: Arc<ConnectionPool>,
@@ -1793,6 +2028,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 Some(StandaloneHandle {
                     conn,
                     _retained_slot: Some(handle_slot),
+                    read_transaction_slot: None,
                 })
             } else {
                 None
@@ -1904,6 +2140,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 handle: Some(StandaloneHandle {
                     conn,
                     _retained_slot: Some(handle_slot),
+                    read_transaction_slot: None,
                 }),
                 writer_task: None,
                 origin: self.pool.origin(),
@@ -2380,42 +2617,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_read_only_handles_reject_transaction_control_without_consumption() {
+    async fn cached_read_transaction_retains_one_permit_until_commit_or_rollback() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_reader_tx_control.db")),
             write_queue_enabled: Some(true),
             max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(20),
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut reader = bridge.reader().await.unwrap();
+        let mut contender = bridge.reader().await.unwrap();
 
-        let rejected = reader
+        reader
             .query_all(SqlStatement {
                 sql: "BEGIN DEFERRED".into(),
                 params: vec![],
                 label: None,
             })
-            .await;
-        assert!(
-            matches!(
-                &rejected,
-                Err(StorageError::InvalidInput {
-                    operation,
-                    message,
-                    ..
-                }) if operation.as_ref() == "query_all"
-                    && message.contains("transaction control")
-                    && message.contains("BEGIN")
-            ),
-            "a cached read-only handle must reject transaction control; got {rejected:?}"
-        );
+            .await
+            .expect("BEGIN DEFERRED must open an admitted cached-reader snapshot");
         assert_eq!(
             pool.sql_bridge_reader_slots().available_permits(),
-            1,
-            "rejection must leave the operation permit available"
+            0,
+            "the successful BEGIN must retain its operation permit"
         );
 
         let value = reader
@@ -2425,8 +2652,123 @@ mod tests {
                 label: None,
             })
             .await
-            .expect("transaction-control rejection must not consume the reader handle");
+            .expect("a query inside the admitted transaction must reuse its retained permit");
         assert!(matches!(value, Some(SqlValue::Integer(7))));
+
+        let blocked = contender
+            .query_scalar(SqlStatement {
+                sql: "SELECT 8".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                &blocked,
+                Err(StorageError::Timeout { operation })
+                    if operation.as_ref() == "sql_bridge.reader_operation"
+            ),
+            "a second logical read must contend with the admitted transaction; got {blocked:?}"
+        );
+
+        reader
+            .query_all(SqlStatement {
+                sql: "COMMIT".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("COMMIT must close the admitted cached-reader snapshot");
+        assert_eq!(
+            pool.sql_bridge_reader_slots().available_permits(),
+            1,
+            "COMMIT may release the permit only after autocommit is restored"
+        );
+        let value = contender
+            .query_scalar(SqlStatement {
+                sql: "SELECT 8".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("the contender must run after COMMIT releases admission");
+        assert!(matches!(value, Some(SqlValue::Integer(8))));
+
+        reader
+            .query_all(SqlStatement {
+                sql: "BEGIN TRANSACTION".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("plain deferred BEGIN TRANSACTION must also be admitted");
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 0);
+        let nested = reader
+            .query_all(SqlStatement {
+                sql: "ROLLBACK TO stale_snapshot".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(&nested, Err(StorageError::InvalidInput { .. })),
+            "ROLLBACK TO requires unsupported nested state; got {nested:?}"
+        );
+        assert_eq!(
+            pool.sql_bridge_reader_slots().available_permits(),
+            0,
+            "rejected nested control must not release the still-live transaction admission"
+        );
+        reader
+            .query_all(SqlStatement {
+                sql: "ROLLBACK".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("ROLLBACK must close the admitted cached-reader snapshot");
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_read_only_handles_reject_unsupported_transaction_control_without_consumption() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(
+                dir.path()
+                    .join("sql_bridge_reader_unsupported_tx_control.db"),
+            ),
+            write_queue_enabled: Some(true),
+            max_readers: 1,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let mut reader = bridge.reader().await.unwrap();
+        for (sql, keyword) in [
+            ("BEGIN IMMEDIATE", "BEGIN"),
+            ("BEGIN EXCLUSIVE", "BEGIN"),
+            ("START TRANSACTION", "START"),
+            ("COMMIT", "COMMIT"),
+        ] {
+            let rejected = reader
+                .query_all(SqlStatement {
+                    sql: sql.into(),
+                    params: vec![],
+                    label: None,
+                })
+                .await;
+            assert!(
+                matches!(
+                    &rejected,
+                    Err(StorageError::InvalidInput { message, .. })
+                        if message.contains(keyword)
+                ),
+                "unsupported cached-reader control {sql:?} must fail closed; got {rejected:?}"
+            );
+            assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 1);
+        }
 
         let mut queue_backed_writer = bridge.writer().await.unwrap();
         let rejected = queue_backed_writer
@@ -2464,10 +2806,143 @@ mod tests {
             .await
             .expect("transaction-control rejection must not consume the queue-backed handle");
         assert!(matches!(value, Some(SqlValue::Integer(8))));
+
+        queue_backed_writer
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("queue-backed cached reader must share explicit read-transaction admission");
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 0);
+        queue_backed_writer
+            .query_all(SqlStatement {
+                sql: "END".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("END must release queue-backed cached-reader admission");
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 1);
     }
 
     #[tokio::test]
-    async fn cached_read_only_handles_reject_transaction_control_after_sqlite_empty_prefixes() {
+    async fn dropping_cached_reader_transaction_closes_snapshot_before_releasing_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_reader_tx_drop.db")),
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(20),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut reader = bridge.reader().await.unwrap();
+        let mut contender = bridge.reader().await.unwrap();
+
+        reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("begin admitted transaction");
+        reader
+            .query_all(SqlStatement {
+                sql: "SELECT * FROM sqlite_schema".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("materialize read snapshot");
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 0);
+
+        drop(reader);
+        assert_eq!(
+            pool.sql_bridge_reader_slots().available_permits(),
+            1,
+            "dropping the handle must close its transaction before returning admission"
+        );
+        contender
+            .query_all(SqlStatement {
+                sql: "SELECT * FROM sqlite_schema".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("a new operation must run after the transactional handle drops");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_cached_reader_transaction_keeps_permit_until_connection_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_reader_tx_cancel.db")),
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(50),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut reader = bridge.reader().await.unwrap();
+        let mut contender = bridge.reader().await.unwrap();
+
+        reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("begin admitted transaction");
+        let (entered, release, completed) = blocking_progress_gate(
+            &reader
+                .handle
+                .as_ref()
+                .expect("reader retains connection after BEGIN")
+                .conn,
+        );
+        let query = tokio::spawn(async move { reader.query_all(progress_gate_statement()).await });
+        entered.notified().await;
+        query.abort();
+        assert!(matches!(query.await, Err(error) if error.is_cancelled()));
+
+        let blocked = contender
+            .query_all(SqlStatement {
+                sql: "SELECT 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                &blocked,
+                Err(StorageError::Timeout { operation })
+                    if operation.as_ref() == "sql_bridge.reader_operation"
+            ),
+            "cancellation must not release the transaction permit while SQLite runs; got {blocked:?}"
+        );
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
+            .await
+            .expect("cancelled transaction connection did not close");
+        contender
+            .query_all(SqlStatement {
+                sql: "SELECT 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("admission must recover after the detached connection closes");
+    }
+
+    #[tokio::test]
+    async fn cached_reader_transaction_lifecycle_survives_sqlite_empty_prefixes() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_reader_prefixed_tx_control.db")),
@@ -2479,40 +2954,46 @@ mod tests {
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut reader = bridge.reader().await.unwrap();
 
-        for (sql, keyword) in [
-            (
-                " ; -- empty statement\n /* leading comment */ \u{feff} BEGIN DEFERRED",
-                "BEGIN",
+        reader
+            .query_all(SqlStatement {
+                sql: " ; -- empty statement\n /* leading comment */ \u{feff} BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("prefixed BEGIN must enter the admitted transaction state");
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 0);
+        reader
+            .query_all(SqlStatement {
+                sql: " /* leading comment */ \u{feff} ; COMMIT".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("prefixed COMMIT must end the admitted transaction state");
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 1);
+
+        let rejected = reader
+            .query_all(SqlStatement {
+                sql: " ; /* no active transaction */ \u{feff} COMMIT".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                &rejected,
+                Err(StorageError::InvalidInput {
+                    operation,
+                    message,
+                    ..
+                }) if operation.as_ref() == "query_all"
+                    && message.contains("transaction control")
+                    && message.contains("COMMIT")
             ),
-            (" /* leading comment */ \u{feff} ; COMMIT", "COMMIT"),
-        ] {
-            let rejected = reader
-                .query_all(SqlStatement {
-                    sql: sql.into(),
-                    params: vec![],
-                    label: None,
-                })
-                .await;
-            assert!(
-                matches!(
-                    &rejected,
-                    Err(StorageError::InvalidInput {
-                        operation,
-                        message,
-                        ..
-                    }) if operation.as_ref() == "query_all"
-                        && message.contains("transaction control")
-                        && message.contains(keyword)
-                ),
-                "cached readers must classify {keyword} through SQLite-empty prefixes; \
-                 got {rejected:?}"
-            );
-            assert_eq!(
-                pool.sql_bridge_reader_slots().available_permits(),
-                1,
-                "prefixed transaction-control rejection must release the operation permit"
-            );
-        }
+            "a prefixed COMMIT without an admitted transaction must still fail closed; \
+             got {rejected:?}"
+        );
 
         let mut queue_backed_writer = bridge.writer().await.unwrap();
         let rejected = queue_backed_writer
@@ -2544,7 +3025,7 @@ mod tests {
                 label: None,
             })
             .await
-            .expect("prefixed transaction-control rejection must preserve the cached reader");
+            .expect("prefixed transaction lifecycle must preserve the cached reader");
         assert!(matches!(value, Some(SqlValue::Integer(10))));
     }
 
@@ -2568,6 +3049,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: None,
+                read_transaction_slot: None,
             }),
             pool: Arc::clone(&pool),
         };
@@ -2761,6 +3243,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: None,
+                read_transaction_slot: None,
             }),
             pool: Arc::clone(&pool),
         };
@@ -2829,6 +3312,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
+                read_transaction_slot: None,
             }),
             writer_task: None,
             origin: pool.origin(),
@@ -2884,6 +3368,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: None,
+                read_transaction_slot: None,
             }),
             pool: Arc::clone(&pool),
         };
@@ -2949,6 +3434,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
+                read_transaction_slot: None,
             }),
             writer_task: None,
             origin: pool.origin(),
@@ -3017,6 +3503,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
+                read_transaction_slot: None,
             }),
             writer_task: None,
             origin: pool.origin(),
@@ -3107,6 +3594,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
+                read_transaction_slot: None,
             }),
             writer_task: None,
             origin: pool.origin(),
@@ -3450,6 +3938,40 @@ mod tests {
     }
 
     #[test]
+    fn cached_read_transaction_control_classification_matrix() {
+        use CachedReadTransactionControl::{BeginDeferred, Finish, Unsupported};
+
+        for (sql, expected) in [
+            ("BEGIN", Some(BeginDeferred)),
+            ("begin transaction", Some(BeginDeferred)),
+            (
+                "/* p */ \u{feff} ; BEGIN /* mode */ DEFERRED",
+                Some(BeginDeferred),
+            ),
+            ("BEGIN IMMEDIATE", Some(Unsupported("BEGIN"))),
+            ("BEGIN /* lock */ EXCLUSIVE", Some(Unsupported("BEGIN"))),
+            ("START TRANSACTION", Some(Unsupported("START"))),
+            ("COMMIT", Some(Finish("COMMIT"))),
+            ("END TRANSACTION", Some(Finish("END"))),
+            ("ROLLBACK", Some(Finish("ROLLBACK"))),
+            ("ROLLBACK TRANSACTION", Some(Finish("ROLLBACK"))),
+            ("ROLLBACK TO sp", Some(Unsupported("ROLLBACK"))),
+            (
+                "ROLLBACK /* nested */ TRANSACTION /* target */ TO sp",
+                Some(Unsupported("ROLLBACK")),
+            ),
+            ("SAVEPOINT sp", Some(Unsupported("SAVEPOINT"))),
+            ("SELECT 1", None),
+        ] {
+            assert_eq!(
+                cached_read_transaction_control(sql),
+                expected,
+                "cached-reader transaction classification mismatch for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sqlite_accepts_utf8_bom_before_transaction_control() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE bom_transaction_test (id INTEGER)")
@@ -3620,6 +4142,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
+                read_transaction_slot: None,
             }),
             writer_task: None,
             origin: pool.origin(),
@@ -3719,6 +4242,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
+                read_transaction_slot: None,
             }),
             writer_task: None,
             origin: pool.origin(),
@@ -3817,6 +4341,7 @@ mod tests {
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
+                read_transaction_slot: None,
             }),
             writer_task: None,
             origin: pool.origin(),

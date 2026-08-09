@@ -40,7 +40,7 @@ registry tests for defense-in-depth against cross-test interference.
 
 File-backed `SqlBridge` handles keep their standalone connection for the
 handle lifetime, preserving connection-local statement/cache behavior across
-calls but not caller-owned transactions on cached read-only handles. The pool
+calls and one explicitly admitted deferred read transaction. The pool
 therefore owns two shared permit sets across every bridge constructed over it:
 reader opens and active reads are capped at the effective `max_readers` (with a
 minimum of one in degraded mode), and standalone writer handles are capped at
@@ -54,14 +54,32 @@ cannot escape the active-read cap.
 Reader-open saturation reports `sql_bridge.reader_open`; active-query
 saturation reports `sql_bridge.reader_operation`.
 
-Cached read-only handles reject `BEGIN`, `START`, `COMMIT`, `END`, `ROLLBACK`,
-`SAVEPOINT`, and `RELEASE` statement heads with `StorageError::InvalidInput`.
-As a defense-in-depth postcondition, they must also be in autocommit before an
-operation permit is released. If a cached reader reaches either side of an
-operation outside autocommit, the bridge rolls it back while still holding the
-permit and fails the operation; a connection that cannot be restored is
-discarded before the permit is released. An idle cached reader can therefore
+Cached read-only handles admit one explicit top-level deferred read transaction:
+`BEGIN`, `BEGIN TRANSACTION`, and `BEGIN DEFERRED [TRANSACTION]` retain the
+opening operation's reader permit, subsequent queries reuse it, and
+`COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite returns to
+autocommit. Immediate/exclusive starts, `START`, nested `BEGIN`, `SAVEPOINT`,
+`RELEASE`, and `ROLLBACK ... TO` are rejected with
+`StorageError::InvalidInput`; `execute_batch` still rejects every transaction
+control form. A terminal statement that fails while SQLite remains in the
+transaction keeps the permit, allowing a later full rollback or safe handle
+drop rather than exposing an unadmitted snapshot.
+
+As a defense-in-depth postcondition, every ordinary cached-reader operation
+must be in autocommit before its operation permit is released. Unadmitted state
+is rolled back while the permit is still held; an uncleanable connection is
+discarded first. The connection field precedes the explicit-transaction permit
+in the owned handle, so cancellation or handle drop closes SQLite (and its WAL
+snapshot) before returning admission. An idle cached reader can therefore
 never retain a WAL snapshot outside the active-read budget.
+
+`multiple_long_lived_idle_bridge_sessions_allow_bounded_checkpoint_progress`
+is the #1460/#1812 integration contract: eight long-lived idle bridge sessions
+remain open against a two-reader budget while repeated writes and the central
+ADR-091 PASSIVE checkpointer make complete frame progress and keep the WAL
+bounded. Autocheckpoint is disabled in the fixture, so the result neither
+depends on per-commit checkpoint I/O nor weakens #1848's single central
+checkpoint-owner direction.
 
 Cancelling an in-flight call also permanently invalidates a STANDALONE
 reader/writer handle: the call takes the boxed handle's connection on entry
@@ -87,7 +105,7 @@ standalone writer. A live `writer()` handle therefore makes such an
 do not hold a boxed writer handle across an `atomic_unit()` call on the same
 pool — drop the handle first. With the write queue enabled, `atomic_unit`
 runs inside the writer task instead and never touches this budget.
-The cached-reader autocommit postcondition does not apply to a standalone
+The cached-reader admission state does not apply to a standalone
 read-write writer: its handle-scoped writer permit remains held across the
 whole manual transaction, including reader-supertrait calls within that
 transaction, while each such read additionally uses an active-reader permit.
@@ -97,7 +115,9 @@ gate 1): it opens no standalone connection and holds no writer permit, and
 every mutating call routes through the writer task. Reads through such a
 queue-backed writer handle lazily open a standalone READ-ONLY connection on
 first use (`SqliteWriter::ensure_conn`) and cache it without a reader permit;
-each query acquires the pool-wide reader permit for its blocking operation.
+each ordinary query acquires the pool-wide reader permit for its blocking
+operation, while an explicit deferred read transaction retains one permit
+across its whole multi-call span.
 The read-only open still ensures a queue-backed handle can never execute DML
 on an untracked read-write connection. The one-permit writer budget therefore
 counts only standalone read-write writer handles — the flag-off/degraded
