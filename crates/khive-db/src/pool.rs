@@ -567,7 +567,7 @@ impl ConnectionPool {
     /// the complete canonical migration ledger for this binary.
     ///
     /// Validation runs on the raw `SQLITE_OPEN_READ_WRITE` connection before
-    /// [`configure_writer_connection`] can change journal mode or any other
+    /// `configure_writer_connection` can change journal mode or any other
     /// persistent setting. This closes the admission/configuration race for
     /// caller-selected write targets: replacing the path after an earlier
     /// read-only inspection cannot make the replacement eligible for a

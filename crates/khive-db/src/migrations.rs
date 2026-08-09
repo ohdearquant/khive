@@ -321,7 +321,7 @@ fn validate_applied_migration_names(
 /// This validator is for callers that need to admit an existing database as
 /// already-current without running migrations. Migration startup itself may
 /// validly encounter a prefix while it is bringing a database forward, so it
-/// continues to use [`validate_applied_migration_names`].
+/// continues to use `validate_applied_migration_names`.
 pub fn validate_current_schema_ledger(conn: &Connection) -> Result<u32, SqliteError> {
     let applied = read_migration_ledger(conn)?;
     if applied.len() != MIGRATIONS.len() {
