@@ -616,7 +616,16 @@ Boot and access obey these rules:
    out a reader before any writer acquisition. A file-backed read-only pool
    keeps at least one genuine read-only reader even when the snapshot uses a
    rollback journal rather than WAL; `reader()` never aliases that inspection
-   onto the query-only writer slot.
+   onto the query-only writer slot. Persistent-WAL inspection also leaves the
+   source files and directory unchanged. A clean checkpointed main file with no
+   sidecars uses an encoded read-only `immutable=1` URI solely to prevent
+   SQLite from creating fresh `-wal`/`-shm`. If committed frames remain, the
+   frozen snapshot must include both `-wal` and a filesystem-read-only `-shm`;
+   ordinary read-only WAL semantics then preserve frame visibility. A
+   non-empty `-wal` without that index is rejected before open because
+   immutable SQLite would omit the committed frames, and a writable `-shm` is
+   rejected as potentially live. Rollback-journal databases never use
+   immutable mode and retain SQLite change detection.
 2. Boot does not register embedding models, apply pack-auxiliary schema, start a
    writer task, checkpoint, or schedule a WAL sweep for that backend. Daemon
    warm hooks remain per-pack-runtime aware: writer-bearing ANN warm and session
@@ -632,6 +641,11 @@ Boot and access obey these rules:
    admitted only when the runtime serving generic `list`/`update` can durably
    claim and mark delivery. The two decisions remain independent in a mixed
    topology, and neither adapter polls or sends before its decision passes.
+   Filesystem blob-store construction is gated by the runtime assigned to the
+   `blob` pack as well: a read-only blob runtime opens only an existing root,
+   never materializes the default directory, and rejects put/delete/sweep
+   mutators. A writable blob secondary beside a read-only main remains
+   writable, while a read-only blob secondary beside a writable main does not.
 3. Store acquisition does not run lazy DDL or repair DML. A requested optional
    vector, sparse, or text-search table must already exist in the snapshot and
    is checked through a reader connection, never the pool's query-only writer

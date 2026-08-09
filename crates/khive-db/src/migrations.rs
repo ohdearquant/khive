@@ -403,10 +403,7 @@ pub fn read_schema_version(conn: &Connection) -> Result<u32, SqliteError> {
 /// missing file read-only errors rather than creating it. This is the path used
 /// by schema-inspection commands that must not mutate the database.
 pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError> {
-    let conn = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
     read_schema_version(&conn)
 }
 

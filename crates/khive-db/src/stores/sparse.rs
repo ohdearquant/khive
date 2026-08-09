@@ -265,18 +265,10 @@ impl SqliteSparseStore {
     {
         if self.is_file_backed {
             // For file-backed DBs open a standalone read-only connection.
-            let config = self.pool.config();
-            let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-                operation: "sparse_reader".into(),
-                message: "in-memory databases do not support standalone connections".into(),
-            })?;
-            let conn = rusqlite::Connection::open_with_flags(
-                path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-            )
-            .map_err(|e| map_err(e, op))?;
+            let conn = self
+                .pool
+                .open_standalone_reader()
+                .map_err(|error| map_sqlite_err(error, op))?;
             tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
                 .await
                 .map_err(|e| StorageError::driver(StorageCapability::Sparse, op, e))?

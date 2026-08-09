@@ -710,6 +710,20 @@ impl StorageBackend {
         Ok(Arc::new(blob::FsBlobStore::new(root, floor)?))
     }
 
+    /// Resolve the filesystem blob root exactly like [`Self::blob_store`] but
+    /// require it to exist instead of creating it. Snapshot runtimes wrap the
+    /// returned capability so its read methods remain available while every
+    /// mutator is refused.
+    pub fn blob_store_read_only(
+        &self,
+        config_root: Option<&Path>,
+        floor_bytes: Option<u64>,
+    ) -> Result<Arc<dyn khive_storage::BlobStore>, SqliteError> {
+        let root = blob::resolve_blob_root(self.data_dir().as_deref(), config_root)?;
+        let floor = floor_bytes.unwrap_or(blob::FsBlobStore::DEFAULT_FLOOR_BYTES);
+        Ok(Arc::new(blob::FsBlobStore::open_existing(root, floor)?))
+    }
+
     /// Is this a file-backed backend?
     pub fn is_file_backed(&self) -> bool {
         self.is_file_backed

@@ -2152,6 +2152,50 @@ fn override_matches_declared_main_backend(
         == canonical_path_no_side_effects(std::path::Path::new(override_path))?)
 }
 
+/// Refuse a declared writable SQLite backend whose current filesystem mode is
+/// already read-only, without opening SQLite or creating any path.
+///
+/// The multi-backend boot path performs the same check after open so its
+/// captured runtime identity remains authoritative. Pre-open clients must run
+/// this narrower probe before daemon forwarding as well: a warm daemon may
+/// still hold a write-capable handle acquired before a later chmod, and the
+/// declaration-only topology fingerprint would otherwise route the request to
+/// that retained writer. A force-memory override supersedes every declared
+/// path and must skip this helper entirely at its call site.
+pub fn validate_declared_backend_access_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
+    for backend in backends {
+        if backend.kind != BackendKind::Sqlite || backend.read_only {
+            continue;
+        }
+        let Some(path) = backend.path.as_ref() else {
+            continue;
+        };
+        let expanded = khive_runtime::expand_tilde(path);
+        let metadata = match std::fs::metadata(&expanded) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "backend {}: cannot inspect filesystem access mode for {} before daemon \
+                     forwarding: {error}",
+                    backend.name,
+                    expanded.display(),
+                ));
+            }
+        };
+        if metadata.permissions().readonly() {
+            anyhow::bail!(
+                "backend {}: path {} has no filesystem write bits; declare `read_only = true` \
+                 so backend topology and daemon config identity describe the snapshot-inspection \
+                 mode explicitly (request was refused before daemon forwarding)",
+                backend.name,
+                expanded.display(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn build_registry_for_multi_backend_inner(
     mut base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -2249,8 +2293,11 @@ fn build_registry_for_multi_backend_inner(
     // boot produces (`default_runtime` plus each per-pack runtime), so a
     // pack that later reads `KhiveRuntime::blob_store()` sees the same
     // selection regardless of which backend its own KG data lives on.
+    let blob_store_runtime = per_pack_runtimes_local
+        .get("blob")
+        .unwrap_or(&default_runtime);
     if let Some(store) =
-        install_resolved_blob_store(&default_runtime, khive_cfg, main_backend.as_ref())?
+        install_resolved_blob_store(blob_store_runtime, khive_cfg, main_backend.as_ref())?
     {
         for rt in per_pack_runtimes_local.values() {
             rt.install_blob_store(store.clone());
@@ -2972,7 +3019,7 @@ pub fn install_resolved_blob_store(
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<dyn khive_storage::BlobStore>>> {
-    match khive_runtime::resolve_blob_store(khive_cfg, backend) {
+    match khive_runtime::resolve_blob_store_for_mode(khive_cfg, backend, rt.is_read_only()) {
         Ok(store) => {
             rt.install_blob_store(store.clone());
             Ok(Some(store))
@@ -5284,11 +5331,12 @@ region = "us-east-1"
     }
 
     impl ClearedKhiveEnvGuard {
-        const VARS: [&'static str; 4] = [
+        const VARS: [&'static str; 5] = [
             "KHIVE_DB",
             "KHIVE_ACTOR",
             "KHIVE_PACKS",
             "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
+            "KHIVE_BLOB_ROOT",
         ];
 
         fn clear() -> Self {
@@ -5494,6 +5542,184 @@ region = "us-east-1"
             Err(khive_storage::StorageError::CapacityFloor { .. }) => {}
             Err(other) => panic!("fs-default store must accept a write: {other:?}"),
         }
+    }
+
+    fn prepare_current_snapshot_source(path: &std::path::Path) {
+        let backend = StorageBackend::sqlite(path).expect("create snapshot source");
+        backend
+            .prepare_core_schema()
+            .expect("prepare exact-current migration ledger");
+    }
+
+    fn blob_only_runtime_config() -> RuntimeConfig {
+        RuntimeConfig {
+            packs: vec!["blob".to_string()],
+            ..base_runtime_config_for_multi_backend()
+        }
+    }
+
+    /// The default fs root is optional when no `[storage.blob]` section was
+    /// declared. A snapshot boot must not create that directory merely by
+    /// installing the blob pack, and `blob.put` must report the pack runtime's
+    /// read-only mode before attempting any physical store write.
+    #[tokio::test]
+    #[serial]
+    async fn read_only_single_backend_neither_creates_blob_root_nor_accepts_blob_put() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("snapshot.db");
+        let blob_root = dir.path().join("blobs");
+        prepare_current_snapshot_source(&main_path);
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: BackendId::MAIN.to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: true,
+            }],
+            ..KhiveConfig::default()
+        };
+        let multi = build_registry_for_multi_backend(blob_only_runtime_config(), &khive_cfg, None)
+            .expect("read-only blob-pack registry must boot without creating a store");
+        assert!(
+            !blob_root.exists(),
+            "snapshot boot must not materialize the default FsBlobStore root"
+        );
+
+        let error = multi
+            .registry
+            .dispatch("blob.put", serde_json::json!({"bytes": "YQ=="}))
+            .await
+            .expect_err("blob.put must reject on its read-only pack runtime");
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert!(
+            !blob_root.exists(),
+            "the rejected put must remain side-effect free"
+        );
+    }
+
+    /// Mixed topology is governed by the runtime assigned to the blob pack,
+    /// not by the main audit backend. A writable main must not accidentally
+    /// make a read-only blob secondary writable or create its default fs root.
+    #[tokio::test]
+    #[serial]
+    async fn read_only_blob_secondary_refuses_put_beside_writable_main() {
+        use khive_runtime::PackConfig;
+
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let archive_path = dir.path().join("blob-snapshot.db");
+        let blob_root = dir.path().join("blobs");
+        prepare_current_snapshot_source(&main_path);
+        prepare_current_snapshot_source(&archive_path);
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "blob-snapshot".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(archive_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: true,
+                },
+            ],
+            packs: HashMap::from([(
+                "blob".to_string(),
+                PackConfig {
+                    backend: "blob-snapshot".to_string(),
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+        let multi = build_registry_for_multi_backend(blob_only_runtime_config(), &khive_cfg, None)
+            .expect("mixed topology must boot");
+        let error = multi
+            .registry
+            .dispatch("blob.put", serde_json::json!({"bytes": "YQ=="}))
+            .await
+            .expect_err("read-only blob secondary must reject put");
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert!(
+            !blob_root.exists(),
+            "main writability must not create storage for a read-only blob pack"
+        );
+    }
+
+    /// Positive mixed-topology counterpart: a read-only main does not disable
+    /// a blob pack explicitly routed to a writable secondary.
+    #[tokio::test]
+    #[serial]
+    async fn writable_blob_secondary_accepts_put_beside_read_only_main() {
+        use khive_runtime::PackConfig;
+
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-snapshot.db");
+        let blob_db = dir.path().join("blob-writable.db");
+        let blob_root = dir.path().join("writable-blobs");
+        prepare_current_snapshot_source(&main_path);
+        prepare_current_snapshot_source(&blob_db);
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: true,
+                },
+                BackendConfig {
+                    name: "blob-writable".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(blob_db),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: HashMap::from([(
+                "blob".to_string(),
+                PackConfig {
+                    backend: "blob-writable".to_string(),
+                },
+            )]),
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.display().to_string()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let multi = build_registry_for_multi_backend(blob_only_runtime_config(), &khive_cfg, None)
+            .expect("writable blob secondary must boot beside read-only main");
+        let result = multi
+            .registry
+            .dispatch("blob.put", serde_json::json!({"bytes": "YQ=="}))
+            .await;
+        assert!(
+            result.is_ok(),
+            "writable blob secondary must accept put: {result:?}"
+        );
+        assert!(
+            blob_root.exists(),
+            "writable blob storage may materialize its root"
+        );
     }
 
     /// Regression for ADR-073: a pack assigned to a secondary backend must

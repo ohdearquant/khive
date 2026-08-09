@@ -357,6 +357,21 @@ impl FsBlobStore {
     /// Create a store rooted at `root`, creating the directory if absent.
     pub fn new(root: PathBuf, floor_bytes: u64) -> Result<Self, SqliteError> {
         fs::create_dir_all(&root)?;
+        Self::open_existing(root, floor_bytes)
+    }
+
+    /// Open a store rooted at an existing directory without creating any
+    /// filesystem entry. Used by snapshot runtimes so boot can retain blob
+    /// reads while remaining side-effect free; mutation is fenced by the
+    /// runtime's read-only wrapper.
+    pub fn open_existing(root: PathBuf, floor_bytes: u64) -> Result<Self, SqliteError> {
+        let metadata = fs::metadata(&root)?;
+        if !metadata.is_dir() {
+            return Err(SqliteError::InvalidData(format!(
+                "blob store root is not a directory: {}",
+                root.display()
+            )));
+        }
         let write_lock = write_lock_for_root(&root)?;
         Ok(Self {
             root,

@@ -332,6 +332,17 @@ error. Normal single-backend boot also selects this mode when an existing
 SQLite file has no filesystem write bits. Explicit read-only configuration
 does not create a missing database or its parent directory.
 
+Persistent-WAL inspection is physically source-side-effect free. A clean,
+checkpointed WAL database with no sidecars is opened through an encoded
+read-only immutable URI so SQLite cannot materialize fresh `-wal`/`-shm`
+files. A complete frozen snapshot that still has committed WAL frames must
+include both `-wal` and a filesystem-read-only `-shm`; it is opened with
+ordinary read-only WAL semantics so those frames remain visible. A non-empty
+`-wal` without that frozen index is rejected before SQLite opens (immutable
+mode would silently omit the committed frames), as is any writable `-shm`
+(evidence of potentially live shared state). Rollback-journal databases never
+use immutable mode and retain SQLite locking and change detection.
+
 Read-only boot is an inspection path, not a migration path. It requires the
 snapshot's core migration ledger to be the exact contiguous canonical sequence
 through the build's latest migration; a missing middle row or foreign version
@@ -355,6 +366,13 @@ schedule ticker is omitted only when the schedule
 pack's own runtime is read-only: it remains enabled on a writable secondary
 beside a read-only main, and remains disabled on a read-only secondary beside a
 writable main.
+
+Blob storage follows the runtime assigned to the `blob` pack by the same rule.
+A read-only blob runtime opens only an already-existing filesystem root, never
+creates the default `blobs/` directory, and rejects `blob.put` plus lower-level
+delete/sweep mutators. This remains true for a read-only blob secondary beside
+a writable main; conversely, a writable blob secondary beside a read-only main
+retains normal puts.
 
 Feature-enabled email and Telegram background work is also admitted by the
 runtime that serves each loop's verbs, not by `--daemon` alone. Inbound polling
