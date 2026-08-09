@@ -64,10 +64,9 @@ fn wal_path(db_path: &Path) -> PathBuf {
     PathBuf::from(wal)
 }
 
-/// Safety bound on the fattening loop below: 200,000 rows * 64 KiB caps
-/// worst-case disk usage at ~12.2 GiB instead of an unbounded loop if the
-/// WAL threshold is never reached for some unexpected reason.
-const MAX_FATTEN_ROWS: u32 = 200_000;
+/// Safety bound on the fattening loop below: 1,024 rows * 64 KiB keeps an
+/// unexpected fixture failure near 64 MiB instead of consuming runner disk.
+const MAX_FATTEN_ROWS: u32 = 1_024;
 
 /// Insert 64 KiB blobs, each its own committed (autocommit) transaction, so
 /// `checkpoint_once` has real, checkpointable frames waiting, until the
@@ -76,6 +75,14 @@ const MAX_FATTEN_ROWS: u32 = 200_000;
 /// if that writer invariant regresses.
 fn fatten_wal(pool: &ConnectionPool, db_path: &Path) {
     let writer = pool.writer().expect("acquire writer to seed the WAL");
+    let autocheckpoint: u32 = writer
+        .conn()
+        .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+        .expect("read writer wal_autocheckpoint");
+    assert_eq!(
+        autocheckpoint, 0,
+        "fixture requires the production writer invariant before allocating WAL bytes"
+    );
     writer
         .conn()
         .execute_batch("CREATE TABLE blobs (v BLOB NOT NULL)")
