@@ -98,7 +98,7 @@ impl Pack for SessionPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS:   &'static [HandlerDef] = &SESSION_HANDLERS;
     const REQUIRES:   &'static [&'static str] = &["kg"];
-    // SCHEMA_PLAN: None for M1; Some(PackSchemaPlan { ... }) for M2
+    // SCHEMA_PLAN: shipped mirror tables (§6); a session_metadata M2 stays deferred
 }
 ```
 
@@ -149,8 +149,10 @@ case (the only currently supported configuration): `core()` returns `self.clone(
 `core_backend` is `None`, so session notes land in the shared `notes` table alongside KG,
 GTD, and memory notes, queryable by `search(kind="session")`.
 
-M1 requires no schema migration and no auxiliary tables. It is the complete shipped
-implementation for the first PR.
+The M1 note-storage path itself requires no core schema migration or auxiliary list index. It was
+the complete implementation in the first PR; the later background mirror amendment (§6) separately
+ships pack-owned auxiliary tables and must not be confused with the deferred `session_metadata`
+index below.
 
 #### M2 — optional dedicated `session_metadata` index (deferred)
 
@@ -346,7 +348,13 @@ unchanged. Platforms or filesystems that cannot provide either retain the length
    file-identity witness or a file length below the stored offset resets the in-memory offset to
    zero. A legacy NULL-witness cursor replays once when a witness first becomes available. Replay
    is safe under invariant 2 and prevents a same-path, same-length replacement from being mistaken
-   for unchanged EOF.
+   for unchanged EOF. If in-place truncation lands between the service's metadata probe and its
+   file open, the opened-file pass carries an explicit truncation-reset disposition plus that
+   handle's identity through candidate dispatch. That disposition alone permits a numerically
+   lower cursor, and the service adopts the same lower offset and identity in memory after the DB
+   commit; an unexplained lower offset remains rejected. A reset-only pass mixed with another
+   candidate's error checkpoints zero, not the consumed prefix, so retry replays the entire new
+   generation without retaining the stale pre-truncation cursor.
 
 #### ChatGPT export mapping
 
@@ -446,10 +454,11 @@ interprets them lives outside this repository.
   at write time.
 - **Why M1 before M2.** The `notes` table with `kind='session'` is sufficient for the
   initial walking-skeleton implementation: `list_notes` with a kind filter handles
-  moderate volumes, FTS and vector search cover the retrieval cases, and no auxiliary table
-  is needed. M2 is an upgrade path for when a measured list-query bottleneck justifies the
-  added complexity. Shipping M2 before the bottleneck exists violates the project's
-  anti-pattern of premature optimization.
+  moderate volumes, FTS and vector search cover the retrieval cases, and no auxiliary
+  `session_metadata` list index is needed. The mirror's later §6 tables serve transcript ingestion,
+  not that hypothetical list index. M2 remains an upgrade path for when a measured list-query
+  bottleneck justifies the added complexity. Shipping that index before the bottleneck exists
+  violates the project's anti-pattern of premature optimization.
 - **Why `inventory::submit!` over a match arm in `serve.rs`.** ADR-027 established
   self-registration precisely to avoid editing dispatch crates for each new pack. Adding
   a match arm in `serve.rs` would be a regression to the pre-ADR-027 pattern.
@@ -482,8 +491,10 @@ interprets them lives outside this repository.
   this repository.
 - Session records participate in the shared graph: `memory.recall`, full-text and vector
   search, and `annotates` edges all work because session notes land in the main backend.
-- The pack adds no schema migration for M1: the existing `notes` table and `NOTE_KINDS`
-  registration mechanism are sufficient.
+- The M1 public session-record path adds no core migration: the existing `notes` table and
+  `NOTE_KINDS` registration mechanism are sufficient. The later mirror amendment has its own
+  pack-scoped auxiliary schema and one guarded nullable cursor-witness upgrade for older mirror
+  tables.
 - The M2 upgrade path (auxiliary `session_metadata` index via `PackSchemaPlan`) is
   available without any verb API change when list-query scale warrants it.
 - The `inventory::submit!` self-registration keeps `serve.rs` unmodified; adding or
@@ -505,9 +516,10 @@ interprets them lives outside this repository.
 
 - No change to the `khive-vamana`, `khive-db`, `khive-storage`, or `khive-runtime` crates.
   The session pack is a pure consumer of the existing runtime API.
-- No schema migration is introduced by this ADR. If M2 is adopted, it will carry a
-  migration via the standard `PackSchemaPlan` mechanism (ADR-028); that migration is out
-  of scope here.
+- No core notes-substrate or `session_metadata` M2 migration is introduced. The shipped mirror
+  auxiliary tables are declared through the pack schema plan, and existing pre-witness
+  `session_mirror_cursor` tables receive the guarded nullable `file_identity` column upgrade
+  specified in §6. A future M2 list-index migration remains out of scope.
 - ADR-013's note kind taxonomy gains one pack-registered kind (`session`) in the same
   manner as `task` (ADR-019) and `memory` (ADR-021). No amendment to ADR-013 is required;
   the pack extension mechanism ADR-013 §"Pack-registered note kinds" anticipates this.

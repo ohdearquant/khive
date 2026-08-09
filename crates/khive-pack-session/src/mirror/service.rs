@@ -403,15 +403,27 @@ struct ScheduledFile {
 struct CandidateDispatch {
     stats: Option<ingest::MirrorStats>,
     errors: Vec<RuntimeError>,
-    /// `Some` means the selected result came from a deferred line-tail pass;
-    /// the inner option is the platform witness captured from its open file.
-    deferred_file_identity: Option<Option<String>>,
+    /// `Some` means the selected result came from a deferred line-tail pass.
+    /// Its disposition keeps the opened-file identity attached to the cursor
+    /// decision and is the only witness that can authorize a lower offset.
+    mirror_disposition: Option<ingest::MirrorCursorDisposition>,
+}
+
+fn dispatch_progressed(
+    stats: &ingest::MirrorStats,
+    start_offset: u64,
+    disposition: Option<&ingest::MirrorCursorDisposition>,
+) -> bool {
+    stats.new_offset > start_offset
+        || disposition.is_some_and(|disposition| disposition.restarted_after_truncation())
 }
 
 impl CandidateDispatch {
     /// Record one candidate's result. Returns `true` when this candidate
-    /// should end dispatch for the file: it advanced the offset past
-    /// `start_offset` AND inserted rows.
+    /// should end dispatch for the file: it made witnessed cursor progress
+    /// AND inserted rows. Cursor progress is normally a numeric advance; a
+    /// `MirrorPass` that proved probe/open truncation can instead restart at
+    /// a lower offset while carrying the opened-file identity.
     ///
     /// Invariant relied on (ADR-080 §6 invariant 4): an `Err` never advances
     /// the cursor — every ingest path commits the cursor only inside the
@@ -427,74 +439,91 @@ impl CandidateDispatch {
     /// candidate could otherwise swallow bytes that a later, correct
     /// provider candidate would have parsed into rows. Its cursor commit is
     /// deferred (`mirror_file_deferred`) and committed by the dispatch loop
-    /// only when no inserting candidate claims the span and no candidate
-    /// errored.
+    /// only when no inserting candidate claims the span. An ordinary forward
+    /// empty advance is vetoed when another candidate errors; a witnessed
+    /// restart instead checkpoints zero so no new-generation prefix can be
+    /// skipped after regrowth.
     ///
-    /// Recording precedence: an advancing result (`new_offset >
-    /// start_offset`) always replaces a recorded non-advancing one, so a
-    /// later empty advance cannot be hidden behind an earlier no-progress
-    /// candidate — the in-memory offset must track the durably committed
-    /// cursor. Among advancing results the first recorded wins (an empty
-    /// advance never overwrites an inserting one, and an inserting
-    /// candidate ends dispatch anyway). A non-advancing success is
-    /// recorded only when nothing is recorded yet.
+    /// Recording precedence: a progressing result always replaces a recorded
+    /// non-progressing one, so a later empty advance or witnessed restart
+    /// cannot be hidden behind an earlier no-progress candidate. Among
+    /// progressing results the first recorded wins (an empty result never
+    /// overwrites an inserting one, and an inserting candidate ends dispatch
+    /// anyway). A non-progressing success is recorded only when nothing is
+    /// recorded yet.
     fn record(
         &mut self,
         result: Result<ingest::MirrorStats, RuntimeError>,
         start_offset: u64,
     ) -> bool {
-        self.record_with_witness(result, start_offset, None)
+        match result {
+            Ok(stats) => self.record_success(stats, start_offset, None),
+            Err(error) => {
+                self.errors.push(error);
+                false
+            }
+        }
     }
 
-    fn record_with_witness(
+    fn record_mirror_pass(
         &mut self,
-        result: Result<ingest::MirrorStats, RuntimeError>,
+        result: Result<ingest::MirrorPass, RuntimeError>,
         start_offset: u64,
-        deferred_file_identity: Option<Option<String>>,
     ) -> bool {
         match result {
-            Ok(stats) if stats.new_offset > start_offset && stats.inserted > 0 => {
-                self.stats = Some(stats);
-                self.deferred_file_identity = deferred_file_identity;
-                true
-            }
-            Ok(stats) if stats.new_offset > start_offset => {
-                // Empty advance: bytes consumed, but no rows were inserted —
-                // fall through to remaining candidates. (The cursor commit is
-                // deferred to the end of dispatch by `mirror_file_deferred`;
-                // an inserting candidate or an erroring candidate can still
-                // veto it.) Always replace a recorded non-advancing result so
-                // the in-memory offset follows the furthest consumed byte;
-                // keep the first advancing record.
-                let recorded_advancing = self
-                    .stats
-                    .as_ref()
-                    .is_some_and(|recorded| recorded.new_offset > start_offset);
-                if !recorded_advancing {
-                    self.stats = Some(stats);
-                    self.deferred_file_identity = deferred_file_identity;
-                }
-                false
-            }
-            Ok(stats) if stats.new_offset >= start_offset => {
-                if self.stats.is_none() {
-                    self.stats = Some(stats);
-                    self.deferred_file_identity = deferred_file_identity;
-                }
-                false
-            }
-            Ok(_) => {
-                // The ingest contract guarantees `new_offset >= start_offset`
-                // (read_bounded_chunk only advances from start_offset; export
-                // paths return start_offset or the file length after a
-                // `file_len <= start_offset` guard). Defend against future
-                // drift: never record a regressing cursor.
-                false
+            Ok(pass) => {
+                let (stats, disposition) = pass.into_parts();
+                self.record_success(stats, start_offset, Some(disposition))
             }
             Err(error) => {
                 self.errors.push(error);
                 false
             }
+        }
+    }
+
+    fn record_success(
+        &mut self,
+        stats: ingest::MirrorStats,
+        start_offset: u64,
+        mirror_disposition: Option<ingest::MirrorCursorDisposition>,
+    ) -> bool {
+        let progressed = dispatch_progressed(&stats, start_offset, mirror_disposition.as_ref());
+        let permitted = stats.new_offset >= start_offset
+            || mirror_disposition
+                .as_ref()
+                .is_some_and(|disposition| disposition.restarted_after_truncation());
+        if !permitted {
+            // A lower offset without the explicit opened-file truncation
+            // disposition is unexplained and remains rejected.
+            return false;
+        }
+
+        if progressed && stats.inserted > 0 {
+            self.stats = Some(stats);
+            self.mirror_disposition = mirror_disposition;
+            true
+        } else if progressed {
+            // Empty progress: bytes consumed, or a truncation reset proved,
+            // but no rows were inserted — fall through to remaining
+            // candidates. The cursor commit remains deferred so an inserting
+            // candidate or an error can still control which bytes are safe to
+            // checkpoint. Always replace a recorded non-progressing result;
+            // keep the first progressing record.
+            let recorded_progress = self.stats.as_ref().is_some_and(|recorded| {
+                dispatch_progressed(recorded, start_offset, self.mirror_disposition.as_ref())
+            });
+            if !recorded_progress {
+                self.stats = Some(stats);
+                self.mirror_disposition = mirror_disposition;
+            }
+            false
+        } else {
+            if self.stats.is_none() {
+                self.stats = Some(stats);
+                self.mirror_disposition = mirror_disposition;
+            }
+            false
         }
     }
 }
@@ -1257,27 +1286,70 @@ fn tally_dispatch_errors(
     had_errors && discovery.record_error_poll(path)
 }
 
+/// Apply a selected dispatch result to the service's in-memory cursor.
+///
+/// Numeric advances and holds are ordinary. A numeric regression is accepted
+/// only when the line-tail pass carries the opened-file disposition proving
+/// that the requested offset was beyond EOF after the metadata probe. The
+/// same disposition also refreshes the in-memory identity from the handle
+/// that produced the cursor.
+fn adopt_dispatch_cursor(
+    cursor: &mut MirrorCursorState,
+    start_offset: u64,
+    stats: &ingest::MirrorStats,
+    mirror_disposition: Option<&ingest::MirrorCursorDisposition>,
+) -> bool {
+    let restarted_after_truncation =
+        mirror_disposition.is_some_and(|disposition| disposition.restarted_after_truncation());
+    if stats.new_offset < start_offset && !restarted_after_truncation {
+        return false;
+    }
+
+    cursor.byte_offset = stats.new_offset;
+    if let Some(file_identity) =
+        mirror_disposition.and_then(ingest::MirrorCursorDisposition::file_identity)
+    {
+        cursor.file_identity = Some(file_identity.to_string());
+    }
+    dispatch_progressed(stats, start_offset, mirror_disposition)
+}
+
 /// Finish dispatch bookkeeping for a deferred empty advance. The service
-/// vetoes the cursor commit when any candidate errored, and a commit failure
-/// itself becomes an error poll so persistent failures reach cold cadence.
+/// vetoes an ordinary forward cursor commit when any candidate errored. A
+/// witnessed truncation still persists offset zero on a mixed-error pass:
+/// lowering the cursor only causes replay, while retaining the stale higher
+/// cursor could skip a regrown interval. A commit failure itself becomes an
+/// error poll so persistent failures reach cold cadence.
 async fn finalize_dispatch_stats(
     runtime: &KhiveRuntime,
     path: &Path,
     offset: u64,
     ended_by_inserting: bool,
     stats: Option<ingest::MirrorStats>,
-    deferred_file_identity: Option<Option<String>>,
+    mirror_disposition: Option<ingest::MirrorCursorDisposition>,
     mut had_errors: bool,
-) -> (Option<ingest::MirrorStats>, bool) {
-    // Commit a deferred empty advance only when dispatch ended with no
-    // inserting candidate AND no candidate error. An erroring candidate might
-    // have parsed the span had it succeeded, so the cursor stays at the old
-    // offset and a later pass re-reads the bytes (bounded and idempotent)
-    // rather than skipping them. On commit failure the in-memory offset is
-    // likewise NOT applied.
+) -> (
+    Option<ingest::MirrorStats>,
+    Option<ingest::MirrorCursorDisposition>,
+    bool,
+) {
+    // Commit an ordinary deferred empty advance only when dispatch ended with
+    // no inserting candidate AND no candidate error. An erroring candidate
+    // might have parsed the span had it succeeded, so a normal cursor stays at
+    // the old offset. A witnessed restart cannot safely retain that old
+    // offset: on a mixed-error pass it checkpoints zero so the entire new
+    // generation is retried. On commit failure the in-memory offset is not
+    // applied.
+    let restarted_after_truncation = mirror_disposition
+        .as_ref()
+        .is_some_and(|disposition| disposition.restarted_after_truncation());
     let stats = match stats {
-        Some(stats) if !ended_by_inserting && stats.inserted == 0 && stats.new_offset > offset => {
-            if had_errors {
+        Some(mut stats)
+            if !ended_by_inserting
+                && stats.inserted == 0
+                && (stats.new_offset > offset || restarted_after_truncation) =>
+        {
+            if had_errors && !restarted_after_truncation {
                 tracing::debug!(
                     path = %path.display(),
                     new_offset = stats.new_offset,
@@ -1288,19 +1360,33 @@ async fn finalize_dispatch_stats(
             } else {
                 // Whole-file exporters already committed their cursor in the
                 // same atomic unit as parsing, so only a selected line-tail
-                // result carries an outer `Some` and needs this deferred DML.
-                let Some(file_identity) = deferred_file_identity.as_ref() else {
-                    return (Some(stats), had_errors);
+                // result carries a disposition and needs this deferred DML.
+                let Some(disposition) = mirror_disposition.as_ref() else {
+                    return (Some(stats), None, had_errors);
+                };
+                let commit_offset = if had_errors && restarted_after_truncation {
+                    tracing::debug!(
+                        path = %path.display(),
+                        consumed_offset = stats.new_offset,
+                        "session mirror: candidate errored after a witnessed truncation; \
+                         persisting offset zero so the new generation is replayed"
+                    );
+                    0
+                } else {
+                    stats.new_offset
                 };
                 let commit = ingest::commit_empty_advance_with_witness(
                     runtime,
                     path,
-                    stats.new_offset,
-                    file_identity.as_deref(),
+                    commit_offset,
+                    disposition.file_identity(),
                 )
                 .await;
                 match commit {
-                    Ok(()) => Some(stats),
+                    Ok(()) => {
+                        stats.new_offset = commit_offset;
+                        Some(stats)
+                    }
                     Err(error) => {
                         // A failed deferred cursor commit is an ingest error
                         // for cadence purposes: the file made no durable
@@ -1310,7 +1396,7 @@ async fn finalize_dispatch_stats(
                         tracing::warn!(
                             path = %path.display(),
                             error = %error,
-                            new_offset = stats.new_offset,
+                            new_offset = commit_offset,
                             "session mirror: empty-advance cursor commit failed; \
                              offset held back for a bounded re-read"
                         );
@@ -1321,7 +1407,12 @@ async fn finalize_dispatch_stats(
         }
         other => other,
     };
-    (stats, had_errors)
+    let mirror_disposition = if stats.is_some() {
+        mirror_disposition
+    } else {
+        None
+    };
+    (stats, mirror_disposition, had_errors)
 }
 
 fn classify_entry(
@@ -1535,7 +1626,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             let mut candidate_dispatch = CandidateDispatch::default();
             let mut ended_by_inserting = false;
             for kind in kinds {
-                let (result, deferred_file_identity) = match kind {
+                let should_end_dispatch = match kind {
                     DiscoveredKind::LineTail { source, session_id } => {
                         // Deferred variant: an empty advance (bytes consumed,
                         // zero rows) does NOT commit its cursor inline, so the
@@ -1544,36 +1635,35 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                         // candidates cannot strand a committed cursor past
                         // uninserted rows. The commit happens below, only when
                         // dispatch ends without an inserting candidate.
-                        match ingest::mirror_file_deferred_with_witness(
-                            &runtime,
-                            &scheduled_file.path,
+                        candidate_dispatch.record_mirror_pass(
+                            ingest::mirror_file_deferred_with_witness(
+                                &runtime,
+                                &scheduled_file.path,
+                                offset,
+                                source,
+                                session_id.as_deref(),
+                                current_identity.as_deref(),
+                            )
+                            .await,
                             offset,
-                            source,
-                            session_id.as_deref(),
-                            current_identity.as_deref(),
                         )
-                        .await
-                        {
-                            Ok(pass) => (Ok(pass.stats), Some(pass.file_identity)),
-                            Err(error) => (Err(error), None),
-                        }
                     }
-                    DiscoveredKind::ChatGptExport => (
+                    DiscoveredKind::ChatGptExport => candidate_dispatch.record(
                         ingest::mirror_chatgpt_export_file(&runtime, &scheduled_file.path, offset)
                             .await,
-                        None,
+                        offset,
                     ),
-                    DiscoveredKind::ClaudeAiExport => (
+                    DiscoveredKind::ClaudeAiExport => candidate_dispatch.record(
                         ingest::mirror_claude_ai_export_file(
                             &runtime,
                             &scheduled_file.path,
                             offset,
                         )
                         .await,
-                        None,
+                        offset,
                     ),
                 };
-                if candidate_dispatch.record_with_witness(result, offset, deferred_file_identity) {
+                if should_end_dispatch {
                     ended_by_inserting = true;
                     break;
                 }
@@ -1582,7 +1672,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             let CandidateDispatch {
                 stats,
                 errors,
-                deferred_file_identity,
+                mirror_disposition,
             } = candidate_dispatch;
             let had_errors = !errors.is_empty();
             for error in errors {
@@ -1593,13 +1683,13 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 );
             }
 
-            let (stats, had_errors) = finalize_dispatch_stats(
+            let (stats, mirror_disposition, had_errors) = finalize_dispatch_stats(
                 &runtime,
                 &scheduled_file.path,
                 offset,
                 ended_by_inserting,
                 stats,
-                deferred_file_identity,
+                mirror_disposition,
                 had_errors,
             )
             .await;
@@ -1610,9 +1700,9 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             // make the file healthy while another candidate errors: without
             // this, a misconfigured file with one capped-out provider and
             // one broken provider would stay hot forever.
-            let advanced = stats
-                .as_ref()
-                .is_some_and(|stats| stats.new_offset > offset);
+            let advanced = stats.as_ref().is_some_and(|stats| {
+                dispatch_progressed(stats, offset, mirror_disposition.as_ref())
+            });
             if tally_dispatch_errors(&mut discovery, &scheduled_file.path, advanced, had_errors) {
                 tracing::warn!(
                     path = %scheduled_file.path.display(),
@@ -1622,15 +1712,10 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             }
 
             if let Some(stats) = stats {
-                // `CandidateDispatch::record` already rejects regressing
-                // cursors; guard the write side too so the stored offset can
-                // only advance or hold.
-                if stats.new_offset >= offset {
-                    if let Some(cursor) = cursors.get_mut(&scheduled_file.path) {
-                        cursor.byte_offset = stats.new_offset;
-                    }
+                if let Some(cursor) = cursors.get_mut(&scheduled_file.path) {
+                    adopt_dispatch_cursor(cursor, offset, &stats, mirror_disposition.as_ref());
                 }
-                if stats.inserted > 0 || stats.new_offset > offset {
+                if stats.inserted > 0 || advanced {
                     files_mirrored += 1;
                     rows_inserted += stats.inserted;
                     tracing::debug!(
@@ -2018,11 +2103,12 @@ fn extract_codex_session_id(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod discovery_tests {
     use super::{
-        should_mark_cold, CandidateDispatch, CursorResetReason, DirectoryKind, DiscoveredKind,
-        DiscoveryIndex, MirrorCursorState, TrackedDirectory, COLD_FILE_PROBES_PER_TICK,
-        COLD_STALE_POPS_PER_TICK, DIRECTORY_FORCE_RESCAN_PROBES, DIRECTORY_PROBES_PER_TICK,
-        DIRECTORY_REFRESH_FAILURES_BEFORE_WARN, FILE_COLD_AGE, FILE_ERROR_POLLS_BEFORE_COLD,
-        FILE_UNCHANGED_POLLS_BEFORE_COLD, FILE_UNCHANGED_POLLS_WITHOUT_MTIME,
+        adopt_dispatch_cursor, should_mark_cold, CandidateDispatch, CursorResetReason,
+        DirectoryKind, DiscoveredKind, DiscoveryIndex, MirrorCursorState, TrackedDirectory,
+        COLD_FILE_PROBES_PER_TICK, COLD_STALE_POPS_PER_TICK, DIRECTORY_FORCE_RESCAN_PROBES,
+        DIRECTORY_PROBES_PER_TICK, DIRECTORY_REFRESH_FAILURES_BEFORE_WARN, FILE_COLD_AGE,
+        FILE_ERROR_POLLS_BEFORE_COLD, FILE_UNCHANGED_POLLS_BEFORE_COLD,
+        FILE_UNCHANGED_POLLS_WITHOUT_MTIME,
     };
     use crate::mirror::ingest::MirrorStats;
     use std::collections::HashSet;
@@ -2306,18 +2392,30 @@ mod discovery_tests {
     fn regressing_candidate_offset_is_never_recorded() {
         let start_offset = 100;
         let mut dispatch = CandidateDispatch::default();
+        let regression = MirrorStats {
+            inserted: 4,
+            scanned: 4,
+            new_offset: start_offset - 60,
+        };
 
-        assert!(!dispatch.record(
-            Ok(MirrorStats {
-                inserted: 4,
-                scanned: 4,
-                new_offset: start_offset - 60,
-            }),
-            start_offset,
-        ));
+        assert!(!dispatch.record(Ok(regression.clone()), start_offset));
         assert!(
             dispatch.stats.is_none(),
             "a regressing cursor must not be recorded"
+        );
+        let mut cursor = MirrorCursorState {
+            byte_offset: start_offset,
+            file_identity: Some("unix:7:11".to_string()),
+        };
+        assert!(!adopt_dispatch_cursor(
+            &mut cursor,
+            start_offset,
+            &regression,
+            None,
+        ));
+        assert_eq!(
+            cursor.byte_offset, start_offset,
+            "the application guard also rejects an unwitnessed regression"
         );
 
         assert!(dispatch.record(
@@ -3053,12 +3151,11 @@ mod cursor_retry_tests {
         let first_uuid = "uuid-probe-open-prefix";
         let second_uuid = "uuid-probe-open-regrown";
         let line = |uuid: &str, text: &str| {
-            format!(
-                "{}\n",
-                format_args!(
-                    r#"{{"uuid":"{uuid}","sessionId":"sess-probe-open","type":"user","timestamp":"2026-08-09T10:00:00Z","message":{{"role":"user","content":"{text}"}}}}"#
-                )
-            )
+            let mut line = format!(
+                r#"{{"uuid":"{uuid}","sessionId":"sess-probe-open","type":"user","timestamp":"2026-08-09T10:00:00Z","message":{{"role":"user","content":"{text}"}}}}"#
+            );
+            line.push('\n');
+            line
         };
         let first_line = line(first_uuid, "prefix after truncation");
         let second_line = line(second_uuid, &"regrown interval ".repeat(16));
@@ -3124,10 +3221,11 @@ mod cursor_retry_tests {
         assert!(!had_errors);
         let stats = stats.expect("restarted pass selected");
         let disposition = disposition.expect("line-tail disposition retained");
-        assert!(matches!(
-            disposition,
-            MirrorCursorDisposition::RestartedAfterTruncation { .. }
-        ));
+        let MirrorCursorDisposition::RestartedAfterTruncation { file_identity } = &disposition
+        else {
+            panic!("probe/open truncation must carry the reset disposition");
+        };
+        assert_eq!(file_identity.as_deref(), probed_identity.as_deref());
         assert!(stats.new_offset < old_offset);
         assert_eq!(cursor_offset(&rt, &path).await, Some(stats.new_offset));
         assert!(adopt_dispatch_cursor(
@@ -3389,7 +3487,7 @@ mod cursor_retry_tests {
         let mut discovery = DiscoveryIndex::default();
         discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
 
-        let (stats, had_errors) = finalize_dispatch_stats(
+        let (stats, disposition, had_errors) = finalize_dispatch_stats(
             &rt,
             &path,
             0,
@@ -3399,11 +3497,14 @@ mod cursor_retry_tests {
                 scanned: 0,
                 new_offset: 64,
             }),
-            Some(None),
+            Some(MirrorCursorDisposition::Continued {
+                file_identity: None,
+            }),
             false,
         )
         .await;
         assert!(stats.is_none(), "failed commit must hold back the offset");
+        assert!(disposition.is_none());
         assert!(had_errors, "failed commit must become an error poll");
 
         for _ in 1..FILE_ERROR_POLLS_BEFORE_COLD {
@@ -3421,6 +3522,38 @@ mod cursor_retry_tests {
             had_errors
         ));
         assert!(discovery.files[&path].cold);
+    }
+
+    #[tokio::test]
+    async fn mixed_error_after_empty_truncation_reset_checkpoints_zero() {
+        let (rt, dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+        let path = dir.path().join("mixed-error-reset.jsonl");
+
+        let (stats, disposition, had_errors) = finalize_dispatch_stats(
+            &rt,
+            &path,
+            100,
+            false,
+            Some(MirrorStats {
+                inserted: 0,
+                scanned: 2,
+                new_offset: 40,
+            }),
+            Some(MirrorCursorDisposition::RestartedAfterTruncation {
+                file_identity: Some("unix:7:11".to_string()),
+            }),
+            true,
+        )
+        .await;
+
+        let stats = stats.expect("the reset itself remains selected");
+        assert_eq!(stats.new_offset, 0, "mixed errors force a full replay");
+        assert!(disposition
+            .as_ref()
+            .is_some_and(MirrorCursorDisposition::restarted_after_truncation));
+        assert!(had_errors, "the other candidate's error remains visible");
+        assert_eq!(cursor_offset(&rt, &path).await, Some(0));
     }
 
     #[tokio::test]

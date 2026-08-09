@@ -88,12 +88,51 @@ pub struct MirrorStats {
     pub new_offset: u64,
 }
 
+/// How the opened file relates to the cursor supplied for this pass.
+///
+/// The identity is carried in both dispositions so the polling service never
+/// separates an offset decision from the exact opened generation that
+/// produced it. Only `RestartedAfterTruncation` authorizes a numerically lower
+/// cursor: it is emitted when the requested offset was beyond the opened
+/// file's EOF, which proves an in-place generation reset after the service's
+/// metadata probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MirrorCursorDisposition {
+    Continued { file_identity: Option<String> },
+    RestartedAfterTruncation { file_identity: Option<String> },
+}
+
+impl MirrorCursorDisposition {
+    pub(super) fn file_identity(&self) -> Option<&str> {
+        match self {
+            Self::Continued { file_identity }
+            | Self::RestartedAfterTruncation { file_identity } => file_identity.as_deref(),
+        }
+    }
+
+    pub(super) fn restarted_after_truncation(&self) -> bool {
+        matches!(self, Self::RestartedAfterTruncation { .. })
+    }
+}
+
 /// Internal pass result used by the polling service to keep the offset and
-/// the identity of the opened file together across deferred cursor commits.
+/// its opened-file continuity disposition together through candidate
+/// dispatch and deferred cursor commits.
 #[derive(Debug)]
 pub(super) struct MirrorPass {
     pub(super) stats: MirrorStats,
-    pub(super) file_identity: Option<String>,
+    cursor_disposition: MirrorCursorDisposition,
+}
+
+impl MirrorPass {
+    pub(super) fn into_parts(self) -> (MirrorStats, MirrorCursorDisposition) {
+        (self.stats, self.cursor_disposition)
+    }
+
+    #[cfg(test)]
+    fn file_identity(&self) -> Option<&str> {
+        self.cursor_disposition.file_identity()
+    }
 }
 
 /// Stable identity witness available directly from portable metadata.
@@ -259,8 +298,9 @@ pub async fn mirror_file(
 /// candidate dispatch order: bytes are never skipped ahead of a later
 /// candidate that could parse them, and an interrupt between candidates
 /// cannot leave the cursor advanced past bytes no candidate inserted. The
-/// service additionally vetoes that commit when ANY candidate errors during
-/// the pass, even if another candidate returned an empty advance.
+/// service additionally vetoes an ordinary forward commit when ANY candidate
+/// errors during the pass. A service-only witnessed truncation instead
+/// checkpoints zero on a mixed-error pass so retry replays the new generation.
 pub async fn mirror_file_deferred(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -286,7 +326,10 @@ pub async fn mirror_file_deferred(
 /// file handle that produced it. `expected_file_identity` comes from the
 /// service's metadata probe; if the path was replaced before this function
 /// opens it, the pass is refused so the next probe can reconcile the new file
-/// from byte zero instead of blessing it with its predecessor's offset.
+/// from byte zero instead of blessing it with its predecessor's offset. If
+/// the identity still matches but the requested offset is beyond the opened
+/// EOF, the returned `MirrorPass` carries an explicit truncation-reset
+/// disposition and that opened identity through service dispatch.
 pub(super) async fn mirror_file_deferred_with_witness(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -349,7 +392,7 @@ struct MirrorChunk {
     events: Vec<parse::ParsedEvent>,
     scanned: u64,
     new_offset: u64,
-    file_identity: Option<String>,
+    cursor_disposition: MirrorCursorDisposition,
 }
 
 /// Outcome of `read_line_bounded` for one line. See
@@ -457,7 +500,16 @@ fn read_bounded_chunk(
     // An offset beyond EOF proves in-place truncation (or a shorter same-path
     // replacement). Replay from the beginning; equality remains ordinary EOF
     // when the opened file is the generation the service expected.
-    let start_offset = if start_offset > file_len {
+    let cursor_disposition = if start_offset > file_len {
+        MirrorCursorDisposition::RestartedAfterTruncation {
+            file_identity: file_identity.clone(),
+        }
+    } else {
+        MirrorCursorDisposition::Continued {
+            file_identity: file_identity.clone(),
+        }
+    };
+    let start_offset = if cursor_disposition.restarted_after_truncation() {
         0
     } else {
         start_offset
@@ -467,7 +519,7 @@ fn read_bounded_chunk(
             events: Vec::new(),
             scanned: 0,
             new_offset: start_offset,
-            file_identity,
+            cursor_disposition,
         });
     }
 
@@ -559,7 +611,7 @@ fn read_bounded_chunk(
         events,
         scanned,
         new_offset,
-        file_identity,
+        cursor_disposition,
     })
 }
 
@@ -617,7 +669,8 @@ async fn mirror_file_inner(
         ))
     })?;
 
-    if chunk.new_offset == start_offset {
+    let restarted_after_truncation = chunk.cursor_disposition.restarted_after_truncation();
+    if chunk.new_offset == start_offset && !restarted_after_truncation {
         // Nothing was consumed this pass (EOF, or only a partial trailing
         // line was seen) — there is no advanced cursor to persist.
         return Ok(MirrorPass {
@@ -626,17 +679,18 @@ async fn mirror_file_inner(
                 scanned: 0,
                 new_offset: chunk.new_offset,
             },
-            file_identity: chunk.file_identity,
+            cursor_disposition: chunk.cursor_disposition,
         });
     }
 
     if chunk.events.is_empty() {
-        // Bytes were consumed (`chunk.new_offset > start_offset` here,
-        // checked above) but nothing parsed — e.g. a chunk made entirely of
-        // blank lines, unparseable lines, or skipped oversized lines. With
-        // `commit_empty_advance`, apply the cursor update immediately so we
-        // don't re-read the same bytes on the next call. Without it (the
-        // dispatch loop), the commit is deferred to
+        // Bytes were consumed, or an opened-file truncation proved the
+        // supplied cursor belongs to an earlier generation, but nothing
+        // parsed — e.g. a chunk made entirely of blank lines, unparseable
+        // lines, or skipped oversized lines. With `commit_empty_advance`,
+        // apply the cursor update immediately so we don't re-read the same
+        // bytes on the next call. Without it (the dispatch loop), the commit
+        // is deferred to
         // [`commit_empty_advance`], which the loop calls only when no later
         // candidate inserted rows for the span — so the cursor never moves
         // past bytes another provider candidate might still parse, and an
@@ -650,7 +704,7 @@ async fn mirror_file_inner(
                 path,
                 &None,
                 chunk.new_offset,
-                chunk.file_identity.as_deref(),
+                chunk.cursor_disposition.file_identity(),
             )
             .await?;
         }
@@ -660,11 +714,11 @@ async fn mirror_file_inner(
                 scanned: chunk.scanned,
                 new_offset: chunk.new_offset,
             },
-            file_identity: chunk.file_identity,
+            cursor_disposition: chunk.cursor_disposition,
         });
     }
 
-    let file_identity = chunk.file_identity.clone();
+    let file_identity = chunk.cursor_disposition.file_identity().map(str::to_owned);
     let stats = write_events_and_cursor(
         runtime,
         path,
@@ -673,12 +727,12 @@ async fn mirror_file_inner(
         &chunk.events,
         chunk.scanned,
         chunk.new_offset,
-        chunk.file_identity,
+        file_identity,
     )
     .await?;
     Ok(MirrorPass {
         stats,
-        file_identity,
+        cursor_disposition: chunk.cursor_disposition,
     })
 }
 
@@ -2140,14 +2194,9 @@ mod tests {
             metadata_file_identity(&std::fs::metadata(&path).expect("replacement metadata"));
         assert_ne!(replacement_identity, original_identity);
 
-        commit_empty_advance_with_witness(
-            &rt,
-            &path,
-            pass.stats.new_offset,
-            pass.file_identity.as_deref(),
-        )
-        .await
-        .expect("commit opened-file witness");
+        commit_empty_advance_with_witness(&rt, &path, pass.stats.new_offset, pass.file_identity())
+            .await
+            .expect("commit opened-file witness");
         assert_eq!(
             cursor_file_identity(&rt, &path.to_string_lossy()).await,
             original_identity,

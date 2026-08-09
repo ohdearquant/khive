@@ -33,7 +33,14 @@ same documented length-only fallback.
 If the identity changes between the service's metadata probe and the ingest file-open, that pass is
 refused and retried after reconciliation. Deferred cursor-only advances carry the opened file's
 witness through the commit instead of re-statting the path, so replacement cannot pair an old
-offset with a new identity in either race window.
+offset with a new identity in either race window. In-place truncation in that same probe/open
+window is different: the identity still matches, but the requested offset is beyond the opened
+file's EOF. `MirrorPass` therefore carries an explicit truncation-reset disposition together with
+the opened identity through candidate dispatch. Only that disposition permits a lower selected
+offset; after the atomic DB cursor commit the service adopts the same lower offset and identity in
+memory. If another candidate errors after an empty restarted pass, the service checkpoints zero so
+the next attempt replays the whole new generation. Lower offsets without this witness remain
+rejected.
 
 No single line, complete or partial, is ever buffered past
 `MirrorLimits::max_line_bytes` (see `read_line_bounded` below): a complete
