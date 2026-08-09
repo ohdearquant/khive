@@ -133,7 +133,7 @@ const WRITE_DELAY_MS_OVERRIDE_ENV: &str = "KHIVE_WRITER_TIMEOUT_SINK_WRITE_DELAY
 /// caller-visible WAITING: under burst, contention now presents as latency,
 /// which the failure-shaped rows are structurally unable to record — a
 /// quiet sink no longer means an uncontended writer. The bound is on the
-/// whole send-to-reply span (enqueue wait + queue depth + execution), i.e.
+/// whole request span (queue wait + transaction stages), i.e.
 /// the quantity a blocked caller actually experiences.
 const SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
 
@@ -293,7 +293,7 @@ impl Site {
 /// `"direct_route_violation"` (a direct writer acquisition bypassing an
 /// enabled queue, carries `site`), and `"slow_write"` (a queued write whose
 /// send-to-reply span met [`SLOW_WRITE_THRESHOLD`], carries `elapsed_ms` +
-/// `queue_depth`).
+/// `queue_depth` plus the four decomposed writer-stage durations).
 struct QueuedEvent {
     ts_utc: String,
     kind: &'static str,
@@ -303,6 +303,16 @@ struct QueuedEvent {
     timeout_ms: Option<u64>,
     elapsed_ms: Option<u64>,
     queue_depth: Option<u64>,
+    writer_stages: Option<WriterStageFields>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct WriterStageFields {
+    queue_wait_micros: u64,
+    transaction_acquire_micros: u64,
+    body_micros: u64,
+    commit_micros: u64,
+    total_micros: u64,
 }
 
 /// Process-global handle to the writer thread's inbox. Set at most once per
@@ -337,6 +347,8 @@ struct EventRecord<'a> {
     elapsed_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queue_depth: Option<u64>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    writer_stages: Option<WriterStageFields>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -353,6 +365,7 @@ fn build_line(
     timeout_ms: Option<u64>,
     elapsed_ms: Option<u64>,
     queue_depth: Option<u64>,
+    writer_stages: Option<WriterStageFields>,
     pid: Option<u32>,
     version: Option<&str>,
 ) -> String {
@@ -365,6 +378,7 @@ fn build_line(
         timeout_ms,
         elapsed_ms,
         queue_depth,
+        writer_stages,
         pid,
         version,
     };
@@ -393,6 +407,7 @@ fn build_line_now(
         site,
         error,
         timeout_ms,
+        None,
         None,
         None,
         pid,
@@ -629,6 +644,7 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
         event.timeout_ms,
         event.elapsed_ms,
         event.queue_depth,
+        event.writer_stages,
         None,
         None,
     );
@@ -943,6 +959,7 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
         timeout_ms,
         elapsed_ms: None,
         queue_depth: None,
+        writer_stages: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -965,6 +982,7 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
         timeout_ms: Some(timeout_ms),
         elapsed_ms: None,
         queue_depth: None,
+        writer_stages: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -986,6 +1004,7 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
         timeout_ms: None,
         elapsed_ms: None,
         queue_depth: None,
+        writer_stages: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1010,17 +1029,17 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
         timeout_ms: None,
         elapsed_ms: None,
         queue_depth: None,
+        writer_stages: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
-/// Record a `slow_write` event: a queued write whose whole send-to-reply
-/// span (enqueue wait + queue depth + execution) met the slow-write
-/// threshold. Emitted by `WriterTaskHandle`'s send paths on completion —
-/// success or error alike, since the caller experienced the latency either
-/// way. `queue_depth` is the backlog snapshot taken when the send STARTED,
-/// so a reader can separate "queue was deep" from "one op was slow".
-pub(crate) fn emit_slow_write(db: &str, elapsed_ms: u64, queue_depth: usize) {
+/// Record a `slow_write` event: a queued write whose whole request span met
+/// the slow-write threshold. Emitted before the typed reply wakes the caller,
+/// for success or error alike. The compatibility `elapsed_ms`/`queue_depth`
+/// fields remain, while the microsecond stage fields distinguish admission,
+/// SQLite write-lock acquisition, operation body, and COMMIT (#1849).
+pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStageObservation) {
     let Some(handle) = SINK.get() else {
         return;
     };
@@ -1031,8 +1050,15 @@ pub(crate) fn emit_slow_write(db: &str, elapsed_ms: u64, queue_depth: usize) {
         site: None,
         error: None,
         timeout_ms: None,
-        elapsed_ms: Some(elapsed_ms),
-        queue_depth: Some(queue_depth as u64),
+        elapsed_ms: Some(stages.total_micros / 1_000),
+        queue_depth: Some(stages.queue_depth_at_entry),
+        writer_stages: Some(WriterStageFields {
+            queue_wait_micros: stages.queue_wait_micros,
+            transaction_acquire_micros: stages.transaction_acquire_micros,
+            body_micros: stages.body_micros,
+            commit_micros: stages.commit_micros,
+            total_micros: stages.total_micros,
+        }),
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1113,6 +1139,13 @@ mod tests {
 
     #[test]
     fn slow_write_line_carries_elapsed_and_depth_and_omits_inapplicable_fields() {
+        let stages = WriterStageFields {
+            queue_wait_micros: 11,
+            transaction_acquire_micros: 22,
+            body_micros: 1_111_000,
+            commit_micros: 44,
+            total_micros: 1_234_000,
+        };
         let line = build_line(
             now_rfc3339(),
             "slow_write",
@@ -1122,6 +1155,7 @@ mod tests {
             None,
             Some(1234),
             Some(7),
+            Some(stages),
             None,
             None,
         );
@@ -1129,6 +1163,11 @@ mod tests {
         assert_eq!(parsed["kind"], "slow_write");
         assert_eq!(parsed["elapsed_ms"], 1234);
         assert_eq!(parsed["queue_depth"], 7);
+        assert_eq!(parsed["queue_wait_micros"], 11);
+        assert_eq!(parsed["transaction_acquire_micros"], 22);
+        assert_eq!(parsed["body_micros"], 1_111_000);
+        assert_eq!(parsed["commit_micros"], 44);
+        assert_eq!(parsed["total_micros"], 1_234_000);
         // Inapplicable fields are omitted, not null (existing sink contract).
         assert!(parsed.get("site").is_none());
         assert!(parsed.get("error").is_none());
@@ -1178,6 +1217,7 @@ mod tests {
             timeout_ms: Some(5),
             elapsed_ms: None,
             queue_depth: None,
+            writer_stages: None,
         };
 
         enqueue(&sender, &dropped, make_event());
@@ -1357,6 +1397,7 @@ mod tests {
                         timeout_ms: Some(i as u64),
                         elapsed_ms: None,
                         queue_depth: None,
+                        writer_stages: None,
                     };
                     enqueue(&sender, &dropped, event);
                 })
@@ -1380,6 +1421,7 @@ mod tests {
                 event.timeout_ms,
                 event.elapsed_ms,
                 event.queue_depth,
+                event.writer_stages,
                 None,
                 None,
             );
