@@ -33,12 +33,12 @@ it to `SqlAccess::atomic_unit`. That trait method carries a hard contract (its o
 `&mut dyn SqlWriter` only, never a real `.await` on embedding, ANN warming, or any other
 suspending work.
 
-This module honors that invariant structurally, not by convention: every statement the
-commit-pass closure drives comes from `AtomicOpPlan::plan_statements` (private — the runner's own
-internal flattening step), which can only ever produce `PlanStatement`s — plain parameterized
-SQL, the same shape ADR-099 D1's prepare pass produces for the v1 DML-only admissible verb set
-(ADR-099 D3). There is no code path in this module that can hand `atomic_unit` an embedding call
-or any other suspending future.
+This module honors that invariant structurally, not by convention: ordinary plans are flattened
+by `AtomicOpPlan::plan_statements` into plain parameterized SQL. A `LinkPlan` uses the writer's
+object-safe `execute_edge_upsert` method so SQLite fully consumes both possible `RETURNING`
+branches and carries the persisted `EdgeUpsertOutcome` out of the same transaction. All of these
+writer methods remain synchronous on the inline atomic-unit implementation. There is no code path
+in this module that can hand `atomic_unit` an embedding call or any other suspending future.
 
 The paired suspend-trap tests at the bottom of the file check the two things this promise rests
 on: the real commit pass resolving on first poll (the happy-path proof), and a hand-built closure
@@ -50,8 +50,10 @@ proof).
 Only the **commit pass** (phase 2) lives here: given an already-prepared `Vec<AtomicOpPlan>`
 (phase 1, the async prepare pass, is out of scope for B2), `run_atomic_unit` opens one
 `atomic_unit`, applies each plan's statements under a
-named `SAVEPOINT`, and returns either every op's collected `PostCommitEffect`s (phase 3, the
-async post-commit pass) inside an opaque `CommittedPostCommitEffects` token or the first op's
-failure and its index. Nothing in phase 2 executes deferred effects. After a successful commit,
-the caller passes the token by value to `apply_post_commit_effects`; callers may inspect its
-contents but cannot turn prepare-time effects into an executable token.
+named `SAVEPOINT`, and returns both every op's collected `PostCommitEffect`s (phase 3, the async
+post-commit pass) inside an opaque `CommittedPostCommitEffects` token and one ordered
+`AtomicOpResult` per input plan inside `CommittedAtomicResults`. Link results carry their
+write-derived persisted row and create/reuse disposition; other plans carry `Applied`. A failure
+instead returns its op index and reason. Nothing in phase 2 executes deferred effects. After a
+successful commit, the caller passes the effects token by value to `apply_post_commit_effects`;
+callers may inspect its contents but cannot turn prepare-time effects into an executable token.

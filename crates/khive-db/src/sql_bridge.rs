@@ -761,6 +761,40 @@ impl khive_storage::SqlWriter for SqliteWriter {
         Ok(affected as u64)
     }
 
+    async fn execute_edge_upsert(
+        &mut self,
+        statement: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Option<khive_storage::EdgeUpsertOutcome>> {
+        if let Some(writer_task) = self.writer_task.clone() {
+            return writer_task
+                .send_bounded(move |conn| {
+                    crate::stores::graph::edge_upsert_returning(conn, &statement)
+                        .map_err(|e| map_rusqlite_err(e, "execute_edge_upsert"))
+                })
+                .await;
+        }
+
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
+            operation: "execute_edge_upsert".into(),
+            message: "connection already consumed".into(),
+        })?;
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let result = crate::stores::graph::edge_upsert_returning(&handle.conn, &statement);
+            (handle, result)
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_edge_upsert", e))?;
+        self.handle = Some(handle);
+        result.map_err(|e| {
+            crate::timeout_sink::maybe_emit_busy(
+                &self.db,
+                crate::timeout_sink::Site::StandaloneSqlBridge,
+                &e,
+            );
+            map_rusqlite_err(e, "execute_edge_upsert")
+        })
+    }
+
     async fn execute_batch(
         &mut self,
         statements: Vec<SqlStatement>,
@@ -1210,6 +1244,24 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e))?
     }
 
+    async fn execute_edge_upsert(
+        &mut self,
+        statement: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Option<khive_storage::EdgeUpsertOutcome>> {
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.try_writer().map_err(|e: SqliteError| {
+                StorageError::driver(StorageCapability::Sql, "pool_writer.execute_edge_upsert", e)
+            })?;
+            crate::stores::graph::edge_upsert_returning(&guard, &statement)
+                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_edge_upsert"))
+        })
+        .await
+        .map_err(|e| {
+            StorageError::driver(StorageCapability::Sql, "pool_writer.execute_edge_upsert", e)
+        })?
+    }
+
     async fn execute_batch(
         &mut self,
         statements: Vec<SqlStatement>,
@@ -1395,6 +1447,14 @@ impl khive_storage::SqlWriter for InlineWriter {
             .raw_execute()
             .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
         Ok(affected as u64)
+    }
+
+    async fn execute_edge_upsert(
+        &mut self,
+        statement: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Option<khive_storage::EdgeUpsertOutcome>> {
+        crate::stores::graph::edge_upsert_returning(self.conn(), &statement)
+            .map_err(|e| map_rusqlite_err(e, "inline.execute_edge_upsert"))
     }
 
     async fn execute_batch(

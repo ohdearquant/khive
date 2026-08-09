@@ -16,10 +16,10 @@
 //! [`AtomicUnitOp`] closure for [`SqlAccess::atomic_unit`], whose contract
 //! requires the closure's future to resolve on its first poll — synchronous
 //! DML against the provided `&mut dyn SqlWriter` only, never a suspending
-//! `.await`. Every statement driven here comes from
-//! `AtomicOpPlan::plan_statements`, which can only ever produce
-//! [`PlanStatement`]s (plain parameterized SQL), so no code path in this
-//! module can hand `atomic_unit` a suspending future. The paired
+//! `.await`. Every write driven here is either a plain parameterized
+//! [`PlanStatement`] or a link plan passed to the inline writer's
+//! write-side `RETURNING` seam, so no code path in this module can hand
+//! `atomic_unit` a suspending future. The paired
 //! suspend-trap tests at the bottom of this file check both the happy-path
 //! (real commit pass resolves on first poll) and the misuse-is-caught case
 //! (a hand-built suspending closure fails loudly through the same seam). See
@@ -28,7 +28,9 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use khive_storage::{AtomicUnitOp, SqlAccess, SqlStatement, SqlWriter, StorageError};
+use khive_storage::{
+    AtomicUnitOp, EdgeUpsertOutcome, SqlAccess, SqlStatement, SqlWriter, StorageError,
+};
 
 use crate::atomic_plan::{
     AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernancePlan, GtdCompletePlan,
@@ -190,6 +192,67 @@ impl CommittedPostCommitEffects {
     }
 }
 
+/// One committed operation's write-derived result, aligned by index with the
+/// input plan list.
+#[derive(Debug)]
+pub enum AtomicOpResult {
+    /// The operation committed but has no specialized write-side payload.
+    Applied,
+    /// The persisted edge and its insert/reuse disposition returned by the
+    /// link statement inside the writer transaction.
+    Link(EdgeUpsertOutcome),
+}
+
+// Bitwise weight equality keeps `Eq` lawful even if an internal caller
+// constructs an `Edge` with NaN instead of passing through validation.
+impl PartialEq for AtomicOpResult {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Applied, Self::Applied) => true,
+            (Self::Link(left), Self::Link(right)) => {
+                left.created == right.created
+                    && left.edge.id == right.edge.id
+                    && left.edge.namespace == right.edge.namespace
+                    && left.edge.source_id == right.edge.source_id
+                    && left.edge.target_id == right.edge.target_id
+                    && left.edge.relation == right.edge.relation
+                    && left.edge.weight.to_bits() == right.edge.weight.to_bits()
+                    && left.edge.created_at == right.edge.created_at
+                    && left.edge.updated_at == right.edge.updated_at
+                    && left.edge.deleted_at == right.edge.deleted_at
+                    && left.edge.metadata == right.edge.metadata
+                    && left.edge.target_backend == right.edge.target_backend
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AtomicOpResult {}
+
+/// Ordered write-derived results from one successfully committed atomic unit.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommittedAtomicResults {
+    results: Vec<AtomicOpResult>,
+}
+
+impl CommittedAtomicResults {
+    fn new(results: Vec<AtomicOpResult>) -> Self {
+        Self { results }
+    }
+
+    /// Results in the exact order of the input plans.
+    pub fn as_slice(&self) -> &[AtomicOpResult] {
+        &self.results
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AtomicCommitOutput {
+    post_commit: Vec<PostCommitEffect>,
+    op_results: Vec<AtomicOpResult>,
+}
+
 /// The whole-unit outcome of a completed [`run_atomic_unit`] call — the
 /// commit pass ran to a clean, distinguishable verdict (never returned for
 /// a seam-level failure; see [`AtomicRunnerError`] for that case).
@@ -204,6 +267,7 @@ pub enum AtomicRunOutcome {
     /// raw collection.
     Committed {
         post_commit: CommittedPostCommitEffects,
+        op_results: CommittedAtomicResults,
     },
     /// The op at `failed_op_index` failed; the whole unit rolled back
     /// (ADR-099 D1: "the whole unit rolls back and the failing op index is
@@ -276,7 +340,34 @@ async fn rollback_to_savepoint(writer: &mut dyn SqlWriter, name: &str) -> Result
 async fn apply_plan(
     writer: &mut dyn SqlWriter,
     plan: &AtomicOpPlan,
-) -> Result<(), AtomicOpFailure> {
+) -> Result<AtomicOpResult, AtomicOpFailure> {
+    if let AtomicOpPlan::Link(link) = plan {
+        let label = link.statement.statement.label.clone();
+        let outcome = writer
+            .execute_edge_upsert(link.statement.statement.clone())
+            .await
+            .map_err(|error| AtomicOpFailure::SqlError {
+                statement_label: label.clone(),
+                message: error.to_string(),
+            })?;
+        let observed = u64::from(outcome.is_some());
+        if let Some(guard) = link.statement.guard {
+            if !guard.holds_for(observed) {
+                return Err(AtomicOpFailure::GuardFailed {
+                    statement_label: label,
+                    expected: guard,
+                    observed,
+                });
+            }
+        }
+        return outcome
+            .map(AtomicOpResult::Link)
+            .ok_or_else(|| AtomicOpFailure::SqlError {
+                statement_label: label,
+                message: "edge upsert returned no row without failing its guard".to_string(),
+            });
+    }
+
     for stmt in plan.plan_statements() {
         let label = stmt.statement.label.clone();
         let affected =
@@ -297,7 +388,7 @@ async fn apply_plan(
             }
         }
     }
-    Ok(())
+    Ok(AtomicOpResult::Applied)
 }
 
 /// Run `plans` as ONE atomic unit (ADR-099 D1 commit pass): open a single
@@ -305,9 +396,10 @@ async fn apply_plan(
 /// `SAVEPOINT` (`adr099_atomic_op_<n>`), and commit all or roll back all.
 ///
 /// **This is the seam the atomic-unit suspend-free invariant governs (see
-/// the module doc comment above).** The closure built here drives only
-/// `AtomicOpPlan::plan_statements` — plain DML — against the writer
-/// `atomic_unit` hands it; it issues no transaction control of its own
+/// the module doc comment above).** The closure built here drives plain DML
+/// from `AtomicOpPlan::plan_statements`, plus the link plan's synchronous
+/// write-side `RETURNING` call, against the writer `atomic_unit` hands it; it
+/// issues no transaction control of its own
 /// (`BEGIN`/`COMMIT`/`ROLLBACK` are owned entirely by `atomic_unit`, exactly
 /// like the existing `execute_batch` contract) beyond the per-op
 /// `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` statements, which are themselves
@@ -332,12 +424,14 @@ pub async fn run_atomic_unit(
     let op: AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
             let mut post_commit = Vec::new();
+            let mut op_results = Vec::with_capacity(plans.len());
             for (op_index, plan) in plans.iter().enumerate() {
                 let savepoint = format!("adr099_atomic_op_{op_index}");
                 begin_savepoint(writer, &savepoint).await?;
                 match apply_plan(writer, plan).await {
-                    Ok(()) => {
+                    Ok(op_result) => {
                         release_savepoint(writer, &savepoint).await?;
+                        op_results.push(op_result);
                         if let Some(effect) = plan.post_commit_effect() {
                             post_commit.push(effect);
                         }
@@ -362,17 +456,21 @@ pub async fn run_atomic_unit(
                     }
                 }
             }
-            Ok(Box::new(post_commit) as Box<dyn Any + Send>)
+            Ok(Box::new(AtomicCommitOutput {
+                post_commit,
+                op_results,
+            }) as Box<dyn Any + Send>)
         })
     });
 
     match access.atomic_unit(op).await {
         Ok(boxed) => {
-            let post_commit = *boxed.downcast::<Vec<PostCommitEffect>>().expect(
-                "run_atomic_unit's own closure always returns Box<Vec<PostCommitEffect>> on Ok",
+            let output = *boxed.downcast::<AtomicCommitOutput>().expect(
+                "run_atomic_unit's own closure always returns Box<AtomicCommitOutput> on Ok",
             );
             Ok(AtomicRunOutcome::Committed {
-                post_commit: CommittedPostCommitEffects::new(post_commit),
+                post_commit: CommittedPostCommitEffects::new(output.post_commit),
+                op_results: CommittedAtomicResults::new(output.op_results),
             })
         }
         Err(storage_err) => {
@@ -397,8 +495,10 @@ mod tests {
 
     use std::sync::Arc as StdArc;
 
+    use khive_db::stores::graph::edge_insert_guarded_by_endpoints_statement;
     use khive_db::{ConnectionPool, PoolConfig, SqlBridge};
     use khive_storage::types::{SqlValue, StorageResult as StorageResultAlias};
+    use khive_types::EdgeRelation;
     use uuid::Uuid;
 
     /// A scratch pool wired exactly like the daemon.rs / sql_bridge.rs
@@ -463,7 +563,8 @@ mod tests {
                     deleted_at     INTEGER,
                     metadata       TEXT,
                     target_backend TEXT,
-                    PRIMARY KEY (namespace, id)
+                    PRIMARY KEY (namespace, id),
+                    UNIQUE (namespace, source_id, target_id, relation)
                 );",
             )
             .expect("seed schema");
@@ -571,20 +672,16 @@ mod tests {
             source_id: source,
             target_id: target,
             statement: PlanStatement {
-                statement: SqlStatement {
-                    sql: "INSERT INTO graph_edges \
-                          (namespace, id, source_id, target_id, relation, created_at, updated_at) \
-                          SELECT 'local', ?1, ?2, ?3, 'annotates', 0, 0 \
-                          WHERE EXISTS (SELECT 1 FROM entities WHERE id = ?2 AND deleted_at IS NULL) \
-                            AND EXISTS (SELECT 1 FROM entities WHERE id = ?3 AND deleted_at IS NULL)"
-                        .to_string(),
-                    params: vec![
-                        SqlValue::Text(edge_id.to_string()),
-                        SqlValue::Text(source.to_string()),
-                        SqlValue::Text(target.to_string()),
-                    ],
-                    label: Some("insert-edge-where-exists".to_string()),
-                },
+                statement: edge_insert_guarded_by_endpoints_statement(
+                    "local",
+                    edge_id,
+                    source,
+                    target,
+                    EdgeRelation::Extends,
+                    1.0,
+                    0,
+                    None,
+                ),
                 guard: Some(AffectedRowGuard::exactly(1)),
             },
         })
@@ -887,6 +984,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn atomic_link_results_are_write_derived_and_aligned_with_plan_order() {
+        let pool = scratch_pool("link_result_order");
+        seed_schema(&pool);
+        let source = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        insert_entity(&pool, source, "source");
+        insert_entity(&pool, target, "target");
+        let first_candidate = Uuid::new_v4();
+        let second_candidate = Uuid::new_v4();
+        let bridge = SqlBridge::new(StdArc::clone(&pool), true);
+
+        let outcome = run_atomic_unit(
+            &bridge,
+            vec![
+                rename_plan(source, "source-v2", "rename-source"),
+                link_plan(first_candidate, source, target),
+                link_plan(second_candidate, source, target),
+            ],
+        )
+        .await
+        .expect("seam call ok");
+
+        let op_results = match outcome {
+            AtomicRunOutcome::Committed { op_results, .. } => op_results,
+            other => panic!("expected committed atomic unit: {other:?}"),
+        };
+        let [AtomicOpResult::Applied, AtomicOpResult::Link(first), AtomicOpResult::Link(second)] =
+            op_results.as_slice()
+        else {
+            panic!("op results must remain aligned with the three input plans: {op_results:?}")
+        };
+        assert!(first.created, "the first natural-key write must be created");
+        assert!(!second.created, "the same-unit relink must be reused");
+        assert_eq!(Uuid::from(first.edge.id), first_candidate);
+        assert_eq!(
+            second.edge.id, first.edge.id,
+            "the relink outcome must carry the persisted row id, not its discarded candidate id"
+        );
+        assert_ne!(Uuid::from(second.edge.id), second_candidate);
+    }
+
     // ------------------------------------------------------------------
     // 6. Zero-row
     // ------------------------------------------------------------------
@@ -1112,7 +1251,7 @@ mod tests {
 
         let outcome = run_atomic_unit(&bridge, plans).await.expect("seam call ok");
         match outcome {
-            AtomicRunOutcome::Committed { post_commit } => {
+            AtomicRunOutcome::Committed { post_commit, .. } => {
                 fn require_commit_provenance(_: &CommittedPostCommitEffects) {}
                 require_commit_provenance(&post_commit);
                 assert_eq!(

@@ -6022,6 +6022,73 @@ backend = "sessions"
         }
     }
 
+    async fn seed_atomic_link_endpoints(db_path: &str) -> (String, String) {
+        let server = isolated_server(db_path);
+        let response = dispatch_json(
+            &server,
+            r#"[create(kind="concept", name="AtomicLinkA"), create(kind="concept", name="AtomicLinkB")]"#,
+        )
+        .await;
+        let full_id = |index: usize| {
+            response["results"][index]["result"]["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing endpoint id at index {index}: {response}"))
+                .to_string()
+        };
+        (full_id(0), full_id(1))
+    }
+
+    async fn atomic_singleton_link(
+        db_path: &str,
+        source_id: &str,
+        target_id: &str,
+    ) -> serde_json::Value {
+        crate::atomic_apply::execute_atomic_ops_file(
+            vec![atomic_op(
+                "link",
+                serde_json::json!({
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relation": "extends",
+                }),
+            )],
+            atomic_cfg(db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic singleton link must commit")
+    }
+
+    #[tokio::test]
+    async fn atomic_singleton_link_reports_created_disposition() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let (source_id, target_id) = seed_atomic_link_endpoints(&db_path).await;
+
+        let envelope = atomic_singleton_link(&db_path, &source_id, &target_id).await;
+
+        assert_eq!(envelope["results"][0]["result"]["created"], true);
+        assert_eq!(envelope["results"][0]["result"]["reused"], false);
+    }
+
+    #[tokio::test]
+    async fn atomic_singleton_relink_reports_reused_disposition_and_persisted_id() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let (source_id, target_id) = seed_atomic_link_endpoints(&db_path).await;
+        let first = atomic_singleton_link(&db_path, &source_id, &target_id).await;
+
+        let second = atomic_singleton_link(&db_path, &source_id, &target_id).await;
+
+        assert_eq!(second["results"][0]["result"]["created"], false);
+        assert_eq!(second["results"][0]["result"]["reused"], true);
+        assert_eq!(
+            second["results"][0]["result"]["id"], first["results"][0]["result"]["id"],
+            "natural-key reuse must report the persisted row id"
+        );
+    }
+
     #[tokio::test]
     async fn atomic_kg_only_config_keeps_gtd_hook_and_lifecycle_execution() {
         let db_file = NamedTempFile::new().expect("temp db");

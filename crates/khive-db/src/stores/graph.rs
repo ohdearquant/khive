@@ -953,7 +953,7 @@ fn edge_endpoints_exist(
 /// id itself correctly; comparing candidate and returned ids cannot do that.
 /// A guarded `INSERT ... SELECT ... WHERE` produces no row from either statement
 /// when its endpoint predicate refuses the write.
-fn edge_upsert_returning(
+pub(crate) fn edge_upsert_returning(
     conn: &rusqlite::Connection,
     statement: &SqlStatement,
 ) -> Result<Option<EdgeUpsertOutcome>, rusqlite::Error> {

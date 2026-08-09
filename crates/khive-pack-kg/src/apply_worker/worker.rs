@@ -9,7 +9,7 @@ use khive_runtime::{
     },
     curation::{ContentMergeStrategy, EntityDedupMergePolicy, EntityPatch},
     retrieval::EmbeddingTruncationReport,
-    AtomicOpPlan, AtomicRunOutcome, EdgeListFilter, KhiveRuntime, NamespaceToken, RuntimeError,
+    AtomicOpPlan, AtomicOpResult, AtomicRunOutcome, KhiveRuntime, NamespaceToken, RuntimeError,
     VerbRegistry,
 };
 use khive_storage::types::PageRequest;
@@ -35,11 +35,7 @@ pub(super) enum PreparedApply {
 
 pub(super) enum PendingCreatedRecord {
     Id(Uuid),
-    Edge {
-        source_id: Uuid,
-        target_id: Uuid,
-        relation: EdgeRelation,
-    },
+    Edge { plan_index: usize },
 }
 
 /// Worker that applies approved proposal changesets.
@@ -237,7 +233,10 @@ impl ProposalApplyWorker {
                     .await
                     .map_err(|error| RuntimeError::Storage(error.0))?;
                 match outcome {
-                    AtomicRunOutcome::Committed { post_commit } => {
+                    AtomicRunOutcome::Committed {
+                        post_commit,
+                        op_results,
+                    } => {
                         let outcomes = apply_post_commit_effects_with_report(
                             &self.runtime,
                             token,
@@ -249,7 +248,7 @@ impl ProposalApplyWorker {
                             embedding_truncation.merge(outcome.truncation);
                         }
                         let created_records =
-                            self.resolve_created_records(token, created_records).await?;
+                            Self::resolve_created_records(created_records, op_results.as_slice())?;
                         Ok((created_records, embedding_truncation))
                     }
                     AtomicRunOutcome::RolledBack {
@@ -344,17 +343,13 @@ impl ProposalApplyWorker {
                         "weight": weight.map(f64::from),
                     });
                     let plan = prepare_op(&self.runtime, token, "link", &args).await?;
-                    let (source_id, target_id) = match &plan {
-                        AtomicOpPlan::Link(plan) => (plan.source_id(), plan.target_id()),
+                    match &plan {
+                        AtomicOpPlan::Link(_) => {}
                         _ => unreachable!("link prepare returned a different plan variant"),
-                    };
+                    }
                     Ok(PreparedApply::Atomic {
                         plans: vec![plan],
-                        created_records: vec![PendingCreatedRecord::Edge {
-                            source_id,
-                            target_id,
-                            relation,
-                        }],
+                        created_records: vec![PendingCreatedRecord::Edge { plan_index: 0 }],
                     })
                 }
                 ProposalChangeset::AddNote { note } => {
@@ -412,43 +407,27 @@ impl ProposalApplyWorker {
         })
     }
 
-    async fn resolve_created_records(
-        &self,
-        token: &NamespaceToken,
+    fn resolve_created_records(
         records: Vec<PendingCreatedRecord>,
+        op_results: &[AtomicOpResult],
     ) -> Result<Vec<Uuid>, RuntimeError> {
         let mut ids = Vec::with_capacity(records.len());
         for record in records {
             match record {
                 PendingCreatedRecord::Id(id) => ids.push(id),
-                PendingCreatedRecord::Edge {
-                    source_id,
-                    target_id,
-                    relation,
-                } => {
-                    let edge = self
-                        .runtime
-                        .list_edges(
-                            token,
-                            EdgeListFilter {
-                                source_id: Some(source_id),
-                                target_id: Some(target_id),
-                                relations: vec![relation],
-                                ..Default::default()
-                            },
-                            1,
-                            0,
-                        )
-                        .await?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| {
-                            RuntimeError::Internal(
-                                "committed proposal edge was not found by natural key".to_string(),
-                            )
-                        })?;
-                    ids.push(edge.id.0);
-                }
+                PendingCreatedRecord::Edge { plan_index } => match op_results.get(plan_index) {
+                    Some(AtomicOpResult::Link(outcome)) => ids.push(outcome.edge.id.0),
+                    Some(AtomicOpResult::Applied) => {
+                        return Err(RuntimeError::Internal(format!(
+                            "committed proposal edge plan {plan_index} has no write-side result"
+                        )))
+                    }
+                    None => {
+                        return Err(RuntimeError::Internal(format!(
+                            "committed proposal edge plan index {plan_index} is out of range"
+                        )))
+                    }
+                },
             }
         }
         Ok(ids)

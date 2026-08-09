@@ -17,11 +17,13 @@ use khive_pack_gtd::schema::{is_terminal, normalize_status};
 use khive_runtime::atomic_plan::{
     AffectedRowGuard, GtdCompletePlan, GtdTransitionPlan, PlanStatement, PostCommitEffect,
 };
-use khive_runtime::atomic_runner::{AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
+use khive_runtime::atomic_runner::{
+    AtomicOpFailure, AtomicOpPlan, AtomicOpResult, AtomicRunOutcome,
+};
 use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder};
 use khive_runtime::{
-    EdgeListFilter, KhiveConfig, KhiveRuntime, LinkSpec, Namespace, NamespaceToken, Resolved,
-    RuntimeConfig, RuntimeError,
+    KhiveConfig, KhiveRuntime, LinkSpec, Namespace, NamespaceToken, Resolved, RuntimeConfig,
+    RuntimeError,
 };
 use khive_storage::EdgeRelation;
 #[cfg(test)]
@@ -363,7 +365,17 @@ pub(crate) async fn execute_atomic_ops_file(
 
     let total = ops.len();
     let envelope = match outcome {
-        AtomicRunOutcome::Committed { post_commit } => {
+        AtomicRunOutcome::Committed {
+            post_commit,
+            op_results,
+        } => {
+            if op_results.as_slice().len() != plans.len() {
+                anyhow::bail!(
+                    "atomic commit returned {} ordered op result(s) for {} plan(s)",
+                    op_results.as_slice().len(),
+                    plans.len()
+                );
+            }
             // GAP-5 (ADR-099 B3): `GtdAudit` effects are applied HERE,
             // not inside `khive_runtime::atomic_prepare::apply_post_commit_effects`
             // (crate-direction: `khive-pack-gtd` depends on `khive-runtime`,
@@ -388,8 +400,8 @@ pub(crate) async fn execute_atomic_ops_file(
             // ADR-099 B3: render each committed op's
             // canonical-shaped `result` payload (ADR-099 D4 requires
             // `results[i].result`; the pre-fix envelope carried only
-            // `{ok, tool, op_index}`). Result rendering is itself a READ —
-            // safe post-commit, same reasoning as the reindex pass above.
+            // `{ok, tool, op_index}`). Read-backed renderers run post-commit;
+            // link consumes its already-materialized write-side outcome.
             let mut results: Vec<Value> = Vec::with_capacity(ops.len());
             for (idx, op) in ops.iter().enumerate() {
                 let mut result = build_op_result(
@@ -399,6 +411,7 @@ pub(crate) async fn execute_atomic_ops_file(
                     &op.args,
                     &resolved_args_list[idx],
                     &plans[idx],
+                    &op_results.as_slice()[idx],
                     &gtd_audit_outcomes,
                 )
                 .await
@@ -830,8 +843,9 @@ fn gtd_audit_from_to(effect: &PostCommitEffect) -> Option<(String, String)> {
 /// Render a committed op's canonical-shaped `result` payload (ADR-099 B3:
 /// the pre-fix envelope carried
 /// only `{ok, tool, op_index}`, dropping the `results[i].result` ADR-099 D4
-/// specifies). Result rendering is a pure READ, run strictly after the
-/// commit pass — safe for the same reason the post-commit reindex pass is.
+/// specifies). Most result rendering reads committed state after the commit
+/// pass; link rendering instead consumes the write-side outcome carried out
+/// of that transaction, because its disposition cannot be inferred later.
 ///
 /// `original_args`: the op's args exactly as the caller supplied them
 /// (needed for delete's `id`/`kind` echo, and gtd.transition's raw
@@ -845,8 +859,20 @@ async fn build_op_result(
     original_args: &Value,
     resolved_args: &Value,
     plan: &AtomicOpPlan,
+    op_result: &AtomicOpResult,
     gtd_audit_outcomes: &HashMap<Uuid, bool>,
 ) -> anyhow::Result<Value> {
+    match (plan, op_result) {
+        (AtomicOpPlan::Link(_), AtomicOpResult::Link(_)) => {}
+        (AtomicOpPlan::Link(_), AtomicOpResult::Applied) => {
+            anyhow::bail!("atomic link result: missing write-side edge outcome")
+        }
+        (_, AtomicOpResult::Applied) => {}
+        (_, AtomicOpResult::Link(_)) => {
+            anyhow::bail!("atomic result ordering mismatch: link outcome paired with non-link plan")
+        }
+    }
+
     match (tool, plan) {
         // Canonical shape: `normalize_entity_timestamps(to_json(&updated))`
         // (update.rs:209-211 entity, :242-244 note) — the full updated
@@ -941,40 +967,22 @@ async fn build_op_result(
                 .unwrap_or(Value::Null);
             Ok(json!({"deleted": true, "id": id_val, "kind": kind_val}))
         }
-        // Canonical shape: `to_json(&edge)` with `source_id`/`target_id`
+        // Canonical shape: `to_json(&edge)` plus the writer-derived
+        // `created`/`reused` disposition, with `source_id`/`target_id`
         // swapped back to the CALLER's order for a symmetric relation
-        // (link.rs:183-189). The atomic INSERT is a natural-key upsert, so
-        // the prepare-time-generated edge id may not be the committed row's
-        // id on a conflict — look the edge up post-commit by
-        // `(canonical_source, canonical_target, relation)` instead of
-        // trusting it.
-        ("link", AtomicOpPlan::Link(p)) => {
-            let relation_str = resolved_args
-                .as_object()
-                .and_then(|o| o.get("relation"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("atomic link result: missing relation"))?;
-            let relation: EdgeRelation = relation_str
-                .parse()
-                .map_err(|e| anyhow::anyhow!("atomic link result: unknown relation: {e}"))?;
-            let edges = runtime
-                .list_edges(
-                    token,
-                    EdgeListFilter {
-                        source_id: Some(p.source_id()),
-                        target_id: Some(p.target_id()),
-                        relations: vec![relation],
-                        ..Default::default()
-                    },
-                    1,
-                    0,
-                )
-                .await?;
-            let edge = edges.into_iter().next().ok_or_else(|| {
-                anyhow::anyhow!("atomic link result: committed edge not found by natural key")
-            })?;
-            let mut raw = serde_json::to_value(&edge)?;
-            if relation.is_symmetric() {
+        // (link.rs:183-189). The edge, persisted id, and disposition come
+        // from SQLite `RETURNING` inside the atomic writer transaction; no
+        // post-commit natural-key read is used to infer any of them.
+        ("link", AtomicOpPlan::Link(_)) => {
+            let AtomicOpResult::Link(outcome) = op_result else {
+                unreachable!("validated above")
+            };
+            let mut raw = serde_json::to_value(&outcome.edge)?;
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("created".to_string(), json!(outcome.created));
+                obj.insert("reused".to_string(), json!(!outcome.created));
+            }
+            if outcome.edge.relation.is_symmetric() {
                 if let Some(obj) = raw.as_object_mut() {
                     let orig_source = resolved_args
                         .as_object()
@@ -2284,7 +2292,7 @@ mod tests {
                 .await
                 .expect("commit ok");
         let post_commit = match outcome {
-            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("idempotent no-op must still succeed as Committed, got {other:?}"),
         };
         assert!(
@@ -2335,7 +2343,7 @@ mod tests {
         .await
         .expect("commit guarded no-op assertion");
         let post_commit = match outcome {
-            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("expected committed no-op, got {other:?}"),
         };
         assert!(post_commit.as_slice().is_empty());
@@ -2348,6 +2356,7 @@ mod tests {
             &args,
             &args,
             &plan,
+            &AtomicOpResult::Applied,
             &audit_outcomes,
         )
         .await
@@ -2394,7 +2403,7 @@ mod tests {
                 .await
                 .expect("commit ok");
         let post_commit = match outcome {
-            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
         let transition_audit =
@@ -2415,7 +2424,7 @@ mod tests {
                 .await
                 .expect("commit ok");
         let post_commit = match outcome {
-            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
         let complete_audit =
@@ -2497,7 +2506,7 @@ mod tests {
         .await
         .expect("commit domain write");
         let post_commit = match outcome {
-            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("expected committed completion, got {other:?}"),
         };
         let audit_outcomes =
@@ -2511,6 +2520,7 @@ mod tests {
             &args,
             &args,
             &plan,
+            &AtomicOpResult::Applied,
             &audit_outcomes,
         )
         .await

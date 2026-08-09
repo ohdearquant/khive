@@ -49,8 +49,8 @@ pub use atomic_plan::{
     PostCommitEffect, UpdatePlan,
 };
 pub use atomic_runner::{
-    run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
-    CommittedPostCommitEffects,
+    run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicOpResult, AtomicRunOutcome,
+    AtomicRunnerError, CommittedAtomicResults, CommittedPostCommitEffects,
 };
 pub use blob::resolve_blob_store;
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};

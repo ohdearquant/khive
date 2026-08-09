@@ -1855,7 +1855,7 @@ mod tests {
             .await
             .expect("seam call ok");
         let post_commit = match outcome {
-            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
         assert_eq!(
@@ -1951,7 +1951,7 @@ mod tests {
             .await
             .expect("seam call ok");
         let post_commit = match outcome {
-            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
         apply_post_commit_effects(&runtime, &token, post_commit)
@@ -1983,7 +1983,7 @@ mod tests {
             .await
             .expect("seam call ok");
         let post_commit = match outcome {
-            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
         assert_eq!(
@@ -3744,7 +3744,7 @@ mod tests {
         .await
         .expect("seam call ok");
         let post_commit = match outcome {
-            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit, .. } => post_commit,
             other => panic!("expected the whole unit to commit: {other:?}"),
         };
         assert_eq!(

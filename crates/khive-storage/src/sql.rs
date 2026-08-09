@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 
-use crate::types::{PageRequest, SqlRow, SqlStatement, SqlValue, StorageResult};
+use crate::types::{EdgeUpsertOutcome, PageRequest, SqlRow, SqlStatement, SqlValue, StorageResult};
 
 /// A boxed future, borrowing from the `&mut dyn SqlWriter` an
 /// [`AtomicUnitOp`] is called with (see [`SqlAccess::atomic_unit`]).
@@ -85,6 +85,26 @@ pub trait SqlWriter: SqlReader + Send + 'static {
     /// primitive remains available to internal transaction owners such as
     /// `atomic_unit` for their `BEGIN`/`COMMIT`/`ROLLBACK` calls.
     async fn execute(&mut self, statement: SqlStatement) -> StorageResult<u64>;
+    /// Execute the canonical guarded edge-upsert statement and return the
+    /// persisted row plus its insert/reuse disposition from the same writer
+    /// transaction. `None` means the statement's endpoint guard refused the
+    /// write before either upsert branch produced a row.
+    ///
+    /// This dedicated write-side `RETURNING` seam exists because
+    /// [`SqlReader::query_row`] may stop stepping early and therefore cannot
+    /// safely execute DML with side effects. The default keeps alternate SQL
+    /// writers source-compatible while making lack of this SQLite-specific
+    /// capability explicit to the atomic link runner.
+    async fn execute_edge_upsert(
+        &mut self,
+        _statement: SqlStatement,
+    ) -> StorageResult<Option<EdgeUpsertOutcome>> {
+        Err(crate::error::StorageError::Unsupported {
+            capability: crate::StorageCapability::Sql,
+            operation: "execute_edge_upsert".into(),
+            message: "writer does not expose write-side edge RETURNING outcomes".to_string(),
+        })
+    }
     /// Execute multiple DML statements and return the total rows affected.
     async fn execute_batch(&mut self, statements: Vec<SqlStatement>) -> StorageResult<u64>;
     /// Execute a raw SQL script (no parameters; used for migrations).
