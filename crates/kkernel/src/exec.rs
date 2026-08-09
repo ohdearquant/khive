@@ -4299,33 +4299,45 @@ id = "lambda:fallback"
                     response["results"][0]["result"]
                 )
             });
-        let names: std::collections::BTreeSet<&str> =
-            rows.iter().filter_map(|row| row["name"].as_str()).collect();
+        // A row that carries no string name is an unreadable instrument, not an
+        // absent entity, so it panics here rather than being dropped silently.
+        let mut observed: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row["name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("read-back row carries no string name: {row}"))
+                    .to_owned()
+            })
+            .collect();
         // An empty or unparsed read-back is an instrument failure, not a pass.
         assert!(
-            !names.is_empty(),
-            "read-back yielded no names from {} rows; first row: {:?}",
-            rows.len(),
-            rows.first()
+            !observed.is_empty(),
+            "read-back yielded no rows; result was {}",
+            response["results"][0]["result"]
         );
+        observed.sort_unstable();
 
-        for index in 0..OPS_FILE_CHUNK_SIZE {
-            let expected = format!("abort-manifest-{index:03}");
-            assert!(
-                names.contains(expected.as_str()),
-                "manifest reports chunk 1 committed, but {expected} is absent from the database"
-            );
-        }
+        // Enumerate the two legal outcomes instead of bounding a count. Entity
+        // names carry no uniqueness constraint and the upsert is keyed by UUID,
+        // so any count of distinct names is a proxy: a duplicate row satisfies
+        // it while the property it stands for is broken. Comparing the whole
+        // sorted list pins which rows are present, and how many of each.
+        let committed: Vec<String> = (0..OPS_FILE_CHUNK_SIZE)
+            .map(|index| format!("abort-manifest-{index:03}"))
+            .collect();
+        // Chunk 2 was dispatched without a verified response, so its single op
+        // may or may not have landed. The manifest reports it as unconfirmed
+        // rather than committed precisely because both outcomes are legal here.
+        let mut with_unconfirmed = committed.clone();
+        with_unconfirmed.push(format!("abort-manifest-{OPS_FILE_CHUNK_SIZE:03}"));
 
-        // Chunk 2 was dispatched without a verified response, so its single op may
-        // or may not have landed. The manifest reports it as unconfirmed rather
-        // than committed precisely because both outcomes are legal here; anything
-        // outside that two-value range means the reconciliation record is wrong.
         assert!(
-            names.len() == OPS_FILE_CHUNK_SIZE || names.len() == OPS_FILE_CHUNK_SIZE + 1,
-            "expected the {OPS_FILE_CHUNK_SIZE} confirmed rows plus at most the single \
-             unconfirmed one, found {}",
-            names.len()
+            observed == committed || observed == with_unconfirmed,
+            "manifest reports chunk 1 committed and chunk 2 unconfirmed, so the database must \
+             hold exactly the {OPS_FILE_CHUNK_SIZE} confirmed rows, optionally plus the one \
+             unconfirmed row; found {} rows: {observed:?}",
+            observed.len()
         );
     }
 
