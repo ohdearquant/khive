@@ -1445,7 +1445,7 @@ impl KhiveRuntime {
     /// Claim `external_id` on an outbound `message` note through the
     /// ADR-124-sanctioned store-level one-key atomic path, bypassing the
     /// caller-facing owner-established-property refusal in
-    /// [`Self::update_note`]/[`Self::prepare_update_note`]. This is deliberately
+    /// [`Self::update_note`] (and its crate-internal prepare path). This is deliberately
     /// NOT exposed through any registered verb (ADR-124's stated bound): it is
     /// reachable only from pack/runtime code that owns outbox bookkeeping for
     /// the `message` note kind.
