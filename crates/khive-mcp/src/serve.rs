@@ -6494,7 +6494,10 @@ region = "us-east-1"
             "canonical backend identity must not create a missing read-only parent"
         );
 
-        let error = open_backend(&config).expect_err("missing read-only snapshot must fail");
+        let error = match open_backend(&config) {
+            Ok(_) => panic!("missing read-only snapshot must fail"),
+            Err(error) => error,
+        };
         assert!(
             error.to_string().contains("read-only open"),
             "error must identify the read-only open: {error}"
@@ -6527,8 +6530,10 @@ region = "us-east-1"
             journal_mode: None,
             read_only: false,
         };
-        let error = open_backend(&config)
-            .expect_err("an undeclared multi-backend storage-mode change must fail closed");
+        let error = match open_backend(&config) {
+            Ok(_) => panic!("an undeclared multi-backend storage-mode change must fail closed"),
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(message.contains("read_only = true"), "{message}");
         assert!(message.contains("config identity"), "{message}");
