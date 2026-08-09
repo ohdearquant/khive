@@ -266,8 +266,10 @@ pub fn compute_config_id(
 
 /// Compute the daemon identity with an already-snapshotted ADR-118 policy.
 ///
-/// Runtime-owning call sites use this form so an environment mutation after
-/// construction cannot make the fingerprint disagree with serving behavior.
+/// Test-only compatibility wrapper for exercising one already-snapshotted
+/// policy. Runtime-owning call sites pass both captured policies through
+/// [`compute_config_id_with_runtime_policies`].
+#[cfg(test)]
 pub(crate) fn compute_config_id_with_ann_fresh_tail(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
@@ -298,7 +300,7 @@ fn configured_storage_read_only(
     })
 }
 
-/// Runtime-aware variant of [`compute_config_id`].
+/// Test-only storage-policy variant of [`compute_config_id`].
 ///
 /// A chmod-detected snapshot has the same configured path as its writable
 /// source but cannot safely share a warm daemon with it: the writable daemon
@@ -306,6 +308,7 @@ fn configured_storage_read_only(
 /// Fold the effective main-backend mode into the existing `backend` component
 /// so the mismatch remains parseable as a structured backend mismatch without
 /// changing the legacy fingerprint for writable runtimes.
+#[cfg(test)]
 pub(crate) fn compute_config_id_with_storage_mode(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
