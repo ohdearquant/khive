@@ -64,21 +64,24 @@ invocation with no live traffic, or equivalent.
 
 A DB-coordinated sweep is available separately as
 `BlobStore::transactional_orphan_sweep`. The filesystem implementation acquires
-the same process-local mutex and root-local advisory file lock as `put`, captures
-the complete candidate set, and classifies file age before opening SQLite's writer
-transaction. A short `SqlAccess::atomic_unit` anti-joins live entity references
-and commits durable `blob_gc_claims`; entity INSERT/UPDATE triggers reject a
-new live reference to a claimed digest. Physical deletion then runs outside the
-SQLite transaction while the root locks remain held, followed by a second short
-SQL-only claim cleanup. A crash after the claim commit leaves the fence durable
-and fail-closed; the next sweep clears claims for missing/live/grace-protected
-objects and resumes eligible deletion. A filesystem publisher in another
-process that begins while the sweep holds the advisory lock waits; after the
-sweep releases the lock, `put` rechecks the target and republishes bytes removed
-as an orphan before returning the `ContentRef`. This coordination applies to
-publishers using `FsBlobStore`; direct filesystem mutation does not participate
-in the advisory-lock protocol. Backends that cannot provide both coordination
-boundaries return `Unsupported`.
+a database-scoped process mutex and `<database>.khive-blob-gc.lock` before the
+same root-local locks as `put`, captures the complete candidate set, and
+classifies file age before opening SQLite's writer transaction. Acquiring the
+database owner makes all pre-existing claims abandoned, including claims copied
+by a backup or left under a relocated root; validated abandoned rows are removed
+in batches of at most 128. Candidates then pass through bounded claim, physical
+delete, and cleanup batches of the same maximum size. Each short
+`SqlAccess::atomic_unit` anti-joins live entity references and commits durable
+`blob_gc_claims`; entity INSERT/UPDATE triggers reject a new live reference to a
+claimed digest. Physical deletion runs outside SQLite while both owner/root locks
+remain held, followed by a bounded SQL-only cleanup. A crash after claim commit
+leaves the fence durable and fail-closed; the next exclusive database owner
+rescans rather than resuming deletion blindly. A filesystem publisher in
+another process that begins while the sweep holds the advisory root lock waits;
+after release, `put` rechecks the target and republishes bytes removed as an
+orphan before returning the `ContentRef`. Direct filesystem mutation does not
+participate in the advisory-lock protocol. Backends that cannot provide both
+coordination boundaries return `Unsupported`.
 
 The original `orphan_sweep` remains an offline-maintenance API for callers that
 already have a trusted `live_refs` snapshot. It intentionally retains its

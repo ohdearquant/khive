@@ -262,15 +262,20 @@ Run those two methods only when writes that could create a new `content_ref` ref
 quiesced. `BlobStore::transactional_orphan_sweep(sql, dry_run)`, added by PR #1313, is the live-
 traffic alternative for backends that can coordinate both stores. The filesystem implementation:
 
-1. acquires the canonical-root in-process and advisory write locks and captures the complete blob
-   candidate set while publishers are excluded;
+1. acquires a canonical-database in-process lock and `<database>.khive-blob-gc.lock`, then the
+   canonical-root in-process and advisory write locks, and captures the complete blob candidate
+   set while publishers are excluded;
 2. outside SQLite, evaluates file age and prepares the complete candidate set;
-3. enters a short, SQL-only `SqlAccess::atomic_unit` (`BEGIN IMMEDIATE` on SQLite), selects
-   distinct references from non-deleted entities, and durably claims only absent candidates in
-   `blob_gc_claims`;
-4. after that transaction commits, deletes claimed files while retaining both root write locks;
-   entity INSERT/UPDATE triggers reject a newly live reference to any active claim; and
-5. removes the claims in a second short SQL-only atomic unit before releasing the root locks.
+3. after validating durable evidence, removes claims abandoned by the previous database owner in
+   SQL-only transactions of at most 128 rows; ownership, not the mutable path-derived `root_key`,
+   makes root relocation and restored-backup recovery safe;
+4. for each candidate batch of at most 128, enters a short, SQL-only `SqlAccess::atomic_unit`
+   (`BEGIN IMMEDIATE` on SQLite), selects distinct references from non-deleted entities, and
+   durably claims only absent candidates in `blob_gc_claims`;
+5. after that transaction commits, deletes only the claimed batch while retaining database/root
+   ownership; entity INSERT/UPDATE triggers reject a newly live reference to any active claim; and
+6. removes that bounded claim batch in a second short SQL-only atomic unit before advancing, then
+   releases all locks after the final batch.
 
 This yields two concurrency guarantees pinned by tests. A blob published after candidate capture
 is not in the sweep set and survives. A committed entity reference cannot appear between the
@@ -278,8 +283,10 @@ liveness query and physical deletion: SQLite's writer lock covers the anti-join 
 then the durable trigger fence covers the external deletion phase without monopolizing SQLite's
 single writer. Invalid stored `content_ref` or claim values fail closed rather than making the
 sweep delete against an incomplete live set. A crash after claim commit leaves a durable
-fail-closed row; the next sweep clears claims whose object is missing, live, or grace-protected and
-resumes eligible work.
+fail-closed row; the next exclusive database owner rescans the current root and liveness state,
+clears abandoned claims in bounded units, and freshly claims any still-eligible work. At no point
+does one writer transaction bind, mutate, or return more than 128 candidates, bounding claim-table
+and WAL work per writer hold.
 
 The guarantee still has a bounded publish gap. `put(bytes)` and the later entity write that stores
 its returned reference are separate client steps, outside one shared transaction. A candidate with

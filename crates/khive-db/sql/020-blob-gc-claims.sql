@@ -1,11 +1,13 @@
 -- V20: durable cross-resource claims for live-traffic filesystem blob GC.
 --
--- A sweep first commits a claim using SQLite-only work, then releases the
--- single-writer slot before touching the filesystem.  These triggers are the
--- fence that keeps a concurrent entity write from making a claimed object
--- newly live in that released-writer window.  Claims are removed after the
--- physical phase; a process crash leaves them fail-closed for the next sweep
--- to recover.
+-- Under exclusive database-scoped sweep ownership, a sweep commits one
+-- bounded claim batch using SQLite-only work, then releases the single-writer
+-- slot before touching the filesystem.  These triggers are the fence that
+-- keeps a concurrent entity write from making a claimed object newly live in
+-- that released-writer window.  Claims are removed after each physical batch;
+-- a process crash leaves them fail-closed for the next exclusive owner to
+-- rescan and recover. root_key is diagnostic only: abandoned recovery covers
+-- all rows and therefore survives blob-root relocation or database restore.
 
 CREATE TABLE IF NOT EXISTS blob_gc_claims (
     root_key    TEXT    NOT NULL,

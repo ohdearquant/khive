@@ -1208,7 +1208,11 @@ invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
 run. A background checkpoint tick may independently perform its normal cleanup, but the
 diagnostic request itself never converts an unmeasured value into a clean-looking zero.
 
-### 2026-08-09 amendment (Amendment 7): write-transaction external-work audit
+### 2026-08-09 amendment (Amendment 9): write-transaction external-work audit
+
+The Amendment 9 allocation assumes #1844 lands as Amendment 7 and #1845 lands as Amendment 8.
+If that integration order changes, the integrating rebase must renumber this amendment and its
+cross-document references rather than publishing a duplicate or skipped allocation.
 
 **Motivation.** WAL mode admits one writer. Queue time therefore depends on both mean writer hold
 time and its variance; a filesystem call, network request, blocking wait, or expensive compute
@@ -1235,19 +1239,40 @@ production caller named in that row was inspected through its commit/rollback ed
 | `SqlBridge` manual owners                       | Standalone and pool-backed `execute_batch`; flag-off `run_manual_atomic_unit`                             | Pre-prepared parameterized statements, commit/rollback, poisoning bookkeeping | SQL-only                                |
 | Store flag-off batch owners                     | `entity`, `note`, `event`, `graph`, `text`, `sparse`, `vectors`, and `agents` batch/upsert/delete methods | Bounded per-item SQL loops and result counters                                | SQL-only                                |
 | Vector-store private IMMEDIATE transactions     | Vector batch upsert/delete/orphan reconciliation                                                          | sqlite-vec/ordinary table statements and bounded row binding                  | SQL-only                                |
-| Runtime/pack `AtomicUnitOp` callers             | Runtime atomic runner and ANN registry; brain fold/persist; session mirror ingest; blob claim/cleanup     | DML/query statements and bounded validation/folding                           | SQL-only                                |
+| Retrieval weight private IMMEDIATE transaction  | `engine_weights::apply_weight_delta_with_eta`                                                              | One scalar read, bounded EMA arithmetic, weight upsert, and audit-row insert   | SQL-only                                |
+| Runtime/pack `AtomicUnitOp` callers             | Runtime atomic runner and ANN registry; brain fold/persist; session mirror ingest; blob recovery/claim/cleanup | DML/query statements and bounded validation/folding                        | SQL-only                                |
 | Blob physical GC (outside owner)                | `FsBlobStore::transactional_orphan_sweep`                                                                 | Root walk, metadata, advisory locking, and file deletion                      | Explicitly outside SQLite transactions  |
 
 **Blob cross-resource repair.** The sweep now prepares its file candidates before SQLite opens a
-writer transaction. Its first short atomic unit anti-joins live `entities.content_ref` values and
-commits durable `blob_gc_claims`. V20 entity INSERT/UPDATE triggers reject any new live reference
-to a claimed digest. Only after commit does the sweep delete files under its process-local and
-cross-process root locks; a second short atomic unit removes the claims. A crash between those
-units leaves the trigger fence durable and fail-closed for the next sweep to recover. This keeps
-the stronger ADR-111 liveness guarantee without retaining SQLite's single writer across external
-I/O. `transactional_orphan_sweep_releases_sqlite_writer_before_physical_delete` pauses at that exact
-boundary, proves an unrelated writer commits while deletion is parked, and proves a racing claimed
-reference is rejected.
+writer transaction. The protocol first holds a process-local lock keyed by the canonical database
+path and a cross-process `<database>.khive-blob-gc.lock`, then takes the existing root locks. This
+database-scoped ownership serializes differently configured roots as well as identical roots. Once
+acquired, every pre-existing claim in that database is abandoned; after fail-closed validation it
+is removed in transactions of at most 128 rows. Recovery therefore does not depend on the mutable
+path-derived `root_key` and also covers a relocated root or an online-backup snapshot restored at a
+different database path.
+
+Candidate processing is likewise split into units of at most 128. Each short atomic unit anti-joins
+live `entities.content_ref` values and commits only that bounded set of durable `blob_gc_claims`;
+V20 entity INSERT/UPDATE triggers reject a new live reference to any claimed digest. After commit,
+the sweep deletes only that batch's files outside SQLite and removes only that batch's claims in a
+second bounded atomic unit before advancing. JSON bindings, claim-table mutations, returned rows,
+and application result folding are therefore cardinality-bounded per writer hold. A crash between
+units leaves the trigger fence durable and fail-closed; the next exclusive database owner rescans
+the filesystem and liveness evidence before recovering it. This keeps the stronger ADR-111
+liveness guarantee without retaining SQLite's single writer across external I/O or creating one
+orphan-population-sized claim transaction.
+
+`transactional_orphan_sweep_releases_sqlite_writer_before_physical_delete` pauses at the exact
+claim/physical boundary, proves an unrelated writer commits while deletion is parked, and proves a
+racing claimed reference is rejected. `transactional_orphan_sweep_bounds_each_durable_claim_batch`
+pins the 128-row active-claim peak,
+`abandoned_claim_recovery_deletes_at_most_one_batch_per_writer_hold` pins bounded recovery, and
+`transactional_orphan_sweep_recovers_claims_after_root_relocation` plus
+`transactional_orphan_sweep_recovers_claims_copied_by_database_restore` pin path-independent
+abandoned-claim recovery across both relocation and backup restore.
+`cancelling_sweep_during_delete_keeps_owner_locks_until_blocking_work_finishes` proves cancellation
+cannot release either advisory owner while already-started blocking deletion continues.
 
 **Review guard.** This table is normative and exhaustive. Any PR that adds or widens a
 `BEGIN IMMEDIATE`, `TransactionBehavior::Immediate`, `WriterGuard::transaction`, writer-task

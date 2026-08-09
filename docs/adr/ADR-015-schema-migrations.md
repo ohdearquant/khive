@@ -146,6 +146,8 @@ above remains the historical pre-consolidation record.
 |     V16 | ADR-019 / #1474    | gtd_dependency_cycle_guards        | shipped |
 |     V17 | ADR-142 / #1700    | agents_ddl                         | shipped |
 |     V18 | #1479              | ann_consumer_pending               | shipped |
+|     V19 | #1737              | list_cursor_backfill_repair        | shipped |
+|     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
@@ -170,11 +172,19 @@ above remains the historical pre-consolidation record.
 > direct-storage, and atomic-unit writers. The migration does not rewrite or reject existing
 > rows while installing the triggers.
 
-> **V17 record (2026-08-01)**: `ann_consumer_pending` adds timestamped lifecycle
+> **V18 record (2026-08-01)**: `ann_consumer_pending` adds timestamped lifecycle
 > metadata for the closed ANN pending watermark `-2` and translates legacy
 > zero-watermark registrations into a one-day pending grace window. Successful
 > checkpoints, including a valid checkpoint at `S = 0`, atomically remove the
 > metadata; only never-activated pending rows are eligible for retirement.
+
+> **V19 record (2026-08-07, #1737)**: `list_cursor_backfill_repair` repairs
+> divergent V13/V14 migration names and reconstructs list-cursor sequence rows
+> inside the same upgrade transaction.
+
+> **V20 record (2026-08-09, ADR-091 / #1850)**: `blob_gc_claims` adds the
+> durable entity-write fence used by bounded transactional filesystem-blob GC.
+> The migration version is independent of ADR-091's amendment number.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 

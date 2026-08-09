@@ -1588,6 +1588,10 @@ impl SqlBridge {
 
 #[async_trait]
 impl khive_storage::SqlAccess for SqlBridge {
+    fn database_path(&self) -> Option<std::path::PathBuf> {
+        self.pool.canonical_path().map(std::path::Path::to_path_buf)
+    }
+
     async fn reader(
         &self,
     ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlReader>> {
