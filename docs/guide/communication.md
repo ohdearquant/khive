@@ -124,24 +124,31 @@ return immediately. A new committed message wakes the call and causes the full
 filtered query to run again; unrelated messages cannot leak through or end the
 wait early. `limit=0` remains immediate.
 
-### Read
+### Mark read
 
-Marks an inbound message read. Outbound messages cannot be marked read. The mark write is
-best-effort: a successful response can carry `read: false` plus `mark_error` when the mark
-did not land — check `read` and re-issue later if needed.
+`comm.mark_read` is the named bulk mutation. It marks inbound messages read; it does not return
+message content. Use `comm.inbox` or `comm.thread` to retrieve content. Outbound messages cannot be
+marked read.
 
 ```
+request(ops="comm.mark_read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
+request(ops="comm.mark_read(ids=[\"<message_id_1>\", \"<message_id_2>\"], atomic=true)")
+
+# Compatibility surface
 request(ops="comm.read(id=\"<message_id_or_prefix>\")")
 request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 ```
 
-Exactly one of `id` or `ids` is required. IDs accept either a full UUID or a
-short 8-character hex prefix; `ids` accepts 1-500 entries. The bulk form
-validates every target before mutating any and returns per-item results plus
-`requested_count`, `unique_count`, `marked_count`, and `failed_count`. Bulk
-updates are not transactional across messages: target-validation errors reject
-the call before any write, while later storage errors are reported in each
-result's `read` and optional `mark_error` fields.
+`comm.mark_read` requires `ids` with 1-500 full UUIDs or 8-character hex prefixes. It validates
+every target before mutation, deduplicates resolved IDs, and returns ordered results plus
+`requested_count`, `unique_count`, `marked_count`, and `failed_count`. The default
+`atomic=false` reuses the best-effort bulk behavior: later storage failures appear in each
+result's `read=false` and `mark_error` without rolling back an earlier success. With
+`atomic=true`, all unique marks are guarded and committed in one transaction; any failed
+recheck or storage statement rolls back the full set.
+
+`comm.read` remains compatible with the 0.7.0 surface: exactly one of `id` or `ids` is required,
+and its bulk form remains best-effort. Prefer the named verb for new bulk callers.
 
 ### Reply
 

@@ -12,6 +12,7 @@ delivery confirmation, and channel polling observability.
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
 | `comm.inbox`     | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
 | `comm.read`      | Mark one or up to 500 inbound messages as read (best-effort: inspect each result's `read`/`mark_error`)                                                       |
+| `comm.mark_read` | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                               |
 | `comm.unread`    | Count the caller's unread inbound messages without message payloads                                                                                           |
 | `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
@@ -161,7 +162,21 @@ message view. Stable property aliases such as `from_actor`, `to_actor`, and
 `comm.read(id=...)` keeps the single-message response. The additive
 `comm.read(ids=[...])` form validates 1-500 supplied IDs and returns per-item
 outcomes with marked/failed counts; inspect `read`/`mark_error` because bulk
-updates are not one cross-message transaction.
+updates are not one cross-message transaction. `comm.read` remains available
+for compatibility, but its name describes neither retrieval nor mutation
+clearly; retrieve message content through `comm.inbox` or `comm.thread`.
+
+Use `comm.mark_read(ids=[...])` as the canonical bulk mutation. It reuses the
+same best-effort behavior by default. Pass `atomic=true` when every unique
+validated target must be marked inside one transaction or none may change.
+
+This is the residual scope of #1387 after the 0.7.0 release: #1572 already
+shipped bulk best-effort `comm.read(ids=[...])`, and ADR-057 superseded the
+issue's original namespace and legacy-recipient acceptance assumptions with
+actor-addressed eligibility, attribution-only namespaces, and the accepted
+fail-open rule for rows without `to_actor`. The additive work here is the
+canonical `comm.mark_read` name and its `atomic=true` mode; the released
+validation and compatibility contracts remain unchanged.
 
 Over MCP: `request(ops="comm.send(to=\"lambda:leo\", content=\"PR #372 is ready for review\")")`.
 

@@ -1,14 +1,15 @@
 # ADR-057: Comm Actor-Addressed Delivery
 
-**Status**: Accepted\
-**Date**: 2026-06-15\
+**Status**: Accepted (amended 2026-08-06 — named atomic mark-read)\
+**Date**: 2026-06-15 (amended 2026-08-06)\
 **Authors**: khive maintainers
 **Depends on**: ADR-007 (Namespace), ADR-017 (Pack Standard), ADR-040 (Communication and
 Schedule Packs)\
 **Related issues**: #57 (actor-addressed delivery -- primary), #13 (cross-namespace policy
 gate), #75 (actor identity on every request), #1447 (sender-side dual-write confirmation),
 #1428 (process provenance), #1490 (versioned message properties), #1468 (list-read field
-projection), #1471 (sender-visible sent history), #199 (anonymous inbox isolation)
+projection), #1471 (sender-visible sent history), #199 (anonymous inbox isolation),
+and #1387 (named atomic mark-read)
 
 ## Context
 
@@ -330,11 +331,15 @@ routing decision instead:
 
 `from_actor` and `to_actor` are set on the reply message using the same logic as `comm.send`.
 
-### `comm.thread` and `comm.read` behavior changes
+### `comm.thread`, `comm.read`, and `comm.mark_read` behavior changes
 
-No changes to thread resolution or read-marking logic. Thread queries filter by
-`properties.thread_id`, which is namespace-scoped and independent of actor labels. Read
-marking is a per-message operation gated on namespace membership, which is unchanged.
+Thread queries filter by `properties.thread_id`, which is namespace-scoped and independent of
+actor labels. `comm.mark_read` is the canonical bulk mutation name added by ADR-040's 2026-08-06
+amendment; `comm.read` remains its released compatibility surface. Both names reuse the same target
+validation and live mutation filter. An attributed row is markable only by its `to_actor`; a legacy
+row with no `to_actor` retains this ADR's accepted `EqOrMissing` fail-open rule. Atomic mode changes
+only the transaction boundary across already-authorized targets, not principal resolution,
+namespace behavior, or legacy visibility.
 
 ### Interaction with ADR-007 Rev 3 (namespace as attribution)
 
