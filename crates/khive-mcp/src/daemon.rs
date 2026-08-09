@@ -3662,6 +3662,175 @@ mod tests {
         clear_daemon_env();
     }
 
+    #[derive(Clone)]
+    struct MaximumDiagnosticCoordinator {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::coordinator::CoordinatorService for MaximumDiagnosticCoordinator {
+        async fn locate(&self, _id: uuid::Uuid) -> Option<khive_runtime::BackendId> {
+            Some(khive_runtime::BackendId::main())
+        }
+
+        fn record_created(&self, _id: uuid::Uuid, _backend_id: khive_runtime::BackendId) {}
+
+        fn primary_backend_id(&self) -> Option<khive_runtime::BackendId> {
+            Some(khive_runtime::BackendId::main())
+        }
+
+        async fn link(
+            &self,
+            _namespace: &Namespace,
+            _source_id: uuid::Uuid,
+            _target_id: uuid::Uuid,
+            _relation: khive_storage::EdgeRelation,
+            _weight: f64,
+            _metadata: Option<serde_json::Value>,
+        ) -> Result<crate::coordinator::CoordLinkResult, crate::coordinator::CoordError> {
+            unreachable!("maximum diagnostic fixture only dispatches search")
+        }
+
+        async fn fan_out_search(
+            &self,
+            _request: &khive_pack_kg::handlers::ValidatedSearchRequest,
+            _namespace: &Namespace,
+            _extra_visible: &[Namespace],
+        ) -> crate::coordinator::CoordSearchResult {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = uuid::Uuid::from_u128(call as u128 + 1);
+            let per_backend = (0..64)
+                .map(|index| crate::coordinator::BackendSearchResult {
+                    backend_id: khive_runtime::BackendId::new(format!(
+                        "backend-{index:03}-{}",
+                        "very-long-backend-id-".repeat(32)
+                    )),
+                    entity_hits: Vec::new(),
+                    note_hits: Vec::new(),
+                    error: Some(format!(
+                        "backend {index} failed: {}",
+                        "\0\"\\".repeat(2_048)
+                    )),
+                })
+                .collect();
+            crate::coordinator::CoordSearchResult {
+                entity_hits: vec![khive_runtime::SearchHit {
+                    entity_id: id,
+                    score: Default::default(),
+                    source: khive_runtime::SearchSource::Both,
+                    title: Some(format!("result-{call}")),
+                    snippet: (call == 0)
+                        .then(|| "x".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1_024)),
+                }],
+                note_hits: Vec::new(),
+                per_backend,
+                partial: true,
+                entity_kinds: std::collections::HashMap::from([(id, "concept".to_string())]),
+                note_kinds: std::collections::HashMap::new(),
+                entity_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
+                note_created_at: std::collections::HashMap::new(),
+                note_names: std::collections::HashMap::new(),
+            }
+        }
+
+        fn is_single_backend(&self) -> bool {
+            false
+        }
+    }
+
+    /// A maximum-length legal chain crosses the real Unix daemon framing path.
+    /// Its first result forces payload omission while every operation carries a
+    /// maximum-cardinality multi-backend degradation report. The mandatory
+    /// diagnostic subset must remain typed, non-empty, parity-preserving, and
+    /// small enough for the daemon to send a normal response frame.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_maximum_search_chain_preserves_bounded_backend_diagnostics() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let mut config = memory_runtime_config();
+        config.default_namespace = Namespace::parse("test").unwrap();
+        config.packs = vec!["kg".to_string()];
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let reference = crate::server::KhiveMcpServer::new(runtime)
+            .expect("server builds with kg")
+            .with_coordinator(std::sync::Arc::new(MaximumDiagnosticCoordinator {
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }));
+        let config_id = reference.config_id().to_string();
+        let daemon_server = reference.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let ready = connect_when_ready(&sock).await;
+        drop(ready);
+
+        let ops = std::iter::repeat(r#"search(kind="entity", query="frame")"#)
+            .take(khive_request::MAX_OPS)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let request = DaemonRequestFrame {
+            ops,
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id,
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+        let response = exchange(&sock, &request).await;
+        assert!(response.ok, "daemon response failed: {:?}", response.error);
+        assert!(
+            serde_json::to_vec(&response).unwrap().len() <= khive_runtime::daemon::MAX_FRAME_BYTES
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(response.result.as_deref().expect("daemon response body"))
+                .expect("response JSON");
+        assert_eq!(body["summary"]["total"], khive_request::MAX_OPS);
+        assert_eq!(body["summary"]["succeeded"], khive_request::MAX_OPS);
+        let entries = body["results"].as_array().expect("results");
+        assert!(entries
+            .iter()
+            .any(|entry| entry.get("result_omitted").is_some()));
+        for entry in entries {
+            assert_eq!(entry["status"], "partial");
+            assert_eq!(entry["backend_errors_truncated"], true);
+            assert!(entry["backend_errors_omitted"].as_u64().unwrap() > 0);
+            let missing = entry["missing_backends"].as_array().unwrap();
+            let errors = entry["backend_errors"].as_object().unwrap();
+            assert!(
+                !errors.is_empty(),
+                "truncation must retain at least one cause"
+            );
+            assert_eq!(
+                missing,
+                &errors
+                    .keys()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        handle.abort();
+        let _ = handle.await;
+        clear_daemon_env();
+    }
+
     #[tokio::test]
     #[serial]
     async fn daemon_rejects_client_after_git_write_policy_is_revoked() {

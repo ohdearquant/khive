@@ -468,6 +468,10 @@ retry-policy row in Verification.
     `rank_score` and `rank_score_kind` survive.
 14. Partial-success and degraded-empty fixtures asserting exact backend/cause
     parity plus frame-budget preservation of `backend_errors`.
+15. A real Unix-daemon round trip with the maximum 100-operation chain, an
+    over-cardinality failed-backend set on every operation, and a result large
+    enough to force frame-budget omission. The emitted frame MUST remain within
+    the daemon cap without dropping all causes from any operation.
 
 ## Amendment 1 (2026-08-09): per-backend failure evidence
 
@@ -478,27 +482,50 @@ failure. Reproducing the call with more logging does not repair the original
 response, and ordinary backend search errors were not logged at any level.
 
 Every multi-backend search with failed legs MUST now carry `backend_errors`, an
-object keyed by the same sorted backend ids present in `missing_backends`. Each
-value is `{kind: "backend_error", message: <captured backend error>}`. The
-generic initial kind keeps the public taxonomy closed while the message retains
-the actionable cause; adding narrower kinds requires a later amendment rather
-than message parsing. Messages are bounded to 1,024 Unicode scalar values plus
-an ellipsis so mandatory frame-budget preservation cannot itself exceed the
-per-cause diagnostic budget; an empty cause becomes an explicit
-`backend search failed without diagnostic detail` sentinel. A complete search
-MUST omit `backend_errors`.
+object whose sorted keys exactly equal `missing_backends`. Each value is
+`{kind: "backend_error", message: <captured backend error>}`. The generic
+initial kind keeps the public taxonomy closed while the message retains the
+actionable cause; adding narrower kinds requires a later amendment rather than
+message parsing. A complete search MUST omit all degradation fields.
 
-For a partial success, `backend_errors` is a peer of `missing_backends` on the
-successful operation envelope. For degraded-empty `search_incomplete`, it is
-inside the structured `error` object. Presentation and frame-budget omission
-MUST preserve it in both locations. The coordinator MUST also log each captured
-ordinary backend search failure at warning level with the backend id and cause;
-join failures, timeouts, and authorization failures retain their existing
-warning paths.
+Mandatory diagnostics have deterministic aggregate bounds, not merely a
+per-message bound:
+
+- retain at most 16 backend entries, ordered by their emitted key;
+- bound an emitted backend key to 256 Unicode scalar values; an overlong id is
+  represented by a prefix plus `…#<sha256>` and its value adds
+  `backend_id_truncated: true` and `backend_id_chars`;
+- bound each message to 1,024 Unicode scalar values plus an ellipsis; an empty
+  cause becomes `backend search failed without diagnostic detail`;
+- serialize the complete worst-placement diagnostic object (the
+  `search_incomplete` form) while admitting entries and stop before it exceeds
+  `MAX_FRAME_BYTES / MAX_OPS / 4` bytes.
+
+When count or byte admission omits causes, the same object that contains
+`missing_backends` and `backend_errors` MUST add
+`backend_errors_truncated: true` and `backend_errors_omitted: <positive count>`.
+At least one bounded cause MUST remain. `missing_backends` names the retained
+diagnostic subset and MUST still exactly equal the `backend_errors` keys; the
+typed omitted count makes clear that it is not the complete failed-backend set.
+The quarter-frame-per-maximum-request calculation leaves one quarter for the
+at-most-twofold JSON-string escaping of the daemon response and half for fixed
+operation and outer-envelope fields. Therefore all mandatory diagnostics from
+100 legal operations remain preservable even after result/error payload
+omission.
+
+For a partial success, `backend_errors` and any truncation fields are peers of
+`missing_backends` on the successful operation envelope. For degraded-empty
+`search_incomplete`, all three live inside the structured `error` object.
+Presentation and frame-budget omission MUST preserve them in those exact
+locations. The coordinator MUST also log every captured ordinary backend search
+failure at warning level with the full backend id and cause before wire
+truncation; join failures, timeouts, and authorization failures retain their
+existing warning paths.
 
 This amendment is additive and does not alter success, completeness, retry, or
-ranking semantics. `missing_backends` remains the compact machine list;
-`backend_errors` is the diagnostic evidence for exactly those entries.
+ranking semantics. `backend_errors` remains the diagnostic evidence for exactly
+the entries in `missing_backends`; the explicit omitted count reports any
+additional failed legs without pretending their causes were retained.
 
 ## References
 

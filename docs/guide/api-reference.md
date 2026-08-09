@@ -414,12 +414,15 @@ The same validated request is used for single- and multi-backend execution.
 
 In multi-backend mode a backend failure with surviving hits yields those hits
 with `status: "partial"`, deprecated `partial: true`, `missing_backends`, and a
-`backend_errors` object mapping each failed backend to its captured cause. These
-fields sit beside `result` rather than inside the result array and survive
-presentation and response-frame compaction. If no hit survives filtering, the
+`backend_errors` object mapping each retained failed backend to its captured
+cause. These fields sit beside `result` rather than inside the result array and
+survive presentation and response-frame compaction. If bounded diagnostics omit
+additional failed legs, `backend_errors_truncated: true` and
+`backend_errors_omitted` appear beside them; `missing_backends` always exactly
+matches the retained `backend_errors` keys. If no hit survives filtering, the
 operation is `ok: false` with `error.kind="search_incomplete"`; that structured
-error carries the same `missing_backends` and `backend_errors`. A complete
-search omits both degradation fields.
+error carries the same fields inside `error`. A complete search omits all
+degradation fields.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 

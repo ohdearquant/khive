@@ -113,12 +113,47 @@ A failure in a parallel batch does not stop its siblings. In a chain, entries
 after the failure are returned as `{ "ok": false, "tool": "...", "aborted": true }`;
 the summary records their count in `aborted`.
 
-A successful multi-backend search can still be incomplete when one backend is
-unavailable. In that case the search entry includes `"partial": true` and a
-`"missing_backends": [...]` list beside `result`. Check this operation-level
-advisory even when `ok` and the aggregate request `status` report success. It
-survives batch/chain execution, presentation modes, and daemon frame-budget
-omission.
+A successful multi-backend search can still be incomplete when a backend is
+unavailable. In that case the operation-level fields sit beside `result`:
+
+```json
+{
+  "ok": true,
+  "tool": "search",
+  "status": "partial",
+  "partial": true,
+  "missing_backends": ["archive"],
+  "backend_errors": {
+    "archive": { "kind": "backend_error", "message": "storage unavailable" }
+  },
+  "result": [{ "...": "..." }]
+}
+```
+
+If failed legs leave no result after filtering, the operation instead fails and
+the diagnostics move inside the structured error:
+
+```json
+{
+  "ok": false,
+  "tool": "search",
+  "error": {
+    "kind": "search_incomplete",
+    "retryable": false,
+    "missing_backends": ["archive"],
+    "backend_errors": {
+      "archive": { "kind": "backend_error", "message": "storage unavailable" }
+    }
+  }
+}
+```
+
+Check these operation-level fields even when the aggregate request `status`
+reports success. The sorted `missing_backends` entries always exactly equal the
+`backend_errors` keys. A large failed-backend set is a typed truncation: it adds
+`backend_errors_truncated: true` and a positive `backend_errors_omitted` beside
+those two fields while retaining at least one cause. The diagnostics survive
+batch/chain execution, presentation modes, and daemon frame-budget omission.
 
 The inline `results`/`summary` envelope is the default. Set the optional
 `save_to` parameter to sink the full results to a JSONL file instead; `request`

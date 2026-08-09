@@ -52,11 +52,13 @@ operation is successful but its operation envelope also carries:
 The advisory is part of a typed intercepted-dispatch outcome, not an optional
 mutex slot. The same value flows through single, batch, and chain execution;
 presentation transforms only `result`, and daemon frame-budget omission keeps
-`status`, `partial`, `missing_backends`, and `backend_errors` even if the result
-itself must be omitted. If no result survives filtering, the operation instead
-returns `ok: false` with `error.kind="search_incomplete"`; the same
-`missing_backends` and `backend_errors` live inside that error object. Complete
-searches omit both degradation fields.
+`status`, `partial`, `missing_backends`, `backend_errors`, and any
+`backend_errors_truncated`/`backend_errors_omitted` fields even if the result
+itself must be omitted. The map/list keys remain exactly equal; truncation keeps
+at least one cause and explicitly counts the additional failed legs. If no
+result survives filtering, the operation instead returns `ok: false` with
+`error.kind="search_incomplete"`; all degradation fields live inside that error
+object. Complete searches omit them.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 

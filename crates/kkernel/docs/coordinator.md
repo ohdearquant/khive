@@ -48,8 +48,10 @@ Results are merged with Reciprocal Rank Fusion (unweighted, k=60). Per-backend e
 spawned-task join failures — are captured in `BackendSearchResult::error`; a single failing backend
 does NOT abort the fan-out or disappear from diagnostics. The MCP service derives the operation's
 `status`/`partial`/`missing_backends` advisory and its backend-keyed `backend_errors` causes from
-these per-backend results. Ordinary backend failures are also logged at warning level with the
-backend id and captured cause.
+these per-backend results. The MCP boundary deterministically bounds the retained cause set and
+adds an explicit omitted count when necessary; its retained list/map keys remain equal. Ordinary
+backend failures are logged before that wire bound at warning level with the full backend id and
+captured cause.
 
 When `is_single_backend()` is true the fan-out degenerates to a single backend call.
 
