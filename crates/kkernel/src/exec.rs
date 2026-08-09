@@ -4272,6 +4272,61 @@ id = "lambda:fallback"
             !save_path.exists(),
             "an aborted run must not publish partial JSONL"
         );
+
+        // `committed_chunks: [1]` is a claim about DURABLE STATE, and the manifest
+        // asserting it is assembled locally. Every assertion above would still pass
+        // if chunk 1's writes had been rolled back or never reached storage, because
+        // the bookkeeping would simply agree with itself. Read it back through the
+        // same server so the reconciliation record is checked against the database
+        // it describes. The requested limit stays under the entity list cap, so the
+        // handler returns a bare array rather than a clamp-wrapped object.
+        let params = RequestParams {
+            ops: r#"list(kind="concept", limit=200)"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+        let raw = server.dispatch_request_local(params).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let rows = response["results"][0]["result"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "read-back must return a bare array under the entity list cap; got {}",
+                    response["results"][0]["result"]
+                )
+            });
+        let names: std::collections::BTreeSet<&str> =
+            rows.iter().filter_map(|row| row["name"].as_str()).collect();
+        // An empty or unparsed read-back is an instrument failure, not a pass.
+        assert!(
+            !names.is_empty(),
+            "read-back yielded no names from {} rows; first row: {:?}",
+            rows.len(),
+            rows.first()
+        );
+
+        for index in 0..OPS_FILE_CHUNK_SIZE {
+            let expected = format!("abort-manifest-{index:03}");
+            assert!(
+                names.contains(expected.as_str()),
+                "manifest reports chunk 1 committed, but {expected} is absent from the database"
+            );
+        }
+
+        // Chunk 2 was dispatched without a verified response, so its single op may
+        // or may not have landed. The manifest reports it as unconfirmed rather
+        // than committed precisely because both outcomes are legal here; anything
+        // outside that two-value range means the reconciliation record is wrong.
+        assert!(
+            names.len() == OPS_FILE_CHUNK_SIZE || names.len() == OPS_FILE_CHUNK_SIZE + 1,
+            "expected the {OPS_FILE_CHUNK_SIZE} confirmed rows plus at most the single \
+             unconfirmed one, found {}",
+            names.len()
+        );
     }
 
     #[tokio::test]
