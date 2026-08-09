@@ -1555,7 +1555,7 @@ one identity.
 4. Both endpoints of every fixture `project contains module` edge expose the
    same non-empty `source_project` value.
 
-## Amendment 7 (2026-08-09): explicit map-target admission
+## Amendment 6 (2026-08-09): explicit map-target admission
 
 Amendment 2 made source ingest's explicit `db` create-capable. That made a
 caller typo indistinguishable from authorization to create and migrate a new

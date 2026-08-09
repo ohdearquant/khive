@@ -1,4 +1,4 @@
-//! `code.ingest` verb handler (ADR-085 Amendment 2 B1/B7 and Amendment 7).
+//! `code.ingest` verb handler (ADR-085 Amendment 2 B1/B7 and Amendment 6).
 //!
 //! Opens a fresh `KhiveRuntime` bound to the target database — never the
 //! shared production runtime/backend the pack itself was constructed with —
