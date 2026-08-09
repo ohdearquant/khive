@@ -1196,13 +1196,14 @@ class MakefileGateContractTests(unittest.TestCase):
     def test_fleet_targets_split_build_verification_from_verification_only(self) -> None:
         self.assertIn("fleet-build: verify-local-artifact\n", self.makefile)
         self.assertIn("fleet-check:\n", self.makefile)
-        self.assertIn('if [ -n "$(FLEET_ARTIFACT)" ]; then', self.makefile)
-        self.assertIn('--artifact "$(FLEET_ARTIFACT)"', self.makefile)
+        self.assertIn('if [ -n "$$FLEET_ARTIFACT_VALUE" ]; then', self.makefile)
+        self.assertIn('--artifact "$$FLEET_ARTIFACT_VALUE"', self.makefile)
         self.assertIn('--build-receipt "$(LOCAL_BUILD_RECEIPT)"', self.makefile)
 
         fleet_check = self.makefile[
             self.makefile.index("fleet-check:\n") : self.makefile.index("clean:\n")
         ]
+        self.assertNotIn("$(FLEET_ARTIFACT)", fleet_check)
         self.assertNotIn("build_local_artifact.py", fleet_check)
         self.assertNotIn("~/.cargo/bin", fleet_check)
         self.assertNotIn("pkill", fleet_check)
@@ -1219,6 +1220,74 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertIn("scripts/verify_local_artifact.py", fleet_build.stdout)
         self.assertNotIn("codesign", fleet_build.stdout)
         self.assertNotIn("pkill", fleet_build.stdout)
+
+    def test_fleet_check_preserves_literal_shell_metacharacters_in_artifact_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            injection_record = root / "command-substitution-ran"
+            injection_command = shim_dir / "khive-fleet-injection"
+            injection_command.write_text(
+                "#!/bin/sh\nprintf invoked > \"$FLEET_INJECTION_RECORD\"\n"
+                "printf substituted\n",
+                encoding="utf-8",
+            )
+            injection_command.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "FAKE_MODE": "ok",
+                    "FLEET_DOLLAR_EXPANSION": "mangled",
+                    "FLEET_INJECTION_RECORD": str(injection_record),
+                    "PATH": f"{shim_dir}{os.pathsep}{environment['PATH']}",
+                }
+            )
+            artifact_names = (
+                "kkernel $FLEET_DOLLAR_EXPANSION",
+                'kkernel "quoted"',
+                "kkernel `khive-fleet-injection`",
+            )
+
+            for index, artifact_name in enumerate(artifact_names):
+                with self.subTest(artifact_name=artifact_name):
+                    artifact = root / artifact_name
+                    artifact.write_text(
+                        textwrap.dedent(FAKE_ARTIFACT), encoding="utf-8"
+                    )
+                    artifact.chmod(0o755)
+                    probe_record = root / f"probe-{index}.json"
+                    environment["FAKE_RECORD"] = str(probe_record)
+
+                    completed = subprocess.run(
+                        [
+                            "make",
+                            "--no-print-directory",
+                            "fleet-check",
+                            f"FLEET_ARTIFACT={artifact}",
+                            f"FULL_PACKS={TEST_PACKS}",
+                            "LOCAL_VERB_FLOOR=3",
+                        ],
+                        cwd=REPO_ROOT,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+
+                    self.assertEqual(
+                        completed.returncode,
+                        0,
+                        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+                    )
+                    self.assertTrue(probe_record.is_file())
+                    self.assertFalse(
+                        injection_record.exists(),
+                        "FLEET_ARTIFACT was evaluated as shell source",
+                    )
 
     def test_broken_pack_registration_fails_fleet_build_before_install_or_daemon_stop(
         self,

@@ -8,6 +8,10 @@ CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
 LOCAL_VERIFY_STAMP := $(LOCAL_BUILD_RECEIPT).verified
 FLEET_ARTIFACT ?=
+# Capture the caller's literal value before make can expand any `$` bytes, then
+# pass it to the recipe through the environment instead of shell source.
+override FLEET_ARTIFACT_VALUE := $(value FLEET_ARTIFACT)
+export FLEET_ARTIFACT_VALUE
 
 .PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
 
@@ -58,11 +62,11 @@ fleet-build: verify-local-artifact
 # Re-run the verification probe without rebuilding. By default this checks the
 # exact Cargo artifact named by the current build receipt. Set FLEET_ARTIFACT to
 # check any executable directly, including the installed kkernel binary:
-#   make fleet-check FLEET_ARTIFACT="$$HOME/.cargo/bin/kkernel"
+#   make fleet-check FLEET_ARTIFACT="$HOME/.cargo/bin/kkernel"
 fleet-check:
-	@if [ -n "$(FLEET_ARTIFACT)" ]; then \
+	@if [ -n "$$FLEET_ARTIFACT_VALUE" ]; then \
 		python3 scripts/verify_local_artifact.py \
-			--artifact "$(FLEET_ARTIFACT)" \
+			--artifact "$$FLEET_ARTIFACT_VALUE" \
 			--packs "$(FULL_PACKS)" \
 			--min-verbs "$(LOCAL_VERB_FLOOR)"; \
 	else \

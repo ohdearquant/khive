@@ -346,7 +346,9 @@ The local install contract is now build, verify, then install:
    the installed binary). Neither target installs a binary or interrupts a daemon. The probe
    runs `verbs()` with daemon and embeddings disabled, an in-memory database, an empty
    explicit config, an isolated home/current directory, and the Makefile-owned full pack
-   selection. It never reads the installed `kkernel`, touches `~/.cargo/bin`, or stops the
+   selection. The receipt-bound path never reads the installed `kkernel` or touches
+   `~/.cargo/bin`; `fleet-check FLEET_ARTIFACT=...` reads the explicitly selected executable and
+   may therefore be used to check that installed path intentionally. Neither mode stops the
    daemon. A configured cross-target artifact that cannot execute on the developer host fails
    closed at this probe rather than falling back to a stale host artifact. The MCP client waits
    for and validates a successful `initialize` response before sending the initialized
