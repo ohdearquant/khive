@@ -563,7 +563,11 @@ independently of the ones after it:
 - **L1.5 (import-scan edges).** A regex-based import scan produces
   module-to-module and project-to-project `depends_on` edges. This is the
   coverage floor for a language that has no Scanner yet, and doubles as the
-  signal for which language to build a Scanner for next.
+  signal for which language to build a Scanner for next. The regex tier is
+  intentionally scope-blind: guarded/type-check-only and function-local imports
+  are included. Its edges and any cycles derived from them therefore mean static
+  lexical coupling, not proven module-initialization or runtime dependency; L1.5
+  carries no scope discriminator from which a consumer could infer otherwise.
 - **L2 (symbol tier).** The full Scanner/Extractor pipeline (B2) over the D2
   subtypes and D3 edge rules, at declaration granularity.
 
@@ -1469,6 +1473,9 @@ The normalization is:
 | L1.5 undeclared project import                                 | `build`        |
 
 The L1.5 module default makes D3's existing compile-time guidance concrete.
+That `build` policy scope does not override B3's scope-blind scanner caveat:
+it classifies the edge for filtering but does not prove that the import runs at
+module initialization or at runtime.
 For project imports, the governing manifest is authoritative when it declares
 the imported project: an import of a dev-only dependency remains dev-scoped
 instead of fabricating a production back-edge. An undeclared project import

@@ -99,18 +99,62 @@ fn prepare_sql_statement<'conn>(
     conn.prepare(sql)
 }
 
-/// Preflight only the multiple-statement boundary. Other prepare errors are
-/// left for the normal execution phase so transaction/rollback behavior for
-/// ordinary invalid SQL remains unchanged.
-fn reject_multiple_statement(
-    conn: &rusqlite::Connection,
+/// Prepare one [`SqlStatement`] through rusqlite's per-connection LRU cache
+/// while retaining the same single-statement tail validation as
+/// [`prepare_sql_statement`].
+fn prepare_cached_sql_statement<'conn>(
+    conn: &'conn rusqlite::Connection,
     sql: &str,
-) -> Result<(), rusqlite::Error> {
-    match prepare_sql_statement(conn, sql) {
-        Ok(_) => Ok(()),
-        Err(error @ rusqlite::Error::MultipleStatement) => Err(error),
-        Err(_) => Ok(()),
+) -> Result<rusqlite::CachedStatement<'conn>, rusqlite::Error> {
+    conn.prepare_cached(sql)
+}
+
+/// A batch statement prepared once before execution. Ordinary SQL errors are
+/// retried in the execution phase so they still exercise the owning
+/// transaction's rollback path and can observe schema changes made by an
+/// earlier statement in the same batch; only `MultipleStatement` aborts
+/// preflight.
+enum PreparedBatchStatement<'conn> {
+    Ready(rusqlite::Statement<'conn>),
+    PrepareAtExecution,
+}
+
+/// Prepare each batch statement exactly once while rejecting an executable
+/// tail before any statement runs.
+fn prepare_batch_statements<'conn>(
+    conn: &'conn rusqlite::Connection,
+    statements: &[SqlStatement],
+) -> Result<Vec<PreparedBatchStatement<'conn>>, rusqlite::Error> {
+    let mut prepared = Vec::with_capacity(statements.len());
+    for statement in statements {
+        match prepare_sql_statement(conn, &statement.sql) {
+            Ok(statement) => prepared.push(PreparedBatchStatement::Ready(statement)),
+            Err(error @ rusqlite::Error::MultipleStatement) => return Err(error),
+            Err(_) => prepared.push(PreparedBatchStatement::PrepareAtExecution),
+        }
     }
+    Ok(prepared)
+}
+
+/// Bind and execute handles returned by [`prepare_batch_statements`].
+fn execute_prepared_batch<'conn>(
+    conn: &'conn rusqlite::Connection,
+    prepared: Vec<PreparedBatchStatement<'conn>>,
+    statements: &[SqlStatement],
+) -> Result<u64, rusqlite::Error> {
+    debug_assert_eq!(prepared.len(), statements.len());
+    let mut total = 0u64;
+    for (prepared, statement) in prepared.into_iter().zip(statements) {
+        let mut prepared = match prepared {
+            PreparedBatchStatement::Ready(prepared) => prepared,
+            PreparedBatchStatement::PrepareAtExecution => {
+                prepare_sql_statement(conn, &statement.sql)?
+            }
+        };
+        bind_params(&mut prepared, &statement.params)?;
+        total += prepared.raw_execute()? as u64;
+    }
+    Ok(total)
 }
 
 /// SQL statement heads that are transaction control. `execute_batch` owns the
@@ -118,10 +162,18 @@ fn reject_multiple_statement(
 /// the list in its own `BEGIN IMMEDIATE`, and the queue-backed path runs
 /// inside the writer task's per-request transaction), so a caller-supplied
 /// statement that itself starts, ends, or branches a transaction can commit
-/// or roll back early and break the batch's all-or-nothing contract. `END`
-/// is included: SQLite accepts `END [TRANSACTION]` as a `COMMIT` spelling.
-const TRANSACTION_CONTROL_KEYWORDS: [&str; 6] =
-    ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"];
+/// or roll back early and break the batch's all-or-nothing contract. `START`
+/// is classified as the alternate transaction-opening spelling so callers get
+/// this typed boundary error; `END` is SQLite's `COMMIT` spelling.
+const TRANSACTION_CONTROL_KEYWORDS: [&str; 7] = [
+    "BEGIN",
+    "START",
+    "COMMIT",
+    "END",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "RELEASE",
+];
 
 /// Return the transaction-control keyword heading `sql`, if any.
 ///
@@ -208,7 +260,120 @@ fn reject_transaction_control_statements(
 /// was poisoned (dropped instead of restored), if it was.
 struct BatchFailure {
     error: rusqlite::Error,
-    poison_reason: Option<String>,
+    poison_reason: Option<BatchPoisonReason>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchHandleDisposition {
+    Retain,
+    Poison,
+}
+
+/// Execute one standalone batch while every prepared statement remains scoped
+/// to the borrowed connection. The owned [`StandaloneHandle`] stays outside
+/// this helper, so it can be restored or dropped only after all statement
+/// borrows have ended.
+fn execute_standalone_batch(
+    conn: &rusqlite::Connection,
+    statements: &[SqlStatement],
+    origin: khive_storage::tx_registry::TxOrigin,
+) -> (BatchHandleDisposition, Result<u64, BatchFailure>) {
+    let prepared = match prepare_batch_statements(conn, statements) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return (
+                BatchHandleDisposition::Retain,
+                Err(BatchFailure {
+                    error,
+                    poison_reason: None,
+                }),
+            );
+        }
+    };
+    if let Err(begin_error) = conn.execute_batch("BEGIN IMMEDIATE") {
+        // Busy/locked is transient contention (another writer held SQLite's
+        // write lock past `busy_timeout`); the connection itself is untouched,
+        // so the handle remains reusable. Any other failure leaves transaction
+        // state suspect and poisons the handle.
+        drop(prepared);
+        let (disposition, poison_reason) = if crate::timeout_sink::is_busy_or_locked(&begin_error) {
+            (BatchHandleDisposition::Retain, None)
+        } else {
+            tracing::warn!(
+                %begin_error,
+                "execute_batch: BEGIN IMMEDIATE failed non-transiently; \
+                 poisoning the standalone connection — the handle is \
+                 dropped and must be re-acquired"
+            );
+            (
+                BatchHandleDisposition::Poison,
+                Some(BatchPoisonReason::BeginFailed),
+            )
+        };
+        return (
+            disposition,
+            Err(BatchFailure {
+                error: begin_error,
+                poison_reason,
+            }),
+        );
+    }
+
+    // Registered only after BEGIN succeeds, and retained through COMMIT or
+    // ROLLBACK so the registry never reports a transaction as finished early.
+    let _tx_handle =
+        khive_storage::tx_registry::register_scoped(Some("execute_batch".to_string()), origin);
+    let result = (|| -> Result<u64, rusqlite::Error> {
+        let total = execute_prepared_batch(conn, prepared, statements)?;
+        conn.execute_batch("COMMIT")?;
+        Ok(total)
+    })();
+
+    let mut disposition = BatchHandleDisposition::Retain;
+    let mut poison_reason = None;
+    if let Err(error) = &result {
+        if let Err(rollback_error) = conn.execute_batch("ROLLBACK") {
+            // A failed ROLLBACK leaves the connection in an unknown
+            // transaction state. Preserve the original statement error while
+            // making the poison cause explicit to the caller.
+            tracing::warn!(
+                %error,
+                %rollback_error,
+                "execute_batch: ROLLBACK after statement failure failed; \
+                 poisoning the standalone connection — the handle is \
+                 dropped and must be re-acquired"
+            );
+            disposition = BatchHandleDisposition::Poison;
+            poison_reason = Some(BatchPoisonReason::RollbackFailed(rollback_error));
+        }
+    }
+
+    (
+        disposition,
+        result.map_err(|error| BatchFailure {
+            error,
+            poison_reason,
+        }),
+    )
+}
+
+#[derive(Debug)]
+enum BatchPoisonReason {
+    BeginFailed,
+    RollbackFailed(rusqlite::Error),
+}
+
+impl std::fmt::Display for BatchPoisonReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeginFailed => f.write_str(
+                "BEGIN IMMEDIATE failed non-transiently; connection transaction state is suspect",
+            ),
+            Self::RollbackFailed(error) => {
+                write!(f, "ROLLBACK after statement failure failed: {error}")
+            }
+        }
+    }
 }
 
 /// A `rusqlite::Error` whose display carries the poison context, so a
@@ -218,7 +383,7 @@ struct BatchFailure {
 #[derive(Debug)]
 struct PoisonedBatchError {
     original: rusqlite::Error,
-    poison_reason: String,
+    poison_reason: BatchPoisonReason,
 }
 
 impl std::fmt::Display for PoisonedBatchError {
@@ -723,7 +888,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
                 .send_bounded(move |conn| {
-                    let mut stmt = prepare_sql_statement(conn, &statement.sql)
+                    let mut stmt = prepare_cached_sql_statement(conn, &statement.sql)
                         .map_err(|e| map_rusqlite_err(e, "execute"))?;
                     bind_params(&mut stmt, &statement.params)
                         .map_err(|e| map_rusqlite_err(e, "execute"))?;
@@ -741,7 +906,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         })?;
         let (handle, result) = tokio::task::spawn_blocking(move || {
             let res = (|| -> Result<usize, rusqlite::Error> {
-                let mut stmt = prepare_sql_statement(&handle.conn, &statement.sql)?;
+                let mut stmt = prepare_cached_sql_statement(&handle.conn, &statement.sql)?;
                 bind_params(&mut stmt, &statement.params)?;
                 stmt.raw_execute()
             })();
@@ -784,22 +949,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
                 .send_bounded(move |conn| {
-                    for statement in &statements {
-                        reject_multiple_statement(conn, &statement.sql)
-                            .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
-                    }
-                    let mut total: u64 = 0;
-                    for statement in &statements {
-                        let mut stmt = prepare_sql_statement(conn, &statement.sql)
-                            .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
-                        bind_params(&mut stmt, &statement.params)
-                            .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
-                        total += stmt
-                            .raw_execute()
-                            .map_err(|e| map_rusqlite_err(e, "execute_batch"))?
-                            as u64;
-                    }
-                    Ok(total)
+                    let prepared = prepare_batch_statements(conn, &statements)
+                        .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
+                    execute_prepared_batch(conn, prepared, &statements)
+                        .map_err(|e| map_rusqlite_err(e, "execute_batch"))
                 })
                 .await;
         }
@@ -810,108 +963,12 @@ impl khive_storage::SqlWriter for SqliteWriter {
         })?;
         let origin = self.origin.clone();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            if let Err(error) = statements
-                .iter()
-                .try_for_each(|statement| reject_multiple_statement(&handle.conn, &statement.sql))
-            {
-                return (
-                    Some(handle),
-                    Err(BatchFailure {
-                        error,
-                        poison_reason: None,
-                    }),
-                );
-            }
-            if let Err(begin_error) = handle.conn.execute_batch("BEGIN IMMEDIATE") {
-                // Busy/locked is transient contention (another writer held
-                // SQLite's write lock past `busy_timeout`); the connection
-                // itself is untouched, so the handle is restored as reusable.
-                // Any other failure leaves the connection's transaction state
-                // suspect (e.g. "cannot start a transaction within a
-                // transaction" after a caller-driven bare `BEGIN` on this
-                // same connection), so the handle is poisoned — dropped, not
-                // restored — and the returned error carries the poison
-                // context instead of letting a later call fail with only the
-                // generic "connection already consumed".
-                let mut poison_reason = None;
-                let retained = if crate::timeout_sink::is_busy_or_locked(&begin_error) {
-                    Some(handle)
-                } else {
-                    tracing::warn!(
-                        %begin_error,
-                        "execute_batch: BEGIN IMMEDIATE failed non-transiently; \
-                         poisoning the standalone connection — the handle is \
-                         dropped and must be re-acquired"
-                    );
-                    poison_reason = Some(
-                        "BEGIN IMMEDIATE failed non-transiently; connection \
-                         transaction state is suspect"
-                            .to_string(),
-                    );
-                    None
-                };
-                return (
-                    retained,
-                    Err(BatchFailure {
-                        error: begin_error,
-                        poison_reason,
-                    }),
-                );
-            }
-            // Registered only after BEGIN succeeds, so an unopened transaction is
-            // never counted. The handle is declared here — enclosing both the
-            // statement-execution closure below AND the ROLLBACK path — so it
-            // stays registered until the transaction is actually finished
-            // (COMMIT or ROLLBACK), not just until the inner closure returns.
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("execute_batch".to_string()),
-                origin,
-            );
-            let result = (|| -> Result<u64, rusqlite::Error> {
-                let mut total: u64 = 0;
-                for statement in &statements {
-                    let mut stmt = prepare_sql_statement(&handle.conn, &statement.sql)?;
-                    bind_params(&mut stmt, &statement.params)?;
-                    total += stmt.raw_execute()? as u64;
-                }
-                handle.conn.execute_batch("COMMIT")?;
-                Ok(total)
-            })();
-            let mut poison_reason = None;
-            let retained = if let Err(error) = &result {
-                if let Err(rollback_error) = handle.conn.execute_batch("ROLLBACK") {
-                    // A failed ROLLBACK leaves the connection in an unknown
-                    // transaction state, so it must never be reused: the handle
-                    // is poisoned (dropped instead of restored) and every
-                    // subsequent call on this bridge fails with "connection
-                    // already consumed". The caller sees the ORIGINAL statement
-                    // error with the poison context attached (never masked by
-                    // the rollback failure alone).
-                    tracing::warn!(
-                        %error,
-                        %rollback_error,
-                        "execute_batch: ROLLBACK after statement failure failed; \
-                         poisoning the standalone connection — the handle is \
-                         dropped and must be re-acquired"
-                    );
-                    poison_reason = Some(format!(
-                        "ROLLBACK after statement failure failed: {rollback_error}"
-                    ));
-                    None
-                } else {
-                    Some(handle)
-                }
-            } else {
-                Some(handle)
+            let (disposition, result) = execute_standalone_batch(&handle.conn, &statements, origin);
+            let retained = match disposition {
+                BatchHandleDisposition::Retain => Some(handle),
+                BatchHandleDisposition::Poison => None,
             };
-            // `_tx_handle` drops here, after ROLLBACK (or COMMIT) has already run.
-            (
-                retained,
-                result.map_err(|error| BatchFailure {
-                    error,
-                    poison_reason,
-                }),
-            )
+            (retained, result)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
@@ -1197,7 +1254,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e)
             })?;
-            let mut stmt = prepare_sql_statement(&guard, &statement.sql)
+            let mut stmt = prepare_cached_sql_statement(&guard, &statement.sql)
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
             bind_params(&mut stmt, &statement.params)
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
@@ -1223,10 +1280,8 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e)
             })?;
-            for statement in &statements {
-                reject_multiple_statement(&guard, &statement.sql)
-                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
-            }
+            let prepared = prepare_batch_statements(&guard, &statements)
+                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
             guard
                 .execute_batch("BEGIN IMMEDIATE")
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
@@ -1234,20 +1289,8 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                 Some("pool_writer.execute_batch".to_string()),
                 pool.origin(),
             );
-            let result = (|| -> Result<u64, StorageError> {
-                let mut total = 0u64;
-                for statement in &statements {
-                    let mut stmt = prepare_sql_statement(&guard, &statement.sql)
-                        .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
-                    bind_params(&mut stmt, &statement.params)
-                        .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
-                    total += stmt
-                        .raw_execute()
-                        .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?
-                        as u64;
-                }
-                Ok(total)
-            })();
+            let result = execute_prepared_batch(&guard, prepared, &statements)
+                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"));
             match result {
                 Ok(total) => {
                     if let Err(e) = guard.execute_batch("COMMIT") {
@@ -1387,7 +1430,7 @@ impl khive_storage::SqlWriter for InlineWriter {
     ) -> khive_storage::types::StorageResult<u64> {
         // Boundary: `execute_batch` owns transaction-control rejection;
         // `atomic_unit` uses this one-statement primitive for its own boundary.
-        let mut stmt = prepare_sql_statement(self.conn(), &statement.sql)
+        let mut stmt = prepare_cached_sql_statement(self.conn(), &statement.sql)
             .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
         bind_params(&mut stmt, &statement.params)
             .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
@@ -1406,22 +1449,10 @@ impl khive_storage::SqlWriter for InlineWriter {
         // task's transaction — reject transaction-control statements up
         // front, same contract as every other `execute_batch`.
         reject_transaction_control_statements(&statements, "inline.execute_batch")?;
-        for statement in &statements {
-            reject_multiple_statement(self.conn(), &statement.sql)
-                .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
-        }
-        let mut total: u64 = 0;
-        for statement in &statements {
-            let mut stmt = prepare_sql_statement(self.conn(), &statement.sql)
-                .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
-            bind_params(&mut stmt, &statement.params)
-                .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
-            total += stmt
-                .raw_execute()
-                .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?
-                as u64;
-        }
-        Ok(total)
+        let prepared = prepare_batch_statements(self.conn(), &statements)
+            .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
+        execute_prepared_batch(self.conn(), prepared, &statements)
+            .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
@@ -1934,6 +1965,171 @@ mod tests {
             .is_err(),
             "a zero-limit page must still fail on invalid SQL at prepare time"
         );
+    }
+
+    #[test]
+    fn cached_writer_prepare_preserves_the_single_statement_boundary() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(matches!(
+            prepare_cached_sql_statement(&conn, "SELECT 1; SELECT 2"),
+            Err(rusqlite::Error::MultipleStatement)
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_backed_execute_reuses_the_persistent_connection_statement_cache() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("sql_bridge_writer_cache.db")),
+                write_queue_enabled: Some(true),
+                write_routing_strict: true,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE writer_cache_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+            )
+            .unwrap();
+
+        let writer_task = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("file-backed queue-enabled pool must expose its writer task");
+        let prepare_count = Arc::new(AtomicUsize::new(0));
+        let hook_count = Arc::clone(&prepare_count);
+        writer_task
+            .send_top_level(move |conn| {
+                conn.authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Insert { table_name } if table_name == "writer_cache_test"
+                    ) {
+                        hook_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Authorization::Allow
+                }))
+                .map_err(|error| map_rusqlite_err(error, "test.install_authorizer"))
+            })
+            .await
+            .unwrap();
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut writer = bridge.writer().await.unwrap();
+        for id in [1, 2] {
+            khive_storage::SqlWriter::execute(
+                &mut *writer,
+                SqlStatement {
+                    sql: "INSERT INTO writer_cache_test (id, value) VALUES (?1, ?2)".into(),
+                    params: vec![SqlValue::Integer(id), SqlValue::Text(format!("value-{id}"))],
+                    label: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            prepare_count.load(Ordering::SeqCst),
+            1,
+            "the second identical execute on the writer task's persistent connection must reuse \
+             the cached SQLite statement instead of compiling it again"
+        );
+        writer_task
+            .send_top_level(|conn| {
+                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .map_err(|error| map_rusqlite_err(error, "test.remove_authorizer"))
+            })
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn inline_execute_batch_prepares_each_statement_once() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE single_prepare_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .unwrap();
+        let prepare_count = Arc::new(AtomicUsize::new(0));
+        let hook_count = Arc::clone(&prepare_count);
+        conn.authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Insert { table_name } if table_name == "single_prepare_test"
+            ) {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
+
+        let mut writer = InlineWriter {
+            conn: &conn as *const rusqlite::Connection,
+        };
+        let affected = block_on_sync(khive_storage::SqlWriter::execute_batch(
+            &mut writer,
+            vec![SqlStatement {
+                sql: "INSERT INTO single_prepare_test (id, value) VALUES (?1, ?2)".into(),
+                params: vec![SqlValue::Integer(1), SqlValue::Text("once".into())],
+                label: None,
+            }],
+        ))
+        .expect("InlineWriter operations must resolve on their first poll")
+        .expect("valid batch must execute");
+
+        assert_eq!(affected, 1);
+        assert_eq!(
+            prepare_count.load(Ordering::SeqCst),
+            1,
+            "classification and execution must share one prepared statement handle"
+        );
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+    }
+
+    #[test]
+    fn inline_execute_batch_preserves_schema_dependencies_between_statements() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut writer = InlineWriter {
+            conn: &conn as *const rusqlite::Connection,
+        };
+
+        let affected = block_on_sync(khive_storage::SqlWriter::execute_batch(
+            &mut writer,
+            vec![
+                SqlStatement {
+                    sql: "CREATE TABLE dependent_prepare_test (id INTEGER PRIMARY KEY)".into(),
+                    params: vec![],
+                    label: None,
+                },
+                SqlStatement {
+                    sql: "INSERT INTO dependent_prepare_test (id) VALUES (1)".into(),
+                    params: vec![],
+                    label: None,
+                },
+            ],
+        ))
+        .expect("InlineWriter operations must resolve on their first poll")
+        .expect("a later statement must be prepared after its prerequisite schema change");
+
+        assert_eq!(affected, 1);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dependent_prepare_test", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
@@ -2450,8 +2646,8 @@ mod tests {
         assert!(cancelled, "writer batch task did not report cancellation");
     }
 
-    /// Transaction-control statements (`BEGIN`/`COMMIT`/`END`/`ROLLBACK`/
-    /// `SAVEPOINT`/`RELEASE`) in `execute_batch` input are rejected with a
+    /// Transaction-control statements (`BEGIN`/`START`/`COMMIT`/`END`/
+    /// `ROLLBACK`/`SAVEPOINT`/`RELEASE`) in `execute_batch` input are rejected with a
     /// typed invalid-input error BEFORE anything executes, on the standalone
     /// path: a caller `COMMIT` inside the batch's own `BEGIN IMMEDIATE`
     /// would commit early and break the all-or-nothing contract. The
@@ -2557,6 +2753,7 @@ mod tests {
         // through leading whitespace and `--`/`/* */` comments.
         for sql in [
             "BEGIN IMMEDIATE",
+            "START TRANSACTION",
             "commit",
             "End transaction",
             "ROLLBACK",
@@ -2717,6 +2914,8 @@ mod tests {
         for (sql, expected) in [
             ("BEGIN", Some("BEGIN")),
             ("begin immediate", Some("BEGIN")),
+            ("START TRANSACTION", Some("START")),
+            ("start transaction", Some("START")),
             ("COMMIT", Some("COMMIT")),
             ("commit;", Some("COMMIT")),
             ("END", Some("END")),
@@ -2914,6 +3113,16 @@ mod tests {
         )
         .await;
         let batch_error = batch.expect_err("invalid second statement must fail the batch");
+        let poison = match &batch_error {
+            StorageError::Driver { source, .. } => source
+                .downcast_ref::<PoisonedBatchError>()
+                .expect("failed rollback must retain its typed poison wrapper"),
+            other => panic!("failed rollback must return a driver error; got {other:?}"),
+        };
+        assert!(
+            matches!(&poison.poison_reason, BatchPoisonReason::RollbackFailed(_)),
+            "the poison cause must be compiler-checked as RollbackFailed; got {poison:?}"
+        );
         let batch_message = batch_error.to_string();
         assert!(
             batch_message.contains("ROLLBACK after statement failure failed"),
@@ -2996,6 +3205,16 @@ mod tests {
         )
         .await;
         let batch_error = batch.expect_err("BEGIN inside an open transaction must fail");
+        let poison = match &batch_error {
+            StorageError::Driver { source, .. } => source
+                .downcast_ref::<PoisonedBatchError>()
+                .expect("failed BEGIN must retain its typed poison wrapper"),
+            other => panic!("failed BEGIN must return a driver error; got {other:?}"),
+        };
+        assert!(
+            matches!(&poison.poison_reason, BatchPoisonReason::BeginFailed),
+            "the poison cause must be compiler-checked as BeginFailed; got {poison:?}"
+        );
         let batch_message = batch_error.to_string();
         assert!(
             batch_message.contains("BEGIN IMMEDIATE failed non-transiently"),

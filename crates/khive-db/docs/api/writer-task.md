@@ -51,6 +51,10 @@ classification table in `writer_task.rs`'s module docs still opens its own
 writer; strict routing per ADR-136 D1 has not landed) replies the request's
 error via `AnyWriteRequest::reply_error` without ever invoking the
 request's operation closure via `AnyWriteRequest::execute_and_reply`.
+For transaction-wrapped requests, the scoped `writer_task_tx` registry span
+is dropped before the oneshot reply wakes the caller, both after a completed
+transaction and after a failed `BEGIN`. A caller that has observed its reply
+therefore cannot still observe that request as an open SQL transaction.
 There is no watchdog/retry story for a failed `BEGIN` (ADR-067
 Component D remains future work); the connection simply tries
 `BEGIN IMMEDIATE` fresh on the next request.

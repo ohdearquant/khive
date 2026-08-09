@@ -56,6 +56,41 @@ pub struct AdmissionFailureContext {
     pub retry_after_ms: Option<u64>,
 }
 
+/// Typed disposition for a channel message whose `comm.ingest` write failed.
+///
+/// Every bucket carries the stable [`RuntimeError`] variant name that selected
+/// it. Consumers can therefore make retry/quarantine decisions and report a
+/// reason without inspecting the error's rendered text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelIngestFailureClass {
+    /// A pre-execution admission failure that is safe to retry indefinitely.
+    Retryable { reason: &'static str },
+    /// A deterministic policy refusal that should quarantine immediately.
+    Permanent { reason: &'static str },
+    /// An error with no explicit retry or permanent policy classification.
+    Unknown { reason: &'static str },
+}
+
+impl ChannelIngestFailureClass {
+    /// Stable lowercase bucket name persisted on quarantine notifications.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Retryable { .. } => "retryable",
+            Self::Permanent { .. } => "permanent",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
+    /// Stable typed error-variant name; never derived from `Display` output.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Retryable { reason } | Self::Permanent { reason } | Self::Unknown { reason } => {
+                reason
+            }
+        }
+    }
+}
+
 /// Structured context recovered from either a direct SQLite runtime error or
 /// a typed SQLite source preserved inside a storage-driver wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +388,61 @@ pub enum RuntimeError {
 }
 
 impl RuntimeError {
+    /// Classify a failed inbound channel write without inspecting rendered
+    /// error text.
+    ///
+    /// Existing typed admission failures remain retryable. Secret detection is
+    /// the first deterministic policy refusal and is permanent. `None` from
+    /// [`Self::admission_failure_context`] is deliberately not interpreted as
+    /// permanent: every other variant starts in the bounded `Unknown` bucket.
+    pub fn channel_ingest_failure_class(&self) -> ChannelIngestFailureClass {
+        let reason = self.variant_name();
+        if self.admission_failure_context().is_some() {
+            ChannelIngestFailureClass::Retryable { reason }
+        } else if matches!(self, Self::SecretDetected(_)) {
+            ChannelIngestFailureClass::Permanent { reason }
+        } else {
+            ChannelIngestFailureClass::Unknown { reason }
+        }
+    }
+
+    /// Stable top-level variant name used by typed policy classifiers.
+    const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Storage(_) => "Storage",
+            Self::Sqlite(_) => "Sqlite",
+            Self::Query(_) => "Query",
+            Self::NotFound(_) => "NotFound",
+            Self::InvalidInput(_) => "InvalidInput",
+            Self::UnknownVerb(_) => "UnknownVerb",
+            Self::Unconfigured(_) => "Unconfigured",
+            Self::UnknownModel(_) => "UnknownModel",
+            Self::Embedding(_) => "Embedding",
+            Self::Ambiguous(_) => "Ambiguous",
+            Self::Fusion(_) => "Fusion",
+            Self::Internal(_) => "Internal",
+            Self::GuardedWriteFailed(_) => "GuardedWriteFailed",
+            Self::MissingPackDependency(_) => "MissingPackDependency",
+            Self::MissingPackDependencies(_) => "MissingPackDependencies",
+            Self::CircularPackDependency(_) => "CircularPackDependency",
+            Self::PackRedeclared { .. } => "PackRedeclared",
+            Self::VerbCollision { .. } => "VerbCollision",
+            Self::PermissionDenied { .. } => "PermissionDenied",
+            Self::Khive(_) => "Khive",
+            Self::NamespaceMismatch { .. } => "NamespaceMismatch",
+            Self::AmbiguousPrefix { .. } => "AmbiguousPrefix",
+            Self::CrossBackendMergeUnsupported { .. } => "CrossBackendMergeUnsupported",
+            Self::UnknownRemote { .. } => "UnknownRemote",
+            Self::RemoteCacheMissing { .. } => "RemoteCacheMissing",
+            Self::AmbiguousId { .. } => "AmbiguousId",
+            Self::CrossNamespaceWrite { .. } => "CrossNamespaceWrite",
+            Self::RemoteFetchError { .. } => "RemoteFetchError",
+            Self::WriteBudgetExceeded { .. } => "WriteBudgetExceeded",
+            Self::SecretDetected(_) => "SecretDetected",
+            Self::DeadlineExceeded { .. } => "DeadlineExceeded",
+        }
+    }
+
     /// Recover a finite-wait pool-checkout timeout without inspecting rendered
     /// error text.
     ///
@@ -462,5 +552,59 @@ impl From<khive_types::EntityTypeError> for RuntimeError {
 impl From<khive_types::KhiveError> for RuntimeError {
     fn from(e: khive_types::KhiveError) -> Self {
         Self::Khive(e)
+    }
+}
+
+#[cfg(test)]
+mod channel_ingest_failure_class_tests {
+    use super::{ChannelIngestFailureClass, RuntimeError};
+    use crate::secret_gate::SecretMatch;
+
+    #[test]
+    fn secret_detected_is_permanent_by_typed_variant_not_display_text() {
+        let first = RuntimeError::SecretDetected(SecretMatch {
+            detector: "fixture",
+            masked: "first-rendering".to_string(),
+        });
+        let second = RuntimeError::SecretDetected(SecretMatch {
+            detector: "fixture",
+            masked: "completely-different-rendering".to_string(),
+        });
+
+        assert_ne!(first.to_string(), second.to_string());
+        assert_eq!(
+            first.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Permanent {
+                reason: "SecretDetected"
+            }
+        );
+        assert_eq!(
+            second.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Permanent {
+                reason: "SecretDetected"
+            },
+            "rendered error details must not participate in ingest classification"
+        );
+    }
+
+    #[test]
+    fn admission_failures_are_retryable_and_unclassified_errors_are_unknown() {
+        let retryable =
+            RuntimeError::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms: 25 });
+        assert_eq!(
+            retryable.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Retryable { reason: "Storage" }
+        );
+
+        let unknown = RuntimeError::InvalidInput(
+            "write blocked: SecretDetected text must not affect classification".to_string(),
+        );
+        assert_eq!(
+            unknown.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Unknown {
+                reason: "InvalidInput"
+            },
+            "a rendered message resembling SecretDetected must remain Unknown unless its typed variant is SecretDetected"
+        );
     }
 }

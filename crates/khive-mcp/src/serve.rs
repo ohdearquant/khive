@@ -387,6 +387,7 @@ fn spawn_email_channel_loops(server: &KhiveMcpServer) {
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
+            let runtime = server.runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
             let default_actor = default_inbound_actor_from_env();
             let mut allowlist = allowed_recipients_from_env();
@@ -403,22 +404,46 @@ fn spawn_email_channel_loops(server: &KhiveMcpServer) {
             let allowlist_clone = allowlist.clone();
             let mailbox_clone = mailbox.clone();
             let email_ch_clone = Arc::clone(&email_ch);
+            let runtime_outbox = runtime.clone();
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                tokio::task::spawn(channel_poll_loop(
-                    ch_registry,
-                    verb_reg_poll,
-                    ingest_ns_clone,
-                    default_actor_clone,
-                ));
-                tokio::task::spawn(channel_outbox_loop(
-                    email_ch_clone,
-                    verb_reg_outbox,
-                    ingest_ns_outbox,
-                    mailbox_clone,
-                    allowlist_clone,
-                ));
-                tracing::info!("email channel polling and outbox loops started");
+                tokio::task::spawn(async move {
+                    if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await {
+                        tracing::error!(
+                            error = %error,
+                            "email polling disabled: quarantine blob storage is unavailable"
+                        );
+                        return;
+                    }
+                    channel_poll_loop(
+                        ch_registry,
+                        verb_reg_poll,
+                        ingest_ns_clone,
+                        default_actor_clone,
+                    )
+                    .await;
+                });
+                match runtime_outbox {
+                    Some(rt) => {
+                        tokio::task::spawn(channel_outbox_loop(
+                            email_ch_clone,
+                            verb_reg_outbox,
+                            rt,
+                            ingest_ns_outbox,
+                            mailbox_clone,
+                            allowlist_clone,
+                        ));
+                        tracing::info!("email channel polling and outbox loops started");
+                    }
+                    None => {
+                        tracing::error!(
+                            "email polling started but the outbox loop was NOT started: server \
+                             has no default-backend runtime handle, which the outbox loop needs \
+                             to claim external_id on outbound notes; outbound mail will not be \
+                             sent"
+                        );
+                    }
+                }
             });
             if !spawned {
                 tracing::error!(
@@ -533,6 +558,216 @@ fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegist
 #[cfg(feature = "channel-email")]
 const CHANNEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+const UNKNOWN_INGEST_QUARANTINE_THRESHOLD: u8 = 5;
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelIngestDisposition {
+    Hold { attempt: Option<u8> },
+    Quarantine,
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn channel_ingest_attempt_key(channel_kind: &str, external_id: Option<&str>) -> Option<String> {
+    external_id.map(|external_id| format!("{channel_kind}:{external_id}"))
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn channel_ingest_disposition(
+    classification: khive_runtime::ChannelIngestFailureClass,
+    channel_kind: &str,
+    external_id: Option<&str>,
+    unknown_attempts: &mut std::collections::HashMap<String, u8>,
+) -> ChannelIngestDisposition {
+    use khive_runtime::ChannelIngestFailureClass;
+
+    match classification {
+        ChannelIngestFailureClass::Retryable { .. } => {
+            ChannelIngestDisposition::Hold { attempt: None }
+        }
+        ChannelIngestFailureClass::Permanent { .. } => ChannelIngestDisposition::Quarantine,
+        ChannelIngestFailureClass::Unknown { .. } => {
+            let Some(key) = channel_ingest_attempt_key(channel_kind, external_id) else {
+                return ChannelIngestDisposition::Hold { attempt: None };
+            };
+            let attempt = unknown_attempts.entry(key).or_default();
+            *attempt = attempt.saturating_add(1);
+            if *attempt >= UNKNOWN_INGEST_QUARANTINE_THRESHOLD {
+                ChannelIngestDisposition::Quarantine
+            } else {
+                ChannelIngestDisposition::Hold {
+                    attempt: Some(*attempt),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn log_channel_quarantine(
+    channel_kind: &str,
+    classification: khive_runtime::ChannelIngestFailureClass,
+    external_id: &str,
+) {
+    tracing::warn!(
+        channel = channel_kind,
+        classification = classification.name(),
+        reason = classification.reason(),
+        external_id,
+        "quarantined inbound message after comm.ingest refusal"
+    );
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn ensure_channel_quarantine_storage(
+    registry: &khive_runtime::VerbRegistry,
+) -> Result<(), khive_runtime::RuntimeError> {
+    use serde_json::json;
+
+    if !registry.has_verb("blob.put") || !registry.has_verb("blob.stat") {
+        return Err(khive_runtime::RuntimeError::Unconfigured(
+            "channel quarantine requires the blob pack".to_string(),
+        ));
+    }
+
+    // `blob.stat` is read-only. Probing a valid, absent digest verifies both
+    // verb registration and that the pack's BlobStore is installed without
+    // publishing a startup artifact.
+    registry
+        .dispatch(
+            "blob.stat",
+            json!({"content_ref": "0000000000000000000000000000000000000000000000000000000000000000"}),
+        )
+        .await?;
+    Ok(())
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn quarantine_channel_ingest_failure(
+    registry: &khive_runtime::VerbRegistry,
+    ingest_namespace: &str,
+    channel_kind: &str,
+    default_inbound_actor: Option<&str>,
+    envelope: &khive_channel::ChannelEnvelope,
+    classification: khive_runtime::ChannelIngestFailureClass,
+) -> Result<(), khive_runtime::RuntimeError> {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    use serde_json::json;
+
+    let external_id = envelope.external_id.as_deref().ok_or_else(|| {
+        khive_runtime::RuntimeError::InvalidInput(
+            "cannot quarantine a channel message without external_id".to_string(),
+        )
+    })?;
+    let (replay_bytes, notification_to) = envelope
+        .quarantine_replay
+        .as_ref()
+        .map(|replay| (replay.bytes.as_slice(), replay.notification_to.as_str()))
+        .unwrap_or_else(|| (envelope.content.as_bytes(), envelope.to.as_str()));
+
+    let put = registry
+        .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
+        .await?;
+    let content_ref = put
+        .get("content_ref")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            khive_runtime::RuntimeError::Internal(
+                "blob.put returned no string content_ref for channel quarantine".to_string(),
+            )
+        })?;
+
+    // Quarantine sender prefix invariant: the sender retains the originating
+    // channel prefix because prefix-keyed consumers depend on it for alert
+    // visibility. Moving `email:quarantine` outside `email:` hides the alert.
+    let quarantine_sender = format!("{channel_kind}:quarantine");
+    debug_assert!(
+        quarantine_sender.starts_with(&format!("{channel_kind}:")),
+        "quarantine sender prefix invariant: prefix-keyed consumers require the channel prefix"
+    );
+
+    let mut params = json!({
+        "namespace": ingest_namespace,
+        "from": quarantine_sender,
+        "to": notification_to,
+        "content": "Inbound channel message quarantined. Original bytes are available through the attached content reference.",
+        "channel_kind": channel_kind,
+        "external_id": external_id,
+        "metadata": {
+            "quarantined": "true",
+            "quarantine_classification": classification.name(),
+            "quarantine_reason": classification.reason(),
+            "quarantine_external_id": external_id,
+            "quarantine_content_ref": content_ref,
+        },
+    });
+    if let Some(actor) = default_inbound_actor {
+        params["default_inbound_actor"] = json!(actor);
+    }
+    registry.dispatch("comm.ingest", params).await?;
+    log_channel_quarantine(channel_kind, classification, external_id);
+    Ok(())
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn handle_channel_ingest_failure(
+    registry: &khive_runtime::VerbRegistry,
+    ingest_namespace: &str,
+    channel_kind: &str,
+    default_inbound_actor: Option<&str>,
+    envelope: &khive_channel::ChannelEnvelope,
+    error: &khive_runtime::RuntimeError,
+    unknown_attempts: &mut std::collections::HashMap<String, u8>,
+) -> bool {
+    let classification = error.channel_ingest_failure_class();
+    match channel_ingest_disposition(
+        classification,
+        channel_kind,
+        envelope.external_id.as_deref(),
+        unknown_attempts,
+    ) {
+        ChannelIngestDisposition::Hold { attempt } => {
+            tracing::warn!(
+                channel = channel_kind,
+                classification = classification.name(),
+                reason = classification.reason(),
+                external_id = envelope.external_id.as_deref(),
+                attempt,
+                threshold = UNKNOWN_INGEST_QUARANTINE_THRESHOLD,
+                "comm.ingest failed; holding channel progress"
+            );
+            false
+        }
+        ChannelIngestDisposition::Quarantine => {
+            match quarantine_channel_ingest_failure(
+                registry,
+                ingest_namespace,
+                channel_kind,
+                default_inbound_actor,
+                envelope,
+                classification,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(quarantine_error) => {
+                    tracing::warn!(
+                        channel = channel_kind,
+                        classification = classification.name(),
+                        reason = classification.reason(),
+                        external_id = envelope.external_id.as_deref(),
+                        error = %quarantine_error,
+                        "channel quarantine failed; holding progress for retry"
+                    );
+                    false
+                }
+            }
+        }
+    }
+}
+
 /// Background task that polls all registered channels every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
@@ -583,6 +818,10 @@ async fn channel_poll_loop(
     // (first failure since success, or a change in error class) rather than
     // once per retry. Cleared on every success.
     let mut last_error_class: HashMap<(String, String), &'static str> = HashMap::new();
+    // Unknown ingest failures are bounded per external message ID. Entries
+    // remain pinned through quarantine until the page cursor itself commits,
+    // so a cursor-commit failure cannot restart the five-attempt wait.
+    let mut unknown_ingest_attempts: HashMap<String, u8> = HashMap::new();
     let mut next_interval = CHANNEL_POLL_INTERVAL;
     let event_store = registry.event_store();
     // Captured before the loop's first sleep (issue #449 follow-up).
@@ -693,29 +932,44 @@ async fn channel_poll_loop(
                     // the whole page -- comm.ingest's `INSERT OR IGNORE`
                     // dedup then skips re-storing the messages that already
                     // succeeded, and only the failed one is retried.
+                    let page_attempt_keys: Vec<String> = page
+                        .envelopes
+                        .iter()
+                        .filter_map(|env| {
+                            channel_ingest_attempt_key(kind, env.external_id.as_deref())
+                        })
+                        .collect();
                     let mut page_fully_ingested = true;
                     for env in page.envelopes {
                         let params = json!({
                             "namespace": ingest_namespace,
-                            "from": env.from,
-                            "to": env.to,
-                            "content": env.content,
-                            "subject": env.subject,
+                            "from": env.from.clone(),
+                            "to": env.to.clone(),
+                            "content": env.content.clone(),
+                            "subject": env.subject.clone(),
                             "channel_kind": kind,
-                            "external_id": env.external_id,
-                            "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
-                            "correlation_external_id": env.correlation_external_id,
+                            "external_id": env.external_id.clone(),
+                            "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
+                            "correlation_external_id": env.correlation_external_id.clone(),
                             "default_inbound_actor": default_inbound_actor,
-                            "wire_message_id": env.wire_message_id,
-                            "wire_references": env.wire_references,
-                            "metadata": env.metadata,
+                            "wire_message_id": env.wire_message_id.clone(),
+                            "wire_references": env.wire_references.clone(),
+                            "metadata": env.metadata.clone(),
                         });
-                        if let Err(e) = registry.dispatch("comm.ingest", params).await {
-                            tracing::warn!(
-                                channel = kind,
-                                "comm.ingest failed for inbound message: {e}"
-                            );
-                            page_fully_ingested = false;
+                        if let Err(error) = registry.dispatch("comm.ingest", params).await {
+                            let handled = handle_channel_ingest_failure(
+                                &registry,
+                                &ingest_namespace,
+                                kind,
+                                Some(&default_inbound_actor),
+                                &env,
+                                &error,
+                                &mut unknown_ingest_attempts,
+                            )
+                            .await;
+                            if !handled {
+                                page_fully_ingested = false;
+                            }
                         }
                     }
 
@@ -738,6 +992,11 @@ async fn channel_poll_loop(
                             // Nothing new to commit this tick is not a
                             // failure -- safe to advance the bootstrap floor.
                             None => bootstrap_floor_advances = true,
+                        }
+                        if bootstrap_floor_advances {
+                            for key in page_attempt_keys {
+                                unknown_ingest_attempts.remove(&key);
+                            }
                         }
                     } else {
                         tracing::warn!(
@@ -1058,11 +1317,19 @@ fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) ->
 /// `delivered_at` write causes a duplicate send on restart; the duplicate carries
 /// the same Message-ID so receiving MTAs typically collapse it.
 ///
+/// The `external_id` claim goes through `runtime`'s non-wire
+/// `claim_outbound_message_external_id` rather than a `registry.dispatch("update",
+/// ...)` call: `external_id` is one of the owner-established properties the
+/// generic `update` verb refuses to patch on a pack-owned note kind, so a caller
+/// patch through `dispatch` is rejected by design and would leave every note
+/// stuck retrying forever.
+///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
 async fn channel_outbox_loop(
     email_channel: std::sync::Arc<khive_channel_email::EmailChannel>,
     registry: khive_runtime::VerbRegistry,
+    runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
     mailbox: String,
     allowlist: Vec<String>,
@@ -1072,6 +1339,17 @@ async fn channel_outbox_loop(
     use serde_json::json;
 
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
+    let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::error!(
+                namespace = %ingest_namespace,
+                error = %e,
+                "outbox loop: ingest namespace does not parse; loop will not run"
+            );
+            return;
+        }
+    };
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -1184,17 +1462,24 @@ async fn channel_outbox_loop(
                 Some(eid) if !eid.is_empty() => eid.to_string(),
                 _ => {
                     let mid = format!("<{note_id}@{domain}>");
-                    // Persist the claimed external_id before sending.
-                    let claim_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "external_id": mid.clone() },
-                            }),
-                        )
-                        .await;
+                    // Persist the claimed external_id before sending, through the
+                    // non-wire owner path: the generic `update` verb refuses any
+                    // patch naming `external_id` on a `message` note (it is an
+                    // owner-established property), so this cannot go through
+                    // `registry.dispatch`.
+                    let claim_result = match uuid::Uuid::parse_str(&note_id) {
+                        Ok(uuid) => match runtime.authorize(namespace.clone()) {
+                            Ok(token) => {
+                                runtime
+                                    .claim_outbound_message_external_id(&token, uuid, mid.clone())
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                            "note id {note_id} is not a valid UUID: {e}"
+                        ))),
+                    };
                     if let Err(e) = claim_result {
                         tracing::warn!(
                             note_id = %note_id,
@@ -1324,11 +1609,16 @@ fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
             let tg_ch_outbox = Arc::clone(&tg_ch);
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                tokio::task::spawn(telegram_poll_loop(
-                    tg_ch_poll,
-                    verb_reg_poll,
-                    ingest_ns_poll,
-                ));
+                tokio::task::spawn(async move {
+                    if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await {
+                        tracing::error!(
+                            error = %error,
+                            "telegram polling disabled: quarantine blob storage is unavailable"
+                        );
+                        return;
+                    }
+                    telegram_poll_loop(tg_ch_poll, verb_reg_poll, ingest_ns_poll).await;
+                });
                 tokio::task::spawn(telegram_outbox_loop(
                     tg_ch_outbox,
                     verb_reg_outbox,
@@ -1392,33 +1682,49 @@ async fn telegram_poll_loop(
     use serde_json::json;
 
     const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut unknown_ingest_attempts = std::collections::HashMap::<String, u8>::new();
 
     loop {
         match telegram_channel.poll(Utc::now()).await {
             Ok(envelopes) => {
                 let kind = telegram_channel.kind();
+                let batch_attempt_keys: Vec<String> = envelopes
+                    .iter()
+                    .filter_map(|env| channel_ingest_attempt_key(kind, env.external_id.as_deref()))
+                    .collect();
                 let mut all_ingested = true;
                 for env in envelopes {
                     let params = json!({
                         "namespace": ingest_namespace,
-                        "from": env.from,
-                        "to": env.to,
-                        "content": env.content,
+                        "from": env.from.clone(),
+                        "to": env.to.clone(),
+                        "content": env.content.clone(),
                         "channel_kind": kind,
-                        "external_id": env.external_id,
-                        "sent_at": env.sent_at.map(|ts| ts.to_rfc3339()),
+                        "external_id": env.external_id.clone(),
+                        "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
                     });
-                    if let Err(e) = registry.dispatch("comm.ingest", params).await {
-                        tracing::warn!(
-                            channel = kind,
-                            "comm.ingest failed for inbound telegram message: {e}"
-                        );
-                        all_ingested = false;
+                    if let Err(error) = registry.dispatch("comm.ingest", params).await {
+                        let handled = handle_channel_ingest_failure(
+                            &registry,
+                            &ingest_namespace,
+                            kind,
+                            None,
+                            &env,
+                            &error,
+                            &mut unknown_ingest_attempts,
+                        )
+                        .await;
+                        if !handled {
+                            all_ingested = false;
+                        }
                     }
                 }
 
                 if all_ingested {
                     telegram_channel.commit_offset();
+                    for key in batch_attempt_keys {
+                        unknown_ingest_attempts.remove(&key);
+                    }
                 } else {
                     tracing::warn!(
                         channel = kind,
@@ -1923,7 +2229,11 @@ fn build_registry_for_multi_backend_inner(
 
     let gate = default_runtime.config().gate.clone();
     let default_namespace = default_runtime.config().default_namespace.clone();
-    let config_id = crate::server::compute_config_id(default_runtime.config(), Some(khive_cfg));
+    let config_id = crate::server::compute_config_id_with_ann_fresh_tail(
+        default_runtime.config(),
+        Some(khive_cfg),
+        default_runtime.ann_fresh_tail_enabled(),
+    );
     let visible_namespaces = default_runtime.config().visible_namespaces.clone();
 
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
@@ -2466,6 +2776,7 @@ pub fn build_server_from_multi_backend_registry(
     // leaving them permanently invisible to cross-process WAL-pin attribution.
     let secondary_pools = secondary_file_backed_pools(&multi);
     let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
+    let default_runtime = multi.default_runtime.clone();
 
     let server = KhiveMcpServer::from_registry_with_meta(
         multi.registry,
@@ -2473,7 +2784,8 @@ pub fn build_server_from_multi_backend_registry(
         &multi.config_id,
     )
     .with_default_output_format(fmt)
-    .with_secondary_pools(secondary_pools);
+    .with_secondary_pools(secondary_pools)
+    .with_runtime(default_runtime);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
@@ -6893,6 +7205,93 @@ region = "us-east-1"
         }
     }
 
+    #[cfg(feature = "channel-email")]
+    mod channel_ingest_disposition_tests {
+        use super::*;
+        use khive_runtime::ChannelIngestFailureClass;
+        use std::collections::HashMap;
+
+        #[tokio::test]
+        async fn quarantine_storage_preflight_rejects_a_missing_blob_pack() {
+            let registry = khive_runtime::VerbRegistryBuilder::new()
+                .build()
+                .expect("empty registry builds");
+            let error = ensure_channel_quarantine_storage(&registry)
+                .await
+                .expect_err("channel polling must fail closed without blob storage");
+            assert!(matches!(
+                error,
+                khive_runtime::RuntimeError::Unconfigured(_)
+            ));
+        }
+
+        #[test]
+        fn unknown_failure_holds_four_attempts_then_quarantines_on_five() {
+            let mut attempts = HashMap::new();
+            let classification = ChannelIngestFailureClass::Unknown {
+                reason: "InvalidInput",
+            };
+
+            for expected_attempt in 1..UNKNOWN_INGEST_QUARANTINE_THRESHOLD {
+                assert_eq!(
+                    channel_ingest_disposition(
+                        classification,
+                        "email",
+                        Some("imap:h:1:7"),
+                        &mut attempts,
+                    ),
+                    ChannelIngestDisposition::Hold {
+                        attempt: Some(expected_attempt),
+                    }
+                );
+            }
+            assert_eq!(
+                channel_ingest_disposition(
+                    classification,
+                    "email",
+                    Some("imap:h:1:7"),
+                    &mut attempts,
+                ),
+                ChannelIngestDisposition::Quarantine,
+                "the fifth unknown failure must close the retry livelock"
+            );
+        }
+
+        #[test]
+        fn retryable_never_increments_and_permanent_quarantines_immediately() {
+            let mut attempts = HashMap::new();
+            assert_eq!(
+                channel_ingest_disposition(
+                    ChannelIngestFailureClass::Retryable { reason: "Storage" },
+                    "email",
+                    Some("imap:h:1:8"),
+                    &mut attempts,
+                ),
+                ChannelIngestDisposition::Hold { attempt: None }
+            );
+            assert!(
+                attempts.is_empty(),
+                "retryable failures must not consume the unknown budget"
+            );
+
+            assert_eq!(
+                channel_ingest_disposition(
+                    ChannelIngestFailureClass::Permanent {
+                        reason: "SecretDetected",
+                    },
+                    "email",
+                    Some("imap:h:1:9"),
+                    &mut attempts,
+                ),
+                ChannelIngestDisposition::Quarantine
+            );
+            assert!(
+                attempts.is_empty(),
+                "permanent failures bypass the unknown budget"
+            );
+        }
+    }
+
     // --- log_eligible_poll_failure: edge-triggered warn ---
 
     #[cfg(feature = "channel-email")]
@@ -6908,26 +7307,35 @@ region = "us-east-1"
         struct CapturedEvent {
             level: Option<tracing::Level>,
             message: Option<String>,
+            reason: Option<String>,
         }
 
         #[derive(Default)]
-        struct CapturedEventVisitor(Option<String>);
+        struct CapturedEventVisitor {
+            message: Option<String>,
+            reason: Option<String>,
+        }
 
         impl Visit for CapturedEventVisitor {
             fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "message" {
-                    self.0 = Some(value.to_string());
+                match field.name() {
+                    "message" => self.message = Some(value.to_string()),
+                    "reason" => self.reason = Some(value.to_string()),
+                    _ => {}
                 }
             }
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
+                if matches!(field.name(), "message" | "reason") {
                     let formatted = format!("{value:?}");
-                    self.0 = Some(
-                        formatted
-                            .trim_start_matches('"')
-                            .trim_end_matches('"')
-                            .to_string(),
-                    );
+                    let value = formatted
+                        .trim_start_matches('"')
+                        .trim_end_matches('"')
+                        .to_string();
+                    match field.name() {
+                        "message" => self.message = Some(value),
+                        "reason" => self.reason = Some(value),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -6955,7 +7363,8 @@ region = "us-east-1"
                 event.record(&mut visitor);
                 self.events.lock().unwrap().push(CapturedEvent {
                     level: Some(*event.metadata().level()),
-                    message: visitor.0,
+                    message: visitor.message,
+                    reason: visitor.reason,
                 });
             }
             fn enter(&self, _: &tracing::span::Id) {}
@@ -7069,6 +7478,33 @@ region = "us-east-1"
             assert!(
                 message.contains("slot exhausted"),
                 "escalation warn must carry the underlying error text, got: {message}"
+            );
+        }
+
+        #[test]
+        fn quarantine_warn_names_typed_reason() {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = CaptureSubscriber {
+                events: Arc::clone(&buffer),
+            };
+
+            tracing::subscriber::with_default(subscriber, || {
+                log_channel_quarantine(
+                    "email",
+                    khive_runtime::ChannelIngestFailureClass::Permanent {
+                        reason: "SecretDetected",
+                    },
+                    "imap:h:11:7",
+                );
+            });
+
+            let events = buffer.lock().unwrap();
+            assert_eq!(events.len(), 1, "quarantine must emit exactly one event");
+            assert_eq!(events[0].level, Some(tracing::Level::WARN));
+            assert_eq!(
+                events[0].reason.as_deref(),
+                Some("SecretDetected"),
+                "quarantine WARN must name the typed refusal variant"
             );
         }
     }
@@ -8473,6 +8909,8 @@ backend = "kg-backend"
     mod cursor_commit_gating_tests {
         use super::*;
         use async_trait::async_trait;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
         use chrono::{DateTime, Utc};
         use khive_channel::{
             Channel, ChannelCheckpoint, ChannelEnvelope, ChannelError, ChannelPollPage,
@@ -8788,6 +9226,49 @@ backend = "kg-backend"
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
+        struct ContentRefusalOnceChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for ContentRefusalOnceChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                _since: DateTime<Utc>,
+                _checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                let Some(envelope) = self.envelope.lock().unwrap().take() else {
+                    return Ok(ChannelPollPage {
+                        envelopes: vec![],
+                        next_checkpoint: None,
+                    });
+                };
+                Ok(ChannelPollPage {
+                    envelopes: vec![envelope],
+                    next_checkpoint: Some(ChannelCheckpoint {
+                        source: SOURCE.to_string(),
+                        generation: 11,
+                        high_water: Some(7),
+                    }),
+                })
+            }
+        }
+
         #[async_trait]
         impl Channel for QuarantineOnceChannel {
             fn kind(&self) -> &'static str {
@@ -8925,6 +9406,141 @@ backend = "kg-backend"
                 props.get("quarantine_reason").and_then(|v| v.as_str()),
                 Some("missing-body"),
                 "the quarantine reason must survive comm.ingest: {props:?}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn content_refusal_stores_exact_replay_and_ingests_body_free_quarantine() {
+            const EXTERNAL_ID: &str = "imap:h:11:7";
+            const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
+            const ORIGINAL_BYTES: &[u8] = b"From: maintainer@example.com\r\n\
+                To: mailbox@example.com\r\n\
+                Subject: replay fixture\r\n\
+                \r\n\
+                AKIAFAKEKEY1234567890"; // gitleaks:allow
+
+            let envelope = ChannelEnvelope::new(
+                "email:maintainer@example.com",
+                "email:mailbox@example.com",
+                REFUSED_BODY,
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
+
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(ContentRefusalOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime.install_blob_store(Arc::new(blob_store));
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+            ensure_channel_quarantine_storage(&registry)
+                .await
+                .expect("configured replay storage must pass channel startup preflight");
+
+            let refused = registry
+                .dispatch(
+                    "comm.ingest",
+                    json!({
+                        "namespace": "test-ns",
+                        "from": "email:maintainer@example.com",
+                        "to": "email:mailbox@example.com",
+                        "content": REFUSED_BODY,
+                        "channel_kind": "email",
+                        "external_id": EXTERNAL_ID,
+                        "default_inbound_actor": "actor:test",
+                    }),
+                )
+                .await
+                .expect_err("the fixture must exercise the real content gate");
+            assert!(
+                matches!(refused, khive_runtime::RuntimeError::SecretDetected(_)),
+                "the replay test is invalid unless comm.ingest refuses the original content"
+            );
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a permanently refused message must quarantine and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let notes = inbox.as_array().expect("list returns an array");
+            assert_eq!(notes.len(), 1, "only the quarantine notification is stored");
+            let quarantined = &notes[0];
+            assert_eq!(
+                quarantined["properties"]["from_actor"],
+                "email:quarantine",
+                "quarantine sender prefix invariant: `email:` keeps the notification visible to prefix-keyed consumers"
+            );
+            assert_eq!(quarantined["properties"]["external_id"], EXTERNAL_ID);
+            assert_eq!(
+                quarantined["properties"]["quarantine_classification"],
+                "permanent"
+            );
+            assert_eq!(
+                quarantined["properties"]["quarantine_reason"],
+                "SecretDetected"
+            );
+            assert!(
+                !quarantined["content"]
+                    .as_str()
+                    .expect("note content")
+                    .contains(REFUSED_BODY),
+                "the notification must never re-present the refused body"
+            );
+
+            let content_ref = quarantined["properties"]["quarantine_content_ref"]
+                .as_str()
+                .expect("quarantine ContentRef");
+            let fetched = registry
+                .dispatch("blob.get", json!({"content_ref": content_ref}))
+                .await
+                .expect("quarantine replay blob must be retrievable");
+            let replay = BASE64
+                .decode(fetched["bytes"].as_str().expect("base64 replay bytes"))
+                .expect("valid base64 replay bytes");
+            assert_eq!(
+                replay, ORIGINAL_BYTES,
+                "the replay ContentRef must round-trip the byte-exact original message"
             );
         }
 

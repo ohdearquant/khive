@@ -618,16 +618,16 @@ async fn sch_aud_002_out_of_range_cron_minute_rejected() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("minute") || msg.contains("range") || msg.contains("99"),
-        "SCH-AUD-002: out-of-range minute field must be rejected; got: {msg}"
+        msg.contains("cron") && msg.contains("not executable"),
+        "SCH-AUD-002: every unsupported cron form must be rejected; got: {msg}"
     );
 }
 
 #[tokio::test]
-async fn sch_aud_002_valid_wildcard_cron_accepted() {
+async fn sch_aud_002_wildcard_cron_rejected_as_unexecutable() {
     let (registry, _rt) = build_registry();
 
-    let result = registry
+    let error = registry
         .dispatch(
             "schedule.remind",
             serde_json::json!({
@@ -637,15 +637,15 @@ async fn sch_aud_002_valid_wildcard_cron_accepted() {
             }),
         )
         .await
-        .expect("SCH-AUD-002: all-wildcard cron must be accepted");
-    assert_eq!(result["status"], "pending");
+        .expect_err("SCH-AUD-002: an unadvanceable wildcard cron must be rejected");
+    assert!(error.to_string().contains("not executable"));
 }
 
 #[tokio::test]
-async fn sch_aud_002_valid_numeric_cron_accepted() {
+async fn sch_aud_002_numeric_cron_rejected_as_unexecutable() {
     let (registry, _rt) = build_registry();
 
-    let result = registry
+    let error = registry
         .dispatch(
             "schedule.remind",
             serde_json::json!({
@@ -655,17 +655,13 @@ async fn sch_aud_002_valid_numeric_cron_accepted() {
             }),
         )
         .await
-        .expect("SCH-AUD-002: valid numeric cron must be accepted");
-    assert_eq!(result["status"], "pending");
+        .expect_err("SCH-AUD-002: an unadvanceable numeric cron must be rejected");
+    assert!(error.to_string().contains("not executable"));
 }
 
-// ── Issue #481: repeat contract matrix (narrowed, Option B) ─────────────────
-//
-// Standard cron operators (steps, ranges, lists) are documented as accepted
-// but rejected by the implementation, and `kkernel` does not advance
-// five-field repeats yet. Rather than build a full cron parser, the contract
-// is narrowed to named aliases plus a 5-field form where each field is `*`
-// or one in-range integer. This matrix asserts the narrowed contract.
+// ── Repeat contract matrix ─────────────────────────────────────────────────
+// The executor advances exactly the three named aliases. Every cron form is
+// rejected at creation rather than silently consumed as a one-shot.
 
 async fn assert_repeat_accepted(repeat: &str) {
     let (registry, _rt) = build_registry();
@@ -679,7 +675,7 @@ async fn assert_repeat_accepted(repeat: &str) {
             }),
         )
         .await
-        .unwrap_or_else(|e| panic!("repeat {repeat:?} must be accepted under Option B; got: {e}"));
+        .unwrap_or_else(|e| panic!("repeat {repeat:?} must be accepted; got: {e}"));
     assert_eq!(result["status"], "pending");
 }
 
@@ -699,7 +695,7 @@ async fn assert_repeat_rejected(repeat: &str) {
     let msg = err.to_string();
     assert!(
         msg.contains("repeat") || msg.contains("cron"),
-        "repeat {repeat:?} must be rejected under Option B; got: {msg}"
+        "repeat {repeat:?} must be rejected; got: {msg}"
     );
 }
 
@@ -711,13 +707,13 @@ async fn repeat_contract_matrix_aliases_accepted() {
 }
 
 #[tokio::test]
-async fn repeat_contract_matrix_wildcard_accepted() {
-    assert_repeat_accepted("* * * * *").await;
+async fn repeat_contract_matrix_wildcard_rejected() {
+    assert_repeat_rejected("* * * * *").await;
 }
 
 #[tokio::test]
-async fn repeat_contract_matrix_single_numeric_field_accepted() {
-    assert_repeat_accepted("0 9 * * 1").await;
+async fn repeat_contract_matrix_single_numeric_field_rejected() {
+    assert_repeat_rejected("0 9 * * 1").await;
 }
 
 #[tokio::test]

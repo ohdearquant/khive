@@ -1,0 +1,6 @@
+# These release gates intentionally measure wall-clock writer-hold proxies.
+# Reserve the full nextest worker pool so unrelated workspace tests cannot add
+# scheduler delay; keep the calibrated median and p95 limits unchanged.
+[[profile.default.overrides]]
+filter = 'binary_id(khive-pack-comm::hold_time_regression)'
+threads-required = "num-test-threads"

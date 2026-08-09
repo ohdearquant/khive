@@ -327,7 +327,6 @@ def main():
         run_test("repeat=daily/weekly/monthly → ok", test_repeat_valid, proc)
 
         def test_repeat_invalid_cron(proc):
-            # "invalid-cron" is not 5-field cron and not a named alias.
             err = call_verb_expect_error(proc, "schedule.remind", {
                 "content": "bad cron",
                 "at": FAR_FUTURE_A,
@@ -340,15 +339,16 @@ def main():
         run_test("repeat=invalid-cron → error", test_repeat_invalid_cron, proc)
 
         def test_repeat_5field_cron(proc):
-            # 5-field cron must be accepted.
-            ev = call_verb(proc, "schedule.remind", {
+            err = call_verb_expect_error(proc, "schedule.remind", {
                 "content": "cron reminder",
                 "at": FAR_FUTURE_B,
                 "repeat": "0 9 * * 1",
             })
-            assert ev["status"] == "pending", f"5-field cron should succeed: {ev}"
+            assert "cron" in err.lower() and "not executable" in err.lower(), (
+                f"expected explicit non-executable cron error; got: {err!r}"
+            )
 
-        run_test("repeat=5-field cron → ok", test_repeat_5field_cron, proc)
+        run_test("repeat=5-field cron → rejected", test_repeat_5field_cron, proc)
 
         # 10. Agenda time window: only events in [from, to] range returned
         def test_agenda_time_window(proc):

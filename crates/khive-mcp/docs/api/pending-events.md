@@ -42,22 +42,14 @@ freshly-reconstructed `RuntimeConfig::default()` would drain
 
 ## Scheduled-event creator identity
 
-A `scheduled_event` row's persisted `created_by_actor` is the acting identity
-for that row's replay dispatch, for both `event_type: "remind"` and
-`event_type: "schedule"`. The drain supplies it to the server through the
-typed per-request identity seam, so a reminder's `from_actor`/`to_actor` and a
-scheduled action's dispatch identity both remain the creator even when a
-different actor owns the daemon that fires the event.
-
-`created_by_actor` is a trust boundary, not descriptive metadata: it is
-stamped once, at write time, from the caller's authenticated token by
-`schedule.remind`/`schedule.schedule`. The generic `create` and `update`
-verbs reject the `scheduled_event` note kind outright, so no other write path
-can set or alter it — a caller cannot forge or reassign a scheduled event's
-replay identity through the shared CRUD surface. A row with no stored
-`created_by_actor` (data written before this guarantee existed) has no
-verifiable provenance; the drain fails closed and does not dispatch it under
-the daemon's own identity.
+`created_by_actor` is display metadata, never replay authority. Both schedule
+creation verbs append an immutable, target-bound creator-provenance event before
+activating the staged row. The drain reconstructs the exact actor kind from that
+event and supplies it through the typed per-request identity seam, so replay remains
+the creator even when a different actor owns the daemon. Generic scheduled actions
+without that proof fail closed. Legacy reminders ignore forgeable note metadata and
+use the configured scheduler actor, then anonymous `local`, under ADR-106's narrower
+compatibility policy.
 
 ## Why the tick loop uses a fixed interval with `Skip`
 
@@ -100,12 +92,16 @@ written before immutable provenance existed fail closed: the payload is not disp
 row becomes terminal `status="failed"`, and `dispatch_error` plus `dispatch_failed_at`
 explain the migration-policy failure. Legacy reminders ignore any unprovenanced actor claim
 and use the current server actor, then `local`, preserving a safe form of Amendment C's
-fallback without permitting forged delivery identity.
+fallback without permitting forged delivery identity. Refused generic rows retain
+`anonymous:local` in their diagnostic receipt because they have no verified creator; the daemon
+fallback is reminder-only. Legacy batches and chains are also refused before
+`mark_dispatch_invoking`, with terminal `failed`/`not_invoked` state, so best-effort partial
+success can never be retried as a whole and duplicated.
 
 Other generic dispatch failures remain per-event: they are persisted as
-`dispatch_error`/`dispatch_failed_at`, then the row follows its normal one-shot or repeat
-finalization so a permanently broken action cannot retry forever. A later successful
-repeat clears those fields.
+`dispatch_error`/`dispatch_failed_at`. A failed one-shot returns to `pending` for a later
+drain; a failed named repeat advances to its next occurrence. A later success clears
+those fields.
 
 ## Ticker liveness on `schedule.agenda` (issue #1352)
 
@@ -127,30 +123,63 @@ request `presentation="verbose"` when the exact RFC 3339 value is required.
 
 ## Claim / finalize CAS state machine (issue #462)
 
-`claim_pending_event` CAS-transitions a row `pending -> firing` and returns
-the transition's `firing_at` timestamp as a **claim token**. Callers MUST
-thread this token through to `finalize_fired_event`, which requires the
-row's CURRENT `firing_at` to still equal the token — not merely that
-`status='firing'`. Without binding to the specific token, a stale claimant
-that stalls past `STALE_FIRING_TIMEOUT_MICROS`, gets reclaimed by
-`reclaim_stale_firing_events`, and is re-claimed by a second drain could
-resume and finalize over the second drain's live claim purely because both
-rows share `status='firing'`. A reclaim always rewrites `firing_at` (via a
-fresh claim) or clears `status` back to `pending`, so a stale token can never
-match the row's current one. The claim also mirrors the `schedule.cancel` CAS
-in `khive-pack-schedule/src/handlers.rs` (which only matches
-`status='pending'`) so the two writers share one state machine.
+`claim_pending_event` CAS-transitions a row `pending -> firing` and atomically
+persists `firing_at`, a deterministic occurrence id, a fresh invocation id, and
+`lease_expires_at`. Callers thread both `firing_at` and the invocation id through
+every receipt update, lease renewal, and `finalize_fired_event`; a stale claimant
+cannot match a later attempt even if timestamps collide. The pending claim still
+mirrors `schedule.cancel`'s CAS, so cancel and fire share one state machine.
 
-`reclaim_stale_firing_events` sweeps rows stuck in `firing` whose `firing_at`
-predates a staleness threshold, across all namespaces in one statement. Rows
-claimed by a pre-#462 binary (missing `firing_at` entirely) are treated as
-maximally stale and reclaimed unconditionally — there is no timestamp to
-compare against, and leaving them wedged forever is strictly worse.
+Immediately before polling the target action, `mark_dispatch_invoking` changes the
+receipt from `claimed` to `invoking`. The action has a separately spawned lease
+renewer that remains active through durable outcome persistence, so a handler that
+blocks its own async polling task cannot starve the lease and writer contention after
+the return cannot reopen an unleased outcome gap.
+`KHIVE_SCHEDULE_LEASE_SECS` is a positive seconds value (default/fallback 300), and
+renewal runs every one third of the lease. `finalize_fired_event` clears the active
+`firing_at`/`lease_expires_at` fields but retains the last receipt.
+Pre-invocation finalizations retain that same claim identity too: policy or payload
+refusals use `state="not_invoked"` with `completed_at` and a non-empty `error`, while
+grace-window skips use `state="missed"` with `completed_at` and `error=null`. These
+states prove that no target action future was polled; they are not dispatch outcomes.
+Missed reminders still resolve immutable creator provenance so their retained receipt is
+creator-attributed; only a genuinely legacy reminder without provenance uses the scheduler
+fallback.
+Recovery re-checks the current deadline and matches the exact serialized properties selected by
+its scan in every requeue, quarantine, and lifecycle-finalization CAS. A renewal, durable outcome,
+or any other intervening properties mutation therefore wins ownership instead of being overwritten
+from the scan's stale snapshot.
 
-`finalize_fired_event`'s terminal write clears `firing_at` — the event has
-reached its post-cycle state (`fired`, re-armed `pending`, `missed`, or
-identity-policy `failed`), so no claim token should survive to be mistaken for
-a live claim later.
+`reclaim_stale_firing_events` reconciles expired deadlines by durable state. A
+v1 receipt is fully validated before its state is interpreted: the version,
+occurrence/invocation UUIDs, actor encoding, integer `claimed_at` matching the active
+`firing_at`, and the occurrence UUIDv5 derived from the event id plus scheduled UTC
+instant are all required. `invoking` also requires `invocation_started_at`; terminal
+states require a valid `completed_at`, with `error=null` for `succeeded`/`missed` and a
+non-empty error for `failed`/`indeterminate`/`not_invoked`. A `claimed` occurrence
+atomically becomes `not_invoked` and returns to pending because invocation never began; this
+increments `retry_pending`/`finalized`, not `failed`, `invoked`, or `outcomes_persisted`. Valid `succeeded` or `failed`
+resumes finalization without invoking again; a failed one-shot remains pending, while
+a failed repeat advances normally. An expired `invoking`, malformed receipt, or
+completed pre-invocation receipt still attached to `status="firing"` becomes terminal
+`failed`/`indeterminate`, because replay could duplicate a side effect that committed
+before the claimant disappeared. The quarantine record retains the malformed source
+receipt under `invalid_receipt` for diagnosis. Pre-receipt rows retain the historical
+five-minute `firing_at` fallback.
+
+Action errors retain their original structured value in optional
+`dispatch_receipt.error_payload` alongside the readable `error` string. In particular,
+`side_effects_unknown` and other explicit ambiguous outcomes are persisted as terminal
+`indeterminate`, retaining correlation values such as `details.outbound_id`; a later drain does
+not replay them. Receipt validation rejects non-null action payloads for `claimed`, `invoking`,
+`succeeded`, `missed`, and `not_invoked`, while `failed` and `indeterminate` may carry one.
+Each expired-row requeue/quarantine/finalization write is row-local: a write error is logged and
+counted in `failed`, then recovery continues with the remaining rows and normal due-work scan.
+
+`DrainSummary` reports `invoked`, `outcomes_persisted`, and `finalized` separately,
+plus `retry_pending` and `indeterminate`. `fired`/`advanced` increment only after the
+corresponding CAS commits; finalization failure never decrements an unrelated prior
+counter.
 
 ## `discover_pending_namespaces` — offset-safe due-time comparison (PR #782)
 
@@ -163,6 +192,13 @@ guaranteed. `datetime(...)` normalizes both sides to UTC before comparing.
 The Rust layer downstream still re-parses and re-checks each candidate row
 with `DateTime<Utc>` as the final authority — the SQL predicate is a fetch
 bound, not the last word.
+
+## Executable recurrence boundary
+
+Creation accepts only `daily`, `weekly`, and `monthly`, exactly the forms
+`next_trigger_at` advances. Five-field cron is rejected instead of being stored
+and silently consumed as a one-shot. A legacy cron row fails closed before action
+invocation.
 
 ## `advance_repeat_past_missed` — no catch-up bursts (ADR-106 missed-event amendment)
 

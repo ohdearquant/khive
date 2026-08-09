@@ -81,10 +81,12 @@ impl std::fmt::Display for MailAddress {
 }
 
 /// A raw email fetched from the IMAP server before enrichment.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RawEmail {
     /// IMAP UID (opaque; used for message identification).
     pub uid: u32,
+    /// Byte-exact RFC 822 payload returned by IMAP for replay after quarantine.
+    pub raw_bytes: Vec<u8>,
     /// Stable dedup key: `imap:{host}:{uidvalidity}:{uid}`.
     ///
     /// Always set by the IMAP connector. Never empty. Used as the primary
@@ -122,6 +124,27 @@ pub struct RawEmail {
     /// whose `authserv-id` matches the configured trust anchor -- an MTA can
     /// legitimately stamp more than one hop's worth of this header.
     pub authentication_results: Vec<String>,
+}
+
+impl std::fmt::Debug for RawEmail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawEmail")
+            .field("uid", &self.uid)
+            .field("imap_external_id", &self.imap_external_id)
+            .field("raw_bytes_len", &self.raw_bytes.len())
+            .field("from_addrs_len", &self.from_addrs.len())
+            .field("to_len", &self.to.len())
+            .field("has_sender", &self.sender_addr.is_some())
+            .field("has_date", &self.date.is_some())
+            .field("has_text_body", &self.body_text.is_some())
+            .field("has_html_body", &self.body_html.is_some())
+            .field("header_count", &self.headers.len())
+            .field(
+                "authentication_results_count",
+                &self.authentication_results.len(),
+            )
+            .finish()
+    }
 }
 
 impl RawEmail {
@@ -163,5 +186,33 @@ impl RawEmail {
     /// Return the best available body text.
     pub fn best_body(&self) -> String {
         self.body_text.clone().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_email_debug_redacts_replay_and_message_content() {
+        let secret = "AKIAFAKEKEY1234567890";
+        let email = RawEmail {
+            uid: 7,
+            raw_bytes: secret.as_bytes().to_vec(),
+            imap_external_id: "imap:test:1:7".to_string(),
+            from_addrs: vec!["maintainer@example.com".to_string()],
+            sender_addr: None,
+            to: vec!["inbox@example.com".to_string()],
+            subject: secret.to_string(),
+            date: None,
+            body_text: Some(secret.to_string()),
+            body_html: None,
+            headers: HashMap::from([("authorization".to_string(), secret.to_string())]),
+            authentication_results: Vec::new(),
+        };
+
+        let rendered = format!("{email:?}");
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains(&format!("raw_bytes_len: {}", secret.len())));
     }
 }
