@@ -156,13 +156,21 @@ regardless of which task drives it.
 ## `forward_or_spawn` — the `None` contract (#644)
 
 Returns `None` only when nothing was ever written to the daemon and local
-dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or no daemon socket
-could be reached (`NoSocket`). It never returns `None` after the real frame
-has been written — `Some(Ok)`/`Some(Err)` both mean the request's fate is
-already decided at the daemon and the caller must not dispatch locally.
+dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or the socket is
+definitively absent/refused (`NoSocket`). A connect error that does not prove
+absence (`Unreachable`) returns `Some(Err)` immediately because the client
+cannot know whether a healthy daemon is serving other processes. It never
+returns `None` after the real frame has been written — `Some(Ok)`/`Some(Err)`
+both mean the caller must not dispatch locally.
 Under `KHIVE_DAEMON_STRICT=1`, the `NoSocket` case becomes `Some(Err(..))`
 instead (see `fallback_or_reject`) — `KHIVE_NO_DAEMON` itself is unaffected,
 since it is the caller's explicit, unconditional opt-out (nothing is ever
 recorded or counted for it). Once the real frame IS fully written
 (`ParseFailure`/`ProtocolMismatch`), this returns a hard error immediately
 instead of killing/respawning/retrying or falling back locally.
+
+Connection classification is intentionally narrow (#1242): `ENOENT` and
+`ECONNREFUSED` are `NoSocket`, preserving first-spawn and stale-socket
+self-heal. `EACCES`, `EPERM`, and every other indeterminate connect failure
+are `Unreachable`; they return the structured `daemon_unreachable` error and
+perform zero lifecycle actions in both strict and non-strict mode.
