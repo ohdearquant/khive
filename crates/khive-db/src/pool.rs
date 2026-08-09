@@ -1434,11 +1434,12 @@ mod tests {
         }
     }
 
-    const POOL_ENV_VARS: [&str; 7] = [
+    const POOL_ENV_VARS: [&str; 8] = [
         "KHIVE_BUSY_TIMEOUT_SECS",
         "KHIVE_CHECKOUT_TIMEOUT_SECS",
         "KHIVE_WAL_AUTOCHECKPOINT_PAGES",
         "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
+        "KHIVE_DB_DISK_RESERVE_BYTES",
         "KHIVE_WRITE_QUEUE",
         "KHIVE_WRITE_QUEUE_CAPACITY",
         "KHIVE_WRITE_ROUTING",
@@ -1496,6 +1497,145 @@ mod tests {
         );
         assert_eq!(cfg.busy_timeout, Duration::from_secs(30));
         assert_eq!(cfg.checkout_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.disk_reserve_bytes, DEFAULT_DISK_RESERVE_BYTES);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_disk_reserve_bytes() {
+        let _pool_env = clear_pool_env();
+        std::env::set_var("KHIVE_DB_DISK_RESERVE_BYTES", "123456789");
+        let cfg = PoolConfig::default();
+        assert_eq!(cfg.disk_reserve_bytes, 123_456_789);
+    }
+
+    #[test]
+    fn capacity_guard_refuses_pooled_and_standalone_writes_while_old_reader_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk-reserve-old-reader.db");
+        let seed = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            disk_reserve_bytes: 0,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        seed.try_writer()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE guarded_write (id INTEGER PRIMARY KEY);\
+                 INSERT INTO guarded_write (id) VALUES (1)",
+            )
+            .unwrap();
+
+        // Pin an old WAL snapshot exactly like the production incident. The
+        // deterministic constrained-volume model is a reserve no real disk
+        // can clear; unlike allocating until the host fills, this cannot eat
+        // CI or developer disk while proving the same admission boundary.
+        let old_reader = Connection::open_with_flags(&path, reader_open_flags()).unwrap();
+        old_reader.execute_batch("BEGIN DEFERRED").unwrap();
+        assert_eq!(
+            old_reader
+                .query_row("SELECT COUNT(*) FROM guarded_write", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        let constrained = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            disk_reserve_bytes: u64::MAX,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        for error in [
+            constrained.try_writer().err().expect("pooled guard must refuse"),
+            constrained
+                .open_standalone_writer()
+                .err()
+                .expect("standalone guard must refuse"),
+        ] {
+            match error {
+                SqliteError::DiskCapacityFloor {
+                    available_bytes,
+                    reserve_bytes,
+                    volume,
+                } => {
+                    assert!(available_bytes < reserve_bytes);
+                    assert_eq!(reserve_bytes, u64::MAX);
+                    assert!(volume.contains("disk-reserve-old-reader"));
+                }
+                other => panic!("expected DiskCapacityFloor, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            constrained.writer_acquisition_snapshot().acquisitions,
+            0,
+            "a reserve refusal happens before writer admission is counted"
+        );
+        old_reader.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_task_rechecks_capacity_before_begin_and_never_runs_refused_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk-reserve-writer-task.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: Some(true),
+                disk_reserve_bytes: u64::MAX,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let task = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("file-backed queue must spawn");
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_op = Arc::clone(&ran);
+        let error = task
+            .send(move |_conn| {
+                ran_in_op.store(true, Ordering::SeqCst);
+                Ok::<_, StorageError>(())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(!ran.load(Ordering::SeqCst));
+        match error {
+            StorageError::Driver {
+                capability,
+                operation,
+                source,
+            } => {
+                assert_eq!(capability, khive_storage::StorageCapability::Sql);
+                assert_eq!(operation, "writer_task_disk_reserve");
+                assert!(matches!(
+                    source.downcast_ref::<SqliteError>(),
+                    Some(SqliteError::DiskCapacityFloor {
+                        reserve_bytes: u64::MAX,
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected typed writer-task disk reserve error, got {other:?}"),
+        }
+        assert_eq!(pool.writer_acquisition_snapshot().acquisitions, 0);
+    }
+
+    #[test]
+    fn in_memory_pool_is_exempt_from_filesystem_capacity_guard() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            write_queue_enabled: Some(false),
+            disk_reserve_bytes: u64::MAX,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        assert!(pool.try_writer().is_ok());
     }
 
     #[test]

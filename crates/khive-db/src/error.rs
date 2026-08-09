@@ -49,3 +49,21 @@ pub enum SqliteError {
         error: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_full_is_a_distinct_escalation_class() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        );
+        assert!(is_sqlite_full(&error));
+        assert!(!is_sqlite_full(&rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("busy".to_string()),
+        )));
+    }
+}
