@@ -868,12 +868,6 @@ mod tests {
         }
     }
 
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn arm_parked_wake<F: Future>(
         mut future: Pin<&mut F>,
     ) -> (std_mpsc::Receiver<()>, std_mpsc::Sender<()>) {
@@ -892,8 +886,7 @@ mod tests {
     }
 
     fn poll_ready<F: Future>(mut future: Pin<&mut F>) -> F::Output {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         match future.as_mut().poll(&mut context) {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("reply wake must make the writer send ready"),
