@@ -40,6 +40,15 @@ writer-task acquisition class once per dequeued top-level request or successful
 `PoolConfig::write_queue_capacity` resolves the default from
 `KHIVE_WRITE_QUEUE_CAPACITY`).
 
+The lifetime connection open is deliberately not the capacity decision for
+later work. Immediately before either top-level dispatch or `BEGIN
+IMMEDIATE`, the drain loop samples the pool's shared SQLite disk reserve. A
+refused request receives a typed `writer_task_disk_reserve` driver error, its
+closure never runs, no transaction/registry span opens, and the task remains
+healthy so work may resume after an operator restores capacity. This fresh
+per-request sample closes the queue-delay race where free space can disappear
+after task startup or while a request waits behind earlier writes.
+
 ## `run_writer_task` — drain loop and failure modes
 
 See `crates/khive-db/src/writer_task.rs` — private fn `run_writer_task`.

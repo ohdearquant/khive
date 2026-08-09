@@ -176,7 +176,7 @@ fn current_failpoint() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> 
 }
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Vectors, op, e)
+    crate::error::storage_driver_error(StorageCapability::Vectors, op, e)
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {

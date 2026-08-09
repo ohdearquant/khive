@@ -489,6 +489,7 @@ expressed in the former, page-count, unit.
 | `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`  | 20000   | 2     | WAL page count that arms a TRUNCATE attempt                                                                                                                                    | Carried over                                    |
 | `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS` | 300     | 2     | Minimum spacing between successful TRUNCATE attempts                                                                                                                           | Carried over                                    |
 | `KHIVE_WAL_TRUNCATE_BUSY_MS`           | 2000    | 2     | Temporary busy_timeout override during a TRUNCATE attempt                                                                                                                      | Carried over                                    |
+| `KHIVE_DB_DISK_RESERVE_BYTES`          | 1 GiB   | 3     | Refuse file-backed writes before consuming the recovery reserve; `0` explicitly disables                                                                                       | Implemented — see Amendment 7                   |
 
 Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES` (2000),
 `KHIVE_WAL_HIGH_WATER_PAGES` (6000), `KHIVE_JOURNAL_SIZE_LIMIT_BYTES` (64MiB),
@@ -1207,3 +1208,48 @@ invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
 `sidecar_entries_cleanup_would_reap` members are optional and omitted when enumeration did not
 run. A background checkpoint tick may independently perform its normal cleanup, but the
 diagnostic request itself never converts an unmeasured value into a clean-looking zero.
+
+### 2026-08-09 amendment (Amendment 7): pre-write disk recovery reserve
+
+**Motivation.** A long-lived reader can prevent checkpoint backfill while
+writers continue appending WAL frames. Previously khive admitted writes until
+SQLite itself returned `SQLITE_FULL`; at that point there was no guaranteed
+headroom for rollback, diagnostics, or terminating the pinning reader (#1844).
+Disk exhaustion is not lock contention and must not share busy/timeout
+telemetry.
+
+**Decision.** Every read-write file-backed `ConnectionPool` owns a recovery
+reserve, configured by `KHIVE_DB_DISK_RESERVE_BYTES` and defaulting to one GiB.
+Zero explicitly disables the guard for disposable scratch databases.
+Available space is sampled from the database filesystem before first-open
+creation/write-intent configuration, after a pooled writer mutex acquisition,
+before a tracked standalone writer open, at every raw-SQL logical write call,
+and immediately before each writer-task request runs or opens `BEGIN
+IMMEDIATE`. A sample at or below the reserve refuses the operation before SQL
+execution with typed `SqliteError::DiskCapacityFloor`; the writer operation is
+not counted as acquired, and a writer task stays healthy for later work after
+capacity recovers.
+
+Infrastructure connections remain deliberately available under pressure:
+the dedicated checkpoint and diagnostic opens use the untracked seam. They
+must not become request-DML bypasses. The writer task rechecks every request,
+while checkpoint/diagnostics retain their recovery/read-only contracts.
+In-memory and read-only pools have no writable filesystem volume and are
+exempt.
+
+**Wire and escalation.** The MCP error is a non-timeout
+`kind="resource_exhausted"`, `code/stage="sqlite_disk_reserve"` object carrying
+the volume, available bytes, reserve bytes, optional capability/operation,
+`retryable=true`, and null timeout/retry-after fields. If SQLite nonetheless
+returns primary result code `SQLITE_FULL`, the common store/SQL-bridge and
+writer-transaction mapping paths ensure an ERROR-class escalation is emitted.
+It is never recorded as an ordinary writer checkout, queue, busy, or lock
+timeout.
+
+**Residual boundary.** The sample cannot reserve bytes atomically at the
+filesystem. An admitted transaction larger than the headroom or a concurrent
+external process can consume capacity after the sample; operators must size
+the reserve above the largest expected in-flight write. Until ADR-150's
+single-owner topology lands, independent khive processes can also sample the
+same free bytes concurrently. The guard limits blast radius and preserves
+recovery headroom under normal operation; it is not a filesystem quota.

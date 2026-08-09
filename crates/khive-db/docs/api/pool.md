@@ -21,6 +21,42 @@ writer task would let concurrent migrated stores over the same pool spawn
 independent writer connections that contend with each other at `BEGIN
 IMMEDIATE`, defeating the point of ADR-067 Component A.
 
+## File-backed write-capacity reserve
+
+Every read-write file pool owns one immutable `WriteCapacityGuard`. The
+default `KHIVE_DB_DISK_RESERVE_BYTES=1073741824` retains one GiB on the
+database volume; `0` is an explicit opt-out for disposable scratch stores.
+The guard takes a fresh `fs4::available_space` sample before first-open
+creation/write-intent PRAGMAs, after acquiring the pooled writer mutex, before
+a tracked standalone writer open, and before every dequeued writer-task
+request. Raw SQL writer methods also sample at their logical call boundary, so
+a long-lived boxed handle cannot rely solely on its connection-open sample.
+
+A sample at or below the reserve returns typed
+`SqliteError::DiskCapacityFloor` before SQLite executes the write. It does not
+increment writer-acquisition counters and is not a busy/lock/timeout result.
+The MCP wire form is `kind="resource_exhausted"`,
+`code="sqlite_disk_reserve"`, with `available_bytes`, `reserve_bytes`, and no
+fabricated timeout or retry-after value.
+
+With a nonzero reserve, the configured database must be a filesystem path.
+`file:` SQLite URIs are rejected rather than probing a guessed/decoded path;
+use the equivalent filesystem path. A URI remains available only when the
+caller explicitly disables the guard for a disposable store.
+
+The check is an admission snapshot, not a filesystem quota. One very large
+transaction or an external process can consume capacity after sampling; size
+the reserve above the largest expected in-flight transaction. Until the
+single-owner topology in ADR-150 lands, independent processes can also pass
+simultaneous samples. If SQLite nevertheless returns `SQLITE_FULL`, khive logs
+an ERROR-class escalation at the SQLite mapping/transaction boundary;
+that event is never flattened into ordinary timeout telemetry.
+
+Infrastructure-only `open_standalone_writer_untracked` remains unguarded so a
+checkpoint/diagnostic connection can exist under pressure. Those connections
+must not issue request DML: the writer task rechecks before every request, and
+checkpoint/diagnostics retain their read/recovery-only contracts.
+
 ## Test coverage notes
 
 ### `writer_guard_transaction_registers_during_closure_only`

@@ -129,7 +129,7 @@ pub(crate) fn ensure_fts5_schema(
 }
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Text, op, e)
+    crate::error::storage_driver_error(StorageCapability::Text, op, e)
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {

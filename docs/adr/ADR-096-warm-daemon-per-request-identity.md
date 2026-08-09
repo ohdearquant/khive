@@ -352,7 +352,8 @@ This ADR is accepted with the following binding conditions:
 ADR-096 Fork 1 makes the daemon request frame the authority for request identity. Therefore
 `config_id` is an engine-coherence key only: it covers the pack set, database target, primary and
 additional embedding models, construction-baked ADR-118 fresh-tail serving policy, backend
-topology/routing, and construction-baked outbound policy.
+topology/routing, construction-baked SQLite recovery-reserve policy, and construction-baked
+outbound policy.
 
 Identity-derived fields are excluded from `config_id`: `namespace`, `actor_id`, and
 `visible_namespaces`, including the actor namespace that ADR-007 Rev 4 folds into
@@ -367,6 +368,12 @@ with a broader outbound allowlist.
 The ADR-118 fresh-tail policy is likewise part of `config_id`: it is sampled when each
 `KhiveRuntime` is constructed and is not carried per request. Runtimes with opposite policies
 must not share a warm daemon because they provide different committed-write visibility guarantees.
+
+The SQLite recovery reserve is also part of `config_id`: a client requiring a
+nonzero `KHIVE_DB_DISK_RESERVE_BYTES` floor must not reuse a warm daemon whose
+pool was constructed with a smaller or disabled floor. Runtime-owning
+fingerprints use the pool's captured value rather than re-reading the
+environment after construction.
 
 ---
 

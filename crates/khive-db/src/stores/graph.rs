@@ -28,7 +28,7 @@ use crate::writer_task::WriterTaskHandle;
 
 /// Map a rusqlite error to `StorageError` with `Graph` capability.
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Graph, op, e)
+    crate::error::storage_driver_error(StorageCapability::Graph, op, e)
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {

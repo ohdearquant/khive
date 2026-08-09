@@ -25,6 +25,10 @@ pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
 /// ADR-131-defined scope and carries `None`).
 pub const WRITER_ADMISSION_SCOPE: &str = "writer_admission";
 
+/// Stable non-timeout code/stage for a write refused by the SQLite recovery
+/// reserve before execution (#1844).
+pub const SQLITE_DISK_RESERVE_STAGE: &str = "sqlite_disk_reserve";
+
 /// Structured context for a pre-execution write-admission failure: either a
 /// finite-wait pooled writer checkout timeout or a bounded write-queue
 /// enqueue timeout. Both happen before SQLite executes the request, so both
@@ -54,6 +58,25 @@ pub struct AdmissionFailureContext {
     /// `Some(timeout_ms)` for [`WRITER_QUEUE_SATURATED_STAGE`]; `None`
     /// otherwise.
     pub retry_after_ms: Option<u64>,
+}
+
+/// Structured, typed context for an SQLite volume-capacity admission
+/// refusal. Kept separate from [`AdmissionFailureContext`] because no timeout
+/// elapsed and no retry-after duration can honestly be inferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskCapacityContext {
+    /// Stable wire stage/code, [`SQLITE_DISK_RESERVE_STAGE`].
+    pub stage: &'static str,
+    /// Canonical database path identifying the affected filesystem volume.
+    pub volume: String,
+    /// Fresh available-space sample at refusal time.
+    pub available_bytes: u64,
+    /// Configured recovery reserve that the sample did not clear.
+    pub reserve_bytes: u64,
+    /// Storage capability wrapping the SQLite refusal, when known.
+    pub capability: Option<khive_storage::StorageCapability>,
+    /// Storage operation wrapping the SQLite refusal, when known.
+    pub operation: Option<String>,
 }
 
 /// Typed disposition for a channel message whose `comm.ingest` write failed.
@@ -397,7 +420,7 @@ impl RuntimeError {
     /// permanent: every other variant starts in the bounded `Unknown` bucket.
     pub fn channel_ingest_failure_class(&self) -> ChannelIngestFailureClass {
         let reason = self.variant_name();
-        if self.admission_failure_context().is_some() {
+        if self.admission_failure_context().is_some() || self.disk_capacity_context().is_some() {
             ChannelIngestFailureClass::Retryable { reason }
         } else if matches!(self, Self::SecretDetected(_)) {
             ChannelIngestFailureClass::Permanent { reason }
@@ -501,6 +524,41 @@ impl RuntimeError {
             });
         }
         None
+    }
+
+    /// Recover a pre-execution SQLite recovery-reserve refusal without
+    /// parsing display strings. Direct pool errors and store/queue driver
+    /// wrappers preserve the same typed source.
+    pub fn disk_capacity_context(&self) -> Option<DiskCapacityContext> {
+        let (sqlite_error, capability, operation) = match self {
+            Self::Sqlite(error) => (error, None, None),
+            Self::Storage(khive_storage::StorageError::Driver {
+                capability,
+                operation,
+                source,
+            }) => (
+                source.downcast_ref::<khive_db::SqliteError>()?,
+                Some(*capability),
+                Some(operation.to_string()),
+            ),
+            _ => return None,
+        };
+        let khive_db::SqliteError::DiskCapacityFloor {
+            volume,
+            available_bytes,
+            reserve_bytes,
+        } = sqlite_error
+        else {
+            return None;
+        };
+        Some(DiskCapacityContext {
+            stage: SQLITE_DISK_RESERVE_STAGE,
+            volume: volume.clone(),
+            available_bytes: *available_bytes,
+            reserve_bytes: *reserve_bytes,
+            capability,
+            operation,
+        })
     }
 }
 
@@ -606,5 +664,34 @@ mod channel_ingest_failure_class_tests {
             },
             "a rendered message resembling SecretDetected must remain Unknown unless its typed variant is SecretDetected"
         );
+    }
+
+    #[test]
+    fn disk_reserve_refusal_is_typed_retryable_without_timeout_semantics() {
+        let retryable = RuntimeError::Storage(khive_storage::StorageError::driver(
+            khive_storage::StorageCapability::Notes,
+            "append_note",
+            khive_db::SqliteError::DiskCapacityFloor {
+                volume: "/data/khive.db".to_string(),
+                available_bytes: 99,
+                reserve_bytes: 100,
+            },
+        ));
+
+        assert_eq!(
+            retryable.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Retryable { reason: "Storage" }
+        );
+        let context = retryable
+            .disk_capacity_context()
+            .expect("typed reserve context must survive the storage wrapper");
+        assert_eq!(context.stage, "sqlite_disk_reserve");
+        assert_eq!(context.available_bytes, 99);
+        assert_eq!(context.reserve_bytes, 100);
+        assert_eq!(
+            context.capability,
+            Some(khive_storage::StorageCapability::Notes)
+        );
+        assert_eq!(context.operation.as_deref(), Some("append_note"));
     }
 }

@@ -20,7 +20,7 @@ use crate::pool::ConnectionPool;
 use crate::writer_task::WriterTaskHandle;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Sparse, op, e)
+    crate::error::storage_driver_error(StorageCapability::Sparse, op, e)
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {

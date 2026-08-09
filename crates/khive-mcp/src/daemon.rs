@@ -213,6 +213,7 @@ struct ConfigIdFields<'a> {
     embed: &'a str,
     extra: &'a str,
     fresh_tail: &'a str,
+    disk_reserve: &'a str,
     backend: &'a str,
     outbound: &'a str,
     git_write: &'a str,
@@ -236,6 +237,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
     let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
     let outbound = outbound.strip_suffix(']')?;
     let (rest, backend) = rest.rsplit_once(";backend=")?;
+    let (rest, disk_reserve) = rest.rsplit_once(";disk_reserve=")?;
     let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
     let (rest, extra) = rest.rsplit_once(";extra=[")?;
     let extra = extra.strip_suffix(']')?;
@@ -247,6 +249,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         embed,
         extra,
         fresh_tail,
+        disk_reserve,
         backend,
         outbound,
         git_write,
@@ -273,6 +276,8 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "extra"
     } else if client.fresh_tail != daemon.fresh_tail {
         "fresh_tail"
+    } else if client.disk_reserve != daemon.disk_reserve {
+        "disk_reserve"
     } else if client.backend != daemon.backend {
         "backend"
     } else if client.outbound != daemon.outbound {
@@ -2635,9 +2640,9 @@ mod tests {
     #[test]
     fn first_config_mismatch_field_follows_fingerprint_order() {
         let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];fresh_tail=true;\
-                      backend=main;outbound=[];git_write=client-policy";
+                      disk_reserve=1073741824;backend=main;outbound=[];git_write=client-policy";
         let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];fresh_tail=true;\
-                      backend=main;outbound=[];git_write=daemon-policy";
+                      disk_reserve=1073741824;backend=main;outbound=[];git_write=daemon-policy";
 
         assert_eq!(first_config_mismatch_field(client, Some(daemon)), "packs");
     }
@@ -2669,9 +2674,27 @@ mod tests {
     }
 
     #[test]
+    fn first_config_mismatch_field_names_disk_reserve_from_computed_ids() {
+        let config = RuntimeConfig::no_embeddings();
+        let guarded = crate::server::compute_config_id_with_storage_policies(
+            &config,
+            None,
+            true,
+            1_073_741_824,
+        );
+        let disabled =
+            crate::server::compute_config_id_with_storage_policies(&config, None, true, 0);
+
+        assert_eq!(
+            first_config_mismatch_field(&guarded, Some(&disabled)),
+            "disk_reserve"
+        );
+    }
+
+    #[test]
     fn first_config_mismatch_field_names_backend_topology_without_values() {
-        let base = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;backend=main;\
-                    outbound=[];git_write=policy";
+        let base = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;\
+                    disk_reserve=1073741824;backend=main;outbound=[];git_write=policy";
         let client =
             format!("{base};backends=[main:Sqlite:/private/client.db];pack_backends=[kg=main]");
         let daemon =
@@ -2689,10 +2712,10 @@ mod tests {
         reset_fallback_counters();
         let client =
             "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];fresh_tail=true;\
-                      backend=main;outbound=[];git_write=same-policy";
+                      disk_reserve=1073741824;backend=main;outbound=[];git_write=same-policy";
         let daemon =
             "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];fresh_tail=true;\
-                      backend=main;outbound=[];git_write=same-policy";
+                      disk_reserve=1073741824;backend=main;outbound=[];git_write=same-policy";
         let response = DaemonResponseFrame {
             ok: false,
             result: None,

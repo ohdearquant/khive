@@ -364,6 +364,13 @@ impl KhiveRuntime {
         self.ann_fresh_tail_enabled
     }
 
+    /// Return the immutable SQLite recovery reserve captured by this
+    /// runtime's backend pool. Warm-daemon fingerprinting uses this value so
+    /// a later environment mutation cannot change the advertised policy.
+    pub fn disk_reserve_bytes(&self) -> u64 {
+        self.backend.pool().config().disk_reserve_bytes
+    }
+
     /// Override ADR-118's fresh-tail serving policy for this runtime instance.
     ///
     /// This is primarily useful for embedded runtimes and deterministic tests:

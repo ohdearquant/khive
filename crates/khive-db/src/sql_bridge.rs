@@ -492,7 +492,7 @@ fn execute_query_page(
 
 /// Map a rusqlite error to `StorageError`.
 fn map_rusqlite_err(e: rusqlite::Error, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Sql, op, e)
+    crate::error::storage_driver_error(StorageCapability::Sql, op, e)
 }
 
 async fn acquire_handle_slot(
@@ -735,6 +735,12 @@ struct SqliteWriter {
 }
 
 impl SqliteWriter {
+    fn check_write_capacity(&self, operation: &'static str) -> Result<(), StorageError> {
+        self.pool
+            .check_write_capacity()
+            .map_err(|error| StorageError::driver(StorageCapability::Sql, operation, error))
+    }
+
     /// Return the open handle if present, else lazily open a standalone
     /// **read-only** handle now. See the `handle` field doc comment for when
     /// this lazy path is reached — it is only reached from the `SqlReader`
@@ -878,6 +884,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<u64> {
+        self.check_write_capacity("sql_bridge.execute.disk_reserve")?;
         // ADR-067 Component A (Fork C slice 2): a single statement is
         // self-contained, just like `execute_batch`'s full statement list —
         // transaction-control rejection remains an `execute_batch` contract;
@@ -930,6 +937,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         statements: Vec<SqlStatement>,
     ) -> khive_storage::types::StorageResult<u64> {
+        self.check_write_capacity("sql_bridge.execute_batch.disk_reserve")?;
         // ADR-067 Component A: this call is self-contained (the full statement
         // list is supplied up front and the whole thing commits or rolls back
         // as one unit) — unlike `writer()`'s live incrementally-driven handle,
@@ -974,6 +982,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
         self.handle = handle;
         result.map_err(|failure| {
+            crate::error::log_sqlite_full("execute_batch", &failure.error);
             crate::timeout_sink::maybe_emit_busy(
                 &self.db,
                 crate::timeout_sink::Site::StandaloneSqlBridge,
@@ -994,6 +1003,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
+        self.check_write_capacity("sql_bridge.execute_script.disk_reserve")?;
         // ADR-067 Component A (Fork C slice 2): the script text is
         // self-contained (supplied up front, runs as one unit), just like
         // `execute_batch` — route it through the writer task when
@@ -1040,6 +1050,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         script: String,
     ) -> khive_storage::types::StorageResult<()> {
+        self.check_write_capacity("sql_bridge.execute_script_top_level.disk_reserve")?;
         // Boundary: this internal maintenance/migration path deliberately
         // bypasses the `execute_batch` transaction-control rejection.
         // ADR-067 Component A: unlike
@@ -1726,6 +1737,9 @@ impl khive_storage::SqlAccess for SqlBridge {
                     message: "backend is read-only".into(),
                 });
             }
+            self.pool.check_write_capacity().map_err(|error| {
+                StorageError::driver(StorageCapability::Sql, "atomic_unit.disk_reserve", error)
+            })?;
             // Best-effort, same guard `writer()` uses: `Ok(None)` on flag-off;
             // `Err(WriterTaskNoRuntime)` propagates loud rather than silently
             // falling back to a competing connection from a sync caller. ADR-136
@@ -2049,6 +2063,66 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_standalone_writer_rechecks_disk_reserve_on_every_write_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("retained-writer-disk-reserve.db")),
+                write_queue_enabled: Some(false),
+                disk_reserve_bytes: 1,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut writer = bridge.writer().await.unwrap();
+        khive_storage::SqlWriter::execute_script(
+            &mut *writer,
+            "CREATE TABLE capacity_call (id INTEGER PRIMARY KEY)".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // The handle and its RW connection predate this capacity change. A
+        // connection-open-only guard would incorrectly let the INSERT run.
+        pool.force_available_bytes_for_test(0);
+        let error = khive_storage::SqlWriter::execute(
+            &mut *writer,
+            SqlStatement {
+                sql: "INSERT INTO capacity_call (id) VALUES (1)".to_string(),
+                params: vec![],
+                label: Some("capacity-refused".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Driver { ref source, .. }
+                if matches!(
+                    source.downcast_ref::<SqliteError>(),
+                    Some(SqliteError::DiskCapacityFloor {
+                        available_bytes: 0,
+                        reserve_bytes: 1,
+                        ..
+                    })
+                )
+        ));
+
+        pool.force_available_bytes_for_test(2);
+        khive_storage::SqlWriter::execute(
+            &mut *writer,
+            SqlStatement {
+                sql: "INSERT INTO capacity_call (id) VALUES (1)".to_string(),
+                params: vec![],
+                label: Some("capacity-recovered".to_string()),
+            },
+        )
+        .await
+        .expect("capacity recovery must not poison a retained writer handle");
     }
 
     #[test]

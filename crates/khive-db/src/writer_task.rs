@@ -46,7 +46,7 @@ use tokio::sync::{mpsc, oneshot};
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 
 use crate::error::SqliteError;
-use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
+use crate::pool::{ConnectionPool, WriteCapacityGuard, WriterAcquisitionCounters};
 
 /// Closure signature for a write operation executed against the writer
 /// task's dedicated connection.
@@ -168,6 +168,7 @@ fn rollback_after_failure(conn: &Connection, failure_context: &'static str) -> R
             RollbackDisposition::SideEffectsUnknown
         }
         Err(rollback_error) => {
+            crate::error::log_sqlite_full("writer_task_rollback", &rollback_error);
             tracing::error!(
                 error = %rollback_error,
                 failure_context,
@@ -203,24 +204,28 @@ where
                     Some(request_state),
                 )
             }
-            Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
-                RollbackDisposition::RolledBack => (
-                    Err(StorageError::Pool {
-                        operation: commit_operation.into(),
-                        message: commit_error.to_string(),
-                    }),
-                    None,
-                ),
-                RollbackDisposition::SideEffectsUnknown => {
-                    let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                    (
-                        Err(writer_task_terminated(request_state)),
-                        Some(request_state),
-                    )
+            Err(commit_error) => {
+                crate::error::log_sqlite_full(commit_operation, &commit_error);
+                match rollback_after_failure(conn, "commit failure") {
+                    RollbackDisposition::RolledBack => (
+                        Err(StorageError::Pool {
+                            operation: commit_operation.into(),
+                            message: commit_error.to_string(),
+                        }),
+                        None,
+                    ),
+                    RollbackDisposition::SideEffectsUnknown => {
+                        let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                        (
+                            Err(writer_task_terminated(request_state)),
+                            Some(request_state),
+                        )
+                    }
                 }
-            },
+            }
         },
         Ok(Err(operation_error)) => {
+            crate::error::log_storage_sqlite_full("writer_task_operation", &operation_error);
             match rollback_after_failure(conn, "request operation failure") {
                 RollbackDisposition::RolledBack => (Err(operation_error), None),
                 RollbackDisposition::SideEffectsUnknown => {
@@ -278,6 +283,9 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             Ok(outcome) if conn.is_autocommit() => {
                 // No COMMIT/ROLLBACK here: this request explicitly did not
                 // open a transaction, so there is nothing to close.
+                if let Err(error) = &outcome {
+                    crate::error::log_storage_sqlite_full("writer_task_top_level_operation", error);
+                }
                 let _ = reply.send(outcome);
                 None
             }
@@ -627,6 +635,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     // ownership boundary instead.
     let conn = pool.open_standalone_writer_untracked()?;
     let acquisition_counters = pool.writer_acquisition_counters();
+    let write_capacity_guard = pool.write_capacity_guard();
     let origin = pool.origin();
     let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
@@ -636,6 +645,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
         origin,
         db.clone(),
         acquisition_counters,
+        write_capacity_guard,
     ));
     // Stored on the pool (not returned) so the handle's clone-and-share
     // contract stays untouched; see ConnectionPool::take_writer_task_join
@@ -684,10 +694,12 @@ async fn run_writer_task(
     origin: khive_storage::tx_registry::TxOrigin,
     db: String,
     acquisition_counters: Arc<WriterAcquisitionCounters>,
+    write_capacity_guard: Arc<WriteCapacityGuard>,
 ) {
     while let Some(request) = rx.recv().await {
         let origin = origin.clone();
         let acquisition_counters = Arc::clone(&acquisition_counters);
+        let write_capacity_guard = Arc::clone(&write_capacity_guard);
         let outcome = tokio::task::spawn_blocking(move || {
             // A top-level request deliberately skips BEGIN, so it would
             // silently join any transaction leaked by an earlier request.
@@ -701,6 +713,21 @@ async fn run_writer_task(
                 let request_state = WriterTaskRequestState::NotStarted;
                 request.reply_error(writer_task_terminated(request_state));
                 return (conn, Some(request_state));
+            }
+
+            // Admission is checked for every dequeued request, not merely
+            // when this task's lifetime connection was opened. A request can
+            // sit behind older work while another process consumes the last
+            // headroom; sampling here keeps the refusal immediately before
+            // top-level dispatch / BEGIN IMMEDIATE. Capacity recovery leaves
+            // the task healthy, so a later queued request may succeed.
+            if let Err(error) = write_capacity_guard.check() {
+                request.reply_error(StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "writer_task_disk_reserve",
+                    error,
+                ));
+                return (conn, None);
             }
 
             let terminal_state = if request.is_top_level() {
@@ -728,6 +755,7 @@ async fn run_writer_task(
                         )
                     }
                     Err(e) => {
+                        crate::error::log_sqlite_full("writer_task_begin", &e);
                         // Do NOT run the request's operation: `conn` never
                         // entered a transaction, so executing the op's DML
                         // here would run in autocommit mode and land partial

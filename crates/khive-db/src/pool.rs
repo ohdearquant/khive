@@ -24,6 +24,114 @@ const DEFAULT_READER_CAP: usize = 8;
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
+/// Default recovery headroom retained on every file-backed SQLite volume.
+/// One GiB is intentionally large enough for rollback/WAL diagnostics and
+/// operator action without becoming host-size-specific. Set the documented
+/// environment override to `0` only for deliberately disposable scratch DBs.
+const DEFAULT_DISK_RESERVE_BYTES: u64 = 1_073_741_824;
+
+/// Immutable per-pool filesystem admission authority shared with the
+/// lifetime writer task and every direct writer seam.
+#[derive(Debug)]
+pub(crate) struct WriteCapacityGuard {
+    database_path: Option<PathBuf>,
+    probe_path: Option<PathBuf>,
+    reserve_bytes: u64,
+    #[cfg(test)]
+    available_override: AtomicU64,
+}
+
+impl WriteCapacityGuard {
+    fn new(config: &PoolConfig) -> Result<Self, SqliteError> {
+        let active_path = if config.read_only || config.disk_reserve_bytes == 0 {
+            None
+        } else {
+            config.path.as_deref()
+        };
+        let (database_path, probe_path) = match active_path {
+            Some(path) => {
+                if path
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file:"))
+                {
+                    return Err(SqliteError::InvalidConfig(
+                        "KHIVE_DB_DISK_RESERVE_BYTES requires a filesystem database path; \
+                         SQLite file: URIs are ambiguous at the filesystem admission boundary \
+                         (use the equivalent filesystem path, or set the reserve to 0 only for \
+                         a disposable scratch database)"
+                            .to_string(),
+                    ));
+                }
+                let canonical = canonicalize_deepest_existing(path)?;
+                let mut probe = canonical.parent();
+                let existing_probe = loop {
+                    let Some(candidate) = probe else {
+                        break None;
+                    };
+                    if candidate.exists() {
+                        break Some(candidate.to_path_buf());
+                    }
+                    probe = candidate.parent();
+                };
+                let probe = existing_probe.ok_or_else(|| {
+                    SqliteError::InvalidData(format!(
+                        "cannot locate an existing filesystem ancestor for sqlite capacity \
+                         probe at {}",
+                        canonical.display()
+                    ))
+                })?;
+                (Some(canonical), Some(probe))
+            }
+            None => (None, None),
+        };
+        Ok(Self {
+            database_path,
+            probe_path,
+            reserve_bytes: config.disk_reserve_bytes,
+            #[cfg(test)]
+            available_override: AtomicU64::new(u64::MAX),
+        })
+    }
+
+    /// Take a fresh filesystem sample at a logical write-admission boundary.
+    /// A reserve of zero, an in-memory pool, and a read-only pool are inert.
+    pub(crate) fn check(&self) -> Result<(), SqliteError> {
+        let (Some(database_path), Some(probe_path)) =
+            (self.database_path.as_deref(), self.probe_path.as_deref())
+        else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        let override_bytes = self.available_override.load(Ordering::Acquire);
+        #[cfg(test)]
+        let available = if override_bytes != u64::MAX {
+            override_bytes
+        } else {
+            fs4::available_space(probe_path)?
+        };
+        #[cfg(not(test))]
+        let available = fs4::available_space(probe_path)?;
+
+        // Equality refuses too: any positive admitted write would otherwise
+        // consume the first byte of the recovery reserve.
+        if available <= self.reserve_bytes {
+            return Err(SqliteError::DiskCapacityFloor {
+                volume: database_path.display().to_string(),
+                available_bytes: available,
+                reserve_bytes: self.reserve_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn force_available_bytes(&self, available_bytes: u64) {
+        self.available_override
+            .store(available_bytes, Ordering::Release);
+    }
+}
 
 fn deny_retired_writer(_context: AuthContext<'_>) -> Authorization {
     Authorization::Deny
@@ -126,6 +234,13 @@ pub struct PoolConfig {
     ///
     /// Overridable via `KHIVE_WRITE_ADMISSION_DEADLINE_MS`.
     pub write_admission_deadline_ms: u64,
+    /// Minimum free bytes retained on the database volume before admitting a
+    /// file-backed write. A fresh check runs before first-open configuration,
+    /// pool/standalone writer acquisition, and every writer-task request.
+    /// `0` disables the guard for explicitly disposable scratch databases.
+    ///
+    /// Overridable via `KHIVE_DB_DISK_RESERVE_BYTES`. Default: 1 GiB.
+    pub disk_reserve_bytes: u64,
 }
 
 /// ADR-131 Decision 2's validated range for `write_admission_deadline_ms`.
@@ -182,6 +297,10 @@ impl Default for PoolConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_WRITE_ADMISSION_DEADLINE_MS),
+            disk_reserve_bytes: std::env::var("KHIVE_DB_DISK_RESERVE_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_DISK_RESERVE_BYTES),
         }
     }
 }
@@ -316,6 +435,7 @@ pub struct ConnectionPool {
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
+    write_capacity_guard: Arc<WriteCapacityGuard>,
     sql_bridge_reader_slots: Arc<Semaphore>,
     sql_bridge_writer_slots: Arc<Semaphore>,
     /// The pool-wide ADR-067 Component A writer task, spawned lazily and at
@@ -408,6 +528,7 @@ impl<'pool> Drop for ReaderGuard<'pool> {
 /// The Mutex ensures only one writer at a time.
 pub struct WriterGuard<'pool> {
     guard: parking_lot::MutexGuard<'pool, Connection>,
+    write_capacity_guard: Arc<WriteCapacityGuard>,
     /// The origin (ADR-091 backend-scoped attribution) of the pool this
     /// guard was checked out from, carried so `transaction` can register its
     /// span with the correct origin without holding a `&ConnectionPool`.
@@ -488,6 +609,7 @@ impl<'pool> WriterGuard<'pool> {
     where
         F: FnOnce(&Connection) -> Result<R, SqliteError>,
     {
+        self.write_capacity_guard.check()?;
         self.guard.execute_batch("BEGIN IMMEDIATE")?;
         let _tx_handle = khive_storage::tx_registry::register_scoped(
             Some("writer_guard_tx".to_string()),
@@ -497,13 +619,18 @@ impl<'pool> WriterGuard<'pool> {
         match f(&self.guard) {
             Ok(result) => {
                 if let Err(err) = self.guard.execute_batch("COMMIT") {
-                    let _ = self.guard.execute_batch("ROLLBACK");
+                    crate::error::log_sqlite_full("writer_guard_commit", &err);
+                    if let Err(rollback_error) = self.guard.execute_batch("ROLLBACK") {
+                        crate::error::log_sqlite_full("writer_guard_rollback", &rollback_error);
+                    }
                     return Err(err.into());
                 }
                 Ok(result)
             }
             Err(err) => {
-                let _ = self.guard.execute_batch("ROLLBACK");
+                if let Err(rollback_error) = self.guard.execute_batch("ROLLBACK") {
+                    crate::error::log_sqlite_full("writer_guard_rollback", &rollback_error);
+                }
                 Err(err)
             }
         }
@@ -551,6 +678,12 @@ impl ConnectionPool {
             );
         }
 
+        // This first sample precedes `SQLITE_OPEN_CREATE` and write-intent
+        // PRAGMAs such as `journal_mode=WAL`, so a constrained first open
+        // leaves no empty database/WAL/SHM residue behind.
+        let write_capacity_guard = Arc::new(WriteCapacityGuard::new(&config)?);
+        write_capacity_guard.check()?;
+
         let writer = open_writer_connection(&config)?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
@@ -572,6 +705,7 @@ impl ConnectionPool {
             readers,
             max_readers,
             config,
+            write_capacity_guard,
             sql_bridge_reader_slots: Arc::new(Semaphore::new(max_readers.max(1))),
             sql_bridge_writer_slots: Arc::new(Semaphore::new(1)),
             writer_task: OnceLock::new(),
@@ -695,11 +829,15 @@ impl ConnectionPool {
             });
         };
         self.ensure_pooled_writer_active()?;
+        // Sample only after the process-local mutex is ours so concurrent
+        // checkouts in this pool cannot all pass one stale snapshot.
+        self.write_capacity_guard.check()?;
         self.writer_acquisition_counters
             .pooled_acquisitions
             .fetch_add(1, Ordering::Relaxed);
         Ok(WriterGuard {
             guard,
+            write_capacity_guard: Arc::clone(&self.write_capacity_guard),
             origin: self.origin(),
         })
     }
@@ -728,8 +866,14 @@ impl ConnectionPool {
             )
         })?;
         self.ensure_pooled_writer_active()?;
+        // A zero-wait checkout is still a general writer admission boundary.
+        // The dedicated checkpoint/diagnostics recovery connections use the
+        // explicitly untracked infrastructure seam below and remain able to
+        // reclaim WAL or inspect the database after ordinary writes stop.
+        self.write_capacity_guard.check()?;
         Ok(WriterGuard {
             guard,
+            write_capacity_guard: Arc::clone(&self.write_capacity_guard),
             origin: self.origin(),
         })
     }
@@ -762,6 +906,22 @@ impl ConnectionPool {
     /// Clone the pool-scoped counter set for the lifetime-owned writer task.
     pub(crate) fn writer_acquisition_counters(&self) -> Arc<WriterAcquisitionCounters> {
         Arc::clone(&self.writer_acquisition_counters)
+    }
+
+    /// Recheck the pool's database-volume reserve at a request boundary.
+    pub(crate) fn check_write_capacity(&self) -> Result<(), SqliteError> {
+        self.write_capacity_guard.check()
+    }
+
+    /// Clone the guard into the lifetime-owned writer task.
+    pub(crate) fn write_capacity_guard(&self) -> Arc<WriteCapacityGuard> {
+        Arc::clone(&self.write_capacity_guard)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_available_bytes_for_test(&self, available_bytes: u64) {
+        self.write_capacity_guard
+            .force_available_bytes(available_bytes);
     }
 
     /// Get the current number of available reader connections.
@@ -995,6 +1155,7 @@ impl ConnectionPool {
     /// writer enforces via `query_only`. A fully configured successful open
     /// increments the standalone acquisition class exactly once.
     pub fn open_standalone_writer(&self) -> Result<Connection, SqliteError> {
+        self.write_capacity_guard.check()?;
         let conn = self.open_standalone_writer_untracked()?;
         self.writer_acquisition_counters
             .standalone_acquisitions
@@ -1434,7 +1595,7 @@ mod tests {
         }
     }
 
-    const POOL_ENV_VARS: [&str; 8] = [
+    const POOL_ENV_VARS: [&str; 9] = [
         "KHIVE_BUSY_TIMEOUT_SECS",
         "KHIVE_CHECKOUT_TIMEOUT_SECS",
         "KHIVE_WAL_AUTOCHECKPOINT_PAGES",
@@ -1443,6 +1604,7 @@ mod tests {
         "KHIVE_WRITE_QUEUE",
         "KHIVE_WRITE_QUEUE_CAPACITY",
         "KHIVE_WRITE_ROUTING",
+        "KHIVE_WRITE_ADMISSION_DEADLINE_MS",
     ];
 
     struct PoolEnvGuard {
@@ -1536,7 +1698,8 @@ mod tests {
         old_reader.execute_batch("BEGIN DEFERRED").unwrap();
         assert_eq!(
             old_reader
-                .query_row("SELECT COUNT(*) FROM guarded_write", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM guarded_write", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             1
         );
@@ -1551,7 +1714,14 @@ mod tests {
         constrained.force_available_bytes_for_test(0);
 
         for error in [
-            constrained.try_writer().err().expect("pooled guard must refuse"),
+            constrained
+                .try_writer()
+                .err()
+                .expect("pooled guard must refuse"),
+            constrained
+                .try_writer_nowait()
+                .err()
+                .expect("zero-wait pooled guard must refuse"),
             constrained
                 .open_standalone_writer()
                 .err()
@@ -1651,6 +1821,18 @@ mod tests {
             other => panic!("expected typed writer-task disk reserve error, got {other:?}"),
         }
         assert_eq!(pool.writer_acquisition_snapshot().acquisitions, 0);
+
+        pool.force_available_bytes_for_test(2);
+        task.send(move |_conn| {
+            ran.store(true, Ordering::SeqCst);
+            Ok::<_, StorageError>(())
+        })
+        .await
+        .expect("writer task must stay healthy after capacity recovers");
+        assert_eq!(
+            pool.writer_acquisition_snapshot().writer_task_acquisitions,
+            1
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::sql_bridge::bind_params;
 use crate::writer_task::{execute_wrapped_transaction, WriterTaskHandle};
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Notes, op, e)
+    crate::error::storage_driver_error(StorageCapability::Notes, op, e)
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {

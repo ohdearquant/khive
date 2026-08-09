@@ -774,6 +774,31 @@ the MCP error is a stable object rather than a string:
 rather than through a storage capability wrapper. Callers should branch on `code` or `stage`,
 never on `message`.
 
+A filesystem-capacity refusal is structurally separate from those timeout
+objects. It happens before SQLite executes the write and preserves the
+configured recovery reserve:
+
+```json
+{
+  "kind": "resource_exhausted",
+  "code": "sqlite_disk_reserve",
+  "stage": "sqlite_disk_reserve",
+  "retryable": true,
+  "volume": "/path/to/khive.db",
+  "available_bytes": 900000000,
+  "reserve_bytes": 1073741824,
+  "capability": "notes",
+  "operation": "append_note",
+  "timeout_ms": null,
+  "retry_after_ms": null
+}
+```
+
+Restore capacity before retrying; there is no honest time-based retry hint.
+An actual `SQLITE_FULL` means capacity was consumed after admission or the
+guard was disabled/bypassed and is logged as a distinct ERROR escalation,
+never as writer contention.
+
 The PASSIVE probe may backfill WAL frames into the database — that is normal checkpoint
 I/O and is what the reported `checkpointed_frames` counts. It never changes logical
 state, never escalates to TRUNCATE, never creates a missing database file, and never

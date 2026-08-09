@@ -123,9 +123,11 @@ as stable, full SHA-256 identifiers rather than the path- and topology-bearing
 fingerprints used for the equality check. A configuration mismatch also carries
 `config_mismatch_field`, naming the first differing fingerprint field without
 emitting either field value. Its ordered vocabulary follows the production fingerprint:
-`packs`, `db`, `embed`, `extra`, `fresh_tail`, `backend`, `outbound`, `git_write`,
-`backends`, then `pack_backends`. The wire equality check and fallback decision still use
-the original full fingerprints.
+`packs`, `db`, `embed`, `extra`, `fresh_tail`, `disk_reserve`, `backend`, `outbound`,
+`git_write`, `backends`, then `pack_backends`. The disk-reserve field is the pool's
+construction-captured byte floor, so changing `KHIVE_DB_DISK_RESERVE_BYTES` cannot silently
+reuse a daemon with a weaker policy. The wire equality check and fallback decision still use the
+original full fingerprints.
 
 The `khive_strict_daemon_fallback` marker on a strict-fallback rejection's
 `McpError` (#947) lets `request()` in `server.rs` distinguish "the daemon was

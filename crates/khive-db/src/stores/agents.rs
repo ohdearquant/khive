@@ -68,7 +68,7 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     // ADR-142 defines no `StorageCapability::Agents` variant. `Sql` is the
     // closest existing generic-driver capability; `op` still disambiguates
     // which agent-store method failed.
-    StorageError::driver(StorageCapability::Sql, op, e)
+    crate::error::storage_driver_error(StorageCapability::Sql, op, e)
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
