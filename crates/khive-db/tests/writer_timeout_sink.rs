@@ -396,6 +396,11 @@ async fn text_busy_standalone_writer_emits_ndjson_row() {
         Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
         None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
     }
+    assert_eq!(
+        backend.pool().config().write_queue_enabled,
+        Some(false),
+        "writable StorageBackend::sqlite must preserve an explicit queue-off override"
+    );
 
     let store = backend.text("wts_busy_test").expect("text search");
 
