@@ -122,8 +122,10 @@ The `daemon_fallback` event renders client and daemon configuration identifiers
 as stable, full SHA-256 identifiers rather than the path- and topology-bearing
 fingerprints used for the equality check. A configuration mismatch also carries
 `config_mismatch_field`, naming the first differing fingerprint field without
-emitting either field value. The wire equality check and fallback decision still
-use the original full fingerprints.
+emitting either field value. Its ordered vocabulary follows the production fingerprint:
+`packs`, `db`, `embed`, `extra`, `fresh_tail`, `backend`, `outbound`, `git_write`,
+`backends`, then `pack_backends`. The wire equality check and fallback decision still use
+the original full fingerprints.
 
 The `khive_strict_daemon_fallback` marker on a strict-fallback rejection's
 `McpError` (#947) lets `request()` in `server.rs` distinguish "the daemon was

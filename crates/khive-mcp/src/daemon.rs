@@ -211,6 +211,7 @@ struct ConfigIdFields<'a> {
     db: &'a str,
     embed: &'a str,
     extra: &'a str,
+    fresh_tail: &'a str,
     backend: &'a str,
     outbound: &'a str,
     git_write: &'a str,
@@ -234,6 +235,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
     let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
     let outbound = outbound.strip_suffix(']')?;
     let (rest, backend) = rest.rsplit_once(";backend=")?;
+    let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
     let (rest, extra) = rest.rsplit_once(";extra=[")?;
     let extra = extra.strip_suffix(']')?;
     let (db, embed) = rest.rsplit_once(";embed=")?;
@@ -243,6 +245,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         db,
         embed,
         extra,
+        fresh_tail,
         backend,
         outbound,
         git_write,
@@ -267,6 +270,8 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "embed"
     } else if client.extra != daemon.extra {
         "extra"
+    } else if client.fresh_tail != daemon.fresh_tail {
+        "fresh_tail"
     } else if client.backend != daemon.backend {
         "backend"
     } else if client.outbound != daemon.outbound {
@@ -2554,17 +2559,43 @@ mod tests {
 
     #[test]
     fn first_config_mismatch_field_follows_fingerprint_order() {
-        let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];\
+        let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=client-policy";
-        let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];\
+        let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=daemon-policy";
 
         assert_eq!(first_config_mismatch_field(client, Some(daemon)), "packs");
     }
 
     #[test]
+    fn first_config_mismatch_field_names_fresh_tail_from_computed_ids() {
+        let config = RuntimeConfig::no_embeddings();
+        let enabled = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, true);
+        let disabled = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, false);
+
+        assert_eq!(
+            first_config_mismatch_field(&enabled, Some(&disabled)),
+            "fresh_tail"
+        );
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_later_field_from_computed_ids() {
+        let config = RuntimeConfig::no_embeddings();
+        let mut changed = config.clone();
+        changed.allowed_outbound_namespaces = vec![Namespace::parse("remote").unwrap()];
+        let client = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, true);
+        let daemon = crate::server::compute_config_id_with_ann_fresh_tail(&changed, None, true);
+
+        assert_eq!(
+            first_config_mismatch_field(&client, Some(&daemon)),
+            "outbound"
+        );
+    }
+
+    #[test]
     fn first_config_mismatch_field_names_backend_topology_without_values() {
-        let base = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main;\
+        let base = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;backend=main;\
                     outbound=[];git_write=policy";
         let client =
             format!("{base};backends=[main:Sqlite:/private/client.db];pack_backends=[kg=main]");
@@ -2581,9 +2612,11 @@ mod tests {
     #[serial]
     fn map_response_config_mismatch_logs_opaque_ids_and_field_without_values() {
         reset_fallback_counters();
-        let client = "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];\
+        let client =
+            "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=same-policy";
-        let daemon = "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];\
+        let daemon =
+            "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=same-policy";
         let response = DaemonResponseFrame {
             ok: false,
