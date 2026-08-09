@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use uuid::{Uuid, Version};
 
 use khive_runtime::{actor_is_unattributed, KhiveRuntime, NamespaceToken, RuntimeError};
@@ -20,7 +20,7 @@ use crate::preference::{
     prepare_training_data, sha256_hex, train_model, validate_features, validate_loaded_bundle,
     validate_reason_code, JudgmentChoice, JudgmentRecord, ModelBundle, PreferenceScope,
     PresentationProvenance, RandomizationProvenance, ReasonCode, ResultOccurrence,
-    SelectionProvenance, ServeRecord, FEATURE_COUNT, FEATURE_SCHEMA_VERSION,
+    SelectionProvenance, ServeRecord, TrainedModel, FEATURE_COUNT, FEATURE_SCHEMA_VERSION,
     JUDGMENT_SCHEMA_VERSION, MAX_TRAINING_EVENTS, MODEL_BUNDLE_SCHEMA_VERSION,
     PREFERENCE_RESPONSE_SCHEMA_VERSION, RANDOMIZATION_REVISION, SERVE_SCHEMA_VERSION,
 };
@@ -37,6 +37,31 @@ const JUDGMENT_UUID_NAMESPACE: Uuid = Uuid::from_u128(0x8fc4_55de_533c_5d1d_9228
 const MODEL_EVENT_UUID_NAMESPACE: Uuid = Uuid::from_u128(0x1dc2_337e_b200_5bd1_824f_2653_1164_5c16);
 static JUDGMENT_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 static MODEL_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
+const TRAIN_CONCURRENCY: usize = 1;
+static TRAIN_GATE: Semaphore = Semaphore::const_new(TRAIN_CONCURRENCY);
+
+/// Full-batch preference fitting is CPU-bound for up to `MAX_TRAINING_EVENTS`
+/// events; running it inline on the async executor lets concurrent attributed
+/// callers monopolize worker threads. The permit is held across the
+/// `spawn_blocking` join so at most `TRAIN_CONCURRENCY` fits run at once, and
+/// the fit itself runs on the blocking-worker pool.
+pub(crate) async fn fit_preference_bounded(
+    records: Vec<(i64, JudgmentRecord)>,
+    scope: PreferenceScope,
+) -> Result<TrainedModel, RuntimeError> {
+    let _permit = TRAIN_GATE
+        .acquire()
+        .await
+        .map_err(|_| RuntimeError::Internal("moodboard training semaphore closed".to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let data = prepare_training_data(&records, &scope)?;
+        train_model(&data, scope)
+    })
+    .await
+    .map_err(|error| {
+        RuntimeError::Internal(format!("joining moodboard training worker: {error}"))
+    })?
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -324,8 +349,7 @@ pub(crate) async fn handle_train_preference(
     validate_board(&core, token, board_entity_id, &input.board_id).await?;
     let scope = scope_from_input(token, board_entity_id, input.board_id, &input.descriptor);
     let records = load_judgment_snapshot(&core, token).await?;
-    let data = prepare_training_data(&records, &scope)?;
-    let mut trained = train_model(&data, scope.clone())?;
+    let mut trained = fit_preference_bounded(records, scope.clone()).await?;
 
     let blob_store = require_blob_store(&core)?;
     let network_content_ref = blob_store.put(trained.network_bytes.clone()).await?;
@@ -1532,6 +1556,36 @@ mod tests {
             actor_id: Some(actor_id.to_string()),
         })
         .expect("persistent runtime")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_bounded_trainings_all_complete_and_release_the_gate() {
+        assert_eq!(
+            TRAIN_GATE.available_permits(),
+            TRAIN_CONCURRENCY,
+            "training gate must start at its declared bound"
+        );
+        let tasks: Vec<_> = (0..3)
+            .map(|_| {
+                tokio::spawn(async {
+                    fit_preference_bounded(
+                        crate::preference::tests::sufficient_records(false),
+                        crate::preference::tests::fixture_scope(),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await
+                .expect("join bounded training task")
+                .expect("bounded training must succeed under concurrency");
+        }
+        assert_eq!(
+            TRAIN_GATE.available_permits(),
+            TRAIN_CONCURRENCY,
+            "every training must return its permit"
+        );
     }
 
     fn valid_serve_record() -> ServeRecord {

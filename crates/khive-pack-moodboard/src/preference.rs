@@ -1277,10 +1277,10 @@ pub(crate) fn predict(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn fixture_scope() -> PreferenceScope {
+    pub(crate) fn fixture_scope() -> PreferenceScope {
         PreferenceScope {
             namespace: "local".to_string(),
             actor_kind: "actor".to_string(),
@@ -1353,7 +1353,7 @@ mod tests {
         }
     }
 
-    fn sufficient_records(include_abstain: bool) -> Vec<(i64, JudgmentRecord)> {
+    pub(crate) fn sufficient_records(include_abstain: bool) -> Vec<(i64, JudgmentRecord)> {
         let scope = fixture_scope();
         let targets = BTreeMap::from([
             (DataSplit::Train, MIN_TRAIN_DECISIVE_GROUPS),
