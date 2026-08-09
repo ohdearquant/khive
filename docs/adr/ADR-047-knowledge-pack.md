@@ -135,7 +135,7 @@ they do not introduce new ones.
 | -------------------------- | ------- | ---------- | ---------------------------------------------------------------------------- |
 | `knowledge.upsert_atoms`   | Corpus  | Commissive | Bulk insert/update slug-keyed knowledge atoms                                |
 | `knowledge.upsert_domains` | Corpus  | Commissive | Bulk insert/update domain groupings of atoms                                 |
-| `knowledge.get`            | Corpus  | Assertive  | Fetch one atom or domain by ID, exact slug, or short prefix                   |
+| `knowledge.get`            | Corpus  | Assertive  | Fetch one atom or domain by ID, exact slug, or short prefix                  |
 | `knowledge.list`           | Corpus  | Assertive  | Paginated listing of atoms or domains                                        |
 | `knowledge.delete_atoms`   | Corpus  | Commissive | Soft-delete atoms by slug                                                    |
 | `knowledge.stats`          | Corpus  | Assertive  | Corpus statistics (counts, coverage)                                         |
