@@ -2685,13 +2685,14 @@ mod tests {
 
     #[test]
     fn first_config_mismatch_field_recognizes_read_only_runtime_mode() {
-        let writable = "packs=[kg];db=/private/snapshot.db;embed=none;extra=[];\
-                        backend=main;outbound=[];git_write=policy";
-        let read_only = "packs=[kg];db=/private/snapshot.db;embed=none;extra=[];\
-                         backend=main:read_only;outbound=[];git_write=policy";
+        let config = RuntimeConfig::no_embeddings();
+        let writable =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, false);
+        let read_only =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, true);
 
         assert_eq!(
-            first_config_mismatch_field(read_only, Some(writable)),
+            first_config_mismatch_field(&read_only, Some(&writable)),
             "backend",
             "storage-mode separation must retain a structured mismatch field"
         );
