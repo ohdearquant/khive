@@ -2337,4 +2337,60 @@ mod tests {
         );
         assert!(sample.observed_at_unix_ms > 0);
     }
+
+    /// #1849: bounded-channel queue wait ends when the drain loop receives
+    /// the request. Saturation in Tokio's blocking pool happens after that
+    /// boundary and must remain in `total - named_stages`, never be relabeled
+    /// as writer-queue contention.
+    #[test]
+    fn writer_queue_wait_excludes_blocking_pool_scheduling_delay() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("writer_dequeue_boundary.db");
+            let pool = file_pool(&path);
+            let handle = spawn(&pool, 8).unwrap();
+
+            let (blocker_started_tx, blocker_started_rx) = std_mpsc::sync_channel(0);
+            let (release_blocker_tx, release_blocker_rx) = std_mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).unwrap();
+                release_blocker_rx.recv().unwrap();
+            });
+            blocker_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("sole blocking worker must be occupied");
+
+            let reply = handle
+                .enqueue(|_conn| Ok::<(), StorageError>(()))
+                .await
+                .expect("request must enter the bounded writer channel");
+            let dequeue_deadline = Instant::now() + Duration::from_secs(1);
+            while handle.queue_depth() != 0 {
+                assert!(
+                    Instant::now() < dequeue_deadline,
+                    "writer drain never dequeued the accepted request"
+                );
+                tokio::task::yield_now().await;
+            }
+
+            let scheduling_delay = Duration::from_millis(150);
+            tokio::time::sleep(scheduling_delay).await;
+            release_blocker_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            reply.await.unwrap().unwrap();
+
+            let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
+            assert!(
+                sample.total_micros.saturating_sub(sample.queue_wait_micros) >= 100_000,
+                "the post-dequeue blocking-pool delay must not inflate queue_wait: {sample:?}"
+            );
+        });
+    }
 }
