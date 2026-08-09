@@ -277,7 +277,12 @@ mod tests {
     fn temp_db() -> (TempDir, Option<std::path::PathBuf>) {
         let tmp = TempDir::new().expect("temp dir");
         let path = tmp.path().join("engine_test.db");
-        std::fs::File::create(&path).expect("create empty db file");
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(path.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("create and migrate engine test database");
+        drop(runtime);
         (tmp, Some(path))
     }
 

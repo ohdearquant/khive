@@ -87,6 +87,34 @@ fn read_only_schema_validation_requires_exact_current_version_without_writes() {
         "name-divergence diagnostic must match writable boot: {wrong_name_error}"
     );
 
+    let mut missing_middle = open_memory();
+    run_migrations(&mut missing_middle).expect("migrate missing-row schema");
+    missing_middle
+        .execute("DELETE FROM _schema_migrations WHERE version = 7", [])
+        .expect("remove one canonical ledger row below the maximum");
+    let missing_error = validate_schema_is_current(&missing_middle)
+        .expect_err("MAX(version) equality must not hide a missing migration row");
+    assert!(
+        missing_error.to_string().contains("missing version 7"),
+        "missing-row diagnostic must name the exact gap: {missing_error}"
+    );
+
+    let mut unknown_version = open_memory();
+    run_migrations(&mut unknown_version).expect("migrate unknown-row schema");
+    unknown_version
+        .execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) \
+             VALUES (0, 'foreign_baseline', 0)",
+            [],
+        )
+        .expect("inject a non-canonical version below the maximum");
+    let unknown_error = validate_schema_is_current(&unknown_version)
+        .expect_err("MAX(version) equality must not hide an unknown ledger version");
+    assert!(
+        unknown_error.to_string().contains("unknown version 0"),
+        "unknown-version diagnostic must name the foreign row: {unknown_error}"
+    );
+
     let behind = open_memory();
     let behind_error = validate_schema_is_current(&behind)
         .expect_err("an un-migrated read-only snapshot must be rejected");
@@ -106,6 +134,65 @@ fn read_only_schema_validation_requires_exact_current_version_without_writes() {
     assert!(
         ahead_error.to_string().contains("compatible newer build"),
         "ahead-version diagnostic must be actionable: {ahead_error}"
+    );
+}
+
+#[test]
+fn writable_upgrade_rejects_noncanonical_ledger_before_applying_next_migration() {
+    let mut missing_middle = open_memory();
+    run_migrations(&mut missing_middle).expect("migrate missing-row upgrade source");
+    missing_middle
+        .execute(
+            "DELETE FROM _schema_migrations WHERE version IN (7, 19)",
+            [],
+        )
+        .expect("simulate a pre-V19 ledger with a hidden middle gap");
+    let missing_error = run_migrations(&mut missing_middle)
+        .expect_err("writable migration must reject a missing row before applying V19");
+    assert!(
+        missing_error.to_string().contains("missing version 7"),
+        "writable missing-row diagnostic must name the exact gap: {missing_error}"
+    );
+    assert_eq!(
+        missing_middle
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 19",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "ledger validation must fail before V19 is recorded"
+    );
+
+    let mut unknown_version = open_memory();
+    run_migrations(&mut unknown_version).expect("migrate foreign-row upgrade source");
+    unknown_version
+        .execute("DELETE FROM _schema_migrations WHERE version = 19", [])
+        .expect("simulate a pre-V19 ledger");
+    unknown_version
+        .execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) \
+             VALUES (0, 'foreign_baseline', 0)",
+            [],
+        )
+        .expect("inject a non-canonical version below the maximum");
+    let unknown_error = run_migrations(&mut unknown_version)
+        .expect_err("writable migration must reject a foreign row before applying V19");
+    assert!(
+        unknown_error.to_string().contains("unknown version 0"),
+        "writable foreign-row diagnostic must name the exact version: {unknown_error}"
+    );
+    assert_eq!(
+        unknown_version
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 19",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "ledger validation must fail before V19 is recorded"
     );
 }
 

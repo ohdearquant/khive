@@ -1069,6 +1069,12 @@ impl KhiveRuntime {
         model_name: &str,
         duration_us: i64,
     ) {
+        // Lazy embedder construction can happen during daemon warm or an
+        // assertive request. A snapshot has no durable audit sink, so do not
+        // resolve an EventStore merely to attempt a known-rejected append.
+        if self.is_read_only() {
+            return;
+        }
         let Ok(store) = self.events(token) else {
             return;
         };

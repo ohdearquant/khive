@@ -368,6 +368,15 @@ fn start_daemon_components_if_daemon(
     crate::components::start_daemon_components_with_schedule(server, schedule_rt)
 }
 
+/// Admit the schedule runtime to daemon supervision only when its own assigned
+/// backend is writable. This decision is deliberately per runtime: a read-only
+/// main backend must not disable a schedule pack routed to a writable secondary,
+/// while a writable main must not accidentally start a ticker for a schedule
+/// pack routed to a read-only secondary.
+fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRuntime> {
+    runtime.filter(|runtime| !runtime.is_read_only())
+}
+
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
 /// warning and returns on incomplete config. Only call this when
@@ -2407,12 +2416,13 @@ pub fn enforce_strict_actor_mode(
 
 /// Build a fully-configured server from parsed args (without serving).
 ///
-/// Returns, alongside the server, the resolved [`KhiveRuntime`] handle the
-/// `"schedule"` pack is bound to — `None` when the resolved pack set does
-/// not include `"schedule"` — for `start_daemon_components_if_daemon` to
-/// drain against (ADR-106). This is the SAME runtime the server itself
-/// dispatches through, never an independently re-resolved one (PR #782 —
-/// see `crates/khive-mcp/docs/api/pending-events.md`).
+/// Returns, alongside the server, the resolved writable [`KhiveRuntime`]
+/// handle the `"schedule"` pack is bound to. It is `None` when the resolved
+/// pack set omits `"schedule"` or that pack's own assigned backend is
+/// read-only, because every ticker pass begins with reclaim DML. This is the
+/// SAME runtime the server itself dispatches through, never an independently
+/// re-resolved one (PR #782 — see
+/// `crates/khive-mcp/docs/api/pending-events.md`).
 ///
 /// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
 /// `(namespace, namespace_explicit)` pair from a real CLI parse and, because
@@ -2534,12 +2544,14 @@ pub fn build_server_with_explicit_namespace(
                  Set KHIVE_ACTOR or --actor to this lambda's id."
             );
         }
-        let schedule_rt = runtime
-            .config()
-            .packs
-            .iter()
-            .any(|p| p == "schedule")
-            .then(|| runtime.clone());
+        let schedule_rt = writable_schedule_runtime(
+            runtime
+                .config()
+                .packs
+                .iter()
+                .any(|p| p == "schedule")
+                .then(|| runtime.clone()),
+        );
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
         let server = KhiveMcpServer::new(runtime)
             .map(|s| s.with_default_output_format(fmt))
@@ -2554,10 +2566,12 @@ pub fn build_server_with_explicit_namespace(
         args.db.as_deref(),
         db_anchor.as_deref(),
     )?;
-    let schedule_rt = multi
-        .per_pack_runtimes
-        .get("schedule")
-        .map(|rt| (**rt).clone());
+    let schedule_rt = writable_schedule_runtime(
+        multi
+            .per_pack_runtimes
+            .get("schedule")
+            .map(|rt| (**rt).clone()),
+    );
     let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
     Ok((server, schedule_rt))
 }
@@ -7866,6 +7880,192 @@ region = "us-east-1"
             "when the operator restricts --pack to exclude \"schedule\", the tick must have \
              nothing to drain against — never silently falling back to a runtime that can \
              dispatch through a pack the daemon was not configured to load"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn default_read_only_server_omits_schedule_tick_and_warms_without_a_writer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let db = seat_dir.path().join("read-only-schedule.db");
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("create migrated snapshot source");
+        let mut permissions = std::fs::metadata(&db).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&db, permissions).unwrap();
+
+        use clap::Parser;
+        let args = Args::parse_from(["mcp", "--db", db.to_str().expect("utf8 path"), "--no-embed"]);
+
+        let (_server, schedule_rt) = build_server(&args).expect("read-only server must build");
+        assert!(
+            schedule_rt.is_none(),
+            "the default pack set must not return a writer-dependent ticker runtime for a snapshot"
+        );
+
+        // Read-only pools are intentionally omitted from `server.pool()` so
+        // checkpoint ownership cannot see them. Build the same default pack
+        // registry over a retained runtime clone to inspect its actual pool
+        // while exercising the identical `warm_all` implementation.
+        let runtime = KhiveRuntime::new_readonly(RuntimeConfig {
+            db_path: Some(db),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("retained read-only runtime");
+        let pool = runtime.backend().pool_arc();
+        let warm_server = KhiveMcpServer::new(runtime).expect("default read-only pack registry");
+        let before = pool.writer_acquisition_snapshot();
+        warm_server.warm_all().await;
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            before,
+            "default daemon pack warm must remain outside the read-only writer plane"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_schedule_tick_and_warm_use_each_assigned_backend_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let main_db = seat_dir.path().join("read-only-main.db");
+        let schedule_db = seat_dir.path().join("writable-schedule.db");
+        for path in [&main_db, &schedule_db] {
+            KhiveRuntime::new(RuntimeConfig {
+                db_path: Some(path.clone()),
+                ..RuntimeConfig::no_embeddings()
+            })
+            .expect("create migrated backend");
+        }
+        let mut permissions = std::fs::metadata(&main_db).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&main_db, permissions).unwrap();
+
+        let config_path = write_config(
+            seat_dir.path(),
+            &format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{main}"
+read_only = true
+
+[[backends]]
+name = "schedule-backend"
+kind = "sqlite"
+path = "{schedule}"
+
+[packs.schedule]
+backend = "schedule-backend"
+"#,
+                main = main_db.display(),
+                schedule = schedule_db.display(),
+            ),
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--no-embed",
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+        ]);
+        let (server, schedule_rt) = build_server(&args).expect("mixed-mode server must build");
+        assert!(
+            schedule_rt.is_some(),
+            "a read-only main backend must not suppress schedule when schedule's own backend is writable"
+        );
+        let schedule_pool = schedule_rt
+            .as_ref()
+            .expect("writable schedule runtime")
+            .backend()
+            .pool_arc();
+        let schedule_before = schedule_pool.writer_acquisition_snapshot();
+        server.warm_all().await;
+        assert_eq!(
+            schedule_pool.writer_acquisition_snapshot(),
+            schedule_before,
+            "warming other packs must not add schedule-backend writer traffic"
+        );
+
+        let read_only_schedule_db = seat_dir.path().join("read-only-schedule-secondary.db");
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(read_only_schedule_db.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("create migrated read-only schedule source");
+        let mut permissions = std::fs::metadata(&read_only_schedule_db)
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&read_only_schedule_db, permissions).unwrap();
+        let writable_main_db = seat_dir.path().join("writable-main.db");
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(writable_main_db.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("create migrated writable main");
+        let config_path = write_config(
+            seat_dir.path(),
+            &format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{main}"
+
+[[backends]]
+name = "schedule-backend"
+kind = "sqlite"
+path = "{schedule}"
+read_only = true
+
+[packs.schedule]
+backend = "schedule-backend"
+"#,
+                main = writable_main_db.display(),
+                schedule = read_only_schedule_db.display(),
+            ),
+        );
+        let args = Args::parse_from([
+            "mcp",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--no-embed",
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+        ]);
+        let (_server, schedule_rt) = build_server(&args).expect("mixed-mode server must build");
+        assert!(
+            schedule_rt.is_none(),
+            "a writable main backend must not enable schedule when schedule's own backend is read-only"
         );
     }
 

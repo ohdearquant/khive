@@ -64,11 +64,12 @@ draining immediately at daemon start.
 ## ADR-119 component supervision (issue #1409)
 
 The daemon no longer drops a bare `tokio::spawn` handle for this loop. When the
-resolved daemon pack set includes `schedule`, the host adds exactly one dynamic
-`schedule-tick` registration to the ADR-119 component roster. The factory captures
-the already-resolved schedule runtime and receives the daemon's live server through
-`HostContext`. Client/stdio roles and daemon configurations without the schedule pack
-add no ticker.
+resolved daemon pack set includes `schedule` and that pack's own assigned backend is
+writable, the host adds exactly one dynamic `schedule-tick` registration to the
+ADR-119 component roster. The factory captures the already-resolved schedule runtime
+and receives the daemon's live server through `HostContext`. Client/stdio roles,
+daemon configurations without the schedule pack, and read-only schedule runtimes add
+no ticker. This gate is per assigned runtime rather than the main backend's mode.
 
 The concrete policy is `OnFailure`, five restarts per daemon lifetime, exponential
 backoff with positive jitter from 1 second to a hard 60-second total-delay cap, and a

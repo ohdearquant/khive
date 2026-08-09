@@ -182,7 +182,9 @@
 ### Persistent Daemon (ADR-049)
 
 - `khived` is a persistent warm runtime over a Unix socket
-- `PackRuntime::warm` is invoked on every registered pack during daemon startup
+- `PackRuntime::warm` is invoked on every registered pack during daemon startup;
+  each hook follows its own assigned backend mode, suppressing writer-bearing
+  work for read-only snapshot runtimes (ADR-028 A2)
 
 ### Namespace Token Contract (ADR-050)
 
