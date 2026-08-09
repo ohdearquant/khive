@@ -13,6 +13,31 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// In-memory replay context retained only until an inbound envelope is
+/// durably handled.
+///
+/// The exact transport bytes deliberately bypass `metadata`: metadata is sent
+/// through `comm.ingest` and would re-present content to the same write gate
+/// that can reject the message. Serialization skips this context, and its
+/// `Debug` implementation reports only byte length so logs cannot expose the
+/// original message.
+#[derive(Clone)]
+pub struct QuarantineReplay {
+    /// Byte-exact transport payload stored in content-addressed blob storage.
+    pub bytes: Vec<u8>,
+    /// Channel address that should receive a body-free quarantine notification.
+    pub notification_to: String,
+}
+
+impl std::fmt::Debug for QuarantineReplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuarantineReplay")
+            .field("bytes_len", &self.bytes.len())
+            .field("notification_to", &self.notification_to)
+            .finish()
+    }
+}
+
 /// A message envelope passed between the channel transport and the runtime.
 ///
 /// Outbound envelopes are produced by the runtime and delivered by a `Channel`.
@@ -43,6 +68,9 @@ pub struct ChannelEnvelope {
     pub correlation_external_id: Option<String>,
     /// Arbitrary transport-specific key-value metadata.
     pub metadata: HashMap<String, String>,
+    /// Non-serialized replay context for a message that may need quarantine.
+    #[serde(skip)]
+    pub quarantine_replay: Option<QuarantineReplay>,
     /// RFC 822 Message-ID to set on the outbound email (including angle brackets,
     /// e.g. `<uuid@domain>`). `None` on inbound envelopes and when the transport
     /// should auto-generate the identifier.
@@ -82,6 +110,7 @@ impl ChannelEnvelope {
             external_id: None,
             correlation_external_id: None,
             metadata: HashMap::new(),
+            quarantine_replay: None,
             message_id: None,
             wire_message_id: None,
             wire_references: None,
@@ -105,6 +134,19 @@ impl ChannelEnvelope {
     /// Attach an external deduplication key.
     pub fn with_external_id(mut self, id: impl Into<String>) -> Self {
         self.external_id = Some(id.into());
+        self
+    }
+
+    /// Retain exact source bytes and the safe notification target in memory.
+    pub fn with_quarantine_replay(
+        mut self,
+        bytes: Vec<u8>,
+        notification_to: impl Into<String>,
+    ) -> Self {
+        self.quarantine_replay = Some(QuarantineReplay {
+            bytes,
+            notification_to: notification_to.into(),
+        });
         self
     }
 
