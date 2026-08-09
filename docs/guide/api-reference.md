@@ -755,6 +755,12 @@ checkpoint skips, the diagnostics probe connection, the writer task's one-time l
 connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
 and reused across ticks) do not inflate the write-traffic acquisition total.
 
+`checkpoint_counters` reports checkpoint pressure without making its telemetry another source of
+WAL pressure. `checkpoint_pressure_elevated_ticks` and the episode start/recovery totals are
+in-memory observations; `checkpoint_lifecycle_append_attempts`, append failures, and handoff drops
+describe actual persistence work. The checkpoint task appends only episode elevation and recovery
+transitions, so sustained pressure does not produce one primary-store write per checkpoint tick.
+
 A finite-wait pooled checkout failure retains its compatibility display text in `message`, but
 the MCP error is a stable object rather than a string:
 

@@ -780,3 +780,40 @@ or future from being created for every elevated tick while the writer remains co
 - Sequencing assertion: for a synthetic multi-transition scenario (poll started, auth
   failed, backoff armed, poll started, poll succeeded, backoff reset), the ordered
   `(created_at, id)` query returns exactly that sequence.
+
+## 2026-08-09 amendment: checkpoint outcomes are episode transitions, not attempt rows (#1838)
+
+This amendment supersedes Decision 1's `CheckpointOutcomeRecorded` cadence, Decision 4's
+persisted-last-three-rows consumer, Decision 5's sustained-pressure volume arithmetic, the
+checkpoint-volume consequences, and the per-elevated-tick clauses of the 2026-08-01 bounded
+handoff amendment. The channel lifecycle contracts are unchanged.
+
+Writing one event row per elevated checkpoint cycle is unsafe by mechanism: the row lands in
+the same WAL whose pinned state the checkpoint task is observing. Under a persistent reader pin,
+those instrumentation writes cannot be reclaimed and make the checkpointer a principal author
+of the growing backlog. The historical assumption that severe pressure is necessarily
+self-bounding through TRUNCATE was disproved in production: a pin may make TRUNCATE report no
+progress for hours.
+
+`CheckpointOutcomeRecorded` is therefore an episode-transition event:
+
+1. enqueue one row on the healthy-to-elevated transition;
+2. aggregate every sustained elevated observation in task memory, with no event-store call;
+3. enqueue one recovery row on the elevated-to-healthy transition.
+
+Both rows carry the current threshold booleans and two additive summary fields:
+`episode_elevated_ticks` (the number of elevated observations aggregated so far) and
+`episode_peak_wal_pages` (the maximum observed WAL frame count). On recovery those fields are
+the complete episode summary. New transition rows use `payload_schema_version = 2`; both fields
+are absent when a consumer decodes legacy version-1 rows written before this amendment. The
+bounded handoff still advances its accepted elevation state only after `try_send` succeeds,
+preserving retry of a rejected opening or recovery edge without reintroducing per-attempt
+primary-store appends.
+
+The N-consecutive-cycle severity decision no longer reads lifecycle rows. ADR-091's
+`CheckpointSeverityState` already counts consecutive observed ticks in memory, emits the WARN
+edge at the configured N, and rearms below threshold. The persisted stream is for durable
+incident boundaries and recovery summaries; exact attempt volume and persistence failures are
+reported by ADR-091's process counters. This makes the storage invariant explicit: one sustained
+episode produces at most one opening append attempt and one recovery append attempt, regardless
+of checkpoint cadence or pin duration.

@@ -146,6 +146,12 @@ existing test call site). Read-only surface: nothing here is ever reset
 outside `#[cfg(test)]`, and nothing reachable over the daemon wire can reset
 them either (see `khive_runtime::daemon::DaemonRequestFrame::metrics_only`).
 
+Issue #1838 adds the pressure-episode and lifecycle-sink counters exposed by
+`db_diagnostics`: elevated observations, episode starts/recoveries, actual
+primary-store append attempts/failures, and bounded-handoff drops. These are
+process-lifetime aggregates across checkpoint tasks. They preserve per-attempt
+operator evidence without writing one event row per attempt into a pinned WAL.
+
 ## `run_checkpoint_task` — shutdown design history
 
 See `crates/khive-db/src/checkpoint.rs` — `run_checkpoint_task`.
@@ -165,23 +171,31 @@ backend is in-memory and only secondary file-backed tasks are spawned, the
 first secondary task owns emission. Other tasks receive no owner, so the API
 cannot silently discard a caller-supplied event store based on `is_main`.
 
-Lifecycle persistence is isolated from the scheduler (issue #1434). The task
-serializes each outcome and uses a zero-wait `try_send` into a dedicated append
-worker with capacity for one queued event behind the append in progress. If
-both slots are occupied, that outcome is dropped; the first drop in each
-uninterrupted full-queue episode warns, and a later successful enqueue re-arms
-the warning. The worker logs sink failures and continues. This preserves
-accepted-event order and bounds work and memory under writer contention while
-ensuring event-store checkout or SQLite busy waits cannot delay a later
-PASSIVE/TRUNCATE cycle. Checkpoint-task shutdown aborts the scheduler-owned
-async worker instead of waiting for its current append future. That guarantee
-is local to `run_checkpoint_task`, not daemon, runtime, or process shutdown: if
-the event store already admitted the append to `spawn_blocking` or a
-`WriterTask`, aborting the worker does not cancel it, and at most one such sink
-operation may outlive the checkpoint task. If a recovery/drain row meets a full
-queue, the task keeps the elevation episode open and retries that drain on the
-next healthy tick; a dropped enqueue therefore cannot permanently suppress the
-row that closes a previously accepted elevated sequence.
+Lifecycle persistence is isolated from the scheduler (issues #1434 and
+#1838). The task serializes only pressure-state transitions and uses a
+zero-wait `try_send` into a dedicated append worker with capacity for one
+queued event behind the append in progress. One opening row marks elevation;
+sustained elevated ticks update a bounded in-memory count and peak only; one
+recovery row carries the complete episode summary. These transition rows use
+payload schema version 2; the two additive summary fields remain optional so
+version-1 rows decode unchanged. Thus primary-store writes are O(state
+transitions), not O(checkpoint attempts), even when a reader pins the WAL
+indefinitely. If both handoff slots are occupied, that transition is dropped;
+the first drop in each uninterrupted full-queue episode warns, and a later
+successful enqueue re-arms the warning. The accepted elevation state is
+unchanged on a rejected transition, so opening/recovery handoffs can retry
+without creating per-tick store calls. Actual append attempts, failures, and
+handoff drops have separate diagnostics counters.
+
+The worker logs sink failures and continues. This preserves accepted-event
+order and bounds work and memory under writer contention while ensuring
+event-store checkout or SQLite busy waits cannot delay a later PASSIVE/TRUNCATE
+cycle. Checkpoint-task shutdown aborts the scheduler-owned async worker instead
+of waiting for its current append future. That guarantee is local to
+`run_checkpoint_task`, not daemon, runtime, or process shutdown: if the event
+store already admitted the append to `spawn_blocking` or a `WriterTask`,
+aborting the worker does not cancel it, and at most one such sink operation may
+outlive the checkpoint task.
 
 ## Private tx-registry logging helpers (Plank 0)
 

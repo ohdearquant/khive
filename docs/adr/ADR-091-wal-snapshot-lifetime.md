@@ -1207,3 +1207,46 @@ invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
 `sidecar_entries_cleanup_would_reap` members are optional and omitted when enumeration did not
 run. A background checkpoint tick may independently perform its normal cleanup, but the
 diagnostic request itself never converts an unmeasured value into a clean-looking zero.
+
+### 2026-08-09 amendment (Amendment 7): checkpoint telemetry cannot amplify a pinned WAL
+
+**Motivation.** A production WAL pin exposed a feedback loop in the ADR-094 lifecycle sink.
+`run_checkpoint_task` appended `CheckpointOutcomeRecorded` to the primary store on every
+at/above-`warn_pages` observation. A pinned reader prevented those event writes from being
+reclaimed, so the 500 ms checkpoint loop became a high-rate writer to the WAL it was trying to
+drain. The event handoff was already lossy under sink contention; paying one primary-store write
+per attempt therefore provided neither complete history nor storage safety (#1838).
+
+**Decision.** Checkpoint pressure persistence is edge-triggered. One elevation row is enqueued
+when pressure first reaches `warn_pages`, sustained elevated observations aggregate in bounded
+task memory, and one recovery row is enqueued after pressure returns below `warn_pages`.
+`CheckpointOutcomeRecordedPayload` carries `episode_elevated_ticks` and
+`episode_peak_wal_pages`; the recovery row is the complete episode summary, while a delayed
+opening enqueue reports the aggregate observed so far. Both fields are absent on legacy rows
+written before this amendment; new transition rows use `payload_schema_version = 2`. A full
+bounded handoff leaves the accepted elevation state unchanged, so that transition may be retried
+without admitting one store append per checkpoint attempt. A recovery enqueue is likewise
+retried on later healthy ticks until accepted. If no elevation row ever reached the handoff, no
+orphan recovery row is invented.
+
+The invariant is now: with A checkpoint attempts inside one uninterrupted pressure episode,
+primary-store lifecycle appends are O(state transitions) (normally two), never O(A). The
+checkpoint loop's per-attempt evidence remains in the existing tracing/debug path and in honest
+process-global diagnostics:
+
+- `checkpoint_pressure_elevated_ticks`;
+- `checkpoint_pressure_episodes_started` / `checkpoint_pressure_episodes_recovered`;
+- `checkpoint_lifecycle_append_attempts` / `checkpoint_lifecycle_append_failures`;
+- `checkpoint_lifecycle_enqueue_drops`.
+
+These are lifetime aggregates across every checkpoint task in the process, matching the scope of
+the pre-existing ADR-091 counters. They are not reset by the operator surface. The actual
+pressure ladder remains `CheckpointSeverityState`'s in-memory consecutive-observation machine;
+it does not query persisted per-tick events. WAL-pin sidecars, no-progress attribution, PASSIVE /
+TRUNCATE policy, and the one-sidecar-pass-per-tick bound are unchanged.
+
+**Failure direction.** Lifecycle persistence remains best-effort. A queue drop or append failure
+can leave a gap in durable transitions, but it increments an explicit diagnostic counter and
+never creates a primary-store retry loop. The checkpoint task's essential operator evidence is
+the transition row, recovery summary when deliverable, process counters, edge-triggered logs,
+and WAL-pin attribution—not a self-amplifying per-attempt event stream.
