@@ -322,13 +322,17 @@ pub(crate) fn compute_config_id_with_storage_mode(
     )
 }
 
+/// Compute daemon identity from construction-captured runtime policies.
+///
+/// `storage_read_only` is authoritative. Re-probing filesystem permissions
+/// here could relabel a runtime that already retained a write-capable SQLite
+/// handle after a later chmod; only the pre-open wrappers above may probe.
 pub(crate) fn compute_config_id_with_runtime_policies(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
     ann_fresh_tail_enabled: bool,
     storage_read_only: bool,
 ) -> String {
-    let storage_read_only = storage_read_only || configured_storage_read_only(config, khive_cfg);
     let mut packs = config.packs.clone();
     packs.sort();
     let db = config
@@ -4258,6 +4262,63 @@ mod tests {
             compute_config_id_with_storage_mode(&runtime, None, true),
             "pre-open forwarding and opened-server identities must converge"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_owned_config_id_keeps_captured_writable_mode_after_post_open_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("runtime-mode tempdir");
+        let path = dir.path().join("post-open-chmod.db");
+        let config = RuntimeConfig {
+            db_path: Some(path.clone()),
+            embedding_model: None,
+            packs: Vec::new(),
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("open writable runtime");
+        assert!(
+            !runtime.is_read_only(),
+            "runtime must capture writable mode"
+        );
+        let captured_writable_id = compute_config_id_with_runtime_policies(
+            runtime.config(),
+            None,
+            runtime.ann_fresh_tail_enabled(),
+            runtime.is_read_only(),
+        );
+
+        let original_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let pre_open_read_only_id = compute_config_id(runtime.config(), None);
+        assert!(
+            pre_open_read_only_id.contains(&format!(
+                "backend={:?}:read_only",
+                runtime.config().backend_id
+            )),
+            "a new runtime must detect the chmod-read-only snapshot: {pre_open_read_only_id}"
+        );
+
+        let server = KhiveMcpServer::new(runtime).expect("build server from opened runtime");
+        assert_eq!(
+            server.config_id(),
+            captured_writable_id,
+            "runtime-owned identity must trust the access mode captured when its SQLite pool opened"
+        );
+        assert_ne!(
+            server.config_id(),
+            pre_open_read_only_id,
+            "an already-open writable engine must not advertise the pre-open read-only identity"
+        );
+
+        drop(server);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(original_mode);
+        std::fs::set_permissions(&path, permissions).unwrap();
     }
 
     /// The same collision, one layer up the resolution chain: `--db`/`KHIVE_DB`
