@@ -10,7 +10,8 @@
   Apache-2.0) plus `khive-capability`
 - Amended by: [ADR-143](ADR-143-store-held-caller-grants.md), which supersedes
   Amendment 2's configuration-text roster and "no runtime registration API"
-  invariant with store-held caller grants and hierarchical subactor identity
+  invariant with store-held caller grants and hierarchical subactor identity,
+  delivering per-caller differentiation in per-view form
 
 > **Implementation status (2026-08-08):** This accepted staged design is not
 > fully shipped. The current runtime default remains `AllowAllGate`, and the
