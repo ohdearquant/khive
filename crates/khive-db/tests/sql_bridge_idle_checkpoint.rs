@@ -16,7 +16,7 @@ use std::sync::Arc;
 use khive_db::checkpoint::{checkpoint_once, TruncateState};
 use khive_db::{CheckpointConfig, ConnectionPool, PoolConfig, SqlBridge};
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_storage::{SqlAccess as _, SqlReader as _};
+use khive_storage::SqlAccess as _;
 
 const SESSION_COUNT: usize = 8;
 const WRITE_CYCLES: i64 = 4;

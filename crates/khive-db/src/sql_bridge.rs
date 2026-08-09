@@ -2886,7 +2886,10 @@ mod tests {
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
-        let mut reader = bridge.reader().await.unwrap();
+        let mut reader = SqliteReader {
+            handle: Some(open_cached_reader_handle(Arc::clone(&pool)).await.unwrap()),
+            pool: Arc::clone(&pool),
+        };
         let mut contender = bridge.reader().await.unwrap();
 
         reader
