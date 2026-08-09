@@ -337,6 +337,24 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         args: &Value,
     ) -> Result<(), RuntimeError>;
 
+    /// Normalize a shared note update before storage is mutated.
+    ///
+    /// The default preserves the original property-validation contract. A
+    /// kind-owning pack overrides this when caller-facing note fields mirror
+    /// owned properties and must be changed together (for example, a task's
+    /// searchable `content` and `properties.description`).
+    async fn prepare_note_update(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        let properties = args.get("properties").filter(|value| !value.is_null());
+        self.validate_note_update(runtime, token, note, properties)
+            .await
+    }
+
     /// Validate a shared note-property update before storage is mutated.
     ///
     /// The default accepts the update. Kind-owning packs override this when a
@@ -1249,7 +1267,7 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(RuntimeError::InvalidInput(format!(
+        Err(RuntimeError::UnknownVerb(format!(
             "unknown verb {verb:?}; available: {}",
             self.available_verbs.join(", ")
         )))
@@ -2015,7 +2033,7 @@ impl VerbRegistry {
         // trail (matches the "no audit row is ever dropped" contract above).
         if let Some(audit) = deferred_audit.take() {
             if let Some(store) = &self.event_store {
-                // Dispatch is about to return `InvalidInput` below (no pack
+                // Dispatch is about to return `UnknownVerb` below (no pack
                 // owns this verb), so the persisted outcome must be `Error`,
                 // not `Success`. `work_class` is still stamped (ADR-103
                 // Decision (a)); `resource.cost_unit` is omitted, matching
@@ -2033,7 +2051,7 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(RuntimeError::InvalidInput(format!(
+        Err(RuntimeError::UnknownVerb(format!(
             "unknown verb {verb:?}; available: {}",
             self.available_verbs.join(", ")
         )))
@@ -2112,10 +2130,30 @@ impl VerbRegistry {
         None
     }
 
-    /// Run the owning kind's shared-note-update validator, if it declares one.
+    /// Run the owning kind's shared-note-update normalizer/validator, if it declares one.
     ///
     /// Both canonical KG dispatch and user-facing atomic preparation call this
     /// seam so pack-specific property invariants cannot drift between them.
+    pub async fn prepare_note_update_hook(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        if let Some(hook) = self.find_kind_hook(&note.kind) {
+            hook.prepare_note_update(runtime, token, note, args).await?;
+        }
+        Ok(())
+    }
+
+    /// Run the owning kind's shared-note-update property validator, if it
+    /// declares one.
+    ///
+    /// Kept as the validation-only compatibility seam for callers that do not
+    /// own a mutable request object. Canonical and atomic CRUD use
+    /// [`Self::prepare_note_update_hook`] so a hook can also normalize coupled
+    /// fields before its validation runs.
     pub async fn validate_note_update_hook(
         &self,
         runtime: &KhiveRuntime,
@@ -5312,7 +5350,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items[0].duration_us, 0);
-        // Dispatch returns InvalidInput for an unknown verb, so the
+        // Dispatch returns UnknownVerb for an unknown verb, so the
         // persisted outcome must be Error, not the previously-hardcoded
         // Success.
         assert_eq!(page.items[0].outcome, EventOutcome::Error);
@@ -6855,7 +6893,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+        assert!(matches!(err, RuntimeError::UnknownVerb(_)));
 
         let ev = first_event(&store).await;
         assert_eq!(ev.outcome, EventOutcome::Error);
@@ -7962,8 +8000,8 @@ mod help_tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, RuntimeError::InvalidInput(_)),
-            "help=true on unknown verb must return InvalidInput, got {err:?}"
+            matches!(err, RuntimeError::UnknownVerb(_)),
+            "help=true on unknown verb must return UnknownVerb, got {err:?}"
         );
         let msg = err.to_string();
         assert!(

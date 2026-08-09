@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Deterministic GQL `SKIP` paging with structured `has_more`/`next_offset`
   continuation metadata for result sets beyond the query page bound (#1601).
+- `comm.mark_read(ids=[...], atomic=false)` as the canonical bulk mark-read
+  surface, with an opt-in all-or-nothing transaction and the released
+  `comm.read(id|ids)` forms retained for compatibility. This closes #1387's
+  residual scope after #1572 shipped best-effort bulk read marking and ADR-057
+  superseded its original namespace/legacy-recipient assumptions (#1387).
 - `whoami` verb (kg pack, bare name): reports the caller's actor reference,
   write namespace, and read-visible namespace set already resolved by the
   runtime for the current request.

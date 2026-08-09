@@ -15,8 +15,9 @@ when `PoolConfig::write_queue_enabled` is set.
 ## `WriterTaskTerminated` and `WriterTaskRequestState`
 
 `WriterTaskTerminated { request_state }` is the public error returned when a
-writer-task request cannot complete because that task instance has terminated.
-The state reports what the task can prove about the individual request:
+single-writer request cannot complete because its writer-task instance has terminated or the
+legacy pool-mutex writer has been retired after a terminal transaction fault. The state reports
+what the execution seam can prove about the individual request:
 
 | State                   | Meaning                                                                                                                 |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -33,9 +34,17 @@ terminator returns without restoring autocommit mode. A request buffered
 behind the terminal request, or a send attempted after the receiver closes,
 is `NotStarted`.
 
-If rollback succeeds and restores autocommit mode, no terminal error is
-introduced: the caller receives the original operation error or the existing
-retryable `writer_task_commit` pool error, and the writer remains available.
+The legacy pool-mutex transaction fallback uses the same commit/rollback/panic finalizer as the
+writer task. An unverified finalization reports `SideEffectsUnknown`; any terminal outcome retires
+the pooled writer and installs a deny-all authorizer quarantine so neither later checkouts nor the
+legacy raw-connection handle can reuse a connection with unknown transaction state. The variant and
+its rendered `writer task terminated` prefix retain their historical names for wire and Rust API
+compatibility.
+
+If rollback after a non-panic operation or commit failure succeeds and restores autocommit mode,
+no terminal error is introduced: the caller receives the original operation error or the existing
+retryable commit pool error, and the writer remains available. A caught operation panic remains
+terminal even when its transaction was provably rolled back.
 
 This error has no storage capability attribution (`capability()` returns
 `None`) and is not automatically retryable (`is_retryable()` returns `false`).

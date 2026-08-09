@@ -2865,6 +2865,39 @@ async fn read_help_returns_optional_id_and_ids() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `comm.mark_read(help=true)` names the mutation and exposes its atomic opt-in.
+#[tokio::test]
+async fn mark_read_help_distinguishes_marking_from_retrieval() -> anyhow::Result<()> {
+    let client = connect_comm_schedule().await?;
+    let result = ok_one(&client, "comm.mark_read(help=true)").await?;
+
+    assert_eq!(result["verb"], "comm.mark_read");
+    assert!(result["description"]
+        .as_str()
+        .unwrap()
+        .contains("comm.inbox"));
+    assert!(result["description"]
+        .as_str()
+        .unwrap()
+        .contains("comm.thread"));
+
+    let params = result["params"]
+        .as_array()
+        .expect("params must be an array");
+    let ids = params
+        .iter()
+        .find(|param| param["name"] == "ids")
+        .expect("mark_read help must include ids");
+    assert_eq!(ids["required"], serde_json::json!(true));
+    let atomic = params
+        .iter()
+        .find(|param| param["name"] == "atomic")
+        .expect("mark_read help must include atomic");
+    assert_eq!(atomic["required"], serde_json::json!(false));
+
+    Ok(())
+}
+
 /// `schedule.schedule(help=true)` must return required `action` and `at`.
 #[tokio::test]
 async fn schedule_help_returns_required_action_and_at() -> anyhow::Result<()> {

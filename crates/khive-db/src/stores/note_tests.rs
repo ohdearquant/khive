@@ -1,5 +1,25 @@
 use super::*;
 use crate::pool::PoolConfig;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+fn deny_commit(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Transaction {
+            operation: TransactionOperation::Unknown,
+        } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }
+}
+
+fn deny_rollback(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Transaction {
+            operation: TransactionOperation::Rollback,
+        } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }
+}
 
 pub(super) mod page_snapshot_seam {
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -89,6 +109,48 @@ async fn test_upsert_and_get_note() {
     assert_eq!(fetched.id, id);
     assert_eq!(fetched.content, "Hello world");
     assert_eq!(fetched.kind, "observation");
+}
+
+#[tokio::test]
+async fn replace_note_cas_requires_new_revision_strictly_greater_than_snapshot() {
+    let store = setup_memory_store();
+    let mut original = make_note("default", "observation", "original");
+    original.created_at = 100;
+    original.updated_at = 100;
+    let id = original.id;
+    store.upsert_note(original.clone()).await.unwrap();
+
+    for refused_revision in [99, 100] {
+        let mut replacement = original.clone();
+        replacement.content = format!("must-not-land-{refused_revision}");
+        replacement.updated_at = refused_revision;
+        assert!(
+            !store
+                .replace_note_if_unchanged(replacement, original.updated_at, original.deleted_at)
+                .await
+                .unwrap(),
+            "CAS must refuse replacement revision {refused_revision} when the snapshot revision is {}",
+            original.updated_at
+        );
+        assert_eq!(
+            store.get_note(id).await.unwrap().unwrap().content,
+            "original"
+        );
+    }
+
+    let mut advanced = original.clone();
+    advanced.content = "advanced".to_string();
+    advanced.updated_at = 101;
+    assert!(
+        store
+            .replace_note_if_unchanged(advanced, original.updated_at, original.deleted_at)
+            .await
+            .unwrap(),
+        "a strictly newer revision must still satisfy the CAS"
+    );
+    let persisted = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(persisted.content, "advanced");
+    assert_eq!(persisted.updated_at, 101);
 }
 
 #[tokio::test]
@@ -624,6 +686,188 @@ async fn try_patch_note_property_refuses_array_document() {
         Some(serde_json::json!(["not", "an", "object"]))
     );
     assert_eq!(fetched.updated_at, original_updated_at);
+}
+
+fn atomic_mark_read_filter() -> khive_storage::note::NoteFilter {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::SqlValue;
+
+    NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrMissing,
+                value: SqlValue::Text("lambda:reader".to_string()),
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
+    let store = setup_memory_store();
+    let eligible = make_note("local", "message", "eligible").with_properties(serde_json::json!({
+        "direction": "inbound",
+        "to_actor": "lambda:reader",
+        "read": false,
+        "preserve": "eligible",
+    }));
+    let ineligible =
+        make_note("local", "message", "ineligible").with_properties(serde_json::json!({
+            "direction": "outbound",
+            "to_actor": "lambda:reader",
+            "read": false,
+            "preserve": "ineligible",
+        }));
+    let eligible_id = eligible.id;
+    let ineligible_id = ineligible.id;
+    let updated_at = eligible.updated_at.max(ineligible.updated_at) + 1;
+    store.upsert_note(eligible).await.unwrap();
+    store.upsert_note(ineligible).await.unwrap();
+
+    let filter = atomic_mark_read_filter();
+
+    let error = store
+        .patch_note_property_atomic(
+            vec![eligible_id, ineligible_id],
+            "local",
+            &filter,
+            "$.read",
+            serde_json::json!(true),
+            updated_at,
+        )
+        .await
+        .expect_err("an ineligible target must abort the atomic patch");
+    assert!(
+        matches!(&error, StorageError::Conflict { message, .. }
+            if message.contains(&ineligible_id.to_string())),
+        "the conflict must name the first failing id {ineligible_id}; got {error:?}"
+    );
+    assert!(!error.is_retryable(), "a precondition conflict is terminal");
+
+    for (id, preserved) in [(eligible_id, "eligible"), (ineligible_id, "ineligible")] {
+        let stored = store.get_note(id).await.unwrap().unwrap();
+        let properties = stored.properties.unwrap();
+        assert_eq!(properties["read"], false);
+        assert_eq!(properties["preserve"], preserved);
+    }
+
+    store
+        .patch_note_property_atomic(
+            vec![eligible_id, eligible_id],
+            "local",
+            &filter,
+            "$.read",
+            serde_json::json!(true),
+            updated_at,
+        )
+        .await
+        .expect("deduplicated eligible targets commit together");
+    let stored = store.get_note(eligible_id).await.unwrap().unwrap();
+    let properties = stored.properties.unwrap();
+    assert_eq!(properties["read"], true);
+    assert_eq!(properties["preserve"], "eligible");
+}
+
+#[tokio::test]
+async fn atomic_note_property_patch_writer_task_commits_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("atomic-note-property-writer-task.db")),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    let store = SqlNoteStore::new(Arc::clone(&pool), true);
+    let eligible_properties = serde_json::json!({
+        "direction": "inbound",
+        "to_actor": "lambda:reader",
+        "read": false,
+    });
+    let first = make_note("local", "message", "first eligible")
+        .with_properties(eligible_properties.clone());
+    let second = make_note("local", "message", "second eligible")
+        .with_properties(eligible_properties.clone());
+    let ineligible =
+        make_note("local", "message", "ineligible").with_properties(serde_json::json!({
+            "direction": "outbound",
+            "to_actor": "lambda:reader",
+            "read": false,
+        }));
+    let first_id = first.id;
+    let second_id = second.id;
+    let ineligible_id = ineligible.id;
+    let updated_at = first
+        .updated_at
+        .max(second.updated_at)
+        .max(ineligible.updated_at)
+        + 1;
+    for note in [first, second, ineligible] {
+        store.upsert_note(note).await.unwrap();
+    }
+
+    let filter = atomic_mark_read_filter();
+    store
+        .patch_note_property_atomic(
+            vec![first_id, second_id],
+            "local",
+            &filter,
+            "$.read",
+            serde_json::json!(true),
+            updated_at,
+        )
+        .await
+        .expect("all eligible rows commit through the writer task");
+    for id in [first_id, second_id] {
+        let stored = store.get_note(id).await.unwrap().unwrap();
+        assert_eq!(stored.properties.unwrap()["read"], true);
+    }
+
+    store
+        .update_note_properties(first_id, Some(eligible_properties), updated_at + 1)
+        .await
+        .unwrap();
+    let error = store
+        .patch_note_property_atomic(
+            vec![first_id, ineligible_id],
+            "local",
+            &filter,
+            "$.read",
+            serde_json::json!(true),
+            updated_at + 2,
+        )
+        .await
+        .expect_err("a later ineligible row must abort the writer-task transaction");
+    assert!(
+        matches!(&error, StorageError::Conflict { message, .. }
+            if message.contains(&ineligible_id.to_string())),
+        "the conflict must name the first failing id {ineligible_id}; got {error:?}"
+    );
+    assert_eq!(
+        store
+            .get_note(first_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .properties
+            .unwrap()["read"],
+        false,
+        "the earlier eligible update must roll back"
+    );
+    assert_eq!(pool.writer_task_spawn_count(), 1);
 }
 
 #[tokio::test]
@@ -1165,6 +1409,161 @@ async fn test_try_insert_note_insert_and_seq_assignment_are_atomic() {
         fetched.is_none(),
         "the note insert must roll back together with the failed sequence \
          assignment, not strand the note without a notes_seq row: {fetched:?}"
+    );
+}
+
+#[tokio::test]
+async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_usable() {
+    let store = setup_memory_store();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch("CREATE TABLE tx_finalize (id INTEGER PRIMARY KEY)")
+            .unwrap();
+    }
+
+    let result = store
+        .with_writer_tx("test_pooled_commit", |conn| {
+            conn.execute("INSERT INTO tx_finalize (id) VALUES (1)", [])?;
+            conn.authorizer(Some(deny_commit))?;
+            Ok(())
+        })
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(StorageError::Pool { operation, .. }) if operation == "test_pooled_commit"
+        ),
+        "a denied COMMIT followed by a verified rollback must report the commit error: {result:?}"
+    );
+
+    let writer = store
+        .pool
+        .try_writer()
+        .expect("verified rollback must leave the pooled writer usable");
+    let conn = writer.conn();
+    assert!(conn.is_autocommit());
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tx_finalize", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn pooled_transaction_rollback_failure_reports_unknown_and_retires_writer() {
+    let store = setup_memory_store();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch("CREATE TABLE tx_rollback_fault (id INTEGER PRIMARY KEY)")
+            .unwrap();
+    }
+
+    let result = store
+        .with_writer_tx(
+            "test_pooled_rollback",
+            |conn| -> Result<(), rusqlite::Error> {
+                conn.execute("INSERT INTO tx_rollback_fault (id) VALUES (1)", [])?;
+                conn.authorizer(Some(deny_rollback))?;
+                Err(rusqlite::Error::InvalidQuery)
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::WriterTaskTerminated {
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+            })
+        ),
+        "a failed rollback cannot claim that the attempted write did not land"
+    );
+
+    let checkout = store.pool.try_writer();
+    assert!(
+        matches!(checkout, Err(SqliteError::InvalidData(message)) if message.contains("retired")),
+        "a connection with an unverified rollback must never be checked out again"
+    );
+
+    let legacy = store.pool.legacy_conn();
+    let legacy_guard = legacy.lock();
+    let direct_probe = legacy_guard.query_row("SELECT 1", [], |row| row.get::<_, i64>(0));
+    assert!(
+        direct_probe.is_err(),
+        "the compatibility raw-connection handle must not bypass retirement quarantine"
+    );
+}
+
+#[tokio::test]
+async fn pooled_transaction_panic_with_failed_rollback_reports_unknown_and_retires_writer() {
+    let store = setup_memory_store();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch("CREATE TABLE tx_panic_fault (id INTEGER PRIMARY KEY)")
+            .unwrap();
+    }
+
+    let result = store
+        .with_writer_tx("test_pooled_panic", |conn| -> Result<(), rusqlite::Error> {
+            conn.execute("INSERT INTO tx_panic_fault (id) VALUES (1)", [])?;
+            conn.authorizer(Some(deny_rollback))?;
+            panic!("intentional pooled transaction panic");
+        })
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::WriterTaskTerminated {
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+            })
+        ),
+        "a panic whose rollback cannot be verified must report unknown side effects"
+    );
+
+    let checkout = store.pool.try_writer();
+    assert!(
+        matches!(checkout, Err(SqliteError::InvalidData(message)) if message.contains("retired")),
+        "the pooled writer must retire after a transaction-body panic"
+    );
+}
+
+#[tokio::test]
+async fn pooled_transaction_refuses_preexisting_non_autocommit_connection() {
+    let store = setup_memory_store();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+    }
+    let operation_ran = Arc::new(AtomicBool::new(false));
+    let operation_ran_in_closure = Arc::clone(&operation_ran);
+
+    let result = store
+        .with_writer_tx("test_pooled_preexisting_transaction", move |_conn| {
+            operation_ran_in_closure.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::WriterTaskTerminated {
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+            })
+        ),
+        "an inherited transaction has an unknown prior outcome and must fail closed"
+    );
+    assert!(!operation_ran.load(Ordering::SeqCst));
+
+    let checkout = store.pool.try_writer();
+    assert!(
+        matches!(checkout, Err(SqliteError::InvalidData(message)) if message.contains("retired")),
+        "the inherited non-autocommit connection must not be reused"
     );
 }
 

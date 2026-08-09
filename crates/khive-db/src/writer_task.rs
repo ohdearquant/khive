@@ -161,7 +161,7 @@ fn rollback_after_failure(conn: &Connection, failure_context: &'static str) -> R
         Ok(()) => {
             tracing::error!(
                 failure_context,
-                "writer task: ROLLBACK returned success but the connection is still in a \
+                "writer transaction: ROLLBACK returned success but the connection is still in a \
                  transaction; request side effects are unknown"
             );
             RollbackDisposition::SideEffectsUnknown
@@ -170,10 +170,78 @@ fn rollback_after_failure(conn: &Connection, failure_context: &'static str) -> R
             tracing::error!(
                 error = %rollback_error,
                 failure_context,
-                "writer task: rollback after request failure failed; request side effects are \
+                "writer transaction: rollback after request failure failed; request side effects are \
                  unknown"
             );
             RollbackDisposition::SideEffectsUnknown
+        }
+    }
+}
+
+/// Execute an operation inside an already-open transaction and apply the
+/// shared commit, rollback, panic, and autocommit verification rules.
+pub(crate) fn execute_wrapped_transaction<R, F>(
+    conn: &Connection,
+    commit_operation: &'static str,
+    operation: F,
+) -> (Result<R, StorageError>, Option<WriterTaskRequestState>)
+where
+    F: FnOnce(&Connection) -> Result<R, StorageError>,
+{
+    match catch_unwind(AssertUnwindSafe(|| operation(conn))) {
+        Ok(Ok(value)) => match conn.execute_batch("COMMIT") {
+            Ok(()) if conn.is_autocommit() => (Ok(value), None),
+            Ok(()) => {
+                tracing::error!(
+                    "writer transaction: COMMIT returned success but the connection is still in \
+                     a transaction; request side effects are unknown"
+                );
+                let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                (
+                    Err(writer_task_terminated(request_state)),
+                    Some(request_state),
+                )
+            }
+            Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
+                RollbackDisposition::RolledBack => (
+                    Err(StorageError::Pool {
+                        operation: commit_operation.into(),
+                        message: commit_error.to_string(),
+                    }),
+                    None,
+                ),
+                RollbackDisposition::SideEffectsUnknown => {
+                    let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                    (
+                        Err(writer_task_terminated(request_state)),
+                        Some(request_state),
+                    )
+                }
+            },
+        },
+        Ok(Err(operation_error)) => {
+            match rollback_after_failure(conn, "request operation failure") {
+                RollbackDisposition::RolledBack => (Err(operation_error), None),
+                RollbackDisposition::SideEffectsUnknown => {
+                    let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                    (
+                        Err(writer_task_terminated(request_state)),
+                        Some(request_state),
+                    )
+                }
+            }
+        }
+        Err(_panic_payload) => {
+            let request_state = match rollback_after_failure(conn, "request panic") {
+                RollbackDisposition::RolledBack => WriterTaskRequestState::TransactionRolledBack,
+                RollbackDisposition::SideEffectsUnknown => {
+                    WriterTaskRequestState::SideEffectsUnknown
+                }
+            };
+            (
+                Err(writer_task_terminated(request_state)),
+                Some(request_state),
+            )
         }
     }
 }
@@ -187,67 +255,11 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         // `(self.op)(conn)` directly would drop `self.reply` while unwinding,
         // leaving the active caller with only an untyped RecvError.
         let WriteRequest { op, reply, .. } = *self;
-        match catch_unwind(AssertUnwindSafe(|| op(conn))) {
-            Ok(Ok(value)) => match conn.execute_batch("COMMIT") {
-                Ok(()) if conn.is_autocommit() => {
-                    // The receiver may already be gone (caller dropped its
-                    // future) — that is not this task's problem to report.
-                    let _ = reply.send(Ok(value));
-                    None
-                }
-                Ok(()) => {
-                    tracing::error!(
-                        "writer task: COMMIT returned success but the connection is still in a \
-                         transaction; request side effects are unknown"
-                    );
-                    let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                    let _ = reply.send(Err(writer_task_terminated(request_state)));
-                    Some(request_state)
-                }
-                Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
-                    RollbackDisposition::RolledBack => {
-                        let _ = reply.send(Err(StorageError::Pool {
-                            operation: "writer_task_commit".into(),
-                            message: commit_error.to_string(),
-                        }));
-                        None
-                    }
-                    RollbackDisposition::SideEffectsUnknown => {
-                        let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                        let _ = reply.send(Err(writer_task_terminated(request_state)));
-                        Some(request_state)
-                    }
-                },
-            },
-            Ok(Err(operation_error)) => {
-                match rollback_after_failure(conn, "request operation failure") {
-                    RollbackDisposition::RolledBack => {
-                        let _ = reply.send(Err(operation_error));
-                        None
-                    }
-                    RollbackDisposition::SideEffectsUnknown => {
-                        let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                        let _ = reply.send(Err(writer_task_terminated(request_state)));
-                        Some(request_state)
-                    }
-                }
-            }
-            Err(_panic_payload) => {
-                // The transaction and connection are owned by this blocking
-                // thread, so rollback happens here rather than from the async
-                // task on a foreign connection.
-                let request_state = match rollback_after_failure(conn, "request panic") {
-                    RollbackDisposition::RolledBack => {
-                        WriterTaskRequestState::TransactionRolledBack
-                    }
-                    RollbackDisposition::SideEffectsUnknown => {
-                        WriterTaskRequestState::SideEffectsUnknown
-                    }
-                };
-                let _ = reply.send(Err(writer_task_terminated(request_state)));
-                Some(request_state)
-            }
-        }
+        let (result, terminal_state) = execute_wrapped_transaction(conn, "writer_task_commit", op);
+        // The receiver may already be gone (caller dropped its future) —
+        // that is not this task's problem to report.
+        let _ = reply.send(result);
+        terminal_state
     }
 
     fn execute_and_reply_top_level_reporting_terminal(

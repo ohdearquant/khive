@@ -155,13 +155,14 @@ metadata on an existing record. `gtd`'s entire parameter surface is
 pack-owned kinds would remove that workflow's only path and offer none in its place; refusing a
 class to close a specific hole is a broader change than the hole justifies.
 
-The refusal lives at the runtime layer in `prepare_update_note`. Two call sites reach it: the
-`update` verb by way of `update_note`, and the atomic seam in `atomic_prepare`. Placing the
-refusal in the kg handler instead would leave the atomic seam open. No proposal-borne note update
-converges there, because `ProposalChangeset` carries no note-update variant at all
-(`khive-types/src/event.rs`); should one be added, it must route through `prepare_update_note`
-rather than around it. `name`, `content`, `salience` and `decay_factor` remain patchable on every
-kind.
+The refusal lives at the runtime layer in `prepare_update_note_from_snapshot`. Two call sites
+reach it: the `update` verb through the guarded
+`update_note_from_snapshot_with_embedding_report` path, and the atomic seam in
+`atomic_prepare`. Placing the refusal in the kg handler instead would leave the atomic seam open.
+No proposal-borne note update converges there, because `ProposalChangeset` carries no note-update
+variant at all (`khive-types/src/event.rs`); should one be added, it must route through this
+guarded snapshot update path rather than around it. `name`, `content`, `salience` and
+`decay_factor` remain patchable on every kind.
 
 The pack-owned kind set is derived from the packs' `NOTE_KINDS` constants
 (`PackRegistry::pack_owned_note_kinds`): every note kind declared by a pack other than the

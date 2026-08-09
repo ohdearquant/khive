@@ -55,7 +55,7 @@ impl Pack for GtdPack {
     const HANDLERS:     &'static [HandlerDef]    = &[
         HandlerDef { name: "gtd.assign",     description: "Create a task with optional dependencies.",       visibility: Visibility::Verb },
         HandlerDef { name: "gtd.next",       description: "List actionable tasks (status next or active).", visibility: Visibility::Verb },
-        HandlerDef { name: "gtd.complete",   description: "Mark a task done with optional result.",         visibility: Visibility::Verb },
+        HandlerDef { name: "gtd.complete",   description: "Mark a task done (or cancelled) with an optional result note.", visibility: Visibility::Verb },
         HandlerDef { name: "gtd.tasks",      description: "Filtered task list.",                            visibility: Visibility::Verb },
         HandlerDef { name: "gtd.transition", description: "Explicit GTD status transition.",                visibility: Visibility::Verb },
     ];
@@ -117,7 +117,16 @@ semantics are required.
 Transition validation lives in the `transition` verb handler. Illegal jumps (e.g.,
 `done → inbox`) return `RuntimeError::InvalidInput` with the allowed-set message.
 Same-status transitions are idempotent no-ops; the response carries `transitioned:
-false` with an explanatory `note` field.
+false` with an explanatory `note` field. Canonical dispatch may still persist a
+caller-supplied transition note as the explicitly documented note-event exception;
+ADR-099 atomic v1 carries a guarded no-effect assertion that revalidates the exact
+prepare snapshot at commit, but does not persist the caller note or an audit row.
+
+`gtd.complete` uses this same table, with a target of `done` by default or
+`cancelled` when requested. It does not add a narrower "actionable only" gate:
+`inbox`, `waiting`, and `someday` all have legal direct terminal transitions above,
+so `complete` accepts them just as `transition` does. Terminal source states remain
+rejected.
 
 ### Status / priority aliases
 
@@ -137,13 +146,13 @@ task-specific knowledge in retrieval.
 
 ### Five disjoint verbs
 
-| Verb             | Purpose                                                                                                                                       |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gtd.assign`     | Create a task. Args: `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?`, `description?`. Returns the task envelope. |
-| `gtd.next`       | List actionable tasks (`status ∈ {next, active}`), priority-sorted. Args: `limit?`, `assignee?`, `include_blocked?`.                          |
-| `gtd.complete`   | Validate transition to `done`, record `completed_at` and optional `result`. Args: `id`, `result?`.                                            |
-| `gtd.tasks`      | Filtered list. Args: `status?`, `assignee?`, `priority?`, `limit?`, `offset?`.                                                                |
-| `gtd.transition` | Explicit lifecycle change with full transition validation. Args: `id`, `status`, `note?`.                                                     |
+| Verb             | Purpose                                                                                                                                                         |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gtd.assign`     | Create a task. Args: `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?`, `description?`. Returns the task envelope.                   |
+| `gtd.next`       | List actionable tasks (`status ∈ {next, active}`), priority-sorted. Args: `limit?`, `assignee?`, `include_blocked?`.                                            |
+| `gtd.complete`   | Validate transition to a terminal state, record `completed_at` and optional `result`. Args: `id`, `status?` (`done` or `cancelled`; default `done`), `result?`. |
+| `gtd.tasks`      | Filtered list. Args: `status?`, `assignee?`, `priority?`, `limit?`, `offset?`.                                                                                  |
+| `gtd.transition` | Explicit lifecycle change with full transition validation. Args: `id`, `status`, `note?`.                                                                       |
 
 No collision with kg pack's shared CRUD. ADR-017's `VerbRegistry` registers all five
 verbs as `gtd`-owned. The kg pack's `create(kind="note", note_kind="task", ...)`
@@ -260,6 +269,12 @@ impl KindHook for TaskHook {
         // ...
     }
 
+    async fn prepare_note_update(/* ..., args: &mut Value */) -> Result<(), RuntimeError> {
+        // Keep note.content and properties.description synchronized, then
+        // run the dependency-property validator.
+        // ...
+    }
+
     async fn validate_links(/* batch ... */) -> Result<(), RuntimeError> {
         // Reject direct, transitive, and same-batch depends_on edge cycles.
         // ...
@@ -308,6 +323,32 @@ at the same `NoteStore::upsert_note` + `GraphStore::upsert_edge` calls. Agents p
 whichever fits their context: `assign` reads naturally for "I'm creating a task";
 `create(kind="note", note_kind="task")` reads naturally for "I'm batching mixed
 substrate operations through the request DSL."
+
+The generic path rejects a present GTD field whose JSON type is wrong instead of
+treating it as absent and applying a default. This applies to both top-level flavored
+fields and their recognized `properties` equivalents. JSON `null` retains normal
+optional-field semantics: `title=null` falls back to a valid string `name`, while both
+absent/null spellings still fail the required-title check. The shared raw
+`CreateParams` shape is validated before the task hook can replace derived `name`,
+`content`, or `salience`, and both title spellings are parsed strictly. Top-level values
+win when both valid forms are supplied.
+
+Task body text has one mirror contract. With a description, `note.content` and
+`properties.description` contain the same string; without one, `note.content` falls
+back to the title. The task kind hook applies the same rule to generic `update`: a
+content-only patch fills the description mirror, a description-only patch fills
+content, conflicting simultaneous values are rejected, clearing a stored non-null
+description restores the title fallback, clearing an absent description preserves a
+non-fallback body, and renaming a description-less task updates content only while its
+stored body is the title fallback. A task title remains required: `name=null` is
+rejected before any mirror patch can write,
+including when the same request clears `properties.description`. The
+canonical and atomic update paths run this same hook before building their writes. The
+hook snapshot is also the patch/write snapshot: canonical persistence compare-and-swaps
+its revision, while atomic persistence guards the same revision in-transaction. Atomic
+v1 does not project one update's new task state into a later update of the same task;
+the later stale guard fails and rolls the entire unit back rather than losing ordered
+effects.
 
 ### Lifecycle verbs stay pack-owned
 
@@ -381,12 +422,15 @@ impl PackRuntime for GtdPack {
 }
 ```
 
-`gtd_lifecycle_audit` is a pack-auxiliary table. It records each `transition`
+`gtd_lifecycle_audit` is a pack-auxiliary table. It records each real `transition`
 and `complete` invocation for replay and compliance, including the caller namespace.
 The `namespace` column is nullable because it was added after the table shipped:
 legacy rows may be `NULL`, while new rows always bind the authorized namespace.
 Per ADR-015, pack schema uses idempotent declarations by default; GTD's nullable
 namespace `ALTER TABLE` is the documented v1 pack-local evolution exception.
+The state mutation remains successful when this best-effort append fails, but every
+successful real lifecycle response includes `audit_persisted`; `false` makes that
+degradation caller-visible instead of silently losing the only operational signal.
 
 `StorageProfile.roles: [Hot]` because task work is interactive — tasks are read and
 updated constantly. `default_backend: "main"` keeps tasks on the same backend as kg
@@ -427,12 +471,19 @@ the blocker-resolution read required to classify dependency state.
   "from": "next",
   "to": "active",
   "transitioned": true,
-  "is_terminal": false
+  "is_terminal": false,
+  "audit_persisted": true
 }
 ```
 
 Same-status transitions return `{"transitioned": false, "note": "already in target
-status"}` so callers can audit the no-op.
+status"}` so callers can audit the no-op. They do not carry `audit_persisted` when no
+audit append was attempted. On canonical dispatch, a same-status call that carries a
+note persists that note, appends a same-status audit row, and reports the append with
+`note_recorded` and `audit_persisted`. Atomic v1 represents the same-status case with a
+guarded, mutation-free snapshot assertion even when `note` was supplied, so stale
+multi-op assumptions roll back while neither side effect is persisted; it returns only
+the base no-op shape.
 
 ### Config-driven loading
 
@@ -533,6 +584,10 @@ time T with note N in namespace NS." The audit table records each `transition` a
 `complete` invocation. Legacy rows created before the namespace backfill may have
 `NULL` namespace.
 
+The append stays non-fatal because the lifecycle row is already committed. Returning
+`audit_persisted` on successful state changes preserves that best-effort boundary while
+letting callers alert or reconcile when the auxiliary row was not written.
+
 This is GTD-specific data; it doesn't belong in the core `events` table (which is
 governed by ADR-004 and used for system-level events). Pack-auxiliary tables (per
 ADR-015) are the right placement.
@@ -599,8 +654,10 @@ minimal. Operators who want GTD configure it explicitly.
   Fine for personal/agent workloads (typical inboxes < 50 actionable items);
   `next`'s full-scan-then-sort will need property indexes or a v2 SQL path
   (e.g. `ORDER BY` pushed into SQL) at hundreds-of-thousands scale.
-- Same-status transitions are no-ops, which can surprise callers expecting a write.
-  Mitigated: `transitioned: false` + `note` field in the response body.
+- Same-status transitions do not change lifecycle state. Canonical dispatch may
+  still persist a supplied note event; atomic v1 instead executes a guarded
+  no-effect assertion and discards that note. Mitigated: `transitioned: false` +
+  the path distinction documented above.
 - `depends_on` redundancy (property + edge) requires both writes to succeed for
   consistency. Edge write is best-effort; on failure, the property still holds.
   Mitigated: documented; future relibilization (atomic two-write transaction) is a
@@ -612,8 +669,9 @@ minimal. Operators who want GTD configure it explicitly.
   forward-compatible vocabulary extension.
 - `gtd_lifecycle_audit` is pack-auxiliary; its presence is invisible to non-GTD
   packs.
-- Task properties (priority, status, assignee, etc.) remain free-form JSON — no
-  schema enforcement beyond what `transition` validates.
+- Task properties remain JSON rather than dedicated columns. The task hook still
+  validates recognized create-field types, the content/description mirror, and
+  dependency invariants before shared CRUD writes.
 
 ## Implementation
 
@@ -628,6 +686,7 @@ minimal. Operators who want GTD configure it explicitly.
   - `TaskHook` implementing `KindHook`.
   - `prepare_create`: normalize GTD args into kg shape.
   - `after_create`: fire `depends_on` edges (best-effort, logged on failure).
+  - `prepare_note_update`: synchronize task content/description and validate properties.
   - `validate_note_update` / `validate_links`: reject dependency cycles before writes.
 - `crates/khive-pack-gtd/src/dependency.rs`:
   - Bounded property and edge reachability validation.
