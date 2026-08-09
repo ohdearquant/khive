@@ -2747,6 +2747,129 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    struct InterleavingTailReader {
+        subject: Uuid,
+        calls: Vec<String>,
+    }
+
+    impl InterleavingTailReader {
+        fn row(columns: Vec<(&str, SqlValue)>) -> khive_storage::SqlRow {
+            khive_storage::SqlRow {
+                columns: columns
+                    .into_iter()
+                    .map(|(name, value)| khive_storage::types::SqlColumn {
+                        name: name.to_owned(),
+                        value,
+                    })
+                    .collect(),
+            }
+        }
+
+        fn embedding(values: &[f32]) -> SqlValue {
+            SqlValue::Blob(
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for InterleavingTailReader {
+        async fn query_row(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Option<khive_storage::SqlRow>> {
+            panic!("fresh-tail replay must use query_all")
+        }
+
+        async fn query_all(
+            &mut self,
+            statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Vec<khive_storage::SqlRow>> {
+            let label = statement.label.unwrap_or_default();
+            self.calls.push(label.clone());
+            let id = SqlValue::Text(self.subject.to_string());
+            Ok(match label.as_str() {
+                // The coherent snapshot: the suffix and its matching current
+                // vector are both the pre-commit state.
+                "memory_ann_fresh_tail_snapshot" => vec![Self::row(vec![
+                    ("seq", SqlValue::Integer(1)),
+                    ("subject_id", id),
+                    ("op", SqlValue::Text("upsert".into())),
+                    ("vector_model", SqlValue::Text("snapshot-race-model".into())),
+                    ("vector_kind", SqlValue::Text("note".into())),
+                    ("vector_field", SqlValue::Text("note.content".into())),
+                    ("embedding", Self::embedding(&[1.0, 0.0])),
+                    ("live_note_id", SqlValue::Text(self.subject.to_string())),
+                ])],
+                // Legacy multi-query behavior: a writer commits immediately
+                // after suffix selection, so the next pooled read observes a
+                // newer vector than the selected log row described.
+                "memory_ann_fetch_tail" => vec![Self::row(vec![
+                    ("seq", SqlValue::Integer(1)),
+                    ("subject_id", id),
+                    ("op", SqlValue::Text("upsert".into())),
+                ])],
+                "memory_ann_tail_point_read" => vec![Self::row(vec![
+                    (
+                        "embedding_model",
+                        SqlValue::Text("snapshot-race-model".into()),
+                    ),
+                    ("kind", SqlValue::Text("note".into())),
+                    ("field", SqlValue::Text("note.content".into())),
+                    ("embedding", Self::embedding(&[0.0, 1.0])),
+                ])],
+                "memory_ann_tail_live_notes" => vec![Self::row(vec![(
+                    "id",
+                    SqlValue::Text(self.subject.to_string()),
+                )])],
+                other => panic!("unexpected fresh-tail query label: {other}"),
+            })
+        }
+
+        async fn query_scalar(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Option<SqlValue>> {
+            panic!("fresh-tail replay must use query_all")
+        }
+
+        async fn explain(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Vec<khive_storage::SqlRow>> {
+            panic!("fresh-tail replay must not issue EXPLAIN")
+        }
+    }
+
+    /// A writer committing between suffix selection and corpus hydration must
+    /// not let a pool-backed reader combine the old log row with the new
+    /// vector. One statement makes the commit entirely visible or entirely
+    /// invisible; this seam deterministically advances after the first call.
+    #[tokio::test]
+    async fn fresh_tail_snapshot_cannot_return_a_torn_log_vector_pair() {
+        let subject = Uuid::new_v4();
+        let mut reader = InterleavingTailReader {
+            subject,
+            calls: Vec::new(),
+        };
+
+        let (ops, watermark) =
+            fetch_final_tail_on(&mut reader, "snapshot-race-model", 0, Some(20_000))
+                .await
+                .expect("fresh-tail snapshot");
+
+        assert_eq!(watermark, 1);
+        assert_eq!(ops, vec![(subject, Some(vec![1.0, 0.0]))]);
+        assert_eq!(
+            reader.calls,
+            vec!["memory_ann_fresh_tail_snapshot"],
+            "one logical no-index replay must execute exactly one SQLite statement"
+        );
+    }
+
     #[test]
     fn outcome_into_candidates_replace_with_reason_discloses_degradation() {
         // Re-resolution failure classes (reader open, snapshot begin,
