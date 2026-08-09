@@ -25,6 +25,7 @@ pub mod khive_error;
 pub mod namespace;
 pub mod note;
 pub mod pack;
+pub mod refusal;
 pub mod substrate;
 pub mod timestamp;
 pub mod vector;
@@ -58,6 +59,7 @@ pub use pack::{
     EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, Pack,
     PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
 };
+pub use refusal::RefusalReason;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;

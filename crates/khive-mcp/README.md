@@ -20,8 +20,8 @@ lifetime.
   client only forwards to a warm daemon (ADR-049) when the fingerprints match;
   otherwise it falls back to local dispatch
 - **Result sinking** — `RequestParams::save_to` writes results as JSONL and returns a
-  manifest (`path`, `rows`, `per_column_null_counts`, `schema_fingerprint`, `checksum`)
-  instead of inlining a large result set
+  manifest (`path`, `rows`, `per_column_null_counts`, `schema_fingerprint`, `checksum`,
+  `summary`, optional `failures`) instead of inlining a large result set
 - **Cross-backend coordinator seam** — `CoordinatorService` is a trait khive-mcp defines
   and `kkernel` implements, avoiding a dependency cycle for multi-backend link/traverse
 

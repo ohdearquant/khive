@@ -97,13 +97,13 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_thirteen_handlers() {
+fn comm_pack_declares_fourteen_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        13,
-        "comm pack must declare 13 handlers: send, delivered, inbox, read, unread, reply, \
+        14,
+        "comm pack must declare 14 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
          thread, ingest, heartbeat, health, probe, cursor_get, cursor_commit \
-         (khive #1447, #449, #66)"
+         (khive #1387, #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"comm.send"));
@@ -113,6 +113,10 @@ fn comm_pack_declares_thirteen_handlers() {
     );
     assert!(names.contains(&"comm.inbox"));
     assert!(names.contains(&"comm.read"));
+    assert!(
+        names.contains(&"comm.mark_read"),
+        "comm.mark_read verb must be registered (khive #1387)"
+    );
     assert!(
         names.contains(&"comm.unread"),
         "comm.unread verb must be registered (khive #66)"
@@ -10581,6 +10585,271 @@ async fn i1422_bulk_read_validates_every_target_before_mutating() {
 }
 
 #[tokio::test]
+async fn i1387_mark_read_supports_best_effort_and_atomic_bulk_modes() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let created_at = chrono::Utc::now().timestamp_micros();
+    let mut ids = Vec::new();
+    for sequence in [501_u32, 502, 503] {
+        ids.push(
+            insert_i1422_message(
+                &runtime,
+                sequence,
+                created_at + i64::from(sequence),
+                "lambda:sender",
+                "lambda:reader",
+                None,
+                &format!("named mark-read {sequence}"),
+            )
+            .await,
+        );
+    }
+
+    let best_effort = registry
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({ "ids": [ids[0].to_string()] }),
+        )
+        .await
+        .expect("mark_read defaults to the shipped best-effort bulk path");
+    assert_eq!(best_effort["requested_count"], 1);
+    assert_eq!(best_effort["unique_count"], 1);
+    assert_eq!(best_effort["marked_count"], 1);
+    assert_eq!(best_effort["failed_count"], 0);
+
+    let atomic = registry
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({
+                "ids": [ids[1].to_string(), ids[2].to_string(), ids[1].to_string()],
+                "atomic": true,
+            }),
+        )
+        .await
+        .expect("atomic mark_read commits every unique target");
+    assert_eq!(atomic["requested_count"], 3);
+    assert_eq!(atomic["unique_count"], 2);
+    assert_eq!(atomic["marked_count"], 2);
+    assert_eq!(atomic["failed_count"], 0);
+    assert!(atomic["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["read"] == true));
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    for id in ids {
+        let note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.properties.unwrap()["read"], true);
+    }
+}
+
+#[tokio::test]
+async fn i1387_atomic_mark_read_rolls_back_an_earlier_live_patch() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let created_at = chrono::Utc::now().timestamp_micros();
+    let eligible = insert_i1422_message(
+        &runtime,
+        504,
+        created_at,
+        "lambda:sender",
+        "lambda:reader",
+        None,
+        "must roll back",
+    )
+    .await;
+    let non_object = insert_i1422_message(
+        &runtime,
+        505,
+        created_at + 1,
+        "lambda:sender",
+        "lambda:reader",
+        None,
+        "transaction guard",
+    )
+    .await;
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    runtime
+        .notes(&token)
+        .unwrap()
+        .update_note_properties(non_object, Some(serde_json::json!([])), created_at + 2)
+        .await
+        .unwrap();
+
+    let error = registry
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({
+                "ids": [eligible.to_string(), non_object.to_string()],
+                "atomic": true,
+            }),
+        )
+        .await
+        .expect_err("a non-object target must abort the guarded transaction");
+    let error = error.to_string();
+    assert!(
+        error.contains("conflict") && error.contains(&non_object.to_string()),
+        "the verb error must name the conflict and failing id {non_object}; got {error}"
+    );
+
+    let eligible = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(eligible)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        eligible.properties.unwrap()["read"],
+        false,
+        "the first guarded UPDATE must roll back when a later target is ineligible"
+    );
+    let non_object = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(non_object)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(non_object.properties, Some(serde_json::json!([])));
+}
+
+#[tokio::test]
+async fn i1387_atomic_mark_read_preserves_adr057_legacy_fail_open() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let created_at = chrono::Utc::now().timestamp_micros();
+    let legacy = insert_i1422_message(
+        &runtime,
+        506,
+        created_at,
+        "lambda:sender",
+        "lambda:reader",
+        None,
+        "legacy addressee-free message",
+    )
+    .await;
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    runtime
+        .notes(&token)
+        .unwrap()
+        .update_note_properties(
+            legacy,
+            Some(serde_json::json!({ "direction": "inbound", "read": false })),
+            created_at + 1,
+        )
+        .await
+        .unwrap();
+
+    let result = registry
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({ "ids": [legacy.to_string()], "atomic": true }),
+        )
+        .await
+        .expect("ADR-057 keeps addressee-free legacy rows markable");
+    assert_eq!(result["marked_count"], 1);
+    assert_eq!(result["failed_count"], 0);
+
+    let stored = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(legacy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.properties.unwrap()["read"], true);
+}
+
+#[tokio::test]
+async fn i1387_atomic_mark_read_reuses_addressee_validation_before_mutation() {
+    let backend = shared_backend();
+    let (registry_a, runtime) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _runtime_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "for B" }),
+        )
+        .await
+        .expect("A sends to B");
+    registry_b
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:a", "content": "for A" }),
+        )
+        .await
+        .expect("B sends to A");
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let notes = runtime
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_for = |actor: &str| {
+        notes
+            .iter()
+            .find(|note| {
+                note.properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("direction"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("inbound")
+                    && note
+                        .properties
+                        .as_ref()
+                        .and_then(|properties| properties.get("to_actor"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(actor)
+            })
+            .map(|note| note.id)
+            .unwrap_or_else(|| panic!("inbound message for {actor} must exist"))
+    };
+    let for_a = inbound_for("lambda:a");
+    let for_b = inbound_for("lambda:b");
+
+    let error = registry_a
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({
+                "ids": [for_a.to_string(), for_b.to_string()],
+                "atomic": true,
+            }),
+        )
+        .await
+        .expect_err("A cannot mark B's inbound delivery state");
+    let error = error.to_string();
+    assert!(error.contains("read: message"));
+    assert!(error.contains("lambda:a"));
+    assert!(!error.contains("lambda:b"));
+
+    for id in [for_a, for_b] {
+        let note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            note.properties.unwrap()["read"],
+            false,
+            "complete validation must occur before the atomic mutation"
+        );
+    }
+}
+
+#[tokio::test]
 async fn i1422_rejects_invalid_filter_and_bulk_shapes() {
     let (registry, _runtime) = build_registry_for_ns("local");
 
@@ -10618,6 +10887,24 @@ async fn i1422_rejects_invalid_filter_and_bulk_shapes() {
         .dispatch(
             "comm.read",
             serde_json::json!({ "ids": vec!["00000000"; 501] }),
+        )
+        .await
+        .is_err());
+    assert!(registry
+        .dispatch("comm.mark_read", serde_json::json!({ "ids": [] }))
+        .await
+        .is_err());
+    assert!(registry
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({ "ids": vec!["00000000"; 501] }),
+        )
+        .await
+        .is_err());
+    assert!(registry
+        .dispatch(
+            "comm.mark_read",
+            serde_json::json!({ "ids": ["00000000"], "atomic": "yes" }),
         )
         .await
         .is_err());

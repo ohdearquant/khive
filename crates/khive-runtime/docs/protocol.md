@@ -95,9 +95,9 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
 
 | Condition                        | Error                                              |
 | --------------------------------- | --------------------------------------------------- |
-| Unknown verb                      | `RuntimeError::InvalidInput("unknown verb ...")`   |
+| Unknown verb                      | `RuntimeError::UnknownVerb("unknown verb ...")`    |
 | Gate deny                         | `RuntimeError::PermissionDenied { verb, reason }`  |
-| Pack not loaded                   | `RuntimeError::InvalidInput` (unknown verb path)   |
+| Pack not loaded                   | `RuntimeError::UnknownVerb` (unknown verb path)    |
 | Malformed explicit namespace      | `RuntimeError::InvalidInput` (non-string `namespace`, rejected before gate) |
 
 `RuntimeError::NamespaceMismatch` is a historical/rejected variant from a pre-Rev-6

@@ -26,7 +26,12 @@
 - Declares vocabulary via constants: `NOTE_KINDS`, `ENTITY_KINDS`, `HANDLERS`, `EDGE_RULES`,
   `NOTE_KIND_SPECS`, `SCHEMA_PLAN`.
 - The `TaskHook` implements the `KindHook` extension point: normalizes GTD fields on
-  `prepare_create` and wires `depends_on` graph edges on `after_create` (best-effort).
+  `prepare_create`, synchronizes task content/description on `prepare_note_update`,
+  and wires `depends_on` graph edges on `after_create` (best-effort).
+- Generic create validates the raw shared `CreateParams` shape before `prepare_create`,
+  so normalization cannot hide malformed `name`, `content`, or `salience` values.
+- Update normalization and persistence share one note snapshot. Canonical persistence
+  compare-and-swaps it; atomic persistence carries the same revision guard into commit.
 - `EDGE_RULES` contains one rule: `depends_on` between two `task` notes (task→task).
 - Endpoint rules are additive only — this pack cannot tighten the base contract.
 
@@ -35,10 +40,11 @@
 - Five verbs: `gtd.assign`, `gtd.next`, `gtd.complete`, `gtd.tasks`, `gtd.transition`.
 - Lifecycle states: `inbox → next | waiting | someday | active | done | cancelled`.
 - `done` and `cancelled` are permanently terminal (no reopen; issue #273).
-- `complete()` is restricted to actionable states (`next`, `active`). Tasks in `inbox`,
-  `waiting`, or `someday` must be explicitly transitioned to an actionable state first.
-- `gtd_lifecycle_audit` table records every `transition` and `complete` invocation for
-  replay and compliance. Writes are best-effort (non-fatal on failure).
+- `complete()` validates its `done`/`cancelled` target against the same lifecycle table as
+  `transition`; every non-terminal state has a legal direct terminal transition.
+- `gtd_lifecycle_audit` receives best-effort rows for successful real transitions,
+  completions, and canonical same-status note events. Writes are non-fatal on failure,
+  and attempted-write responses expose `audit_persisted` so loss is never silent.
 - `depends_on` property stores UUIDs of blocking tasks; `gtd.next` excludes tasks whose
   blockers are not in `done` state by default. Query results report `dependency_state`,
   `actionable`, and structural `blocked_by` diagnostics; `include_blocked=true` makes
@@ -90,15 +96,17 @@
 - The KG `get` and `list` handlers apply a remap: `properties.status` is promoted to the
   top-level `status` field; the row-visibility value moves to `lifecycle`. Tests verify this.
 
-### `complete()` actionable-state gate (UE2-H1)
+### `complete()` lifecycle-table parity
 
-- `complete()` rejects tasks in non-actionable states (`inbox`, `waiting`, `someday`) with
-  a message directing the caller to transition first. `transition(status=done)` bypasses
-  this gate for use cases where direct terminal transition is intended.
+- `complete()` uses the same `can_transition` contract as `transition`: `inbox`, `next`,
+  `active`, `waiting`, and `someday` may all move directly to `done` or `cancelled`.
+  `done` and `cancelled` remain permanently terminal.
 
 ### Atomic transition
 
 - Both `complete()` and `transition()` use a conditional SQL UPDATE with a
-  `json_extract(properties, '$.status') = expected_current` WHERE predicate. This ensures
-  that concurrent calls in a parallel DSL batch only one wins; the other gets
-  `rows_affected = 0` and returns an error rather than a false success.
+  WHERE predicate over the exact decision snapshot's `updated_at`, `deleted_at`, and
+  semantic GTD status. Missing legacy `properties.status` is compared as `inbox`.
+  This ensures that concurrent lifecycle calls and generic task updates cannot
+  overwrite one another: the loser gets `rows_affected = 0` and returns an error,
+  while a mixed atomic unit rolls back in full.

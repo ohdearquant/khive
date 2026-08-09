@@ -257,14 +257,32 @@ impl JsonlSaveSink {
                 "aborted": 0,
             })
         });
+        let failures = summary
+            .get("failures")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| failure_projection(results));
         for row in results {
             self.write_row(row)?;
         }
-        self.finish(summary)
+        self.finish_with_failures(summary, failures)
     }
 
     /// Publish the complete JSONL file and return its ordinary manifest.
-    pub fn finish(mut self, summary: Value) -> anyhow::Result<Value> {
+    pub fn finish(self, summary: Value) -> anyhow::Result<Value> {
+        let failures = summary
+            .get("failures")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.finish_with_failures(summary, failures)
+    }
+
+    fn finish_with_failures(
+        mut self,
+        summary: Value,
+        failures: Vec<Value>,
+    ) -> anyhow::Result<Value> {
         self.temp
             .as_file_mut()
             .flush()
@@ -291,15 +309,44 @@ impl JsonlSaveSink {
         })?;
         let absolute =
             std::fs::canonicalize(&destination).unwrap_or_else(|_| destination.to_path_buf());
-        Ok(json!({
+        let mut manifest = json!({
             "path": absolute.to_string_lossy(),
             "rows": rows,
             "per_column_null_counts": null_counts,
             "schema_fingerprint": schema_fingerprint,
             "checksum": checksum,
             "summary": summary,
-        }))
+        });
+        if !failures.is_empty() {
+            manifest["failures"] = Value::Array(failures);
+        }
+        Ok(manifest)
     }
+}
+
+fn failure_projection(results: &[Value]) -> Vec<Value> {
+    results
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.get("ok").and_then(Value::as_bool) == Some(false))
+        .map(|(op_index, row)| {
+            let mut failure = json!({
+                "op_index": row
+                    .get("op_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(op_index as u64),
+                "tool": row.get("tool").and_then(Value::as_str).unwrap_or("?"),
+                "error": row
+                    .get("error")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("unknown error".to_string())),
+            });
+            if let Some(reason) = row.get("reason").and_then(Value::as_str) {
+                failure["reason"] = Value::String(reason.to_string());
+            }
+            failure
+        })
+        .collect()
 }
 
 /// Write `results_envelope` as JSONL to `path` and return the self-describing manifest.
@@ -316,9 +363,17 @@ impl JsonlSaveSink {
 ///   "rows": <N>,
 ///   "per_column_null_counts": { "<field>": <null_count>, ... },
 ///   "schema_fingerprint": "<sha256 of sorted field names>",
-///   "checksum": "<sha256 of file bytes>"
+///   "checksum": "<sha256 of file bytes>",
+///   "summary": { ... },
+///   "failures": [ {"op_index": 0, "tool": "...", "error": ..., "reason": "..."} ]
 /// }
 /// ```
+///
+/// `failures` is omitted for an all-successful result. It is a compact
+/// projection rather than the full result payload: callers still need stable
+/// refusal metadata in the stdout manifest while canonical per-op rows remain
+/// in the JSONL file. Incremental callers may provide an already-bounded
+/// `summary.failures` projection; that bound is preserved in the manifest.
 ///
 /// `restrict_to_export_root` gates the destination policy (root containment,
 /// `..` traversal rejection, symlink-destination rejection): `true` for the
@@ -380,13 +435,54 @@ mod tests {
 
         let envelope = make_envelope(vec![
             json!({ "ok": true, "tool": "stats", "result": {} }),
-            json!({ "ok": false, "tool": "get", "error": "not found" }),
+            json!({
+                "ok": false,
+                "tool": "get",
+                "error": "not found",
+                "reason": "entity-not-found"
+            }),
         ]);
 
         let manifest = write_and_manifest(&envelope, &path, false).unwrap();
         assert_eq!(manifest["summary"]["total"], json!(2));
         assert_eq!(manifest["summary"]["succeeded"], json!(1));
         assert_eq!(manifest["summary"]["failed"], json!(1));
+        assert_eq!(manifest["failures"][0]["op_index"], json!(1));
+        assert_eq!(manifest["failures"][0]["tool"], json!("get"));
+        assert_eq!(manifest["failures"][0]["error"], json!("not found"));
+        assert_eq!(manifest["failures"][0]["reason"], json!("entity-not-found"));
+    }
+
+    #[test]
+    fn incremental_sink_preserves_bounded_summary_failures() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("bounded.jsonl");
+        let mut sink = JsonlSaveSink::new(&path, false).unwrap();
+        sink.write_row(&json!({
+            "ok": false,
+            "tool": "get",
+            "error": "full canonical row",
+            "reason": "entity-not-found"
+        }))
+        .unwrap();
+        let manifest = sink
+            .finish(json!({
+                "total": 2_000,
+                "succeeded": 0,
+                "failed": 2_000,
+                "aborted": 0,
+                "failures": [{
+                    "op_index": 0,
+                    "tool": "get",
+                    "error": "bounded detail",
+                    "reason": "entity-not-found"
+                }],
+                "failure_details_omitted": 1_999
+            }))
+            .unwrap();
+        assert_eq!(manifest["failures"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["failures"][0]["error"], "bounded detail");
+        assert_eq!(manifest["summary"]["failure_details_omitted"], 1_999);
     }
 
     #[test]

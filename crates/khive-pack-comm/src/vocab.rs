@@ -43,7 +43,7 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     PRIMARY KEY (channel_kind, channel_slug)\
 )";
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -199,7 +199,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Mark one or up to 500 inbound messages as read. Mark writes are best-effort: inspect each result's read/mark_error fields and re-issue failures later.",
+        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: inspect each result's read/mark_error fields and re-issue failures later.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -214,6 +214,26 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
                 param_type: "array of string",
                 required: false,
                 description: "One to 500 inbound message ids to mark read in one operation. Mutually exclusive with `id`; all targets are validated before mutation and duplicate resolved ids are updated once.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.mark_read",
+        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Defaults to best-effort updates, with atomic=true for all-or-nothing mutation.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "ids",
+                param_type: "array of string",
+                required: true,
+                description: "One to 500 inbound message ids. Every target is validated before mutation and duplicate resolved ids are updated once.",
+            },
+            ParamDef {
+                name: "atomic",
+                param_type: "boolean",
+                required: false,
+                description: "All-or-nothing cross-message mutation. Defaults to false (best-effort per-target storage updates after complete validation).",
             },
         ],
     },

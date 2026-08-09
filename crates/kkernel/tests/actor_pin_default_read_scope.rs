@@ -6,8 +6,8 @@
 //! Drives `run_exec` end-to-end (its normal in-process fallback — the same
 //! entry point `kkernel exec` uses) against a project `[actor] id =
 //! "lambda:fallback"` config with no `visible_namespaces` configured. Seeds
-//! one record each into `local`, `lambda:fallback`, and `lambda:pinned` via
-//! an explicit per-op `namespace=` write escape, then reads back with
+//! one record each into `local`, `lambda:fallback`, and `lambda:pinned` through
+//! a model-less setup runtime, then reads back with
 //! `--actor lambda:pinned` and again with `--actor local`, asserting each
 //! read's namespace-derived scope.
 //!
@@ -25,6 +25,7 @@
 
 use std::path::PathBuf;
 
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use kkernel::exec::{run_exec, ExecArgs};
 use serial_test::serial;
 
@@ -145,37 +146,30 @@ id = "lambda:fallback"
     std::env::set_current_dir(project_dir.path()).expect("chdir into isolated project dir");
 
     // ── seed: one record each into local, lambda:fallback, lambda:pinned ────
-    // Explicit `namespace=` on each op is the documented write escape
-    // (ADR-007 Rev 4): it targets exactly that namespace regardless of the
-    // caller's actor/default namespace, so seeding does not depend on the
-    // pin behavior under test.
-    let seed_ops = r#"[
-        create(kind="observation", content="local-record", namespace="local"),
-        create(kind="observation", content="fallback-record", namespace="lambda:fallback"),
-        create(kind="observation", content="pinned-record", namespace="lambda:pinned")
-    ]"#;
-    let seed_save = project_dir.path().join("seed-result.jsonl");
-    let seed_args = base_args(
-        &db_str,
-        None,
-        seed_ops,
-        seed_save.to_str().expect("utf8 save path"),
-    );
-    let seed_result = run_exec(seed_args).await;
-    assert!(
-        seed_result.is_ok(),
-        "seeding local/fallback/pinned records must succeed: {seed_result:?}"
-    );
-    let seed_raw = std::fs::read_to_string(&seed_save).expect("read seed save-file");
-    assert_eq!(
-        seed_raw.lines().filter(|l| !l.trim().is_empty()).count(),
-        3,
-        "seed batch must have written exactly 3 result rows: {seed_raw}"
-    );
-    for line in seed_raw.lines().filter(|l| !l.trim().is_empty()) {
-        let row: serde_json::Value = serde_json::from_str(line).expect("parse seed row json");
-        assert_eq!(row["ok"], true, "every seed create() must succeed: {row}");
+    // Seed through a model-less runtime: record creation is setup, while the
+    // actor-pinned `kkernel exec` read path below is the behavior under test.
+    // Keeping setup embedding-free makes this contract hermetic on fresh CI
+    // machines with no downloaded model files or outbound network access.
+    let seed_runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: Some(db_path.clone()),
+        packs: vec!["kg".to_string()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("build model-less seed runtime");
+    for (namespace, content) in [
+        ("local", "local-record"),
+        ("lambda:fallback", "fallback-record"),
+        ("lambda:pinned", "pinned-record"),
+    ] {
+        let token = seed_runtime
+            .authorize(Namespace::parse(namespace).expect("valid seed namespace"))
+            .expect("authorize seed namespace");
+        seed_runtime
+            .create_note(&token, "observation", None, content, None, None, vec![])
+            .await
+            .expect("seed observation without embedding");
     }
+    drop(seed_runtime);
 
     // ── read #1: --actor lambda:pinned, default (no namespace=) list() ──────
     let pinned_save = project_dir.path().join("pinned-read.jsonl");

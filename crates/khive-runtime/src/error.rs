@@ -186,6 +186,9 @@ pub enum RuntimeError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("invalid input: {0}")]
+    UnknownVerb(String),
+
     #[error("unconfigured: {0} is not set")]
     Unconfigured(String),
 

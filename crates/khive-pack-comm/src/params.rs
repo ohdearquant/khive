@@ -89,6 +89,14 @@ pub(crate) struct ReadParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct MarkReadParams {
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub atomic: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UnreadParams {}
 
 #[derive(Deserialize)]

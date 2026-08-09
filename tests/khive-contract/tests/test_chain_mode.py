@@ -67,8 +67,8 @@ def test_chain_assign_then_complete(
     ns = temp_namespace
     title = f"ChainAssignComplete_{uuid.uuid4().hex[:6]}"
 
-    # gtd.assign defaults to inbox; complete rejects inbox→done directly (ADR-462).
-    # Assign with status="next" so gtd.complete can run immediately via $prev.id.
+    # Use status="next" to exercise an explicit non-default starting state; the
+    # accepted lifecycle also permits the default inbox→done completion directly.
     ops = (
         f'gtd.assign(title="{title}", status="next", namespace="{ns}")'
         f' | gtd.complete(id=$prev.id, namespace="{ns}")'

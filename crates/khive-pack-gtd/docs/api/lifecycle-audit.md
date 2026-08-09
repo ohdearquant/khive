@@ -1,8 +1,8 @@
 # Lifecycle audit trail (`src/handlers.rs`)
 
-Every `gtd.transition` and `gtd.complete` invocation is recorded into a
-`gtd_lifecycle_audit` table for replay and compliance (ADR-019). This
-document covers the write path's implementation details that don't belong
+Every state-changing `gtd.transition` and `gtd.complete` invocation attempts
+to append to a `gtd_lifecycle_audit` table for replay and compliance (ADR-019).
+This document covers the write path's implementation details that don't belong
 in the caller-facing contract on `handle_transition`/`handle_complete`.
 
 ## `ensure_audit_schema` — why per-call, not `OnceLock`
@@ -16,9 +16,9 @@ without the audit table. In production this per-call DDL is idempotent and
 cheap: SQLite skips an `IF NOT EXISTS` table creation near-instantly once
 the table already exists.
 
-## Why `ensure_audit_schema` and `write_audit_record` are `pub`
+## Why the lifecycle-audit helpers are `pub`
 
-Unlike every other helper in `handlers.rs`, these two are `pub` rather than
+Unlike every other helper in `handlers.rs`, these are `pub` rather than
 module-private. The ADR-099 `--atomic` CLI surface's `gtd.transition`/
 `gtd.complete` prepare functions live in `kkernel` (a crate that already
 depends on both `khive-runtime` and `khive-pack-gtd` — see that crate's
@@ -30,18 +30,30 @@ statement a second time in `kkernel`.
 
 Audit writes are best-effort: a failure to write the audit row is logged and
 does not fail the transition/complete call itself, since the state change
-already committed successfully.
+already committed successfully. `write_audit_record_with_status` returns a
+boolean, and the canonical and atomic real-transition response builders expose
+it as `audit_persisted`. The original public `write_audit_record` remains a
+unit-returning compatibility wrapper. This keeps the auxiliary append non-fatal
+without silently claiming a complete audit trail.
 
-## Same-status rows: note-bearing no-ops are audited
+## Same-status rows: canonical and atomic behavior
 
 A `gtd.transition` call where `current == target` normally writes no audit
-row — an idempotent no-op is not a lifecycle event. The one exception is a
-no-op that carries a caller-supplied `note`: the note is persisted to
-`properties.transition_note` (last-write-wins), and a same-status audit row
-(`from_state == to_state`) is written so each overwritten note keeps a
-durable trail. Consumers counting or replaying *real* transitions must
-therefore filter `from_state != to_state`; same-status rows are note events,
-not lifecycle changes.
+row — an idempotent no-op is not a lifecycle event. On canonical dispatch, a
+no-op that carries a caller-supplied `note` is the exception: the note is
+persisted to `properties.transition_note` (last-write-wins), and a same-status
+audit row (`from_state == to_state`) is attempted so each overwritten note can
+keep a durable trail. Its response carries `note_recorded` and, when the note
+write wins, `audit_persisted`. Consumers counting or replaying *real*
+transitions must therefore filter `from_state != to_state`; same-status rows
+are note events, not lifecycle changes.
+
+ADR-099 atomic v1 encodes every same-status transition as a guarded no-effect
+assertion, including calls that supplied `note`. The assertion revalidates the
+prepare snapshot inside the commit transaction, while the call still returns
+the base no-op shape, persists neither the note nor an audit row, and omits
+both status fields. Call canonical `gtd.transition` when a same-status note
+must be recorded.
 
 ## `CompleteParams` / `TransitionParams` — `pub` structs, private fields
 

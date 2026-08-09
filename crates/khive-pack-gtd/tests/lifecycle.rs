@@ -198,59 +198,155 @@ async fn test_complete_on_already_done_returns_clear_error() {
 }
 
 #[tokio::test]
-async fn complete_from_inbox_is_rejected() {
+async fn complete_from_inbox_succeeds_per_lifecycle_table() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "inbox task"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
     assert_eq!(resp["status"], "inbox");
 
-    let err = pack
+    let done = pack
         .dispatch("gtd.complete", json!({"id": id}))
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("inbox"),
-        "error must mention current state 'inbox'; got: {msg}"
+        .expect("ADR-019 permits inbox -> done");
+    assert_eq!(done["from"], "inbox");
+    assert_eq!(done["to"], "done");
+}
+
+#[tokio::test]
+async fn legacy_tasks_missing_status_can_transition_and_complete_from_semantic_inbox() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+
+    let mut transition_task = khive_storage::Note::new("local", "task", "legacy transition body");
+    transition_task.name = Some("legacy transition body".to_string());
+    transition_task.properties = Some(json!({
+        "priority": "p2",
+        "description": "legacy transition body",
+    }));
+    let transition_id = transition_task.id;
+    let transition_revision = transition_task.updated_at;
+
+    let mut complete_task = khive_storage::Note::new("local", "task", "legacy complete body");
+    complete_task.name = Some("legacy complete body".to_string());
+    complete_task.properties = Some(json!({
+        "priority": "p2",
+        "description": "legacy complete body",
+    }));
+    let complete_id = complete_task.id;
+    let complete_revision = complete_task.updated_at;
+
+    let store = runtime.notes(&token).expect("note store");
+    store
+        .upsert_note(transition_task)
+        .await
+        .expect("seed legacy transition task");
+    store
+        .upsert_note(complete_task)
+        .await
+        .expect("seed legacy complete task");
+
+    let pack = pack(runtime.clone());
+    let transitioned = pack
+        .dispatch(
+            "gtd.transition",
+            json!({"id": transition_id.to_string(), "status": "next"}),
+        )
+        .await
+        .expect("missing status must transition from semantic inbox");
+    assert_eq!(transitioned["from"], "inbox");
+    assert_eq!(transitioned["to"], "next");
+    assert_eq!(transitioned["transitioned"], true);
+    assert!(transitioned["audit_persisted"].is_boolean());
+
+    let completed = pack
+        .dispatch(
+            "gtd.complete",
+            json!({"id": complete_id.to_string(), "result": "legacy shipped"}),
+        )
+        .await
+        .expect("missing status must complete from semantic inbox");
+    assert_eq!(completed["from"], "inbox");
+    assert_eq!(completed["to"], "done");
+    assert_eq!(completed["completed"], true);
+    assert!(completed["audit_persisted"].is_boolean());
+
+    let transitioned_note = runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(transition_id)
+        .await
+        .expect("read transitioned task")
+        .expect("transitioned task exists");
+    assert!(transitioned_note.updated_at > transition_revision);
+    assert_eq!(
+        transitioned_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("status"))
+            .and_then(|status| status.as_str()),
+        Some("next")
     );
-    assert!(
-        msg.contains("transition to 'next' or 'active'"),
-        "error must guide caller to transition first; got: {msg}"
+    assert_eq!(
+        transitioned_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("description"))
+            .and_then(|description| description.as_str()),
+        Some(transitioned_note.content.as_str())
+    );
+
+    let completed_note = runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(complete_id)
+        .await
+        .expect("read completed task")
+        .expect("completed task exists");
+    assert!(completed_note.updated_at > complete_revision);
+    assert_eq!(
+        completed_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("status"))
+            .and_then(|status| status.as_str()),
+        Some("done")
+    );
+    assert_eq!(
+        completed_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("description"))
+            .and_then(|description| description.as_str()),
+        Some(completed_note.content.as_str())
     );
 }
 
 #[tokio::test]
-async fn complete_from_waiting_is_rejected() {
+async fn complete_from_waiting_succeeds_per_lifecycle_table() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "waiting task", "status": "waiting"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
 
-    let err = pack
+    let done = pack
         .dispatch("gtd.complete", json!({"id": id}))
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("waiting"),
-        "error must mention current state 'waiting'; got: {msg}"
-    );
+        .expect("ADR-019 permits waiting -> done");
+    assert_eq!(done["from"], "waiting");
+    assert_eq!(done["to"], "done");
 }
 
 #[tokio::test]
-async fn complete_from_someday_is_rejected() {
+async fn complete_from_someday_succeeds_per_lifecycle_table() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "someday task", "status": "someday"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
 
-    let err = pack
+    let done = pack
         .dispatch("gtd.complete", json!({"id": id}))
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("someday"),
-        "error must mention current state 'someday'; got: {msg}"
-    );
+        .expect("ADR-019 permits someday -> done");
+    assert_eq!(done["from"], "someday");
+    assert_eq!(done["to"], "done");
 }
 
 #[tokio::test]

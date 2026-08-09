@@ -1,4 +1,4 @@
-//! pack-comm — Communication pack providing nine public `comm.*` verbs.
+//! pack-comm — Communication pack providing ten public `comm.*` verbs.
 
 pub mod handlers;
 pub(crate) mod inbox_signal;
