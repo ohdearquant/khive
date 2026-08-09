@@ -387,6 +387,7 @@ fn spawn_email_channel_loops(server: &KhiveMcpServer) {
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
+            let runtime = server.runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
             let default_actor = default_inbound_actor_from_env();
             let mut allowlist = allowed_recipients_from_env();
@@ -403,6 +404,7 @@ fn spawn_email_channel_loops(server: &KhiveMcpServer) {
             let allowlist_clone = allowlist.clone();
             let mailbox_clone = mailbox.clone();
             let email_ch_clone = Arc::clone(&email_ch);
+            let runtime_outbox = runtime.clone();
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 tokio::task::spawn(async move {
@@ -421,14 +423,27 @@ fn spawn_email_channel_loops(server: &KhiveMcpServer) {
                     )
                     .await;
                 });
-                tokio::task::spawn(channel_outbox_loop(
-                    email_ch_clone,
-                    verb_reg_outbox,
-                    ingest_ns_outbox,
-                    mailbox_clone,
-                    allowlist_clone,
-                ));
-                tracing::info!("email channel polling and outbox loops started");
+                match runtime_outbox {
+                    Some(rt) => {
+                        tokio::task::spawn(channel_outbox_loop(
+                            email_ch_clone,
+                            verb_reg_outbox,
+                            rt,
+                            ingest_ns_outbox,
+                            mailbox_clone,
+                            allowlist_clone,
+                        ));
+                        tracing::info!("email channel polling and outbox loops started");
+                    }
+                    None => {
+                        tracing::error!(
+                            "email polling started but the outbox loop was NOT started: server \
+                             has no default-backend runtime handle, which the outbox loop needs \
+                             to claim external_id on outbound notes; outbound mail will not be \
+                             sent"
+                        );
+                    }
+                }
             });
             if !spawned {
                 tracing::error!(
@@ -1302,11 +1317,19 @@ fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) ->
 /// `delivered_at` write causes a duplicate send on restart; the duplicate carries
 /// the same Message-ID so receiving MTAs typically collapse it.
 ///
+/// The `external_id` claim goes through `runtime`'s non-wire
+/// `claim_outbound_message_external_id` rather than a `registry.dispatch("update",
+/// ...)` call: `external_id` is one of the owner-established properties the
+/// generic `update` verb refuses to patch on a pack-owned note kind, so a caller
+/// patch through `dispatch` is rejected by design and would leave every note
+/// stuck retrying forever.
+///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
 async fn channel_outbox_loop(
     email_channel: std::sync::Arc<khive_channel_email::EmailChannel>,
     registry: khive_runtime::VerbRegistry,
+    runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
     mailbox: String,
     allowlist: Vec<String>,
@@ -1316,6 +1339,17 @@ async fn channel_outbox_loop(
     use serde_json::json;
 
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
+    let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::error!(
+                namespace = %ingest_namespace,
+                error = %e,
+                "outbox loop: ingest namespace does not parse; loop will not run"
+            );
+            return;
+        }
+    };
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -1428,17 +1462,24 @@ async fn channel_outbox_loop(
                 Some(eid) if !eid.is_empty() => eid.to_string(),
                 _ => {
                     let mid = format!("<{note_id}@{domain}>");
-                    // Persist the claimed external_id before sending.
-                    let claim_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "external_id": mid.clone() },
-                            }),
-                        )
-                        .await;
+                    // Persist the claimed external_id before sending, through the
+                    // non-wire owner path: the generic `update` verb refuses any
+                    // patch naming `external_id` on a `message` note (it is an
+                    // owner-established property), so this cannot go through
+                    // `registry.dispatch`.
+                    let claim_result = match uuid::Uuid::parse_str(&note_id) {
+                        Ok(uuid) => match runtime.authorize(namespace.clone()) {
+                            Ok(token) => {
+                                runtime
+                                    .claim_outbound_message_external_id(&token, uuid, mid.clone())
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                            "note id {note_id} is not a valid UUID: {e}"
+                        ))),
+                    };
                     if let Err(e) = claim_result {
                         tracing::warn!(
                             note_id = %note_id,
@@ -2735,6 +2776,7 @@ pub fn build_server_from_multi_backend_registry(
     // leaving them permanently invisible to cross-process WAL-pin attribution.
     let secondary_pools = secondary_file_backed_pools(&multi);
     let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
+    let default_runtime = multi.default_runtime.clone();
 
     let server = KhiveMcpServer::from_registry_with_meta(
         multi.registry,
@@ -2742,7 +2784,8 @@ pub fn build_server_from_multi_backend_registry(
         &multi.config_id,
     )
     .with_default_output_format(fmt)
-    .with_secondary_pools(secondary_pools);
+    .with_secondary_pools(secondary_pools)
+    .with_runtime(default_runtime);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
