@@ -2143,16 +2143,16 @@ true`, `code: "writer_pool_checkout_timeout"` or `"writer_queue_saturated"`)
 never rolls back a sibling that already committed. Inspect each result
 entry's own `ok` field rather than assuming batch-level atomicity.
 
-`search` carries its own per-op `status` ("complete" | "partial") inside that
-op's `result` entry, separate from the top-level batch `status` above. A
-degraded-but-answered search stays ok:true with status="partial" plus a
-missing_backends list, backend_errors causes, and the deprecated partial:true
-alias. If the bounded diagnostic subset omits additional failed legs, the same
-location carries backend_errors_truncated:true and backend_errors_omitted. When a backend
-failure leaves no hit standing after filtering, the op instead fails outright
-with ok:false and error.kind="search_incomplete"; its error retains both the
-retained backend list and causes plus any truncation fields. That case must not
-be read as "no results found."
+`search` carries its own per-op `status` ("complete" | "partial") on the
+operation envelope beside `result`, separate from the top-level batch `status`
+above. A degraded-but-answered search stays ok:true with status="partial" plus
+missing_backends, backend_errors causes, and the deprecated partial:true alias
+at that same envelope level. If the bounded diagnostic subset omits additional
+failed legs, backend_errors_truncated:true and backend_errors_omitted are peers
+there too. When a backend failure leaves no hit standing after filtering, the
+op instead fails outright with ok:false and error.kind="search_incomplete";
+the retained backend list, causes, and truncation fields live inside that
+`error` object. That case must not be read as "no results found."
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
