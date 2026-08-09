@@ -153,16 +153,16 @@ destination file is published by one atomic rename, while non-atomic database
 chunks commit incrementally. After dispatch starts, success emits the ordinary
 manifest unchanged. Any later error that stops the run before the manifest is
 finalized, including malformed JSON or a structurally self-contradictory
-response envelope, emits an aborted manifest before the non-zero exit. A
-`--strict` failure or an all-failed file is a policy exit taken after the
-ordinary manifest has already been published, so those runs keep the ordinary
-manifest and exit non-zero without an aborted one. Its `committed_chunks` are
-the structurally confirmed prefix;
-`dispatched_chunk`, when present, is unverified and may still have database
+response envelope, emits an aborted manifest before the non-zero exit. The
+aborted manifest's `committed_chunks` are the structurally confirmed prefix;
+its `dispatched_chunk`, when present, is unverified and may still have database
 effects. Its `summary` covers confirmed rows, while `unconfirmed_ops` accounts
-for the remainder without calling them aborted. `file_published=false` means
-the incomplete temp JSONL was discarded and any previous destination was
-preserved.
+for the remainder without calling them aborted. Its `file_published=false`
+means the incomplete temp JSONL was discarded and any previous destination was
+preserved. A `--strict` failure or an all-failed file is a policy exit taken
+after the ordinary manifest has already been published, so those runs keep the
+ordinary manifest, carry none of the aborted-only fields above, and exit
+non-zero without an aborted one.
 
 Atomic ops-file preflight and prepare failures use the real per-operation
 `results` shape: an unknown or unloaded verb receives `verb-refused`, while a
