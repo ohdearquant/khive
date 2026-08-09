@@ -1610,11 +1610,11 @@ pub(crate) async fn fetch_final_tail(
     rt: &KhiveRuntime,
     model: &str,
     s: u64,
-    limit: Option<u64>,
+    live_threshold: Option<f64>,
 ) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
-    fetch_final_tail_on(reader.as_mut(), model, s, limit).await
+    fetch_final_tail_on(reader.as_mut(), model, s, live_threshold).await
 }
 
 /// Same as [`fetch_final_tail`] but runs every read through a caller-supplied
@@ -1625,35 +1625,56 @@ async fn fetch_final_tail_on(
     reader: &mut dyn khive_storage::SqlReader,
     model: &str,
     s: u64,
-    limit: Option<u64>,
+    live_threshold: Option<f64>,
 ) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
-    // `limit` (ADR-118 §3, Cold/Empty tier): cap the scan to the newest
-    // `limit` log rows instead of the entire scope, taking the highest-seq
-    // suffix so the freshest writes stay visible. The DESC+LIMIT rows are
-    // reversed back to ascending order below so final-op-per-subject
-    // coalescing (insert-overwrite = last write wins) is unaffected.
-    let order_limit = match limit {
-        Some(n) => format!("ORDER BY seq DESC LIMIT {n}"),
-        None => "ORDER BY seq".to_string(),
+    // `live_threshold` (ADR-118 §3, Cold/Empty tier): cap the scan to
+    // ceil(threshold × live corpus) newest log rows. The live count and log
+    // suffix are selected by one SQL statement so they describe one snapshot,
+    // matching the knowledge consumer's equivalent fallback. The DESC+LIMIT
+    // rows are reversed below so final-op-per-subject coalescing still sees
+    // ascending sequence order (insert-overwrite = last write wins).
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let (live_cte, order_limit) = match live_threshold {
+        Some(_) => (
+            format!(
+                "WITH live AS (\
+                   SELECT COUNT(*) AS live_count FROM {table_name} v \
+                   JOIN notes n ON n.id = v.subject_id \
+                   WHERE v.embedding_model = ?1 \
+                     AND v.kind = 'note' AND v.field = 'note.content' \
+                     AND n.deleted_at IS NULL\
+                 ) "
+            ),
+            "ORDER BY seq DESC \
+             LIMIT (SELECT CAST(live_count * ?3 AS INTEGER) + \
+                       CASE WHEN CAST(live_count * ?3 AS INTEGER) < live_count * ?3 \
+                            THEN 1 ELSE 0 END FROM live)"
+                .to_string(),
+        ),
+        None => (String::new(), "ORDER BY seq".to_string()),
     };
+    let mut params = vec![
+        SqlValue::Text(model.to_owned()),
+        SqlValue::Integer(s as i64),
+    ];
+    if let Some(threshold) = live_threshold {
+        params.push(SqlValue::Float(threshold));
+    }
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT seq, subject_id, op FROM ann_write_log \
+                "{live_cte}SELECT seq, subject_id, op FROM ann_write_log \
                   WHERE embedding_model = ?1 \
                     AND kind = 'note' AND field = 'note.content' AND seq > ?2 \
                   {order_limit}"
             ),
-            params: vec![
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Integer(s as i64),
-            ],
+            params,
             label: Some("memory_ann_fetch_tail".into()),
         })
         .await
         .map_err(|e| e.to_string())?;
     let mut rows = rows;
-    if limit.is_some() {
+    if live_threshold.is_some() {
         rows.reverse();
     }
 
@@ -1698,7 +1719,6 @@ async fn fetch_final_tail_on(
     // A vec row that is absent, or present but out of this consumer's scope,
     // contradicts the log's committed final upsert (vec writes and log appends
     // are same-transaction) → Err, which the caller treats as Cold.
-    let table_name = format!("vec_{}", sanitize_model_key(model));
     let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::with_capacity(upsert_ids.len());
     for subject in &upsert_ids {
         let rows = reader
@@ -1973,9 +1993,9 @@ pub(crate) enum FreshTailOutcome {
 /// (and primary) tier: a serving bridge exists, and every committed write
 /// above its watermark is merged in, giving read-your-writes visibility.
 /// `s = None` is the second tier (§3): no serving index is available at all,
-/// so the leg caps its scan at a fixed-ceiling newest suffix of the log
-/// instead of the entire scope, guaranteeing visibility of only the
-/// caller's most recent writes until a serving index exists again.
+/// so the leg caps its scan at a corpus-relative newest suffix of the log
+/// instead of the entire scope, guaranteeing visibility of only the caller's
+/// most recent writes until a serving index exists again.
 /// `query`/`k` are the recall vector and fetch limit — needed only by the
 /// serving tier's mismatch re-resolution path, which must run a fresh ANN
 /// search against a newly loaded segment.
@@ -2375,19 +2395,19 @@ async fn fresh_tail_reresolve(
     unreachable!("the loop always returns on or before its terminal round")
 }
 
-/// Fixed ceiling for the Cold/Empty-tier capped scan (ADR-118 §3). Deriving
-/// a corpus-proportional cap (`ann_rebuild_threshold() * live`) needs an
-/// O(corpus) live-count join — appropriate for the background restart
-/// classifier, not for this per-query path. The ceiling is
-/// a fixed, conservative match to the ADR's own worked example (a 0.20
-/// threshold on a 68k-row corpus is ~13.6k comparisons).
-const FRESH_TAIL_CAPPED_MAX_ROWS: u64 = 20_000;
-
 /// Tier 2 (§3): no serving index at all. A cheap, log-only existence probe
 /// (no corpus join) fast-paths the common empty-tail case; a non-empty tail
-/// is capped at a fixed ceiling rather than a live-corpus-proportional one,
-/// so this bounded fallback never itself pays an O(corpus) cost.
+/// is capped at ceil(`ann_rebuild_threshold() * live corpus`) rows. The live
+/// count and selected newest suffix share one SQL statement/snapshot.
 async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
+    fresh_tail_capped_at_threshold(rt, model, ann_rebuild_threshold()).await
+}
+
+async fn fresh_tail_capped_at_threshold(
+    rt: &KhiveRuntime,
+    model: &str,
+    live_threshold: f64,
+) -> FreshTailOutcome {
     match tail_exists(rt, model, 0).await {
         Ok(false) => return FreshTailOutcome::Ops(Vec::new()),
         Ok(true) => {}
@@ -2396,7 +2416,7 @@ async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
             return FreshTailOutcome::Skipped("fresh-tail: tail-existence read failed");
         }
     }
-    match fetch_final_tail(rt, model, 0, Some(FRESH_TAIL_CAPPED_MAX_ROWS)).await {
+    match fetch_final_tail(rt, model, 0, Some(live_threshold)).await {
         Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: capped tail fetch failed; skipping exact leg");
@@ -4562,6 +4582,54 @@ mod tests {
     }
 
     // ── ADR-118: fresh-tail exact leg ───────────────────────────────────────
+
+    /// #1161 regression: the no-index fallback follows ADR-118's
+    /// ceil(threshold × live corpus) ceiling instead of a flat 20,000-row
+    /// suffix. Six live vectors at 0.20 admit exactly the two newest raw log
+    /// rows; this also pins ceil rounding rather than truncation.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_no_index_cap_tracks_live_corpus_fraction() {
+        const MODEL: &str = "adr118-corpus-relative-cap-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let mut ids = Vec::new();
+
+        for i in 0..6u32 {
+            let note = rt
+                .create_note_with_decay_for_embedding_model(
+                    &token,
+                    "memory",
+                    None,
+                    &format!("corpus-relative cap note {i}"),
+                    Some(0.7),
+                    0.01,
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .expect("create note");
+            ids.push(note.id);
+        }
+
+        let ops = match fresh_tail_capped_at_threshold(&rt, MODEL, 0.20).await {
+            FreshTailOutcome::Ops(ops) => ops,
+            FreshTailOutcome::Replace(..) => {
+                panic!("no-index capped leg must not produce replacement candidates")
+            }
+            FreshTailOutcome::Skipped(reason) => {
+                panic!("no-index capped leg unexpectedly skipped: {reason}")
+            }
+        };
+        let selected: Vec<Uuid> = ops.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            selected,
+            ids[4..].to_vec(),
+            "ceil(0.20 × 6) must select the two newest raw log rows"
+        );
+    }
 
     /// A subject present in the stale warm ANN index whose final tail op is
     /// `delete` must be dropped from the merged candidate list — the tail is
