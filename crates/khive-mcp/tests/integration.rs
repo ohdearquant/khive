@@ -131,12 +131,8 @@ async fn agent_one(
     Ok(first["result"].clone())
 }
 
-/// Issue #1602: normal runtime boot detects a chmod-read-only SQLite snapshot,
-/// keeps assertive verbs usable, and surfaces the deliberately skipped audit
-/// append beside each canonical result. The same backend still rejects writes.
 #[cfg(unix)]
-#[tokio::test]
-async fn chmod_read_only_snapshot_serves_stats_and_list_with_audit_advisory() {
+async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServer) {
     use std::os::unix::fs::PermissionsExt;
 
     use khive_mcp::tools::request::RequestParams;
@@ -180,10 +176,22 @@ async fn chmod_read_only_snapshot_serves_stats_and_list_with_audit_advisory() {
         .expect("normal boot must detect and validate the read-only snapshot");
     assert!(runtime.is_read_only());
     let server = KhiveMcpServer::new(runtime).expect("read-only server builds");
+    (dir, server)
+}
+
+/// Issue #1602: normal runtime boot detects a chmod-read-only SQLite snapshot,
+/// keeps assertive verbs usable, and surfaces the deliberately skipped audit
+/// append beside each canonical result. The same backend still rejects writes.
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advisory() {
+    use khive_mcp::tools::request::RequestParams;
+
+    let (_dir, server) = seeded_read_only_snapshot_server().await;
 
     let reads = server
         .dispatch_request_local(RequestParams {
-            ops: r#"[stats(), list(kind="entity")]"#.to_string(),
+            ops: r#"[stats(), list(kind="entity", limit=501)]"#.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
             save_to: None,
@@ -204,6 +212,9 @@ async fn chmod_read_only_snapshot_serves_stats_and_list_with_audit_advisory() {
         "list's stable envelope must be preserved: {}",
         results[1]
     );
+    assert_eq!(results[1]["result"]["requested_limit"], json!(501));
+    assert_eq!(results[1]["result"]["effective_limit"], json!(500));
+    assert_eq!(results[1]["result"]["limit_clamped"], json!(true));
     for entry in results {
         assert_eq!(
             entry["advisories"][0]["code"],
@@ -237,6 +248,47 @@ async fn chmod_read_only_snapshot_serves_stats_and_list_with_audit_advisory() {
         mutation_error.contains("read-only") || mutation_error.contains("readonly"),
         "mutating verbs must remain rejected: {mutation}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_read_only_snapshot_default_list_keeps_array_and_sibling_audit_advisory() {
+    use khive_mcp::tools::request::RequestParams;
+
+    let (_dir, server) = seeded_read_only_snapshot_server().await;
+    let response = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"list(kind="entity")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("default-presentation read dispatch");
+    let response: Value = serde_json::from_str(&response).expect("read response JSON");
+    let entry = &response["results"][0];
+
+    assert_eq!(entry["ok"], json!(true), "list must succeed: {response}");
+    assert_eq!(entry["tool"], json!("list"));
+    let items = entry["result"]
+        .as_array()
+        .expect("within-cap list must preserve main's bare-array result");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], json!("snapshot entity"));
+    assert_eq!(items[0]["id"].as_str().map(str::len), Some(8));
+    assert_eq!(
+        entry["advisories"][0]["code"],
+        json!(khive_runtime::AUDIT_PERSISTENCE_SKIPPED_READ_ONLY)
+    );
+    assert!(
+        entry["result"].get("advisories").is_none(),
+        "the transport advisory must remain outside the verb-owned array"
+    );
+    assert_eq!(response["summary"]["succeeded"], json!(1));
+    assert_eq!(response["status"], json!("success"));
 }
 
 // ── server info / surface shape ──────────────────────────────────────────────
