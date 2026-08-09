@@ -1158,10 +1158,12 @@ async fn run_pending_events_on_with_lease(
 
                 summary.invoked += 1;
                 let (completion, persisted_outcome) = dispatch_with_renewable_lease(
-                    rt,
-                    ns_str,
-                    id,
-                    &claim,
+                    DispatchLeaseTarget {
+                        rt,
+                        namespace: ns_str,
+                        scheduled_event_id: id,
+                        claim: &claim,
+                    },
                     lease,
                     dsl,
                     dispatch_actor,
@@ -1380,10 +1382,10 @@ fn validate_dispatch_receipt(
         }
         DispatchReceiptState::Failed | DispatchReceiptState::Indeterminate => {
             receipt_timestamp(&receipt, "completed_at")?;
-            if !receipt
+            if receipt
                 .get("error")
                 .and_then(Value::as_str)
-                .is_some_and(|error| !error.trim().is_empty())
+                .is_none_or(|error| error.trim().is_empty())
             {
                 return Err(format!(
                     "dispatch receipt state {} requires a non-empty error",
@@ -1393,10 +1395,10 @@ fn validate_dispatch_receipt(
         }
         DispatchReceiptState::NotInvoked => {
             receipt_timestamp(&receipt, "completed_at")?;
-            if !receipt
+            if receipt
                 .get("error")
                 .and_then(Value::as_str)
-                .is_some_and(|error| !error.trim().is_empty())
+                .is_none_or(|error| error.trim().is_empty())
             {
                 return Err(
                     "dispatch receipt state not_invoked requires a non-empty error".to_string(),
@@ -2530,17 +2532,27 @@ async fn verified_creator_for_event(
 /// namespace and gate/audit decisions never inherit daemon authority. The
 /// returned receipt result is already persisted (or carries the persistence
 /// error); callers must not perform another outcome write.
-async fn dispatch_with_renewable_lease(
-    rt: &KhiveRuntime,
-    namespace: &str,
+struct DispatchLeaseTarget<'a> {
+    rt: &'a KhiveRuntime,
+    namespace: &'a str,
     scheduled_event_id: uuid::Uuid,
-    claim: &DispatchClaim,
+    claim: &'a DispatchClaim,
+}
+
+async fn dispatch_with_renewable_lease(
+    target: DispatchLeaseTarget<'_>,
     lease: DispatchLeaseConfig,
     action_dsl: &str,
     creator_actor: Option<VerifiedActor>,
     server: &KhiveMcpServer,
     verbose: bool,
 ) -> (DispatchCompletion, Result<Option<Value>>) {
+    let DispatchLeaseTarget {
+        rt,
+        namespace,
+        scheduled_event_id,
+        claim,
+    } = target;
     let renewal_rt = rt.clone();
     let renewal_namespace = namespace.to_string();
     let renewal_claim = claim.clone();
