@@ -851,6 +851,55 @@ async fn wire_malformed_tiers_rejected_before_db_open() {
     }
 }
 
+/// Presence is distinct from omission for `db`: every non-string value,
+/// including JSON null, is rejected before the omitted-target creation branch
+/// can initialize `<path>/.khive/code-map.db`.
+#[tokio::test]
+async fn wire_present_non_string_db_is_rejected_without_default_creation() {
+    let root = TempDir::new().expect("tempdir");
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+
+    for (label, db_value) in [
+        ("null", Value::Null),
+        ("boolean", json!(false)),
+        ("number", json!(7)),
+        ("array", json!(["map.db"])),
+        ("object", json!({"path": "map.db"})),
+    ] {
+        let package_name = format!("pkg_invalid_db_{label}");
+        write_l2_symbol_fixture(root.path(), &package_name);
+        let package = root.path().join(&package_name);
+        let expected_default = package.join(".khive").join("code-map.db");
+
+        let error = dispatch(
+            &reg,
+            "code.ingest",
+            json!({
+                "path": package.to_string_lossy(),
+                "db": db_value,
+                "languages": ["rust"],
+                "tiers": [],
+            }),
+        )
+        .await
+        .expect_err("a present non-string db must be rejected");
+
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(_)),
+            "{label}: malformed db must fail as InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("db must be a string"),
+            "{label}: refusal must identify the db type contract: {error}"
+        );
+        assert!(
+            !expected_default.exists()
+                && !expected_default.parent().expect("default parent").exists(),
+            "{label}: malformed db must not initialize the omitted-target default"
+        );
+    }
+}
+
 /// An explicit target is an operator claim that the map database already
 /// exists and is current. A typo must not be interpreted as permission to
 /// create and migrate a new SQLite file at that path.

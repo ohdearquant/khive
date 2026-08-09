@@ -13,7 +13,12 @@ complete canonical migration ledger. It opens without `SQLITE_OPEN_CREATE` and
 validates the ledger on the raw writer connection before persistent pool
 configuration (including `journal_mode=WAL`). This same-connection ordering is
 what makes a replacement after an earlier read-only inspection fail without
-mutating the replacement.
+mutating the replacement. The pool retains that exact-current policy: every
+later read-write connection, including the default-on file-backed writer-task
+connection, validates its own raw handle before connection PRAGMAs or DML. Any
+later-writer admission failure is latched for the pool, so a rejected writer
+cannot silently degrade to the pool-mutex connection or another standalone
+writer.
 
 ## `ConnectionPool::writer_task_handle` — single-writer-task rationale
 

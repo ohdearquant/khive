@@ -303,6 +303,16 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
 /// writer connection.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    /// Admission policy retained from [`Self::new_existing_current`]. When
+    /// set, every read-write connection opened after construction must prove
+    /// the same complete canonical migration ledger on its own raw handle
+    /// before any connection configuration or DML is allowed.
+    require_current_schema: bool,
+    /// First failed later-writer admission for an exact-current pool. Such a
+    /// failure is permanent for this pool: latching it prevents a rejected
+    /// writer-task connection from silently degrading to the already-open
+    /// pool-mutex writer or another independently opened writer.
+    later_writer_admission_failure: OnceLock<String>,
     /// Fail-closed guard for the legacy pool-mutex writer. A transaction
     /// owner retires this connection after a body panic or when it cannot
     /// prove that finalization restored autocommit mode; subsequent checkouts
@@ -613,6 +623,8 @@ impl ConnectionPool {
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            require_current_schema,
+            later_writer_admission_failure: OnceLock::new(),
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             readers,
@@ -791,12 +803,37 @@ impl ConnectionPool {
     }
 
     fn ensure_pooled_writer_active(&self) -> Result<(), SqliteError> {
+        self.ensure_later_writer_admission_active()?;
         if self.pooled_writer_retired.load(Ordering::Acquire) {
             return Err(SqliteError::InvalidData(
                 "pooled writer connection retired after a terminal transaction fault".to_string(),
             ));
         }
         Ok(())
+    }
+
+    fn ensure_later_writer_admission_active(&self) -> Result<(), SqliteError> {
+        match self.later_writer_admission_failure.get() {
+            Some(message) => Err(SqliteError::InvalidData(message.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn latch_later_writer_admission_failure(&self, error: SqliteError) -> SqliteError {
+        let candidate = format!(
+            "exact-current pool refused a later write connection and is now fail-closed: {error}"
+        );
+        let message = self
+            .later_writer_admission_failure
+            .get_or_init(|| candidate);
+        SqliteError::InvalidData(message.clone())
+    }
+
+    fn writer_task_admission_error(error: SqliteError) -> StorageError {
+        StorageError::Pool {
+            operation: "writer_task_admission".into(),
+            message: error.to_string(),
+        }
     }
 
     /// Snapshot all instrumented writer acquisition outcomes since this pool
@@ -891,9 +928,12 @@ impl ConnectionPool {
     ///
     /// Returns `Ok(None)` if the flag is off, or if the writer task failed to
     /// spawn for a reason other than a missing runtime (for example, an
-    /// in-memory pool has no standalone-connection support) — callers fall
-    /// back to the legacy pool-mutex write path in either case. A spawn
-    /// failure is logged once here (at first access), not once per store.
+    /// in-memory pool has no standalone-connection support) — ordinary pools
+    /// fall back to the legacy pool-mutex write path in either case. An
+    /// exact-current pool instead latches any later-writer admission failure
+    /// and returns it: a failed raw-connection ledger check must never degrade
+    /// to a different writer. A spawn failure is logged once here (at first
+    /// access), not once per store.
     ///
     /// Returns `Err(StorageError::WriterTaskNoRuntime)` instead of panicking
     /// when `write_queue_enabled` is set but this is the first access and no
@@ -906,6 +946,8 @@ impl ConnectionPool {
     /// fail loud on a genuine misconfiguration (write queue requested but no
     /// runtime to run it on) can propagate the `Err` directly.
     pub fn writer_task_handle(&self) -> Result<Option<WriterTaskHandle>, StorageError> {
+        self.ensure_later_writer_admission_active()
+            .map_err(Self::writer_task_admission_error)?;
         // Same pinned invariant `write_queue_active` asserts, kept inline
         // here because this gate keys on the flag ALONE: an explicit
         // `Some(true)` on an in-memory pool must still attempt the spawn
@@ -924,6 +966,8 @@ impl ConnectionPool {
         // Fast path: already resolved (spawned, degraded, or off) by an
         // earlier call — no need to re-check the runtime.
         if let Some(existing) = self.writer_task.get() {
+            self.ensure_later_writer_admission_active()
+                .map_err(Self::writer_task_admission_error)?;
             return Ok(existing.clone());
         }
         // Not yet initialized and the flag is on: spawning requires
@@ -932,7 +976,7 @@ impl ConnectionPool {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(StorageError::WriterTaskNoRuntime);
         }
-        Ok(self
+        let handle = self
             .writer_task
             .get_or_init(|| {
                 #[cfg(test)]
@@ -942,16 +986,28 @@ impl ConnectionPool {
                 match crate::writer_task::spawn(self, self.config.write_queue_capacity) {
                     Ok(handle) => Some(handle),
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "KHIVE_WRITE_QUEUE=1 but the writer task failed to spawn; \
-                             writes fall back to the pool-mutex path"
-                        );
+                        if self.require_current_schema {
+                            let error = self.latch_later_writer_admission_failure(e);
+                            tracing::error!(
+                                error = %error,
+                                "the exact-current writer task failed admission; the pool is \
+                                 fail-closed and writer fallback is disabled"
+                            );
+                        } else {
+                            tracing::warn!(
+                                error = %e,
+                                "KHIVE_WRITE_QUEUE=1 but the writer task failed to spawn; \
+                                 writes fall back to the pool-mutex path"
+                            );
+                        }
                         None
                     }
                 }
             })
-            .clone())
+            .clone();
+        self.ensure_later_writer_admission_active()
+            .map_err(Self::writer_task_admission_error)?;
+        Ok(handle)
     }
 
     /// Test-only: how many times the writer-task init closure actually ran.
@@ -1058,6 +1114,7 @@ impl ConnectionPool {
     /// write paths must call [`Self::open_standalone_writer`] so their
     /// acquisitions are observable.
     pub(crate) fn open_standalone_writer_untracked(&self) -> Result<Connection, SqliteError> {
+        self.ensure_later_writer_admission_active()?;
         let path = self.config.path.as_ref().ok_or_else(|| {
             SqliteError::InvalidData(
                 "in-memory databases do not support standalone connections".to_string(),
@@ -1070,16 +1127,35 @@ impl ConnectionPool {
             ));
         }
 
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_URI,
-        )?;
-        conn.busy_timeout(self.config.busy_timeout)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        Ok(conn)
+        let admitted = (|| {
+            let conn = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )?;
+            if self.require_current_schema {
+                // This must be the first operation on the newly opened raw
+                // connection. In particular, keep it before synchronous or
+                // any future write-intent connection PRAGMA.
+                crate::migrations::validate_current_schema_ledger(&conn)?;
+            }
+            conn.busy_timeout(self.config.busy_timeout)?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            Ok(conn)
+        })();
+
+        match admitted {
+            Ok(conn) => {
+                self.ensure_later_writer_admission_active()?;
+                Ok(conn)
+            }
+            Err(error) if self.require_current_schema => {
+                Err(self.latch_later_writer_admission_failure(error))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Open a standalone read-only connection to the same file-backed database.
@@ -1664,6 +1740,89 @@ mod tests {
             assert!(
                 !PathBuf::from(sidecar).exists(),
                 "rejected replacement must not gain a {suffix} sidecar"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn current_existing_pool_default_queue_revalidates_a_later_writer_after_replacement() {
+        let _pool_env = clear_pool_env();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.db");
+        let replacement = dir.path().join("replacement.db");
+
+        for path in [&target, &replacement] {
+            let mut conn = Connection::open(path).unwrap();
+            crate::migrations::run_migrations(&mut conn).unwrap();
+        }
+        {
+            let stale = Connection::open(&replacement).unwrap();
+            stale
+                .execute(
+                    "DELETE FROM _schema_migrations \
+                     WHERE version = (SELECT MAX(version) FROM _schema_migrations)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let pool = ConnectionPool::new_existing_current(PoolConfig {
+            path: Some(target.clone()),
+            // Keep the target in DELETE mode so the still-open original pool
+            // owns no WAL/SHM paths while the deterministic replacement is
+            // installed. The unset queue preference must still resolve to the
+            // file-backed default of enabled.
+            wal_mode: false,
+            ..PoolConfig::default()
+        })
+        .expect("the initial canonical writer is admitted");
+        assert_eq!(pool.config().write_queue_enabled, Some(true));
+
+        std::fs::remove_file(&target).unwrap();
+        std::fs::rename(&replacement, &target).unwrap();
+        let before = std::fs::read(&target).unwrap();
+        let before_mode: String = Connection::open_with_flags(&target, reader_open_flags())
+            .unwrap()
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(before_mode, "delete");
+
+        let error = pool
+            .writer_task_handle()
+            .expect_err("the default-queue writer must revalidate its own raw connection");
+        assert!(
+            error.to_string().contains("migration ledger"),
+            "the later-writer refusal must name the ledger: {error}"
+        );
+        assert!(
+            pool.try_writer().is_err(),
+            "a failed current-ledger admission must not degrade to the pooled writer"
+        );
+        assert!(
+            pool.open_standalone_writer().is_err(),
+            "a failed current-ledger admission must not retry through another standalone writer"
+        );
+        assert!(
+            pool.writer_task_handle().is_err(),
+            "a failed current-ledger admission must stay fail-closed on later queue lookups"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            before,
+            "the rejected replacement must remain byte-identical"
+        );
+        let after_mode: String = Connection::open_with_flags(&target, reader_open_flags())
+            .unwrap()
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_mode, "delete");
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = target.as_os_str().to_owned();
+            sidecar.push(suffix);
+            assert!(
+                !PathBuf::from(sidecar).exists(),
+                "rejected later-writer admission must not create {suffix}"
             );
         }
     }

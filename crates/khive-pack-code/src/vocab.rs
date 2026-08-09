@@ -26,9 +26,10 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             name: "db",
             param_type: "string",
             required: false,
-            description: "Existing, current-schema target map database path. Omit it to create \
-                           or migrate <path>/.khive/code-map.db. The shared production database \
-                           is always rejected, with no override.",
+            description: "Existing, current-schema target map database path. Only absence selects \
+                           the default; null and every other non-string value are invalid. Omit it \
+                           to create or migrate <path>/.khive/code-map.db. The shared production \
+                           database is always rejected, with no override.",
         },
         ParamDef {
             name: "languages",

@@ -3,8 +3,9 @@
 //! Opens a fresh `KhiveRuntime` bound to the target database — never the
 //! shared production runtime/backend the pack itself was constructed with —
 //! and drives the caller-selected L1, L1.5, and L2 tiers in `source_ingest`.
-//! An explicit `db` must already exist at the current schema version; omitting
-//! it intentionally creates/migrates the workspace-local default.
+//! An explicit string `db` must already exist at the current schema version;
+//! omitting the member intentionally creates/migrates the workspace-local
+//! default. Presence with any other JSON type, including `null`, is invalid.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -105,7 +106,16 @@ impl CodePack {
         };
         let tiers = parse_tiers(params.get("tiers"))?;
 
-        let db_param = params.get("db").and_then(Value::as_str);
+        let db_param = match params.get("db") {
+            None => None,
+            Some(Value::String(path)) => Some(path.as_str()),
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "db must be a string when provided; omit db to use the workspace-local default"
+                        .into(),
+                ));
+            }
+        };
         let runtime_db_path = self.runtime.config().db_path.clone();
         let db_path = resolve_target_db(db_param, &path, runtime_db_path.as_deref())
             .map_err(RuntimeError::InvalidInput)?;

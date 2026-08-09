@@ -530,7 +530,8 @@ single `git.digest` verb for a comparable bulk-intake surface. Signature:
   extensions under `path`; callers may pass an explicit language list to skip
   detection or restrict scope.
 - `db` targets the destination database (see B7); it defaults to a workspace map
-  database, not the shared production graph.
+  database, not the shared production graph. Only an absent member selects that
+  default: a present `null` or any other non-string value is invalid.
 
 ### B2: Pipeline shape
 
@@ -1577,10 +1578,16 @@ path. The raw write-capable connection validates the exact ledger again before
 pool configuration may issue `PRAGMA journal_mode=WAL` or any other
 write-intent setting. The pre-configuration check uses that same opened
 connection, so replacing the path after read-only inspection cannot mutate the
-replacement before refusal. Model registration and ingest begin only after
-that check succeeds.
+replacement before refusal. The pool retains the exact-current requirement and
+applies it to every read-write connection opened later in its lifetime,
+including the default-on writer-task connection, before connection PRAGMAs or
+DML. A later-writer admission failure latches the pool closed instead of
+silently degrading to the original pool-mutex writer. Model registration and
+ingest begin only after the applicable checks succeed.
 
-Omitting `db` retains the intentional creation surface from Amendment 2:
+Only omitting the `db` member retains the intentional creation surface from
+Amendment 2; a present `null` or any other non-string JSON value is rejected
+before target resolution or filesystem mutation:
 `<path>/.khive/code-map.db` is created and migrated through the ordinary
 runtime constructor. Owner-authorized orchestration that creates a fresh map
 and then calls the public verb (for example, `kkernel repo build`) must
@@ -1601,3 +1608,10 @@ initialize that map explicitly before supplying it as `db`.
    inspection and write-capable open is rejected before journal mode changes;
    the replacement bytes, DELETE journal mode, and absence of WAL/SHM sidecars
    are preserved.
+6. A deterministic replacement after pool construction but before the
+   default-on writer task opens its own connection is rejected by that raw
+   connection before configuration; the replacement remains byte-identical in
+   DELETE mode with no journal/WAL/SHM sidecars, and the pool does not fall back
+   to another writer.
+7. A present non-string `db`, including JSON `null`, is rejected before the
+   omitted-target default directory or database can be created.
