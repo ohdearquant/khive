@@ -952,6 +952,9 @@ means a selected profile record was unreadable and downstream feedback must not
 fall back to a current binding/default.
 Each result also carries canonical `full_id`; pass it directly to
 `memory.feedback(target_id=...)` in a later request without an extra `get`.
+`full_id` is present when the resolved output format is `json`, the builtin
+default, under any presentation mode. The `auto` and `table` formats omit it
+unless the request sets `presentation=verbose`.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1843,7 +1846,9 @@ request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pa
 
 List stored sessions newest first.
 Every summary includes canonical `full_id` for direct reuse with
-`session.resume` or `session.export` across requests.
+`session.resume` or `session.export` across requests. As with other records,
+`full_id` is present under the default `json` output format and is omitted by
+`format=auto` and `format=table` unless the request sets `presentation=verbose`.
 
 | Param      | Type    | Required | Notes                                               |
 | ---------- | ------- | -------- | --------------------------------------------------- |
