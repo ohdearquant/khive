@@ -1157,6 +1157,12 @@ mod tests {
 
     use crate::MemoryPack;
 
+    fn memory_runtime_with_fresh_tail(ann_fresh_tail_enabled: bool) -> KhiveRuntime {
+        KhiveRuntime::memory()
+            .expect("in-memory runtime")
+            .with_ann_fresh_tail_enabled(ann_fresh_tail_enabled)
+    }
+
     #[derive(Clone, Debug, Default)]
     struct CapturedWarning {
         fields: HashMap<String, String>,
@@ -1388,7 +1394,7 @@ mod tests {
         const DIMS: usize = 16;
         const NOTE_TEXT: &str = "issue 836 normal path recall without any ann contention";
 
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = memory_runtime_with_fresh_tail(true);
         rt.register_embedder(HashVecProvider {
             model_name: MODEL.to_owned(),
             dims: DIMS,
@@ -1430,31 +1436,8 @@ mod tests {
         }
     }
 
-    /// Guards a mutated `KHIVE_ANN_FRESH_TAIL` value, restoring whatever value
-    /// (present or absent) it held before the guard was created, even if the
-    /// test panics.
-    struct FreshTailEnvGuard {
-        prior: Option<String>,
-    }
-
-    impl FreshTailEnvGuard {
-        fn disable() -> Self {
-            let prior = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
-            std::env::set_var("KHIVE_ANN_FRESH_TAIL", "0");
-            Self { prior }
-        }
-    }
-
-    impl Drop for FreshTailEnvGuard {
-        fn drop(&mut self) {
-            match self.prior.take() {
-                Some(v) => std::env::set_var("KHIVE_ANN_FRESH_TAIL", v),
-                None => std::env::remove_var("KHIVE_ANN_FRESH_TAIL"),
-            }
-        }
-    }
-
-    /// #1477: an exceptional fresh-tail skip (here, the exact leg disabled via
+    /// #1477: an exceptional fresh-tail skip (here, the runtime's exact leg is
+    /// disabled, as production can request via construction-time
     /// `KHIVE_ANN_FRESH_TAIL=0`) forfeits read-your-writes visibility on the
     /// warm-index path — that is degraded serving, not an ordinary healthy
     /// response, and must be disclosed on a non-empty response the same way
@@ -1468,9 +1451,7 @@ mod tests {
         const DIMS: usize = 16;
         const NOTE_TEXT: &str = "issue 1477 fresh tail disabled recall degradation note";
 
-        let _env_guard = FreshTailEnvGuard::disable();
-
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = memory_runtime_with_fresh_tail(false);
         rt.register_embedder(HashVecProvider {
             model_name: MODEL.to_owned(),
             dims: DIMS,
@@ -1546,9 +1527,7 @@ mod tests {
         const DIMS: usize = 16;
         const NOTE_TEXT: &str = "budget capped degraded disclosure note body";
 
-        let _env_guard = FreshTailEnvGuard::disable();
-
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = memory_runtime_with_fresh_tail(false);
         rt.register_embedder(HashVecProvider {
             model_name: MODEL.to_owned(),
             dims: DIMS,

@@ -1805,14 +1805,6 @@ async fn fetch_final_tail_on(
 
 // ── ADR-118: fresh-tail exact leg (read-your-writes recall visibility) ─────────
 
-/// `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Any
-/// other value, including unset, leaves it enabled.
-fn fresh_tail_enabled() -> bool {
-    std::env::var("KHIVE_ANN_FRESH_TAIL")
-        .map(|v| v != "0")
-        .unwrap_or(true)
-}
-
 /// Read the currently-installed bridge's fresh-tail watermark for `key`: the
 /// `ann_write_log` seq its corpus state reflects, or `None` if no bridge is
 /// installed. Test-only: production call sites need this paired atomically
@@ -2063,8 +2055,10 @@ pub(crate) async fn fresh_tail_leg(
         }
     }
 
-    if !fresh_tail_enabled() {
-        return FreshTailOutcome::Skipped("fresh-tail leg disabled via KHIVE_ANN_FRESH_TAIL");
+    if !rt.ann_fresh_tail_enabled() {
+        return FreshTailOutcome::Skipped(
+            "fresh-tail leg disabled by runtime policy (KHIVE_ANN_FRESH_TAIL is sampled at construction)",
+        );
     }
 
     match s {

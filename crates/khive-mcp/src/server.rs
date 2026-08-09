@@ -225,8 +225,8 @@ impl DispatchFailure {
 ///
 /// Two servers produce the same id iff they can safely share one warm engine:
 /// same pack set (order-independent), same storage target, same embedders, same
-/// backend topology/routing, and same construction-baked outbound and git-write
-/// policies.
+/// backend topology/routing, and same construction-baked fresh-tail, outbound,
+/// and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects
@@ -251,6 +251,22 @@ impl DispatchFailure {
 pub fn compute_config_id(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
+) -> String {
+    compute_config_id_with_ann_fresh_tail(
+        config,
+        khive_cfg,
+        khive_runtime::ann_fresh_tail_enabled_from_env(),
+    )
+}
+
+/// Compute the daemon identity with an already-snapshotted ADR-118 policy.
+///
+/// Runtime-owning call sites use this form so an environment mutation after
+/// construction cannot make the fingerprint disagree with serving behavior.
+pub(crate) fn compute_config_id_with_ann_fresh_tail(
+    config: &RuntimeConfig,
+    khive_cfg: Option<&khive_runtime::KhiveConfig>,
+    ann_fresh_tail_enabled: bool,
 ) -> String {
     let mut packs = config.packs.clone();
     packs.sort();
@@ -292,11 +308,12 @@ pub fn compute_config_id(
     let git_write = format!("{:x}", git_write_hasher.finalize());
 
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];backend={:?};outbound=[{}];git_write={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};backend={:?};outbound=[{}];git_write={}",
         packs.join(","),
         db,
         primary,
         extra.join(","),
+        ann_fresh_tail_enabled,
         config.backend_id,
         outbound.join(","),
         git_write,
@@ -543,7 +560,11 @@ impl KhiveMcpServer {
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
         let gate = runtime.config().gate.clone();
         let default_namespace = runtime.config().default_namespace.clone();
-        let config_id = compute_config_id(runtime.config(), None);
+        let config_id = compute_config_id_with_ann_fresh_tail(
+            runtime.config(),
+            None,
+            runtime.ann_fresh_tail_enabled(),
+        );
         let visible_namespaces = runtime.config().visible_namespaces.clone();
         let actor_id = runtime.config().actor_id.clone();
         let mut builder = VerbRegistryBuilder::new();
@@ -2902,6 +2923,20 @@ mod tests {
         assert_eq!(
             error.data.as_ref().and_then(|data| data["reason"].as_str()),
             Some("parse-error")
+        );
+    }
+
+    /// ADR-118's serving toggle is baked into a runtime. Opposite policies
+    /// must never share one warm daemon even when every `RuntimeConfig` field
+    /// is otherwise identical.
+    #[test]
+    fn config_id_differs_when_ann_fresh_tail_policy_differs() {
+        let config = RuntimeConfig::no_embeddings();
+
+        assert_ne!(
+            compute_config_id_with_ann_fresh_tail(&config, None, true),
+            compute_config_id_with_ann_fresh_tail(&config, None, false),
+            "opposite fresh-tail policies must not share one warm daemon"
         );
     }
 

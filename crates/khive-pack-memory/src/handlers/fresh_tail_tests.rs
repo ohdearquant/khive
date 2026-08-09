@@ -17,30 +17,6 @@ use crate::MemoryPack;
 const MODEL: &str = "adr118-e2e-test-model";
 const DIMS: usize = 16;
 
-/// Guards a mutated `KHIVE_ANN_FRESH_TAIL` value, restoring whatever value
-/// (present or absent) it held before the guard was created, even if the
-/// test panics.
-struct EnvGuard {
-    prior: Option<String>,
-}
-
-impl EnvGuard {
-    fn disable_fresh_tail() -> Self {
-        let prior = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
-        std::env::set_var("KHIVE_ANN_FRESH_TAIL", "0");
-        Self { prior }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match self.prior.take() {
-            Some(v) => std::env::set_var("KHIVE_ANN_FRESH_TAIL", v),
-            None => std::env::remove_var("KHIVE_ANN_FRESH_TAIL"),
-        }
-    }
-}
-
 async fn build_registry(rt: &KhiveRuntime) -> VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
@@ -49,6 +25,13 @@ async fn build_registry(rt: &KhiveRuntime) -> VerbRegistry {
 }
 
 fn new_runtime(tmp: &std::path::Path) -> KhiveRuntime {
+    new_runtime_with_fresh_tail(tmp, true)
+}
+
+fn new_runtime_with_fresh_tail(
+    tmp: &std::path::Path,
+    ann_fresh_tail_enabled: bool,
+) -> KhiveRuntime {
     let db_path = tmp.join("khive-graph.db");
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: Some(db_path),
@@ -56,7 +39,8 @@ fn new_runtime(tmp: &std::path::Path) -> KhiveRuntime {
         additional_embedding_models: vec![],
         ..RuntimeConfig::default()
     })
-    .expect("runtime");
+    .expect("runtime")
+    .with_ann_fresh_tail_enabled(ann_fresh_tail_enabled);
     rt.register_embedder(HashVecProvider {
         model_name: MODEL.to_owned(),
         dims: DIMS,
@@ -286,18 +270,18 @@ async fn empty_tail_leaves_vector_candidates_unchanged() {
     );
 }
 
-/// `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg: a note written after the
-/// ANN cache is warm must NOT appear in the vector leg's own candidates
+/// A runtime constructed with the ADR-118 exact leg disabled must not surface
+/// a post-warm write in the vector leg's own candidates
 /// (`memory.recall_candidates`'s `vector_candidates`, sourced only from the
 /// vector leg — unlike full `memory.recall`, unaffected by FTS finding it).
 #[tokio::test]
 #[serial(adr118_fresh_tail)]
-async fn env_var_disables_fresh_tail_restoring_pre_adr_behavior() {
+async fn runtime_policy_disables_fresh_tail_restoring_pre_adr_behavior() {
     let tmp = tempfile::Builder::new()
         .prefix("khive-adr118-e2e-6-")
         .tempdir_in(std::env::temp_dir())
         .expect("tempdir");
-    let rt = new_runtime(tmp.path());
+    let rt = new_runtime_with_fresh_tail(tmp.path(), false);
     let ns = Namespace::parse("local").expect("local namespace");
     let token = rt.authorize(ns).expect("authorize local");
 
@@ -306,7 +290,7 @@ async fn env_var_disables_fresh_tail_restoring_pre_adr_behavior() {
             &token,
             "memory",
             None,
-            &format!("adr118 e2e env-disable seed note {i}"),
+            &format!("adr118 e2e policy-disable seed note {i}"),
             Some(0.7),
             None,
             vec![],
@@ -319,14 +303,12 @@ async fn env_var_disables_fresh_tail_restoring_pre_adr_behavior() {
     registry
         .dispatch(
             "memory.recall_candidates",
-            json!({"query": "adr118 e2e env-disable seed note", "limit": 10}),
+            json!({"query": "adr118 e2e policy-disable seed note", "limit": 10}),
         )
         .await
         .expect("warm recall_candidates");
 
-    let _guard = EnvGuard::disable_fresh_tail();
-
-    const MARKER: &str = "adr118 e2e env-disable distinctive marker xyzzy";
+    const MARKER: &str = "adr118 e2e policy-disable distinctive marker xyzzy";
     let fresh = rt
         .create_note(&token, "memory", None, MARKER, Some(0.7), None, vec![])
         .await
@@ -344,7 +326,7 @@ async fn env_var_disables_fresh_tail_restoring_pre_adr_behavior() {
         .expect("vector_candidates must be an array");
     assert!(
         !contains_id(vector_candidates, fresh.id),
-        "KHIVE_ANN_FRESH_TAIL=0 must restore pre-ADR-118 behavior: a note \
+        "a disabled runtime must restore pre-ADR-118 behavior: a note \
          written after the cache warmed must stay invisible to the vector \
          leg until a rebuild, got: {vector_candidates:?}"
     );
