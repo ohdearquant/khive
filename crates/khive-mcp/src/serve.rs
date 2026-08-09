@@ -2864,21 +2864,12 @@ pub struct WiringSurface {
     /// The resolved ADR-078 default output format.
     pub output_format: OutputFormat,
     /// Whether the default ingest namespace passes the email loop's gate
-    /// preflight (#503/#602). This is only the authorization half of
-    /// admission; the runtime-mode fields below independently prevent tasks
-    /// backed by read-only runtimes from starting.
+    /// preflight (#503/#602). This captures only the existing public
+    /// authorization surface; runtime-mode admission remains private server
+    /// wiring and independently prevents read-only-backed tasks from starting.
     /// Only meaningful when the `channel-email` feature is compiled in.
     #[cfg(feature = "channel-email")]
     pub channel_loop_eligible: bool,
-    /// Runtime-mode half of channel-loop admission. These values deliberately
-    /// remain independent in mixed topologies: inbound `comm.*` writes and
-    /// outbound generic KG mutations can resolve to different backends.
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    pub channel_inbound_poll_admitted: bool,
-    /// Whether the runtime serving generic `list`/`update` is writable, so an
-    /// external delivery can be durably claimed and marked complete.
-    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-    pub channel_outbound_delivery_admitted: bool,
 }
 
 impl WiringSurface {
@@ -2892,10 +2883,6 @@ impl WiringSurface {
                 &ingest_namespace_from_env(),
                 &server.verb_registry_clone(),
             ),
-            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-            channel_inbound_poll_admitted: server.channel_loop_admission().inbound_poll,
-            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-            channel_outbound_delivery_admitted: server.channel_loop_admission().outbound_delivery,
         }
     }
 }
