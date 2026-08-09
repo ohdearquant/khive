@@ -1081,6 +1081,8 @@ mod tests {
                 .text("present")
                 .expect("create the optional FTS table while writable");
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
         read_only
@@ -1119,6 +1121,8 @@ mod tests {
                 .vectors("present", "present", 3)
                 .expect("create the optional vector table while writable");
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
         read_only
@@ -1154,6 +1158,8 @@ mod tests {
                 .await
                 .unwrap();
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let ro = StorageBackend::sqlite_read_only(&path).unwrap();
         let sql = ro.sql();
@@ -1364,6 +1370,8 @@ mod tests {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable.events().unwrap();
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let ro = StorageBackend::sqlite_read_only(&path).unwrap();
         let store = match ro.events() {
@@ -1399,6 +1407,8 @@ mod tests {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable.text("ro_test").unwrap();
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let ro = StorageBackend::sqlite_read_only(&path).unwrap();
         let store = match ro.text("ro_test") {

@@ -3507,6 +3507,26 @@ fn apply_config_pack_selection(
 mod tests {
     use super::*;
     use khive_runtime::{BlobConfig, Namespace, StorageSectionConfig};
+
+    // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
+    // connections close asynchronously; read-only admission rejects a writable
+    // `-shm` as potentially live.
+    #[cfg(unix)]
+    fn freeze_snapshot_sidecars(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+            }
+        }
+    }
     use serial_test::serial;
     use std::io::Write;
 
@@ -6747,6 +6767,7 @@ region = "us-east-1"
         let mut permissions = std::fs::metadata(&db_path).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&db_path, permissions).unwrap();
+        freeze_snapshot_sidecars(&db_path);
 
         let config = BackendConfig {
             name: "archive".to_string(),
@@ -8358,6 +8379,7 @@ region = "us-east-1"
         let mut permissions = std::fs::metadata(&db).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&db, permissions).unwrap();
+        freeze_snapshot_sidecars(&db);
 
         use clap::Parser;
         let args = Args::parse_from(["mcp", "--db", db.to_str().expect("utf8 path"), "--no-embed"]);
@@ -8413,6 +8435,7 @@ region = "us-east-1"
         let mut permissions = std::fs::metadata(&main_db).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&main_db, permissions).unwrap();
+        freeze_snapshot_sidecars(&main_db);
 
         let config_path = write_config(
             seat_dir.path(),
@@ -8477,6 +8500,7 @@ backend = "schedule-backend"
             .permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&read_only_schedule_db, permissions).unwrap();
+        freeze_snapshot_sidecars(&read_only_schedule_db);
         let writable_main_db = seat_dir.path().join("writable-main.db");
         KhiveRuntime::new(RuntimeConfig {
             db_path: Some(writable_main_db.clone()),

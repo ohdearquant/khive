@@ -5466,6 +5466,21 @@ path = "{}"
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(path, permissions).unwrap();
+
+        // A writable fixture's connections can close asynchronously and leave
+        // `-wal`/`-shm` sidecars behind; read-only admission rejects a writable
+        // `-shm` as potentially live. Freeze any lingering sidecars so the
+        // snapshot takes the documented frozen form.
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().unwrap().to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().unwrap().join(name);
+            if sidecar.exists() {
+                let mut sidecar_permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+                sidecar_permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, sidecar_permissions).unwrap();
+            }
+        }
     }
 
     #[cfg(unix)]

@@ -3252,6 +3252,26 @@ mod tests {
     use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+
+    // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
+    // connections close asynchronously; read-only admission rejects a writable
+    // `-shm` as potentially live.
+    #[cfg(unix)]
+    fn freeze_snapshot_sidecars(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+            }
+        }
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -4466,6 +4486,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&path, permissions).unwrap();
+        freeze_snapshot_sidecars(&path);
 
         let detected = compute_config_id(&runtime, None);
         assert_ne!(writable, detected);
@@ -4509,6 +4530,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&path, permissions).unwrap();
+        freeze_snapshot_sidecars(&path);
 
         let pre_open_read_only_id = compute_config_id(runtime.config(), None);
         assert!(
