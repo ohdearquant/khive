@@ -277,11 +277,12 @@ fn read_applied_migration_ledger(
         "SELECT version, name FROM _schema_migrations \
          WHERE version <= ?1 ORDER BY version ASC",
     )?;
-    Ok(stmt
+    let rows = stmt
         .query_map([through_version], |row| {
             Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
         })?
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Require the applied versions through `through_version` to be the exact
