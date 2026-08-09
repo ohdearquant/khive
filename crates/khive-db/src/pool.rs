@@ -779,7 +779,7 @@ impl ConnectionPool {
         &self.config
     }
 
-    /// Pool-wide permits for file-backed raw-SQL reader handles.
+    /// Pool-wide permits for file-backed raw-SQL reader opens and active reads.
     pub(crate) fn sql_bridge_reader_slots(&self) -> Arc<Semaphore> {
         Arc::clone(&self.sql_bridge_reader_slots)
     }

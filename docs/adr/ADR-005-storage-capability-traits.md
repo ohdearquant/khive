@@ -507,3 +507,33 @@ therefore cannot temporarily exceed the live connection budget. The writer
 task's fixed connection and store-internal operation-scoped connections are
 outside this raw-SQL handle budget and retain their ADR-067/ADR-135
 contracts.
+
+## Amendment: operation-scoped raw-SQL reader admission (2026-08-09)
+
+Issue #1828 supersedes the preceding amendment's reader-handle lifetime rule.
+The pool's effective reader count bounds concurrent file-backed raw-SQL reader
+opens and active read operations, not the number of retained `SqlReader`
+handles. `SqlAccess::reader()` may cache a read-only connection on its returned
+handle, but the permit used while opening that connection is released when the
+open finishes. Each `query_row`, `query_all`, and `query_page` call acquires a
+reader permit before moving the cached connection onto the blocking thread and
+releases it only after SQLite finishes the operation.
+Saturation keeps the existing finite `checkout_timeout` and returns
+`StorageError::Timeout` with operation `sql_bridge.reader_open` or
+`sql_bridge.reader_operation`, respectively.
+
+The same rule applies to reads through a queue-backed `SqlWriter`: its lazily
+opened read-only connection remains cached without a reader permit, while each
+active query uses the shared operation permit. If an awaiting task is
+cancelled after SQLite work starts, the detached blocking closure retains the
+connection and permit together until that work actually finishes. Cancellation
+therefore cannot oversubscribe active reads, while idle retained handles no
+longer consume permanent admission capacity.
+
+This amendment does not change the one-permit standalone writer budget. A
+read-write connection still retains its writer permit for its handle lifetime,
+including while one of its reader-supertrait methods runs; that read also
+acquires the ordinary active-read permit. Cached idle reader connections are
+autocommit connections and do not retain a WAL snapshot (ADR-091), but their
+count is no longer a `max_readers` contract: callers that retain arbitrarily
+many handles remain responsible for their process's file-descriptor budget.
