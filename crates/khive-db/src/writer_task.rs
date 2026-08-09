@@ -867,10 +867,13 @@ async fn run_writer_task(
     acquisition_counters: Arc<WriterAcquisitionCounters>,
 ) {
     while let Some(request) = rx.recv().await {
+        // The bounded-channel wait ends at this exact dequeue boundary.
+        // Sampling inside the blocking closure would misattribute a saturated
+        // Tokio blocking pool to writer-queue contention (#1849).
+        let queue_wait = request.queue_wait();
         let origin = origin.clone();
         let acquisition_counters = Arc::clone(&acquisition_counters);
         let outcome = tokio::task::spawn_blocking(move || {
-            let queue_wait = request.queue_wait();
             // A top-level request deliberately skips BEGIN, so it would
             // silently join any transaction leaked by an earlier request.
             // Refuse every request before dispatch if the connection is not
