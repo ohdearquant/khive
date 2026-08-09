@@ -2310,6 +2310,27 @@ impl KhiveRuntime {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> RuntimeResult<Edge> {
+        Ok(self
+            .link_with_outcome(token, source_id, target_id, relation, weight, metadata)
+            .await?
+            .edge)
+    }
+
+    /// Link one natural-key triple and report whether this call inserted its row.
+    ///
+    /// A conflict reuses the persisted edge id (including soft-delete revival)
+    /// and returns `created = false`; the decision is derived from the candidate
+    /// id versus the row read back after the atomic upsert, so no preflight read
+    /// can race the write.
+    pub async fn link_with_outcome(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+    ) -> RuntimeResult<LinkWriteOutcome> {
         validate_edge_weight(weight)?;
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
@@ -2347,6 +2368,7 @@ impl KhiveRuntime {
             metadata,
             target_backend: None,
         };
+        let candidate_id = edge.id;
         // `upsert_edge_guarded` re-checks both endpoints exist as part of the same
         // write, not the separate `validate_edge_relation_endpoints` read above: a
         // concurrent hard-delete landing between that read and this write can no
@@ -2392,7 +2414,10 @@ impl KhiveRuntime {
                     "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
                 ))
             })?;
-        Ok(persisted)
+        Ok(LinkWriteOutcome {
+            created: persisted.id == candidate_id,
+            edge: persisted,
+        })
     }
 
     /// Write an edge with an explicit `target_backend` stamp (ADR-029 D3).
@@ -5684,6 +5709,24 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         specs: Vec<LinkSpec>,
     ) -> RuntimeResult<Vec<Edge>> {
+        Ok(self
+            .link_many_with_outcomes(token, specs)
+            .await?
+            .into_iter()
+            .map(|outcome| outcome.edge)
+            .collect())
+    }
+
+    /// Atomic batch form of [`Self::link_with_outcome`].
+    ///
+    /// Outcome order matches input order, and each `created` bit is decided by
+    /// comparing the generated candidate id with the persisted natural-key row
+    /// after the one guarded batch upsert.
+    pub async fn link_many_with_outcomes(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<LinkSpec>,
+    ) -> RuntimeResult<Vec<LinkWriteOutcome>> {
         if specs.is_empty() {
             return Ok(vec![]);
         }
@@ -5748,7 +5791,10 @@ impl KhiveRuntime {
                         edge.source_id, edge.target_id, edge.relation.as_str()
                     ))
                 })?;
-            persisted.push(row);
+            persisted.push(LinkWriteOutcome {
+                created: row.id == edge.id,
+                edge: row,
+            });
         }
         Ok(persisted)
     }
@@ -5890,6 +5936,13 @@ pub struct LinkSpec {
     pub relation: EdgeRelation,
     pub weight: f64,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// Persisted edge plus the natural-key upsert disposition for one link call.
+#[derive(Clone, Debug)]
+pub struct LinkWriteOutcome {
+    pub edge: Edge,
+    pub created: bool,
 }
 
 /// Fully specified entity creation request — input to [`KhiveRuntime::create_many`].

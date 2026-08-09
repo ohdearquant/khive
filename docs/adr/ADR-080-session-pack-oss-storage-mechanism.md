@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-06-28
-**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context); 2026-08-01 — claude.ai export source (§6); 2026-08-02 — delta-proportional mirror polling (§6)
+**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context); 2026-08-01 — claude.ai export source (§6); 2026-08-02 — delta-proportional mirror polling (§6); 2026-08-09 — replacement-safe cursor witnesses (§6)
 **Superseded by**: [ADR-083](ADR-083-session-pack-t1-verbs.md) for §3 only; ADR-083 is
 the current authority for the public session verb surface, while the rest of this record
 remains in force.
@@ -319,7 +319,10 @@ three indexes: `sessions` (one row per session or conversation: provider id, sou
 git branch, slug, message count, first/last seen), `session_messages` (one row per
 transcript event: uuid key, session id, per-session `seq`, parent uuid, sidechain flag,
 role, type, masked text, masked raw, timestamp), and `session_mirror_cursor` (one row per
-watched file: byte offset, session id, updated-at).
+watched file: byte offset, nullable platform file-identity witness, session id, updated-at).
+Existing cursor tables are upgraded in place with a guarded nullable-column migration. On Unix
+the witness is device plus inode; on Windows it is volume serial plus file index. Platforms or
+filesystems that cannot provide either retain the length-only fallback.
 
 #### Invariants (normative for every source)
 
@@ -334,7 +337,14 @@ watched file: byte offset, session id, updated-at).
 4. **Errors never advance the cursor.** A per-file parse or IO error leaves that file's
    cursor untouched (the file is retried next pass) and does not block other files.
 5. **One transaction per file pass.** Message rows, the metadata touch, the message-count
-   refresh, and the cursor upsert commit atomically.
+   refresh, and the cursor offset-plus-identity upsert commit atomically. The identity is captured
+   from the same open file handle that produced the offset; a probe/open mismatch refuses the pass,
+   and a deferred cursor-only commit carries that captured witness rather than re-statting the path.
+6. **Replacement and truncation restart at zero.** Before the EOF fast path, a changed
+   file-identity witness or a file length below the stored offset resets the in-memory offset to
+   zero. A legacy NULL-witness cursor replays once when a witness first becomes available. Replay
+   is safe under invariant 2 and prevents a same-path, same-length replacement from being mistaken
+   for unchanged EOF.
 
 #### ChatGPT export mapping
 

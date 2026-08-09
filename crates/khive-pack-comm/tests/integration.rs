@@ -2691,15 +2691,14 @@ async fn test_inbox_limit_200_succeeds() {
             "comm.inbox",
             serde_json::json!({ "limit": 200, "status": "all" }),
         )
-        .await;
-    assert!(
-        result.is_ok(),
-        "inbox(limit=200) must succeed; got err={:?}",
-        result.unwrap_err()
-    );
+        .await
+        .expect("inbox(limit=200) must succeed");
+    assert!(result.get("limit_clamped").is_none(), "{result}");
+    assert!(result.get("requested_limit").is_none(), "{result}");
+    assert!(result.get("effective_limit").is_none(), "{result}");
 }
 
-/// inbox(limit=201) clamps silently to 200 and succeeds — no InvalidInput.
+/// inbox(limit=201) clamps to 200 and discloses the effective page size.
 #[tokio::test]
 async fn test_inbox_limit_201_clamps_to_200() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -2717,18 +2716,16 @@ async fn test_inbox_limit_201_clamps_to_200() {
         .await
         .expect("send succeeds");
 
-    // The handler uses .clamp(1, 200), so 201 is silently capped — not rejected.
     let result = registry
         .dispatch(
             "comm.inbox",
             serde_json::json!({ "limit": 201, "status": "all" }),
         )
-        .await;
-    assert!(
-        result.is_ok(),
-        "inbox(limit=201) must clamp silently to 200, not return an error; got err={:?}",
-        result.unwrap_err()
-    );
+        .await
+        .expect("inbox(limit=201) must clamp rather than reject");
+    assert_eq!(result["requested_limit"], 201, "{result}");
+    assert_eq!(result["effective_limit"], 200, "{result}");
+    assert_eq!(result["limit_clamped"], true, "{result}");
 }
 
 /// inbox(status="banana") must return InvalidInput — unknown status values are rejected.

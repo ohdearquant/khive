@@ -587,7 +587,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Commissive: commits a typed edge to the graph
     HandlerDef {
         name: "link",
-        description: "Create a typed directed edge",
+        description: "Create or reuse a typed directed edge. Singleton responses include \
+                      created/reused booleans; bulk responses count created and reused \
+                      natural-key rows separately from duplicates skipped within the request.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

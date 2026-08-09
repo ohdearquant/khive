@@ -51,7 +51,7 @@ defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 | `update`         | Patch properties, tags, or content (by UUID)                                                                                                                                                                                                                                   | Correcting or enriching an existing record                              |
 | `delete`         | Soft-delete (or hard-delete) a record (by UUID)                                                                                                                                                                                                                                | Removing stale or incorrect data                                        |
 | `merge`          | Deduplicate two entities or two notes into one                                                                                                                                                                                                                                 | "LoRA" and "Low-Rank Adaptation" are the same concept                   |
-| `link`           | Connect two nodes with a typed relation                                                                                                                                                                                                                                        | When relationships emerge from research                                 |
+| `link`           | Create or reuse a typed edge and report the natural-key upsert disposition                                                                                                                                                                                                     | When relationships emerge from research                                 |
 | `neighbors`      | Immediate neighbors of a node                                                                                                                                                                                                                                                  | "What connects to this entity?"                                         |
 | `traverse`       | Bounded multi-hop BFS (≤100 roots, depth ≤10, finite result/work/time budgets)                                                                                                                                                                                                 | Structural context — lineages, paths, clusters                          |
 | `query`          | GQL/SPARQL query string → SQL                                                                                                                                                                                                                                                  | Complex pattern matching over the graph                                 |
@@ -98,6 +98,11 @@ request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
 # skip_dedup_check=true because resolve already searched -- avoids a redundant post-create hint.
 request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_check=true)')
 ```
+
+`link` is an idempotent natural-key upsert. Singleton results include `created` and `reused`
+booleans (exactly one true) and always return the persisted edge id; relinking or reviving a row is
+`reused`. Bulk results count persisted `created` and `reused` rows separately, while `skipped`
+continues to mean duplicate entries removed within that one request.
 
 ### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
@@ -220,6 +225,10 @@ fully filtered page is empty. Existing matches return immediately; new messages
 re-run the same actor/status/sender/time/text-filtered query with the same offset,
 and the paginated response shape is unchanged. Omit it (or pass `0`) for the
 snapshot behavior.
+
+`comm.inbox` accepts limits above 200 by clamping them to 200 and explicitly adds
+`requested_limit`, `effective_limit`, and `limit_clamped: true` to that response. Values at or
+below 200 keep the ordinary envelope; `limit=0` remains the count-only path.
 
 **Mark-read is inbound-only.** `comm.read` is the compatibility surface; it marks a received message
 as read and does not retrieve content. Calling it on an outbound

@@ -222,6 +222,11 @@ the initial storage query, so query time reduces the remaining signal-wait
 budget. The timeout-edge final query and response serialization can add ordinary
 request-processing time after that deadline.
 
+`limit` defaults to 20. Values from 1 through 200 preserve the ordinary envelope and `limit=0`
+preserves the immediate count-only path. Values above 200 are clamped rather than rejected, and the
+returned envelope discloses `requested_limit`, `effective_limit: 200`, and
+`limit_clamped: true`; the metadata is identical on immediate and long-poll responses.
+
 One process-local `InboxSignal` belongs to each `CommPack` instance. It combines
 `tokio::sync::Notify` with a monotonically increasing generation. The handler
 captures the generation before every query, preventing a commit between the

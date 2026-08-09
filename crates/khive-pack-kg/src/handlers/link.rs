@@ -66,16 +66,24 @@ impl KgPack {
                 registry
                     .validate_link_hooks(&self.runtime, token, &specs)
                     .await?;
-                let edges = self.runtime.link_many(token, specs).await?;
+                let outcomes = self.runtime.link_many_with_outcomes(token, specs).await?;
+                let created = outcomes.iter().filter(|outcome| outcome.created).count();
+                let reused = outcomes.len() - created;
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
-                    "created": edges.len(),
+                    "created": created,
+                    "reused": reused,
                     "skipped": skipped,
                     "failed": 0,
                 });
                 if verbose {
-                    resp["edges"] = serde_json::to_value(&edges)
-                        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                    resp["edges"] = serde_json::to_value(
+                        outcomes
+                            .iter()
+                            .map(|outcome| &outcome.edge)
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
                 }
                 return to_json(&resp);
             } else {
@@ -83,6 +91,8 @@ impl KgPack {
                 let mut error_list: Vec<Value> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
+                let mut created = 0usize;
+                let mut reused = 0usize;
                 for (idx, entry) in entries.into_iter().enumerate() {
                     let source =
                         match resolve_uuid_unfiltered(&entry.source_id, &self.runtime, token).await
@@ -153,16 +163,24 @@ impl KgPack {
                     }
                     match self
                         .runtime
-                        .link(token, source, target, relation, weight, metadata)
+                        .link_with_outcome(token, source, target, relation, weight, metadata)
                         .await
                     {
-                        Ok(edge) => results.push(to_json(&edge)?),
+                        Ok(outcome) => {
+                            if outcome.created {
+                                created += 1;
+                            } else {
+                                reused += 1;
+                            }
+                            results.push(to_json(&outcome.edge)?);
+                        }
                         Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
                     }
                 }
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
-                    "created": results.len(),
+                    "created": created,
+                    "reused": reused,
                     "skipped": skipped,
                     "failed": error_list.len(),
                     "errors": error_list,
@@ -200,9 +218,9 @@ impl KgPack {
             .validate_link_hooks(&self.runtime, token, std::slice::from_ref(&spec))
             .await?;
 
-        let edge = match self
+        let outcome = match self
             .runtime
-            .link(token, source, target, relation, weight, metadata)
+            .link_with_outcome(token, source, target, relation, weight, metadata)
             .await
         {
             Ok(e) => e,
@@ -216,7 +234,11 @@ impl KgPack {
             }
             Err(e) => return Err(e),
         };
-        let mut raw = to_json(&edge)?;
+        let mut raw = to_json(&outcome.edge)?;
+        if let Some(obj) = raw.as_object_mut() {
+            obj.insert("created".to_string(), json!(outcome.created));
+            obj.insert("reused".to_string(), json!(!outcome.created));
+        }
         if relation.is_symmetric() {
             if let Some(obj) = raw.as_object_mut() {
                 obj.insert("source_id".to_string(), json!(source.to_string()));

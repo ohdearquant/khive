@@ -1,7 +1,8 @@
 # ADR-057: Comm Actor-Addressed Delivery
 
-**Status**: Accepted (amended 2026-08-06 — named atomic mark-read)\
-**Date**: 2026-06-15 (amended 2026-08-06)\
+**Status**: Accepted (amended 2026-08-06 — named atomic mark-read; 2026-08-09 — inbox
+limit-clamp disclosure)\
+**Date**: 2026-06-15 (amended 2026-08-06 and 2026-08-09)\
 **Authors**: khive maintainers
 **Depends on**: ADR-007 (Namespace), ADR-017 (Pack Standard), ADR-040 (Communication and
 Schedule Packs)\
@@ -9,7 +10,7 @@ Schedule Packs)\
 gate), #75 (actor identity on every request), #1447 (sender-side dual-write confirmation),
 #1428 (process provenance), #1490 (versioned message properties), #1468 (list-read field
 projection), #1471 (sender-visible sent history), #199 (anonymous inbox isolation),
-and #1387 (named atomic mark-read)
+and #1387 (named atomic mark-read), plus #1761 (inbox limit-clamp disclosure)
 
 ## Context
 
@@ -212,6 +213,14 @@ properties render as null, while `from_actor`/`to_actor` fall back to the full
 view's `from`/`to` values. Omitting `fields` preserves the complete
 historical response, while an empty list or an unknown field is rejected rather
 than silently changing shape.
+
+#### Amendment: limit-clamp disclosure (2026-08-09)
+
+`limit=0` remains the count-only envelope and values from 1 through 200 retain the historical
+response shape. A value above 200 is still accepted and clamped, but the envelope adds
+`requested_limit`, `effective_limit`, and `limit_clamped: true`. Clients can therefore distinguish
+the effective page size from the requested size without turning a previously accepted call into an
+error. The same metadata is added after either an immediate query or a long-poll result.
 
 ### `comm.send` behavior change
 

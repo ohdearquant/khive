@@ -11,6 +11,15 @@ pub(crate) const VALID_EXPORT_FORMATS: &[&str] = &["json", "markdown"];
 ///
 /// Three tables + three indexes, all idempotent (`CREATE TABLE/INDEX IF NOT EXISTS`).
 /// Applied at boot via the `schema_plan` hook and lazily in tests via `execute_script`.
+pub(crate) const SESSION_CURSOR_SCHEMA_STMT: &str =
+    "CREATE TABLE IF NOT EXISTS session_mirror_cursor (\
+        file_path     TEXT PRIMARY KEY,\
+        session_id    TEXT,\
+        byte_offset   INTEGER NOT NULL DEFAULT 0,\
+        file_identity TEXT,\
+        updated_at    INTEGER NOT NULL\
+    )";
+
 pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 6] = [
     "CREATE TABLE IF NOT EXISTS sessions (\
         id                  TEXT PRIMARY KEY,\
@@ -40,12 +49,7 @@ pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 6] = [
     )",
     "CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id, seq)",
     "CREATE INDEX IF NOT EXISTS idx_session_messages_parent  ON session_messages(parent_uuid)",
-    "CREATE TABLE IF NOT EXISTS session_mirror_cursor (\
-        file_path   TEXT PRIMARY KEY,\
-        session_id  TEXT,\
-        byte_offset INTEGER NOT NULL DEFAULT 0,\
-        updated_at  INTEGER NOT NULL\
-    )",
+    SESSION_CURSOR_SCHEMA_STMT,
 ];
 
 /// Speech-act categories follow ADR-025: `session.store` is a Directive

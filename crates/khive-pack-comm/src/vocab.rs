@@ -107,7 +107,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.inbox",
-        description: "List and page through the caller's filtered inbound or sent messages, optionally waiting for a new matching message. Defaults to the inbound inbox.",
+        description: "List and page through the caller's filtered inbound or sent messages, optionally waiting for a new matching message. Defaults to the inbound inbox. A limit above 200 is clamped and disclosed through requested_limit/effective_limit/limit_clamped response metadata.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -115,7 +115,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Max messages to return. Default 20, max 200.",
+                description: "Max messages to return. Default 20; values above 200 are clamped to 200 and disclosed in response metadata.",
             },
             ParamDef {
                 name: "box",

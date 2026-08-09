@@ -16,7 +16,7 @@ VERBS_UNDER_TEST = {"create", "get", "list", "search", "link"}
 
 @pytest.mark.adr_007
 @pytest.mark.slow
-def test_read_isolation_between_namespaces(
+def test_explicit_namespace_routing_and_multirecord_isolation(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
     sample_entity,
@@ -29,7 +29,12 @@ def test_read_isolation_between_namespaces(
     ADR-007 Rev 6 Rule 2 (SHIPPED, PR-A1 commit 2607e263): get/update/delete resolve by UUID
     with WHERE id = ? only — no namespace equality check at any layer (store, runtime, handler).
 
+    `namespace` is a registry-owned dispatch argument (not a `create`-handler field): the registry
+    resolves it into the authorization/storage token and strips it before strict handler decoding.
+
     Contract verified here:
+    - create(namespace=alpha) returns/stores alpha attribution, and positive alpha list/search
+      controls prove that routing occurred before the negative beta isolation assertions.
     - get(id, namespace=beta) where entity lives in alpha: SUCCEEDS — full-UUID by-ID is
       namespace-agnostic (ADR-007 Rev 6 Rule 2, SHIPPED PR-A1 commit 2607e263).
     - 8-char prefix get from beta: SUCCEEDS — prefix expansion for by-ID ops is unfiltered
@@ -52,6 +57,20 @@ def test_read_isolation_between_namespaces(
         "namespace": ns_alpha,
     })
     full_id = entity["id"]
+    assert entity.get("namespace") == ns_alpha, (
+        "the registry-owned namespace argument must be consumed before create validation and "
+        f"stamp the stored entity; got: {entity}"
+    )
+
+    entities_alpha = khive_session.verb("list", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "namespace": ns_alpha,
+    })
+    assert full_id in [e["id"] for e in entities_alpha], (
+        "the positive alpha control must prove explicit namespace routing; by-ID reads alone "
+        "cannot distinguish an alpha write from an accidental local write"
+    )
 
     # By-ID get from beta: must SUCCEED (ADR-007 Rev 6 Rule 2 — namespace-agnostic)
     envelope_get = khive_session.request_batch([{
@@ -92,6 +111,16 @@ def test_read_isolation_between_namespaces(
     assert full_id not in hit_ids_beta, (
         f"AlphaEntity must not appear in beta namespace search (multi-record scoping): "
         f"{hit_ids_beta}"
+    )
+
+    hits_alpha = khive_session.verb("search", {
+        "kind": "entity",
+        "query": "AlphaEntity",
+        "namespace": ns_alpha,
+    })
+    assert full_id in [h.get("id", h.get("entity_id", "")) for h in hits_alpha], (
+        "the positive alpha search control must prove the multi-record namespace predicate "
+        f"selects the explicitly routed write; got: {hits_alpha}"
     )
 
     # Per P-H2 (ADR-045): get returns flat object with granular kind — no {data: ...} wrapper.

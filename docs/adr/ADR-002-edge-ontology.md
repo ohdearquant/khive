@@ -23,6 +23,9 @@ carry a relation-specific payload atomically with the delete, as specified in "C
 with a per-relation coherence classification for curation), records the existing self-loop
 rejection, and states the delete-then-relink direction rule. See "Reciprocal pairs,
 self-loops, and repricing" below. Motivated by issue #1667.
+**Amended 2026-08-09**: the `link` response exposes whether its natural-key upsert created a row or
+reused/revived the persisted row. Bulk responses count persisted reuse separately from
+request-local duplicate skips. Motivated by issue #1761.
 
 ## Context
 
@@ -253,6 +256,13 @@ symmetric relations the question does not arise: either endpoint order canonical
 the same natural key, so a re-link in either order revives the same row. Callers must
 not infer stored direction from adjacency output (`neighbors` echoes the traversal
 origin, issue #1670); `get(edge_id)` is the supported direction read.
+
+**Upsert disposition (normative response contract).** A singleton `link` result carries exactly
+one true boolean across `created` and `reused`. Inserting a new natural-key row yields
+`created=true`; updating or reviving an existing row yields `reused=true` and returns that row's
+persisted id. The decision is made from the atomic upsert/readback outcome, never a preflight read.
+For bulk calls, `created` and `reused` are counts of those persisted outcomes; `skipped` remains the
+separate count of duplicate natural keys removed within the request before persistence.
 
 **Migration consequence.** The legality ruling strands no existing rows. Reciprocal
 pairs in state-like relations stay as-is. Reciprocal pairs in order-like relations and

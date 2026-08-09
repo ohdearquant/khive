@@ -3286,6 +3286,41 @@ async fn link_output_returns_full_uuids_and_iso_dates() {
 
 // ── Bulk link: entry limit, dedup, and response shape ────────────────────────
 
+#[tokio::test]
+async fn singleton_link_reports_created_then_reused() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "ReuseA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "ReuseB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let link = || {
+        json!({
+            "source_id": a["id"],
+            "target_id": b["id"],
+            "relation": "extends",
+        })
+    };
+
+    let first = pack.dispatch("link", link()).await.expect("first link");
+    assert_eq!(first["created"], true, "{first}");
+    assert_eq!(first["reused"], false, "{first}");
+
+    let second = pack.dispatch("link", link()).await.expect("reused link");
+    assert_eq!(second["id"], first["id"], "natural-key reuse preserves id");
+    assert_eq!(second["created"], false, "{second}");
+    assert_eq!(second["reused"], true, "{second}");
+}
+
 // Fix 2: >1000 entries must return InvalidInput immediately.
 #[tokio::test]
 async fn bulk_link_over_1000_entries_returns_error() {
@@ -3398,6 +3433,48 @@ async fn bulk_link_dedup_and_response_shape() {
         result.get("edges").is_none(),
         "edges must be absent without verbose=true (ADR-038 F205); got {result:?}"
     );
+}
+
+#[tokio::test]
+async fn bulk_link_counts_persisted_reuse_separately_from_request_dedup() {
+    let pack = pack();
+    let mut ids = Vec::new();
+    for name in ["BulkReuseA", "BulkReuseB", "BulkReuseC"] {
+        ids.push(
+            pack.dispatch(
+                "create",
+                json!({"kind": "entity", "name": name, "entity_kind": "concept"}),
+            )
+            .await
+            .unwrap()["id"]
+                .clone(),
+        );
+    }
+    pack.dispatch(
+        "link",
+        json!({"source_id": ids[0], "target_id": ids[1], "relation": "extends"}),
+    )
+    .await
+    .expect("seed existing edge");
+
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [
+                    {"source_id": ids[0], "target_id": ids[1], "relation": "extends"},
+                    {"source_id": ids[0], "target_id": ids[2], "relation": "extends"},
+                ],
+                "atomic": true,
+            }),
+        )
+        .await
+        .expect("mixed create/reuse batch");
+
+    assert_eq!(result["attempted"], 2, "{result}");
+    assert_eq!(result["created"], 1, "{result}");
+    assert_eq!(result["reused"], 1, "{result}");
+    assert_eq!(result["skipped"], 0, "{result}");
 }
 
 // F205: bulk link with verbose=true must include edges array; without verbose it must be absent.

@@ -648,7 +648,7 @@ pub(crate) async fn handle_inbox(
 
     let store = store.as_ref();
     let namespace = token.namespace().as_str();
-    wait_for_inbox_response(inbox_signal, deadline, || {
+    let mut response = wait_for_inbox_response(inbox_signal, deadline, || {
         query_inbox_response(
             store,
             namespace,
@@ -661,7 +661,13 @@ pub(crate) async fn handle_inbox(
             limit,
         )
     })
-    .await
+    .await?;
+    if raw_limit > 200 {
+        response["requested_limit"] = json!(raw_limit);
+        response["effective_limit"] = json!(limit);
+        response["limit_clamped"] = json!(true);
+    }
+    Ok(response)
 }
 
 async fn wait_for_inbox_response<Query, QueryFuture>(

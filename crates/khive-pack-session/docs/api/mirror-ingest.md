@@ -19,6 +19,17 @@ incrementally across multiple calls for large deltas. It is safe to call
 repeatedly on the same file; `INSERT OR IGNORE` keyed by the event UUID
 ensures idempotency.
 
+The background service reconciles each persisted offset with a file-identity witness before the
+EOF fast path. A different witness resets the offset to zero even when the replacement has exactly
+the old length; a length below the offset catches in-place truncation. `read_bounded_chunk` also
+restarts directly when a caller supplies an offset beyond current EOF. The cursor stores the
+identity observed for the consumed file alongside the successfully consumed offset, while
+platforms without a portable witness retain the strict length-decrease fallback.
+If the identity changes between the service's metadata probe and the ingest file-open, that pass is
+refused and retried after reconciliation. Deferred cursor-only advances carry the opened file's
+witness through the commit instead of re-statting the path, so replacement cannot pair an old
+offset with a new identity in either race window.
+
 No single line, complete or partial, is ever buffered past
 `MirrorLimits::max_line_bytes` (see `read_line_bounded` below): a complete
 line over that cap is skipped with a `tracing::warn!` naming the file and
@@ -215,7 +226,8 @@ entirely — this function must not, and does not, issue its own
 
 `upsert_cursor_on_writer` issues the one `session_mirror_cursor` upsert
 statement inside the already-open `atomic_unit` transaction — no transaction
-control of its own. `write_cursor_only` is the standalone path used when a
+control of its own. The statement persists `file_identity` with `byte_offset`, so an eventful pass
+cannot commit one without the other. `write_cursor_only` is the standalone path used when a
 pass consumed bytes but produced no parseable events (blank/unparseable/
 skipped-oversized lines): it still must persist the advanced offset so the
 next poll does not re-read the same bytes, and a failure here must propagate
@@ -235,6 +247,9 @@ test-only byte cap forcing multi-pass behavior instead of giant fixtures:
 - **multi-pass bounded reads**: a multi-line file is consumed across multiple
   bounded passes — each committing its own chunk and cursor advance — never
   reading the whole file at once.
+- **same-path truncation restarts at zero**: a shorter replacement presented with the prior EOF
+  offset is read from its new prefix, inserts its new event, and replaces the stored offset and
+  identity instead of returning a stale EOF cursor.
 - **oversized complete line**: a single complete line larger than
   `max_line_bytes` must never be fully buffered and parsed — it is rejected
   outright, the offset advances past it so ingestion does not wedge, and

@@ -462,7 +462,7 @@ identify the hit. It diverges from both `neighbors` and `list`'s row shapes abov
 
 ### `link` — Commissive
 
-Create a typed directed edge.
+Create or reuse a typed directed edge.
 
 | Param       | Type   | Required | Notes                                                                                                                                                                                                                                                                     |
 | ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -474,6 +474,15 @@ Create a typed directed edge.
 ```
 request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"extends\")")
 ```
+
+The singleton response is the persisted edge plus `created` and `reused` booleans. Exactly one is
+true: a new natural-key row reports `created: true`; an existing or soft-delete-revived row keeps
+its persisted id and reports `reused: true`. The disposition is derived from the atomic upsert and
+readback, not from a racy preflight lookup.
+
+Bulk `links=[...]` responses separate rows already present in storage from duplicates within the
+request: `created` and `reused` count persisted dispositions, while `skipped` counts request-local
+deduplication. `attempted` and `failed` retain their existing meanings.
 
 ### `neighbors` — Assertive
 
@@ -1323,7 +1332,7 @@ committed matching message and otherwise returns at the deadline.
 
 | Param                | Type    | Required | Notes                                                                     |
 | -------------------- | ------- | -------- | ------------------------------------------------------------------------- |
-| `limit`              | integer | no       | Default 20, max 200.                                                      |
+| `limit`              | integer | no       | Default 20; values above 200 clamp to 200 with disclosure metadata.       |
 | `box`                | string  | no       | `inbox` (default)\|`sent`. Sent rows are scoped to the caller.            |
 | `offset`             | integer | no       | Default 0; offset after every supplied filter.                            |
 | `status`             | string  | no       | Inbox-only: `unread` (default)\|`read`\|`all`.                            |
@@ -1356,6 +1365,10 @@ Responses also carry `offset`, `has_more`, and `next_offset`; repeat the same
 filtered call with each non-null `next_offset` to enumerate every match without
 marking it read. All filters are ANDed. Time bounds use response `created_at`,
 not optional transport `sent_at` metadata.
+
+When `limit` exceeds 200, the envelope additionally returns `requested_limit`,
+`effective_limit: 200`, and `limit_clamped: true`. At or below the cap these keys are omitted;
+`limit=0` remains the count-only response.
 
 `fields` accepts the ordinary top-level message keys plus stable property
 aliases (`comm_schema_version`, `from_actor`, `to_actor`, `thread_id`,
