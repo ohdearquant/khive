@@ -1,7 +1,7 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All nine public verbs (`send`, `delivered`, `inbox`, `unread`, `read`, `reply`,
-//! `thread`, `health`, `probe`) store or query comm state. Message-specific metadata lives
+//! All ten public verbs (`send`, `delivered`, `inbox`, `unread`, `read`, `mark_read`,
+//! `reply`, `thread`, `health`, `probe`) store or query comm state. Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
 use std::collections::{HashMap, HashSet};
@@ -21,7 +21,8 @@ use crate::message::{
 };
 use crate::params::{
     deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
-    IngestParams, ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
+    IngestParams, MarkReadParams, ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams,
+    UnreadParams,
 };
 
 fn add_embedding_truncation_warning(
@@ -924,60 +925,137 @@ pub(crate) async fn handle_read(
             mark_read_target(runtime, token, id, note).await
         }
         (None, Some(raw_ids)) => {
-            const MAX_BULK_READ_IDS: usize = 500;
-            if raw_ids.is_empty() {
-                return Err(RuntimeError::InvalidInput(
-                    "read: `ids` must contain at least one message id".into(),
-                ));
-            }
-            if raw_ids.len() > MAX_BULK_READ_IDS {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "read: `ids` accepts at most {MAX_BULK_READ_IDS} message ids, got {}",
-                    raw_ids.len()
-                )));
-            }
-
-            // Validate every target before the first mutation so malformed,
-            // outbound, or wrong-addressee input cannot produce a partial bulk read.
-            let requested_count = raw_ids.len();
-            let mut seen = HashSet::new();
-            let mut targets = Vec::with_capacity(requested_count);
-            for raw in raw_ids {
-                let (id, note) = validate_read_target(runtime, token, &raw).await?;
-                if seen.insert(id) {
-                    targets.push((id, note));
-                }
-            }
-
-            let mut results = Vec::with_capacity(targets.len());
-            for (id, note) in targets {
-                let original_properties = note.properties.clone();
-                match mark_read_target(runtime, token, id, note).await {
-                    Ok(result) => results.push(result),
-                    Err(error) => results.push(json!({
-                        "id": short_id(id),
-                        "full_id": id.as_hyphenated().to_string(),
-                        "read": false,
-                        "mark_error": error.to_string(),
-                        "properties": original_properties,
-                    })),
-                }
-            }
-            let marked_count = results
-                .iter()
-                .filter(|result| result["read"].as_bool() == Some(true))
-                .count();
-            let unique_count = results.len();
-            let failed_count = unique_count - marked_count;
-            Ok(json!({
-                "results": results,
-                "requested_count": requested_count,
-                "unique_count": unique_count,
-                "marked_count": marked_count,
-                "failed_count": failed_count,
-            }))
+            let (requested_count, targets) =
+                validate_bulk_read_targets(runtime, token, raw_ids, "read").await?;
+            mark_read_targets_best_effort(runtime, token, requested_count, targets).await
         }
     }
+}
+
+/// `mark_read` — canonical bulk mark-read surface with optional all-or-nothing mutation.
+pub(crate) async fn handle_mark_read(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: MarkReadParams = deser(params)?;
+    let (requested_count, targets) =
+        validate_bulk_read_targets(runtime, token, p.ids, "mark_read").await?;
+    if p.atomic {
+        mark_read_targets_atomic(runtime, token, requested_count, targets).await
+    } else {
+        mark_read_targets_best_effort(runtime, token, requested_count, targets).await
+    }
+}
+
+const MAX_BULK_READ_IDS: usize = 500;
+
+async fn validate_bulk_read_targets(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw_ids: Vec<String>,
+    verb: &str,
+) -> Result<(usize, Vec<(Uuid, Note)>), RuntimeError> {
+    if raw_ids.is_empty() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}: `ids` must contain at least one message id"
+        )));
+    }
+    if raw_ids.len() > MAX_BULK_READ_IDS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}: `ids` accepts at most {MAX_BULK_READ_IDS} message ids, got {}",
+            raw_ids.len()
+        )));
+    }
+
+    let requested_count = raw_ids.len();
+    let mut seen = HashSet::new();
+    let mut targets = Vec::with_capacity(requested_count);
+    for raw in raw_ids {
+        let (id, note) = validate_read_target(runtime, token, &raw).await?;
+        if seen.insert(id) {
+            targets.push((id, note));
+        }
+    }
+    Ok((requested_count, targets))
+}
+
+async fn mark_read_targets_best_effort(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    requested_count: usize,
+    targets: Vec<(Uuid, Note)>,
+) -> Result<Value, RuntimeError> {
+    let mut results = Vec::with_capacity(targets.len());
+    for (id, note) in targets {
+        let original_properties = note.properties.clone();
+        match mark_read_target(runtime, token, id, note).await {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(json!({
+                "id": short_id(id),
+                "full_id": id.as_hyphenated().to_string(),
+                "read": false,
+                "mark_error": error.to_string(),
+                "properties": original_properties,
+            })),
+        }
+    }
+    Ok(bulk_read_response(requested_count, results))
+}
+
+async fn mark_read_targets_atomic(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    requested_count: usize,
+    targets: Vec<(Uuid, Note)>,
+) -> Result<Value, RuntimeError> {
+    let store = runtime.notes(token)?;
+    let ids = targets.iter().map(|(id, _)| *id).collect();
+    store
+        .patch_note_property_atomic(
+            ids,
+            token.namespace().as_str(),
+            &read_recheck_filter(token.actor().id.as_str()),
+            "$.read",
+            json!(true),
+            Utc::now().timestamp_micros(),
+        )
+        .await?;
+
+    let mut results = Vec::with_capacity(targets.len());
+    for (id, note) in targets {
+        let properties = match store.get_note(id).await {
+            Ok(Some(fresh)) => fresh.properties.unwrap_or_else(|| json!({})),
+            _ => {
+                let mut fallback = note.properties.unwrap_or_else(|| json!({}));
+                fallback["read"] = json!(true);
+                fallback
+            }
+        };
+        results.push(json!({
+            "id": short_id(id),
+            "full_id": id.as_hyphenated().to_string(),
+            "read": true,
+            "properties": properties,
+        }));
+    }
+    Ok(bulk_read_response(requested_count, results))
+}
+
+fn bulk_read_response(requested_count: usize, results: Vec<Value>) -> Value {
+    let marked_count = results
+        .iter()
+        .filter(|result| result["read"].as_bool() == Some(true))
+        .count();
+    let unique_count = results.len();
+    let failed_count = unique_count - marked_count;
+    json!({
+        "results": results,
+        "requested_count": requested_count,
+        "unique_count": unique_count,
+        "marked_count": marked_count,
+        "failed_count": failed_count,
+    })
 }
 
 async fn validate_read_target(
@@ -1053,12 +1131,31 @@ async fn validate_read_target(
         tracing::warn!(
             id = %id,
             caller_actor = %caller_actor,
-            "comm.read: message has no `to_actor` (pre-ADR-057 legacy); allowing read \
+            "comm mark-read: message has no `to_actor` (pre-ADR-057 legacy); allowing read \
              without addressee verification (issue #87)"
         );
     }
 
     Ok((id, note))
+}
+
+fn read_recheck_filter(caller_actor: &str) -> NoteFilter {
+    NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrMissing,
+                value: SqlValue::Text(caller_actor.to_string()),
+            },
+        ],
+        ..Default::default()
+    }
 }
 
 async fn mark_read_target(
@@ -1087,22 +1184,7 @@ async fn mark_read_target(
     // the same `UPDATE` — the same eligibility predicate
     // `validate_read_target` already checked, re-evaluated at mutation time
     // rather than trusted from an earlier read.
-    let recheck_filter = NoteFilter {
-        kind: Some("message".to_string()),
-        property_filters: vec![
-            PropertyFilter {
-                json_path: "$.direction".to_string(),
-                op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
-                value: SqlValue::Null,
-            },
-            PropertyFilter {
-                json_path: "$.to_actor".to_string(),
-                op: FilterOp::EqOrMissing,
-                value: SqlValue::Text(caller_actor.to_string()),
-            },
-        ],
-        ..Default::default()
-    };
+    let recheck_filter = read_recheck_filter(caller_actor);
 
     // Best-effort: under multi-client writer contention the pool checkout can
     // time out. The read itself already succeeded above — failing the whole
@@ -1182,7 +1264,7 @@ fn read_response(
             tracing::warn!(
                 id = %full,
                 error = %e,
-                "comm.read: mark-read update failed under writer contention; \
+                "comm mark-read: update failed under writer contention; \
                  degrading to read:false (best-effort)"
             );
             json!({

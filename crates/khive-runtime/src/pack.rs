@@ -337,6 +337,24 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         args: &Value,
     ) -> Result<(), RuntimeError>;
 
+    /// Normalize a shared note update before storage is mutated.
+    ///
+    /// The default preserves the original property-validation contract. A
+    /// kind-owning pack overrides this when caller-facing note fields mirror
+    /// owned properties and must be changed together (for example, a task's
+    /// searchable `content` and `properties.description`).
+    async fn prepare_note_update(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        let properties = args.get("properties").filter(|value| !value.is_null());
+        self.validate_note_update(runtime, token, note, properties)
+            .await
+    }
+
     /// Validate a shared note-property update before storage is mutated.
     ///
     /// The default accepts the update. Kind-owning packs override this when a
@@ -2112,10 +2130,30 @@ impl VerbRegistry {
         None
     }
 
-    /// Run the owning kind's shared-note-update validator, if it declares one.
+    /// Run the owning kind's shared-note-update normalizer/validator, if it declares one.
     ///
     /// Both canonical KG dispatch and user-facing atomic preparation call this
     /// seam so pack-specific property invariants cannot drift between them.
+    pub async fn prepare_note_update_hook(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        if let Some(hook) = self.find_kind_hook(&note.kind) {
+            hook.prepare_note_update(runtime, token, note, args).await?;
+        }
+        Ok(())
+    }
+
+    /// Run the owning kind's shared-note-update property validator, if it
+    /// declares one.
+    ///
+    /// Kept as the validation-only compatibility seam for callers that do not
+    /// own a mutable request object. Canonical and atomic CRUD use
+    /// [`Self::prepare_note_update_hook`] so a hook can also normalize coupled
+    /// fields before its validation runs.
     pub async fn validate_note_update_hook(
         &self,
         runtime: &KhiveRuntime,

@@ -8,7 +8,8 @@ use thiserror::Error;
 
 use crate::capability::StorageCapability;
 
-/// What is known about one request when its single writer task terminates.
+/// What is known about one request when its single-writer execution seam
+/// terminates or is retired.
 ///
 /// The state is deliberately about the request, not about why the task
 /// stopped. Callers need this distinction to decide whether a write is known
@@ -117,9 +118,12 @@ pub enum StorageError {
     #[error("write queue full: timed out after {timeout_ms}ms waiting for writer task capacity")]
     WriteQueueFull { timeout_ms: u64 },
 
-    /// The pool's single writer task has terminated permanently. The state
-    /// identifies what is known about this request at that boundary. Retrying
-    /// on the same pool cannot recover the closed writer task.
+    /// A single-writer execution seam has terminated permanently. This is the
+    /// historical writer-task variant and display name; the fail-closed
+    /// pool-mutex fallback also uses it when transaction finalization becomes
+    /// terminal. The state identifies what is known about this request at
+    /// that boundary. Retrying on the same pool cannot recover the retired
+    /// writer seam.
     #[error("writer task terminated (request_state={request_state})")]
     WriterTaskTerminated {
         request_state: WriterTaskRequestState,

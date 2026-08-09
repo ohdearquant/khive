@@ -615,6 +615,14 @@ jobs:
       # widen once it has proven stable.
       - name: cargo check --workspace (Windows)
         run: cargo check --workspace
+      # #1335: the walpin sidecar's real Windows FFI paths (open/ACL/rename/
+      # delete/mtime touch) previously had no executable coverage — a
+      # refactor could compile and pass this job without ever running them.
+      # The substring filter selects any test whose full path contains `walpin`,
+      # including tests outside the `walpin` module; it is not the full suite.
+      # Keep this still-new lane fast; widen alongside the `cargo check` step above.
+      - name: khive-db walpin Windows FFI tests
+        run: cargo test -p khive-db --lib walpin
 
   coverage-ratchet:
     name: Coverage ratchet

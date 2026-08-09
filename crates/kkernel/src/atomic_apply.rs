@@ -6,11 +6,13 @@
 //! rejected pre-target-runtime rather than partially supported, and the gtd-adapter
 //! ownership split with `khive-pack-gtd`.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_pack_gtd::handlers::{ensure_audit_schema, write_audit_record};
+use khive_pack_gtd::handlers::{ensure_audit_schema, write_audit_record_with_status};
 use khive_pack_gtd::schema::{is_terminal, normalize_status};
 use khive_runtime::atomic_plan::{
     AffectedRowGuard, GtdCompletePlan, GtdTransitionPlan, PlanStatement, PostCommitEffect,
@@ -368,12 +370,13 @@ pub(crate) async fn execute_atomic_ops_file(
             // not the other way around — that function treats `GtdAudit` as
             // a no-op, see its match arm). `kkernel` already depends on both
             // crates, so it calls the SAME canonical `ensure_audit_schema`/
-            // `write_audit_record` functions the non-atomic `gtd.transition`/
+            // `write_audit_record_with_status` functions the non-atomic `gtd.transition`/
             // `gtd.complete` handlers call, rather than re-deriving the
-            // DDL/INSERT. Best-effort: errors are logged inside those
-            // functions and never propagated — a missing audit row must
-            // never fail an already-committed atomic unit.
-            apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
+            // DDL/INSERT. Best-effort: append errors are logged and returned
+            // as per-task booleans for result rendering — a missing audit row
+            // never fails an already-committed atomic unit, but is visible.
+            let gtd_audit_outcomes =
+                apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
             let embedding_outcomes =
                 khive_runtime::atomic_prepare::apply_post_commit_effects_with_report(
                     &runtime,
@@ -396,6 +399,7 @@ pub(crate) async fn execute_atomic_ops_file(
                     &op.args,
                     &resolved_args_list[idx],
                     &plans[idx],
+                    &gtd_audit_outcomes,
                 )
                 .await
                 .with_context(|| {
@@ -460,10 +464,15 @@ pub(crate) async fn execute_atomic_ops_file(
 }
 
 /// Applies every [`PostCommitEffect::GtdAudit`] via the canonical gtd audit
-/// functions (GAP-5, ADR-099 B3); best-effort, cannot fail. See
+/// functions (GAP-5, ADR-099 B3); best-effort, cannot fail. Returns each
+/// affected task's append outcome so response rendering can expose degradation. See
 /// `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`
 /// for why this lives in `kkernel` rather than `khive-runtime`.
-async fn apply_gtd_audit_post_commit_effects(runtime: &KhiveRuntime, effects: &[PostCommitEffect]) {
+async fn apply_gtd_audit_post_commit_effects(
+    runtime: &KhiveRuntime,
+    effects: &[PostCommitEffect],
+) -> HashMap<Uuid, bool> {
+    let mut outcomes = HashMap::new();
     for effect in effects {
         if let PostCommitEffect::GtdAudit {
             task_id,
@@ -474,7 +483,7 @@ async fn apply_gtd_audit_post_commit_effects(runtime: &KhiveRuntime, effects: &[
         } = effect
         {
             ensure_audit_schema(runtime).await;
-            write_audit_record(
+            let persisted = write_audit_record_with_status(
                 runtime,
                 *task_id,
                 from_status,
@@ -483,8 +492,10 @@ async fn apply_gtd_audit_post_commit_effects(runtime: &KhiveRuntime, effects: &[
                 namespace,
             )
             .await;
+            outcomes.insert(*task_id, persisted);
         }
     }
+    outcomes
 }
 
 fn describe_failure(failure: &AtomicOpFailure) -> String {
@@ -555,32 +566,59 @@ async fn prepare_one(
             Ok((plan, args.clone()))
         }
         "update" => {
-            let resolved = resolve_kg_ids_in_args(runtime, token, tool, args).await?;
+            let mut resolved = resolve_kg_ids_in_args(runtime, token, tool, args).await?;
             let expected_kind = update_expected_kind(&resolved, registry)?;
-            let plan = khive_runtime::atomic_prepare::prepare_update(
-                runtime,
-                token,
-                &resolved,
-                expected_kind,
-            )
-            .await
-            .map_err(anyhow::Error::new)?;
+            if resolved
+                .get("entity_kind")
+                .is_some_and(|value| !value.is_null())
+            {
+                anyhow::bail!(
+                    "entity_kind is immutable; to change kind, delete then re-create the entity, \
+                     or use merge() if this is a deduplication correction"
+                );
+            }
             let id = resolved
                 .get("id")
                 .and_then(Value::as_str)
                 .and_then(|raw| Uuid::parse_str(raw).ok())
                 .ok_or_else(|| anyhow::anyhow!("resolved update id must be a full UUID"))?;
-            if let Some(Resolved::Note(note)) = runtime
+            let resolved_target = runtime
                 .resolve_by_id(token, id)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-            {
-                let properties = resolved.get("properties").filter(|value| !value.is_null());
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let plan = if let Some(Resolved::Note(note)) = resolved_target {
+                // Canonical KG dispatch checks an explicit kind mismatch
+                // before invoking a pack hook. Preserve that error ordering:
+                // a request aimed at the wrong kind must not be normalized as
+                // though it targeted this task.
+                khive_runtime::atomic_prepare::validate_note_update_expected_kind(
+                    &note,
+                    &expected_kind,
+                )
+                .map_err(anyhow::Error::new)?;
                 registry
-                    .validate_note_update_hook(runtime, token, &note, properties)
+                    .prepare_note_update_hook(runtime, token, &note, &mut resolved)
                     .await
                     .map_err(anyhow::Error::new)?;
-            }
+                khive_runtime::atomic_prepare::prepare_update_from_note_snapshot(
+                    runtime,
+                    token,
+                    &resolved,
+                    expected_kind,
+                    note,
+                )
+                .await
+                .map_err(anyhow::Error::new)?
+            } else {
+                khive_runtime::atomic_prepare::prepare_update(
+                    runtime,
+                    token,
+                    &resolved,
+                    expected_kind,
+                )
+                .await
+                .map_err(anyhow::Error::new)?
+            };
             Ok((plan, resolved))
         }
         "link" => {
@@ -807,6 +845,7 @@ async fn build_op_result(
     original_args: &Value,
     resolved_args: &Value,
     plan: &AtomicOpPlan,
+    gtd_audit_outcomes: &HashMap<Uuid, bool>,
 ) -> anyhow::Result<Value> {
     match (tool, plan) {
         // Canonical shape: `normalize_entity_timestamps(to_json(&updated))`
@@ -954,9 +993,9 @@ async fn build_op_result(
             Ok(raw)
         }
         // Canonical shapes: handlers.rs:1030-1037 (idempotent no-op) /
-        // :1107-1118 (transitioned). `p.statements.is_empty()` is exactly
-        // the idempotent-no-op signal `prepare_gtd_transition` encodes
-        // (current == target after `normalize_status`, GAP-6).
+        // :1107-1118 (transitioned). The plan carries an explicit no-op bit:
+        // same-status plans now contain a guarded snapshot assertion rather
+        // than an empty statement list.
         ("gtd.transition", AtomicOpPlan::GtdTransition(p)) => {
             let note = runtime
                 .notes(token)?
@@ -966,7 +1005,7 @@ async fn build_op_result(
                     anyhow::anyhow!("atomic gtd.transition result: task not found post-commit")
                 })?;
             let task = khive_pack_gtd::handlers::render_task(&note);
-            if p.statements().is_empty() {
+            if p.is_idempotent_noop() {
                 let raw_status = original_args
                     .as_object()
                     .and_then(|o| o.get("status"))
@@ -988,6 +1027,13 @@ async fn build_op_result(
                     gtd_audit_from_to(p.post_commit()).ok_or_else(|| {
                         anyhow::anyhow!("atomic gtd.transition result: missing audit effect")
                     })?;
+                let audit_persisted =
+                    gtd_audit_outcomes
+                        .get(&p.task_id())
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("atomic gtd.transition result: missing audit outcome")
+                        })?;
                 Ok(json!({
                     "transitioned": true,
                     "id": task["id"],
@@ -999,6 +1045,7 @@ async fn build_op_result(
                     "priority": task["priority"],
                     "assignee": task["assignee"],
                     "due": task["due"],
+                    "audit_persisted": audit_persisted,
                 }))
             }
         }
@@ -1015,6 +1062,13 @@ async fn build_op_result(
             let (from_status, to_status) = gtd_audit_from_to(p.post_commit()).ok_or_else(|| {
                 anyhow::anyhow!("atomic gtd.complete result: missing audit effect")
             })?;
+            let audit_persisted =
+                gtd_audit_outcomes
+                    .get(&p.task_id())
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("atomic gtd.complete result: missing audit outcome")
+                    })?;
             let completed_at = note
                 .properties
                 .as_ref()
@@ -1032,6 +1086,7 @@ async fn build_op_result(
                 "to": to_status,
                 "completed_at": completed_at,
                 "is_terminal": is_terminal(&to_status),
+                "audit_persisted": audit_persisted,
             }))
         }
         (other, _) => anyhow::bail!(
@@ -1058,8 +1113,8 @@ fn require_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
 /// `khive_pack_gtd::handlers::prepare_transition` — the ONE place the
 /// normalize/validate/secret-gate/load/idempotent-check/lifecycle-guard
 /// decision logic lives. This function's only job is turning that decision
-/// into an `AtomicOpPlan`: the idempotent no-op case produces an empty
-/// statement list, and the write case turns the decided patch into a
+/// into an `AtomicOpPlan`: the idempotent no-op case produces a guarded
+/// mutation-free assertion, and the write case turns the decided patch into a
 /// `PlanStatement` via `khive_pack_gtd::handlers::gtd_transition_statement`
 /// — the same DML builder canonical's `atomic_gtd_transition` calls.
 async fn prepare_gtd_transition(
@@ -1080,10 +1135,16 @@ async fn prepare_gtd_transition(
             .map_err(anyhow::Error::new)?;
 
     match decision {
-        khive_pack_gtd::handlers::TransitionDecision::NoOp { note, .. } => {
+        khive_pack_gtd::handlers::TransitionDecision::NoOp { note, current, .. } => {
+            let statement = khive_pack_gtd::handlers::gtd_noop_assertion_statement(&note, &current)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan::new(
                 note.id,
-                vec![],
+                vec![PlanStatement {
+                    statement,
+                    guard: Some(AffectedRowGuard::exactly(1)),
+                }],
+                true,
                 PostCommitEffect::None,
             )))
         }
@@ -1096,7 +1157,7 @@ async fn prepare_gtd_transition(
             transition_note,
         } => {
             let statement = khive_pack_gtd::handlers::gtd_transition_statement(
-                note.id, &current, &target, &props, updated_at,
+                &note, &current, &target, &props, updated_at,
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -1106,6 +1167,7 @@ async fn prepare_gtd_transition(
                     statement,
                     guard: Some(AffectedRowGuard::exactly(1)),
                 }],
+                false,
                 PostCommitEffect::GtdAudit {
                     task_id: note.id,
                     from_status: current,
@@ -1143,7 +1205,7 @@ async fn prepare_gtd_complete(
             .map_err(anyhow::Error::new)?;
 
     let statement = khive_pack_gtd::handlers::gtd_transition_statement(
-        decision.note.id,
+        &decision.note,
         &decision.current,
         decision.target,
         &decision.props,
@@ -1359,6 +1421,619 @@ mod tests {
             .expect("task must carry properties")
     }
 
+    fn full_registry(runtime: &KhiveRuntime) -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        let pack_names: Vec<String> = PackRegistry::discovered_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        PackRegistry::register_packs(&pack_names, runtime.clone(), &mut builder)
+            .expect("register packs");
+        builder.build().expect("registry")
+    }
+
+    async fn assert_task_update_then_lifecycle_rolls_back(lifecycle_tool: &str) {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+
+        let (update, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({"id": task_id.to_string(), "content": "new mirrored body"}),
+        )
+        .await
+        .expect("prepare generic task update");
+        let lifecycle_args = match lifecycle_tool {
+            "gtd.transition" => json!({"id": task_id.to_string(), "status": "next"}),
+            "gtd.complete" => json!({"id": task_id.to_string(), "result": "shipped"}),
+            other => panic!("unexpected lifecycle tool {other}"),
+        };
+        let (lifecycle, _) =
+            prepare_one(&runtime, &token, &registry, lifecycle_tool, &lifecycle_args)
+                .await
+                .unwrap_or_else(|error| panic!("prepare {lifecycle_tool}: {error}"));
+
+        // Both plans were decided from the same pre-unit task snapshot. The
+        // generic update runs first and advances its revision; the lifecycle
+        // plan must then fail its exact-snapshot guard. The atomic runner must
+        // roll the first write back instead of committing stale lifecycle
+        // properties over its newly mirrored description.
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![update, lifecycle],
+        )
+        .await
+        .expect("atomic runner");
+        assert!(
+            matches!(
+                &outcome,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 1,
+                    failure: AtomicOpFailure::GuardFailed { observed: 0, .. },
+                }
+            ),
+            "update -> {lifecycle_tool} must fail closed and roll back; got: {outcome:?}"
+        );
+
+        let persisted = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(persisted.updated_at, before.updated_at);
+        assert_eq!(persisted.content, "atomic-gtd-test-task");
+        assert_eq!(
+            task_properties(&persisted)
+                .get("status")
+                .and_then(Value::as_str),
+            Some("inbox")
+        );
+        assert!(task_properties(&persisted).get("description").is_none());
+    }
+
+    #[tokio::test]
+    async fn atomic_generic_task_update_synchronizes_content_and_description() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+
+        let (plan, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({"id": task_id.to_string(), "content": "atomic body"}),
+        )
+        .await
+        .expect("prepare atomic task content update");
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit content update");
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+
+        let after_content = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(after_content.content, "atomic body");
+        assert_eq!(
+            task_properties(&after_content)
+                .get("description")
+                .and_then(Value::as_str),
+            Some("atomic body")
+        );
+
+        let (plan, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "properties": {"description": "atomic property body"},
+            }),
+        )
+        .await
+        .expect("prepare atomic task description update");
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit description update");
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+
+        let after_description = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(after_description.content, "atomic property body");
+        assert_eq!(
+            task_properties(&after_description)
+                .get("description")
+                .and_then(Value::as_str),
+            Some("atomic property body")
+        );
+
+        let (plan, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({"id": task_id.to_string(), "content": null, "properties": null}),
+        )
+        .await
+        .expect("prepare atomic null/no-op patch");
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit null/no-op patch");
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+        let after_null = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(after_null.content, "atomic property body");
+        assert_eq!(
+            task_properties(&after_null)
+                .get("description")
+                .and_then(Value::as_str),
+            Some("atomic property body")
+        );
+
+        let (plan, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "properties": {"description": null},
+            }),
+        )
+        .await
+        .expect("prepare atomic description clear");
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit description clear");
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+        let after_clear = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(after_clear.content, "atomic-gtd-test-task");
+        assert!(task_properties(&after_clear)
+            .get("description")
+            .is_some_and(Value::is_null));
+    }
+
+    #[tokio::test]
+    async fn atomic_task_update_rejects_title_clear_before_description_clear_can_write() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task before rejected update")
+            .expect("task exists");
+
+        let err = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "name": null,
+                "properties": {"description": null},
+            }),
+        )
+        .await
+        .expect_err("a task title cannot be cleared under --atomic");
+        assert!(
+            err.to_string().contains("task title cannot be cleared"),
+            "title-clear error must identify the task invariant; got: {err}"
+        );
+
+        let after = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task after rejected update")
+            .expect("task exists");
+        assert_eq!(after, before, "rejected preparation must not write");
+    }
+
+    #[tokio::test]
+    async fn atomic_task_update_rejects_lifecycle_properties_during_prepare() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task before rejected update")
+            .expect("task exists");
+
+        let err = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "properties": {"status": "done"},
+            }),
+        )
+        .await
+        .expect_err("atomic prepare must share lifecycle-owned property rejection");
+        assert_eq!(
+            err.to_string(),
+            "invalid input: properties.status is lifecycle-owned and cannot be patched on a task; use gtd.transition for lifecycle changes or gtd.complete for terminal completion"
+        );
+        let after = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task after rejected update")
+            .expect("task exists");
+        assert_eq!(after, before, "rejected atomic prepare must not write");
+    }
+
+    #[tokio::test]
+    async fn atomic_task_update_checks_explicit_kind_before_running_task_hook() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+
+        // The mirror fields deliberately conflict. If the task hook ran
+        // before the explicit-kind check, its "must match" error would mask
+        // canonical dispatch's expected NotFound result.
+        let err = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "kind": "observation",
+                "content": "one body",
+                "properties": {"description": "another body"},
+            }),
+        )
+        .await
+        .expect_err("wrong explicit note kind must fail before task normalization");
+        let message = err.to_string();
+        assert!(message.contains("not found: note"), "got: {message}");
+        assert!(
+            !message.contains("must match"),
+            "task hook must not run before kind mismatch rejection: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_task_update_guard_refuses_snapshot_changed_after_prepare() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let (plan, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({"id": task_id.to_string(), "content": "prepared body"}),
+        )
+        .await
+        .expect("prepare task update");
+
+        let mut concurrent = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        concurrent.content = "concurrent body".to_string();
+        concurrent.properties =
+            Some(json!({"status": "inbox", "priority": "p2", "description": "concurrent body"}));
+        concurrent.updated_at = concurrent.updated_at.saturating_add(10);
+        runtime
+            .notes(&token)
+            .expect("note store")
+            .upsert_note(concurrent)
+            .await
+            .expect("concurrent write");
+
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("atomic runner");
+        assert!(
+            matches!(
+                &outcome,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 0,
+                    failure: AtomicOpFailure::GuardFailed { observed: 0, .. },
+                }
+            ),
+            "stale prepared update must roll back; got: {outcome:?}"
+        );
+        let persisted = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(persisted.content, "concurrent body");
+        assert_eq!(
+            task_properties(&persisted)
+                .get("description")
+                .and_then(Value::as_str),
+            Some("concurrent body")
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_atomic_task_updates_fail_closed_without_projected_state() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let (first, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({"id": task_id.to_string(), "content": "first body"}),
+        )
+        .await
+        .expect("prepare first update");
+        let (second, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "properties": {"description": "second body"},
+            }),
+        )
+        .await
+        .expect("prepare second update");
+
+        // Both plans intentionally share the same pre-unit snapshot. The
+        // first advances its revision; the second must then trip its guard,
+        // rolling the whole unit back instead of overwriting the first write
+        // with an independently prepared full-row image.
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![first, second],
+        )
+        .await
+        .expect("atomic runner");
+        assert!(
+            matches!(
+                &outcome,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 1,
+                    failure: AtomicOpFailure::GuardFailed { observed: 0, .. },
+                }
+            ),
+            "repeated target must fail closed; got: {outcome:?}"
+        );
+        let persisted = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(persisted.content, "atomic-gtd-test-task");
+        assert!(task_properties(&persisted).get("description").is_none());
+    }
+
+    #[tokio::test]
+    async fn atomic_generic_update_then_transition_rolls_back_on_shared_snapshot() {
+        assert_task_update_then_lifecycle_rolls_back("gtd.transition").await;
+    }
+
+    #[tokio::test]
+    async fn atomic_generic_update_then_complete_rolls_back_on_shared_snapshot() {
+        assert_task_update_then_lifecycle_rolls_back("gtd.complete").await;
+    }
+
+    /// Every op is prepared from the pre-unit snapshot. A same-status
+    /// transition prepared second must therefore revalidate that snapshot
+    /// after an earlier real transition on the same task, not silently
+    /// commit without checking its now-stale hypothesis.
+    #[tokio::test]
+    async fn atomic_transition_then_stale_noop_rolls_back_whole_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+
+        let (transition, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "gtd.transition",
+            &json!({"id": task_id.to_string(), "status": "next"}),
+        )
+        .await
+        .expect("prepare real transition");
+        let (stale_noop, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "gtd.transition",
+            &json!({"id": task_id.to_string(), "status": "inbox"}),
+        )
+        .await
+        .expect("prepare same-status transition from the original snapshot");
+
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![transition, stale_noop],
+        )
+        .await
+        .expect("atomic runner");
+        assert!(
+            matches!(
+                &outcome,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 1,
+                    failure: AtomicOpFailure::GuardFailed {
+                        statement_label: Some(label),
+                        observed: 0,
+                        ..
+                    },
+                } if label == "gtd_atomic_noop_assertion"
+            ),
+            "the stale no-op assertion must fail at op 1; got: {outcome:?}"
+        );
+
+        let persisted = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists after rollback");
+        assert_eq!(persisted.updated_at, before.updated_at);
+        assert_eq!(task_properties(&persisted)["status"], "inbox");
+    }
+
+    /// A deletion earlier in the unit must likewise invalidate a no-op that
+    /// was prepared while the task still existed. The no-op's assertion is
+    /// what forces the delete to roll back as part of the whole unit.
+    #[tokio::test]
+    async fn atomic_delete_then_stale_noop_rolls_back_whole_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+
+        let (delete, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "delete",
+            &json!({"id": task_id.to_string(), "hard": true}),
+        )
+        .await
+        .expect("prepare hard delete");
+        let (stale_noop, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "gtd.transition",
+            &json!({"id": task_id.to_string(), "status": "inbox"}),
+        )
+        .await
+        .expect("prepare same-status transition before delete applies");
+
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![delete, stale_noop],
+        )
+        .await
+        .expect("atomic runner");
+        assert!(
+            matches!(
+                &outcome,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 1,
+                    failure: AtomicOpFailure::GuardFailed {
+                        statement_label: Some(label),
+                        observed: 0,
+                        ..
+                    },
+                } if label == "gtd_atomic_noop_assertion"
+            ),
+            "the delete must invalidate the no-op assertion at op 1; got: {outcome:?}"
+        );
+
+        let persisted = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("hard delete must roll back with the unit");
+        assert_eq!(persisted, before);
+    }
+
     /// ADR-099 B3: atomic `gtd.transition`
     /// must persist a caller-supplied `note` as `properties.transition_note`
     /// — parity with `khive-pack-gtd::handlers::handle_transition`
@@ -1460,7 +2135,9 @@ mod tests {
             .expect("authorize");
 
         // (a) secret in `result` rejected before any write.
-        let task_id = seed_task(&runtime, &token, "next").await;
+        // Use the default inbox state to preserve direct-complete parity with
+        // the accepted lifecycle table (inbox -> done is legal).
+        let task_id = seed_task(&runtime, &token, "inbox").await;
         let err = prepare_gtd_complete(
             &runtime,
             &token,
@@ -1486,7 +2163,7 @@ mod tests {
             task_properties(&note)
                 .get("status")
                 .and_then(|v| v.as_str()),
-            Some("next"),
+            Some("inbox"),
             "rejected prepare must not have mutated the task"
         );
 
@@ -1564,14 +2241,16 @@ mod tests {
         );
     }
 
-    /// GAP-6 (ADR-099 B3): an idempotent `gtd.transition` (current ==
-    /// target after `normalize_status`) must perform NO write — parity with
-    /// `handle_transition`'s early return (handlers.rs:995-1005). The
+    /// GAP-6 (ADR-099 B3): an idempotent atomic `gtd.transition` (current ==
+    /// target after `normalize_status`) must perform no persisted mutation.
+    /// Its guarded no-effect statement only revalidates the snapshot. This
+    /// matches canonical when no note was supplied; canonical note-bearing
+    /// no-ops have a separate note-event contract outside atomic v1. The
     /// pre-fix atomic prepare only special-cased `current != target` inside
     /// its `can_transition` guard, so a current==target call fell through
     /// to an unconditional `UPDATE` that bumped `updated_at` for nothing.
     #[tokio::test]
-    async fn atomic_gtd_transition_idempotent_noop_performs_no_write() {
+    async fn atomic_gtd_transition_idempotent_noop_performs_no_mutation() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -1594,6 +2273,11 @@ mod tests {
         )
         .await
         .expect("prepare idempotent transition must succeed (no-op, not an error)");
+        let AtomicOpPlan::GtdTransition(noop_plan) = &plan else {
+            panic!("expected gtd transition plan")
+        };
+        assert!(noop_plan.is_idempotent_noop());
+        assert_eq!(noop_plan.statements().len(), 1);
 
         let outcome =
             khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
@@ -1606,7 +2290,7 @@ mod tests {
         assert!(
             post_commit.as_slice().is_empty(),
             "an idempotent no-op transition must produce no post-commit effect (no audit row \
-             either — canonical never reaches its own write_audit_record call): {post_commit:?}"
+             either — canonical no-note no-ops never reach their own audit helper): {post_commit:?}"
         );
 
         let after = runtime
@@ -1618,15 +2302,76 @@ mod tests {
             .expect("task must still exist");
         assert_eq!(
             after.updated_at, updated_at_before,
-            "an idempotent transition must not touch updated_at — no write happened"
+            "an idempotent transition must not change updated_at"
         );
+    }
+
+    #[tokio::test]
+    async fn atomic_same_status_transition_with_note_remains_mutation_and_audit_free() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "next").await;
+        let before = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        let args = json!({
+            "id": task_id.to_string(),
+            "status": "next",
+            "note": "canonical-only note event",
+        });
+        let plan = prepare_gtd_transition(&runtime, &token, &args)
+            .await
+            .expect("prepare atomic same-status no-op");
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![plan.clone()],
+        )
+        .await
+        .expect("commit guarded no-op assertion");
+        let post_commit = match outcome {
+            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected committed no-op, got {other:?}"),
+        };
+        assert!(post_commit.as_slice().is_empty());
+
+        let audit_outcomes = HashMap::new();
+        let result = build_op_result(
+            &runtime,
+            &token,
+            "gtd.transition",
+            &args,
+            &args,
+            &plan,
+            &audit_outcomes,
+        )
+        .await
+        .expect("render no-op result");
+        assert_eq!(result["transitioned"], false);
+        assert!(result.get("note_recorded").is_none());
+        assert!(result.get("audit_persisted").is_none());
+
+        let after = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(after.updated_at, before.updated_at);
+        assert!(task_properties(&after).get("transition_note").is_none());
     }
 
     /// GAP-5 (ADR-099 B3): a committed atomic `gtd.transition` AND a
     /// committed atomic `gtd.complete` must each write a
     /// `gtd_lifecycle_audit` row — parity with `handle_transition`/
     /// `handle_complete`'s best-effort `ensure_audit_schema` +
-    /// `write_audit_record` calls (handlers.rs:1062-1071, :873-883). The
+    /// `write_audit_record_with_status` calls. The
     /// pre-fix atomic prepare wrote no audit row at all.
     #[tokio::test]
     async fn atomic_gtd_transition_and_complete_write_lifecycle_audit_rows() {
@@ -1652,7 +2397,9 @@ mod tests {
             AtomicRunOutcome::Committed { post_commit } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
-        apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
+        let transition_audit =
+            apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
+        assert_eq!(transition_audit.get(&transition_task), Some(&true));
 
         // (b) complete next -> done.
         let complete_task = seed_task(&runtime, &token, "next").await;
@@ -1671,7 +2418,9 @@ mod tests {
             AtomicRunOutcome::Committed { post_commit } => post_commit,
             other => panic!("expected Committed, got {other:?}"),
         };
-        apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
+        let complete_audit =
+            apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
+        assert_eq!(complete_audit.get(&complete_task), Some(&true));
 
         let mut reader = runtime.sql().reader().await.expect("reader");
         let rows = reader
@@ -1714,5 +2463,59 @@ mod tests {
             complete_row_present,
             "expected an audit row for the complete op: {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn atomic_complete_result_reports_failed_audit_append() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        ensure_audit_schema(&runtime).await;
+        {
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            writer
+                .execute_script(
+                    "CREATE TRIGGER reject_atomic_gtd_audit_insert \
+                     BEFORE INSERT ON gtd_lifecycle_audit \
+                     BEGIN SELECT RAISE(FAIL, 'forced atomic audit failure'); END;"
+                        .to_string(),
+                )
+                .await
+                .expect("failure-injection trigger");
+        }
+
+        let task_id = seed_task(&runtime, &token, "next").await;
+        let args = json!({"id": task_id.to_string(), "result": "shipped"});
+        let plan = prepare_gtd_complete(&runtime, &token, &args)
+            .await
+            .expect("prepare complete");
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![plan.clone()],
+        )
+        .await
+        .expect("commit domain write");
+        let post_commit = match outcome {
+            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected committed completion, got {other:?}"),
+        };
+        let audit_outcomes =
+            apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
+        assert_eq!(audit_outcomes.get(&task_id), Some(&false));
+
+        let result = build_op_result(
+            &runtime,
+            &token,
+            "gtd.complete",
+            &args,
+            &args,
+            &plan,
+            &audit_outcomes,
+        )
+        .await
+        .expect("render committed completion");
+        assert_eq!(result["completed"], true);
+        assert_eq!(result["audit_persisted"], false);
     }
 }

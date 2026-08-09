@@ -8,8 +8,13 @@ functions that build those plans.
 
 Pack-owned mutation invariants are adapted at the `kkernel` boundary, where both
 the `VerbRegistry` and this runtime plan vocabulary are visible. For task note
-updates and task dependency links, `kkernel` invokes the same `KindHook` validators
-as canonical KG dispatch after building the substrate plan. Core migration V15's
+updates and task dependency links, `kkernel` invokes the same `KindHook` update
+normalizer/validators as canonical KG dispatch before building the substrate plan.
+For a note update, the hook and plan consume one shared note snapshot; the generated
+statement compares that snapshot's `updated_at` and deletion marker at apply time.
+Concurrent changes and repeated same-target note updates prepared without projected
+state therefore fail their affected-row guard and roll back the unit.
+Core migration V15's
 transaction-time triggers remain the final backstop: they see earlier statements
 in the same atomic unit and close concurrent check/write races that an async prepare
 pass cannot.

@@ -205,6 +205,19 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         args: &Value,
     ) -> Result<(), RuntimeError>;
 
+    /// Normalize a generic note update before the write. The default delegates
+    /// to `validate_note_update` with the request's property patch.
+    async fn prepare_note_update(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &Note,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        let properties = args.get("properties").filter(|value| !value.is_null());
+        self.validate_note_update(runtime, token, note, properties).await
+    }
+
     /// Validate a generic note-property update before the write. Default: accept.
     async fn validate_note_update(
         &self,
@@ -232,10 +245,22 @@ The 2026-08-01 dependency-integrity amendment adds the two default-accepting
 pre-write validators after GTD demonstrated a cross-record invariant that generic
 CRUD cannot own: task dependency acyclicity. `validate_note_update` receives only
 note-property patches, while `validate_links` receives the whole proposed batch so a
-cycle formed entirely inside one atomic link request cannot evade validation. Packs
-that do not need either hook inherit a no-op and remain source-compatible. Future
-hooks (`after_update`, `before_delete`) can extend the same pattern when a concrete
-consumer requires them.
+cycle formed entirely inside one atomic link request cannot evade validation.
+
+The 2026-08-06 task-mirror amendment adds `prepare_note_update`. Its default delegates
+to `validate_note_update`, so existing hooks retain their behavior. An owning pack may
+override it to normalize coupled caller fields before the shared CRUD patch is built.
+GTD uses this seam to keep a task note's searchable `content` synchronized with
+`properties.description`; both canonical dispatch and atomic preparation invoke the
+same hook before constructing their write. The note snapshot supplied to the hook is
+also the snapshot patched and persisted: canonical writes use a compare-and-swap
+replacement, and atomic plans carry the same revision/deletion predicate into their
+affected-row guard. A concurrent change therefore refuses or rolls back the write
+instead of storing normalization derived from stale state. The registry retains the
+validation-only `validate_note_update_hook` compatibility seam for callers without a
+mutable request. Packs that need neither behavior inherit a no-op. Future hooks
+(`after_update`, `before_delete`) can extend the same pattern when a concrete consumer
+requires them.
 
 ### `VerbRegistry`: the runtime's pack catalog
 
@@ -864,7 +889,7 @@ dedicated ADR. v1 is compile-time.
 
 - The kg pack's name carries weight beyond its origins (it owns shared CRUD for all
   kinds). Renaming is not justified.
-- `KindHook` covers create specialization plus default-accepting note-update and
+- `KindHook` covers create specialization, note-update normalization/validation, and
   link-batch validation. Post-update and delete hooks extend the pattern when a real
   consumer asks.
 - Pack auxiliary schema is non-evolving in v1. If a pack needs to evolve its schema, it

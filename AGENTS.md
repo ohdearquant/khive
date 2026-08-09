@@ -120,10 +120,16 @@ Full `gtd.transition` allowed transitions:
 `done` and `cancelled` are terminal.
 
 `gtd.transition` returns one of two shapes. On a real transition: `{transitioned: true, id, full_id,
-from, to, is_terminal, title, priority, assignee, due}` — `is_terminal: true` when the task reaches
-`done` or `cancelled`. On an idempotent no-op (the task is already in the requested status): `{transitioned:
-false, id, full_id, from, to, note: "already in target status"}` — the task fields (`title`, `priority`,
-`assignee`, `due`, `is_terminal`) are omitted. Branch on `transitioned` before reading those fields.
+from, to, is_terminal, title, priority, assignee, due, audit_persisted}` — `is_terminal: true` when
+the task reaches `done` or `cancelled`; `audit_persisted: false` means the state change committed but
+its best-effort lifecycle-audit append failed. On an idempotent no-op (the task is already in the
+requested status): `{transitioned: false, id, full_id, from, to, note: "already in target status"}` —
+the task fields (`title`, `priority`, `assignee`, `due`, `is_terminal`) are omitted. Canonical
+dispatch with a caller-supplied transition note additionally returns `note_recorded` and, when that
+note write wins its guard, `audit_persisted`; atomic v1 treats every same-status transition as a
+mutation-free guarded assertion and does not persist that note. The assertion revalidates the exact
+prepare snapshot so an earlier op in the same atomic unit cannot make the no-op stale. Branch on
+`transitioned` before reading those fields.
 
 ### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
@@ -172,7 +178,7 @@ it does not train the default/live namespace's posterior state.
 Omitting `signal` is an abstention and emits no feedback event. When `signal` is present, `target_id`
 must exactly match one `results[].id`; rank position never supplies a judgment.
 
-### Comm pack — 9 verbs (`comm.` prefix)
+### Comm pack — 10 verbs (`comm.` prefix)
 
 | Verb             | What it does                                                                                                            | When to use                                                 |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
@@ -181,6 +187,7 @@ must exactly match one `results[].id`; rank position never supplies a judgment.
 | `comm.inbox`     | Page/filter inbound or caller-authored sent messages; `wait_ms?` enables a bounded long poll; optionally project fields | Triage inbox, wait for what's next, or inspect sent history |
 | `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                                       | Cheap unread check without listing                          |
 | `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`)                  | Acknowledge receipt (recipient action)                      |
+| `comm.mark_read` | Named bulk mark-read; optional `atomic=true` makes the cross-message mutation all-or-nothing                            | Clear a supplied inbox set without naming ambiguity         |
 | `comm.reply`     | Reply to a message (threading linkage)                                                                                  | Respond in-thread                                           |
 | `comm.thread`    | Retrieve full conversation thread                                                                                       | Read the whole conversation                                 |
 | `comm.health`    | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                                       | Check daemon channel-poll state                             |
@@ -210,12 +217,15 @@ re-run the same actor/status/sender/time/text-filtered query with the same offse
 and the paginated response shape is unchanged. Omit it (or pass `0`) for the
 snapshot behavior.
 
-**`comm.read` is inbound-only.** It marks a received message as read; calling it on an outbound
+**Mark-read is inbound-only.** `comm.read` is the compatibility surface; it marks a received message
+as read and does not retrieve content. Calling it on an outbound
 (sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be
 marked as read`. To confirm a sent message was received, read it from the recipient's `comm.inbox`
 or `comm.thread`. Pass exactly one of `id` or `ids`; the latter accepts 1-500 IDs and returns
 per-item `read`/`mark_error` outcomes plus marked/failed counts. Bulk updates are not atomic across
-messages. If a send/reply returns an `ambiguous` error containing a full `outbound_id`, pass that
+messages. Prefer `comm.mark_read(ids=[...])` for the unambiguous bulk name; it preserves that
+best-effort default, while `atomic=true` validates every target and commits every unique mark in one
+transaction or none. If a send/reply returns an `ambiguous` error containing a full `outbound_id`, pass that
 UUID to `comm.delivered` before retrying. This checks the atomic pair's internal inbound sibling; it
 does not claim later SMTP delivery and cannot help when the whole MCP response is lost before the
 caller receives the server-generated UUID.

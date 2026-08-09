@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  12 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  git, code, workspace, blob — together exposing               │
-│  90 public verbs (see the verb-catalog paragraph below        │
+│  91 public verbs (see the verb-catalog paragraph below        │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039, forward-deployed,  │
@@ -113,7 +113,7 @@ not shipped.
 | `crates/khive-pack-gtd`         | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                                                                                                                                                                      |
 | `crates/khive-pack-memory`      | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))                                                                                                                                             |
 | `crates/khive-pack-brain`       | Brain pack: profile management registry, Bayesian routing/feedback verbs                                                                                                                                                                                          |
-| `crates/khive-pack-comm`        | Comm pack: threaded messaging, inbox/delivery/cursor verbs (nine public `comm.*` verbs)                                                                                                                                                                           |
+| `crates/khive-pack-comm`        | Comm pack: threaded messaging, inbox/delivery/cursor verbs (ten public `comm.*` verbs)                                                                                                                                                                            |
 | `crates/khive-pack-schedule`    | Schedule pack: `schedule.remind`/`schedule`/`agenda`/`cancel` over `scheduled_event` notes                                                                                                                                                                        |
 | `crates/khive-pack-knowledge`   | Knowledge pack: domain/atom corpus verbs, search, compose, suggest                                                                                                                                                                                                |
 | `crates/khive-pack-session`     | Session pack: session storage/list/resume/export verbs                                                                                                                                                                                                            |
@@ -252,13 +252,13 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 
 Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
 
-| Verb             | Args                                                                         | What it does                                                |
-| ---------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `gtd.assign`     | `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?` | Create a task (defaults: status=inbox, priority=p2)         |
-| `gtd.next`       | `limit?`, `assignee?`                                                        | List actionable tasks (status ∈ next/active), priority-sort |
-| `gtd.complete`   | `id`, `result?`                                                              | Validate transition → done, record `completed_at`           |
-| `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
-| `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
+| Verb             | Args                                                                         | What it does                                                           |
+| ---------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `gtd.assign`     | `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?` | Create a task (defaults: status=inbox, priority=p2)                    |
+| `gtd.next`       | `limit?`, `assignee?`                                                        | List actionable tasks (status ∈ next/active), priority-sort            |
+| `gtd.complete`   | `id`, `status?` (`done` or `cancelled`), `result?`                           | Validate a terminal transition (default `done`), record `completed_at` |
+| `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                                  |
+| `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation             |
 
 ### Memory pack verbs (5 — ADR-021, optional)
 

@@ -1,7 +1,7 @@
 # ADR-040: Communication and Schedule Packs
 
-**Status**: accepted (amended 2026-08-01 — bounded inbox long poll)\
-**Date**: 2026-05-23 (amended 2026-08-01)\
+**Status**: accepted (amended 2026-08-06 — named atomic mark-read)\
+**Date**: 2026-05-23 (amended 2026-08-06)\
 **Authors**: khive maintainers
 
 ## Context
@@ -59,12 +59,21 @@ impl Pack for CommPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS:     &'static [HandlerDef]   = &[
         HandlerDef { name: "comm.send",   description: "Send a message, optionally threaded.",                             visibility: Visibility::Verb },
+        HandlerDef { name: "comm.delivered", description: "Confirm the inbound sibling for an outbound UUID.",             visibility: Visibility::Verb },
         HandlerDef { name: "comm.inbox",  description: "List inbound messages for the caller.",                            visibility: Visibility::Verb },
         HandlerDef { name: "comm.read",   description: "Mark an inbound message as read.",                                 visibility: Visibility::Verb },
+        HandlerDef { name: "comm.mark_read", description: "Mark inbound messages read, optionally atomically.",             visibility: Visibility::Verb },
+        HandlerDef { name: "comm.unread", description: "Count unread inbound messages.",                                  visibility: Visibility::Verb },
         HandlerDef { name: "comm.reply",  description: "Reply to a message, threading linkage.",                           visibility: Visibility::Verb },
         HandlerDef { name: "comm.thread", description: "Retrieve all messages in a conversation thread, chronologically.", visibility: Visibility::Verb },
+        HandlerDef { name: "comm.health", description: "Report channel-poll health.",                                      visibility: Visibility::Verb },
+        HandlerDef { name: "comm.probe",  description: "Probe for new inbound message metadata.",                          visibility: Visibility::Verb },
+        HandlerDef { name: "comm.ingest", description: "Ingest an external channel message.",                              visibility: Visibility::Subhandler },
+        HandlerDef { name: "comm.heartbeat", description: "Record channel-poll liveness.",                                 visibility: Visibility::Subhandler },
+        HandlerDef { name: "comm.cursor_get", description: "Read a channel cursor.",                                       visibility: Visibility::Subhandler },
+        HandlerDef { name: "comm.cursor_commit", description: "Commit a channel cursor.",                                  visibility: Visibility::Subhandler },
     ];
-    // ADR-023 §4: pack-prefixed verb names — `comm.send` / `comm.inbox` / `comm.read` / `comm.reply` / `comm.thread`
+    // Ten public verbs plus four runtime subhandlers; Visibility controls catalog exposure.
     const EDGE_RULES:   &'static [EdgeEndpointRule] = &[];
     const REQUIRES:     &'static [&'static str] = &["kg"];
 }
@@ -94,15 +103,20 @@ The `content` field on the note is the message body. Subject is optional metadat
 caller's namespace) or `outbound` (message sent by the caller). This is set by `send` and
 `reply` at write time — callers do not supply it.
 
-#### Five verbs
+#### Core message lifecycle verbs
 
-| Verb          | Speech act (ADR-025) | Args                                                        | What it does                                                                                                                                                                                                                                                                                                                                                     |
-| ------------- | -------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?`                   | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.                                                                                    |
-| `comm.inbox`  | assertive            | `limit?`, `offset?`, `box?`, `fields?`, `wait_ms?`, filters | List inbound messages (`direction=inbound`) by default, or caller-authored outbound rows with `box="sent"`. `status` filters inbox read state; offset pagination, field projection, and box-appropriate actor/time/text filters do not change message state. A bounded long poll (`wait_ms`, 1-30,000) waits only when the fully filtered initial page is empty. |
-| `comm.read`   | declaration          | `id?`, `ids?`                                               | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                                                                                                             |
-| `comm.reply`  | commissive           | `id`, `content`                                             | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.                                                                                  |
-| `comm.thread` | assertive            | `id`, `limit?`, `order?`, `after?`, `fields?`               | Validate and resolve the thread root, enforce actor visibility, deduplicate dual-write copies, then apply cursor filtering, requested order, truncation, and optional field projection. `id` accepts an 8-char short prefix or full UUID.                                                                                                                        |
+| Verb             | Speech act (ADR-025) | Args                                                        | What it does                                                                                                                                                                                                                                                                                                                                                     |
+| ---------------- | -------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`      | commissive           | `to`, `subject?`, `content`, `thread_id?`                   | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.                                                                                    |
+| `comm.inbox`     | assertive            | `limit?`, `offset?`, `box?`, `fields?`, `wait_ms?`, filters | List inbound messages (`direction=inbound`) by default, or caller-authored outbound rows with `box="sent"`. `status` filters inbox read state; offset pagination, field projection, and box-appropriate actor/time/text filters do not change message state. A bounded long poll (`wait_ms`, 1-30,000) waits only when the fully filtered initial page is empty. |
+| `comm.read`      | declaration          | `id?`, `ids?`                                               | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                                                                                                             |
+| `comm.mark_read` | declaration          | `ids`, `atomic?`                                            | Canonical named bulk mark-read. Default best-effort behavior matches `comm.read(ids=...)`; `atomic=true` commits every unique mark in one transaction or none. Message content remains a read through `comm.inbox` / `comm.thread`.                                                                                                                              |
+| `comm.reply`     | commissive           | `id`, `content`                                             | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.                                                                                  |
+| `comm.thread`    | assertive            | `id`, `limit?`, `order?`, `after?`, `fields?`               | Validate and resolve the thread root, enforce actor visibility, deduplicate dual-write copies, then apply cursor filtering, requested order, truncation, and optional field projection. `id` accepts an 8-char short prefix or full UUID.                                                                                                                        |
+
+This table focuses the stateful message lifecycle. The accepted amendments below define the other
+four current public verbs (`delivered`, `unread`, `health`, and `probe`); the pack-identity snippet
+and current-surface rationale enumerate the complete ten-verb catalog.
 
 #### Inbox pagination, richer filters, and bulk read amendment (2026-08-01)
 
@@ -521,9 +535,10 @@ graceful shutdown — machinery that belongs in the runtime binary, not a pack. 
 intent storage (pack) from trigger evaluation (runtime/external) keeps the pack composable
 across deployment modes: single-binary local use, daemon mode, external cron.
 
-### Why five verbs for comm, four for schedule
+### Initial five-verb comm shape and current surface
 
-The comm pack's natural CRUD shape maps to five verbs: `send`/`reply` are the two creation
+At this ADR's original acceptance, the comm pack's natural CRUD shape mapped to five verbs:
+`send`/`reply` are the two creation
 paths (standalone vs. threaded), `inbox` and `read` are the two read-path verbs (list and
 acknowledge), and `thread` is the conversation-reconstruction verb. `thread` was promoted from
 the `list(kind=message, thread_id=X)` workaround path to a first-class verb because (a) it
@@ -531,13 +546,18 @@ validates the root ID before scanning, (b) it uses a paginated scan rather than 
 prefetch window, and (c) it returns chronologically sorted output — semantics that `list` does
 not guarantee.
 
-The schedule pack retains exactly four verbs: `remind`/`schedule` are the two creation paths
+Subsequent accepted amendments added `delivered`, `unread`, `health`, `probe`, and `mark_read`.
+The current comm catalog therefore exposes ten public verbs. Its 14 handler definitions also
+include four runtime subhandlers (`ingest`, `heartbeat`, `cursor_get`, and `cursor_commit`), which
+do not appear in the public verb catalog.
+
+The schedule pack retains exactly four public verbs: `remind`/`schedule` are the two creation paths
 (notification vs. verb dispatch), `agenda` is the query verb, and `cancel` is the termination
 verb.
 
 Both packs use disjoint verb names with no overlap with kg, gtd, or memory verb names.
-ADR-017's `VerbRegistry` rejects duplicates at boot. The total catalog grows by nine verbs
-across the two packs (five comm + four schedule), not eight.
+ADR-017's `VerbRegistry` rejects duplicates at boot. The original decision added nine public verbs
+(five comm + four schedule); the current combined public surface is 14 (ten comm + four schedule).
 
 ### Why no `forget` / `unschedule` — use `cancel` / `delete`
 
@@ -565,9 +585,10 @@ standard `delete(id)` path.
 
 - Two new note kinds (`message`, `scheduled_event`) integrate into the existing notes pipeline
   at zero schema cost. FTS5 search, hybrid recall, and graph linkage work without new plumbing.
-- The verb catalog grows by nine verbs across two packs (five comm: send/inbox/read/reply/thread;
-  four schedule: schedule/remind/agenda/cancel), each with a distinct and coherent domain.
-  ADR-016's dynamic catalog means agents that don't load these packs see no surface bloat.
+- The original decision grew the verb catalog by nine verbs across two packs. Accepted amendments
+  bring the current public surface to 14 (ten comm and four schedule), each with a distinct and
+  coherent domain. ADR-016's dynamic catalog means agents that don't load these packs see no
+  surface bloat.
 - The `annotates` edge mechanism from ADR-002 works for both packs without new edge endpoint
   rules — messages and scheduled events attach to KG entities the same way observations do.
 - Cross-pack scheduling (GTD, Comm) is composition at the payload level — no inter-pack API.
@@ -623,7 +644,7 @@ standard `delete(id)` path.
 ## Implementation
 
 - `crates/khive-pack-comm/src/lib.rs`: `CommPack` struct + `Pack` / `PackRuntime` impls.
-- `crates/khive-pack-comm/src/handlers.rs`: `send`, `inbox`, `read`, `reply` handlers;
+- `crates/khive-pack-comm/src/handlers.rs`: `send`, `inbox`, `read`, `mark_read`, `reply` handlers;
   direction assignment logic; thread root resolution.
 - `crates/khive-pack-schedule/src/lib.rs`: `SchedulePack` struct + `Pack` / `PackRuntime`
   impls.
@@ -656,7 +677,7 @@ standard `delete(id)` path.
 - ADR-023: Declarative Pack Format — mentioned but not used; both packs require verb
   handlers and are Rust packs per ADR-017.
 - ADR-025: Verb Speech Acts — `send`, `reply`, `remind`, `schedule` are commissive;
-  `inbox`, `agenda` are assertive; `read`, `cancel` are declarative.
+  `inbox`, `agenda` are assertive; `read`, `mark_read`, `cancel` are declarative.
 - ADR-027: Dynamic Pack Loading — self-registration via `inventory::submit!`.
 - ADR-028: Pack-Scoped Backends — `default_backend = "main"` for both packs.
 
@@ -674,7 +695,8 @@ throw away a successful read for a caller who cannot retry the fetch half.
 kind, outbound direction, wrong addressee) remain fatal and unchanged. The post-read
 mark-read patch itself is best-effort:
 
-The patch uses `NoteStore::set_note_property("read", true)`, an atomic storage-level JSON set.
+The patch uses `NoteStore::try_patch_note_property("read", true)`, an atomic storage-level JSON set
+with a live eligibility recheck.
 It does not replace the properties document, so a concurrent write to another key survives without
 a get/retry loop. This changes no `comm.read` response field or error/degradation rule.
 
@@ -729,3 +751,48 @@ truth. Direct database writes or a distinct process/registry do not share the
 signal; the timeout-edge final query or the caller's next request observes them
 from durable storage. No notification carries message content, actor identity,
 or authorization, and no wake bypasses ADR-018/ADR-057 filtering.
+
+## Amendment (2026-08-06): named atomic mark-read (#1387)
+
+The 0.7.0 surface already shipped bulk best-effort mutation as `comm.read(ids=[...])` through
+#1422/#1572. That compatibility contract remains intact, including its single-`id` form, bulk form,
+complete target validation before the first write, duplicate-ID collapse, result/count envelope,
+and per-target post-validation storage degradation. Removing `ids` from `comm.read` would break a
+released wire shape, so it remains a compatibility alias rather than being narrowed back to one id.
+
+Those released decisions supersede the corresponding premises and acceptance bullets in the
+original #1387 issue. #1572 already delivered the bulk best-effort operation and established fatal
+whole-call prevalidation rather than a new per-entry authorization-error envelope. ADR-057 and
+ADR-007 establish actor-addressed eligibility, attribution-only namespaces, and fail-open access to
+legacy rows with no `to_actor`; they supersede #1387's earlier wrong-namespace and
+attributed-versus-unattributed legacy split. The residual #1387 scope is therefore the canonical
+`comm.mark_read` name, its retrieval-versus-mutation catalog wording, and the `atomic=true`
+all-or-nothing transaction.
+
+The comm pack adds `comm.mark_read(ids=[...], atomic=false)` as the canonical, unambiguous bulk
+name. It marks delivery state; it never retrieves message bodies. Callers retrieve content through
+the Assertive `comm.inbox` and `comm.thread` verbs. With omitted/default `atomic=false`, the handler
+reuses the existing `comm.read(ids=...)` validation and best-effort mutation path; this amendment
+does not fork the authorization or response logic.
+
+`atomic=true` keeps the same 1-500 input cap, prefix/UUID resolution, complete prevalidation,
+first-occurrence order, deduplication, and bulk response fields. After prevalidation it passes every
+unique UUID plus the same namespace/kind/direction/addressee `NoteFilter` to
+`NoteStore::patch_note_property_atomic`. The SQLite implementation rechecks each target inside one
+writer transaction and patches only `$.read` through `json_set`. Every statement must affect exactly
+one live object-valued row. A missing, soft-deleted, wrong-kind, outbound, wrong-addressee, or
+otherwise ineligible row aborts the transaction, as does a statement or commit failure observed by
+the transaction executor; no earlier mark in that failed unit remains committed. Both the
+writer-task and legacy pool-mutex executors verify commit/rollback completion and restored
+autocommit mode. A lost writer-task reply or an unverified transaction finalization returns the
+existing `side_effects_unknown` storage error and permanently retires that writer seam: the unit is
+still indivisible, but the caller cannot infer whether it committed and the poisoned connection is
+never reused. A successful unit returns the existing bulk summary with `read=true` for every unique
+target. The 500-id cap also bounds contention: one atomic call holds the single writer across at
+most 500 guarded `UPDATE`s, limiting head-of-line latency for concurrent writers.
+
+This amendment does not change ADR-057's actor or legacy-row decisions. In particular,
+`to_actor`-less pre-ADR-057 rows retain the accepted `EqOrMissing` fail-open compatibility rule for
+both names; newly attributed messages remain addressee-gated. Target-validation errors remain fatal
+before either mutation mode, matching the shipped #1572 contract rather than introducing a second,
+per-entry authorization-error envelope only on the new spelling.

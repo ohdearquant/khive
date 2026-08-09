@@ -5,6 +5,29 @@ mod common;
 use common::{assign, pack, rt};
 use khive_storage::{SqlStatement, SqlValue};
 use serde_json::json;
+use uuid::Uuid;
+
+#[tokio::test]
+async fn public_write_audit_record_compatibility_api_returns_unit() {
+    let rt = rt();
+    khive_pack_gtd::handlers::ensure_audit_schema(&rt).await;
+    let note_id = Uuid::new_v4();
+    let result =
+        khive_pack_gtd::handlers::write_audit_record(&rt, note_id, "inbox", "next", None, "local")
+            .await;
+    let _: () = result;
+
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT COUNT(*) AS count FROM gtd_lifecycle_audit WHERE note_id = ?1".into(),
+            params: vec![SqlValue::Text(note_id.to_string())],
+            label: None,
+        })
+        .await
+        .expect("audit count");
+    assert!(matches!(rows[0].get("count"), Some(SqlValue::Integer(1))));
+}
 
 #[tokio::test]
 async fn transition_writes_lifecycle_audit_record() {
@@ -18,13 +41,14 @@ async fn transition_writes_lifecycle_audit_record() {
     .await;
     let task_id = resp["full_id"].as_str().unwrap().to_string();
 
-    fixture
+    let transition = fixture
         .dispatch(
             "gtd.transition",
             json!({"id": task_id, "status": "next", "note": "moved to next"}),
         )
         .await
         .expect("transition should succeed");
+    assert_eq!(transition["audit_persisted"], true);
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("sql reader");
@@ -93,10 +117,11 @@ async fn complete_writes_lifecycle_audit_record() {
         .await
         .expect("transition to next should succeed");
 
-    fixture
+    let completed = fixture
         .dispatch("gtd.complete", json!({"id": task_id, "result": "done!"}))
         .await
         .expect("complete should succeed");
+    assert_eq!(completed["audit_persisted"], true);
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("sql reader");
@@ -128,6 +153,94 @@ async fn complete_writes_lifecycle_audit_record() {
         Some("done"),
         "audit to_state must be 'done'"
     );
+}
+
+#[tokio::test]
+async fn lifecycle_success_reports_audit_degradation_when_insert_fails() {
+    let rt = rt();
+    khive_pack_gtd::handlers::ensure_audit_schema(&rt).await;
+    {
+        let mut writer = rt.sql().writer().await.expect("sql writer");
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_gtd_audit_insert \
+                 BEFORE INSERT ON gtd_lifecycle_audit \
+                 BEGIN SELECT RAISE(FAIL, 'forced audit failure'); END;"
+                    .into(),
+            )
+            .await
+            .expect("failure-injection trigger");
+    }
+    let fixture = pack(rt.clone());
+
+    let transition_task = assign(
+        &fixture,
+        json!({"title": "audit-degraded transition", "status": "inbox"}),
+    )
+    .await;
+    let transition = fixture
+        .dispatch(
+            "gtd.transition",
+            json!({"id": transition_task["full_id"], "status": "next"}),
+        )
+        .await
+        .expect("domain transition remains successful");
+    assert_eq!(transition["transitioned"], true);
+    assert_eq!(transition["to"], "next");
+    assert_eq!(
+        transition["audit_persisted"], false,
+        "caller must see that the best-effort audit append was lost"
+    );
+
+    let complete_task = assign(
+        &fixture,
+        json!({"title": "audit-degraded complete", "status": "inbox"}),
+    )
+    .await;
+    let completed = fixture
+        .dispatch(
+            "gtd.complete",
+            json!({"id": complete_task["full_id"], "result": "finished during triage"}),
+        )
+        .await
+        .expect("domain completion remains successful");
+    assert_eq!(completed["completed"], true);
+    assert_eq!(completed["to"], "done");
+    assert_eq!(
+        completed["audit_persisted"], false,
+        "caller must see that the best-effort audit append was lost"
+    );
+
+    let noop_task = assign(
+        &fixture,
+        json!({"title": "audit-degraded no-op note", "status": "next"}),
+    )
+    .await;
+    let noop = fixture
+        .dispatch(
+            "gtd.transition",
+            json!({
+                "id": noop_task["full_id"],
+                "status": "next",
+                "note": "persist note despite degraded audit",
+            }),
+        )
+        .await
+        .expect("canonical note-bearing no-op remains successful");
+    assert_eq!(noop["transitioned"], false);
+    assert_eq!(noop["note_recorded"], true);
+    assert_eq!(noop["audit_persisted"], false);
+
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT COUNT(*) AS count FROM gtd_lifecycle_audit".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .expect("audit count");
+    assert!(matches!(rows[0].get("count"), Some(SqlValue::Integer(0))));
 }
 
 #[tokio::test]
@@ -433,6 +546,7 @@ async fn noop_transition_with_note_writes_audit_record_and_persists_note() {
         r["note_recorded"], true,
         "note_recorded must be true when a note is persisted"
     );
+    assert_eq!(r["audit_persisted"], true);
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("sql reader");

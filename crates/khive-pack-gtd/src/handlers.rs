@@ -5,7 +5,7 @@
 //!
 //! FILE SIZE JUSTIFICATION: All five GTD verb handlers (`assign`, `next`, `complete`,
 //! `tasks`, `transition`) share internal helpers (`load_task`, `atomic_gtd_transition`,
-//! `ensure_audit_schema`, `write_audit_record`) that access `pub(crate)` symbols and
+//! `ensure_audit_schema`, `write_audit_record_with_status`) that access `pub(crate)` symbols and
 //! must stay co-located to avoid circular imports within the crate. Splitting by verb
 //! would require either making those helpers `pub` (which widens the API surface) or
 //! duplicating them. The file is reviewed against this invariant at each significant
@@ -23,8 +23,8 @@ use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 use crate::schema::{
-    allowed_transitions, can_transition, is_actionable, is_terminal, is_valid_priority,
-    is_valid_status, normalize_status, TASK_LIFECYCLE_HELP,
+    allowed_transitions, can_transition, is_terminal, is_valid_priority, is_valid_status,
+    normalize_status, TASK_LIFECYCLE_HELP,
 };
 use crate::GtdPack;
 
@@ -52,7 +52,7 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
 
     // `CREATE TABLE IF NOT EXISTS` above is a no-op on databases that already
     // have `gtd_lifecycle_audit` from before the `namespace` column existed.
-    // Guard-check and upgrade those tables in place so `write_audit_record`'s
+    // Guard-check and upgrade those tables in place so the audit writer's
     // `INSERT ... namespace` doesn't silently fail on legacy schemas.
     let rows = match w
         .query_all(SqlStatement {
@@ -86,11 +86,12 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     }
 }
 
-/// Append one row to `gtd_lifecycle_audit`.
+/// Append one row to `gtd_lifecycle_audit`, preserving the original public
+/// unit-returning API.
 ///
-/// Best-effort: failures are logged and swallowed. The note's successful
-/// write has already happened; a missing audit row is degraded, not a
-/// failure. `pub` for the same reason as `ensure_audit_schema` above.
+/// Best-effort failures remain logged and swallowed for compatibility. New
+/// lifecycle response builders call [`write_audit_record_with_status`] when
+/// they need to expose degradation to the caller.
 pub async fn write_audit_record(
     runtime: &KhiveRuntime,
     note_id: Uuid,
@@ -99,6 +100,23 @@ pub async fn write_audit_record(
     transition_note: Option<&str>,
     namespace: &str,
 ) {
+    let _ = write_audit_record_with_status(runtime, note_id, from, to, transition_note, namespace)
+        .await;
+}
+
+/// Append one lifecycle-audit row and report whether it persisted.
+///
+/// The task mutation has already committed, so failure remains non-fatal;
+/// callers use the boolean to expose that degraded side effect without
+/// changing [`write_audit_record`]'s public return contract.
+pub async fn write_audit_record_with_status(
+    runtime: &KhiveRuntime,
+    note_id: Uuid,
+    from: &str,
+    to: &str,
+    transition_note: Option<&str>,
+    namespace: &str,
+) -> bool {
     let now = Utc::now().timestamp_micros();
     let stmt = SqlStatement {
         sql: "INSERT INTO gtd_lifecycle_audit \
@@ -119,8 +137,18 @@ pub async fn write_audit_record(
         label: Some("gtd_audit".into()),
     };
     match runtime.sql().writer().await {
-        Ok(mut w) => {
-            if let Err(e) = w.execute(stmt).await {
+        Ok(mut w) => match w.execute(stmt).await {
+            Ok(affected) if affected > 0 => true,
+            Ok(_) => {
+                tracing::warn!(
+                    note_id = %note_id,
+                    from,
+                    to,
+                    "gtd: audit insert affected no rows (non-fatal)"
+                );
+                false
+            }
+            Err(e) => {
                 tracing::warn!(
                     note_id = %note_id,
                     from,
@@ -128,14 +156,16 @@ pub async fn write_audit_record(
                     error = %e,
                     "gtd: audit write failed (non-fatal)"
                 );
+                false
             }
-        }
+        },
         Err(e) => {
             tracing::warn!(
                 note_id = %note_id,
                 error = %e,
                 "gtd: failed to acquire SQL writer for audit write (non-fatal)"
             );
+            false
         }
     }
 }
@@ -336,24 +366,63 @@ pub(crate) async fn resolve_context_entity_id(
     }
 }
 
-/// Status a task is treated as when the `status` property is missing/empty.
-/// Property filters that select this value must use `FilterOp::EqOrMissing`
-/// (not plain `Eq`) so legacy rows without a stored `status` still match —
-/// `json_extract` on an absent path is SQL `NULL`, which never equals a text
-/// literal.
+/// Status a task is treated as when the `status` property is missing or not a string.
+/// Property filters that select this value must use `FilterOp::TextEqOrNonText`
+/// (not plain `Eq`) so their SQL predicate mirrors [`task_status`]'s exact
+/// `CASE` semantics for absent, JSON-null, and non-text legacy values.
 const DEFAULT_STATUS: &str = "inbox";
 
 /// Priority a task is treated as when the `priority` property is missing/empty.
-/// Same `EqOrMissing` rule as [`DEFAULT_STATUS`] applies.
+/// An explicit default-priority filter uses `FilterOp::EqOrMissing` so legacy
+/// rows without the property remain visible.
 const DEFAULT_PRIORITY: &str = "p2";
 
-/// Status used internally on a task. Defaults to "inbox" when missing/empty.
+/// Status used internally on a task. Defaults to "inbox" when missing or non-string.
 fn task_status(props: Option<&Value>) -> String {
     props
         .and_then(|p| p.get("status"))
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_STATUS)
         .to_string()
+}
+
+/// Produce a lifecycle-write revision that is strictly newer than the exact
+/// note snapshot used to make the transition decision. `updated_at` is the
+/// optimistic-concurrency revision for task notes, so equality would let two
+/// independently prepared writes appear to share one revision.
+fn next_lifecycle_updated_at(snapshot_updated_at: i64) -> Result<i64, RuntimeError> {
+    let minimum = snapshot_updated_at.checked_add(1).ok_or_else(|| {
+        RuntimeError::Internal(
+            "task updated_at is already at i64::MAX and cannot advance".to_string(),
+        )
+    })?;
+    Ok(Utc::now().timestamp_micros().max(minimum))
+}
+
+fn lifecycle_write_conflict(
+    operation: &str,
+    note_id: Uuid,
+    expected_status: &str,
+    actual_status: &str,
+) -> RuntimeError {
+    if is_terminal(actual_status) {
+        RuntimeError::InvalidInput(format!(
+            "task {} is in terminal state {actual_status:?}; no further transitions allowed",
+            short_id(note_id)
+        ))
+    } else if actual_status != expected_status {
+        RuntimeError::InvalidInput(format!(
+            "{operation}: task {} changed from expected state {expected_status:?} to \
+             {actual_status:?}; retry with fresh state",
+            short_id(note_id)
+        ))
+    } else {
+        RuntimeError::InvalidInput(format!(
+            "{operation}: task {} changed after the lifecycle decision while remaining in \
+             state {actual_status:?}; retry with fresh state",
+            short_id(note_id)
+        ))
+    }
 }
 
 /// Priority rank used for sorting actionable tasks (lower = higher priority).
@@ -540,32 +609,33 @@ async fn load_task(
 /// from `expected_current` to `target` status.
 ///
 /// Relies on SQLite's atomic single-statement UPDATE plus a conditional WHERE
-/// predicate (`json_extract(properties,'$.status') = ?`) so that concurrent
-/// `complete()` or `transition()` calls on the same task in a parallel batch do
-/// NOT both report success. Only one write wins; the other gets 0 rows affected
-/// and must report an error.
+/// predicate over the exact decision snapshot's revision, deletion marker,
+/// and semantic GTD status. This prevents a lifecycle write from replacing a
+/// property document changed by a generic task update, even when that update
+/// left `properties.status` unchanged. Only one write wins; the other gets 0
+/// rows affected and must report an error.
 ///
 /// Returns the number of rows updated (1 = success, 0 = lost race / already moved).
 async fn atomic_gtd_transition(
     runtime: &KhiveRuntime,
-    note_id: Uuid,
+    snapshot: &khive_storage::note::Note,
     expected_current: &str,
     target: &str,
     new_props: &serde_json::Value,
     updated_at: i64,
 ) -> Result<u64, RuntimeError> {
     // The conditional UPDATE runs as a single SQLite statement, which is atomic
-    // on its own — no explicit transaction is needed because we never split the
-    // read-check from the write. The WHERE predicate goes through json_extract
-    // on the properties column to check the GTD status rather than the
-    // row-visibility `status` column (which is always "active").
+    // on its own — no explicit transaction is needed because the decision
+    // snapshot's revision/deletion/status checks and the write are one DML
+    // statement. The GTD status predicate uses the properties column rather
+    // than the row-visibility `status` column (which is always "active").
     //
-    // Concurrency: if another writer has already written `target` (or any other
-    // terminal state) by the time the WHERE predicate is evaluated, the predicate
-    // fails and rows_affected = 0. Caller distinguishes the rows-affected-0 loser
-    // path from the pre-load terminal-state error returned by `load_task`.
+    // Concurrency: if another writer has advanced the note revision, changed
+    // semantic status, or soft-deleted the row by the time the predicate is
+    // evaluated, it fails with rows_affected = 0. The caller distinguishes
+    // that loser path from the pre-load errors returned by `load_task`.
     let statement =
-        gtd_transition_statement(note_id, expected_current, target, new_props, updated_at)?;
+        gtd_transition_statement(snapshot, expected_current, target, new_props, updated_at)?;
     let sql = runtime.sql();
     let mut writer = sql
         .writer()
@@ -587,43 +657,115 @@ async fn atomic_gtd_transition(
 /// executes it immediately via the writer above; the atomic path turns it
 /// into a `PlanStatement` for the synchronous commit pass instead.
 pub fn gtd_transition_statement(
-    note_id: Uuid,
+    snapshot: &khive_storage::note::Note,
     expected_current: &str,
     target: &str,
     new_props: &serde_json::Value,
     updated_at: i64,
 ) -> Result<SqlStatement, RuntimeError> {
+    if snapshot.deleted_at.is_some() {
+        return Err(RuntimeError::NotFound(format!(
+            "deleted task {}",
+            short_id(snapshot.id)
+        )));
+    }
+    if updated_at <= snapshot.updated_at {
+        return Err(RuntimeError::Internal(format!(
+            "gtd lifecycle updated_at must strictly advance snapshot revision {} (got {updated_at})",
+            snapshot.updated_at
+        )));
+    }
     let props_str = serde_json::to_string(new_props)
         .map_err(|e| RuntimeError::Internal(format!("serialize props: {e}")))?;
     Ok(SqlStatement {
         sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
               WHERE id = ?3 \
-              AND json_extract(properties, '$.status') = ?4 \
-              AND deleted_at IS NULL"
+              AND updated_at = ?4 \
+              AND deleted_at IS ?5 \
+              AND ?2 > updated_at \
+              AND CASE \
+                    WHEN json_type(properties, '$.status') = 'text' \
+                    THEN json_extract(properties, '$.status') \
+                    ELSE 'inbox' \
+                  END = ?6"
             .to_string(),
         params: vec![
             SqlValue::Text(props_str),
             SqlValue::Integer(updated_at),
-            SqlValue::Text(note_id.as_hyphenated().to_string()),
+            SqlValue::Text(snapshot.id.as_hyphenated().to_string()),
+            SqlValue::Integer(snapshot.updated_at),
+            match snapshot.deleted_at {
+                Some(deleted_at) => SqlValue::Integer(deleted_at),
+                None => SqlValue::Null,
+            },
             SqlValue::Text(expected_current.to_string()),
         ],
         label: Some(format!("gtd_atomic_transition_{target}")),
     })
 }
 
-/// Outcome of [`prepare_transition`]'s decide step: either nothing to write
-/// (the idempotent `current == target` case, canonical's early return) or a
-/// fully computed patched `properties` value ready to apply — via
+/// Build the guarded, mutation-free assertion used for an atomic
+/// same-status transition.
+///
+/// Atomic prepare classifies `current == target` from a read snapshot, but a
+/// preceding op in the same atomic file may transition, update, or delete the
+/// task before this op reaches the commit pass. An empty plan would silently
+/// discard the snapshot hypothesis. This statement deliberately assigns
+/// `updated_at` to itself (so the persisted row is byte-for-byte unchanged)
+/// while re-validating the exact revision, deletion marker, and semantic GTD
+/// status under the transaction. Its affected-row guard therefore turns any
+/// stale no-op into a whole-unit rollback.
+pub fn gtd_noop_assertion_statement(
+    snapshot: &khive_storage::note::Note,
+    expected_current: &str,
+) -> Result<SqlStatement, RuntimeError> {
+    if snapshot.deleted_at.is_some() {
+        return Err(RuntimeError::NotFound(format!(
+            "deleted task {}",
+            short_id(snapshot.id)
+        )));
+    }
+    Ok(SqlStatement {
+        sql: "UPDATE notes SET updated_at = updated_at \
+              WHERE id = ?1 \
+              AND updated_at = ?2 \
+              AND deleted_at IS ?3 \
+              AND CASE \
+                    WHEN json_type(properties, '$.status') = 'text' \
+                    THEN json_extract(properties, '$.status') \
+                    ELSE 'inbox' \
+                  END = ?4"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(snapshot.id.as_hyphenated().to_string()),
+            SqlValue::Integer(snapshot.updated_at),
+            match snapshot.deleted_at {
+                Some(deleted_at) => SqlValue::Integer(deleted_at),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(expected_current.to_string()),
+        ],
+        label: Some("gtd_atomic_noop_assertion".to_string()),
+    })
+}
+
+/// Outcome of [`prepare_transition`]'s decide step: either no status change
+/// (the idempotent `current == target` case) or a fully computed patched
+/// `properties` value ready to apply — via
 /// `atomic_gtd_transition` (canonical, immediate) or
 /// [`gtd_transition_statement`] (ADR-099 atomic, deferred to the commit
-/// pass).
+/// pass). Canonical dispatch may record a caller note after the no-op decision;
+/// atomic v1 instead carries a guarded no-effect assertion and deliberately
+/// omits both the note mutation and audit side effect.
 pub enum TransitionDecision {
     NoOp {
+        /// Exact note snapshot used to classify the no-op.
         note: khive_storage::note::Note,
         current: String,
         target: String,
     },
     Write {
+        /// Exact note snapshot whose revision/deletion marker guards apply.
         note: khive_storage::note::Note,
         current: String,
         target: String,
@@ -686,40 +828,41 @@ pub async fn prepare_transition(
         )));
     }
 
-    let updated_at = Utc::now().timestamp_micros();
+    let updated_at = next_lifecycle_updated_at(note.updated_at)?;
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
-    if let Some(obj) = props.as_object_mut() {
-        obj.insert("status".into(), json!(target.to_string()));
-        if let Some(n) = note_arg {
-            obj.insert("transition_note".into(), json!(n));
-        }
-        if target == "done" {
-            obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
-        }
+    let obj = props.as_object_mut().ok_or_else(|| {
+        RuntimeError::InvalidInput("task properties must be a JSON object".to_string())
+    })?;
+    obj.insert("status".into(), json!(target.to_string()));
+    if let Some(n) = note_arg {
+        obj.insert("transition_note".into(), json!(n));
+    }
+    if target == "done" {
+        obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
+    }
 
-        // #95: `transition_note` above is last-write-wins by design (it's the
-        // "latest note" quick-read field every existing caller already
-        // depends on) — but that means every note before the last one was
-        // gone with no trace anywhere in the record. `gtd_lifecycle_audit`
-        // (see `write_audit_record` below) already persists the full
-        // from/to/note/at history in SQL, so the storage-side history this
-        // issue asks about already exists; it just isn't surfaced back to a
-        // caller reading the task. `transition_history` mirrors that same
-        // per-transition record onto the note's own `properties` blob (a
-        // free-form JSON column — no schema/storage change needed) so a
-        // plain `get`/`tasks` read of the task, not just a raw SQL query
-        // against the audit table, shows the accumulated history.
-        let entry = json!({
-            "from": current,
-            "to": target,
-            "note": note_arg,
-            "at": micros_to_iso(updated_at),
-        });
-        match obj.get_mut("transition_history") {
-            Some(Value::Array(history)) => history.push(entry),
-            _ => {
-                obj.insert("transition_history".into(), json!([entry]));
-            }
+    // #95: `transition_note` above is last-write-wins by design (it's the
+    // "latest note" quick-read field every existing caller already
+    // depends on) — but that means every note before the last one was
+    // gone with no trace anywhere in the record. `gtd_lifecycle_audit`
+    // (see the lifecycle-audit helpers above) already persists the full
+    // from/to/note/at history in SQL, so the storage-side history this
+    // issue asks about already exists; it just isn't surfaced back to a
+    // caller reading the task. `transition_history` mirrors that same
+    // per-transition record onto the note's own `properties` blob (a
+    // free-form JSON column — no schema/storage change needed) so a
+    // plain `get`/`tasks` read of the task, not just a raw SQL query
+    // against the audit table, shows the accumulated history.
+    let entry = json!({
+        "from": current,
+        "to": target,
+        "note": note_arg,
+        "at": micros_to_iso(updated_at),
+    });
+    match obj.get_mut("transition_history") {
+        Some(Value::Array(history)) => history.push(entry),
+        _ => {
+            obj.insert("transition_history".into(), json!([entry]));
         }
     }
 
@@ -737,6 +880,7 @@ pub async fn prepare_transition(
 /// `properties` value ready to apply. Unlike [`TransitionDecision`], there is
 /// no idempotent no-op case — `complete()` always writes when it succeeds.
 pub struct CompleteDecision {
+    /// Exact note snapshot whose revision/deletion marker guards apply.
     pub note: khive_storage::note::Note,
     pub current: String,
     pub target: &'static str,
@@ -748,7 +892,7 @@ pub struct CompleteDecision {
 /// Decide step of `gtd.complete` (ADR-099 B3 r6 second pass) — same split as
 /// [`prepare_transition`] above: validates the target terminal status,
 /// secret-gates the caller-supplied result, loads the task, checks the
-/// terminal/actionable guards, and computes the patched `properties` value,
+/// terminal/lifecycle guards, and computes the patched `properties` value,
 /// all WITHOUT writing. `GtdPack::handle_complete` and the ADR-099 `--atomic`
 /// `gtd.complete` prepare function in `kkernel` both call this ONE function.
 pub async fn prepare_complete(
@@ -772,23 +916,30 @@ pub async fn prepare_complete(
             short_id(note.id)
         )));
     }
-    if !is_actionable(&current) {
+    if !can_transition(&current, target) {
+        let allowed = allowed_transitions(&current);
+        let allowed_display = if allowed.is_empty() {
+            "(none)".to_string()
+        } else {
+            allowed.join(", ")
+        };
         return Err(RuntimeError::InvalidInput(format!(
-            "complete: task in {current:?}; transition to 'next' or 'active' first, \
-             or use transition(status=done) explicitly"
+            "complete: cannot transition from {current:?} to {target:?}; \
+             allowed from {current:?}: {allowed_display}. Full lifecycle: {TASK_LIFECYCLE_HELP}"
         )));
     }
 
     let completed_at = Utc::now().to_rfc3339();
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
-    if let Some(obj) = props.as_object_mut() {
-        obj.insert("status".into(), json!(target));
-        obj.insert("completed_at".into(), json!(completed_at));
-        if let Some(result) = result_arg {
-            obj.insert("result".into(), json!(result));
-        }
+    let obj = props.as_object_mut().ok_or_else(|| {
+        RuntimeError::InvalidInput("task properties must be a JSON object".to_string())
+    })?;
+    obj.insert("status".into(), json!(target));
+    obj.insert("completed_at".into(), json!(completed_at));
+    if let Some(result) = result_arg {
+        obj.insert("result".into(), json!(result));
     }
-    let updated_at = Utc::now().timestamp_micros();
+    let updated_at = next_lifecycle_updated_at(note.updated_at)?;
 
     Ok(CompleteDecision {
         note,
@@ -941,7 +1092,7 @@ impl GtdPack {
 
         // Decide step (ADR-099 B3 r6 second pass): validates the target
         // terminal status, secret-gates the result, loads the task, checks
-        // the terminal/actionable guards, and computes the patched
+        // the terminal/lifecycle guards, and computes the patched
         // `properties` value — the SAME function the ADR-099 `--atomic`
         // `gtd.complete` prepare path in `kkernel` calls.
         let decision = prepare_complete(
@@ -953,53 +1104,39 @@ impl GtdPack {
         )
         .await?;
         let CompleteDecision {
-            mut note,
+            note,
             current,
             target,
             props,
             updated_at,
             completed_at,
         } = decision;
-        note.properties = Some(props);
-        // notes.status is row-visibility (always "active" for live rows);
-        // GTD status lives in properties.status and W1-G's remap surfaces it
-        // at data.status in the response.
-        note.updated_at = updated_at;
 
-        // atomic transition — use a conditional SQL UPDATE
-        // so that a concurrent complete() on the same task loses the race
-        // cleanly rather than both reporting success.
-        let rows_affected = atomic_gtd_transition(
-            self.runtime(),
-            note.id,
-            &current,
-            target,
-            note.properties.as_ref().unwrap(),
-            note.updated_at,
-        )
-        .await?;
+        // Guard the complete against the exact note snapshot that produced
+        // `props`, not merely its old GTD status. A concurrent generic update
+        // may leave status unchanged while changing description/content or
+        // other task properties; replacing its property document would lose
+        // that write and can break the task-body mirror invariant.
+        let rows_affected =
+            atomic_gtd_transition(self.runtime(), &note, &current, target, &props, updated_at)
+                .await?;
 
         if rows_affected == 0 {
-            // Another concurrent op already transitioned this task away from `current`.
-            // Re-read the actual current state to give a precise error.
+            // Re-read status for a precise conflict class. The snapshot guard
+            // can also fail while status stays unchanged (for example, a
+            // concurrent generic task update advanced the note revision).
             let (_, actual_now) = load_task(self.runtime(), token, &p.id).await?;
-            let message = if is_terminal(&actual_now) {
-                format!(
-                    "task {} is in terminal state {actual_now:?}; no further transitions allowed",
-                    short_id(note.id)
-                )
-            } else {
-                format!(
-                    "complete: task {} changed from expected state {current:?} to {actual_now:?}; retry with fresh state",
-                    short_id(note.id)
-                )
-            };
-            return Err(RuntimeError::InvalidInput(message));
+            return Err(lifecycle_write_conflict(
+                "complete",
+                note.id,
+                &current,
+                &actual_now,
+            ));
         }
 
-        // Write lifecycle audit record (best-effort).
+        // Write lifecycle audit record (best-effort, explicitly reported).
         ensure_audit_schema(self.runtime()).await;
-        write_audit_record(
+        let audit_persisted = write_audit_record_with_status(
             self.runtime(),
             note.id,
             &current,
@@ -1017,6 +1154,7 @@ impl GtdPack {
             "to": target,
             "completed_at": completed_at,
             "is_terminal": is_terminal(target),
+            "audit_persisted": audit_persisted,
         }))
     }
 
@@ -1071,14 +1209,14 @@ impl GtdPack {
         let mut property_filters = vec![match status_filter.as_deref() {
             Some(want) => PropertyFilter {
                 json_path: "$.status".to_string(),
-                // A legacy task with no stored `status` property is treated as
-                // `inbox` everywhere else in this pack (`task_status`,
-                // `render_task`). `json_extract` on an absent path is SQL
-                // NULL, which `Eq` never matches, so an explicit
-                // `status="inbox"` query would silently exclude those rows —
-                // `EqOrMissing` restores the "absent counts as default" rule.
+                // A legacy task whose stored `status` is absent OR non-text is
+                // treated as `inbox` everywhere else in this pack
+                // (`task_status`, `render_task`). Use the storage predicate
+                // whose SQL CASE expression reproduces that exact read model;
+                // `EqOrMissing` alone would still exclude booleans, numbers,
+                // arrays, and objects.
                 op: if want == DEFAULT_STATUS {
-                    FilterOp::EqOrMissing
+                    FilterOp::TextEqOrNonText
                 } else {
                     FilterOp::Eq
                 },
@@ -1221,7 +1359,7 @@ impl GtdPack {
         let decision =
             prepare_transition(self.runtime(), token, &p.id, &p.status, p.note.as_deref()).await?;
 
-        let (note, current, target) = match decision {
+        let (note, current, target, audit_persisted) = match decision {
             TransitionDecision::NoOp {
                 note,
                 current,
@@ -1232,19 +1370,23 @@ impl GtdPack {
                 // stays an accurate statement about status; persisting the note is a
                 // separate effect.
                 let mut note_recorded = None;
+                let mut audit_persisted = None;
                 if let Some(n) = p.note.as_deref() {
                     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
-                    if let Some(obj) = props.as_object_mut() {
-                        obj.insert("transition_note".into(), json!(n));
-                    }
-                    let updated_at = Utc::now().timestamp_micros();
+                    let obj = props.as_object_mut().ok_or_else(|| {
+                        RuntimeError::InvalidInput(
+                            "task properties must be a JSON object".to_string(),
+                        )
+                    })?;
+                    obj.insert("transition_note".into(), json!(n));
+                    let updated_at = next_lifecycle_updated_at(note.updated_at)?;
                     // Same conditional UPDATE `atomic_gtd_transition` uses elsewhere —
                     // here expected == target, so it only wins if the status is still
                     // what `prepare_transition` just observed (loses the race to a
                     // concurrent real transition without clobbering it).
                     let rows_affected = atomic_gtd_transition(
                         self.runtime(),
-                        note.id,
+                        &note,
                         &current,
                         &target,
                         &props,
@@ -1253,15 +1395,17 @@ impl GtdPack {
                     .await?;
                     if rows_affected > 0 {
                         ensure_audit_schema(self.runtime()).await;
-                        write_audit_record(
-                            self.runtime(),
-                            note.id,
-                            &current,
-                            &target,
-                            Some(n),
-                            token.namespace().as_str(),
-                        )
-                        .await;
+                        audit_persisted = Some(
+                            write_audit_record_with_status(
+                                self.runtime(),
+                                note.id,
+                                &current,
+                                &target,
+                                Some(n),
+                                token.namespace().as_str(),
+                            )
+                            .await,
+                        );
                     }
                     note_recorded = Some(rows_affected > 0);
                 }
@@ -1277,6 +1421,9 @@ impl GtdPack {
                 if let Some(recorded) = note_recorded {
                     response["note_recorded"] = json!(recorded);
                 }
+                if let Some(persisted) = audit_persisted {
+                    response["audit_persisted"] = json!(persisted);
+                }
                 return Ok(response);
             }
             TransitionDecision::Write {
@@ -1287,36 +1434,39 @@ impl GtdPack {
                 updated_at,
                 transition_note,
             } => {
+                // The shared conditional write guards the exact snapshot
+                // revision/deletion marker as well as semantic status, so a
+                // concurrent generic update cannot be replaced by stale
+                // lifecycle properties.
+                let rows_affected = atomic_gtd_transition(
+                    self.runtime(),
+                    &note,
+                    &current,
+                    &target,
+                    &props,
+                    updated_at,
+                )
+                .await?;
+
+                if rows_affected == 0 {
+                    let (_, actual_now) = load_task(self.runtime(), token, &p.id).await?;
+                    return Err(lifecycle_write_conflict(
+                        "transition",
+                        note.id,
+                        &current,
+                        &actual_now,
+                    ));
+                }
+
                 note.properties = Some(props);
                 // notes.status is row-visibility (always "active" for live
                 // rows); GTD status lives in properties.status and W1-G's
                 // remap surfaces it at data.status in the response.
                 note.updated_at = updated_at;
 
-                // atomic transition — conditional SQL
-                // UPDATE so concurrent transitions in the same parallel
-                // batch only one wins.
-                let rows_affected = atomic_gtd_transition(
-                    self.runtime(),
-                    note.id,
-                    &current,
-                    &target,
-                    note.properties.as_ref().unwrap(),
-                    note.updated_at,
-                )
-                .await?;
-
-                if rows_affected == 0 {
-                    let (_, actual_now) = load_task(self.runtime(), token, &p.id).await?;
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "task {} is in terminal state {actual_now:?}; no further transitions allowed",
-                        short_id(note.id)
-                    )));
-                }
-
-                // Write lifecycle audit record (best-effort).
+                // Write lifecycle audit record (best-effort, explicitly reported).
                 ensure_audit_schema(self.runtime()).await;
-                write_audit_record(
+                let audit_persisted = write_audit_record_with_status(
                     self.runtime(),
                     note.id,
                     &current,
@@ -1326,7 +1476,7 @@ impl GtdPack {
                 )
                 .await;
 
-                (note, current, target)
+                (note, current, target, audit_persisted)
             }
         };
 
@@ -1342,6 +1492,208 @@ impl GtdPack {
             "priority": task["priority"],
             "assignee": task["assignee"],
             "due": task["due"],
+            "audit_persisted": audit_persisted,
         }))
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_revision_strictly_advances_a_future_snapshot() {
+        let future_snapshot = Utc::now()
+            .timestamp_micros()
+            .checked_add(86_400_000_000)
+            .expect("one-day future timestamp is representable");
+        assert_eq!(
+            next_lifecycle_updated_at(future_snapshot).expect("advance lifecycle revision"),
+            future_snapshot + 1
+        );
+    }
+
+    async fn seeded_task() -> (KhiveRuntime, NamespaceToken, khive_storage::note::Note) {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize local");
+        let mut task =
+            khive_storage::note::Note::new("local", "task", "canonical-lifecycle-test-task");
+        task.name = Some("canonical-lifecycle-test-task".to_string());
+        task.properties = Some(json!({"status": "inbox", "priority": "p2"}));
+        runtime
+            .notes(&token)
+            .expect("note store")
+            .upsert_note(task.clone())
+            .await
+            .expect("seed task");
+        (runtime, token, task)
+    }
+
+    async fn install_concurrent_mirrored_update(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        snapshot: &khive_storage::note::Note,
+    ) -> i64 {
+        // This is the canonical generic-note CAS seam after the task hook has
+        // synchronized the two body spellings. It starts from the very same
+        // snapshot as the lifecycle decision, then commits first.
+        let (concurrent, _) = runtime
+            .update_note_from_snapshot_with_embedding_report(
+                token,
+                snapshot.clone(),
+                khive_runtime::NotePatch::new(
+                    None,
+                    Some("concurrent mirrored body".to_string()),
+                    None,
+                    None,
+                    Some(json!({"description": "concurrent mirrored body"})),
+                ),
+            )
+            .await
+            .expect("commit concurrent canonical update");
+        concurrent.updated_at
+    }
+
+    async fn assert_concurrent_update_survived(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        task_id: Uuid,
+        concurrent_revision: i64,
+    ) {
+        let persisted = runtime
+            .notes(token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(persisted.updated_at, concurrent_revision);
+        assert_eq!(persisted.content, "concurrent mirrored body");
+        assert_eq!(
+            persisted
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("description"))
+                .and_then(Value::as_str),
+            Some("concurrent mirrored body")
+        );
+        assert_eq!(task_status(persisted.properties.as_ref()), "inbox");
+    }
+
+    #[tokio::test]
+    async fn canonical_transition_refuses_stale_decision_snapshot() {
+        let (runtime, token, task) = seeded_task().await;
+        let decision = prepare_transition(
+            &runtime,
+            &token,
+            &task.id.as_hyphenated().to_string(),
+            "next",
+            None,
+        )
+        .await
+        .expect("prepare transition");
+        let TransitionDecision::Write {
+            note: snapshot,
+            current,
+            target,
+            props,
+            updated_at,
+            ..
+        } = decision
+        else {
+            panic!("inbox -> next must be a write decision");
+        };
+        assert!(updated_at > snapshot.updated_at);
+
+        let concurrent_revision =
+            install_concurrent_mirrored_update(&runtime, &token, &snapshot).await;
+        let affected =
+            atomic_gtd_transition(&runtime, &snapshot, &current, &target, &props, updated_at)
+                .await
+                .expect("execute guarded transition");
+        assert_eq!(affected, 0, "stale transition snapshot must lose its CAS");
+        assert_concurrent_update_survived(&runtime, &token, task.id, concurrent_revision).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_transition_guard_closes_soft_delete_without_revision_change() {
+        let (runtime, token, task) = seeded_task().await;
+        let decision = prepare_transition(
+            &runtime,
+            &token,
+            &task.id.as_hyphenated().to_string(),
+            "next",
+            None,
+        )
+        .await
+        .expect("prepare transition");
+        let TransitionDecision::Write {
+            note: snapshot,
+            current,
+            target,
+            props,
+            updated_at,
+            ..
+        } = decision
+        else {
+            panic!("inbox -> next must be a write decision");
+        };
+
+        assert!(runtime
+            .notes(&token)
+            .expect("note store")
+            .delete_note(task.id, khive_storage::DeleteMode::Soft)
+            .await
+            .expect("soft delete task"));
+        let tombstone = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note_including_deleted(task.id)
+            .await
+            .expect("read tombstone")
+            .expect("tombstone exists");
+        assert_eq!(
+            tombstone.updated_at, snapshot.updated_at,
+            "legacy soft delete deliberately demonstrates why deletion marker is a separate guard"
+        );
+        assert!(tombstone.deleted_at.is_some());
+
+        let affected =
+            atomic_gtd_transition(&runtime, &snapshot, &current, &target, &props, updated_at)
+                .await
+                .expect("execute guarded transition");
+        assert_eq!(affected, 0, "soft-deleted snapshot must lose its CAS");
+    }
+
+    #[tokio::test]
+    async fn canonical_complete_refuses_stale_decision_snapshot() {
+        let (runtime, token, task) = seeded_task().await;
+        let decision = prepare_complete(
+            &runtime,
+            &token,
+            &task.id.as_hyphenated().to_string(),
+            None,
+            Some("shipped"),
+        )
+        .await
+        .expect("prepare complete");
+        assert!(decision.updated_at > decision.note.updated_at);
+
+        let concurrent_revision =
+            install_concurrent_mirrored_update(&runtime, &token, &decision.note).await;
+        let affected = atomic_gtd_transition(
+            &runtime,
+            &decision.note,
+            &decision.current,
+            decision.target,
+            &decision.props,
+            decision.updated_at,
+        )
+        .await
+        .expect("execute guarded complete");
+        assert_eq!(affected, 0, "stale complete snapshot must lose its CAS");
+        assert_concurrent_update_survived(&runtime, &token, task.id, concurrent_revision).await;
     }
 }

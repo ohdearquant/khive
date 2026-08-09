@@ -75,12 +75,20 @@ request(ops="gtd.assign(title=\"Review the task guide\", assignee=\"docs-maintai
 ```
 
 `gtd.transition` validates the lifecycle with `can_transition` before writing.
-A repeated transition to the current status is a no-op. Use `gtd.complete` to
-finish an actionable task (`next` or `active`); it records `completed_at`, and
-can mark the task `done` (the default) or `cancelled`.
+A repeated transition to the current status is a no-op. `gtd.complete` uses the
+same lifecycle table for a terminal transition, records `completed_at`, and can
+mark any non-terminal task `done` (the default) or `cancelled`.
+
+Successful state changes include `audit_persisted`. A value of `false` means the
+task state committed but the best-effort lifecycle-audit append failed; alert or
+reconcile it rather than assuming the audit row exists.
 
 When `gtd.transition` is a no-op, branch on `transitioned`: when it is `false`,
-only `transitioned`, `id`, `full_id`, `from`, `to`, and `note` are present.
+the base fields are `transitioned`, `id`, `full_id`, `from`, `to`, and `note`.
+On canonical dispatch, supplying a transition note also adds `note_recorded`
+and, if that guarded note write succeeds, `audit_persisted`. Atomic v1 uses a
+guarded no-effect assertion for same-status plans and does not persist a supplied
+note; use canonical dispatch when that note event matters.
 
 ## Dependencies
 
@@ -101,8 +109,8 @@ updates and graph links.
   identifier is not work to take without coordination.
 - `done` and `cancelled` cannot transition again. Capture follow-up work as a
   new task instead of trying to reopen a terminal one.
-- `gtd.complete` is for actionable tasks. To finish an inbox, waiting, or
-  someday task directly, use a valid `gtd.transition` to `done` or `cancelled`.
+- `gtd.complete` may finish any non-terminal task directly. It still rejects a
+  task that is already `done` or `cancelled`.
 
 ## See also
 

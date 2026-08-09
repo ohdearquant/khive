@@ -23,7 +23,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 9     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -851,6 +851,9 @@ request(ops="gtd.next(assignee=\"agent:docs\", limit=10)")
 ### `gtd.complete` — Declaration
 
 Mark a task done (or cancelled) with an optional result note.
+Every non-terminal GTD state may move directly to either terminal state. Successful
+state changes include `audit_persisted`; `false` means the task committed but the
+best-effort lifecycle-audit append failed.
 
 | Param    | Type   | Required | Notes                                             |
 | -------- | ------ | -------- | ------------------------------------------------- |
@@ -1256,7 +1259,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 9 verbs
+## `comm` pack — 10 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -1365,7 +1368,8 @@ request(ops="comm.unread()")
 
 ### `comm.read` — Declaration
 
-Mark one or more inbound messages as read. Outbound messages cannot be marked read. Mark writes
+Compatibility mark-read surface for one or more inbound messages. It does not retrieve message
+content; use `comm.inbox` or `comm.thread` for that. Outbound messages cannot be marked read. Mark writes
 are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
 remain fatal, but a post-read mark failure returns `read: false` with `mark_error`. Inspect each
 single or bulk result and re-issue failures later.
@@ -1385,6 +1389,30 @@ Exactly one of `id` or `ids` is required. The bulk response contains ordered
 `failed_count`. Bulk updates are not atomic across messages: validation errors
 reject the call before any write, while later storage errors appear in each
 item's `read` and optional `mark_error`.
+
+### `comm.mark_read` — Declaration
+
+Canonical named bulk mark-read. It accepts the same inbound targets and returns the same bulk
+summary shape as `comm.read(ids=[...])`, while adding an all-or-nothing mutation mode.
+
+| Param    | Type            | Required | Notes                                                                                            |
+| -------- | --------------- | -------- | ------------------------------------------------------------------------------------------------ |
+| `ids`    | array of string | yes      | 1-500 prefixes or full UUIDs. All targets validate up front; duplicate resolved IDs update once. |
+| `atomic` | bool            | no       | Default false. True commits every unique mark in one transaction or rolls the full set back.     |
+
+```
+request(ops="comm.mark_read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
+request(ops="comm.mark_read(ids=[\"<message-id-1>\", \"<message-id-2>\"], atomic=true)")
+```
+
+With the default `atomic=false`, complete prevalidation is followed by the existing best-effort
+per-target storage updates; inspect `read` and `mark_error`. With `atomic=true`, every target is
+rechecked for namespace, message kind, inbound direction, and addressee inside one transaction.
+A failed recheck or transaction statement returns an operation error and leaves every target
+unchanged. A `side_effects_unknown` storage error means the transaction stayed indivisible but its
+commit outcome could not be confirmed; callers must not blindly retry that case. The affected writer
+is retired instead of being reused.
+Retrieve content separately through `comm.inbox` or `comm.thread`.
 
 ### `comm.reply` — Commissive
 

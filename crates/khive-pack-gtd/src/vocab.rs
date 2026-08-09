@@ -63,9 +63,10 @@ pub(crate) static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
 
 /// Pack-auxiliary schema for GTD lifecycle audit.
 ///
-/// `gtd_lifecycle_audit` records every `transition` (and `complete`) invocation
-/// for replay and compliance auditing. The table is idempotent (`CREATE TABLE
-/// IF NOT EXISTS`) and is NOT part of the core versioned migration chain.
+/// `gtd_lifecycle_audit` receives best-effort rows for successful real
+/// `transition`/`complete` changes and canonical same-status note events. The
+/// table is idempotent (`CREATE TABLE IF NOT EXISTS`) and is NOT part of the
+/// core versioned migration chain.
 ///
 /// Every statement must be idempotent so the generic boot applier can call them
 /// on any database (fresh or pre-existing) without error. The fresh-table DDL
