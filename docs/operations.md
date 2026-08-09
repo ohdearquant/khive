@@ -123,12 +123,12 @@ kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --name
     before importing (`archive.rs:93, 233-255`).
   - `--format json` / `--format ndjson`: parsed through `khive_vcs_adapters::JsonFormatAdapter`,
     a flat array of entity/edge records in the adapter's own wire shape (a `json` file is one JSON
-    array; an `ndjson` file is one record per line, joined into an array before parsing). **These
-    two formats are not the same code path as `--format archive`** and validate entity kind
-    earlier, against only the base 8 `khive_types::EntityKind` variants, not the merged pack
-    registry. A pack-registered kind such as `resource` imports successfully with `--format
-    archive` but is rejected by `--format json`/`--format ndjson`; this asymmetry is a known,
-    explicitly-commented gap (`archive.rs:609-620`), not a bug to work around locally.
+    array; an `ndjson` file is one record per line, joined into an array before parsing). These
+    formats pass the merged pack kind registry into the adapter, so pack-registered kinds such as
+    `resource` use the same installed taxonomy as archive import. Canonical `source`+`target`
+    identifies an edge; `from`/`to` remain entity metadata; a complete dual entity/edge signature
+    is rejected as ambiguous. Required names must be non-blank and present timestamps must be valid
+    RFC 3339 strings.
   - A malformed record anywhere in a `json`/`ndjson` array aborts the entire import before any DB
     write; earlier well-formed records in the same file are not partially applied
     (`archive.rs:823-891`).

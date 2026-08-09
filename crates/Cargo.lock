@@ -2542,6 +2542,7 @@ dependencies = [
 name = "khive-vcs-adapters"
 version = "0.7.0"
 dependencies = [
+ "chrono",
  "khive-types",
  "serde",
  "serde_json",

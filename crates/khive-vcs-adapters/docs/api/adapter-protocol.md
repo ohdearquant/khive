@@ -40,8 +40,9 @@ The current modules divide responsibilities as follows: `adapter` defines the tr
 
 The `JsonFormatAdapter` accepts a JSON array of objects. Dispatch:
 
-- Object with `source`/`from` **and** `target`/`to` keys → edge record
-- All other objects → entity record
+- Object with canonical `source` **and** `target` keys → edge record
+- All other objects → entity record (`from`/`to` remain ordinary metadata)
+- Complete `kind`+`name` and `source`+`target` signatures in one object → fatal ambiguity error
 
 Field lookup is case-insensitive (ADR-036 §2). Unknown entity keys fold into `properties`.
 
@@ -51,10 +52,10 @@ requires `impl Read` pipeline wiring.
 
 ## Error boundary
 
-Missing fields, invalid values, structural parse failures, unknown entity kinds, and unknown edge
-relations are fatal. Deferred formats return `AdapterError::NotYetImplemented`. Malformed optional
-reserved fields (e.g. a non-string `created_at`) produce warnings; absent optional fields are
-accepted silently, and unknown non-reserved keys are folded into `properties` without a warning.
+Missing or blank required fields, invalid values, structural parse failures, malformed present
+RFC 3339 timestamps, unknown entity kinds, and unknown edge relations are fatal. Deferred formats
+return `AdapterError::NotYetImplemented`. Absent optional fields are accepted silently, and unknown
+non-reserved keys are folded into `properties` without a warning.
 Callers inspect `warnings()` after draining the streams.
 
 ## Deferred formats

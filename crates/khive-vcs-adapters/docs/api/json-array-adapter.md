@@ -17,13 +17,15 @@ runtime validation.
 
 ## Entity/edge dispatch
 
-Key matching is ASCII case-insensitive. An object with both `source`/`from` and `target`/`to` is an
-edge; every other object is parsed as an entity. Entity and edge iteration drain their stored
-results, so a second call produces no records.
+Key matching is ASCII case-insensitive. An object with canonical `source` and `target` is an edge;
+every other object is parsed as an entity. `from` and `to` are ordinary entity metadata keys. A
+record carrying both the complete entity signature (`kind` and `name`) and complete edge signature
+(`source` and `target`) is a fatal ambiguous-record error. Entity and edge iteration drain their
+stored results, so a second call produces no records.
 
 ## Entity parsing
 
-Required non-empty fields are `kind` and `name`; an absent ID receives a new UUID. Reserved fields
+Required non-blank fields are `kind` and `name`; an absent ID receives a new UUID. Reserved fields
 include `entity_type`, description, tags, timestamps, and properties. Remaining unknown keys fold
 into the properties object rather than being discarded. Unknown kinds fail unless accepted by the
 base taxonomy, an alias, or the supplied extra-kind set.
@@ -33,6 +35,9 @@ base taxonomy, an alias, or the supplied extra-kind set.
 Source, target, and relation are required. Relations always use the closed `EdgeRelation` taxonomy.
 Weight defaults to `0.7` and must be finite in `[0, 1]`; IDs default to new UUIDs. Unknown edge
 relations are fatal regardless of entity schema mode.
+
+For both substrates, a present `created_at` or `updated_at` must be an RFC 3339 string. Absence is
+accepted; a malformed or wrongly typed present value is fatal rather than warned away or defaulted.
 
 ## Warnings and streaming
 

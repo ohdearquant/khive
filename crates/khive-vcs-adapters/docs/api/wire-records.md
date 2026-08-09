@@ -5,10 +5,10 @@ pipeline; adapters do not write them directly to the database.
 
 ## `EntityRecord`
 
-The record carries UUID `id`, string `kind`, optional `entity_type`, non-empty `name`, optional
-description, JSON properties, tags, and optional creation/update timestamp strings. Timestamp
-strings are preserved as supplied without format validation — RFC 3339 conformance is the import
-pipeline's responsibility — and a non-string timestamp value is dropped with a warning. The adapter
+The record carries UUID `id`, string `kind`, optional `entity_type`, non-blank `name`, optional
+description, JSON properties, tags, and optional creation/update timestamp strings. Present
+timestamp values must be RFC 3339 strings and are preserved exactly after validation; malformed or
+non-string timestamp values are fatal. The adapter
 reserves `entity_type`, `created_at`, and `updated_at` before folding unknown input keys into
 properties, so those compatibility fields never appear twice.
 

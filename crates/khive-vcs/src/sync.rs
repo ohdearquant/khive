@@ -698,6 +698,9 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
     for (i, e) in entities.iter().enumerate() {
         EntityKind::from_str(&e.kind)
             .map_err(|_| anyhow!("entity {i} ({}): unknown kind {:?}", e.id, e.kind))?;
+        if e.name.trim().is_empty() {
+            bail!("entity {i} ({}): name must be a non-blank name", e.id);
+        }
 
         if !entity_ids.insert(e.id) {
             bail!("entity {i}: duplicate entity id {}", e.id);
@@ -1411,6 +1414,18 @@ mod tests {
         );
 
         assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "unknown kind").await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_whitespace_only_entity_name_before_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let entities =
+            format!(r#"{{"id":"{id}","kind":"concept","name":"   ","properties":{{}},"tags":[]}}"#);
+
+        assert_sync_rejected_before_db_write(repo, &db_path, &entities, "", "non-blank name").await;
     }
 
     #[tokio::test]

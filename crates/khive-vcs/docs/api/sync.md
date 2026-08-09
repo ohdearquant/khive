@@ -9,7 +9,7 @@ visible as the "current" state.
 
 1. Read `<repo_root>/.khive/kg/entities.ndjson` and `edges.ndjson`.
 2. **Validate-first gate** (`validate_ndjson_records`, issue #476): full
-   ADR-020 structural validation — entity kind validity, entity/edge
+   ADR-020 structural validation — entity kind validity, non-blank entity names, entity/edge
    timestamp validity, entity/edge sort order, duplicate entity ids,
    duplicate edge ids, duplicate semantic edge triples
    `(source, target, relation)`, dangling edge endpoints, edge

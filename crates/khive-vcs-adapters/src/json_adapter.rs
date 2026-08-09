@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 /// A [`FormatAdapter`] that parses a JSON array of objects.
 ///
-/// Parsing is eager; objects with source and target keys become edges. See
+/// Parsing is eager; objects with canonical source and target keys become edges. See
 /// `crates/khive-vcs-adapters/docs/api/json-array-adapter.md`.
 pub struct JsonFormatAdapter {
     entities: Vec<Result<EntityRecord, AdapterError>>,
@@ -66,18 +66,22 @@ impl JsonFormatAdapter {
                 }
             };
 
-            // Normalise keys to lowercase once for dispatch detection.
-            // Keys are matched case-insensitively.
-            let has_source = obj.keys().any(|k| {
-                let l = k.to_ascii_lowercase();
-                l == "source" || l == "from"
-            });
-            let has_target = obj.keys().any(|k| {
-                let l = k.to_ascii_lowercase();
-                l == "target" || l == "to"
-            });
+            // Dispatch only on complete canonical signatures. `from`/`to`
+            // are common entity metadata keys and therefore remain ordinary
+            // properties. A record that supplies both complete signatures is
+            // ambiguous and must fail the whole eager parse before callers can
+            // persist either interpretation.
+            let entity_signature = has_key_ci(&obj, "kind") && has_key_ci(&obj, "name");
+            let edge_signature = has_key_ci(&obj, "source") && has_key_ci(&obj, "target");
+            if entity_signature && edge_signature {
+                return Err(AdapterError::InvalidField {
+                    index,
+                    field: "$record".into(),
+                    reason: "ambiguous record: complete entity (kind + name) and edge (source + target) signatures are both present".into(),
+                });
+            }
 
-            if has_source && has_target {
+            if edge_signature {
                 edges.push(parse_edge(index, obj, &mut warnings));
             } else {
                 entities.push(parse_entity(index, obj, &mut warnings, extra_valid_kinds));
@@ -90,6 +94,10 @@ impl JsonFormatAdapter {
             warnings,
         })
     }
+}
+
+fn has_key_ci(obj: &serde_json::Map<String, Value>, field: &str) -> bool {
+    obj.keys().any(|key| key.eq_ignore_ascii_case(field))
 }
 
 impl FormatAdapter for JsonFormatAdapter {
@@ -126,23 +134,48 @@ fn remove_ci(
     Some((key, val))
 }
 
-/// Extract a required non-empty string field, case-insensitive.
+/// Extract a required non-blank string field, case-insensitive.
 fn extract_required_string(
     obj: &mut serde_json::Map<String, Value>,
     index: usize,
     field: &str,
 ) -> Result<String, AdapterError> {
     match remove_ci(obj, field) {
-        Some((_, Value::String(s))) if !s.is_empty() => Ok(s),
+        Some((_, Value::String(s))) if !s.trim().is_empty() => Ok(s),
         Some(_) => Err(AdapterError::InvalidField {
             index,
             field: field.into(),
-            reason: "must be a non-empty string".into(),
+            reason: "must be a non-blank string".into(),
         }),
         None => Err(AdapterError::MissingField {
             index,
             field: field.into(),
         }),
+    }
+}
+
+fn extract_optional_timestamp(
+    obj: &mut serde_json::Map<String, Value>,
+    index: usize,
+    field: &str,
+) -> Result<Option<String>, AdapterError> {
+    match remove_ci(obj, field) {
+        Some((_, Value::String(raw))) => {
+            chrono::DateTime::parse_from_rfc3339(&raw).map_err(|error| {
+                AdapterError::InvalidField {
+                    index,
+                    field: field.into(),
+                    reason: format!("must be RFC3339: {error}"),
+                }
+            })?;
+            Ok(Some(raw))
+        }
+        Some(_) => Err(AdapterError::InvalidField {
+            index,
+            field: field.into(),
+            reason: "must be an RFC3339 string".into(),
+        }),
+        None => Ok(None),
     }
 }
 
@@ -243,26 +276,8 @@ fn parse_entity(
         None => None,
     };
 
-    let created_at = match remove_ci(&mut obj, "created_at") {
-        Some((_, Value::String(s))) => Some(s),
-        Some(_) => {
-            warnings.push(format!(
-                "record {index}: 'created_at' is not a string; ignored"
-            ));
-            None
-        }
-        None => None,
-    };
-    let updated_at = match remove_ci(&mut obj, "updated_at") {
-        Some((_, Value::String(s))) => Some(s),
-        Some(_) => {
-            warnings.push(format!(
-                "record {index}: 'updated_at' is not a string; ignored"
-            ));
-            None
-        }
-        None => None,
-    };
+    let created_at = extract_optional_timestamp(&mut obj, index, "created_at")?;
+    let updated_at = extract_optional_timestamp(&mut obj, index, "updated_at")?;
 
     let id = extract_uuid_field(&mut obj, index, "id")?;
 
@@ -329,7 +344,6 @@ fn parse_edge(
     warnings: &mut Vec<String>,
 ) -> Result<EdgeRecord, AdapterError> {
     let source = remove_ci(&mut obj, "source")
-        .or_else(|| remove_ci(&mut obj, "from"))
         .and_then(|(_, v)| v.as_str().map(|s| s.to_owned()))
         .ok_or_else(|| AdapterError::MissingField {
             index,
@@ -337,7 +351,6 @@ fn parse_edge(
         })?;
 
     let target = remove_ci(&mut obj, "target")
-        .or_else(|| remove_ci(&mut obj, "to"))
         .and_then(|(_, v)| v.as_str().map(|s| s.to_owned()))
         .ok_or_else(|| AdapterError::MissingField {
             index,
@@ -375,26 +388,8 @@ fn parse_edge(
 
     let weight = extract_weight(&mut obj, index)?;
 
-    let created_at = match remove_ci(&mut obj, "created_at") {
-        Some((_, Value::String(s))) => Some(s),
-        Some(_) => {
-            warnings.push(format!(
-                "record {index}: edge 'created_at' is not a string; ignored"
-            ));
-            None
-        }
-        None => None,
-    };
-    let updated_at = match remove_ci(&mut obj, "updated_at") {
-        Some((_, Value::String(s))) => Some(s),
-        Some(_) => {
-            warnings.push(format!(
-                "record {index}: edge 'updated_at' is not a string; ignored"
-            ));
-            None
-        }
-        None => None,
-    };
+    let created_at = extract_optional_timestamp(&mut obj, index, "created_at")?;
+    let updated_at = extract_optional_timestamp(&mut obj, index, "updated_at")?;
 
     let mut properties = match remove_ci(&mut obj, "properties") {
         Some((_, Value::Object(m))) => m,

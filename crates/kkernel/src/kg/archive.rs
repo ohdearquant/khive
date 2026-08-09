@@ -166,6 +166,10 @@ fn adapter_records_to_archive(
             // Entity kind is validated against the merged pack/runtime kind
             // registry inside `runtime.import_kg`, not here — a bare base-enum
             // parse would reject valid pack-registered kinds like `resource`.
+            let created_at = parse_dt(e.created_at.as_deref(), now)
+                .with_context(|| format!("entity {} invalid created_at", e.id))?;
+            let updated_at = parse_dt(e.updated_at.as_deref(), now)
+                .with_context(|| format!("entity {} invalid updated_at", e.id))?;
             Ok(ExportedEntity {
                 id: e.id,
                 kind: e.kind,
@@ -178,8 +182,8 @@ fn adapter_records_to_archive(
                     Some(e.properties)
                 },
                 tags: e.tags,
-                created_at: parse_dt(e.created_at.as_deref(), now),
-                updated_at: parse_dt(e.updated_at.as_deref(), now),
+                created_at,
+                updated_at,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -339,18 +343,24 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
 
     let exported_entities = entities
         .into_iter()
-        .map(|e| ExportedEntity {
-            id: e.id,
-            kind: e.kind,
-            entity_type: e.entity_type,
-            name: e.name,
-            description: e.description,
-            properties: e.properties,
-            tags: e.tags,
-            created_at: parse_dt(e.created_at.as_deref(), now),
-            updated_at: parse_dt(e.updated_at.as_deref(), now),
+        .map(|e| {
+            let created_at = parse_dt(e.created_at.as_deref(), now)
+                .with_context(|| format!("entity {} invalid created_at", e.id))?;
+            let updated_at = parse_dt(e.updated_at.as_deref(), now)
+                .with_context(|| format!("entity {} invalid updated_at", e.id))?;
+            Ok(ExportedEntity {
+                id: e.id,
+                kind: e.kind,
+                entity_type: e.entity_type,
+                name: e.name,
+                description: e.description,
+                properties: e.properties,
+                tags: e.tags,
+                created_at,
+                updated_at,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let exported_edges = edges
         .into_iter()
@@ -401,11 +411,13 @@ where
     Ok(records)
 }
 
-fn parse_dt(value: Option<&str>, fallback: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
-    value
-        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+fn parse_dt(value: Option<&str>, fallback: chrono::DateTime<Utc>) -> Result<chrono::DateTime<Utc>> {
+    let Some(raw) = value else {
+        return Ok(fallback);
+    };
+    chrono::DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or(fallback)
+        .with_context(|| format!("timestamp {raw:?} must be RFC3339"))
 }
 
 #[cfg(test)]
@@ -843,6 +855,16 @@ mod tests {
         assert_eq!(e.updated_at.to_rfc3339(), "2026-02-02T00:00:00+00:00");
     }
 
+    #[test]
+    fn parse_dt_defaults_only_when_timestamp_is_absent() {
+        let fallback = Utc::now();
+        assert_eq!(parse_dt(None, fallback).unwrap(), fallback);
+
+        let err = parse_dt(Some("not-rfc3339"), fallback)
+            .expect_err("a present malformed timestamp must not become import time");
+        assert!(err.to_string().contains("RFC3339"));
+    }
+
     /// #472: importing adapter JSON with `entity_type`/timestamps end-to-end
     /// through `cmd_import` must land those fields in the runtime, not `None`
     /// + import-time `Utc::now()`.
@@ -961,6 +983,55 @@ mod tests {
         assert!(
             rt2.get_entity(&tok2, never_imported_uuid).await.is_err(),
             "entity preceding the malformed element in the array must not have been imported"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_json_adapter_rejects_malformed_timestamp_without_db_write() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("adapter-malformed-time.db");
+        let valid_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let bad_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let source_path = tmp.path().join("bad-time.json");
+        std::fs::write(
+            &source_path,
+            format!(
+                r#"[{{"id":"{valid_id}","kind":"concept","name":"MustNotLand"}},{{"id":"{bad_id}","kind":"concept","name":"BadTime","created_at":"not-rfc3339"}}]"#
+            ),
+        )
+        .unwrap();
+
+        let err = cmd_import(ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        })
+        .await
+        .expect_err("present malformed timestamps must reject the complete import");
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("created_at")
+                    && cause.to_string().contains("RFC3339")),
+            "error must identify the malformed timestamp: {err:#}"
+        );
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        })
+        .unwrap();
+        let token = runtime.authorize(ns).unwrap();
+        assert!(
+            runtime
+                .get_entity(&token, valid_id.parse().unwrap())
+                .await
+                .is_err(),
+            "the valid record before the malformed record must not be written"
         );
     }
 

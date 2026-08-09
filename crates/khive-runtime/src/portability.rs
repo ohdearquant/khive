@@ -208,11 +208,26 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str().to_owned();
 
+        // Complete deterministic validation before opening a store or issuing
+        // the first write. Endpoint existence and namespace checks remain at
+        // write time because they depend on mutable target state.
+        for (index, entity) in archive.entities.iter().enumerate() {
+            self.validate_entity_kind(&entity.kind)?;
+            if entity.name.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "archive entity {index} ({}) name must be non-blank",
+                    entity.id
+                )));
+            }
+        }
+        for edge in &archive.edges {
+            crate::operations::validate_edge_weight(edge.weight)?;
+        }
+
         let store = self.entities(token)?;
         let mut entities_imported = 0usize;
         let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
         for ee in &archive.entities {
-            self.validate_entity_kind(&ee.kind)?;
             let created_micros = ee.created_at.timestamp_micros();
             let updated_micros = ee.updated_at.timestamp_micros();
             let entity = khive_storage::entity::Entity {
@@ -244,7 +259,6 @@ impl KhiveRuntime {
         let mut edges_imported = 0usize;
         let mut edges_skipped = 0usize;
         for ee in &archive.edges {
-            crate::operations::validate_edge_weight(ee.weight)?;
             let source_ok = match self.get_entity(token, ee.source).await {
                 Ok(_) => true,
                 Err(RuntimeError::NotFound(_)) => false,
@@ -434,6 +448,57 @@ mod tests {
         assert!(summary.embedding_truncation.discarded_bytes > 0);
         let wire = serde_json::to_value(&summary).expect("serialize import summary");
         assert_eq!(wire["embedding_truncation"]["truncated"], 1);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_whitespace_name_before_any_entity_write() {
+        let runtime = make_rt().await;
+        let token = NamespaceToken::local();
+        let valid_id = Uuid::new_v4();
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![
+                ExportedEntity {
+                    id: valid_id,
+                    kind: "concept".to_string(),
+                    entity_type: None,
+                    name: "Must not be written".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                ExportedEntity {
+                    id: Uuid::new_v4(),
+                    kind: "concept".to_string(),
+                    entity_type: None,
+                    name: " \t\n ".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ],
+            edges: vec![],
+        };
+
+        let err = runtime
+            .import_kg(&archive, &token)
+            .await
+            .expect_err("whitespace-only entity names must fail the whole import");
+        assert!(
+            err.to_string().contains("non-blank"),
+            "error must explain the name invariant: {err}"
+        );
+        assert!(
+            runtime.get_entity(&token, valid_id).await.is_err(),
+            "deterministic validation must finish before the first entity write"
+        );
     }
 
     /// 1. Roundtrip: 3 entities + 2 edges survive export → import on a fresh runtime.
