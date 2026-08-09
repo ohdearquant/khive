@@ -4276,8 +4276,8 @@ id = "lambda:fallback"
         // if chunk 1's writes had been rolled back or never reached storage, because
         // the bookkeeping would simply agree with itself. Read it back through the
         // same server so the reconciliation record is checked against the database
-        // it describes. The requested limit stays under the entity list cap, so the
-        // handler returns a bare array rather than a clamp-wrapped object.
+        // it describes. The stable list contract wraps rows in `items` whether or
+        // not the requested limit reaches the entity cap.
         let params = RequestParams {
             ops: r#"list(kind="concept", limit=200)"#.to_string(),
             presentation: None,
@@ -4289,11 +4289,11 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let rows = response["results"][0]["result"]
+        let rows = response["results"][0]["result"]["items"]
             .as_array()
             .unwrap_or_else(|| {
                 panic!(
-                    "read-back must return a bare array under the entity list cap; got {}",
+                    "read-back list result must contain an items array; got {}",
                     response["results"][0]["result"]
                 )
             });
@@ -4375,7 +4375,10 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(response["results"][0]["result"], serde_json::json!([]));
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
@@ -6344,7 +6347,10 @@ backend = "sessions"
 
         let server = isolated_server(&db_path);
         let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
-        assert_eq!(response["results"][0]["result"], serde_json::json!([]));
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
