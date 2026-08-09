@@ -1147,8 +1147,10 @@ impl SessionSweepConfig {
     /// `KHIVE_TX_MAX_AGE_SECS` (the same knobs the daemon's checkpoint task
     /// reads) so a session and the daemon agree on the same thresholds.
     pub fn from_env() -> Self {
-        let mut cfg = Self::default();
-        cfg.interval = session_sweep_interval_from_env();
+        let mut cfg = Self {
+            interval: session_sweep_interval_from_env(),
+            ..Self::default()
+        };
         // Shares `tx_age_thresholds_from_env` with `CheckpointConfig::from_env`
         // (minor, ADR-091 Amendment 2) so a session and the daemon
         // parse and validate `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS`
