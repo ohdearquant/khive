@@ -179,21 +179,26 @@ const TRANSACTION_CONTROL_KEYWORDS: [&str; 7] = [
 
 /// Return the transaction-control keyword heading `sql`, if any.
 ///
-/// Tolerates leading whitespace and `--` line / `/* */` block comments (SQLite
-/// skips both before a statement) and matches the keyword case-insensitively
-/// with a word-boundary check, so e.g. an identifier beginning with `begin`
-/// never matches.
+/// Tolerates leading whitespace, UTF-8 BOMs, empty statements (`;`), and `--`
+/// line / `/* */` block comments (SQLite skips all of them before an executable
+/// statement) and matches the keyword case-insensitively with a word-boundary
+/// check, so e.g. an identifier beginning with `begin` never matches.
 fn transaction_control_head(sql: &str) -> Option<&'static str> {
     let mut rest: &[u8] = sql.as_bytes();
-    if rest.starts_with(b"\xEF\xBB\xBF") {
-        rest = &rest[3..];
-    }
     loop {
         let mut idx = 0;
         while idx < rest.len() && rest[idx].is_ascii_whitespace() {
             idx += 1;
         }
         rest = &rest[idx..];
+        if let Some(tail) = rest.strip_prefix(b"\xEF\xBB\xBF") {
+            rest = tail;
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix(b";") {
+            rest = tail;
+            continue;
+        }
         if let Some(tail) = rest.strip_prefix(b"--") {
             let mut idx = 0;
             while idx < tail.len() && tail[idx] != b'\n' {
@@ -2462,6 +2467,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_read_only_handles_reject_transaction_control_after_sqlite_empty_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_reader_prefixed_tx_control.db")),
+            write_queue_enabled: Some(true),
+            max_readers: 1,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut reader = bridge.reader().await.unwrap();
+
+        for (sql, keyword) in [
+            (
+                " ; -- empty statement\n /* leading comment */ \u{feff} BEGIN DEFERRED",
+                "BEGIN",
+            ),
+            (" /* leading comment */ \u{feff} ; COMMIT", "COMMIT"),
+        ] {
+            let rejected = reader
+                .query_all(SqlStatement {
+                    sql: sql.into(),
+                    params: vec![],
+                    label: None,
+                })
+                .await;
+            assert!(
+                matches!(
+                    &rejected,
+                    Err(StorageError::InvalidInput {
+                        operation,
+                        message,
+                        ..
+                    }) if operation.as_ref() == "query_all"
+                        && message.contains("transaction control")
+                        && message.contains(keyword)
+                ),
+                "cached readers must classify {keyword} through SQLite-empty prefixes; \
+                 got {rejected:?}"
+            );
+            assert_eq!(
+                pool.sql_bridge_reader_slots().available_permits(),
+                1,
+                "prefixed transaction-control rejection must release the operation permit"
+            );
+        }
+
+        let mut queue_backed_writer = bridge.writer().await.unwrap();
+        let rejected = queue_backed_writer
+            .query_all(SqlStatement {
+                sql: "-- leading comment\n \u{feff} ; /* empty */ SAVEPOINT pinned".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                &rejected,
+                Err(StorageError::InvalidInput {
+                    operation,
+                    message,
+                    ..
+                }) if operation.as_ref() == "writer.query_all"
+                    && message.contains("transaction control")
+                    && message.contains("SAVEPOINT")
+            ),
+            "a queue-backed cached reader must classify transaction control through \
+             comments, BOMs, and empty statements; got {rejected:?}"
+        );
+
+        let value = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT 10".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("prefixed transaction-control rejection must preserve the cached reader");
+        assert!(matches!(value, Some(SqlValue::Integer(10))));
+    }
+
+    #[tokio::test]
     async fn cached_reader_restores_autocommit_before_releasing_its_operation_permit() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
@@ -3137,6 +3224,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_execute_batch_rejects_prefixed_commit_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_prefixed_commit_standalone.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch("CREATE TABLE prefixed_commit (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut writer = bridge.writer().await.unwrap();
+
+        let rejected = writer
+            .execute_batch(vec![
+                SqlStatement {
+                    sql: "INSERT INTO prefixed_commit (id) VALUES (1)".into(),
+                    params: vec![],
+                    label: None,
+                },
+                SqlStatement {
+                    sql: " ; -- empty statement\n /* leading comment */ \u{feff} ; COMMIT".into(),
+                    params: vec![],
+                    label: None,
+                },
+            ])
+            .await;
+        assert!(
+            matches!(
+                &rejected,
+                Err(StorageError::InvalidInput {
+                    operation,
+                    message,
+                    ..
+                }) if operation.as_ref() == "execute_batch"
+                    && message.contains("transaction control")
+                    && message.contains("COMMIT")
+            ),
+            "standalone execute_batch must reject a prefixed COMMIT before the INSERT; \
+             got {rejected:?}"
+        );
+
+        let mut reader = bridge.reader().await.unwrap();
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM prefixed_commit".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(count, Some(SqlValue::Integer(0))),
+            "prefixed COMMIT rejection must happen before the earlier INSERT; got {count:?}"
+        );
+
+        let affected = writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO prefixed_commit (id) VALUES (2)".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("prefixed COMMIT rejection must leave the standalone handle reusable");
+        assert_eq!(affected, 1);
+    }
+
+    #[tokio::test]
     async fn execute_batch_rejects_multi_statement_on_pool_backed_path() {
         let pool = Arc::new(ConnectionPool::new(PoolConfig::default()).unwrap());
         pool.writer()
@@ -3261,6 +3421,11 @@ mod tests {
             ("release savepoint sp1", Some("RELEASE")),
             ("   \t COMMIT", Some("COMMIT")),
             ("\u{feff}BEGIN", Some("BEGIN")),
+            (" ; BEGIN", Some("BEGIN")),
+            (" ; ; -- empty\n /* comment */ COMMIT", Some("COMMIT")),
+            ("  \u{feff} SAVEPOINT sp1", Some("SAVEPOINT")),
+            ("/* comment */ \u{feff} ; RELEASE sp1", Some("RELEASE")),
+            ("\u{feff} ; \u{feff} -- empty\n ROLLBACK", Some("ROLLBACK")),
             ("-- a comment\nCOMMIT", Some("COMMIT")),
             // SQLite does not nest block comments: the comment ends at the
             // first `*/`, leaving `*/ COMMIT`, which is not a statement head.
@@ -3272,6 +3437,8 @@ mod tests {
             ("SELECT * FROM commit_log", None),
             ("CREATE TABLE rollback_audit (id INTEGER)", None),
             ("/* comment only */", None),
+            (" ; /* empty statements only */ ; ", None),
+            (" ; SELECT 1", None),
             ("", None),
         ] {
             assert_eq!(
@@ -3339,6 +3506,36 @@ mod tests {
         assert!(
             matches!(&rejected, Err(StorageError::InvalidInput { .. })),
             "a bare COMMIT in a queue-backed batch must be rejected up front; got {rejected:?}"
+        );
+
+        let prefixed = khive_storage::SqlWriter::execute_batch(
+            &mut *writer,
+            vec![
+                SqlStatement {
+                    sql: "INSERT INTO tx_reject_queue_test (id, val) VALUES (3, 'prefixed')".into(),
+                    params: vec![],
+                    label: None,
+                },
+                SqlStatement {
+                    sql: "/* leading */ \u{feff} ; -- empty\n ; COMMIT".into(),
+                    params: vec![],
+                    label: None,
+                },
+            ],
+        )
+        .await;
+        assert!(
+            matches!(
+                &prefixed,
+                Err(StorageError::InvalidInput {
+                    operation,
+                    message,
+                    ..
+                }) if operation.as_ref() == "execute_batch"
+                    && message.contains("transaction control")
+                    && message.contains("COMMIT")
+            ),
+            "a prefixed COMMIT must be rejected before touching the writer task; got {prefixed:?}"
         );
 
         let affected = khive_storage::SqlWriter::execute_batch(
