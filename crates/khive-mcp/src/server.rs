@@ -437,6 +437,14 @@ pub struct KhiveMcpServer {
     /// deployments. `None` in single-backend mode — all dispatch goes through the
     /// `VerbRegistry` unchanged (zero-change invariant).
     coordinator: Option<Arc<dyn CoordinatorService>>,
+    /// The default-backend `KhiveRuntime` this server was built from, kept so
+    /// background daemon tasks (e.g. the email outbox loop) can reach
+    /// non-wire owner APIs — such as the ADR-124-sanctioned store-level
+    /// property claim — that have no verb surface and so cannot go through
+    /// `registry.dispatch`. `None` only for servers built via
+    /// [`Self::from_registry`]/[`Self::from_registry_with_meta`] without an
+    /// explicit [`Self::with_runtime`] call (test-only construction paths).
+    runtime: Option<KhiveRuntime>,
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
     /// or registry-only servers that have no persistent database.
     pool: Option<Arc<ConnectionPool>>,
@@ -639,6 +647,7 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            runtime: Some(runtime),
         })
     }
 
@@ -661,6 +670,7 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            runtime: None,
         }
     }
 
@@ -682,7 +692,17 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            runtime: None,
         }
+    }
+
+    /// Attach the default-backend `KhiveRuntime` (see the `runtime` field docs
+    /// on [`KhiveMcpServer`]). Used by the multi-backend boot path to wire in
+    /// the same `default_runtime` it already resolved while building the
+    /// registry.
+    pub fn with_runtime(mut self, runtime: KhiveRuntime) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     /// Override the server-level default output format (ADR-078).
@@ -731,6 +751,15 @@ impl KhiveMcpServer {
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     pub(crate) fn verb_registry_clone(&self) -> VerbRegistry {
         self.registry.clone()
+    }
+
+    /// Clone the default-backend `KhiveRuntime`, if this server was built with
+    /// one, for use by background tasks that need a non-wire owner API (e.g.
+    /// the email outbox loop's `external_id` claim). `KhiveRuntime` is
+    /// internally `Arc`-wrapped so this clone is cheap.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    pub(crate) fn runtime_clone(&self) -> Option<KhiveRuntime> {
+        self.runtime.clone()
     }
 
     /// Route a `link` or `search` verb through the coordinator when in multi-backend mode.
