@@ -130,3 +130,116 @@ Deno.test("adaptJson — description is top-level field, not in properties", () 
   assertEquals(r.entities[0].description, "My description");
   assertEquals(r.entities[0].properties["description"], undefined);
 });
+
+Deno.test("#1758 adaptJson — rejects ambiguous complete entity and edge signatures", () => {
+  const text = JSON.stringify([{
+    name: "Ambiguous",
+    kind: "concept",
+    source: "a",
+    target: "b",
+    relation: "depends_on",
+  }]);
+  assertThrows(() => adaptJson(text), Error, "ambiguous");
+});
+
+Deno.test("#1758 adaptJson — preserves original nonblank entity name bytes", () => {
+  const originalName = "  LoRA\t";
+  const result = adaptJson(JSON.stringify([{ name: originalName, kind: "concept" }]));
+  assertEquals(result.entities[0].name, originalName);
+});
+
+Deno.test("#1758 adaptJson — from and to remain ordinary entity properties", () => {
+  const result = adaptJson(JSON.stringify([{
+    name: "Metadata",
+    kind: "concept",
+    from: "source-note",
+    to: "target-note",
+  }]));
+  assertEquals(result.entities.length, 1);
+  assertEquals(result.edges.length, 0);
+  assertEquals(result.entities[0].properties["from"], "source-note");
+  assertEquals(result.entities[0].properties["to"], "target-note");
+});
+
+Deno.test("#1758 adaptJson — preserves valid entity timestamps outside properties", () => {
+  const createdAt = "2026-08-09T15:04:05.123+02:30";
+  const updatedAt = "2026-08-09T13:04:06Z";
+  const result = adaptJson(JSON.stringify([{
+    name: "Timestamped",
+    kind: "concept",
+    created_at: createdAt,
+    updated_at: updatedAt,
+  }]));
+  assertEquals(Reflect.get(result.entities[0], "created_at"), createdAt);
+  assertEquals(Reflect.get(result.entities[0], "updated_at"), updatedAt);
+  assertEquals(result.entities[0].properties["created_at"], undefined);
+  assertEquals(result.entities[0].properties["updated_at"], undefined);
+});
+
+Deno.test("#1758 adaptJson — preserves valid edge timestamps outside properties", () => {
+  const createdAt = "2026-08-09T13:04:05Z";
+  const updatedAt = "2026-08-09T13:04:06.5-04:00";
+  const result = adaptJson(JSON.stringify([{
+    source: "a",
+    target: "b",
+    relation: "depends_on",
+    created_at: createdAt,
+    updated_at: updatedAt,
+  }]));
+  assertEquals(Reflect.get(result.edges[0], "created_at"), createdAt);
+  assertEquals(Reflect.get(result.edges[0], "updated_at"), updatedAt);
+  assertEquals(result.edges[0].properties["created_at"], undefined);
+  assertEquals(result.edges[0].properties["updated_at"], undefined);
+});
+
+Deno.test("#1758 adaptJson — rejects every present invalid entity timestamp", () => {
+  const invalidValues: unknown[] = [
+    null,
+    true,
+    42,
+    {},
+    [],
+    "",
+    "2026-08-09",
+    "2026-02-30T13:04:05Z",
+    "2026-08-09T13:04:05",
+  ];
+  for (const field of ["created_at", "updated_at"]) {
+    for (const invalid of invalidValues) {
+      assertThrows(
+        () => adaptJson(JSON.stringify([{ name: "Bad time", kind: "concept", [field]: invalid }])),
+        Error,
+        field,
+      );
+    }
+  }
+});
+
+Deno.test("#1758 adaptJson — rejects every present invalid edge timestamp", () => {
+  const invalidValues: unknown[] = [
+    null,
+    true,
+    42,
+    {},
+    [],
+    "",
+    "2026-08-09",
+    "2026-02-30T13:04:05Z",
+    "2026-08-09T13:04:05",
+  ];
+  for (const field of ["created_at", "updated_at"]) {
+    for (const invalid of invalidValues) {
+      assertThrows(
+        () =>
+          adaptJson(JSON.stringify([{
+            source: "a",
+            target: "b",
+            relation: "depends_on",
+            [field]: invalid,
+          }])),
+        Error,
+        field,
+      );
+    }
+  }
+});

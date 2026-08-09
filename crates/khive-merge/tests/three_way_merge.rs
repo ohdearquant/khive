@@ -50,6 +50,9 @@ fn edge(src: Uuid, tgt: Uuid) -> ExportedEdge {
         target: tgt,
         relation: EdgeRelation::Extends,
         weight: 1.0,
+        properties: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
     }
 }
 
@@ -60,6 +63,9 @@ fn edge_weighted(src: Uuid, tgt: Uuid, weight: f64) -> ExportedEdge {
         target: tgt,
         relation: EdgeRelation::Extends,
         weight,
+        properties: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
     }
 }
 
@@ -750,6 +756,9 @@ fn merge_preserves_weight_modified_edge_id() {
         target: b,
         relation: EdgeRelation::Extends,
         weight: 0.5,
+        properties: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
     };
     let ours_edge = ExportedEdge {
         edge_id: Uuid::new_v4(),
@@ -757,6 +766,9 @@ fn merge_preserves_weight_modified_edge_id() {
         target: b,
         relation: EdgeRelation::Extends,
         weight: 0.9,
+        properties: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
     };
     let expected_id = ours_edge.edge_id;
     let entities = vec![entity(a, "A"), entity(b, "B")];
@@ -1034,6 +1046,9 @@ fn rejects_duplicate_edge_ids_in_archive() {
             target: b,
             relation: EdgeRelation::Extends,
             weight: 1.0,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         },
         ExportedEdge {
             edge_id: dup_id,
@@ -1041,6 +1056,9 @@ fn rejects_duplicate_edge_ids_in_archive() {
             target: d,
             relation: EdgeRelation::DependsOn,
             weight: 1.0,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         },
     ];
     let theirs = archive_full(vec![], vec![]);
@@ -1080,6 +1098,9 @@ fn rejects_swapped_symmetric_duplicate_edges_in_archive() {
                 target: hi,
                 relation: EdgeRelation::CompetesWith,
                 weight: 1.0,
+                properties: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
             },
             ExportedEdge {
                 edge_id: Uuid::new_v4(),
@@ -1087,6 +1108,9 @@ fn rejects_swapped_symmetric_duplicate_edges_in_archive() {
                 target: lo,
                 relation: EdgeRelation::CompetesWith,
                 weight: 1.0,
+                properties: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
             },
         ],
     );

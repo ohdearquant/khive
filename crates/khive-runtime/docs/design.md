@@ -48,6 +48,8 @@
 - Embeddings are excluded from archives (regenerable from text + model)
 - Edges are collected by source entity, not by namespace scan, to capture cross-entity relationships
 - `edge_id` field on `ExportedEdge` is stable across export/import cycles; old archives without it receive a fresh UUID on import
+- `ExportedEdge::properties` round-trips storage `metadata`, and its independent creation/update
+  timestamps are preserved; legacy archives missing timestamps receive import-time defaults
 
 ### Note Kinds and Annotation (ADR-013, ADR-024)
 
@@ -177,6 +179,8 @@
 
 - `ExportedEdge::edge_id` carries the stable `LinkId` UUID across export/import cycles,
   as specified in ADR-020 (Git-Native KG Implementation) §edge_id.
+- `ExportedEdge::properties` maps to `Edge::metadata`; `created_at` and `updated_at` are
+  exported and imported independently rather than being regenerated.
 - Old archives (pre-0.2) omit `edge_id`; `serde(default)` assigns a fresh UUID on import.
 
 ### Persistent Daemon (ADR-049)

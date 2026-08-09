@@ -14,6 +14,8 @@ export interface EntityRecord {
   properties: Record<string, unknown>;
   /** Top-level field per ADR-048. undefined means absent from source; canonicalEntityJson emits []. */
   tags?: string[];
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface EdgeRecord {
@@ -23,4 +25,6 @@ export interface EdgeRecord {
   relation: string;
   weight?: number;
   properties: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
 }

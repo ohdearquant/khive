@@ -167,6 +167,11 @@ opaque stable handle for `update`/`delete`. `target` may be a local UUID or a
 `kg://<remote>/<namespace>/<id>` cross-repo reference (§8, per
 [ADR-037](ADR-037-remote-resolution-and-hash-verification.md)).
 
+Edge `properties` map losslessly to the storage edge's `metadata` object and participate in
+snapshot identity after recursive key canonicalization. `created_at` and `updated_at` remain
+independent provenance fields through adapter, archive, runtime, local-sync, and remote-hash paths;
+a missing legacy timestamp may use import time, while a present value is never replaced.
+
 Field ordering within both record types is fixed at the serializer level. Re-exporting
 the same logical state always produces the same bytes — a property the SHA-256 snapshot
 hash from [ADR-010](ADR-010-kg-versioning.md) depends on.

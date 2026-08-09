@@ -3,13 +3,14 @@
  *
  * Reads a JSON file containing an array of objects. Each object is either an
  * entity or an edge depending on which fields are present:
- *   - has source + target  → edge
- *   - otherwise            → entity (name required)
+ *   - complete source + target signature  → edge
+ *   - otherwise                           → entity (name required)
  *
  * Entity fields recognized case-insensitively (ADR-036 §JSON-detection):
- *   id, name, kind, description, tags.
+ *   id, name, kind, description, tags, created_at, updated_at.
  * Everything else collects into `properties`. Edge fields recognized:
- *   edge_id, source, target, relation, weight; everything else → properties.
+ *   edge_id, source, target, relation, weight, created_at, updated_at;
+ * everything else → properties.
  *
  * Fatal errors (throw): JSON parse errors, non-array top level, missing
  * required fields (name, kind/defaultKind). These are never silently promoted
@@ -18,6 +19,7 @@
 
 import type { EdgeRecord, EntityRecord } from "./types.ts";
 import { randomUuid } from "./util.ts";
+import { isRfc3339Timestamp } from "../rfc3339.ts";
 
 export interface JsonImportResult {
   entities: EntityRecord[];
@@ -31,6 +33,8 @@ const ENTITY_RESERVED_LOWER = new Set([
   "kind",
   "description",
   "tags",
+  "created_at",
+  "updated_at",
   "properties",
 ]);
 const EDGE_RESERVED_LOWER = new Set([
@@ -39,6 +43,8 @@ const EDGE_RESERVED_LOWER = new Set([
   "target",
   "relation",
   "weight",
+  "created_at",
+  "updated_at",
   "properties",
 ]);
 
@@ -63,6 +69,21 @@ function getField(
   const rawKey = lowerMap.get(lowerKey);
   if (rawKey === undefined) return undefined;
   return obj[rawKey];
+}
+
+function extractOptionalTimestamp(
+  obj: Record<string, unknown>,
+  lowerMap: Map<string, string>,
+  index: number,
+  field: string,
+): string | undefined {
+  const rawKey = lowerMap.get(field);
+  if (rawKey === undefined) return undefined;
+  const value = obj[rawKey];
+  if (!isRfc3339Timestamp(value)) {
+    throw new Error(`item ${index}: "${field}" must be an RFC3339 string`);
+  }
+  return value;
 }
 
 export function adaptJson(
@@ -94,20 +115,24 @@ export function adaptJson(
     const obj = item as Record<string, unknown>;
     const lm = buildLowerMap(obj);
 
-    // Edge detection: has source + target (case-insensitive).
-    const sourceVal = getField(obj, lm, "source");
-    const targetVal = getField(obj, lm, "target");
-    if (typeof sourceVal === "string" && typeof targetVal === "string") {
-      // Missing relation on an otherwise-valid edge object is fatal.
-      const relationVal = getField(obj, lm, "relation");
-      if (!relationVal || typeof relationVal !== "string" || !relationVal.trim()) {
-        throw new Error(`item ${i}: edge object is missing required "relation" field`);
+    // Dispatch only on complete canonical signatures. `from`/`to` remain
+    // ordinary entity properties. Supplying both signatures is ambiguous.
+    const entitySignature = lm.has("kind") && lm.has("name");
+    const edgeSignature = lm.has("source") && lm.has("target");
+    if (entitySignature && edgeSignature) {
+      throw new Error(
+        `item ${i}: ambiguous record has complete entity (kind + name) and edge (source + target) signatures`,
+      );
+    }
+
+    if (edgeSignature) {
+      for (const field of ["source", "target", "relation"]) {
+        const value = getField(obj, lm, field);
+        if (typeof value !== "string" || !value.trim()) {
+          throw new Error(`item ${i}: edge "${field}" must be a non-blank string`);
+        }
       }
-      const edge = extractEdge(obj, lm);
-      if (edge) edges.push(edge);
-      else {
-        throw new Error(`item ${i}: edge has empty source/target/relation`);
-      }
+      edges.push(extractEdge(obj, lm, i));
       continue;
     }
 
@@ -117,14 +142,16 @@ export function adaptJson(
       throw new Error(`item ${i}: entity object is missing required "name" field`);
     }
     const kindVal = getField(obj, lm, "kind");
-    const kindRaw = typeof kindVal === "string" ? kindVal.trim() : "";
-    if (!kindRaw && !defaultKind) {
+    if (lm.has("kind") && (typeof kindVal !== "string" || !kindVal.trim())) {
+      throw new Error(`item ${i}: entity "kind" must be a non-blank string`);
+    }
+    if (!lm.has("kind") && (typeof defaultKind !== "string" || !defaultKind.trim())) {
       throw new Error(
         `item ${i}: entity object is missing "kind" field and no --default-kind was specified`,
       );
     }
 
-    const entity = extractEntity(obj, lm, defaultKind);
+    const entity = extractEntity(obj, lm, defaultKind, i);
     if (entity) {
       entities.push(entity);
     } else {
@@ -140,17 +167,18 @@ function extractEntity(
   obj: Record<string, unknown>,
   lm: Map<string, string>,
   defaultKind: string | undefined,
+  index: number,
 ): EntityRecord | null {
   const idVal = getField(obj, lm, "id");
   const id = typeof idVal === "string" && idVal.length > 0 ? idVal : randomUuid();
 
   const nameVal = getField(obj, lm, "name");
-  const name = typeof nameVal === "string" ? nameVal.trim() : "";
-  if (!name) return null;
+  const name = typeof nameVal === "string" ? nameVal : "";
+  if (!name.trim()) return null;
 
   const kindVal = getField(obj, lm, "kind");
   const kindRaw = typeof kindVal === "string" ? kindVal.trim() : "";
-  const kind = kindRaw || defaultKind;
+  const kind = kindRaw || defaultKind?.trim();
   if (!kind) return null;
 
   // description is a top-level field (ADR-048), not a property.
@@ -177,16 +205,22 @@ function extractEntity(
     ? tagsVal.filter((t): t is string => typeof t === "string")
     : undefined;
 
+  const created_at = extractOptionalTimestamp(obj, lm, index, "created_at");
+  const updated_at = extractOptionalTimestamp(obj, lm, index, "updated_at");
+
   const record: EntityRecord = { id, name, kind, properties };
   if (description !== undefined) record.description = description;
   if (tags !== undefined) record.tags = tags;
+  if (created_at !== undefined) record.created_at = created_at;
+  if (updated_at !== undefined) record.updated_at = updated_at;
   return record;
 }
 
 function extractEdge(
   obj: Record<string, unknown>,
   lm: Map<string, string>,
-): EdgeRecord | null {
+  index: number,
+): EdgeRecord {
   const sourceVal = getField(obj, lm, "source");
   const targetVal = getField(obj, lm, "target");
   const relationVal = getField(obj, lm, "relation");
@@ -194,7 +228,6 @@ function extractEdge(
   const source = String(sourceVal ?? "").trim();
   const target = String(targetVal ?? "").trim();
   const relation = String(relationVal ?? "").trim();
-  if (!source || !target || !relation) return null;
 
   const edgeIdVal = getField(obj, lm, "edge_id");
   const edge_id = typeof edgeIdVal === "string" && edgeIdVal.length > 0 ? edgeIdVal : randomUuid();
@@ -214,5 +247,7 @@ function extractEdge(
     if (v === undefined || v === null) continue;
     properties[k] = v;
   }
-  return { edge_id, source, target, relation, weight, properties };
+  const created_at = extractOptionalTimestamp(obj, lm, index, "created_at");
+  const updated_at = extractOptionalTimestamp(obj, lm, index, "updated_at");
+  return { edge_id, source, target, relation, weight, properties, created_at, updated_at };
 }

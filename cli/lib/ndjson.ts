@@ -6,6 +6,7 @@
  */
 
 import { EDGES_FILE, ENTITIES_FILE } from "./paths.ts";
+import { isRfc3339Timestamp } from "./rfc3339.ts";
 
 // ─── Domain types ────────────────────────────────────────────────────────────
 
@@ -56,6 +57,8 @@ export interface Entity {
   id: string;
   name: string;
   kind: EntityKind;
+  created_at?: string;
+  updated_at?: string;
   [key: string]: unknown;
 }
 
@@ -65,6 +68,8 @@ export interface Edge {
   source: string;
   target: string;
   relation: EdgeRelation;
+  created_at?: string;
+  updated_at?: string;
   [key: string]: unknown;
 }
 
@@ -74,6 +79,13 @@ export interface Edge {
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
     .test(value);
+}
+
+function hasValidOptionalTimestamps(obj: Record<string, unknown>): boolean {
+  for (const field of ["created_at", "updated_at"]) {
+    if (Object.hasOwn(obj, field) && !isRfc3339Timestamp(obj[field])) return false;
+  }
+  return true;
 }
 
 // ─── Parsing helpers ──────────────────────────────────────────────────────────
@@ -88,8 +100,9 @@ export function parseEntityLine(json: unknown): Entity | null {
   }
   const obj = json as Record<string, unknown>;
   if (typeof obj["id"] !== "string" || !isUuid(obj["id"])) return null;
-  if (typeof obj["name"] !== "string" || obj["name"].length === 0) return null;
+  if (typeof obj["name"] !== "string" || obj["name"].trim().length === 0) return null;
   if (!ENTITY_KINDS.includes(obj["kind"] as EntityKind)) return null;
+  if (!hasValidOptionalTimestamps(obj)) return null;
   return obj as Entity;
 }
 
@@ -105,13 +118,14 @@ export function parseEdgeLine(json: unknown): Edge | null {
   }
   const obj = json as Record<string, unknown>;
   if (typeof obj["edge_id"] !== "string" || !isUuid(obj["edge_id"])) return null;
-  if (typeof obj["source"] !== "string" || obj["source"].length === 0) {
+  if (typeof obj["source"] !== "string" || obj["source"].trim().length === 0) {
     return null;
   }
-  if (typeof obj["target"] !== "string" || obj["target"].length === 0) {
+  if (typeof obj["target"] !== "string" || obj["target"].trim().length === 0) {
     return null;
   }
   if (!EDGE_RELATIONS.includes(obj["relation"] as EdgeRelation)) return null;
+  if (!hasValidOptionalTimestamps(obj)) return null;
   return obj as Edge;
 }
 

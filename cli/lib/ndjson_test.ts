@@ -38,6 +38,51 @@ Deno.test("parseEntityLine: rejects unknown kind", () => {
   assertEquals(entity, null);
 });
 
+Deno.test("#1758 parseEntityLine: rejects whitespace-only name", () => {
+  const entity = parseEntityLine({
+    id: "00000000-0000-0000-0000-000000000001",
+    name: " \t\n ",
+    kind: "concept",
+  });
+  assertEquals(entity, null);
+});
+
+Deno.test("#1758 parseEntityLine: accepts valid RFC3339 timestamps", () => {
+  const entity = parseEntityLine({
+    id: "00000000-0000-0000-0000-000000000001",
+    name: "LoRA",
+    kind: "concept",
+    created_at: "2026-08-09T13:04:05.123Z",
+    updated_at: "2026-08-09T09:04:06-04:00",
+  });
+  assertEquals(entity !== null, true);
+});
+
+Deno.test("#1758 parseEntityLine: rejects every present invalid timestamp", () => {
+  const invalidValues: unknown[] = [
+    null,
+    true,
+    42,
+    {},
+    [],
+    "",
+    "2026-08-09",
+    "2026-02-30T13:04:05Z",
+    "2026-08-09T13:04:05",
+  ];
+  for (const field of ["created_at", "updated_at"]) {
+    for (const invalid of invalidValues) {
+      const entity = parseEntityLine({
+        id: "00000000-0000-0000-0000-000000000001",
+        name: "LoRA",
+        kind: "concept",
+        [field]: invalid,
+      });
+      assertEquals(entity, null);
+    }
+  }
+});
+
 // ─── parseEdgeLine (ADR-048 field names) ─────────────────────────────────────
 
 Deno.test("parseEdgeLine: accepts edge with ADR-048 fields (edge_id/source/target)", () => {
@@ -127,6 +172,44 @@ Deno.test("parseEdgeLine: accepts remote ref as target (non-UUID string)", () =>
   });
   assertEquals(edge !== null, true);
   assertEquals(edge!.target, "lattice:00000000-0000-0000-0000-000000000099");
+});
+
+Deno.test("#1758 parseEdgeLine: accepts valid RFC3339 timestamps", () => {
+  const edge = parseEdgeLine({
+    edge_id: "eeeeeeee-0000-0000-0000-000000000001",
+    source: "00000000-0000-0000-0000-000000000001",
+    target: "00000000-0000-0000-0000-000000000002",
+    relation: "implements",
+    created_at: "2026-08-09T13:04:05Z",
+    updated_at: "2026-08-09T13:04:06.5+00:00",
+  });
+  assertEquals(edge !== null, true);
+});
+
+Deno.test("#1758 parseEdgeLine: rejects every present invalid timestamp", () => {
+  const invalidValues: unknown[] = [
+    null,
+    true,
+    42,
+    {},
+    [],
+    "",
+    "2026-08-09",
+    "2026-02-30T13:04:05Z",
+    "2026-08-09T13:04:05",
+  ];
+  for (const field of ["created_at", "updated_at"]) {
+    for (const invalid of invalidValues) {
+      const edge = parseEdgeLine({
+        edge_id: "eeeeeeee-0000-0000-0000-000000000001",
+        source: "00000000-0000-0000-0000-000000000001",
+        target: "00000000-0000-0000-0000-000000000002",
+        relation: "implements",
+        [field]: invalid,
+      });
+      assertEquals(edge, null);
+    }
+  }
 });
 
 Deno.test("parseEdgeLine: accepts null input gracefully", () => {

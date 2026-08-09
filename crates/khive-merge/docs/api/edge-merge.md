@@ -30,7 +30,7 @@ The edge pass applies the following policies:
 | deleted          | weight changed    | `EdgeModifyDelete`                 |
 | weight changed   | deleted           | `EdgeModifyDelete`                 |
 
-Maximum weight is the automatic last-write-wins policy for simultaneous weight changes. When rebuilding a modified edge, the implementation preserves an ID from the responsible branch; simultaneous changes prefer ours for deterministic identity. A fresh UUID is only a defensive fallback when no originating edge can be found.
+Maximum weight is the automatic last-write-wins policy for simultaneous weight changes. When rebuilding a modified edge, the implementation preserves the responsible branch's ID, properties, and independent timestamps; simultaneous changes prefer ours for deterministic identity. A fresh UUID with import-time timestamps is only a defensive fallback when no originating edge can be found.
 
 Relation reconstruction can return `MergeError::Internal` if the semantic key's relation string no longer parses as a governed relation.
 

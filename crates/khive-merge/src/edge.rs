@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
 use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
@@ -106,8 +107,8 @@ pub fn merge_edges(
                 Some(EdgeChange::Unchanged),
             )
             | (Some(EdgeChange::WeightModified { branch_weight, .. }), None) => {
-                let id = ours_edge_map.get(key).map(|e| e.edge_id);
-                let edge = build_edge(key, *branch_weight, id)?;
+                let existing = ours_edge_map.get(key).copied();
+                let edge = build_edge(key, *branch_weight, existing)?;
                 merged.push(edge);
             }
 
@@ -116,8 +117,8 @@ pub fn merge_edges(
                 Some(EdgeChange::WeightModified { branch_weight, .. }),
             )
             | (None, Some(EdgeChange::WeightModified { branch_weight, .. })) => {
-                let id = theirs_edge_map.get(key).map(|e| e.edge_id);
-                let edge = build_edge(key, *branch_weight, id)?;
+                let existing = theirs_edge_map.get(key).copied();
+                let edge = build_edge(key, *branch_weight, existing)?;
                 merged.push(edge);
             }
 
@@ -132,11 +133,11 @@ pub fn merge_edges(
                     ..
                 }),
             ) => {
-                let id = ours_edge_map
+                let existing = ours_edge_map
                     .get(key)
                     .or_else(|| theirs_edge_map.get(key))
-                    .map(|e| e.edge_id);
-                let edge = build_edge(key, f64::max(*ours_w, *theirs_w), id)?;
+                    .copied();
+                let edge = build_edge(key, f64::max(*ours_w, *theirs_w), existing)?;
                 merged.push(edge);
             }
 
@@ -196,22 +197,26 @@ pub fn validate_dangling_edges(
     conflicts
 }
 
-/// Reconstructs an edge, preserving `existing_id` or minting a fallback UUID.
+/// Reconstructs an edge, preserving the selected branch's identity and
+/// timestamps, or minting import-time provenance for a synthetic fallback.
 fn build_edge(
     key: &EdgeKey,
     weight: f64,
-    existing_id: Option<Uuid>,
+    existing: Option<&ExportedEdge>,
 ) -> Result<ExportedEdge, MergeError> {
     let relation = key
         .relation
         .parse::<khive_storage::EdgeRelation>()
         .map_err(|e| MergeError::Internal(e.to_string()))?;
     Ok(ExportedEdge {
-        edge_id: existing_id.unwrap_or_else(Uuid::new_v4),
+        edge_id: existing.map_or_else(Uuid::new_v4, |edge| edge.edge_id),
         source: key.source,
         target: key.target,
         relation,
         weight,
+        properties: existing.and_then(|edge| edge.properties.clone()),
+        created_at: existing.map_or_else(Utc::now, |edge| edge.created_at),
+        updated_at: existing.map_or_else(Utc::now, |edge| edge.updated_at),
     })
 }
 
@@ -242,6 +247,9 @@ mod tests {
             target: tgt,
             relation: EdgeRelation::Extends,
             weight,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -341,6 +349,9 @@ mod tests {
             target: b,
             relation: EdgeRelation::Extends,
             weight: 0.5,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         let ours_edge = ExportedEdge {
             edge_id: Uuid::new_v4(),
@@ -348,6 +359,9 @@ mod tests {
             target: b,
             relation: EdgeRelation::Extends,
             weight: 0.9,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         let expected_id = ours_edge.edge_id;
 

@@ -26,6 +26,7 @@ import { validate } from "./validate.ts";
 import { adaptCsv } from "../lib/importers/csv.ts";
 import { adaptJson } from "../lib/importers/json.ts";
 import type { EdgeRecord, EntityRecord } from "../lib/importers/types.ts";
+import { isRfc3339Timestamp } from "../lib/rfc3339.ts";
 
 // ─── KgArchive types ──────────────────────────────────────────────────────────
 
@@ -48,6 +49,8 @@ interface KgArchiveEdge {
   relation: string;
   weight?: number;
   properties?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
   [key: string]: unknown;
 }
 
@@ -188,6 +191,7 @@ function mergeEdgeConflict(
     ...existing,
     properties: mergedProperties,
     weight: incoming.weight ?? existing.weight,
+    updated_at: incoming.updated_at ?? existing.updated_at,
   };
 }
 
@@ -252,6 +256,14 @@ function isUuid(value: unknown): value is string {
   );
 }
 
+function validateOptionalTimestamps(record: Record<string, unknown>, label: string): void {
+  for (const field of ["created_at", "updated_at"]) {
+    if (Object.hasOwn(record, field) && !isRfc3339Timestamp(record[field])) {
+      throw new Error(`${label} "${field}" must be an RFC3339 string`);
+    }
+  }
+}
+
 function validateArchive(raw: unknown): KgArchive {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new Error("Archive must be a JSON object");
@@ -281,12 +293,13 @@ function validateArchive(raw: unknown): KgArchive {
     if (!isUuid(e["id"])) {
       throw new Error(`Entity[${i}] must have a UUID "id" field`);
     }
-    if (typeof e["name"] !== "string" || e["name"].length === 0) {
+    if (typeof e["name"] !== "string" || e["name"].trim().length === 0) {
       throw new Error(`Entity[${i}] must have a non-empty "name" field`);
     }
-    if (typeof e["kind"] !== "string" || e["kind"].length === 0) {
+    if (typeof e["kind"] !== "string" || e["kind"].trim().length === 0) {
       throw new Error(`Entity[${i}] must have a "kind" field`);
     }
+    validateOptionalTimestamps(e, `Entity[${i}]`);
   }
 
   // Validate each edge has required fields
@@ -295,15 +308,16 @@ function validateArchive(raw: unknown): KgArchive {
     if (!isUuid(edge["edge_id"])) {
       throw new Error(`Edge[${i}] must have a UUID "edge_id" field`);
     }
-    if (typeof edge["source"] !== "string" || edge["source"].length === 0) {
+    if (typeof edge["source"] !== "string" || edge["source"].trim().length === 0) {
       throw new Error(`Edge[${i}] must have a "source" field`);
     }
-    if (typeof edge["target"] !== "string" || edge["target"].length === 0) {
+    if (typeof edge["target"] !== "string" || edge["target"].trim().length === 0) {
       throw new Error(`Edge[${i}] must have a "target" field`);
     }
-    if (typeof edge["relation"] !== "string" || edge["relation"].length === 0) {
+    if (typeof edge["relation"] !== "string" || edge["relation"].trim().length === 0) {
       throw new Error(`Edge[${i}] must have a "relation" field`);
     }
+    validateOptionalTimestamps(edge, `Edge[${i}]`);
   }
 
   return obj as unknown as KgArchive;
@@ -846,6 +860,8 @@ function adapterResultToArchive(
     description: e.description,
     properties: e.properties as Record<string, unknown>,
     tags: e.tags,
+    created_at: e.created_at,
+    updated_at: e.updated_at,
   }));
   const archiveEdges: KgArchiveEdge[] = edges.map((e) => ({
     edge_id: e.edge_id,
@@ -854,6 +870,8 @@ function adapterResultToArchive(
     relation: e.relation,
     weight: e.weight,
     properties: e.properties as Record<string, unknown>,
+    created_at: e.created_at,
+    updated_at: e.updated_at,
   }));
   return {
     format: "khive-kg",

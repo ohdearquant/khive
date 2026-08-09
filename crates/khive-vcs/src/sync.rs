@@ -52,17 +52,11 @@ struct NdjsonEdge {
     relation: String,
     #[serde(default = "default_weight")]
     weight: f64,
-    // properties: accepted but not yet persisted to the storage-layer Edge
-    // struct. Parsed here so existing NDJSON files round-trip without warning.
     #[serde(default)]
-    // REASON: Accepted for NDJSON round-trip compatibility; not yet persisted to the Edge struct.
-    #[allow(dead_code)]
     properties: Option<serde_json::Value>,
     #[serde(default)]
     created_at: Option<String>,
     #[serde(default)]
-    // REASON: Accepted for NDJSON round-trip compatibility; edge updated_at is derived from created_at.
-    #[allow(dead_code)]
     updated_at: Option<String>,
 }
 
@@ -70,12 +64,21 @@ fn default_weight() -> f64 {
     1.0
 }
 
-/// Parse an ISO-8601 timestamp string into microseconds since epoch.
-/// Returns `now` if the string is `None` or unparseable.
-fn parse_ts_micros(s: Option<&str>) -> i64 {
-    s.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|dt| dt.timestamp_micros())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp_micros())
+/// Parse a present RFC3339 timestamp exactly; only absence uses `fallback`.
+fn parse_timestamp(
+    s: Option<&str>,
+    fallback: chrono::DateTime<Utc>,
+) -> Result<chrono::DateTime<Utc>> {
+    let Some(raw) = s else {
+        return Ok(fallback);
+    };
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .with_context(|| format!("timestamp {raw:?} must be RFC3339"))
+}
+
+fn parse_ts_micros(s: Option<&str>, fallback: chrono::DateTime<Utc>) -> Result<i64> {
+    Ok(parse_timestamp(s, fallback)?.timestamp_micros())
 }
 
 /// Summary of a completed sync run.
@@ -270,8 +273,10 @@ pub async fn run_sync_remote(
     // `staging` tempdir is still alive here — we drop it after moving files.
 
     // ── 3. Build KgArchive and compute canonical hash ─────────────────────────
-    // build_kg_archive is fallible: an invalid relation causes it to return an
-    // error here, before any cache file is written (fail-closed).
+    // Apply the same deterministic gate used by local DB rebuilds before hash
+    // computation or reader-visible cache publication.
+    validate_ndjson_records(&entities_ndjson, &edges_ndjson)
+        .with_context(|| format!("validating remote {:?} NDJSON", remote.name))?;
     let archive = build_kg_archive(&remote.namespace, &entities_ndjson, &edges_ndjson)
         .with_context(|| format!("validating archive for remote {:?}", remote.name))?;
     let actual_hash = snapshot_id_for_archive(&archive)
@@ -588,28 +593,22 @@ fn build_kg_archive(
     let now = Utc::now();
     let exported_entities: Vec<ExportedEntity> = entities
         .iter()
-        .map(|e| ExportedEntity {
-            id: e.id,
-            kind: e.kind.clone(),
-            entity_type: e.entity_type.clone(),
-            name: e.name.clone(),
-            description: e.description.clone(),
-            properties: e.properties.clone(),
-            tags: e.tags.clone(),
-            created_at: e
-                .created_at
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or(now),
-            updated_at: e
-                .updated_at
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or(now),
+        .map(|e| {
+            Ok(ExportedEntity {
+                id: e.id,
+                kind: e.kind.clone(),
+                entity_type: e.entity_type.clone(),
+                name: e.name.clone(),
+                description: e.description.clone(),
+                properties: e.properties.clone(),
+                tags: e.tags.clone(),
+                created_at: parse_timestamp(e.created_at.as_deref(), now)
+                    .with_context(|| format!("entity {} invalid created_at", e.id))?,
+                updated_at: parse_timestamp(e.updated_at.as_deref(), now)
+                    .with_context(|| format!("entity {} invalid updated_at", e.id))?,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let mut exported_edges: Vec<ExportedEdge> = Vec::with_capacity(edges.len());
     for e in edges {
@@ -623,6 +622,11 @@ fn build_kg_archive(
             target: e.target,
             relation,
             weight: e.weight,
+            properties: e.properties.clone(),
+            created_at: parse_timestamp(e.created_at.as_deref(), now)
+                .with_context(|| format!("edge {} invalid created_at", e.edge_id))?,
+            updated_at: parse_timestamp(e.updated_at.as_deref(), now)
+                .with_context(|| format!("edge {} invalid updated_at", e.edge_id))?,
         });
     }
 
@@ -957,8 +961,11 @@ async fn upsert_entities(
         let mut entities_chunk = Vec::with_capacity(chunk.len());
         let mut docs_chunk = Vec::with_capacity(chunk.len());
         for r in chunk {
-            let created_at = parse_ts_micros(r.created_at.as_deref());
-            let updated_at = parse_ts_micros(r.updated_at.as_deref());
+            let fallback = Utc::now();
+            let created_at = parse_ts_micros(r.created_at.as_deref(), fallback)
+                .with_context(|| format!("entity {} invalid created_at", r.id))?;
+            let updated_at = parse_ts_micros(r.updated_at.as_deref(), fallback)
+                .with_context(|| format!("entity {} invalid updated_at", r.id))?;
             let entity = khive_storage::entity::Entity {
                 id: r.id,
                 namespace: namespace.to_string(),
@@ -1039,9 +1046,11 @@ async fn upsert_edges(
                 .relation
                 .parse()
                 .map_err(|e| anyhow!("invalid relation {:?}: {}", r.relation, e))?;
-            let created_at =
-                chrono::DateTime::from_timestamp_micros(parse_ts_micros(r.created_at.as_deref()))
-                    .unwrap_or_else(chrono::Utc::now);
+            let fallback = Utc::now();
+            let created_at = parse_timestamp(r.created_at.as_deref(), fallback)
+                .with_context(|| format!("edge {} invalid created_at", r.edge_id))?;
+            let updated_at = parse_timestamp(r.updated_at.as_deref(), fallback)
+                .with_context(|| format!("edge {} invalid updated_at", r.edge_id))?;
             let edge = Edge {
                 id: LinkId::from(r.edge_id),
                 namespace: namespace.to_string(),
@@ -1050,9 +1059,9 @@ async fn upsert_edges(
                 relation,
                 weight: r.weight,
                 created_at,
-                updated_at: created_at,
+                updated_at,
                 deleted_at: None,
-                metadata: None,
+                metadata: r.properties.clone(),
                 target_backend: None,
             };
             edge_chunk.push(edge);
@@ -1127,6 +1136,30 @@ mod tests {
         let edges = read_edges(&kg.join("edges.ndjson")).unwrap();
         let archive = build_kg_archive(namespace, &entities, &edges).unwrap();
         snapshot_id_for_archive(&archive).unwrap()
+    }
+
+    #[test]
+    fn remote_snapshot_pin_detects_edge_metadata_only_change() {
+        let source = "11111111-1111-1111-1111-111111111111";
+        let target = "22222222-2222-2222-2222-222222222222";
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let entities = [
+            format!(r#"{{"id":"{source}","kind":"concept","name":"A"}}"#),
+            format!(r#"{{"id":"{target}","kind":"concept","name":"B"}}"#),
+        ]
+        .join("\n");
+        let before = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{source}","target":"{target}","relation":"extends","weight":0.8,"properties":{{"confidence":0.4}}}}"#
+        );
+        let after = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{source}","target":"{target}","relation":"extends","weight":0.8,"properties":{{"confidence":0.9}}}}"#
+        );
+
+        assert_ne!(
+            compute_pin(&entities, &before, "remote-ns"),
+            compute_pin(&entities, &after, "remote-ns"),
+            "remote snapshot identity must cover edge properties"
+        );
     }
 
     // ── test_run_sync_local_path_unchanged_behavior ───────────────────────────
@@ -1601,6 +1634,49 @@ mod tests {
             "invalid updated_at",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn sync_preserves_distinct_edge_timestamps() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let entities = [
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#),
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#),
+        ]
+        .join("\n");
+        let edges = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.5,"properties":{{"confidence":0.95}},"created_at":"2026-03-03T00:00:00Z","updated_at":"2026-04-04T00:00:00Z"}}"#
+        );
+        write_repo(repo, &entities, &edges);
+
+        run_sync(repo, &db_path, "test-ns").await.unwrap();
+
+        let ns = khive_types::Namespace::parse("test-ns").unwrap();
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let token = runtime.authorize(ns).unwrap();
+        let edge = runtime
+            .get_edge(&token, edge_id.parse().unwrap())
+            .await
+            .unwrap()
+            .expect("synced edge must exist");
+        assert_eq!(edge.created_at.to_rfc3339(), "2026-03-03T00:00:00+00:00");
+        assert_eq!(edge.updated_at.to_rfc3339(), "2026-04-04T00:00:00+00:00");
+        assert_eq!(
+            edge.metadata,
+            Some(serde_json::json!({"confidence": 0.95})),
+            "parsed edge properties must persist as storage metadata"
+        );
     }
 
     #[tokio::test]
@@ -2109,6 +2185,74 @@ mod tests {
         assert!(
             meta["commit_sha"].as_str().is_some(),
             "meta.json must have commit_sha"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sync_remote_rejects_blank_name_before_cache_publish() {
+        let remote_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let entity_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let entities = format!(
+            r#"{{"id":"{entity_id}","kind":"concept","name":"   ","properties":{{}},"tags":[]}}"#
+        );
+        let remote_url = make_git_remote(remote_dir.path(), &entities, "");
+        let remote = RemoteConfig {
+            name: RemoteName::parse("blank-name").unwrap(),
+            url: remote_url,
+            git_ref: "main".to_string(),
+            namespace: "remote-ns".to_string(),
+            pin: None,
+        };
+
+        let err = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect_err("remote fetch must reject a whitespace-only entity name");
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("non-blank name")),
+            "error must explain the name invariant: {err:#}"
+        );
+        assert!(
+            !repo_dir
+                .path()
+                .join(".khive/kg/remotes/blank-name")
+                .exists(),
+            "invalid remote records must not publish a cache generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sync_remote_rejects_malformed_timestamp_before_cache_publish() {
+        let remote_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let entity_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let entities = format!(
+            r#"{{"id":"{entity_id}","kind":"concept","name":"Valid","properties":{{}},"tags":[],"updated_at":"not-rfc3339"}}"#
+        );
+        let remote_url = make_git_remote(remote_dir.path(), &entities, "");
+        let remote = RemoteConfig {
+            name: RemoteName::parse("bad-timestamp").unwrap(),
+            url: remote_url,
+            git_ref: "main".to_string(),
+            namespace: "remote-ns".to_string(),
+            pin: None,
+        };
+
+        let err = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect_err("remote fetch must reject a present malformed timestamp");
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("invalid updated_at")),
+            "error must identify the malformed timestamp: {err:#}"
+        );
+        assert!(
+            !repo_dir
+                .path()
+                .join(".khive/kg/remotes/bad-timestamp")
+                .exists(),
+            "invalid remote records must not publish a cache generation"
         );
     }
 

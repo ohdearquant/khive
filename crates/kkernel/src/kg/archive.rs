@@ -82,30 +82,17 @@ pub(super) async fn cmd_export(args: ExportArgs) -> Result<()> {
 
 pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
     let ns = Namespace::parse(&args.namespace)?;
-    let config = RuntimeConfig {
-        db_path: Some(args.db.clone()),
-        default_namespace: ns.clone(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        ..Default::default()
-    };
-    let runtime = KhiveRuntime::new(config)?;
-    let valid_entity_kinds = install_import_kind_registry(&runtime)?;
-    let token = runtime.authorize(ns)?;
-
     let source = std::fs::read_to_string(&args.source)
         .with_context(|| format!("read {}", args.source.display()))?;
 
-    let summary = match args.format {
-        ImportFormat::Archive => {
-            let archive: KgArchive = serde_json::from_str(&source)
-                .with_context(|| format!("parse archive {}", args.source.display()))?;
-            validate_archive_edge_weights(&archive)?;
-            runtime
-                .import_kg(&archive, &token)
-                .await
-                .with_context(|| format!("import archive {}", args.source.display()))?
-        }
+    // Discover the merged pack vocabulary against an in-memory runtime. This
+    // deliberately happens before the target runtime exists: deterministic
+    // source failures must not create or migrate `--db` as a side effect.
+    let validation_runtime = KhiveRuntime::memory().context("create import validation runtime")?;
+    let valid_entity_kinds = install_import_kind_registry(&validation_runtime)?;
+    let archive = match args.format {
+        ImportFormat::Archive => serde_json::from_str(&source)
+            .with_context(|| format!("parse archive {}", args.source.display()))?,
         ImportFormat::Json | ImportFormat::Ndjson => {
             let input = match args.format {
                 ImportFormat::Json => source,
@@ -125,13 +112,26 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
             let edges: Vec<EdgeRecord> = adapter
                 .edges()
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            let archive = adapter_records_to_archive(&args.namespace, entities, edges)?;
-            runtime
-                .import_kg(&archive, &token)
-                .await
-                .with_context(|| format!("import adapter records {}", args.source.display()))?
+            adapter_records_to_archive(&args.namespace, entities, edges)?
         }
     };
+    validate_archive_deterministic(&archive, &valid_entity_kinds)?;
+    drop(validation_runtime);
+
+    let config = RuntimeConfig {
+        db_path: Some(args.db.clone()),
+        default_namespace: ns.clone(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..Default::default()
+    };
+    let runtime = KhiveRuntime::new(config)?;
+    install_import_kind_registry(&runtime)?;
+    let token = runtime.authorize(ns)?;
+    let summary = runtime
+        .import_kg(&archive, &token)
+        .await
+        .with_context(|| format!("import {}", args.source.display()))?;
 
     let json = serde_json::to_string(&summary).expect("serialize ImportSummary");
     println!("{json}");
@@ -230,6 +230,40 @@ pub(super) fn validate_archive_edge_weights(archive: &KgArchive) -> Result<()> {
     Ok(())
 }
 
+fn validate_archive_deterministic(
+    archive: &KgArchive,
+    valid_entity_kinds: &[String],
+) -> Result<()> {
+    if archive.format != "khive-kg" {
+        bail!(
+            "unsupported archive format {:?}; expected \"khive-kg\"",
+            archive.format
+        );
+    }
+    if archive.version != "0.1" {
+        bail!(
+            "unsupported archive version {:?}; supported: \"0.1\"",
+            archive.version
+        );
+    }
+    for (index, entity) in archive.entities.iter().enumerate() {
+        if !valid_entity_kinds.iter().any(|kind| kind == &entity.kind) {
+            bail!(
+                "archive entity {index} ({}) has unknown entity kind {:?}",
+                entity.id,
+                entity.kind
+            );
+        }
+        if entity.name.trim().is_empty() {
+            bail!(
+                "archive entity {index} ({}) name must be non-blank",
+                entity.id
+            );
+        }
+    }
+    validate_archive_edge_weights(archive)
+}
+
 /// Install the merged pack/runtime entity- and note-kind registry on `runtime`
 /// so that `runtime.import_kg` (and any other runtime-layer kind validation)
 /// accepts pack-registered kinds such as `resource`, not just the eight base
@@ -290,12 +324,24 @@ fn adapter_edge_to_exported(edge: EdgeRecord, entity_ids: &HashSet<Uuid>) -> Res
         .with_context(|| format!("edge {} invalid relation {:?}", edge.edge_id, edge.relation))?;
 
     validate_edge_weight(edge.weight, edge.edge_id)?;
+    let now = Utc::now();
+    let created_at = parse_dt(edge.created_at.as_deref(), now)
+        .with_context(|| format!("edge {} invalid created_at", edge.edge_id))?;
+    let updated_at = parse_dt(edge.updated_at.as_deref(), now)
+        .with_context(|| format!("edge {} invalid updated_at", edge.edge_id))?;
     Ok(ExportedEdge {
         edge_id: edge.edge_id,
         source,
         target,
         relation,
         weight: edge.weight,
+        properties: if edge.properties.is_null() {
+            None
+        } else {
+            Some(edge.properties)
+        },
+        created_at,
+        updated_at,
     })
 }
 
@@ -330,6 +376,12 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
         relation: String,
         #[serde(default = "default_weight")]
         weight: f64,
+        #[serde(default)]
+        properties: Option<serde_json::Value>,
+        #[serde(default)]
+        created_at: Option<String>,
+        #[serde(default)]
+        updated_at: Option<String>,
     }
 
     fn default_weight() -> f64 {
@@ -370,12 +422,19 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
                 .parse()
                 .with_context(|| format!("invalid relation {:?}", edge.relation))?;
             validate_edge_weight(edge.weight, edge.edge_id)?;
+            let created_at = parse_dt(edge.created_at.as_deref(), now)
+                .with_context(|| format!("edge {} invalid created_at", edge.edge_id))?;
+            let updated_at = parse_dt(edge.updated_at.as_deref(), now)
+                .with_context(|| format!("edge {} invalid updated_at", edge.edge_id))?;
             Ok(ExportedEdge {
                 edge_id: edge.edge_id,
                 source: edge.source,
                 target: edge.target,
                 relation,
                 weight: edge.weight,
+                properties: edge.properties,
+                created_at,
+                updated_at,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -856,6 +915,51 @@ mod tests {
     }
 
     #[test]
+    fn adapter_records_to_archive_preserves_edge_adr020_timestamps() {
+        let source = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let entities = [source, target]
+            .into_iter()
+            .map(|id| EntityRecord {
+                id,
+                kind: "concept".to_string(),
+                entity_type: None,
+                name: format!("Entity-{id}"),
+                description: None,
+                properties: serde_json::Value::Null,
+                tags: vec![],
+                created_at: None,
+                updated_at: None,
+            })
+            .collect();
+        let edge = EdgeRecord {
+            edge_id: Uuid::new_v4(),
+            source: source.to_string(),
+            target: target.to_string(),
+            relation: "extends".to_string(),
+            weight: 0.8,
+            properties: serde_json::json!({"confidence": 0.95}),
+            created_at: Some("2026-03-03T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-04T00:00:00Z".to_string()),
+        };
+
+        let archive = adapter_records_to_archive("test-ns", entities, vec![edge]).unwrap();
+        assert_eq!(archive.edges.len(), 1);
+        assert_eq!(
+            archive.edges[0].properties,
+            Some(serde_json::json!({"confidence": 0.95}))
+        );
+        assert_eq!(
+            archive.edges[0].created_at.to_rfc3339(),
+            "2026-03-03T00:00:00+00:00"
+        );
+        assert_eq!(
+            archive.edges[0].updated_at.to_rfc3339(),
+            "2026-04-04T00:00:00+00:00"
+        );
+    }
+
+    #[test]
     fn parse_dt_defaults_only_when_timestamp_is_absent() {
         let fallback = Utc::now();
         assert_eq!(parse_dt(None, fallback).unwrap(), fallback);
@@ -1016,6 +1120,10 @@ mod tests {
                     && cause.to_string().contains("RFC3339")),
             "error must identify the malformed timestamp: {err:#}"
         );
+        assert!(
+            !db_path.exists(),
+            "deterministically malformed adapter input must be rejected before the target DB is created"
+        );
 
         let ns = Namespace::parse("test-ns").unwrap();
         let runtime = KhiveRuntime::new(RuntimeConfig {
@@ -1032,6 +1140,43 @@ mod tests {
                 .await
                 .is_err(),
             "the valid record before the malformed record must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_archive_rejects_malformed_edge_timestamp_without_creating_target() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("archive-malformed-edge-time.db");
+        let source = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let edge_id = Uuid::new_v4();
+        let source_path = tmp.path().join("bad-edge-time-archive.json");
+        std::fs::write(
+            &source_path,
+            format!(
+                r#"{{"format":"khive-kg","version":"0.1","namespace":"test-ns","exported_at":"2026-01-01T00:00:00Z","entities":[{{"id":"{source}","kind":"concept","name":"Source","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}},{{"id":"{target}","kind":"concept","name":"Target","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}],"edges":[{{"edge_id":"{edge_id}","source":"{source}","target":"{target}","relation":"extends","weight":0.8,"created_at":"not-rfc3339","updated_at":"2026-04-04T00:00:00Z"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let err = cmd_import(ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Archive,
+            verbose: false,
+        })
+        .await
+        .expect_err("a present malformed archive edge timestamp must reject the import");
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("created_at")
+                    || cause.to_string().contains("RFC3339")),
+            "error must identify the malformed edge timestamp: {err:#}"
+        );
+        assert!(
+            !db_path.exists(),
+            "malformed archive input must not create or migrate the target DB"
         );
     }
 

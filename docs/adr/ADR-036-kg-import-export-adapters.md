@@ -523,9 +523,12 @@ record invariants before the first target write:
    validate-first gate before creating a temporary database. `khive-runtime::import_kg` likewise
    completes deterministic entity-kind/name and edge-weight validation before opening the target
    entity store; mutable endpoint existence and namespace checks remain at write time.
+5. Edge `properties`, `created_at`, and `updated_at` remain reserved portable fields through adapter,
+   archive, runtime, and VCS conversion. Properties persist as storage edge metadata and contribute
+   to the canonical snapshot hash; the two timestamps persist independently.
 
 These rules supersede any earlier implementation text that allowed alias-based edge detection or
-warning/default behavior for a present malformed timestamp.
+warning/default behavior for a present malformed timestamp, or discarded edge metadata/provenance.
 
 ## Format-v2 migration UX (deferred to ADR-048)
 

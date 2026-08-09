@@ -286,6 +286,123 @@ Deno.test("import: rejects archive with entity missing id", async () => {
   }
 });
 
+Deno.test("#1758 import: rejects whitespace-only entity name before publish", async () => {
+  const dir = await makeTempDir();
+  try {
+    const archivePath = await writeArchive(dir, {
+      format: "khive-kg",
+      version: "0.1",
+      entities: [{ ...ENTITY_A, name: " \t\n " }],
+      edges: [],
+    });
+    await assertRejects(() => importArchive(dir, archivePath), Error, "name");
+    assertEquals(await readEntitiesLines(dir), []);
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("#1758 import: rejects whitespace-only entity kind before publish", async () => {
+  const dir = await makeTempDir();
+  try {
+    const archivePath = await writeArchive(dir, {
+      format: "khive-kg",
+      version: "0.1",
+      entities: [{ ...ENTITY_A, kind: " \t\n " }],
+      edges: [],
+    });
+    await assertRejects(() => importArchive(dir, archivePath), Error, "kind");
+    assertEquals(await readEntitiesLines(dir), []);
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("#1758 import: rejects malformed entity timestamps before publish", async () => {
+  for (const field of ["created_at", "updated_at"]) {
+    for (const invalid of [42, "2026-02-30T13:04:05Z"]) {
+      const dir = await makeTempDir();
+      try {
+        const archivePath = await writeArchive(dir, {
+          format: "khive-kg",
+          version: "0.1",
+          entities: [{ ...ENTITY_A, [field]: invalid }],
+          edges: [],
+        });
+        await assertRejects(() => importArchive(dir, archivePath), Error, field);
+        assertEquals(await readEntitiesLines(dir), []);
+      } finally {
+        await removeDir(dir);
+      }
+    }
+  }
+});
+
+Deno.test("#1758 import: rejects malformed edge timestamps before publish", async () => {
+  for (const field of ["created_at", "updated_at"]) {
+    for (const invalid of [null, "2026-08-09T13:04:05"]) {
+      const dir = await makeTempDir();
+      try {
+        const archivePath = await writeArchive(dir, {
+          format: "khive-kg",
+          version: "0.1",
+          entities: [ENTITY_A],
+          edges: [{ ...EDGE_SELF, [field]: invalid }],
+        });
+        await assertRejects(() => importArchive(dir, archivePath), Error, field);
+        assertEquals(await readEdgesLines(dir), []);
+      } finally {
+        await removeDir(dir);
+      }
+    }
+  }
+});
+
+Deno.test("#1758 runImport: generic JSON preserves labels and timestamps", async () => {
+  const dir = await makeTempDir();
+  try {
+    const sourcePath = join(dir, "generic.json");
+    const entityName = "  Padded label\t";
+    const entityCreatedAt = "2026-08-09T13:04:05Z";
+    const entityUpdatedAt = "2026-08-09T13:04:06+00:00";
+    const edgeCreatedAt = "2026-08-09T13:04:07.25Z";
+    const edgeUpdatedAt = "2026-08-09T09:04:08-04:00";
+    await Deno.writeTextFile(
+      sourcePath,
+      JSON.stringify([
+        {
+          ...ENTITY_A,
+          name: entityName,
+          created_at: entityCreatedAt,
+          updated_at: entityUpdatedAt,
+        },
+        {
+          ...EDGE_SELF,
+          created_at: edgeCreatedAt,
+          updated_at: edgeUpdatedAt,
+        },
+      ]),
+    );
+
+    await runImport(dir, ["--format", "json", "--overwrite", sourcePath]);
+
+    const entity = JSON.parse((await readEntitiesLines(dir))[0]);
+    assertEquals(entity.name, entityName);
+    assertEquals(entity.created_at, entityCreatedAt);
+    assertEquals(entity.updated_at, entityUpdatedAt);
+    assertEquals(entity.properties.created_at, undefined);
+    assertEquals(entity.properties.updated_at, undefined);
+
+    const edge = JSON.parse((await readEdgesLines(dir))[0]);
+    assertEquals(edge.created_at, edgeCreatedAt);
+    assertEquals(edge.updated_at, edgeUpdatedAt);
+    assertEquals(edge.properties.created_at, undefined);
+    assertEquals(edge.properties.updated_at, undefined);
+  } finally {
+    await removeDir(dir);
+  }
+});
+
 Deno.test("import: rejects archive with edge missing edge_id", async () => {
   const dir = await makeTempDir();
   try {

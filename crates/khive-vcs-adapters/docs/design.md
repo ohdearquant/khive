@@ -7,9 +7,10 @@
 - This crate implements the format adapter layer of the two-stage KG import pipeline.
 - Adapters are pure transforms: they parse a source format and produce `EntityRecord`/`EdgeRecord`
   streams with no database access; records missing an ID receive a freshly generated UUID at parse time.
-- Fatal errors (missing required fields, unknown kinds/relations, out-of-range weights) abort the
-  iterator immediately. Non-fatal warnings accumulate in `FormatAdapter::warnings()` and are
-  available after the iterator is exhausted.
+- Eager structural/classification errors fail adapter construction. Per-record validation failures
+  are retained as `Result::Err` items in the corresponding entity/edge iterator; callers that need
+  all-or-nothing import must drain and collect both iterators before writing. Non-fatal warnings
+  accumulate in `FormatAdapter::warnings()`.
 - Field lookup is case-insensitive: keys are matched by ASCII-lowercase comparison, allowing
   `"Name"`, `"name"`, and `"NAME"` to all resolve to the `name` field.
 - Unknown entity keys fold into the `properties` map rather than being rejected.
@@ -21,8 +22,10 @@
 ### Git-Native KG Implementation (field shapes) (ADR-020)
 
 - `EntityRecord` and `EdgeRecord` follow the wire shapes specified for the import pipeline.
-- `EntityRecord` carries `id`, `kind`, `name`, `description?`, `properties`, `tags`.
-- `EdgeRecord` carries `edge_id`, `source`, `target`, `relation`, `weight`, `properties`.
+- `EntityRecord` carries `id`, `kind`, `entity_type?`, `name`, `description?`, `properties`,
+  `tags`, `created_at?`, and `updated_at?`.
+- `EdgeRecord` carries `edge_id`, `source`, `target`, `relation`, `weight`, `properties`,
+  `created_at?`, and `updated_at?`.
 - The adapter layer produces these shapes; the standard `khive kg import` pipeline validates
   and loads them into `working.db`.
 
