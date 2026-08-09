@@ -332,8 +332,10 @@ pub(crate) fn redact_repo_url(url: &str) -> String {
         .iter()
         .any(|scheme| candidate.starts_with(scheme))
         || scp_parts(candidate).is_some();
-    let input = if recognized_remote { candidate } else { url };
-    let stripped = strip_query_and_fragment(input);
+    if !recognized_remote {
+        return url.to_string();
+    }
+    let stripped = strip_query_and_fragment(candidate);
     for scheme in ["https://", "http://", "git://", "ssh://"] {
         if let Some(rest) = stripped.strip_prefix(scheme) {
             let authority_end = rest.find('/').unwrap_or(rest.len());
@@ -836,6 +838,16 @@ mod tests {
             " /tmp/a repo ",
             "local filesystem spelling is display metadata and must not be indiscriminately trimmed"
         );
+    }
+
+    #[test]
+    fn redact_repo_url_preserves_question_mark_in_local_path() {
+        assert_eq!(redact_repo_url("/tmp/repo?worktree"), "/tmp/repo?worktree");
+    }
+
+    #[test]
+    fn redact_repo_url_preserves_hash_in_local_path() {
+        assert_eq!(redact_repo_url("/tmp/repo#worktree"), "/tmp/repo#worktree");
     }
 
     #[test]
