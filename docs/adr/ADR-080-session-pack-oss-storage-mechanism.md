@@ -322,8 +322,10 @@ git branch, slug, message count, first/last seen), `session_messages` (one row p
 transcript event: uuid key, session id, per-session `seq`, parent uuid, sidechain flag,
 role, type, masked text, masked raw, timestamp), and `session_mirror_cursor` (one row per
 watched file: byte offset, nullable platform file-identity witness, session id, updated-at).
-Existing cursor tables are upgraded in place with a guarded nullable-column migration. On Unix
-the witness is device plus inode. On Windows the stable Win32 open-handle API
+Existing cursor tables are upgraded in place with a guarded nullable-column migration shared by
+service startup and the public line-tail entry point. A current schema follows a reader-only
+`PRAGMA` path; only an absent or legacy table acquires a writer for the guarded upgrade. On Unix the
+witness is device plus inode. On Windows the stable Win32 open-handle API
 `GetFileInformationByHandle` supplies volume serial plus file index; the unstable Rust
 `MetadataExt` accessors are not used, and the existing `windows:<volume>:<index>` cursor encoding is
 unchanged. Platforms or filesystems that cannot provide either retain the length-only fallback.
@@ -347,7 +349,11 @@ unchanged. Platforms or filesystems that cannot provide either retain the length
    captured witness rather than re-statting the path. Whole-file exporters do not need the probe
    witness: `start_offset` is only a length guard, never a range boundary, so the opened generation
    is either skipped for one poll or replayed from byte zero and committed with its full length and
-   opened identity.
+   opened identity. If the public line-tail API has no cursor row yet, a successful no-progress pass
+   with a stable opened identity checkpoints that exact held offset plus identity. It does not
+   overwrite a pre-existing row whose offset differs from the caller-selected value; the seed is an
+   insert with `ON CONFLICT DO NOTHING`, so a cursor created concurrently after the absence check is
+   protected by the same rule.
 6. **Replacement and truncation restart at zero.** Before the EOF fast path, a changed
    file-identity witness or a file length below the stored offset first commits byte offset zero
    plus the current identity, then applies that reset in memory. This durable reset happens before
@@ -361,7 +367,9 @@ unchanged. Platforms or filesystems that cannot provide either retain the length
    lower cursor, and the service adopts the same lower offset and identity in memory after the DB
    commit; an unexplained lower offset remains rejected. A reset-only pass mixed with another
    candidate's error checkpoints zero, not the consumed prefix, so retry replays the entire new
-   generation without retaining the stale pre-truncation cursor.
+   generation without retaining the stale pre-truncation cursor. The public no-progress seed in
+   invariant 5 is permitted only for an absent row and writes the unchanged caller offset, so it
+   cannot create another lower-offset authorization path.
 
 #### ChatGPT export mapping
 

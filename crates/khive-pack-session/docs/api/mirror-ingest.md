@@ -21,10 +21,19 @@ ensures idempotency.
 
 The public `mirror_file` entry point recovers the persisted identity that belongs to an exact
 `start_offset` match, so directly repeating a successful call with its returned offset detects and
-replays a same-length replacement without an external reconciliation step. An arbitrary
-caller-selected replay offset has no trustworthy identity binding and retains the strict
-length-decrease fallback. The raw deferred read/commit pair is service-private: its result keeps the
-opened identity attached to the offset all the way through the eventual cursor-only commit.
+replays a same-length replacement without an external reconciliation step. When no cursor row exists,
+even an initial no-progress call (EOF or a partial trailing line) checkpoints that same offset with
+the opened identity; the next call therefore has a witness to compare. This seed never overwrites a
+row whose durable offset differs from the caller's value, so an arbitrary caller-selected replay
+offset cannot introduce an unexplained lower cursor and retains the strict length-decrease fallback.
+The raw deferred read/commit pair is service-private: its result keeps the opened identity attached
+to the offset all the way through the eventual cursor-only commit.
+
+Before reading cursor state, the public entry point and background service share one guarded schema
+preflight. A current `file_identity` schema takes a reader-only `PRAGMA` fast path. Only a missing or
+legacy cursor table acquires a writer for `CREATE IF NOT EXISTS` / `ALTER TABLE`, so direct public
+calls against pre-witness databases are upgrade-safe without turning established EOF polls into
+schema writes.
 
 The background service reconciles each persisted offset with a file-identity witness before the
 EOF fast path. A different witness resets the offset to zero even when the replacement has exactly
@@ -262,7 +271,10 @@ pass consumed bytes but produced no parseable events (blank/unparseable/
 skipped-oversized lines): it still must persist the advanced offset so the
 next poll does not re-read the same bytes, and a failure here must propagate
 — silently swallowing it would let the cursor and the already-consumed bytes
-drift apart.
+drift apart. The public entry point uses a separate insert-only cursor statement to seed an absent
+row when a no-progress opened file exposes a stable identity. That statement writes exactly the
+caller's held offset and uses `ON CONFLICT DO NOTHING`, so an existing row — including one created or
+advanced after the preceding absence check — is never replaced by this path.
 
 ## Test suite notes
 

@@ -131,6 +131,12 @@ impl MirrorCursorDisposition {
 /// service can reconcile the new generation first.
 #[derive(Debug)]
 enum CursorContinuity {
+    /// No persisted row exists for this path. A public no-progress pass may
+    /// seed this exact offset with the identity from its opened handle.
+    Untracked,
+    /// A row exists, but its offset does not match the caller-selected offset.
+    /// Never overwrite that durable cursor from a no-progress pass: doing so
+    /// could authorize an unexplained lower offset.
     Unchecked,
     Persisted(Option<String>),
     Probed(Option<String>),
@@ -250,6 +256,89 @@ const MIRROR_MAX_EVENTS_PER_PASS: usize = 1024;
 /// `read_line_bounded` independently of `max_bytes_per_pass` (PACKSESSION-AUD-003).
 const MIRROR_MAX_LINE_BYTES: usize = MIRROR_MAX_BYTES_PER_PASS;
 
+/// Ensure the cursor table can persist file-identity witnesses.
+///
+/// The schema plan's `CREATE TABLE IF NOT EXISTS` cannot evolve a table from
+/// an older release. Both the background service and the public
+/// [`mirror_file`] entry point call this shared preflight. An already-current
+/// schema takes only the reader/`PRAGMA` fast path; a writer is acquired only
+/// when the table is absent or still lacks `file_identity`.
+pub(super) async fn ensure_cursor_identity_schema(
+    runtime: &KhiveRuntime,
+) -> Result<(), RuntimeError> {
+    let mut reader = runtime.sql().reader().await?;
+    let schema_rows = reader
+        .query_all(SqlStatement {
+            sql: "PRAGMA table_info(session_mirror_cursor)".into(),
+            params: vec![],
+            label: Some("mirror_cursor_schema_info_read".into()),
+        })
+        .await?;
+    let schema_is_current = schema_rows.iter().any(|row| {
+        matches!(
+            row.get("name"),
+            Some(SqlValue::Text(name)) if name == "file_identity"
+        )
+    });
+    drop(reader);
+    if schema_is_current {
+        return Ok(());
+    }
+
+    let mut writer = runtime.sql().writer().await?;
+    writer
+        .execute_script(crate::vocab::SESSION_CURSOR_SCHEMA_STMT.to_string())
+        .await?;
+
+    // Re-check under the writer after `CREATE IF NOT EXISTS`: another
+    // process may have completed the same upgrade after our reader probe.
+    let schema_rows = writer
+        .query_all(SqlStatement {
+            sql: "PRAGMA table_info(session_mirror_cursor)".into(),
+            params: vec![],
+            label: Some("mirror_cursor_schema_info_write".into()),
+        })
+        .await?;
+    let has_file_identity = schema_rows.iter().any(|row| {
+        matches!(
+            row.get("name"),
+            Some(SqlValue::Text(name)) if name == "file_identity"
+        )
+    });
+    if has_file_identity {
+        return Ok(());
+    }
+
+    if let Err(alter_error) = writer
+        .execute_script(
+            "ALTER TABLE session_mirror_cursor ADD COLUMN file_identity TEXT".to_string(),
+        )
+        .await
+    {
+        // A concurrent process can win the guarded ALTER after the writer
+        // re-check. Only an actually missing column makes that race fatal.
+        let rows_after_error = writer
+            .query_all(SqlStatement {
+                sql: "PRAGMA table_info(session_mirror_cursor)".into(),
+                params: vec![],
+                label: Some("mirror_cursor_schema_recheck".into()),
+            })
+            .await?;
+        let upgraded_concurrently = rows_after_error.iter().any(|row| {
+            matches!(
+                row.get("name"),
+                Some(SqlValue::Text(name)) if name == "file_identity"
+            )
+        });
+        if !upgraded_concurrently {
+            return Err(RuntimeError::Internal(format!(
+                "mirror: failed to add session_mirror_cursor.file_identity: {alter_error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Per-call caps on how much of a file's delta `mirror_file` reads/parses
 /// before writing a bounded chunk; tests use smaller caps to force multi-pass
 /// behavior without giant fixtures.
@@ -287,8 +376,12 @@ impl MirrorLimits {
 /// Repeating this public call with the offset returned by its preceding
 /// successful pass is generation-safe: the persisted cursor binds that
 /// offset to the opened file identity, so a same-path replacement replays
-/// from zero even when its length is unchanged. Arbitrary caller-selected
-/// replay offsets retain the strict length-decrease fallback.
+/// from zero even when its length is unchanged. A first no-progress pass
+/// seeds an absent row with the same held offset plus opened identity; its
+/// insert-only statement cannot overwrite a cursor created concurrently.
+/// Arbitrary caller-selected replay offsets that differ from an existing row
+/// retain the strict length-decrease fallback and never replace that row.
+/// The shared schema preflight upgrades legacy cursor tables before lookup.
 ///
 /// One bad file or one bad line does NOT kill the loop: per-file errors propagate
 /// to the caller (the service loop logs and continues); per-line parse failures
@@ -300,6 +393,7 @@ pub async fn mirror_file(
     source: LineTailSource,
     codex_session_id: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
+    ensure_cursor_identity_schema(runtime).await?;
     let continuity = persisted_cursor_continuity(runtime, path, start_offset).await?;
     Ok(mirror_file_inner(
         runtime,
@@ -391,7 +485,7 @@ async fn persisted_cursor_continuity(
         .await
         .map_err(|error| RuntimeError::Internal(format!("mirror_file: cursor read: {error}")))?;
     let Some(row) = row else {
-        return Ok(CursorContinuity::Unchecked);
+        return Ok(CursorContinuity::Untracked);
     };
     let stored_offset = match row.get("byte_offset") {
         Some(SqlValue::Integer(offset)) => u64::try_from(*offset).ok(),
@@ -520,7 +614,8 @@ fn read_bounded_chunk(
                 "file identity changed between metadata probe and ingest open",
             ));
         }
-        CursorContinuity::Unchecked
+        CursorContinuity::Untracked
+        | CursorContinuity::Unchecked
         | CursorContinuity::Persisted(_)
         | CursorContinuity::Probed(_) => false,
     };
@@ -685,6 +780,11 @@ async fn mirror_file_inner(
     commit_empty_cursor: bool,
     continuity: CursorContinuity,
 ) -> Result<MirrorPass, RuntimeError> {
+    // Only a genuinely absent row may be seeded by a no-progress public
+    // pass. A mismatched persisted offset is deliberately not eligible: an
+    // arbitrary lower replay offset must never replace durable progress.
+    let seed_untracked_witness =
+        commit_empty_cursor && matches!(&continuity, CursorContinuity::Untracked);
     let chunk = read_bounded_chunk(
         path,
         start_offset,
@@ -703,7 +803,16 @@ async fn mirror_file_inner(
     let restarted = chunk.cursor_disposition.restarted();
     if chunk.new_offset == start_offset && !restarted {
         // Nothing was consumed this pass (EOF, or only a partial trailing
-        // line was seen) — there is no advanced cursor to persist.
+        // line was seen). A first public pass still checkpoints the exact
+        // same offset when the opened generation has a stable identity, so
+        // a same-length replacement before the next call cannot masquerade
+        // as unchanged EOF. Existing/mismatched rows remain untouched here,
+        // and no lower offset is introduced.
+        if seed_untracked_witness {
+            if let Some(file_identity) = chunk.cursor_disposition.file_identity() {
+                seed_cursor_witness_if_absent(runtime, path, start_offset, file_identity).await?;
+            }
+        }
         return Ok(MirrorPass {
             stats: MirrorStats {
                 inserted: 0,
@@ -1400,6 +1509,45 @@ async fn write_cursor_only(
     Ok(())
 }
 
+/// Seed a held offset and its opened identity only while the path remains
+/// untracked.
+///
+/// The public caller establishes `Untracked` with an earlier read, but another
+/// process can create or advance this row before the seed statement acquires
+/// its writer. `ON CONFLICT DO NOTHING` closes that race atomically: this path
+/// never overwrites a concurrently created cursor, especially not with a
+/// lower caller-selected offset.
+async fn seed_cursor_witness_if_absent(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    held_offset: u64,
+    file_identity: &str,
+) -> Result<(), RuntimeError> {
+    let now_us = Utc::now().timestamp_micros();
+    let mut writer =
+        runtime.sql().writer().await.map_err(|error| {
+            RuntimeError::Internal(format!("mirror_file: seed writer: {error}"))
+        })?;
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO session_mirror_cursor(\
+                    file_path, session_id, byte_offset, file_identity, updated_at\
+                  ) VALUES(?1, NULL, ?2, ?3, ?4) \
+                  ON CONFLICT(file_path) DO NOTHING"
+                .into(),
+            params: vec![
+                SqlValue::Text(path.to_string_lossy().into_owned()),
+                SqlValue::Integer(held_offset as i64),
+                SqlValue::Text(file_identity.to_string()),
+                SqlValue::Integer(now_us),
+            ],
+            label: Some("session_mirror_cursor_seed_witness".into()),
+        })
+        .await
+        .map_err(|error| RuntimeError::Internal(format!("mirror_file: cursor seed: {error}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -1435,10 +1583,9 @@ mod tests {
         }
     }
 
-    /// Build a file-backed runtime (exercises the real `atomic_unit`
-    /// single-writer path) and apply the session schema. Caller must keep
-    /// the returned `TempDir` alive.
-    async fn setup() -> (KhiveRuntime, TempDir) {
+    /// Build a file-backed runtime without applying the session schema.
+    /// Caller must keep the returned `TempDir` alive.
+    fn runtime_without_schema() -> (KhiveRuntime, TempDir) {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
         let rt = KhiveRuntime::new(RuntimeConfig {
@@ -1456,6 +1603,14 @@ mod tests {
             actor_id: None,
         })
         .expect("file-backed runtime");
+        (rt, dir)
+    }
+
+    /// Build a file-backed runtime (exercises the real `atomic_unit`
+    /// single-writer path) and apply the session schema. Caller must keep
+    /// the returned `TempDir` alive.
+    async fn setup() -> (KhiveRuntime, TempDir) {
+        let (rt, dir) = runtime_without_schema();
         apply_session_schema(&rt).await;
         (rt, dir)
     }
@@ -1708,6 +1863,146 @@ mod tests {
         );
         assert_eq!(second.new_offset, first.new_offset);
         assert_eq!(count_rows(&rt, "session_messages").await, 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_initial_eof_pass_witnesses_same_length_replacement() {
+        let (rt, dir) = setup().await;
+        let path = dir.path().join("initial-eof-public.jsonl");
+        let replacement_path = dir.path().join("initial-eof-public.next.jsonl");
+        let old = format!(
+            "{}\n",
+            user_line("uuid-public-eof-a", "sess-public-eof", "old")
+        );
+        let new = format!(
+            "{}\n",
+            user_line("uuid-public-eof-b", "sess-public-eof", "new")
+        );
+        assert_eq!(old.len(), new.len());
+        std::fs::write(&path, old).expect("original transcript");
+        let initial_offset = std::fs::metadata(&path).expect("original metadata").len();
+
+        let first = mirror_file(&rt, &path, initial_offset, LineTailSource::ClaudeCode, None)
+            .await
+            .expect("witness initial EOF generation");
+        assert_eq!(first.inserted, 0);
+        assert_eq!(first.new_offset, initial_offset);
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(initial_offset as i64),
+            "a successful public EOF pass must persist its opened generation witness"
+        );
+
+        std::fs::write(&replacement_path, new).expect("replacement transcript");
+        std::fs::rename(&replacement_path, &path).expect("same-path atomic replacement");
+
+        let second = mirror_file(
+            &rt,
+            &path,
+            first.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("mirror same-length replacement");
+        assert_eq!(
+            second.inserted, 1,
+            "the public API must not discard an EOF pass's opened identity"
+        );
+        assert_eq!(second.new_offset, initial_offset);
+        assert_eq!(count_rows(&rt, "session_messages").await, 1);
+    }
+
+    #[tokio::test]
+    async fn public_mirror_file_upgrades_legacy_cursor_schema() {
+        let (rt, dir) = runtime_without_schema();
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute_script(
+                "CREATE TABLE session_mirror_cursor (\
+                    file_path TEXT PRIMARY KEY,\
+                    session_id TEXT,\
+                    byte_offset INTEGER NOT NULL DEFAULT 0,\
+                    updated_at INTEGER NOT NULL\
+                )"
+                .to_string(),
+            )
+            .await
+            .expect("legacy cursor schema");
+        drop(writer);
+
+        let path = dir.path().join("legacy-public.jsonl");
+        std::fs::write(&path, "not-json\n").expect("unparseable transcript");
+        let expected_offset = std::fs::metadata(&path).expect("transcript metadata").len();
+
+        let stats = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
+            .await
+            .expect("public mirror call must upgrade the legacy cursor schema");
+        assert_eq!(stats.inserted, 0);
+        assert_eq!(stats.new_offset, expected_offset);
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(expected_offset as i64)
+        );
+        assert_eq!(
+            cursor_file_identity(&rt, &path.to_string_lossy()).await,
+            probe_file(&path).expect("transcript identity").1
+        );
+    }
+
+    #[tokio::test]
+    async fn public_no_progress_call_preserves_a_different_durable_offset() {
+        let (rt, dir) = setup().await;
+        let path = dir.path().join("mismatched-public-offset.jsonl");
+        std::fs::write(&path, "not-json\n").expect("unparseable transcript");
+        let caller_offset = std::fs::metadata(&path).expect("transcript metadata").len();
+        let durable_offset = caller_offset + 100;
+        write_cursor_only(
+            &rt,
+            &path,
+            &None,
+            durable_offset,
+            Some("test:durable-generation"),
+        )
+        .await
+        .expect("seed a different durable cursor");
+
+        let stats = mirror_file(&rt, &path, caller_offset, LineTailSource::ClaudeCode, None)
+            .await
+            .expect("a held arbitrary replay offset remains a no-op");
+        assert_eq!(stats.new_offset, caller_offset);
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(durable_offset as i64),
+            "a no-progress public pass must not replace a mismatched durable cursor"
+        );
+        assert_eq!(
+            cursor_file_identity(&rt, &path.to_string_lossy()).await,
+            Some("test:durable-generation".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn no_progress_witness_seed_cannot_overwrite_a_concurrent_cursor() {
+        let (rt, dir) = setup().await;
+        let path = dir.path().join("concurrent-public-seed.jsonl");
+        write_cursor_only(&rt, &path, &None, 500, Some("test:concurrent-generation"))
+            .await
+            .expect("seed the concurrent winner");
+
+        seed_cursor_witness_if_absent(&rt, &path, 10, "test:stale-public-generation")
+            .await
+            .expect("the losing seed is an idempotent no-op");
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(500),
+            "the insert-only seed must not regress a concurrently created cursor"
+        );
+        assert_eq!(
+            cursor_file_identity(&rt, &path.to_string_lossy()).await,
+            Some("test:concurrent-generation".to_string())
+        );
     }
 
     #[tokio::test]

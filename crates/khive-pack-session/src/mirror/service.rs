@@ -1522,7 +1522,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
         "session mirror service starting"
     );
 
-    if let Err(error) = ensure_cursor_identity_schema(&runtime).await {
+    if let Err(error) = ingest::ensure_cursor_identity_schema(&runtime).await {
         tracing::error!(
             error = %error,
             "session mirror: file-identity cursor schema is unavailable; service stopped"
@@ -1798,67 +1798,6 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
 
         tokio::time::sleep(config.poll_interval).await;
     }
-}
-
-/// Ensure existing cursor tables gain the nullable file-identity witness.
-///
-/// `CREATE TABLE IF NOT EXISTS` cannot evolve a table created by an older
-/// release, so startup inspects the live columns and applies one guarded
-/// `ALTER TABLE`. A failed migration is load-bearing: continuing would make
-/// every identity-bearing cursor upsert fail or silently fall back to the old
-/// skip-prone contract.
-async fn ensure_cursor_identity_schema(runtime: &KhiveRuntime) -> Result<(), RuntimeError> {
-    let mut writer = runtime.sql().writer().await?;
-    writer
-        .execute_script(crate::vocab::SESSION_CURSOR_SCHEMA_STMT.to_string())
-        .await?;
-
-    let schema_rows = writer
-        .query_all(SqlStatement {
-            sql: "PRAGMA table_info(session_mirror_cursor)".into(),
-            params: vec![],
-            label: Some("mirror_cursor_schema_info".into()),
-        })
-        .await?;
-    let has_file_identity = schema_rows.iter().any(|row| {
-        matches!(
-            row.get("name"),
-            Some(SqlValue::Text(name)) if name == "file_identity"
-        )
-    });
-    if has_file_identity {
-        return Ok(());
-    }
-
-    if let Err(alter_error) = writer
-        .execute_script(
-            "ALTER TABLE session_mirror_cursor ADD COLUMN file_identity TEXT".to_string(),
-        )
-        .await
-    {
-        // A concurrent process may have completed the same guarded upgrade
-        // after our inspection. Re-check before treating the ALTER failure as
-        // fatal; only an actually missing column blocks service startup.
-        let rows_after_error = writer
-            .query_all(SqlStatement {
-                sql: "PRAGMA table_info(session_mirror_cursor)".into(),
-                params: vec![],
-                label: Some("mirror_cursor_schema_recheck".into()),
-            })
-            .await?;
-        let upgraded_concurrently = rows_after_error.iter().any(|row| {
-            matches!(
-                row.get("name"),
-                Some(SqlValue::Text(name)) if name == "file_identity"
-            )
-        });
-        if !upgraded_concurrently {
-            return Err(RuntimeError::Internal(format!(
-                "mirror: failed to add session_mirror_cursor.file_identity: {alter_error}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Load persisted `(path, offset, identity)` state from the cursor table.
@@ -2981,16 +2920,15 @@ mod discovery_tests {
 mod cursor_retry_tests {
     use super::{
         adopt_dispatch_cursor, delete_cursors, drain_pending_cursor_deletes,
-        ensure_cursor_identity_schema, finalize_dispatch_stats, load_cursors, queue_cursor_deletes,
-        reconcile_cursor_durably, tally_dispatch_errors, CandidateDispatch, CursorResetReason,
-        DiscoveredKind, DiscoveryIndex, MirrorCursorState, CURSOR_DELETE_RETRY_LIMIT,
-        FILE_ERROR_POLLS_BEFORE_COLD,
+        finalize_dispatch_stats, load_cursors, queue_cursor_deletes, reconcile_cursor_durably,
+        tally_dispatch_errors, CandidateDispatch, CursorResetReason, DiscoveredKind,
+        DiscoveryIndex, MirrorCursorState, CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
     };
     #[cfg(unix)]
     use crate::mirror::ingest::metadata_file_identity;
     use crate::mirror::ingest::{
-        mirror_file, mirror_file_deferred_with_witness, probe_file, LineTailSource,
-        MirrorCursorDisposition, MirrorStats,
+        ensure_cursor_identity_schema, mirror_file, mirror_file_deferred_with_witness, probe_file,
+        LineTailSource, MirrorCursorDisposition, MirrorStats,
     };
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
     use khive_runtime::{AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig};
