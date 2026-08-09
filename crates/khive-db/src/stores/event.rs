@@ -1026,7 +1026,10 @@ impl EventStore for SqlEventStore {
                 origin,
             );
             if let Err(e) = insert_event_with_observations(conn, &event) {
-                let _ = conn.execute_batch("ROLLBACK");
+                crate::error::log_ignored_sqlite_result(
+                    "append_event_rollback",
+                    conn.execute_batch("ROLLBACK"),
+                );
                 return Err(e);
             }
             conn.execute_batch("COMMIT")?;
@@ -1074,7 +1077,10 @@ impl EventStore for SqlEventStore {
             let summary = match batch_append_events_dml(conn, &events, attempted) {
                 Ok(summary) => summary,
                 Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
+                    crate::error::log_ignored_sqlite_result(
+                        "append_events_rollback",
+                        conn.execute_batch("ROLLBACK"),
+                    );
                     return Err(e);
                 }
             };

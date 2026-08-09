@@ -130,7 +130,10 @@ fn prepare_batch_statements<'conn>(
         match prepare_sql_statement(conn, &statement.sql) {
             Ok(statement) => prepared.push(PreparedBatchStatement::Ready(statement)),
             Err(error @ rusqlite::Error::MultipleStatement) => return Err(error),
-            Err(_) => prepared.push(PreparedBatchStatement::PrepareAtExecution),
+            Err(error) => {
+                crate::error::log_sqlite_full("execute_batch_preflight_deferred", &error);
+                prepared.push(PreparedBatchStatement::PrepareAtExecution);
+            }
         }
     }
     Ok(prepared)
@@ -333,6 +336,7 @@ fn execute_standalone_batch(
     let mut poison_reason = None;
     if let Err(error) = &result {
         if let Err(rollback_error) = conn.execute_batch("ROLLBACK") {
+            crate::error::log_sqlite_full("execute_batch_rollback", &rollback_error);
             // A failed ROLLBACK leaves the connection in an unknown
             // transaction state. Preserve the original statement error while
             // making the poison cause explicit to the caller.
@@ -1305,14 +1309,20 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             match result {
                 Ok(total) => {
                     if let Err(e) = guard.execute_batch("COMMIT") {
-                        let _ = guard.execute_batch("ROLLBACK");
+                        crate::error::log_ignored_sqlite_result(
+                            "pool_writer_execute_batch_commit_rollback",
+                            guard.execute_batch("ROLLBACK"),
+                        );
                         Err(map_rusqlite_err(e, "pool_writer.execute_batch"))
                     } else {
                         Ok(total)
                     }
                 }
                 Err(e) => {
-                    let _ = guard.execute_batch("ROLLBACK");
+                    crate::error::log_ignored_sqlite_result(
+                        "pool_writer_execute_batch_rollback",
+                        guard.execute_batch("ROLLBACK"),
+                    );
                     Err(e)
                 }
             }

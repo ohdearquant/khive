@@ -286,7 +286,10 @@ impl AgentStore for SqlAgentStore {
         self.with_writer("agent_insert", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             if let Err(e) = insert_agent_dml(conn, &record) {
-                let _ = conn.execute_batch("ROLLBACK");
+                crate::error::log_ignored_sqlite_result(
+                    "agent_insert_rollback",
+                    conn.execute_batch("ROLLBACK"),
+                );
                 return Err(e);
             }
             conn.execute_batch("COMMIT")?;

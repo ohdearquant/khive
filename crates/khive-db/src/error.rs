@@ -138,6 +138,30 @@ pub(crate) fn log_storage_sqlite_full(operation: &str, error: &khive_storage::St
     }
 }
 
+/// Preserve a best-effort batch's historical `first_error` contract while
+/// escalating a raw `SQLITE_FULL` before the driver error is flattened into
+/// display text and the outer operation returns `Ok(BatchWriteSummary)`.
+pub(crate) fn record_batch_item_error(
+    operation: &str,
+    error: &rusqlite::Error,
+    first_error: &mut String,
+) {
+    log_sqlite_full(operation, error);
+    if first_error.is_empty() {
+        *first_error = error.to_string();
+    }
+}
+
+/// Observe a raw SQLite result whose caller deliberately preserves the
+/// historical best-effort control flow and discards the outcome. This keeps
+/// non-FULL failures silent while ensuring capacity exhaustion is escalated
+/// before a rollback/savepoint/preflight error can be swallowed.
+pub(crate) fn log_ignored_sqlite_result<T>(operation: &str, result: rusqlite::Result<T>) {
+    if let Err(error) = result {
+        log_sqlite_full(operation, &error);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +274,130 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, tracing::Level::ERROR);
         assert!(events[0].1.contains("SQLITE_FULL escalation"));
+    }
+
+    #[test]
+    fn batch_error_recording_escalates_full_before_flattening() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut first_error = "earlier item failure".to_string();
+
+        tracing::subscriber::with_default(
+            ErrorCapture {
+                events: Arc::clone(&events),
+            },
+            || record_batch_item_error("entity_upsert_batch_item", &error, &mut first_error),
+        );
+
+        assert_eq!(first_error, "earlier item failure");
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, tracing::Level::ERROR);
+        assert!(events[0].1.contains("SQLITE_FULL escalation"));
+    }
+
+    #[test]
+    fn batch_error_recording_preserves_first_error_for_non_full_failures() {
+        let first = rusqlite::Error::InvalidQuery;
+        let later = rusqlite::Error::InvalidParameterName("later".to_string());
+        let mut first_error = String::new();
+
+        record_batch_item_error("batch_item", &first, &mut first_error);
+        record_batch_item_error("batch_item", &later, &mut first_error);
+
+        assert_eq!(first_error, first.to_string());
+    }
+
+    #[test]
+    fn ignored_rollback_result_still_escalates_full() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        tracing::subscriber::with_default(
+            ErrorCapture {
+                events: Arc::clone(&events),
+            },
+            || log_ignored_sqlite_result("fts_batch_rollback", Err::<(), _>(error)),
+        );
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, tracing::Level::ERROR);
+        assert!(events[0].1.contains("SQLITE_FULL escalation"));
+    }
+
+    #[test]
+    fn ignored_non_full_result_remains_silent() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        tracing::subscriber::with_default(
+            ErrorCapture {
+                events: Arc::clone(&events),
+            },
+            || {
+                log_ignored_sqlite_result(
+                    "fts_batch_rollback",
+                    Err::<(), _>(rusqlite::Error::InvalidQuery),
+                )
+            },
+        );
+
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn production_store_census_has_no_raw_sqlite_error_swallow_seams() {
+        let entity = include_str!("stores/entity.rs");
+        let note = include_str!("stores/note.rs");
+        let sparse = include_str!("stores/sparse.rs");
+        let text = include_str!("stores/text.rs");
+        let vectors = include_str!("stores/vectors.rs");
+        let sources = [
+            ("agents", include_str!("stores/agents.rs")),
+            ("entity", entity),
+            ("event", include_str!("stores/event.rs")),
+            ("graph", include_str!("stores/graph.rs")),
+            ("note", note),
+            ("sparse", sparse),
+            ("text", text),
+            ("vectors", vectors),
+            ("sql_bridge", include_str!("sql_bridge.rs")),
+        ];
+
+        for (name, source) in sources {
+            assert!(
+                !source.contains("let _ = conn.execute_batch")
+                    && !source.contains("let _ = guard.execute_batch"),
+                "{name} still discards a raw SQLite rollback/savepoint result"
+            );
+        }
+
+        for (name, source, expected_non_sqlite_count) in [
+            ("entity", entity, 0),
+            ("note", note, 0),
+            // Sparse retains one serde_json serialization failure with this
+            // spelling; its SQLite item failure must use the typed helper.
+            ("sparse", sparse, 1),
+            ("text", text, 0),
+            ("vectors", vectors, 0),
+        ] {
+            assert_eq!(
+                source.matches("first_error = e.to_string();").count(),
+                expected_non_sqlite_count,
+                "{name} still flattens a raw SQLite batch-item error directly"
+            );
+        }
+
+        assert!(
+            !include_str!("sql_bridge.rs")
+                .contains("Err(_) => prepared.push(PreparedBatchStatement::PrepareAtExecution)"),
+            "SQL batch preflight still discards the concrete prepare error before escalation"
+        );
     }
 }

@@ -1315,13 +1315,19 @@ impl GraphStore for SqlGraphStore {
             let summary = match batch_upsert_edges(conn, &edges, attempted) {
                 Ok(summary) => summary,
                 Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
+                    crate::error::log_ignored_sqlite_result(
+                        "upsert_edges_rollback",
+                        conn.execute_batch("ROLLBACK"),
+                    );
                     return Err(e);
                 }
             };
 
             if let Err(e) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
+                crate::error::log_ignored_sqlite_result(
+                    "upsert_edges_commit_rollback",
+                    conn.execute_batch("ROLLBACK"),
+                );
                 return Err(e);
             }
             Ok(summary)
@@ -1377,13 +1383,19 @@ impl GraphStore for SqlGraphStore {
             let outcome = match edge_insert_guarded(conn, &statement, source_id, target_id) {
                 Ok(outcome) => outcome,
                 Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
+                    crate::error::log_ignored_sqlite_result(
+                        "upsert_edge_guarded_rollback",
+                        conn.execute_batch("ROLLBACK"),
+                    );
                     return Err(e);
                 }
             };
 
             if let Err(e) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
+                crate::error::log_ignored_sqlite_result(
+                    "upsert_edge_guarded_commit_rollback",
+                    conn.execute_batch("ROLLBACK"),
+                );
                 return Err(e);
             }
             Ok(outcome)
@@ -1420,13 +1432,19 @@ impl GraphStore for SqlGraphStore {
             let summary = match batch_upsert_edges_guarded(conn, &edges, attempted) {
                 Ok(summary) => summary,
                 Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
+                    crate::error::log_ignored_sqlite_result(
+                        "upsert_edges_guarded_rollback",
+                        conn.execute_batch("ROLLBACK"),
+                    );
                     return Err(e);
                 }
             };
 
             if let Err(e) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
+                crate::error::log_ignored_sqlite_result(
+                    "upsert_edges_guarded_commit_rollback",
+                    conn.execute_batch("ROLLBACK"),
+                );
                 return Err(e);
             }
             Ok(summary)

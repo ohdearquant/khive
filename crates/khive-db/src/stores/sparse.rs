@@ -154,9 +154,11 @@ fn batch_insert_sparse_dml(
         ) {
             Ok(_) => affected += 1,
             Err(e) => {
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
+                crate::error::record_batch_item_error(
+                    "sparse_insert_batch_item",
+                    &e,
+                    &mut first_error,
+                );
                 failed += 1;
             }
         }

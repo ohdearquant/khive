@@ -703,11 +703,19 @@ fn batch_insert_vectors_dml(
                 affected += 1;
             }
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_batch_record");
-                let _ = conn.execute_batch("RELEASE SAVEPOINT vec_batch_record");
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
+                crate::error::log_ignored_sqlite_result(
+                    "vec_insert_batch_item_rollback",
+                    conn.execute_batch("ROLLBACK TO SAVEPOINT vec_batch_record"),
+                );
+                crate::error::log_ignored_sqlite_result(
+                    "vec_insert_batch_item_release",
+                    conn.execute_batch("RELEASE SAVEPOINT vec_batch_record"),
+                );
+                crate::error::record_batch_item_error(
+                    "vec_insert_batch_item",
+                    &e,
+                    &mut first_error,
+                );
                 failed += 1;
             }
         }
@@ -765,8 +773,14 @@ fn vec_upsert_atomic_dml(
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch(&format!("ROLLBACK TO SAVEPOINT {savepoint_name}"));
-            let _ = conn.execute_batch(&format!("RELEASE SAVEPOINT {savepoint_name}"));
+            crate::error::log_ignored_sqlite_result(
+                "vec_upsert_atomic_rollback",
+                conn.execute_batch(&format!("ROLLBACK TO SAVEPOINT {savepoint_name}")),
+            );
+            crate::error::log_ignored_sqlite_result(
+                "vec_upsert_atomic_release",
+                conn.execute_batch(&format!("RELEASE SAVEPOINT {savepoint_name}")),
+            );
             Err(e)
         }
     }
@@ -1193,8 +1207,14 @@ impl VectorStore for SqliteVecStore {
                     Ok(v)
                 }
                 Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_delete_log");
-                    let _ = conn.execute_batch("RELEASE SAVEPOINT vec_delete_log");
+                    crate::error::log_ignored_sqlite_result(
+                        "vec_delete_rollback",
+                        conn.execute_batch("ROLLBACK TO SAVEPOINT vec_delete_log"),
+                    );
+                    crate::error::log_ignored_sqlite_result(
+                        "vec_delete_release",
+                        conn.execute_batch("RELEASE SAVEPOINT vec_delete_log"),
+                    );
                     Err(e)
                 }
             }

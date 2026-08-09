@@ -776,11 +776,19 @@ fn batch_upsert_documents_dml(
                 affected += 1;
             }
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT fts_upsert_doc");
-                let _ = conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc");
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
+                crate::error::log_ignored_sqlite_result(
+                    "fts_upsert_batch_item_rollback",
+                    conn.execute_batch("ROLLBACK TO SAVEPOINT fts_upsert_doc"),
+                );
+                crate::error::log_ignored_sqlite_result(
+                    "fts_upsert_batch_item_release",
+                    conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc"),
+                );
+                crate::error::record_batch_item_error(
+                    "fts_upsert_batch_item",
+                    &e,
+                    &mut first_error,
+                );
                 failed += 1;
             }
         }
@@ -829,7 +837,10 @@ impl TextSearch for Fts5TextSearch {
             );
 
             if let Err(e) = upsert_document_dml(conn, &table, &document) {
-                let _ = conn.execute_batch("ROLLBACK");
+                crate::error::log_ignored_sqlite_result(
+                    "fts_upsert_rollback",
+                    conn.execute_batch("ROLLBACK"),
+                );
                 return Err(e);
             }
 
@@ -1517,7 +1528,10 @@ impl Fts5TextSearch {
                     Ok(moved)
                 }
                 Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
+                    crate::error::log_ignored_sqlite_result(
+                        "fts_rename_namespace_rollback",
+                        conn.execute_batch("ROLLBACK"),
+                    );
                     Err(e)
                 }
             }
