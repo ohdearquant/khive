@@ -12,12 +12,9 @@ The schedule pack for khive — time-triggered intent storage (`remind`,
 | `schedule.agenda`   | List upcoming events; MCP also reports process-local ticker liveness    |
 | `schedule.cancel`   | Cancel a scheduled event                                                |
 
-`at` is an RFC 3339 timestamp; `repeat` accepts `daily` / `weekly` / `monthly`
-or a limited 5-field form where each field is `*` or one in-range integer
-(e.g. `"0 9 * * 1"`). Cron operators such as steps (`*/15`), ranges (`9-17`),
-and lists (`0,30`) are not accepted, and `kkernel`'s pending-events runner
-currently fires the 5-field form one-shot rather than advancing it to its
-next occurrence.
+`at` is an RFC 3339 timestamp; `repeat` accepts `daily` / `weekly` / `monthly`.
+Cron expressions are rejected because the pending-events executor cannot advance
+them; accepted recurrence never degrades silently to one-shot delivery.
 
 ## Semantics
 
@@ -48,6 +45,11 @@ rejected before the event is stored, not at trigger time. Reading pending
 events and dispatching at `trigger_at` is the execution environment's
 responsibility (the ADR-119-supervised daemon component or an external cron / cloud
 scheduler invoking the pending-event runner).
+
+The runner records deterministic occurrence identity, a fresh invocation identity,
+and a renewable lease before dispatch. Failed one-shots remain pending for recovery;
+expired invocations without a durable outcome become indeterminate and are not replayed
+automatically. See ADR-106 Amendment F for the receipt and crash-recovery contract.
 
 On the MCP surface, the host decorates `schedule.agenda` with
 `ticker.last_tick_at`. It is null until the current server process observes a daemon tick

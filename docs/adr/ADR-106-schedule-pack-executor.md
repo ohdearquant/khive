@@ -2,9 +2,10 @@
 
 **Status**: Accepted
 **Date**: 2026-07-09
-**Amended**: 2026-08-01 (missed-event grace policy, Amendment A; implementation note,
+**Amended**: 2026-08-07 (missed-event grace policy, Amendment A; implementation note,
 Amendment B; reminder delivery and failure observability, Amendment C; process-local
-ticker liveness, Amendment D; ADR-119 supervision and creator-bound replay, Amendment E)
+ticker liveness, Amendment D; ADR-119 supervision and creator-bound replay, Amendment E;
+durable dispatch receipts and renewable leases, Amendment F)
 **Depends on**: [ADR-040](ADR-040-communication-and-schedule-packs.md) (schedule pack
 verbs and `scheduled_event` note kind), [ADR-049](ADR-049-khived-daemon.md) (warm daemon
 process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time),
@@ -25,15 +26,16 @@ a conditional CAS update guarded by `status = 'pending'` so a concurrent fire ca
 be clobbered by a stale cancel.
 
 A separate, already-shipped component performs the actual firing: `kkernel exec
---pending-events` (`crates/kkernel/src/pending_events.rs`, entry point
+--pending-events` (`crates/khive-mcp/src/pending_events.rs`, entry point
 `run_pending_events`). This is a complete, well-tested one-shot drain, not a stub:
 
 - A DB-level compare-and-swap state machine moves each due row through
   `pending → firing → fired` (or back to `pending` for a repeating event), using a
-  claim token (`firing_at`, an epoch-microsecond timestamp) that `finalize_fired_event`
-  must match exactly before it will transition a row out of `firing`. A stale-firing
-  reclaim sweep (`reclaim_stale_firing_events`, 5-minute timeout) recovers rows
-  abandoned by a crashed or killed drain.
+  claim token (`firing_at` plus `dispatch_receipt.invocation_id`) that
+  `finalize_fired_event` must match exactly before it will transition a row out of
+  `firing`. The claim atomically persists occurrence/invocation identity and a renewable
+  lease; expired claims are reconciled according to their durable receipt state rather
+  than blindly replayed (Amendment F).
 - Discovery is namespace-partitioned (`discover_pending_namespaces`) and SQL-pushed: a
   `json_extract(properties, '$.trigger_at') <= ?` pre-filter, followed by a Rust-side
   re-check against a parsed `DateTime<Utc>`.
@@ -45,12 +47,11 @@ A separate, already-shipped component performs the actual firing: `kkernel exec
   means a verb-surface change between store and fire produces an explicit failed
   dispatch, never a silent misdispatch.
 - Repeat advancement (`next_trigger_at`) handles the named aliases `daily` / `weekly` /
-  `monthly`. A five-field cron expression is accepted and validated at write time but is
-  not advanced by the drain today: it fires once and is marked terminal, a known,
-  tracked limitation (khive issue #14), out of scope for this ADR.
-- The module's own doc comment frames it plainly: "This is a cron-friendly one-shot
-  drain. It is NOT a long-running daemon. Run it from cron (e.g. `* * * * * kkernel exec
-  --pending-events`) to achieve minute-granularity delivery."
+  `monthly`. Five-field cron is rejected at write time because the drain cannot advance
+  it; a legacy cron row fails closed before dispatch rather than degrading to one-shot.
+- The module exposes a cron-friendly one-shot CLI drain in addition to the
+  daemon-resident tick, so an external `* * * * * kkernel exec --pending-events`
+  remains a supported minute-granularity invocation mode.
 
 The gap is exactly that last sentence: nothing in a default khive deployment invokes
 this drain periodically. No cron entry ships with khive, and the warm daemon process
@@ -184,8 +185,10 @@ cleanly, because the watch channel resolves its `select!` immediately. A pass st
 processing a large backlog when the drain budget expires can be cut off by process
 teardown. That bounded outcome is acceptable because every drain pass is already
 crash-tolerant: each event's fire is finalized individually, and rows stranded in the
-`firing` state by an interrupted pass are recovered by `reclaim_stale_firing_events`
-on a subsequent drain. The executor relies on that recovery path; this ADR does not
+`firing` state by an interrupted pass are reconciled by `reclaim_stale_firing_events`
+on a subsequent drain according to their durable receipt state (Amendment F). A claim
+that expired before invocation is retryable; an invocation with no proven outcome fails
+closed rather than being replayed. The executor relies on that recovery path; this ADR does not
 promise pass completion under shutdown, only prompt exit when idle and recoverability
 when interrupted. No additional field or accessor is added to `DaemonDispatch`
 beyond the existing `pool_for_checkpoint`, which `schedule_tick_loop` still uses to
@@ -350,16 +353,13 @@ watch-channel shutdown design remain unimplemented residuals documented under Am
 B (Acceptance Criteria 5-7); this interval-contract correction does not imply that they
 shipped.
 
-### 7. Repeat-advance semantics are unchanged
+### 7. Original repeat-advance semantics (cron clause superseded by Amendment F)
 
-This ADR does not alter how the drain advances `trigger_at` for repeating events. Named
-aliases (`daily` / `weekly` / `monthly`) continue to be computed from the row's own
-stored `trigger_at`, not from the tick's observed `now`. This is what already gives the
-drain correct missed-fire recovery for free: a daemon that was down for an hour simply
-fires everything overdue on its first tick after restart, because discovery scans
-`status = 'pending' AND trigger_at <= now` rather than a specific expected slot. Five-field
-cron expressions remain validated at write time and not advanced (issue #14),
-unaffected by this ADR.
+Named aliases (`daily` / `weekly` / `monthly`) continue to be computed from the row's own
+stored `trigger_at`, not from the tick's observed `now`. Amendment A governs whether an
+overdue occurrence is dispatched or skipped, and Amendment F supersedes this section's
+original cron clause: five-field cron is now rejected at intent creation because the
+executor cannot advance it safely.
 
 ## Acceptance Criteria
 
@@ -433,16 +433,17 @@ The following identified gaps remain out of scope for this ADR:
 - **Event-plane telemetry for drain passes.** Wiring drain-pass observability into the
   event plane is separate follow-on work and does not require any change to the
   drain's execution logic itself.
-- **Five-field cron repeat advancement** (khive issue #14) is unaffected by this ADR.
+- **Five-field cron repeat advancement** was resolved by Amendment F through explicit
+  write-time rejection; it is no longer deferred.
 
 ## Consequences
 
 - A `scheduled_event` created via `schedule.remind` or `schedule.schedule` fires within
   one tick interval of its `trigger_at` in any deployment running the warm daemon, with
   no separate cron provisioning required.
-- The drain's core claim/dispatch/finalize/reclaim logic is unchanged; this ADR adds an
-  invocation path, not a rewrite of the state machine ADR-040 and the shipped
-  `pending_events.rs` already established.
+- The original ADR added an invocation path without rewriting the drain. Later amendments,
+  especially A, E, and F, intentionally refined missed-event, identity, receipt, lease, and
+  recovery semantics; those amendments are the current contract.
 - External cron invocation of `kkernel exec --pending-events` remains a supported,
   safe-to-run-redundantly fallback, at zero additional design cost beyond the CAS claim
   the drain already has.
@@ -662,7 +663,8 @@ Criterion 6:
   `KHIVE_SCHEDULE_TICK_SECS` contract the criterion text above was amended to name.
 - **Criterion 5** (production-shaped watch-channel shutdown regression): **not met**.
   There is no watch-channel shutdown to test; a tick in flight at process shutdown is
-  still simply dropped, recovered by the next `reclaim_stale_firing_events` sweep.
+  still simply dropped and its durable state is reconciled by the next
+  `reclaim_stale_firing_events` sweep under Amendment F.
 - **Criterion 6** (`kkernel exec --pending-events` implemented as a thin wrapper over
   `DaemonDispatch::drain_pending_events`): **not met**. The CLI path calls
   `khive_mcp::pending_events::run_pending_events` directly, not a `DaemonDispatch` trait
@@ -793,10 +795,10 @@ drain logs the error, increments `DrainSummary.failed`, and persists `delivery_e
 audit event with verb `schedule.remind.fire`, the scheduled-event note as its target,
 and the intended recipient actor and error text in its payload. Failure remains
 per-event: it does not abort the drain or prevent later due rows from dispatching in
-the same pass. The failed reminder is still finalized according to its cadence (a
-one-shot becomes `fired`; a named repeat is re-armed), preventing an indefinitely
-retrying permanently broken delivery. A later successful occurrence clears stale
-`delivery_error` and `delivery_failed_at` properties.
+the same pass. Amendment F supersedes this amendment's original one-shot terminalization:
+a failed one-shot returns to `pending` with its durable failure receipt and error fields,
+while a named repeat remains re-armed at its next occurrence. A later successful
+occurrence clears stale `delivery_error` and `delivery_failed_at` properties.
 
 Because reminder delivery is part of the public `schedule.remind` contract, reminder
 creation checks that the registry provides `comm.send`. If it does not, the handler
@@ -891,6 +893,154 @@ dispatched, the claimed row becomes terminal `status="failed"`, and the drain pe
 `dispatch_error` plus `dispatch_failed_at`. This is the migration policy for rows written
 before creator attribution and deliberately differs from Amendment C's reminder-only legacy
 fallback: an unprovenanced reminder ignores its note actor claim and targets only the current
-server actor (then `local`). Other generic dispatch failures remain per-event and follow
-normal cadence finalization (`fired` or re-armed `pending`) while persisting those same error
-fields; a later successful repeat clears them.
+server actor (then `local`). The refusal receipt for an unprovenanced generic action is stamped
+`anonymous:local`, because no actor was verified; the daemon fallback is reserved for genuinely
+legacy reminders. Other generic dispatch failures remain per-event. Amendment F
+supersedes their one-shot lifecycle: a failed one-shot remains `pending` and retryable; a
+named repeat advances normally. Both persist the same error fields, and later success clears
+them.
+
+The drain also revalidates the single-operation boundary before setting a receipt to
+`invoking`. A legacy action stored as a batch or chain becomes terminal `failed` with a
+`not_invoked` receipt. It is never submitted to best-effort batch dispatch: otherwise one
+operation could commit while a sibling returns a known failure, and retrying the occurrence
+would duplicate the successful side effect.
+
+## Amendment F: Durable dispatch receipts and renewable leases (2026-08-07)
+
+The original claim-token CAS prevented two drains from claiming a pending row at the same
+instant, but it did not make the interval between dispatch and finalization safe. A live action
+running beyond the fixed stale threshold could be reclaimed, and a crash after an externally
+visible side effect but before finalization could invoke that side effect again. Dispatch
+failure was also conflated with successful occurrence consumption, and drain counters were
+incremented before their corresponding lifecycle write committed.
+
+### Occurrence and invocation receipt
+
+Every new claim atomically writes a versioned `dispatch_receipt` into the schedule-managed
+properties together with `status="firing"`, `firing_at`, and `lease_expires_at`:
+
+```json
+{
+  "version": 1,
+  "occurrence_id": "deterministic UUIDv5(event id, scheduled UTC instant)",
+  "invocation_id": "fresh UUIDv4 for this attempt",
+  "actor": "actor:lambda:owner",
+  "state": "claimed",
+  "claimed_at": 1786060800000000
+}
+```
+
+Immediately before polling the action future, the claimant conditionally changes the receipt
+to `state="invoking"`. When the call returns, it conditionally persists `succeeded`, `failed`,
+or `indeterminate` plus `completed_at`, a human-readable `error`, and the original structured
+`error_payload` when the dispatched verb returned one, still bound to both the original
+`firing_at` and `invocation_id`. This preserves reconciliation fields such as an ambiguous
+`comm.send` result's `details.outbound_id` instead of flattening them into a string. Only after
+that durable outcome write does lifecycle
+finalization clear the active lease fields. The final row retains the last receipt, so a
+response loss or finalization failure remains diagnosable and recoverable. Retry attempts for
+the same scheduled instant keep one `occurrence_id` and receive distinct `invocation_id`s.
+Finalizations that occur before action invocation retain the claim receipt as well. Unsupported
+recurrence, missing immutable provenance, and empty payload use `state="not_invoked"` with a
+non-empty error; an occurrence skipped by the grace policy uses `state="missed"` and
+`error=null`. Both carry `completed_at`, and neither state means that the action future began.
+
+The receipt actor is derived from the same immutable creator provenance as replay, including
+for reminders skipped by the missed-event policy. Only a genuinely legacy reminder with no
+provenance uses the configured scheduler/anonymous-local fallback. A refused generic row with
+no verified creator uses `anonymous:local`, never the daemon actor. The receipt is diagnostic
+and never authorizes the dispatch; `VerifiedActor`, namespace injection, public visibility,
+and Gate evaluation remain the authority boundary described by Amendment E.
+
+### Renewable lease and deadline ownership
+
+`KHIVE_SCHEDULE_LEASE_SECS` is a positive integer duration in seconds, defaulting silently to
+`300` when absent, zero, or invalid. A separate task renews `lease_expires_at` every one third
+of that duration through action execution and durable outcome persistence. The renewal is
+independent of the action future's polling task, so a synchronously blocked handler cannot
+starve its own heartbeat on a multi-thread runtime, and writer contention after action return
+cannot create an unleased outcome gap. Reclaim compares the durable deadline, not the original
+start time. Every recovery requeue, quarantine, or lifecycle finalization matches the exact
+serialized properties snapshot selected by the recovery scan as well as re-checking the current
+deadline and claim identity. Any outcome persistence, renewal, or other properties mutation after
+the SELECT therefore fences the stale recovery write, including the race where an `invoking`
+snapshot is followed by a durable `succeeded` outcome whose completed lease is already expired.
+Rows written by older binaries without `lease_expires_at` retain the historical five-minute
+`firing_at` fallback.
+
+If renewal loss or failure is observed before the outcome write, the attempted result is
+classified `indeterminate`; it is never treated as a proven success or a safe automatic retry.
+Once the claim-bound outcome CAS commits, that durable receipt is authoritative: a renewal
+already waiting on the writer may then observe the receipt's terminal state and stop without
+changing the proven outcome. Claim and finalize continue to match the invocation id as well as
+`firing_at`, so a stale claimant cannot overwrite a later attempt.
+
+### Crash and failure recovery
+
+Expired receipts are reconciled as follows:
+
+| Durable state                                 | Recovery                                                                                                                         |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `claimed`                                     | Invocation never began; atomically record `not_invoked`/claim expiry and return the same occurrence to `pending`.                |
+| `invoking`                                    | Outcome is ambiguous; mark terminal `failed`/`indeterminate` and do not dispatch again.                                          |
+| `succeeded`                                   | Resume lifecycle finalization without invoking the action again.                                                                 |
+| `failed`                                      | Preserve the error; return a one-shot to `pending`, or advance a named repeat to its next occurrence.                            |
+| `not_invoked` / `missed` on `status="firing"` | The atomic pre-invocation finalization did not complete; fail closed as `indeterminate` rather than inferring or replaying work. |
+| malformed/unknown                             | Fail closed as `indeterminate`; never inherit daemon authority or replay automatically.                                          |
+
+Recovery validates the complete typed v1 receipt before selecting one of these branches. Every
+receipt needs supported `version`, parseable occurrence and invocation UUIDs, a supported actor
+encoding, and integer `claimed_at` equal to the active `firing_at`. The occurrence id must equal
+UUIDv5(event id, scheduled UTC instant). `invoking` additionally needs a valid
+`invocation_started_at`. Terminal states need a valid `completed_at`; `succeeded` and `missed`
+require `error=null`, while `failed`, `indeterminate`, and `not_invoked` require a non-empty
+string error. `claimed`, `invoking`, `succeeded`, `missed`, and `not_invoked` reject a non-null
+action `error_payload`; `failed` and `indeterminate` may retain one. A malformed terminal-looking receipt therefore cannot be used to mark a row fired
+or retryable: it is durably quarantined as indeterminate, with the rejected receipt retained as
+`invalid_receipt`, and the target action is not invoked.
+
+This is an at-most-once safety boundary for generic non-idempotent actions, not a claim of
+distributed exactly-once execution. The unavoidable crash window between the external side
+effect and the local outcome write is represented explicitly as `indeterminate`; automatically
+replaying that state would recreate the duplicate-side-effect bug this amendment closes.
+The same classification applies when the action _returns_ an explicit ambiguous result, including
+`side_effects_unknown`: the scheduler preserves the structured payload/correlation id, marks the
+occurrence terminally indeterminate, and never blindly retries it. A normal per-op error remains
+a known failure and follows the retry policy below.
+Known action failures are different: the invocation returned a durable failure outcome, so a
+one-shot remains recoverable on a later drain instead of being falsely marked fired. Operators
+can still cancel a retrying pending event.
+
+The missed-event grace policy in Amendment A is unchanged. This amendment does not add or alter
+per-schedule misfire policy.
+
+### Counters and recurrence validation
+
+`DrainSummary` keeps its existing fields and adds `invoked`, `outcomes_persisted`, `finalized`,
+`retry_pending`, and `indeterminate`. `invoked` counts action futures entered in this pass;
+`outcomes_persisted` counts durable outcome writes, including an `indeterminate` classification
+created during crash recovery; `finalized` counts successful lifecycle CAS writes. `fired` and
+`advanced` increment only after their own finalization succeeds, so a failed write never
+decrements an unrelated branch's prior count. Expiry in `claimed` increments `retry_pending` and
+`finalized`, but not `failed`, `invoked`, or `outcomes_persisted`, because the receipt proves that
+the target action never began. Every expired-row finalization is isolated: a storage failure for
+one selected row increments `failed`, is logged with row/namespace identity, and does not prevent
+later expired rows or newly due work from being processed.
+
+Schedule creation now accepts only `daily`, `weekly`, and `monthly`. Five-field cron is rejected
+with an explicit non-executable error; legacy cron rows fail closed before invocation. This
+narrows a previously misleading accepted grammar without changing any recurrence the executor
+could actually honor.
+
+Deterministic regressions cover a live invocation held beyond multiple lease durations while a
+second drain runs (one target-verb entry and one visible side effect), a crash after durable
+success but before finalization (resume without invocation), an expired `invoking` receipt
+(terminal indeterminate with no replay), failed one-shot retry with stable occurrence/distinct
+invocation ids, stale-claim finalization fencing, malformed terminal receipt fields and
+occurrence identity, truthful `claimed -> not_invoked -> pending` recovery, a stale recovery
+snapshot losing to a newly durable success, creator-attributed missed-reminder receipts,
+anonymous attribution for refused generic rows, terminal pre-invocation refusal of legacy
+multi-op actions across two drains, a committed side effect followed by structured
+`side_effects_unknown` across two drains (one invocation/one visible side effect), and an
+injected expired-row finalization failure that does not wedge later due work.
