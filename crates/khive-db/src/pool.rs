@@ -533,7 +533,7 @@ impl ConnectionPool {
     /// WAL is disabled or unavailable, the pool falls back to single-connection
     /// mode.
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
-        Self::new_with_create_policy(config, true)
+        Self::new_with_create_policy(config, true, false)
     }
 
     /// Open a pool over an existing file-backed database without
@@ -550,12 +550,31 @@ impl ConnectionPool {
                 "existing-database pool requires a file-backed path".to_string(),
             ));
         }
-        Self::new_with_create_policy(config, false)
+        Self::new_with_create_policy(config, false, false)
+    }
+
+    /// Open an existing file only when the write connection itself observes
+    /// the complete canonical migration ledger for this binary.
+    ///
+    /// Validation runs on the raw `SQLITE_OPEN_READ_WRITE` connection before
+    /// [`configure_writer_connection`] can change journal mode or any other
+    /// persistent setting. This closes the admission/configuration race for
+    /// caller-selected write targets: replacing the path after an earlier
+    /// read-only inspection cannot make the replacement eligible for a
+    /// write-intent PRAGMA before it is rejected.
+    pub fn new_existing_current(config: PoolConfig) -> Result<Self, SqliteError> {
+        if config.path.is_none() {
+            return Err(SqliteError::InvalidConfig(
+                "current existing-database pool requires a file-backed path".to_string(),
+            ));
+        }
+        Self::new_with_create_policy(config, false, true)
     }
 
     fn new_with_create_policy(
         config: PoolConfig,
         create_if_missing: bool,
+        require_current_schema: bool,
     ) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
         validate_write_admission_deadline(config.write_admission_deadline_ms)?;
@@ -576,6 +595,9 @@ impl ConnectionPool {
         }
 
         let writer = open_writer_connection(&config, create_if_missing)?;
+        if require_current_schema {
+            crate::migrations::validate_current_schema_ledger(&writer)?;
+        }
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
 
@@ -1577,6 +1599,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn current_existing_pool_validates_a_replacement_before_write_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.db");
+        let replacement = dir.path().join("replacement.db");
+
+        {
+            let mut trusted = Connection::open(&target).unwrap();
+            crate::migrations::run_migrations(&mut trusted).unwrap();
+        }
+        crate::migrations::inspect_current_schema_ledger(&target)
+            .expect("the read-only admission probe sees a canonical target");
+
+        {
+            let mut stale = Connection::open(&replacement).unwrap();
+            crate::migrations::run_migrations(&mut stale).unwrap();
+            stale
+                .execute(
+                    "DELETE FROM _schema_migrations \
+                     WHERE version = (SELECT MAX(version) FROM _schema_migrations)",
+                    [],
+                )
+                .unwrap();
+        }
+        std::fs::remove_file(&target).unwrap();
+        std::fs::rename(&replacement, &target).unwrap();
+
+        let before = std::fs::read(&target).unwrap();
+        let before_mode: String = Connection::open_with_flags(&target, reader_open_flags())
+            .unwrap()
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(before_mode, "delete");
+
+        let error = match ConnectionPool::new_existing_current(PoolConfig {
+            path: Some(target.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        }) {
+            Ok(_) => panic!("the replacement's stale ledger must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("migration ledger"),
+            "the pre-configuration validator must name the ledger: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            before,
+            "validation must precede journal-mode or other persistent configuration"
+        );
+        let after_mode: String = Connection::open_with_flags(&target, reader_open_flags())
+            .unwrap()
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_mode, "delete");
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = target.as_os_str().to_owned();
+            sidecar.push(suffix);
+            assert!(
+                !PathBuf::from(sidecar).exists(),
+                "rejected replacement must not gain a {suffix} sidecar"
+            );
+        }
     }
 
     #[test]

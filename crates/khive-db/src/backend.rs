@@ -73,6 +73,28 @@ impl StorageBackend {
         })
     }
 
+    /// Write-capable backend over an existing, already-current database.
+    ///
+    /// The raw writer connection validates the complete canonical migration
+    /// ledger before pool configuration may issue write-intent PRAGMAs. A
+    /// caller-selected path that changes after an earlier inspection is
+    /// therefore rejected before the replacement is mutated.
+    pub fn sqlite_existing_current(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
+        crate::extension::ensure_extensions_loaded();
+        let resolved = path.as_ref().to_path_buf();
+        let config = PoolConfig {
+            path: Some(resolved.clone()),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new_existing_current(config)?;
+        Ok(Self {
+            pool: Arc::new(pool),
+            is_file_backed: true,
+            path: Some(resolved),
+            notes_seq_repair_runs: AtomicUsize::new(0),
+        })
+    }
+
     /// File-backed SQLite database opened read-only.
     ///
     /// Opens the database at `path` and sets `PRAGMA query_only = ON` on the

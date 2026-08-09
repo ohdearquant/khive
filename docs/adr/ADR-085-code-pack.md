@@ -1563,16 +1563,22 @@ create-capable clause: an explicit target is now a claim that an
 operator-selected map already exists and carries the complete canonical khive
 migration ledger for the current schema version.
 
-The handler first inspects an explicit target through a read-only connection.
-It rejects a missing path, a non-database file, and any ledger other than the
-complete canonical sequence of current migration versions and names (including
-a fabricated head row, gaps, substitutions, or extras). Only after that check may it open a
-write-capable pool, and that pool omits `SQLITE_OPEN_CREATE`; the runtime does
-not run migrations on this path. The schema is checked again on the opened
-pool before model registration or ingest. An older schema error identifies
-`kkernel db migrate --db <path>` as the initialization/upgrade remedy; a
-newer schema error requires a khive build that supports that version rather
-than pretending a migration can downgrade it.
+The handler first inspects an explicit target through read-only connections.
+It reports the observed ledger head before enforcing the complete canonical
+sequence of current migration versions and names (including rejection of a
+fabricated head row, gaps, substitutions, or extras). An older head identifies
+`kkernel db migrate --db <path>` as the initialization/upgrade remedy; a newer
+head requires a khive build that supports that version rather than pretending
+a migration can downgrade it.
+
+Only after those checks may the runtime open a write-capable pool, and that
+pool omits `SQLITE_OPEN_CREATE`; the runtime does not run migrations on this
+path. The raw write-capable connection validates the exact ledger again before
+pool configuration may issue `PRAGMA journal_mode=WAL` or any other
+write-intent setting. The pre-configuration check uses that same opened
+connection, so replacing the path after read-only inspection cannot mutate the
+replacement before refusal. Model registration and ingest begin only after
+that check succeeds.
 
 Omitting `db` retains the intentional creation surface from Amendment 2:
 `<path>/.khive/code-map.db` is created and migrated through the ordinary
@@ -1590,3 +1596,8 @@ initialize that map explicitly before supplying it as `db`.
    through `code.ingest`; a SQLite file with only a fabricated current head
    row is rejected byte-identically with no WAL or shared-memory sidecars.
 4. Omitting `db` still creates and migrates the workspace-local default.
+5. Older and newer ledger heads produce distinct forward-migration and
+   compatible-build remedies. A deterministic replacement between read-only
+   inspection and write-capable open is rejected before journal mode changes;
+   the replacement bytes, DELETE journal mode, and absence of WAL/SHM sidecars
+   are preserved.

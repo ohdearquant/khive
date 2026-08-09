@@ -7,6 +7,14 @@ function-specific technical reference for the pool's private/internal
 mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 ("Single-Writer Write Queue") for the ADR-067 rationale.
 
+`ConnectionPool::new_existing_current` is the admission path for a
+caller-selected, write-capable database that must already carry this binary's
+complete canonical migration ledger. It opens without `SQLITE_OPEN_CREATE` and
+validates the ledger on the raw writer connection before persistent pool
+configuration (including `journal_mode=WAL`). This same-connection ordering is
+what makes a replacement after an earlier read-only inspection fail without
+mutating the replacement.
+
 ## `ConnectionPool::writer_task_handle` — single-writer-task rationale
 
 See `crates/khive-db/src/pool.rs` — `writer_task_handle`.

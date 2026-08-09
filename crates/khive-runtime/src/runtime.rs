@@ -205,6 +205,7 @@ impl KhiveRuntime {
     /// an explicit `code.ingest(db=...)`; ordinary runtime boot should continue
     /// to use [`Self::new`].
     pub fn new_existing_current(config: RuntimeConfig) -> RuntimeResult<Self> {
+        let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let path = config.db_path.clone().ok_or_else(|| {
             RuntimeError::InvalidInput(
                 "existing database target requires a file-backed db path".to_string(),
@@ -226,26 +227,32 @@ impl KhiveRuntime {
                 path
             ))
         };
-        let inspected_version =
-            khive_db::inspect_current_schema_ledger(&path).map_err(|error| {
-                RuntimeError::InvalidInput(format!(
-                    "explicit target must be an existing current khive database at {:?}: {error}; \
-                 initialize or upgrade it with `kkernel db migrate --db <path>`",
-                    path
-                ))
-            })?;
+        let inspected_version = khive_db::inspect_schema_version(&path).map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "explicit target must be an existing khive database at {:?}: {error}; \
+                 initialize it with `kkernel db migrate --db <path>`",
+                path
+            ))
+        })?;
         if inspected_version != latest_version {
             return Err(schema_mismatch(inspected_version, "is not current"));
         }
+        khive_db::inspect_current_schema_ledger(&path).map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "explicit target must carry the complete canonical current migration ledger at \
+                 {:?}: {error}; repair or recreate the target explicitly before retrying",
+                path
+            ))
+        })?;
 
-        let backend = StorageBackend::sqlite_existing(&path)?;
-        let reopened_version = {
-            let writer = backend.pool().try_writer()?;
-            khive_db::validate_current_schema_ledger(&writer)?
-        };
-        if reopened_version != latest_version {
-            return Err(schema_mismatch(reopened_version, "changed while opening"));
-        }
+        let backend = StorageBackend::sqlite_existing_current(&path).map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "explicit target at {:?} changed while opening or no longer carries the complete \
+                 canonical current migration ledger; it was refused before write configuration: \
+                 {error}",
+                path
+            ))
+        })?;
 
         register_configured_embedding_models(&backend, &config)?;
         let (registry, default_embedder_name) = build_embedder_registry(&config);
@@ -253,6 +260,7 @@ impl KhiveRuntime {
             backend: Arc::new(backend),
             core_backend: None,
             config,
+            ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),

@@ -932,6 +932,95 @@ async fn wire_explicit_unmigrated_db_is_rejected_byte_identically() {
     }
 }
 
+#[tokio::test]
+async fn wire_explicit_older_db_names_the_migration_remedy() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_older_target");
+    let db = root.path().join("older.db");
+    initialize_explicit_map_db(&db);
+
+    let conn = Connection::open(&db).expect("open initialized map");
+    conn.execute(
+        "DELETE FROM _schema_migrations \
+         WHERE version = (SELECT MAX(version) FROM _schema_migrations)",
+        [],
+    )
+    .expect("make the migration ledger an older canonical prefix");
+    conn.close().expect("close older-ledger connection");
+    let before = std::fs::read(&db).expect("read older target before dispatch");
+
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+    let error = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": root.path().join("pkg_older_target").to_string_lossy(),
+            "db": db.to_string_lossy(),
+            "languages": ["rust"],
+            "tiers": [],
+        }),
+    )
+    .await
+    .expect_err("an older explicit target must be rejected");
+
+    assert!(
+        error.to_string().contains("observed version")
+            && error.to_string().contains("kkernel db migrate"),
+        "an older target must name the forward-migration remedy: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("read older target after dispatch"),
+        before,
+        "remedy selection must remain read-only"
+    );
+}
+
+#[tokio::test]
+async fn wire_explicit_newer_db_names_the_compatible_build_remedy() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_newer_target");
+    let db = root.path().join("newer.db");
+    initialize_explicit_map_db(&db);
+
+    let conn = Connection::open(&db).expect("open initialized map");
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) \
+         SELECT MAX(version) + 1, 'future_test_migration', 0 FROM _schema_migrations",
+        [],
+    )
+    .expect("make the migration ledger newer than this binary");
+    conn.close().expect("close newer-ledger connection");
+    let before = std::fs::read(&db).expect("read newer target before dispatch");
+
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+    let error = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": root.path().join("pkg_newer_target").to_string_lossy(),
+            "db": db.to_string_lossy(),
+            "languages": ["rust"],
+            "tiers": [],
+        }),
+    )
+    .await
+    .expect_err("a newer explicit target must be rejected");
+
+    assert!(
+        error.to_string().contains("observed version")
+            && error
+                .to_string()
+                .contains("use a khive build that supports schema version")
+            && !error.to_string().contains("kkernel db migrate"),
+        "a newer target must name the compatible-build remedy, never migration: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("read newer target after dispatch"),
+        before,
+        "remedy selection must remain read-only"
+    );
+}
+
 /// A `MAX(version)` match is insufficient admission evidence: a valid SQLite
 /// file may forge only the migration-head row while omitting the canonical
 /// history. Explicit targets must reject that ledger read-only, without
