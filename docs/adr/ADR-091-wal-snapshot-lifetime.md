@@ -1165,3 +1165,45 @@ walpin sidecar heartbeat (Amendment 2 Plank B) are behavior-neutral under
 this amendment — only which connection/lock a checkpoint tick runs on
 changed. `run_checkpoint_task`'s public signature, and every other daemon
 call site, are also unchanged.
+
+### 2026-08-08 amendment (Amendment 6): independent bounded sidecar collection
+
+**Motivation.** Amendment 2 coupled `walpin::enumerate_live` — the operation that removes
+dead, reused-PID, stale, and malformed trusted entries — to the TRUNCATE-no-progress diagnostic
+arm. A healthy database never enters that arm, so crash residue accumulated even though the
+enumerator already had a 512-entry work bound. The same coupling also tempted diagnostics to
+serialize cleanup counters as `0`/`false` when no enumeration occurred, making "not measured"
+look like a measured clean state (#1794, #1795).
+
+**Decision.** Every sidecar-enabled daemon checkpoint tick performs at most one bounded sidecar
+pass for that task's file-backed backend. When the tick does not enter TRUNCATE-no-progress
+attribution, the task refreshes its own beacon/heartbeat and runs the housekeeping-specific
+`walpin::housekeep_live` pass before the Observed/Skipped branch. This pass uses the session-sweep
+legacy-record cadence fallback captured once at daemon-task startup
+(the ADR-defined compiled default, 5000 ms), never either the daemon's 500 ms checkpoint cadence
+or the enumerating process's current environment override. It removes only entries whose producer
+is positively dead or whose PID start identity proves reuse. A live PID's malformed,
+uninspectable, or stale heartbeat/beacon remains on disk and classifies `unknown`; housekeeping
+must not consume the evidence that a later no-progress report needs.
+
+When a TRUNCATE attempt makes no progress, the existing `walpin::enumerate_live` attribution pass
+runs instead. The synchronous PASSIVE/TRUNCATE core records an immutable attribution request; it
+never enumerates the directory itself. Before the async checkpoint task may consider ordinary
+housekeeping or emit that tick's lifecycle outcome, it consumes the request in an awaited
+`tokio::task::spawn_blocking` and only then uses the classifications for the operator report. The
+pass may remove trusted malformed/stale residue under Amendment 2's original cleanup rule. The
+checkpoint state is marked attempted before the blocking worker starts, so both success and an
+indeterminate worker failure suppress ordinary housekeeping later in the same tick: a panicked
+worker may already have performed part of the walk, and a second scan would violate the bound.
+Thus the 512-entry cap applies to one sidecar-directory pass per tick rather than silently allowing
+a second 512-entry scan. Collection remains independent of WAL size, threshold crossings, and
+checkpoint availability on every tick that did not already run attribution. An operator who
+explicitly disables the sidecar also disables collection. A trust-boundary enumeration error or
+blocking-worker join failure is surfaced distinctly, warned, and never flattened into successful
+attribution or allowed to terminate the checkpoint loop.
+
+`db_diagnostics` remains non-destructive with respect to sidecar evidence: the request does not
+invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
+`sidecar_entries_cleanup_would_reap` members are optional and omitted when enumeration did not
+run. A background checkpoint tick may independently perform its normal cleanup, but the
+diagnostic request itself never converts an unmeasured value into a clean-looking zero.

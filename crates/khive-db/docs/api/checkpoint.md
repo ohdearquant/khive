@@ -430,3 +430,29 @@ concurrently-running write path (e.g. `graph_upsert_edges`) could do in the
 real suite. The fix (looking up this test's own entry by label via
 `snapshot()` instead of trusting global `oldest()`) must still correctly
 name and escalate THIS entry despite that older decoy.
+
+### Healthy-tick WAL-pin sidecar collection
+
+After the task refreshes its own WAL-pin beacon/heartbeat, every
+sidecar-enabled checkpoint tick that did not already run no-progress
+attribution runs one bounded `walpin::housekeep_live` pass. It removes only
+positively dead/reused-PID residue and preserves malformed, uninspectable, and
+live-but-stale evidence for attribution. Legacy records with no declared
+producer cadence use the session-sweep fallback captured once at task startup
+(the ADR-defined compiled default, 5000 ms), never the daemon's checkpoint
+interval or the enumerator's current environment override.
+
+The TRUNCATE-no-progress path instead runs the destructive attribution
+enumerator. The synchronous checkpoint core only records a request containing
+the pre-TRUNCATE holder census and stable sidecar inputs. The async task then
+executes the directory walk in an awaited `spawn_blocking` before it considers
+ordinary housekeeping or emits the tick's lifecycle outcome; report logging
+cannot consume a partial result. It marks the tick attempted before spawning,
+so a successful pass, a trust-boundary enumeration error, or a blocking-worker
+join failure all suppress same-tick housekeeping. This is fail-safe for the
+one-pass bound because a failed worker may already have completed part of the
+walk. Enumeration and worker failures retain distinct classifications and
+warn without stopping the task. There is therefore at most one
+sidecar-directory pass per tick, processing at most `MAX_SIDECAR_ENTRIES`,
+including on a no-progress tick. Collection does not depend on WAL pressure or
+checkpoint availability; explicitly disabling the sidecar disables it.

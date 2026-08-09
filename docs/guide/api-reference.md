@@ -738,9 +738,9 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report writer-contention and WAL/checkpoint diagnostics for the main database: build identity,
-the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a
-WAL-pin holder census. Takes no parameters.
+Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
+database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
+sidecar file size, and a WAL-pin holder census. Takes no parameters.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
@@ -781,6 +781,16 @@ deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded
 `unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
 `unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
 holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are cleanup-enumeration
+measurements: this request deliberately does not run that mutating enumeration, so both fields are
+omitted rather than reporting fabricated `false`/`0` values.
+
+`graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
+`graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
+count is the legacy cross-namespace duplicate-ID state that can make a multi-namespace edge cursor
+walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
+intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
+live edge table. `graph_edge_integrity_error` explains a missing integrity section.
 Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
 explicit reasons rather than being silently omitted.
 
