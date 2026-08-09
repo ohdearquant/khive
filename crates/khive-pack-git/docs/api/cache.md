@@ -11,17 +11,18 @@ least-recently-used clone (by a `.khive-last-used` marker file's mtime,
 touched on every successful `ensure_clone`) once the cache exceeds
 `digest_cache_max_repos` entries or `digest_cache_max_bytes` total size —
 eviction is safe because ingest cursors live in the database, not the clone.
-Eviction only ever removes entries it can *prove* it owns (`is_owned_entry`:
+Eviction only ever removes entries it can _prove_ it owns (`is_owned_entry`:
 a 16-hex cache-key directory name containing both a `.git` dir and the
 `.khive-last-used` marker) — a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override
 pointed at a broader or pre-existing directory must never lose unrelated
 operator data.
 
 A per-clone size cap (`digest_cache_clone_max_bytes`) rejects a clone/fetch
-that grows past its own budget *before* it ever enters the addressable cache
-slot: `ensure_clone` clones/fetches into a staging directory outside the
-cache root, measures it, and only moves it into `<root>/<cache_key>/` when
-it is under the cap. A too-large clone is deleted from staging and never
+that grows past its own budget _before_ it ever enters the addressable cache
+slot: `ensure_clone` clones/fetches into a private staging directory under
+the cache root but outside every addressable `<cache_key>` slot, measures it,
+and only moves it into `<root>/<cache_key>/` when it is under the cap. A
+too-large clone is deleted from staging and never
 touches `evict_lru`'s bookkeeping or the cache slot. This guarantees the cap
 is enforced before the clone enters the cache — it does NOT bound the
 transient disk usage of the clone/fetch child process itself while it runs
@@ -44,6 +45,16 @@ process-wide `EVICTION_LOCK`), and that pass defers — rather than blocks on
 — any candidate whose per-slot lock is currently held. See `slot_lock` and
 `evict_lru` below.
 
+Every cache mutation opens the root through `prepare_cache_root`, which
+reclaims crash residue named by the exact canonical `.staging-<uuid>` shape
+once its directory mtime is more than 24 hours old. This is deliberately
+separate from LRU accounting: a staging clone has not yet earned an ownership
+marker or addressable cache key. The exact-name, direct-child, real-directory,
+and age checks leave files, symlinks, nested paths, prefix lookalikes, and
+fresh clones untouched. The age fence lets separate daemon processes clone
+different repositories concurrently without one deleting another process's
+ordinary in-flight staging directory.
+
 ## `CacheError::UnsafeToReplace`
 
 A repair operation (refetch/reclone) would have to touch a path that does
@@ -61,7 +72,7 @@ crashed prior run left in a pre-`touch` state) is refused with
 `CacheError::UnsafeToReplace` rather than fetched into or adopted (issue
 #765). A fresh clone is written into a private staging directory first
 (`git clone --filter=blob:none`), measured there, marked with
-`.khive-last-used` there, and only *moved* into the addressable
+`.khive-last-used` there, and only _moved_ into the addressable
 `<root>/<cache_key>/` slot once it is under the cap and already carries its
 ownership marker — an oversized clone never enters the cache slot, never
 participates in `evict_lru`'s accounting, and is removed from staging
@@ -122,7 +133,7 @@ Returns the per-`cache_key` advisory `Mutex` from a process-global registry
 calls racing the same slot cannot interleave a check against another call's
 mutation. The lock is advisory and same-process only: it serializes this
 crate's own cache mutations, not an external process touching the scratch
-root. It is deliberately *not* held across a caller's separate `ensure_clone`
+root. It is deliberately _not_ held across a caller's separate `ensure_clone`
 and later `refetch_clone` calls within one request — that intra-request
 staleness window is what `refetch_clone`'s pre-fetch ownership re-check
 narrows instead.
@@ -143,6 +154,23 @@ oversized clone never enters the cache slot, and because the marker is
 written before the atomic rename, a process interruption between clone and
 rename can never leave a live, markerless slot at the cache-key path (issue
 #765).
+
+A kill can still interrupt the process before any Rust cleanup guard runs and
+leave the unaddressable staging directory behind. `prepare_cache_root` /
+`reap_stale_staging` are the cross-process recovery boundary for that case:
+the next cache operation removes exact staging directories only after the
+24-hour freshness fence has elapsed.
+
+## `prepare_cache_root` / `reap_stale_staging`
+
+Creates the scratch root when needed, then enumerates only its direct
+children. A deletion candidate must be a real directory whose name is exactly
+`.staging-` plus the lowercase canonical hyphenated spelling of a UUID, and
+its mtime must be strictly older than 24 hours. Future-dated entries are
+conservatively retained. Removal uses the same bounded retry helper as owned
+cache eviction and tolerates another process winning the same cleanup race;
+other I/O failures surface instead of silently leaving disk growth
+unobservable.
 
 ## `remove_owned_entry`
 
@@ -165,7 +193,7 @@ otherwise succeed.
 `-c maintenance.auto=false` on every clone/fetch into a cache slot, as
 defensive hardening. `git fetch` runs auto-maintenance after it finishes
 when `maintenance.auto` (default true) is set, and since git 2.47 that
-maintenance runs as a *detached background child*
+maintenance runs as a _detached background child_
 (`git maintenance run --auto --detach`) that can outlive the foreground
 command; on 2.46 and earlier it ran synchronously. The spawn is
 trace2-proven in both directions on the `fetch --refetch` path
@@ -218,7 +246,7 @@ throughout, so a symlink itself is sized but never traversed — clones
 never legitimately contain symlinked directories pointing outside the
 clone, and this avoids any possibility of a symlink loop).
 
-Tolerant of a *descendant* disappearing mid-walk (a vanished entry beneath
+Tolerant of a _descendant_ disappearing mid-walk (a vanished entry beneath
 an existing root contributes 0 bytes rather than aborting the whole size
 computation): a cache slot's `.git` tree can legitimately be mutated by
 something outside this function's control while it walks it — a concurrent
@@ -264,7 +292,7 @@ before calling `evict_lru` in the same synchronous call chain, so `keep`
 disappearing out from under this call is not an expected repair race — it
 is either a genuine bug or an external actor deleting our slot, and
 silently sizing it to `0` would let eviction report success while the slot
-the caller asked to keep is actually gone. A listed *candidate* entry is
+the caller asked to keep is actually gone. A listed _candidate_ entry is
 different — another `evict_lru`/`ensure_clone` repairing the same root can
 legitimately delete it between the `read_dir` listing and the `dir_size`
 call, so that vanish is tolerated by skipping the entry rather than
@@ -275,7 +303,7 @@ that key) is deferred: `evict_lru` takes each candidate lock with `try_lock`
 and skips a `WouldBlock` rather than waiting, so an eviction pass never
 blocks on a concurrent clone/fetch (and, holding `EVICTION_LOCK` while a
 mutation may hold a slot lock and be about to wait on `EVICTION_LOCK`, must
-not). A deferred candidate is therefore *not* counted in this pass — so this
+not). A deferred candidate is therefore _not_ counted in this pass — so this
 pass alone can return with the caps still exceeded. The guarantee that the
 caps are nonetheless restored is `enforce_caps` (below): every mutation runs
 a cap pass on its own exit, so the last of a set of concurrent mutations to
@@ -290,7 +318,7 @@ only in whether a `keep` slot is protected.
 The keep-less cap pass (`evict_to_caps` with no protected slot). Run after a
 cache mutation releases its slot lock on a FAILURE path (issue #960). On
 success a mutation already ran `evict_lru` under its lock, protecting the
-slot it returns; a *failed* `ensure_clone`/`refetch_clone`/`reclone` returns
+slot it returns; a _failed_ `ensure_clone`/`refetch_clone`/`reclone` returns
 before that pass, and a concurrent eviction may have deferred this slot while
 its lock was held — leaving the caps exceeded with nothing scheduled to
 correct them. `finish_mutation` runs `enforce_caps` once the lock is free (no
@@ -316,6 +344,12 @@ sync `#[test]`s).
   failure must not leave a `.staging-<uuid>` directory behind — `evict_lru`
   deliberately never touches non-owned names, so a leaked staging dir
   would otherwise accumulate forever across repeated failures.
+- `stale_staging_sweep_removes_a_direct_canonical_uuid_directory`: advances
+  the deterministic observation clock past the age fence and proves killed-
+  clone-shaped residue is deleted.
+- `staging_sweep_preserves_fresh_foreign_nested_and_nondirectory_entries`:
+  pins the containment and freshness boundary so a broad prefix match cannot
+  delete an in-flight clone or unrelated operator data.
 - `dir_size_errors_when_the_root_itself_is_missing` (PR #847): the walk
   root vanishing must surface as an error, never a laundered `Ok(0)` —
   distinct from a descendant vanishing beneath a still-existing root.
@@ -337,7 +371,7 @@ sync `#[test]`s).
   empty-directory removal is a single `rmdir` syscall, the same order of
   cost as the `symlink_metadata`/`read_dir` calls `dir_size` opens with —
   a populated root, by contrast, has its own directory entry removed
-  *last* by `remove_dir_all` after every child, which would make the
+  _last_ by `remove_dir_all` after every child, which would make the
   root-vanish race effectively unreachable). Runs 500 iterations and
   asserts the race was hit at least once.
 - `refetch_clone_updates_an_existing_slot_to_the_remote_tip`: the primary
@@ -356,7 +390,7 @@ sync `#[test]`s).
   it un-owned.
 - `refetch_clone_refuses_a_markerless_slot_under_the_cap`: remediation
   (issue #765 follow-up PR #788) — `refetch_clone` must refuse a
-  markerless slot *before* ever calling `fetch_refetch`. The origin is
+  markerless slot _before_ ever calling `fetch_refetch`. The origin is
   given fresh history so a fetch that ran despite the missing marker would
   be directly observable via a moved `HEAD`.
 - `reclone_replaces_a_slot_whose_refetch_cannot_succeed`: #765's fallback

@@ -8,15 +8,18 @@
 //! or total-byte limit; a per-clone size cap rejects an oversized
 //! clone/fetch before it enters the addressable cache slot. A per-`cache_key`
 //! advisory `slot_lock` (issue #805) serializes each slot's check-and-mutate
-//! span. See crates/khive-pack-git/docs/api/cache.md for the full design
-//! rationale (ownership-proof eviction, staging-then-move installation,
-//! per-clone cap enforcement, slot serialization).
+//! span. Opening the cache root also reclaims exact `.staging-<uuid>`
+//! directories older than 24 hours, covering process-kill residue that no
+//! in-process error handler can remove. See
+//! crates/khive-pack-git/docs/api/cache.md for the full design rationale
+//! (ownership-proof eviction, staging-then-move installation, crash-residue
+//! reaping, per-clone cap enforcement, slot serialization).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use uuid::Uuid;
 
@@ -27,6 +30,11 @@ pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_CLONE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 const MARKER_FILE: &str = ".khive-last-used";
+const STAGING_PREFIX: &str = ".staging-";
+/// A fresh staging directory may belong to a clone still running in another
+/// process. Only residue older than this deliberately conservative window is
+/// reclaimed when the cache root is opened.
+const STALE_STAGING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug)]
 pub enum CacheError {
@@ -220,7 +228,7 @@ fn finish_mutation(root: &Path, outcome: &Result<PathBuf, CacheError>) {
 }
 
 fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
-    std::fs::create_dir_all(root)?;
+    prepare_cache_root(root)?;
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -263,6 +271,7 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
 }
 
 fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
+    prepare_cache_root(root)?;
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -308,7 +317,7 @@ pub(crate) fn reclone(canonical_url: &str) -> Result<PathBuf, CacheError> {
 }
 
 fn reclone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
-    std::fs::create_dir_all(root)?;
+    prepare_cache_root(root)?;
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -515,6 +524,92 @@ fn io_err(op: &str, path: &Path, e: std::io::Error) -> CacheError {
         e.kind(),
         format!("{op} {}: {e}", path.display()),
     ))
+}
+
+/// Create/open the daemon-owned cache root and reclaim staging directories a
+/// killed clone could not clean up itself. This runs before every public
+/// cache mutation; the age fence prevents one process from deleting a fresh
+/// clone legitimately in flight in another process.
+fn prepare_cache_root(root: &Path) -> Result<(), CacheError> {
+    std::fs::create_dir_all(root)
+        .map_err(|e| io_err("prepare_cache_root: create_dir_all", root, e))?;
+    let removed = reap_stale_staging(root, SystemTime::now(), STALE_STAGING_AGE)?;
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            root = %root.display(),
+            "reclaimed stale git-digest staging directories"
+        );
+    }
+    Ok(())
+}
+
+/// Exact ownership proof for an unaddressable staging clone: a canonical
+/// lowercase hyphenated UUID under the private `.staging-` prefix. Prefix
+/// lookalikes are left untouched, which matters when an operator overrides
+/// the scratch root to an existing directory.
+fn is_staging_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix(STAGING_PREFIX) else {
+        return false;
+    };
+    Uuid::parse_str(suffix).is_ok_and(|id| id.to_string() == suffix)
+}
+
+/// Remove stale staging directories that are direct children of `root`.
+/// Symlinks, files, nested paths, prefix lookalikes, future-dated entries,
+/// and entries at or below `max_age` are never removed. `now`/`max_age` are
+/// explicit so the age boundary is deterministic in tests.
+fn reap_stale_staging(
+    root: &Path,
+    now: SystemTime,
+    max_age: Duration,
+) -> Result<usize, CacheError> {
+    let read_dir = std::fs::read_dir(root)
+        .map_err(|e| io_err("reap_stale_staging: read_dir root", root, e))?;
+    let mut removed = 0usize;
+
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err("reap_stale_staging: read_dir entry", root, e)),
+        };
+        if !is_staging_name(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.parent() != Some(root) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err("reap_stale_staging: stat", &path, e)),
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let modified = metadata
+            .modified()
+            .map_err(|e| io_err("reap_stale_staging: modified", &path, e))?;
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age <= max_age {
+            continue;
+        }
+
+        match remove_dir_all_retrying(&path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err("reap_stale_staging: remove", &path, e)),
+        }
+    }
+
+    Ok(removed)
 }
 
 fn touch(repo_dir: &Path) -> Result<(), CacheError> {

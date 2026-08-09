@@ -175,6 +175,19 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
 4. Cleanup on eviction uses directory removal of the scratch path only (never touches
    user-owned paths).
 
+### Accepted cache crash-residue rider (2026-08-09)
+
+The staging-then-rename design can clean every ordinary error return, but no
+in-process guard runs after `SIGKILL`, OOM termination, or host loss. Each
+cache-root open therefore reclaims a staging directory only when all of these
+hold: it is a direct child of the scratch root, its name is exactly
+`.staging-<canonical UUID>`, it is a real directory rather than a symlink, and
+its mtime is strictly more than 24 hours old. Files, nested paths, prefix
+lookalikes, future-dated entries, and fresh staging clones are retained. This
+recovery is distinct from LRU eviction because an interrupted staging clone
+has no addressable cache key or ownership marker and otherwise lies outside
+both configured cache caps forever.
+
 ### Security posture
 
 - `git clone` of an untrusted remote does not execute repository-supplied code (no hooks
