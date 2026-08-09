@@ -20,8 +20,8 @@ use crate::ingest::{
     GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
 };
 use crate::source::{
-    parse_source, redact_repo_url, remote_url_to_slug, repo_basename, repo_identity, DigestSource,
-    REPO_SLUG_PROPERTY,
+    canonical_remote_identity, parse_source, redact_repo_url, remote_url_to_slug, repo_basename,
+    repo_identity, DigestSource, REPO_SLUG_PROPERTY,
 };
 use crate::GitPack;
 
@@ -566,12 +566,15 @@ async fn find_projects_without_canonical_slug(
         .collect())
 }
 
-/// Fetch soft-deleted pre-slug anchors and carry each row's own `deleted_at`
-/// so callers can merge-sort normalized tombstones by recency alongside an
-/// exact-match set (issue #6 item 1).
-async fn find_soft_deleted_legacy_projects_without_slug(
+/// Fetch every soft-deleted anchor outside the canonical slug tier and carry
+/// each row's own `deleted_at` so callers can normalize, deduplicate, and
+/// merge-sort tombstones by recency alongside an exact-match set. This is the
+/// tombstone counterpart of the live step-2 candidate scan: both absent and
+/// present-but-noncanonical slugs remain URL-reconciliation candidates.
+async fn find_soft_deleted_projects_without_canonical_slug(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    identity: &str,
 ) -> anyhow::Result<Vec<(Uuid, String, i64)>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
@@ -580,11 +583,15 @@ async fn find_soft_deleted_legacy_projects_without_slug(
             sql: "SELECT id, deleted_at, json_extract(properties,'$.repo_url') AS repo_url \
                   FROM entities WHERE kind='project' AND namespace=?1 \
                   AND deleted_at IS NOT NULL \
-                  AND json_extract(properties,'$.repo_slug') IS NULL \
-                  AND json_extract(properties,'$.repo_url') IS NOT NULL"
+                  AND json_extract(properties,'$.repo_url') IS NOT NULL \
+                  AND (json_extract(properties,'$.repo_slug') IS NULL \
+                       OR json_extract(properties,'$.repo_slug')<>?2)"
                 .into(),
-            params: vec![SqlValue::Text(token.namespace().as_str().to_string())],
-            label: Some("git_digest_find_soft_deleted_legacy_projects_without_slug".into()),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(identity.to_string()),
+            ],
+            label: Some("git_digest_find_soft_deleted_projects_without_canonical_slug".into()),
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -635,7 +642,8 @@ async fn find_normalized_noncanonical_matches(
 /// Re-derive the repo-identity slug an anchor's stored `repo_url` resolves to
 /// today (ADR-088 Amendment 2 step 2). A sluggable remote spelling normalizes
 /// directly via `remote_url_to_slug`; an accepted but unsluggable HTTPS source
-/// reproduces `repo_identity(Remote)`'s credential-redacted URL fallback. A
+/// reproduces `repo_identity(Remote)`'s shared credential-redacted,
+/// slash/`.git`-normalized URL fallback. A
 /// path-shaped value (an absolute local path, stored verbatim by the pre-#1173
 /// local-source resolution path) is treated as a local clone and resolved the
 /// same way `repo_identity` resolves a `DigestSource::Local` -- via its current
@@ -651,8 +659,8 @@ async fn normalize_stored_repo_url(repo_url: &str) -> Option<String> {
     }
     if repo_url.trim().starts_with("https://") {
         let candidate = parse_source(repo_url).ok()?;
-        if matches!(&candidate, DigestSource::Remote { .. }) {
-            return Some(repo_identity(&candidate).await);
+        if let DigestSource::Remote { canonical, .. } = candidate {
+            return Some(canonical_remote_identity(&canonical));
         }
     }
     if repo_url.starts_with('/') {
@@ -724,13 +732,14 @@ async fn find_orphaned_anchor(
     // same repository (one that would normalize to the same identity).
     // Extend the tombstone scan with the same normalize-and-compare step
     // the live step-2 path already uses, scoped to soft-deleted rows.
-    let legacy_tombstones = find_soft_deleted_legacy_projects_without_slug(runtime, token)
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
-    let already_matched: std::collections::HashSet<Uuid> =
+    let normalized_tombstones =
+        find_soft_deleted_projects_without_canonical_slug(runtime, token, identity)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+    let mut already_matched: std::collections::HashSet<Uuid> =
         dead_projects.iter().map(|(id, _)| *id).collect();
-    for (id, candidate_repo_url, deleted_at) in legacy_tombstones {
-        if already_matched.contains(&id) {
+    for (id, candidate_repo_url, deleted_at) in normalized_tombstones {
+        if !already_matched.insert(id) {
             continue;
         }
         if normalize_stored_repo_url(&candidate_repo_url)
@@ -1584,6 +1593,55 @@ mod tests {
         assert_eq!(orphan.annotated_note_count, 1);
     }
 
+    /// #1708 public-surface tombstone regression: normalized orphan lookup
+    /// must include a soft-deleted anchor whose slug is present but differs
+    /// from the canonical identity. The wire report must identify its live
+    /// corpus rather than silently creating a replacement anchor beside it.
+    #[tokio::test]
+    async fn git_digest_reports_noncanonical_slug_tombstone_orphan() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_origin_and_one_commit(
+            dir.path(),
+            "https://github.com/org/noncanonical-tombstone-repo",
+        );
+
+        let dead = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "noncanonical-tombstone-repo-old",
+                    "properties": {
+                        "repo_url": "  https://legacy:token@github.com/org/noncanonical-tombstone-repo.git?view=old  ",
+                        "repo_slug": "org/noncanonical-tombstone-repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create noncanonical tombstone anchor");
+        let dead_id = Uuid::parse_str(dead["id"].as_str().unwrap()).expect("uuid");
+        create_note_annotating(&registry, "issue", "#1708 orphan", dead_id).await;
+        assert!(rt
+            .delete_entity(&token, dead_id, false)
+            .await
+            .expect("soft delete"));
+
+        let response = dispatch_local_commit_digest(&registry, dir.path()).await;
+        assert_eq!(response["project_created"], json!(true), "{response}");
+        assert_eq!(
+            response["orphaned_corpus_detected"],
+            json!(true),
+            "{response}"
+        );
+        assert_eq!(
+            response["orphaned_project_id"],
+            json!(dead_id.to_string()),
+            "{response}"
+        );
+        assert_eq!(response["orphaned_note_count"], json!(1), "{response}");
+    }
+
     /// Issue #6 item 2: when a step-1 slug match wins resolution, a live
     /// legacy (pre-slug) anchor for an alternate spelling of the same
     /// repository must still surface in `slug_duplicates` -- previously,
@@ -1662,7 +1720,7 @@ mod tests {
                     "kind": "project",
                     "name": "noncanonical-repo",
                     "properties": {
-                        "repo_url": "legacy-token-user@github.com:org/noncanonical-repo.git?view=compact#top",
+                        "repo_url": "  legacy-token-user@github.com:org/noncanonical-repo.git?view=compact#top  ",
                         "repo_slug": "org/noncanonical-repo",
                     },
                 }),
@@ -1958,7 +2016,7 @@ mod tests {
                     "kind": "project",
                     "name": "unsluggable-remote",
                     "properties": {
-                        "repo_url": "https://legacy-user@example.com/repo?view=legacy#legacy-fragment",
+                        "repo_url": "  https://legacy-user@example.com/repo.git/?view=legacy#legacy-fragment  ",
                         "repo_slug": "example.com/repo",
                     },
                 }),
@@ -1985,8 +2043,8 @@ mod tests {
         );
         assert_eq!(
             properties.get("repo_url").and_then(Value::as_str),
-            Some("https://example.com/repo"),
-            "repair must preserve redacted-URL fallback semantics"
+            Some("https://example.com/repo.git/"),
+            "repair must redact the display URL without replacing it with the identity fallback"
         );
         assert_eq!(
             find_projects_by_slug(&rt, &token, &identity)
@@ -1994,6 +2052,21 @@ mod tests {
                 .expect("canonical lookup"),
             vec![existing_id]
         );
+    }
+
+    #[tokio::test]
+    async fn stored_unsluggable_https_equivalent_spellings_share_fallback_identity() {
+        for spelling in [
+            "https://legacy@example.com/repo.git?view=old",
+            "https://example.com/repo/?view=old#fragment",
+            "https://example.com/repo.git/?view=old",
+        ] {
+            assert_eq!(
+                normalize_stored_repo_url(spelling).await.as_deref(),
+                Some("https://example.com/repo"),
+                "stored equivalent spelling must reproduce the live fallback: {spelling:?}"
+            );
+        }
     }
 
     #[tokio::test]

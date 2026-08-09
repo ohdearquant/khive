@@ -1908,8 +1908,10 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ## `git` pack — 4 verbs
 
-Git-history ingester plus a hardened write surface (ADR-088, ADR-088 Amendment 1,
-ADR-108). Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
+Git-history ingester plus a hardened write surface (ADR-088,
+[ADR-088 Amendment 1](../adr/ADR-088-amendment-1-git-digest.md),
+[ADR-088 Amendment 2](../adr/ADR-088-amendment-2-anchor-identity.md), ADR-108).
+Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
 `issue` / `pull_request` note kinds, used by `git.digest` below and by the `kkernel
 git-ingest` CLI (both drive the same underlying ingest core, so ingest enrichment —
 readable `name`s, `Closes #N` reference edges, parent→child commit `precedes` edges —

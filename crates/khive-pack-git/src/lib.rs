@@ -1,5 +1,5 @@
 //! `khive-pack-git` — the git-lifecycle pack (ADR-088, amended by ADR-088
-//! Amendment 1 and ADR-108).
+//! Amendments 1 and 2, plus ADR-108).
 //!
 //! Contributes three note kinds (`commit`, `issue`, `pull_request`) that make
 //! repository provenance queryable through the KG graph, one read/ingest
@@ -10,7 +10,8 @@
 //! (`write_handlers`, ADR-108) that shell to system git with hardened,
 //! allowlisted argv construction (`write_argv`). See
 //! `docs/adr/ADR-088-git-lifecycle-pack.md`,
-//! `docs/adr/ADR-088-amendment-1-git-digest.md`, and
+//! `docs/adr/ADR-088-amendment-1-git-digest.md`,
+//! `docs/adr/ADR-088-amendment-2-anchor-identity.md`, and
 //! `docs/adr/ADR-108-git-write-surface.md`.
 //!
 //! | Verb | Args | What it does |

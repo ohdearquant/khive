@@ -46,9 +46,11 @@ Every digest source resolves to one canonical **repo slug** stored in
   host — an accepted residual. Inputs that do not yield a host plus at
   least two path segments, or that contain empty segments, do not normalize
   to a slug. An HTTPS value accepted by the top-level `source` parser still
-  needs a stable identity in that case, so it uses its credential-redacted
-  canonical URL as a fallback. Stored-URL reconciliation reproduces that
-  same fallback only for values accepted by the HTTPS source grammar;
+  needs a stable identity in that case, so a shared fallback canonicalizer
+  strips credentials, query/fragment material, trailing slashes, and a
+  trailing `.git` suffix from its identity while retaining the original URL
+  for clone/fetch. Stored-URL reconciliation calls that same canonicalizer
+  only for values accepted by the HTTPS source grammar;
   arbitrary malformed strings are not silently coerced into identities.
 - A local path derives the same slug from its configured `origin` remote.
 - A local repository with no `origin` remote (or an origin that does not
