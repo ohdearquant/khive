@@ -29,8 +29,11 @@ See `crates/khive-db/src/stores/graph.rs` — `edge_insert_guarded_by_endpoints_
 
 The guarded `link` variant of `edge_upsert_statement`, shared by canonical
 singleton link and atomic-apply link. It shares the SAME
-`EDGE_NATURAL_KEY_CONFLICT_SET` conflict-arm text — the two builders cannot
-diverge on write behavior — but wraps the `INSERT` in a guarded `SELECT ...
+id-conflict and natural-key-conflict `SET` text — the two builders cannot
+diverge on write behavior. In particular, a candidate id already bound to a
+different natural key follows the same `(namespace, id)` reuse/update path as
+the unguarded builder instead of surfacing a uniqueness error. The guarded
+builder wraps the `INSERT` in a guarded `SELECT ...
 WHERE EXISTS(...)` that re-probes both endpoints for existence INSIDE the
 transaction, at commit time, rather than trusting prepare-time validation
 alone.

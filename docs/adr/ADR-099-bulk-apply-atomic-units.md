@@ -629,9 +629,9 @@ implementation was restructured to the seam this ADR mandates:
    surviving edge id by a fresh natural-key lookup rather than trusting any prepare-time
    advisory value.
 
-4. **One conflict-arm generation root.** The edge natural-key conflict-arm SQL is
-   produced by a single shared builder consumed by the singleton upsert, the atomic
-   guarded insert, and the batch upsert path. An exhaustive workspace enumeration of
+4. **One conflict-arm generation root.** The edge id-conflict and natural-key
+   conflict-arm SQL is produced by shared fragments consumed by the singleton upsert,
+   the atomic guarded insert, and the batch upsert path. An exhaustive workspace enumeration of
    every hand-written edge-conflict SQL site was recorded in PR #683; the two
    remaining hand-copied sites (entity-merge and note-merge curation SQL) are documented
    residuals tracked by issue #690 rather than blockers under this slice's

@@ -3809,6 +3809,55 @@ async fn guarded_upsert_returns_the_persisted_reuse_disposition_from_its_write()
 }
 
 #[tokio::test]
+async fn guarded_upsert_reuses_a_colliding_candidate_id_for_a_different_natural_key() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let first_source = Uuid::new_v4();
+    let first_target = Uuid::new_v4();
+    let second_source = Uuid::new_v4();
+    let second_target = Uuid::new_v4();
+    for endpoint in [first_source, first_target, second_source, second_target] {
+        insert_live_entity(&pool, endpoint);
+    }
+
+    let first_candidate = make_edge(first_source, first_target, EdgeRelation::Extends, 1.0);
+    let candidate_id = first_candidate.id;
+    let first = match store.upsert_edge_guarded(first_candidate).await.unwrap() {
+        khive_storage::GuardedWriteOutcome::Written(written) => written,
+        other => panic!("first guarded upsert must write, got {other:?}"),
+    };
+    assert!(first.created);
+    assert_eq!(first.edge.id, candidate_id);
+
+    let mut colliding_candidate =
+        make_edge(second_source, second_target, EdgeRelation::DependsOn, 0.6);
+    colliding_candidate.id = candidate_id;
+    let reused = match store
+        .upsert_edge_guarded(colliding_candidate)
+        .await
+        .unwrap()
+    {
+        khive_storage::GuardedWriteOutcome::Written(written) => written,
+        other => panic!("the colliding guarded upsert must write, got {other:?}"),
+    };
+
+    assert!(!reused.created, "an id conflict must report reuse");
+    assert_eq!(reused.edge.id, candidate_id);
+    assert_eq!(reused.edge.source_id, second_source);
+    assert_eq!(reused.edge.target_id, second_target);
+    assert_eq!(reused.edge.relation, EdgeRelation::DependsOn);
+    assert_eq!(reused.edge.weight, 0.6);
+
+    let persisted = store
+        .get_edge(candidate_id)
+        .await
+        .unwrap()
+        .expect("the reused id must remain persisted");
+    assert_eq!(persisted.source_id, second_source);
+    assert_eq!(persisted.target_id, second_target);
+    assert_eq!(persisted.relation, EdgeRelation::DependsOn);
+}
+
+#[tokio::test]
 async fn unguarded_upsert_returns_atomic_disposition_for_cross_backend_linking() {
     let store = setup_memory_store();
     let source = Uuid::new_v4();

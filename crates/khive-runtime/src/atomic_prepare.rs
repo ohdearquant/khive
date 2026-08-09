@@ -1422,10 +1422,9 @@ async fn prepare_link(
     // endpoints inside the transaction, closing the intra-batch hazard
     // where an earlier op in the same atomic unit, e.g. `delete(X, hard)`,
     // could invalidate this op's prepare-time endpoint validation before
-    // commit. The conflict-arm SET list shares the same
-    // `EDGE_NATURAL_KEY_CONFLICT_SET` text `edge_upsert_statement`
-    // (canonical `link`'s builder) uses, so the two cannot silently diverge
-    // (a prior bug: this atomic literal never set
+    // commit. Both conflict arms share their SET text with
+    // `edge_upsert_statement` (canonical `link`'s builder), so the two
+    // cannot silently diverge (a prior bug: this atomic literal never set
     // `target_backend = excluded.target_backend`, so a re-link of an edge
     // carrying a cross-backend `target_backend` stamp behaved differently
     // under `--atomic`).

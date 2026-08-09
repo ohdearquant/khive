@@ -45,6 +45,14 @@ const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 // non-symmetric branch) all call these.
 // ---------------------------------------------------------------------------
 
+/// The id-conflict arm's endpoint/key `SET` prefix — shared, textually,
+/// between [`edge_upsert_statement`] and
+/// [`edge_insert_guarded_by_endpoints_statement`]. The remaining mutable
+/// columns are supplied by [`EDGE_NATURAL_KEY_CONFLICT_SET`] in both builders.
+const EDGE_ID_CONFLICT_SET: &str = "source_id = excluded.source_id, \
+     target_id = excluded.target_id, \
+     relation = excluded.relation";
+
 /// The natural-key conflict arm's `SET` list — shared, textually, between
 /// [`edge_upsert_statement`] and [`edge_insert_guarded_by_endpoints_statement`]
 /// (ADR-099 §B3) so the two can never silently
@@ -100,9 +108,7 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
                created_at, updated_at, deleted_at, metadata, target_backend) \
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
               ON CONFLICT(namespace, id) DO UPDATE SET \
-                  source_id = excluded.source_id, \
-                  target_id = excluded.target_id, \
-                  relation = excluded.relation, \
+                  {EDGE_ID_CONFLICT_SET}, \
                   {EDGE_NATURAL_KEY_CONFLICT_SET} \
               ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
                   {EDGE_NATURAL_KEY_CONFLICT_SET}"
@@ -135,8 +141,8 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
 
 /// The guarded `link` variant of [`edge_upsert_statement`] (ADR-099 §B3,
 /// issue #769), shared by canonical singleton link and atomic-apply link. It shares the SAME
-/// `EDGE_NATURAL_KEY_CONFLICT_SET` conflict-arm text — the two builders
-/// cannot diverge on write behavior — but wraps the `INSERT` in a guarded
+/// id and natural-key conflict-arm text as the unguarded builder, so the two
+/// cannot diverge on write behavior, but wraps the `INSERT` in a guarded
 /// `SELECT ... WHERE EXISTS(...)` that re-probes both endpoints for
 /// existence INSIDE the transaction, at commit time, rather than trusting
 /// prepare-time validation alone.
@@ -167,6 +173,9 @@ pub fn edge_insert_guarded_by_endpoints_statement(
                created_at, updated_at, metadata) \
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8 \
               WHERE ({src_exists}) AND ({tgt_exists}) \
+              ON CONFLICT(namespace, id) DO UPDATE SET \
+                  {EDGE_ID_CONFLICT_SET}, \
+                  {EDGE_NATURAL_KEY_CONFLICT_SET} \
               ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
                   {EDGE_NATURAL_KEY_CONFLICT_SET}"
         ),
