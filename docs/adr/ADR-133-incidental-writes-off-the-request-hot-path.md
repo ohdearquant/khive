@@ -396,7 +396,10 @@ silently lost while its operation reports success.
 ### D6 — Read-flag mutation is batched; acknowledgement remains best-effort
 
 A bulk form taking a list of ids becomes the primary surface for sweeping an inbox, collapsing N
-dispatches into one and N statements into one transaction.
+dispatches into one. Collapsing N statements into one transaction is a separate, opt-in property
+rather than a consequence of batching: `comm.mark_read(atomic=true)` commits every unique mark in
+one transaction or none, while the default `atomic=false` path — and `comm.read(ids=...)`, whose
+behaviour it matches — applies each patch independently.
 
 **Plain `comm.read` attempts the flag write before returning, but the patch is best-effort.** A
 successful patch returns `read: true`. Writer contention, a storage error, or a row that disappears
@@ -409,7 +412,9 @@ acknowledgement into an unconditional durability guarantee.
 The unread surface remains load-bearing for the inbox monitor's stale check. Consequently, an inbox
 sweep MUST count only per-item responses with `read == true` as acknowledged and SHOULD retry rows
 that carry `mark_error`; dispatch success alone does not establish that the flag became
-store-visible. A bulk form preserves these per-item outcomes while reducing acquisitions.
+store-visible. A bulk form preserves these per-item outcomes. It reduces dispatches
+unconditionally; it reduces write acquisitions only on the `atomic=true` path, since the default
+per-item path still takes one write acquisition per row.
 
 ### D7 — Serve-ledger writes are batched per call
 
