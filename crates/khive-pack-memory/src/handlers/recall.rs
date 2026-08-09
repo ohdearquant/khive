@@ -777,6 +777,7 @@ impl MemoryPack {
                     };
                 let mut result = json!({
                     "id": sn.id.to_string(),
+                    "full_id": sn.id.to_string(),
                     "score": sn.score,
                     "rank_score": sn.rank_score,
                     "raw_score": sn.raw_score,

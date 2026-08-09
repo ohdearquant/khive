@@ -953,6 +953,11 @@ Each result carries `serve_attribution` (`profile`, `unattributed`, or
 `unspecified`). `profile` also carries `served_by_profile_id`; `unattributed`
 means a selected profile record was unreadable and downstream feedback must not
 fall back to a current binding/default.
+Each result also carries canonical `full_id`; pass it directly to
+`memory.feedback(target_id=...)` in a later request without an extra `get`.
+`full_id` is present when the resolved output format is `json`, the builtin
+default, under any presentation mode. The `auto` and `table` formats omit it
+unless the request sets `presentation=verbose`.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1586,11 +1591,13 @@ request(ops="[{\"tool\":\"knowledge.upsert_domains\",\"args\":{\"domains\":[{\"s
 
 ### `knowledge.get` — Assertive
 
-Fetch a single atom or domain by UUID or slug.
+Fetch a single atom or domain by full UUID, exact slug, or unique short prefix, in that
+order. Exact slug lookup uses the caller namespace; UUID and prefix forms are
+namespace-agnostic by-ID reads.
 
 | Param              | Type   | Required | Notes                                                                                                                                                                                                                                                                           |
 | ------------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`               | string | yes      | Atom/domain UUID or slug.                                                                                                                                                                                                                                                       |
+| `id`               | string | yes      | Atom/domain full UUID, exact caller-namespace slug, or unique 8+ hex UUID prefix.                                                                                                                                                                                               |
 | `include_sections` | bool   | no       | Include the atom's sections under a `sections` key (ignored for domains). Each section: `id, atom_id, namespace, section_type, heading, content, content_hash, status, tokens, sort_order, created_at, updated_at`, ordered by `sort_order`, `created_at`, `id`. Default false. |
 
 ```
@@ -1866,6 +1873,10 @@ request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pa
 ### `session.list` — Assertive
 
 List stored sessions newest first.
+Every summary includes canonical `full_id` for direct reuse with
+`session.resume` or `session.export` across requests. As with other records,
+`full_id` is present under the default `json` output format and is omitted by
+`format=auto` and `format=table` unless the request sets `presentation=verbose`.
 
 | Param      | Type    | Required | Notes                                               |
 | ---------- | ------- | -------- | --------------------------------------------------- |

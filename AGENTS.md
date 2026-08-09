@@ -144,6 +144,10 @@ prepare snapshot so an earlier op in the same atomic unit cannot make the no-op 
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Its optional `namespace` is an exact-match read override; absent means the caller's normal
 visible namespace set.
+Every hit carries `full_id`, a canonical dashed UUID that can be passed directly to
+the strict `memory.feedback(target_id=...)` contract across requests. `full_id` is
+present under the default `json` output format in any presentation mode; the `auto`
+and `table` formats omit it unless the request sets `presentation=verbose`.
 The returned relevance score is normalized to [0,1]. The ranking `rank_score` is nominally
 [0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. Typical
 production floor: 0.3-0.7.
@@ -245,7 +249,7 @@ caller receives the server-generated UUID.
 | -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
 | `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
 | `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
-| `knowledge.get`            | Fetch atom/domain by UUID or slug                       | Read a specific knowledge entry              |
+| `knowledge.get`            | Fetch atom/domain by UUID, exact slug, or short prefix  | Read a specific knowledge entry              |
 | `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
 | `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
 | `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |
@@ -268,6 +272,9 @@ cases). Scores are normalized to [0,1] when `rerank` is active (default).
 `knowledge.compose(namespace=...)` uses that exact namespace for corpus, section, KG-blend, and
 brain-profile weight reads, including its namespace-keyed Tier-3 fallback; absent preserves the
 caller-token default.
+`knowledge.get` resolves a full UUID first; for non-UUID input, an exact slug in the caller
+namespace wins before unique 8+ hex-prefix resolution. UUID and prefix reads are
+namespace-agnostic under ADR-007.
 Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
 alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
 
@@ -285,6 +292,11 @@ unrecognized `section_type` returns a validation error listing the valid values.
 | `session.list`   | List stored sessions, newest first                | "What sessions have I run?"              |
 | `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session |
 | `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive |
+
+Each `session.list` summary carries `full_id`, the canonical UUID to reuse with
+`session.resume` or `session.export`. Presentation mode does not remove it; the
+`auto` and `table` output formats do, unless the request sets
+`presentation=verbose`.
 
 ### How to call a verb
 
