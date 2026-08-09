@@ -554,13 +554,19 @@ transaction permit, so SQLite closes the snapshot before admission returns.
 Thus an idle cached reader is autocommit and cannot pin WAL, while every live
 multi-call snapshot remains inside the `max_readers` active-read budget.
 
-The `multiple_long_lived_idle_bridge_sessions_allow_bounded_checkpoint_progress`
-regression retains eight bridge sessions against a two-reader budget, disables
+The `multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress`
+regression is scoped to #1828: it retains eight cached reader handles against a
+two-reader budget after each handle completes its one-shot read, disables
 SQLite autocheckpoint, drives repeated write cycles, and observes the central
 ADR-091 PASSIVE checkpoint copying every WAL frame each cycle while the file
-size remains bounded. It covers the idle stdio/bridge-session failure shape in
-#1460 and the concurrent long-lived-session shape in #1812 without depending
-on a zero-reader TRUNCATE window or undoing #1848's central checkpoint owner.
+size remains bounded. This proves idle handles no longer retain reader
+admission without depending on a zero-reader TRUNCATE window or undoing #1848's
+central checkpoint owner.
+
+The regression does not reproduce or close #1460 or #1812. An idle autocommit
+connection does not pin WAL; those issues concern production stdio/multiprocess
+pinning and continuous concurrent-session WAL bounds, respectively, and remain
+open pending their own production-shaped regressions and fixes.
 
 This amendment does not change the one-permit standalone writer budget. A
 read-write connection still retains its writer permit for its handle lifetime,

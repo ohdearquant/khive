@@ -1,10 +1,15 @@
-//! Long-lived bridge-session WAL regression for #1460 and #1812.
+//! Long-lived cached-reader admission regression for #1828.
 //!
-//! Idle MCP sessions retain their cached read-only connections, but no active
-//! statement, transaction, or reader permit. The central ADR-091 checkpointer
-//! must therefore keep making complete PASSIVE progress even when the number
-//! of retained sessions exceeds `max_readers`; the WAL must reuse a bounded
-//! amount of space rather than growing once per write/checkpoint cycle.
+//! Idle `SqlBridge` reader handles retain their cached read-only connections,
+//! but no active statement, transaction, or reader permit. The central ADR-091
+//! checkpointer must therefore keep making complete PASSIVE progress even when
+//! the number of retained handles exceeds `max_readers`; the WAL must reuse a
+//! bounded amount of space rather than growing once per write/checkpoint cycle.
+//!
+//! This fixture does not reproduce or close #1460 or #1812. Those issues concern
+//! production stdio/multiprocess WAL pins and continuous concurrent-session WAL
+//! bounds, respectively, and remain open pending their own production-shaped
+//! regressions and fixes.
 
 use std::sync::Arc;
 
@@ -24,7 +29,7 @@ fn wal_path(db_path: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[tokio::test]
-async fn multiple_long_lived_idle_bridge_sessions_allow_bounded_checkpoint_progress() {
+async fn multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("idle_bridge_checkpoint.db");
     let pool = Arc::new(
@@ -137,7 +142,7 @@ async fn multiple_long_lived_idle_bridge_sessions_allow_bounded_checkpoint_progr
     }
 
     // Keep all connections alive through every checkpoint assertion: dropping
-    // them earlier would reduce this to a short-lived-reader test and miss the
-    // production session-lifetime shape from #1460/#1812.
+    // them earlier would reduce this to a short-lived-reader test and miss
+    // #1828's handle-lifetime permit-exhaustion shape.
     assert_eq!(sessions.len(), SESSION_COUNT);
 }

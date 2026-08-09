@@ -1228,9 +1228,15 @@ there is never an idle WAL snapshot outside admission. See ADR-005's 2026-08-09 
 full raw-SQL capability contract.
 
 **Checkpoint acceptance.** The integration regression
-`multiple_long_lived_idle_bridge_sessions_allow_bounded_checkpoint_progress` retains eight idle
-bridge sessions against a two-reader budget while repeated write cycles run with SQLite
-autocheckpoint disabled. The dedicated Amendment 5 checkpoint connection copies every WAL frame
-on each PASSIVE cycle and the WAL file remains bounded. This covers #1460's long-lived bridge
-session and #1812's concurrent retained-session shapes without depending on a zero-reader
-TRUNCATE window and without reintroducing per-writer autocheckpoint (#1848).
+`multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress` retains eight idle
+cached reader handles against a two-reader budget after each handle completes its one-shot read,
+while repeated write cycles run with SQLite autocheckpoint disabled. The dedicated Amendment 5
+checkpoint connection copies every WAL frame on each PASSIVE cycle and the WAL file remains
+bounded. This is #1828's permit-lifetime acceptance: idle handles no longer retain reader
+admission, without depending on a zero-reader TRUNCATE window or reintroducing per-writer
+autocheckpoint (#1848).
+
+This regression does not reproduce or close #1460 or #1812. An idle autocommit connection does
+not pin WAL; those issues concern production stdio/multiprocess pinning and continuous
+concurrent-session WAL bounds, respectively, and remain open pending their own
+production-shaped regressions and fixes.

@@ -73,13 +73,19 @@ in the owned handle, so cancellation or handle drop closes SQLite (and its WAL
 snapshot) before returning admission. An idle cached reader can therefore
 never retain a WAL snapshot outside the active-read budget.
 
-`multiple_long_lived_idle_bridge_sessions_allow_bounded_checkpoint_progress`
-is the #1460/#1812 integration contract: eight long-lived idle bridge sessions
-remain open against a two-reader budget while repeated writes and the central
-ADR-091 PASSIVE checkpointer make complete frame progress and keep the WAL
-bounded. Autocheckpoint is disabled in the fixture, so the result neither
-depends on per-commit checkpoint I/O nor weakens #1848's single central
+`multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress`
+is the #1828 integration contract: eight cached reader handles remain open
+against a two-reader budget after each handle completes its one-shot read. The
+test proves idle handles no longer retain admission while repeated writes and
+the central ADR-091 PASSIVE checkpointer make complete frame progress and keep
+the WAL bounded. Autocheckpoint is disabled in the fixture, so the result
+neither depends on per-commit checkpoint I/O nor weakens #1848's single central
 checkpoint-owner direction.
+
+This fixture does not reproduce or close #1460 or #1812. An idle autocommit
+connection does not pin WAL; those issues concern production stdio/multiprocess
+pinning and continuous concurrent-session WAL bounds, respectively, and remain
+open pending their own production-shaped regressions and fixes.
 
 Cancelling an in-flight call also permanently invalidates a STANDALONE
 reader/writer handle: the call takes the boxed handle's connection on entry
