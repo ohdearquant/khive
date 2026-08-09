@@ -147,6 +147,13 @@ The runtime adds two consumer seams rather than exposing its backend:
 
 The vision model is never registered as a text `EmbedderProvider`.
 
+In a multi-backend deployment, every `visual_asset` entity lookup, SQL reuse check, create, and
+search-result materialization goes through `pack.runtime().core()` so graph identity remains in
+the shared main backend. Descriptor vector tables deliberately remain on `pack.runtime()`, the
+backend selected for the Moodboard pack. In a single-backend deployment `core()` is a cheap handle
+to that same runtime, so the rule has no storage duplication. The installed `BlobStore` capability
+is shared by the two runtime handles.
+
 ### D4 — Original bytes are canonical; derived state is repairable
 
 `moodboard.ingest(image_base64, name?, media_type?, caption?)` follows publish-then-reference:

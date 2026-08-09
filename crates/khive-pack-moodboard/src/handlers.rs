@@ -50,7 +50,8 @@ pub(crate) async fn handle_ingest(
     let caption = optional_string(&params, "caption", "moodboard.ingest", 32 * 1024)?;
     let declared_media_type = optional_string(&params, "media_type", "moodboard.ingest", 64)?;
     let encoded_image = image_base64_input(&params)?;
-    let blob_store = require_blob_store(pack.runtime())?;
+    let core = pack.runtime().core();
+    let blob_store = require_blob_store(&core)?;
     // Cold-load and verify the checkpoint before decoding large caller bytes:
     // this preserves the no-blob-side-effect identity fence without holding
     // the preprocessing memory permit across Qwen construction.
@@ -65,7 +66,7 @@ pub(crate) async fn handle_ingest(
     drop(preprocessing_permit);
 
     let (asset, created) = find_or_create_visual_asset(
-        pack.runtime(),
+        &core,
         token,
         &content_ref,
         name.as_deref(),
@@ -103,11 +104,12 @@ pub(crate) async fn handle_search(
     require_fields(&params, "moodboard.search", &["asset_id", "top_k"])?;
     let asset_id = parse_asset_id(&params)?;
     let top_k = parse_top_k(&params)?;
-    let asset = pack.runtime().get_entity(token, asset_id).await?;
+    let core = pack.runtime().core();
+    let asset = core.get_entity(token, asset_id).await?;
     validate_visual_asset(&asset)?;
     let content_ref = parse_entity_content_ref(&asset)?;
 
-    let blob_store = require_blob_store(pack.runtime())?;
+    let blob_store = require_blob_store(&core)?;
     let preprocessing_permit = pack.model_state().acquire_preprocessing_permit().await?;
     let original = read_bounded_source_blob(blob_store.as_ref(), &content_ref).await?;
     let prepared = prepare_raster(&original, None)?;
@@ -132,15 +134,8 @@ pub(crate) async fn handle_search(
     )
     .await?;
 
-    let hits = materialize_hits(
-        pack.runtime(),
-        token,
-        blob_store.as_ref(),
-        asset_id,
-        raw_hits,
-        top_k,
-    )
-    .await?;
+    let hits =
+        materialize_hits(&core, token, blob_store.as_ref(), asset_id, raw_hits, top_k).await?;
 
     Ok(json!({
         "query_asset_id": asset_id.to_string(),
@@ -595,6 +590,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use khive_db::stores::blob::FsBlobStore;
+    use khive_runtime::{BackendId, RuntimeConfig};
     use khive_types::Namespace;
 
     #[derive(Debug, Default)]
@@ -636,6 +632,31 @@ mod tests {
         ) -> khive_storage::types::StorageResult<bool> {
             Ok(false)
         }
+    }
+
+    fn main_and_secondary_runtimes() -> (KhiveRuntime, KhiveRuntime) {
+        let make_backend = || {
+            let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
+            {
+                let mut writer = backend.pool().try_writer().expect("writer");
+                khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+            }
+            Arc::new(backend)
+        };
+        let main_backend = make_backend();
+        let secondary_backend = make_backend();
+
+        let mut main_config = RuntimeConfig::no_embeddings();
+        main_config.packs = vec!["kg".to_string()];
+        main_config.backend_id = BackendId::new(BackendId::MAIN);
+        let main = KhiveRuntime::from_backend(main_backend.clone(), main_config);
+
+        let mut secondary_config = RuntimeConfig::no_embeddings();
+        secondary_config.packs = vec!["kg".to_string()];
+        secondary_config.backend_id = BackendId::new("moodboard");
+        let secondary = KhiveRuntime::from_backend(secondary_backend, secondary_config)
+            .with_core_backend(main_backend);
+        (main, secondary)
     }
 
     #[test]
@@ -745,6 +766,118 @@ mod tests {
             .find(|hit| hit.subject_id == opposite)
             .expect("opposite vector hit");
         assert!((opposite_hit.score.to_f64() + 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn visual_entities_use_core_vectors_use_secondary_and_search_hydrates_core() {
+        let (main, secondary) = main_and_secondary_runtimes();
+        let pack = MoodboardPack::new(secondary);
+        let token = pack
+            .runtime()
+            .authorize(Namespace::local())
+            .expect("authorize");
+        let root = tempfile::tempdir().unwrap();
+        let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).unwrap());
+        pack.runtime().install_blob_store(blob_store.clone());
+        let query_ref = blob_store
+            .put(b"core query original".to_vec())
+            .await
+            .unwrap();
+        let candidate_ref = blob_store
+            .put(b"core candidate original".to_vec())
+            .await
+            .unwrap();
+        let prepared = PreparedRaster {
+            inference_png: Vec::new(),
+            media_type: "image/png",
+            original_width: 32,
+            original_height: 32,
+        };
+        let core = pack.runtime().core();
+        let (query, _) = find_or_create_visual_asset(
+            &core,
+            &token,
+            &query_ref,
+            Some("query"),
+            None,
+            &prepared,
+            19,
+        )
+        .await
+        .unwrap();
+        let (candidate, _) = find_or_create_visual_asset(
+            &core,
+            &token,
+            &candidate_ref,
+            Some("candidate"),
+            None,
+            &prepared,
+            23,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            main.get_entity(&token, query.id).await.unwrap().id,
+            query.id
+        );
+        assert_eq!(
+            main.get_entity(&token, candidate.id).await.unwrap().id,
+            candidate.id
+        );
+        assert!(pack.runtime().get_entity(&token, query.id).await.is_err());
+        assert!(
+            find_visual_asset(pack.runtime(), &token, &query_ref)
+                .await
+                .unwrap()
+                .is_none(),
+            "visual_asset SQL must leave the secondary backend empty"
+        );
+
+        let descriptor = DescriptorIdentity::fixture(4);
+        index_embedding(
+            pack.runtime(),
+            &token,
+            &descriptor,
+            query.id,
+            &[1.0, 0.0, 0.0, 0.0],
+        )
+        .await
+        .unwrap();
+        index_embedding(
+            pack.runtime(),
+            &token,
+            &descriptor,
+            candidate.id,
+            &[0.8, 0.6, 0.0, 0.0],
+        )
+        .await
+        .unwrap();
+
+        let raw_hits = search_embedding(
+            pack.runtime(),
+            &token,
+            &descriptor,
+            &[1.0, 0.0, 0.0, 0.0],
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_hits.len(), 2);
+        let main_hits = search_embedding(&main, &token, &descriptor, &[1.0, 0.0, 0.0, 0.0], 2)
+            .await
+            .unwrap();
+        assert!(
+            main_hits.is_empty(),
+            "visual vectors must not leak into main"
+        );
+
+        let hits = materialize_hits(&core, &token, blob_store.as_ref(), query.id, raw_hits, 1)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["asset_id"], candidate.id.to_string());
+        assert_eq!(hits[0]["content_ref"], candidate_ref.to_string());
     }
 
     #[tokio::test]

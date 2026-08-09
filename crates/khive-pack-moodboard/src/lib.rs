@@ -3,7 +3,9 @@
 //! The pack is intentionally opt-in. Original bytes live in the configured
 //! [`khive_storage::BlobStore`], graph identity lives in `visual_asset`
 //! artifact entities, and immutable Lattice descriptor spaces live in named
-//! Khive vector tables. It does not register a text embedder provider.
+//! Khive vector tables. In multi-backend configurations, entities use the
+//! shared core graph while vector tables stay on the pack-selected runtime.
+//! It does not register a text embedder provider.
 
 pub mod handlers;
 mod model;
