@@ -362,7 +362,9 @@ async fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
 /// source -- the value stored in `properties.repo_slug` and matched on by
 /// `resolve_or_create_project`.
 ///
-/// - `Remote`: the `host/owner/repo` slug of the canonical URL.
+/// - `Remote`: the `host/owner/repo` slug of the canonical URL, or the
+///   credential-redacted canonical URL itself when an accepted HTTPS source
+///   does not satisfy the slug grammar.
 /// - `Local`: the canonicalized path's configured `origin` remote, sluggified
 ///   the same way -- so a repo digested once via `https://host/owner/repo`
 ///   and once via a local clone of that same remote converge on one anchor.
@@ -749,19 +751,16 @@ mod tests {
     async fn repo_identity_unsluggable_remote_fallback_is_redacted_and_converges() {
         // A single-path-segment URL does not normalize to a slug; the raw-URL
         // identity fallback must never carry userinfo/query/fragment, and
-        // query-only spelling variants must converge on one identity.
-        let with_secret = DigestSource::Remote {
-            canonical: "https://user:tok3n@example.com/repo?token=SECRET#frag".to_string(),
-            gh_slug: None,
-        };
+        // query-only spelling variants must converge on one identity. Drive
+        // the accepted public source parser rather than constructing the
+        // enum directly so this also pins the input-surface contract.
+        let with_secret = parse_source("https://user:tok3n@example.com/repo?token=SECRET#frag")
+            .expect("accepted unsluggable HTTPS source");
         let identity = repo_identity(&with_secret).await;
         assert_eq!(identity, "https://example.com/repo");
         assert!(!identity.contains("tok3n") && !identity.contains("SECRET"));
 
-        let bare = DigestSource::Remote {
-            canonical: "https://example.com/repo".to_string(),
-            gh_slug: None,
-        };
+        let bare = parse_source("https://example.com/repo").expect("accepted bare HTTPS source");
         assert_eq!(repo_identity(&bare).await, identity);
     }
 

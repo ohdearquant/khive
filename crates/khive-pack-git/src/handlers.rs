@@ -633,19 +633,27 @@ async fn find_normalized_noncanonical_matches(
 }
 
 /// Re-derive the repo-identity slug an anchor's stored `repo_url` resolves to
-/// today (ADR-088 Amendment 2 step 2). A URL-shaped value normalizes directly
-/// via `remote_url_to_slug`. A path-shaped value (an absolute local path,
-/// stored verbatim by the pre-#1173 local-source resolution path) is treated
-/// as a local clone and resolved the same way `repo_identity` resolves a
-/// `DigestSource::Local` -- via its current `origin` remote -- so a legacy
-/// local-path anchor reconciles with a later remote-URL digest of the same
-/// repository. A remote-less local path's `local:<canonical-path>` fallback
-/// is itself canonical evidence and is retained for equality comparison.
-/// Returns `None` only when the stored value is neither a recognized remote
-/// spelling nor an absolute local path.
+/// today (ADR-088 Amendment 2 step 2). A sluggable remote spelling normalizes
+/// directly via `remote_url_to_slug`; an accepted but unsluggable HTTPS source
+/// reproduces `repo_identity(Remote)`'s credential-redacted URL fallback. A
+/// path-shaped value (an absolute local path, stored verbatim by the pre-#1173
+/// local-source resolution path) is treated as a local clone and resolved the
+/// same way `repo_identity` resolves a `DigestSource::Local` -- via its current
+/// `origin` remote -- so a legacy local-path anchor reconciles with a later
+/// remote-URL digest of the same repository. A remote-less local path's
+/// `local:<canonical-path>` fallback is itself canonical evidence and is
+/// retained for equality comparison. Returns `None` when the stored value is
+/// neither a recognized remote spelling, an accepted HTTPS source, nor an
+/// absolute local path.
 async fn normalize_stored_repo_url(repo_url: &str) -> Option<String> {
     if let Some(slug) = remote_url_to_slug(repo_url) {
         return Some(slug);
+    }
+    if repo_url.trim().starts_with("https://") {
+        let candidate = parse_source(repo_url).ok()?;
+        if matches!(&candidate, DigestSource::Remote { .. }) {
+            return Some(repo_identity(&candidate).await);
+        }
     }
     if repo_url.starts_with('/') {
         let candidate = DigestSource::Local(std::path::PathBuf::from(repo_url));
@@ -1928,5 +1936,74 @@ mod tests {
                 .and_then(Value::as_str),
             Some("hand-written-local-slug")
         );
+    }
+
+    /// #1708 accepted-unsluggable-remote regression: a single-segment HTTPS
+    /// path uses `repo_identity(Remote)`'s redacted-URL fallback. Stored URL
+    /// normalization must reproduce that identity and repair a present but
+    /// noncanonical slug rather than minting another anchor.
+    #[tokio::test]
+    async fn unsluggable_https_noncanonical_slug_anchor_is_repaired_and_reused() {
+        let (rt, token, registry) = fixture().await;
+        let source =
+            parse_source("https://source-user@example.com/repo?view=source#source-fragment")
+                .expect("accepted unsluggable HTTPS source");
+        let identity = repo_identity(&source).await;
+        assert_eq!(identity, "https://example.com/repo");
+
+        let existing = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "unsluggable-remote",
+                    "properties": {
+                        "repo_url": "https://legacy-user@example.com/repo?view=legacy#legacy-fragment",
+                        "repo_slug": "example.com/repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create noncanonical unsluggable anchor");
+        let existing_id = Uuid::parse_str(existing["id"].as_str().unwrap()).expect("uuid");
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve accepted unsluggable source");
+        assert_eq!(resolution.id, existing_id);
+        assert!(!resolution.created, "matching fallback identity must reuse");
+        assert!(resolution.slug_duplicates.is_empty());
+
+        let repaired = rt
+            .get_entity(&token, existing_id)
+            .await
+            .expect("repaired anchor remains readable");
+        let properties = repaired.properties.as_ref().expect("properties present");
+        assert_eq!(
+            properties.get("repo_slug").and_then(Value::as_str),
+            Some(identity.as_str())
+        );
+        assert_eq!(
+            properties.get("repo_url").and_then(Value::as_str),
+            Some("https://example.com/repo"),
+            "repair must preserve redacted-URL fallback semantics"
+        );
+        assert_eq!(
+            find_projects_by_slug(&rt, &token, &identity)
+                .await
+                .expect("canonical lookup"),
+            vec![existing_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_remote_fallback_rejects_non_source_shapes() {
+        for malformed in ["relative/repo", "user@example.com/repo", "https://"] {
+            assert_eq!(
+                normalize_stored_repo_url(malformed).await,
+                None,
+                "arbitrary malformed value must not become identity evidence: {malformed}"
+            );
+        }
     }
 }

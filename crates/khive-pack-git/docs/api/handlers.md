@@ -50,6 +50,9 @@ the selected anchor receives the canonical slug and a credential-redacted
 `repo_url` in the same update. This includes a remote-less local repository's
 canonical `local:<canonical-path>` identity. Redaction removes userinfo from
 both scheme URLs and SCP-style shorthand, plus query and fragment material.
+An accepted HTTPS source that does not satisfy the host-plus-two-segments slug
+grammar uses its redacted canonical URL as the identity; reconciliation
+reproduces that fallback only through the accepted HTTPS parser.
 
 An exact canonical-slug winner retains precedence over an older
 URL-equivalent anchor with a conflicting slug. The conflicting row is left

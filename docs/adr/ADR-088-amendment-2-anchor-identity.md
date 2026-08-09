@@ -44,8 +44,12 @@ Every digest source resolves to one canonical **repo slug** stored in
   alternate-port ssh remote converges with its https spelling, at the cost
   of aliasing genuinely distinct git servers on different ports of one
   host — an accepted residual. Inputs that do not yield a host plus at
-  least two path segments, or that contain empty segments, do not
-  normalize (they are not silently coerced).
+  least two path segments, or that contain empty segments, do not normalize
+  to a slug. An HTTPS value accepted by the top-level `source` parser still
+  needs a stable identity in that case, so it uses its credential-redacted
+  canonical URL as a fallback. Stored-URL reconciliation reproduces that
+  same fallback only for values accepted by the HTTPS source grammar;
+  arbitrary malformed strings are not silently coerced into identities.
 - A local path derives the same slug from its configured `origin` remote.
 - A local repository with no `origin` remote (or an origin that does not
   normalize) uses the fallback identity `local:<canonicalized-path>`.
