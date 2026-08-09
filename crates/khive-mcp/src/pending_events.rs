@@ -5116,34 +5116,49 @@ mod tests {
         let original_deadline = invocation_started_at
             .checked_add(ttl_micros)
             .expect("test lease deadline fits in i64");
-        let live_props = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let props = get_note_props(&rt, id).await;
-                let now = Utc::now().timestamp_micros();
-                if props["lease_expires_at"].as_i64().is_some_and(|deadline| {
-                    now > original_deadline && deadline > original_deadline && deadline > now
-                }) {
-                    break props;
+        let proof_horizon = original_deadline
+            .checked_add(ttl_micros)
+            .expect("multi-TTL proof horizon fits in i64");
+        let renewal_margin_micros = i64::try_from(lease.renew_every.as_micros())
+            .expect("test renewal interval fits in i64");
+        let (live_props, observed_at, live_deadline) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let props = get_note_props(&rt, id).await;
+                    let observed_at = Utc::now().timestamp_micros();
+                    let future_margin = observed_at
+                        .checked_add(renewal_margin_micros)
+                        .expect("future-margin timestamp fits in i64");
+                    let deadline = props["lease_expires_at"].as_i64().unwrap_or(i64::MIN);
+                    if observed_at > proof_horizon && deadline > future_margin {
+                        break (props, observed_at, deadline);
+                    }
+                    tokio::time::sleep(lease.renew_every.min(std::time::Duration::from_millis(10)))
+                        .await;
                 }
-                tokio::time::sleep(lease.renew_every.min(std::time::Duration::from_millis(10)))
-                    .await;
-            }
-        })
-        .await
-        .expect("live dispatch lease did not renew beyond its original deadline");
+            })
+            .await
+            .expect("live dispatch lease did not remain renewable beyond two lease durations");
         assert_eq!(live_props["status"], "firing");
         assert!(
-            live_props["lease_expires_at"]
-                .as_i64()
-                .is_some_and(|deadline| {
-                    deadline > original_deadline && deadline > Utc::now().timestamp_micros()
-                }),
-            "live dispatch must renew beyond its original deadline: {live_props}"
+            observed_at > proof_horizon,
+            "proof must observe the dispatch after two original lease durations"
+        );
+        assert!(
+            live_deadline
+                > observed_at
+                    .checked_add(renewal_margin_micros)
+                    .expect("future-margin timestamp fits in i64"),
+            "live dispatch must retain a future lease after the multi-TTL horizon: {live_props}"
         );
 
-        let second = run_pending_events_on_with_lease(&rt, &server, false, lease)
-            .await
-            .expect("second drain");
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_pending_events_on_with_lease(&rt, &server, false, lease),
+        )
+        .await
+        .expect("competing drain blocked, indicating a duplicate invocation")
+        .expect("second drain");
         assert_eq!(second.reclaimed, 0, "live lease must not be reclaimed");
         assert_eq!(second.invoked, 0, "second drain must not invoke the action");
 
