@@ -3066,50 +3066,76 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct BlockingCreateGate {
+    #[derive(Default)]
+    struct AsyncBlockingSideEffectState {
         invocations: std::sync::atomic::AtomicUsize,
         entered: tokio::sync::Notify,
-        released: std::sync::Mutex<bool>,
-        release_cv: std::sync::Condvar,
+        release: tokio::sync::Notify,
     }
 
-    impl BlockingCreateGate {
-        fn new() -> Self {
-            Self {
-                invocations: std::sync::atomic::AtomicUsize::new(0),
-                entered: tokio::sync::Notify::new(),
-                released: std::sync::Mutex::new(false),
-                release_cv: std::sync::Condvar::new(),
-            }
-        }
+    struct ReleaseAsyncBlockingVerbOnDrop(std::sync::Arc<AsyncBlockingSideEffectState>);
 
-        fn release(&self) {
-            *self.released.lock().expect("release lock") = true;
-            self.release_cv.notify_all();
-        }
-    }
-
-    impl Gate for BlockingCreateGate {
-        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
-            if request.verb == "create" {
-                self.invocations
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                self.entered.notify_one();
-                let mut released = self.released.lock().expect("release lock");
-                while !*released {
-                    released = self.release_cv.wait(released).expect("release wait");
-                }
-            }
-            Ok(GateDecision::allow())
-        }
-    }
-
-    struct ReleaseBlockingGateOnDrop(std::sync::Arc<BlockingCreateGate>);
-
-    impl Drop for ReleaseBlockingGateOnDrop {
+    impl Drop for ReleaseAsyncBlockingVerbOnDrop {
         fn drop(&mut self) {
-            self.0.release();
+            self.0.release.notify_one();
+        }
+    }
+
+    struct AsyncBlockingSideEffectPack {
+        runtime: KhiveRuntime,
+        marker: String,
+        state: std::sync::Arc<AsyncBlockingSideEffectState>,
+    }
+
+    impl khive_types::Pack for AsyncBlockingSideEffectPack {
+        const NAME: &'static str = "async-blocking-side-effect-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "test.async_blocking_side_effect",
+            description: "wait asynchronously, then commit one marker",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for AsyncBlockingSideEffectPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &khive_runtime::VerbRegistry,
+            token: &khive_runtime::NamespaceToken,
+        ) -> std::result::Result<Value, khive_runtime::RuntimeError> {
+            debug_assert_eq!(verb, "test.async_blocking_side_effect");
+            self.state
+                .invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.state.entered.notify_one();
+            self.state.release.notified().await;
+            let note = self
+                .runtime
+                .create_note(token, "observation", None, &self.marker, None, None, vec![])
+                .await?;
+            Ok(json!({"id": note.id}))
         }
     }
 
@@ -5054,32 +5080,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn renewable_lease_prevents_live_overrun_reclaim_and_double_dispatch() {
         let (_tmp, db_path) = tmp_db();
-        let gate = std::sync::Arc::new(BlockingCreateGate::new());
-        let _release_gate_on_unwind = ReleaseBlockingGateOnDrop(gate.clone());
-        let rt = KhiveRuntime::new(RuntimeConfig {
-            db_path: Some(std::path::PathBuf::from(&db_path)),
-            default_namespace: Namespace::local(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            gate: gate.clone(),
-            packs: vec!["kg".to_string(), "schedule".to_string()],
-            ..Default::default()
-        })
-        .expect("runtime");
-        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let rt = make_rt(&db_path).await;
         let marker = "renewable-lease-single-invocation";
-        let action = format!("create(kind=\"observation\", content=\"{marker}\")");
-        let id = create_scheduled_event(
-            &rt,
-            "local",
-            &due_rfc3339(),
-            Some(&action),
-            None,
-            "schedule",
-        )
-        .await;
+        let state = std::sync::Arc::new(AsyncBlockingSideEffectState::default());
+        let _release_verb_on_unwind = ReleaseAsyncBlockingVerbOnDrop(state.clone());
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(AsyncBlockingSideEffectPack {
+            runtime: rt.clone(),
+            marker: marker.to_string(),
+            state: state.clone(),
+        });
+        let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
+        let action = "test.async_blocking_side_effect()";
+        let id =
+            create_scheduled_event(&rt, "local", &due_rfc3339(), Some(action), None, "schedule")
+                .await;
         let lease = short_test_lease();
-        let entered = gate.entered.notified();
+        let entered = state.entered.notified();
         let drain_rt = rt.clone();
         let drain_server = server.clone();
         let first = tokio::spawn(async move {
@@ -5087,15 +5105,39 @@ mod tests {
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), entered)
             .await
-            .expect("dispatch entered blocking gate");
+            .expect("dispatch entered async blocking verb");
 
-        tokio::time::sleep(lease.ttl.saturating_mul(2)).await;
-        let live_props = get_note_props(&rt, id).await;
+        let invoking_props = get_note_props(&rt, id).await;
+        assert_eq!(invoking_props["status"], "firing");
+        let invocation_started_at = invoking_props["dispatch_receipt"]["invocation_started_at"]
+            .as_i64()
+            .expect("invocation start timestamp");
+        let ttl_micros = i64::try_from(lease.ttl.as_micros()).expect("test TTL fits in i64");
+        let original_deadline = invocation_started_at
+            .checked_add(ttl_micros)
+            .expect("test lease deadline fits in i64");
+        let live_props = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let props = get_note_props(&rt, id).await;
+                let now = Utc::now().timestamp_micros();
+                if props["lease_expires_at"].as_i64().is_some_and(|deadline| {
+                    now > original_deadline && deadline > original_deadline && deadline > now
+                }) {
+                    break props;
+                }
+                tokio::time::sleep(lease.renew_every.min(std::time::Duration::from_millis(10)))
+                    .await;
+            }
+        })
+        .await
+        .expect("live dispatch lease did not renew beyond its original deadline");
         assert_eq!(live_props["status"], "firing");
         assert!(
             live_props["lease_expires_at"]
                 .as_i64()
-                .is_some_and(|deadline| deadline > Utc::now().timestamp_micros()),
+                .is_some_and(|deadline| {
+                    deadline > original_deadline && deadline > Utc::now().timestamp_micros()
+                }),
             "live dispatch must renew beyond its original deadline: {live_props}"
         );
 
@@ -5105,7 +5147,7 @@ mod tests {
         assert_eq!(second.reclaimed, 0, "live lease must not be reclaimed");
         assert_eq!(second.invoked, 0, "second drain must not invoke the action");
 
-        gate.release();
+        state.release.notify_one();
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), first)
             .await
             .expect("first drain completes")
@@ -5116,7 +5158,7 @@ mod tests {
         assert_eq!(first.finalized, 1);
         assert_eq!(first.fired, 1);
         assert_eq!(
-            gate.invocations.load(std::sync::atomic::Ordering::SeqCst),
+            state.invocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the target verb must be entered exactly once"
         );
