@@ -8372,6 +8372,22 @@ mod help_tests {
             let writable = khive_db::StorageBackend::sqlite(&path).expect("writable backend");
             writable.prepare_core_schema().expect("current schema");
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
         let backend = khive_db::StorageBackend::sqlite_read_only(&path).expect("read-only backend");
         let empty_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
 

@@ -5569,6 +5569,9 @@ region = "us-east-1"
         backend
             .prepare_core_schema()
             .expect("prepare exact-current migration ledger");
+        drop(backend);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(path);
     }
 
     fn blob_only_runtime_config() -> RuntimeConfig {
@@ -6704,6 +6707,8 @@ region = "us-east-1"
         ])
         .expect("DDL on rw backend");
         drop(rw);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&db_path);
 
         // Re-open read-only and confirm writes fail.
         let ro = StorageBackend::sqlite_read_only(&db_path).expect("ro backend");
