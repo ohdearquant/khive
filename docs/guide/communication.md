@@ -303,10 +303,12 @@ correctly in native mail clients.
 A separate poll loop reads the IMAP mailbox every 5 seconds and, for each new
 message, calls the pack-internal `comm.ingest` subhandler (not callable
 directly over the MCP wire) with the parsed envelope: `from`, `to`, `content`,
-`subject`, `channel_kind`, `external_id` (an IMAP-derived dedup key of the
-form `imap:{host}:{uidvalidity}:{uid}`), `sent_at`, and the wire threading
-fields `wire_message_id` / `wire_references`. Duplicate `external_id` values
-are ignored, making re-delivery idempotent.
+`subject`, `channel_kind`, the exact per-credential `channel_slug`, `external_id`
+(an IMAP-derived dedup key of the form `imap:{host}:{uidvalidity}:{uid}`),
+`sent_at`, and the wire threading fields `wire_message_id` / `wire_references`.
+Every channel poller must supply both `Channel::kind()` and `Channel::slug()`;
+kind alone cannot distinguish two accounts using the same adapter. Duplicate
+`external_id` values are ignored, making re-delivery idempotent.
 
 ### Configuration
 

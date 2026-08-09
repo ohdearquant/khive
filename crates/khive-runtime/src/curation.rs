@@ -1290,6 +1290,29 @@ impl KhiveRuntime {
             note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
+            // ADR-056 makes these three properties transport evidence owned
+            // exclusively by `comm.ingest`. This check lives at the runtime
+            // patch seam, not only in comm's shared-CRUD hook, because direct
+            // Rust callers and atomic update preparation both arrive here
+            // without dispatching that hook. Scope it to `message`: the same
+            // JSON names remain ordinary caller metadata on every other kind.
+            if note.kind == "message" {
+                if !props.is_object() {
+                    return Err(RuntimeError::InvalidInput(
+                        "properties on a `message` note must be patched with an object: a \
+                         non-object patch would replace the transport-owned quarantine and \
+                         channel provenance established by `comm.ingest`"
+                            .into(),
+                    ));
+                }
+                if let Some(named) = message_transport_owned_property_named_in(&props) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "`{named}` is transport-owned on a `message` note and cannot be patched; \
+                         only `comm.ingest` may establish quarantine disposition and channel \
+                         provenance"
+                    )));
+                }
+            }
             // On a pack-owned note kind, the properties in
             // `OWNER_ESTABLISHED_PROPERTIES` are established by the owning pack
             // and read back by it to decide something structural — who wrote
@@ -2536,6 +2559,9 @@ fn merge_note_sql(
     if preserve_owner_established {
         preserve_owner_established_properties(&into_note.properties, &mut merged_props);
     }
+    if into_note.kind == "message" {
+        preserve_message_transport_properties(&into_note.properties, &mut merged_props);
+    }
 
     // Recomputed from the final retained properties rather than carried
     // forward from the fold's own count. The fold's count and post-
@@ -2907,6 +2933,26 @@ pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
     "external_id",
 ];
 
+/// Transport evidence that only `comm.ingest` may establish on a `message`.
+///
+/// This list is deliberately separate from [`OWNER_ESTABLISHED_PROPERTIES`].
+/// The latter applies to every pack-owned note kind; quarantine disposition
+/// and channel attribution are message-only, and protecting these names on a
+/// task, memory, or another pack-owned note would reserve ordinary metadata
+/// outside ADR-056's scope.
+pub(crate) const MESSAGE_TRANSPORT_OWNED_PROPERTIES: &[&str] =
+    &["quarantined", "channel_kind", "channel_slug"];
+
+fn message_transport_owned_property_named_in(patch: &Value) -> Option<&'static str> {
+    let Value::Object(map) = patch else {
+        return None;
+    };
+    MESSAGE_TRANSPORT_OWNED_PROPERTIES
+        .iter()
+        .copied()
+        .find(|key| map.contains_key(*key))
+}
+
 /// The first [`OWNER_ESTABLISHED_PROPERTIES`] key a caller-supplied
 /// `properties` patch names, if any.
 ///
@@ -2952,13 +2998,19 @@ pub(crate) fn preserve_owner_established_properties(
     into: &Option<Value>,
     merged: &mut Option<Value>,
 ) {
+    preserve_property_keys(OWNER_ESTABLISHED_PROPERTIES, into, merged);
+}
+
+fn preserve_message_transport_properties(into: &Option<Value>, merged: &mut Option<Value>) {
+    preserve_property_keys(MESSAGE_TRANSPORT_OWNED_PROPERTIES, into, merged);
+}
+
+fn preserve_property_keys(keys: &[&str], into: &Option<Value>, merged: &mut Option<Value>) {
     if !matches!(merged, Some(Value::Object(_))) {
         let Some(Value::Object(into_map)) = into else {
             return;
         };
-        let owned_on_into = OWNER_ESTABLISHED_PROPERTIES
-            .iter()
-            .any(|key| into_map.contains_key(*key));
+        let owned_on_into = keys.iter().any(|key| into_map.contains_key(*key));
         if owned_on_into {
             *merged = into.clone();
         }
@@ -2971,7 +3023,7 @@ pub(crate) fn preserve_owner_established_properties(
         Some(Value::Object(m)) => Some(m),
         _ => None,
     };
-    for key in OWNER_ESTABLISHED_PROPERTIES {
+    for key in keys {
         match into_map.and_then(|m| m.get(*key)) {
             Some(value) => {
                 // Already present on `into` — restore it verbatim.

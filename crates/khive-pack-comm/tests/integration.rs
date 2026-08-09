@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity,
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, NotePatch, RequestIdentity,
     RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlRow, SqlValue};
@@ -11514,6 +11514,163 @@ async fn update_refuses_to_forge_transport_owned_quarantine_properties() {
     }
 }
 
+/// The pack hook exercised above belongs to `VerbRegistry::dispatch("update", ...)`.
+/// A Rust embedder can call the public runtime API directly, so the canonical
+/// runtime update seam must independently enforce the same transport ownership.
+#[tokio::test]
+async fn direct_runtime_update_refuses_transport_owned_message_properties() {
+    let (registry, runtime) = build_registry_with_owned_kinds_and_validator();
+    let ingested = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": "direct runtime transport guard",
+                "channel_kind": "email",
+                "channel_slug": "real-account",
+                "external_id": "direct-runtime-transport-guard",
+                "metadata": {"quarantined": true, "quarantine_reason": "test"},
+            }),
+        )
+        .await
+        .expect("the trusted ingest path must seed transport evidence");
+    let id = uuid::Uuid::parse_str(ingested["full_id"].as_str().expect("full_id"))
+        .expect("full_id must be canonical");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let before = runtime
+        .get_note_including_deleted(&token, id)
+        .await
+        .expect("read seeded note")
+        .expect("seeded note");
+
+    for (key, forged_value) in [
+        ("quarantined", serde_json::json!(false)),
+        ("channel_kind", serde_json::json!("telegram")),
+        ("channel_slug", serde_json::json!("forged-account")),
+    ] {
+        let error = runtime
+            .update_note(
+                &token,
+                id,
+                NotePatch::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(serde_json::json!({key: forged_value})),
+                ),
+            )
+            .await
+            .expect_err("direct runtime update must refuse transport-owned message properties");
+        assert!(
+            error.to_string().contains(key),
+            "direct-runtime refusal must name {key}: {error}"
+        );
+        assert_eq!(
+            runtime
+                .get_note_including_deleted(&token, id)
+                .await
+                .expect("read note after refusal")
+                .expect("note after refusal"),
+            before,
+            "refused direct update naming `{key}` must leave the whole note unchanged"
+        );
+    }
+}
+
+/// Atomic execution prepares note replacement DML without dispatching the KG
+/// pack hook. Preparation must reject the same forged transport evidence
+/// before it can enter an atomic write plan.
+#[tokio::test]
+async fn atomic_prepare_refuses_transport_owned_message_properties() {
+    let (registry, runtime) = build_registry_with_owned_kinds_and_validator();
+    let ingested = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": "atomic prepare transport guard",
+                "channel_kind": "email",
+                "channel_slug": "real-account",
+                "external_id": "atomic-prepare-transport-guard",
+                "metadata": {"quarantined": true, "quarantine_reason": "test"},
+            }),
+        )
+        .await
+        .expect("the trusted ingest path must seed transport evidence");
+    let full_id = ingested["full_id"].as_str().expect("full_id");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+
+    for (key, forged_value) in [
+        ("quarantined", serde_json::json!(false)),
+        ("channel_kind", serde_json::json!("telegram")),
+        ("channel_slug", serde_json::json!("forged-account")),
+    ] {
+        let error = khive_runtime::atomic_prepare::prepare_update(
+            &runtime,
+            &token,
+            &serde_json::json!({
+                "id": full_id,
+                "properties": {key: forged_value},
+            }),
+            Some(khive_runtime::atomic_prepare::AtomicUpdateKind::Note {
+                specific: Some("message".to_string()),
+            }),
+        )
+        .await
+        .expect_err("atomic preparation must refuse transport-owned message properties");
+        assert!(
+            error.to_string().contains(key),
+            "atomic-prepare refusal must name {key}: {error}"
+        );
+    }
+}
+
+/// The transport-property rule belongs specifically to comm's `message`
+/// kind. The same JSON keys remain ordinary metadata on a generic note when
+/// a Rust embedder calls the runtime directly.
+#[tokio::test]
+async fn direct_runtime_update_allows_transport_named_properties_on_other_kinds() {
+    let (registry, runtime) = build_registry_with_owned_kinds_and_validator();
+    let created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "foreign-kind transport-name control",
+            }),
+        )
+        .await
+        .expect("create observation");
+    let id =
+        uuid::Uuid::parse_str(created["id"].as_str().expect("id")).expect("id must be canonical");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+
+    let updated = runtime
+        .update_note(
+            &token,
+            id,
+            NotePatch::new(
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "quarantined": true,
+                    "channel_kind": "user-label",
+                    "channel_slug": "user-value",
+                })),
+            ),
+        )
+        .await
+        .expect("transport-named keys are not reserved on an observation");
+    assert_eq!(updated.properties.unwrap()["quarantined"], true);
+}
+
 /// The guard fires only on pack-owned kinds: naming `from_actor` on a base
 /// kg note kind (e.g. `observation`) must succeed.
 #[tokio::test]
@@ -11892,6 +12049,141 @@ async fn merge_preserves_into_note_from_actor_under_prefer_into() {
         .await
         .expect("get must succeed");
     assert_eq!(after["properties"]["from_actor"], "lambda:x");
+}
+
+/// Transport provenance belongs to one transport item, so merging another
+/// message into the survivor must never import channel identity or quarantine
+/// disposition that the survivor did not already have. An absent key is part
+/// of the survivor's immutable state just as much as a present value. The
+/// table covers every public property merge policy; each policy would import
+/// the absorbed note's absent-on-into keys without the restoration guard.
+#[tokio::test]
+async fn merge_never_transfers_transport_properties_under_any_strategy() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    for strategy in ["prefer_into", "prefer_from", "union"] {
+        let into = registry
+            .dispatch(
+                "comm.ingest",
+                serde_json::json!({
+                    "namespace": "local",
+                    "from": "legacy:unattributed",
+                    "to": "local",
+                    "content": format!("transport-free survivor for {strategy}"),
+                    "external_id": format!("transport-free-survivor-{strategy}"),
+                }),
+            )
+            .await
+            .expect("trusted ingest may preserve a legacy unattributed row");
+        let into_id = into["full_id"].as_str().expect("full_id").to_string();
+
+        let from = registry
+            .dispatch(
+                "comm.ingest",
+                serde_json::json!({
+                    "namespace": "local",
+                    "from": "email:quarantine",
+                    "to": "local",
+                    "content": format!("attributed quarantined source for {strategy}"),
+                    "channel_kind": "email",
+                    "channel_slug": format!("source-{strategy}"),
+                    "external_id": format!("attributed-quarantine-source-{strategy}"),
+                    "metadata": {"quarantined": true, "quarantine_reason": "test"},
+                }),
+            )
+            .await
+            .expect("trusted ingest must establish transport evidence");
+        let from_id = from["full_id"].as_str().expect("full_id").to_string();
+        let from_before = registry
+            .dispatch("get", serde_json::json!({"id": from_id}))
+            .await
+            .expect("read transport source before merge");
+        assert_eq!(from_before["properties"]["quarantined"], true);
+        assert_eq!(from_before["properties"]["channel_kind"], "email");
+        assert_eq!(
+            from_before["properties"]["channel_slug"],
+            format!("source-{strategy}")
+        );
+
+        registry
+            .dispatch(
+                "merge",
+                serde_json::json!({
+                    "kind": "message",
+                    "into_id": into_id,
+                    "from_id": from_id,
+                    "strategy": strategy,
+                }),
+            )
+            .await
+            .expect("generic message merge must succeed");
+
+        let after = registry
+            .dispatch("get", serde_json::json!({"id": into_id}))
+            .await
+            .expect("read survivor after merge");
+        for key in ["quarantined", "channel_kind", "channel_slug"] {
+            assert!(
+                after["properties"].get(key).is_none(),
+                "{strategy} must not transfer transport-owned `{key}` from the absorbed \
+                 message into a survivor that lacked it; got {after}"
+            );
+        }
+    }
+}
+
+/// Scope control for merge: transport-shaped names on `observation` are
+/// caller metadata, so the normal `prefer_from` fold must remain intact.
+#[tokio::test]
+async fn merge_transfers_transport_named_properties_on_non_message_notes() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let into = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "transport-name merge control survivor",
+            }),
+        )
+        .await
+        .expect("create into observation");
+    let from = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "transport-name merge control source",
+                "properties": {
+                    "quarantined": true,
+                    "channel_kind": "user-label",
+                    "channel_slug": "user-value",
+                },
+            }),
+        )
+        .await
+        .expect("create from observation");
+    let into_id = into["id"].as_str().expect("id");
+    let from_id = from["id"].as_str().expect("id");
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "observation",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("transport-shaped names do not restrict observation merge");
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("read merged observation");
+    assert_eq!(after["properties"]["quarantined"], true);
+    assert_eq!(after["properties"]["channel_kind"], "user-label");
+    assert_eq!(after["properties"]["channel_slug"], "user-value");
 }
 
 /// NON-IDENTITY-KEY arm: a non-owned property that differs between the two
