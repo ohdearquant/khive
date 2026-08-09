@@ -33,3 +33,4 @@ quote = { workspace = true }
 khive-pack-kg = { version = "0.7.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
+rusqlite = { workspace = true }

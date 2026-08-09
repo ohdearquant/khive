@@ -726,6 +726,44 @@ fn rejects_pre_consolidation_ledger() {
 }
 
 #[test]
+fn current_ledger_validation_requires_the_complete_canonical_sequence() {
+    let mut canonical = open_memory();
+    let latest = run_migrations(&mut canonical).expect("migrations");
+    assert_eq!(
+        validate_current_schema_ledger(&canonical).expect("canonical ledger is accepted"),
+        latest
+    );
+
+    for (label, mutation) in [
+        ("gap", "DELETE FROM _schema_migrations WHERE version = 10"),
+        (
+            "substituted version",
+            "UPDATE _schema_migrations SET version = 20 WHERE version = 19",
+        ),
+        (
+            "substituted name",
+            "UPDATE _schema_migrations SET name = 'not_the_canonical_name' WHERE version = 19",
+        ),
+        (
+            "extra entry",
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (20, 'extra', 0)",
+        ),
+    ] {
+        let mut conn = open_memory();
+        run_migrations(&mut conn).expect("migrations");
+        conn.execute_batch(mutation).expect("mutate ledger");
+        let error = validate_current_schema_ledger(&conn)
+            .expect_err("{label} migration ledger must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("migration ledger is not canonical"),
+            "{label}: {error}"
+        );
+    }
+}
+
+#[test]
 fn core_tables_exist() {
     let mut conn = open_memory();
     run_migrations(&mut conn).expect("migrations");

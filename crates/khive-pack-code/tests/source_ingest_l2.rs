@@ -21,6 +21,7 @@ use khive_runtime::{
 };
 use khive_storage::types::{Direction, SqlStatement, SqlValue};
 use khive_storage::EdgeRelation;
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -929,6 +930,92 @@ async fn wire_explicit_unmigrated_db_is_rejected_byte_identically() {
             "target validation must not create the {suffix} sidecar"
         );
     }
+}
+
+/// A `MAX(version)` match is insufficient admission evidence: a valid SQLite
+/// file may forge only the migration-head row while omitting the canonical
+/// history. Explicit targets must reject that ledger read-only, without
+/// creating write-intent sidecars.
+#[tokio::test]
+async fn wire_explicit_fabricated_migration_head_is_rejected_byte_identically() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_fabricated_ledger_target");
+    let db = root.path().join("fabricated-ledger.db");
+    initialize_explicit_map_db(&db);
+
+    let conn = Connection::open(&db).expect("open initialized map");
+    conn.execute(
+        "DELETE FROM _schema_migrations \
+         WHERE version <> (SELECT MAX(version) FROM _schema_migrations)",
+        [],
+    )
+    .expect("retain only a forged-looking migration head");
+    conn.close().expect("close fabricated-ledger connection");
+
+    let before = std::fs::read(&db).expect("read target before dispatch");
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db.as_os_str().to_owned();
+        sidecar.push(suffix);
+        assert!(
+            !std::path::PathBuf::from(sidecar).exists(),
+            "fabricated target must start without the {suffix} sidecar"
+        );
+    }
+
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+    let error = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": root.path().join("pkg_fabricated_ledger_target").to_string_lossy(),
+            "db": db.to_string_lossy(),
+            "languages": ["rust"],
+            "tiers": [],
+        }),
+    )
+    .await
+    .expect_err("a fabricated migration head must not admit an explicit target");
+
+    assert!(
+        error.to_string().contains("migration") && error.to_string().contains("ledger"),
+        "the refusal must identify the untrusted migration ledger: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("read target after dispatch"),
+        before,
+        "fabricated-ledger validation must not rewrite the target"
+    );
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db.as_os_str().to_owned();
+        sidecar.push(suffix);
+        assert!(
+            !std::path::PathBuf::from(sidecar).exists(),
+            "fabricated-ledger validation must not create the {suffix} sidecar"
+        );
+    }
+}
+
+/// A complete canonical ledger remains an admissible explicit write target.
+#[tokio::test]
+async fn wire_explicit_canonical_current_db_remains_writable() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_canonical_current_target");
+    let db = root.path().join("canonical-current.db");
+    initialize_explicit_map_db(&db);
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+
+    dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": root.path().join("pkg_canonical_current_target").to_string_lossy(),
+            "db": db.to_string_lossy(),
+            "languages": ["rust"],
+            "tiers": [],
+        }),
+    )
+    .await
+    .expect("a canonical current explicit target remains writable");
 }
 
 /// The workspace-local default remains an intentional creation surface. The

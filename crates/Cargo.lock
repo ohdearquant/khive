@@ -2100,6 +2100,7 @@ dependencies = [
  "khive-types",
  "quote",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "syn",

@@ -226,13 +226,14 @@ impl KhiveRuntime {
                 path
             ))
         };
-        let inspected_version = khive_db::inspect_schema_version(&path).map_err(|error| {
-            RuntimeError::InvalidInput(format!(
-                "explicit target must be an existing current khive database at {:?}: {error}; \
+        let inspected_version =
+            khive_db::inspect_current_schema_ledger(&path).map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "explicit target must be an existing current khive database at {:?}: {error}; \
                  initialize or upgrade it with `kkernel db migrate --db <path>`",
-                path
-            ))
-        })?;
+                    path
+                ))
+            })?;
         if inspected_version != latest_version {
             return Err(schema_mismatch(inspected_version, "is not current"));
         }
@@ -240,7 +241,7 @@ impl KhiveRuntime {
         let backend = StorageBackend::sqlite_existing(&path)?;
         let reopened_version = {
             let writer = backend.pool().try_writer()?;
-            khive_db::read_schema_version(&writer)?
+            khive_db::validate_current_schema_ledger(&writer)?
         };
         if reopened_version != latest_version {
             return Err(schema_mismatch(reopened_version, "changed while opening"));

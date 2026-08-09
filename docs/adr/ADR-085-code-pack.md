@@ -1560,12 +1560,13 @@ Amendment 4 made source ingest's explicit `db` create-capable. That made a
 caller typo indistinguishable from authorization to create and migrate a new
 database at the misspelled path. This amendment supersedes only that
 create-capable clause: an explicit target is now a claim that an
-operator-selected map already exists and is at the current khive schema
-version.
+operator-selected map already exists and carries the complete canonical khive
+migration ledger for the current schema version.
 
 The handler first inspects an explicit target through a read-only connection.
-It rejects a missing path, a non-database file, and any schema version other
-than the current migration head. Only after that check may it open a
+It rejects a missing path, a non-database file, and any ledger other than the
+complete canonical sequence of current migration versions and names (including
+a fabricated head row, gaps, substitutions, or extras). Only after that check may it open a
 write-capable pool, and that pool omits `SQLITE_OPEN_CREATE`; the runtime does
 not run migrations on this path. The schema is checked again on the opened
 pool before model registration or ingest. An older schema error identifies
@@ -1585,5 +1586,7 @@ initialize that map explicitly before supplying it as `db`.
    neither one.
 2. An explicit empty/unmigrated file is rejected byte-identically, with no WAL
    or shared-memory sidecar and with the migration remedy in the error.
-3. An explicit current-schema map remains writable through `code.ingest`.
+3. An explicit map with the complete canonical current ledger remains writable
+   through `code.ingest`; a SQLite file with only a fabricated current head
+   row is rejected byte-identically with no WAL or shared-memory sidecars.
 4. Omitting `db` still creates and migrates the workspace-local default.

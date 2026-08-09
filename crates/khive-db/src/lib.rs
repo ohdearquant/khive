@@ -40,7 +40,8 @@ pub use checkpoint::{
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use error::SqliteError;
 pub use migrations::{
-    inspect_schema_version, query_embedding_models, read_schema_version, run_migrations,
+    inspect_current_schema_ledger, inspect_schema_version, query_embedding_models,
+    read_schema_version, run_migrations, validate_current_schema_ledger,
     EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, WriterGuard};

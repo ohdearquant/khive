@@ -268,6 +268,20 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
 ];
 
+/// Read migration-ledger entries in version order. This is intentionally a
+/// read-only query, shared by migration-time name checks and admission-time
+/// exact-ledger validation so both derive their expectations from
+/// [`MIGRATIONS`].
+fn read_migration_ledger(conn: &Connection) -> Result<Vec<(u32, String)>, SqliteError> {
+    let mut stmt = conn.prepare("SELECT version, name FROM _schema_migrations ORDER BY version")?;
+    let applied = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(applied)
+}
+
 /// Confirm every applied migration through `through_version` is recorded
 /// under its canonical name. A deployment-time rename of an applied
 /// migration (the divergence #1649 repairs for versions 13/14) must not be
@@ -279,15 +293,10 @@ fn validate_applied_migration_names(
     conn: &Connection,
     through_version: u32,
 ) -> Result<(), SqliteError> {
-    let mut stmt =
-        conn.prepare("SELECT version, name FROM _schema_migrations WHERE version <= ?1")?;
-    let applied = stmt
-        .query_map([through_version], |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    for (version, applied_name) in applied {
+    for (version, applied_name) in read_migration_ledger(conn)? {
+        if version > through_version {
+            continue;
+        }
         if let Some(migration) = MIGRATIONS.iter().find(|m| m.version == version) {
             if migration.name != applied_name {
                 return Err(SqliteError::InvalidData(format!(
@@ -302,6 +311,49 @@ fn validate_applied_migration_names(
     }
 
     Ok(())
+}
+
+/// Confirm that `_schema_migrations` is the complete, exact canonical ledger
+/// for the current binary. Unlike [`read_schema_version`], this rejects a
+/// forged migration head, missing intermediate entries, renamed entries, and
+/// unexpected extra entries. It never writes.
+///
+/// This validator is for callers that need to admit an existing database as
+/// already-current without running migrations. Migration startup itself may
+/// validly encounter a prefix while it is bringing a database forward, so it
+/// continues to use [`validate_applied_migration_names`].
+pub fn validate_current_schema_ledger(conn: &Connection) -> Result<u32, SqliteError> {
+    let applied = read_migration_ledger(conn)?;
+    if applied.len() != MIGRATIONS.len() {
+        return Err(SqliteError::InvalidData(format!(
+            "migration ledger is not canonical: expected {} entries through version {}, found {}",
+            MIGRATIONS.len(),
+            MIGRATIONS
+                .last()
+                .map(|migration| migration.version)
+                .unwrap_or(0),
+            applied.len(),
+        )));
+    }
+
+    for (position, (version, name)) in applied.iter().enumerate() {
+        let expected = &MIGRATIONS[position];
+        if *version != expected.version || name != expected.name {
+            return Err(SqliteError::InvalidData(format!(
+                "migration ledger is not canonical at entry {}: expected version {} named '{}', found version {} named '{}'",
+                position + 1,
+                expected.version,
+                expected.name,
+                version,
+                name,
+            )));
+        }
+    }
+
+    Ok(MIGRATIONS
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or(0))
 }
 
 const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
@@ -339,6 +391,17 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     read_schema_version(&conn)
+}
+
+/// Open `path` read-only and confirm it carries the complete canonical
+/// migration ledger for this binary. The file must already exist; this path
+/// never creates the database or runs migrations.
+pub fn inspect_current_schema_ledger(path: &std::path::Path) -> Result<u32, SqliteError> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    validate_current_schema_ledger(&conn)
 }
 
 #[cfg(test)]
