@@ -23,6 +23,25 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        Self::upsert_atoms_with_content_policy(runtime, token, params, false).await
+    }
+
+    /// Import has already validated the complete source document and must retain its
+    /// boundary whitespace. The public upsert verb keeps its established trim behavior.
+    pub(super) async fn upsert_import_atoms(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        Self::upsert_atoms_with_content_policy(runtime, token, params, true).await
+    }
+
+    async fn upsert_atoms_with_content_policy(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+        preserve_content_whitespace: bool,
+    ) -> Result<Value, RuntimeError> {
         let p: UpsertAtomsParams = deser(params)?;
         if p.chunk_size.is_some() {
             tracing::warn!(
@@ -56,7 +75,12 @@ impl KnowledgeHandlers {
                 ));
             }
 
-            let content = atom_in.content.as_deref().unwrap_or("").trim().to_string();
+            let raw_content = atom_in.content.as_deref().unwrap_or("");
+            let content = if preserve_content_whitespace {
+                raw_content.to_string()
+            } else {
+                raw_content.trim().to_string()
+            };
             validate_atom_content(&content)?;
             // Secret gate: scan all caller-supplied text and structured fields
             // before any reader/writer is acquired.

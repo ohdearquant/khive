@@ -1742,17 +1742,25 @@ request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\
 
 ### `knowledge.import` — Commissive
 
-Ingest atlas markdown file(s) as atoms with parsed sections.
+Validate and ingest atlas markdown file(s) with stable root-relative identity.
 
-| Param            | Type   | Required | Notes                                                                         |
-| ---------------- | ------ | -------- | ----------------------------------------------------------------------------- |
-| `path`           | string | yes      | Filesystem path to a markdown file or directory.                              |
-| `format`         | string | no       | Only `atlas_md` supported (default).                                          |
-| `chunk_strategy` | string | no       | `section` (default, one section per atom) or `atom` (whole file as one atom). |
+| Param            | Type   | Required | Notes                                                                           |
+| ---------------- | ------ | -------- | ------------------------------------------------------------------------------- |
+| `path`           | string | yes      | Filesystem path to a `.md` file or bounded directory tree.                      |
+| `format`         | string | no       | Only `atlas_md` supported (default).                                            |
+| `chunk_strategy` | string | no       | `section` (atom plus section rows) or `atom` (whole markdown, no section rows). |
 
 ```
 request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
 ```
+
+Directory slugs use normalized root-relative components joined by `--`; source paths are
+retained in `properties.source_path`. Traversal and source validation complete before writes,
+normalization collisions fail closed, and symlinks are not followed. Root directory symlinks are
+rejected with or without a trailing separator. Entry, depth, and file-limit errors include the
+exact failing path plus current and configured traversal counts. Successful responses add
+`entries_visited`, `files_discovered`, `files_skipped`, `traversal_errors`, `sections_discovered`,
+and `sections_skipped` to the existing import counters.
 
 ### `knowledge.challenge` — Commissive
 

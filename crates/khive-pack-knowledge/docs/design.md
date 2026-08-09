@@ -86,23 +86,24 @@
 
 ## Module Boundaries
 
-| Module                  | Responsibility                                                              |
-| ----------------------- | --------------------------------------------------------------------------- |
-| `lib.rs`                | Public exports and the operator-facing `reindex_knowledge` library entry    |
-| `pack.rs`               | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim          |
+| Module                  | Responsibility                                                                           |
+| ----------------------- | ---------------------------------------------------------------------------------------- |
+| `lib.rs`                | Public exports and the operator-facing `reindex_knowledge` library entry                 |
+| `pack.rs`               | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim                       |
 | `vocab.rs`              | Pack schema statements and the handler descriptor table (19 public verbs + 1 subhandler) |
-| `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                      |
-| `knowledge/mod.rs`      | Knowledge handler module boundaries and shared exports                      |
-| `knowledge/eval.rs`     | Offline query-set validation, atom retrieval scoring, and run persistence   |
-| `knowledge/schema.rs`   | Param and record types for serde deserialization and SQL row mapping        |
-| `knowledge/vamana.rs`   | Shared Vamana ANN index lifecycle (warm-start, build, search, RRF fusion)   |
-| `knowledge/matching.rs` | TF-IDF term matching primitives (tokenize, exact match, count)              |
+| `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                                   |
+| `knowledge/mod.rs`      | Knowledge handler module boundaries and shared exports                                   |
+| `knowledge/eval.rs`     | Offline query-set validation, atom retrieval scoring, and run persistence                |
+| `knowledge/schema.rs`   | Param and record types for serde deserialization and SQL row mapping                     |
+| `knowledge/vamana.rs`   | Shared Vamana ANN index lifecycle (warm-start, build, search, RRF fusion)                |
+| `knowledge/matching.rs` | TF-IDF term matching primitives (tokenize, exact match, count)                           |
 
 ## Namespace Isolation
 
 All corpus SQL queries include `AND namespace = ?` predicates scoped to the caller token's
-namespace. The `knowledge.import` verb delegates to `upsert_atoms` and `edit`, which each
-enforce the caller namespace — no cross-namespace write is possible. `knowledge.compose`
+namespace. The `knowledge.import` verb delegates to the import-preserving atom upsert path and
+`edit`, which each enforce the caller namespace — no cross-namespace write is possible.
+`knowledge.compose`
 accepts an explicit `namespace` as ADR-007's exact single-namespace escape. The same derived
 token scopes automatic suggestion, corpus/section reads, KG blending, and the cross-pack
 brain-profile weight read; Tier-3 pack-local feedback state is keyed by that namespace too.
@@ -117,6 +118,8 @@ run summaries; `knowledge.stats` reads only summaries from that namespace.
 
 - `tests/integration.rs` — full verb surface, happy path + edge cases
 - `tests/fixes.rs` — targeted regression coverage for audit-identified invariants
+- `tests/import_integrity.rs` — bounded traversal, stable path identity, validate-first writes,
+  whole-file atom mode, and additive import reporting
 - `tests/eval_retrieval.rs` — schema routing/idempotence, validation, draft-corpus scoring,
   persistence, and namespace isolation
 - `tests/bench.rs` — warm-latency smoke test (ignored by default; see `docs/benchmarks.md`)

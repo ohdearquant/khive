@@ -60,6 +60,10 @@ name = "fixes"
 path = "tests/fixes.rs"
 
 [[test]]
+name = "import_integrity"
+path = "tests/import_integrity.rs"
+
+[[test]]
 name = "feedback"
 path = "tests/feedback.rs"
 

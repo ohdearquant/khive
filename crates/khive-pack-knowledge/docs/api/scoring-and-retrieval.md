@@ -115,10 +115,23 @@ the first `##` heading as the atom body, and maps each `##` heading to a `Sectio
 any canonical type are classified as `Other`.
 
 An optional `atlas_id:` front-matter line in the first 32 lines is extracted and stored in
-`properties.atlas_id` and as `source_uri = atlas:<id>`.
+`properties.atlas_id` and as `source_uri = atlas:<id>`. Every import also stores the original
+root-relative markdown path in `properties.source_path`; without an Atlas ID, `source_uri` is
+`file:<source_path>`.
 
 The chunk strategy `"section"` (default) creates one atom + N sections per file.
-The `"atom"` strategy creates one atom with the full content as `content` and no sections.
+The `"atom"` strategy creates one atom with the byte-exact UTF-8 file content as `content` and no
+sections.
+
+Directory slugs are stable root-relative identities: normalized path components join with `--`
+(`guides/rope.md` becomes `guides--rope`). A direct file keeps its normalized stem. Any
+normalization collision fails before writes and names both paths. Discovery is deterministic,
+does not follow symlinks, and fails closed at 32 directory levels, 100,000 entries, or 10,000
+markdown files. A root directory symlink is rejected even with a trailing separator. Limit errors
+name the exact failing path and report the current/configured depth, entry, and markdown-file
+counts. The response retains `imported_atoms`, `imported_sections`, and `files_processed`, and
+adds `entries_visited`, `files_discovered`, `files_skipped`, `traversal_errors`,
+`sections_discovered`, and `sections_skipped`.
 
 ## Numeric Validation
 

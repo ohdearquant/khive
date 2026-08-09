@@ -398,8 +398,8 @@ pub(crate) struct ImportParams {
     /// Markdown format hint.  Only `"atlas_md"` is supported in v1.
     #[serde(default)]
     pub format: Option<String>,
-    /// Chunk strategy: `"section"` (one section per atom, default) or `"atom"`
-    /// (entire file as one atom).
+    /// Chunk strategy: `"section"` (atom plus parsed section rows, default) or
+    /// `"atom"` (whole markdown in one atom with no section rows).
     #[serde(default)]
     pub chunk_strategy: Option<String>,
 }

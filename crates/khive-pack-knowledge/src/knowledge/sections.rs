@@ -1,6 +1,7 @@
 //! Section handlers: edit, import, challenge, adjudicate; markdown parsing helpers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -14,7 +15,8 @@ use super::schema::{
 use super::sections_index::embed_sections;
 use super::util::resolve_atom_id;
 use super::util::{
-    content_hash, deser, new_id, now_us, row_str, sql_err, validate_section_content,
+    content_hash, deser, new_id, now_us, row_str, sql_err, validate_atom_content,
+    validate_section_content,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -78,17 +80,147 @@ pub(super) fn section_to_json(s: &Section) -> Value {
 
 // ─── markdown parsing helpers ─────────────────────────────────────────────────
 
-fn collect_md_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
+const MAX_IMPORT_DEPTH: usize = 32;
+const MAX_IMPORT_ENTRIES: usize = 100_000;
+const MAX_IMPORT_FILES: usize = 10_000;
+
+#[derive(Clone, Copy, Debug)]
+struct ImportTraversalLimits {
+    max_depth: usize,
+    max_entries: usize,
+    max_files: usize,
+}
+
+const IMPORT_TRAVERSAL_LIMITS: ImportTraversalLimits = ImportTraversalLimits {
+    max_depth: MAX_IMPORT_DEPTH,
+    max_entries: MAX_IMPORT_ENTRIES,
+    max_files: MAX_IMPORT_FILES,
+};
+
+#[derive(Debug)]
+struct ImportDiscovery {
+    files: Vec<PathBuf>,
+    entries_visited: usize,
+    files_skipped: usize,
+}
+
+fn traversal_error(
+    path: &Path,
+    entries_visited: usize,
+    error: impl std::fmt::Display,
+) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "knowledge.import traversal failed at {:?} after {entries_visited} entries: {error}",
+        path
+    ))
+}
+
+fn traversal_limit_error(
+    limit_kind: &str,
+    path: &Path,
+    depth: usize,
+    entries_visited: usize,
+    files_discovered: usize,
+    limits: ImportTraversalLimits,
+) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "knowledge.import traversal {limit_kind} limit exceeded at {:?}: \
+         depth={depth} max_depth={} entries_visited={entries_visited} max_entries={} \
+         files_discovered={files_discovered} max_files={}",
+        path, limits.max_depth, limits.max_entries, limits.max_files
+    ))
+}
+
+/// Rebuild the caller path from lexical components before metadata inspection.
+/// In particular, this removes a trailing separator that would otherwise make
+/// `symlink_metadata("directory-link/")` dereference the final symlink on Unix.
+fn normalize_import_root(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+fn collect_md_files_with_limits(
+    root: &Path,
+    limits: ImportTraversalLimits,
+) -> Result<ImportDiscovery, RuntimeError> {
+    let mut directories = VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut files = Vec::new();
+    let mut entries_visited = 0usize;
+    let mut files_skipped = 0usize;
+
+    while let Some((directory, depth)) = directories.pop_front() {
+        let read_dir = std::fs::read_dir(&directory)
+            .map_err(|error| traversal_error(&directory, entries_visited, error))?;
+        let mut entries = Vec::new();
+        for entry in read_dir {
+            let entry =
+                entry.map_err(|error| traversal_error(&directory, entries_visited, error))?;
+            let next_entries_visited = entries_visited.saturating_add(1);
+            if next_entries_visited > limits.max_entries {
+                return Err(traversal_limit_error(
+                    "entry",
+                    &entry.path(),
+                    depth,
+                    next_entries_visited,
+                    files.len(),
+                    limits,
+                ));
+            }
+            entries_visited = next_entries_visited;
+            entries.push(entry);
+        }
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        for entry in entries {
             let path = entry.path();
-            if path.is_dir() {
-                collect_md_files(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                out.push(path);
+            let file_type = entry
+                .file_type()
+                .map_err(|error| traversal_error(&path, entries_visited, error))?;
+            if file_type.is_symlink() {
+                files_skipped = files_skipped.saturating_add(1);
+            } else if file_type.is_dir() {
+                let child_depth = depth.saturating_add(1);
+                if child_depth > limits.max_depth {
+                    return Err(traversal_limit_error(
+                        "depth",
+                        &path,
+                        child_depth,
+                        entries_visited,
+                        files.len(),
+                        limits,
+                    ));
+                }
+                directories.push_back((path, child_depth));
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("md")
+            {
+                let files_discovered = files.len().saturating_add(1);
+                if files_discovered > limits.max_files {
+                    return Err(traversal_limit_error(
+                        "markdown file",
+                        &path,
+                        depth,
+                        entries_visited,
+                        files_discovered,
+                        limits,
+                    ));
+                }
+                files.push(path);
+            } else {
+                files_skipped = files_skipped.saturating_add(1);
             }
         }
     }
+
+    files.sort();
+    Ok(ImportDiscovery {
+        files,
+        entries_visited,
+        files_skipped,
+    })
+}
+
+fn collect_md_files(root: &Path) -> Result<ImportDiscovery, RuntimeError> {
+    collect_md_files_with_limits(root, IMPORT_TRAVERSAL_LIMITS)
 }
 
 fn to_slug(stem: &str) -> String {
@@ -106,6 +238,195 @@ fn to_slug(stem: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+#[derive(Debug)]
+struct ImportSourceIdentity {
+    slug: String,
+    source_path: String,
+}
+
+fn import_source_identity(
+    root: &Path,
+    file: &Path,
+    root_is_file: bool,
+) -> Result<ImportSourceIdentity, RuntimeError> {
+    let relative = if root_is_file {
+        file.file_name().map(PathBuf::from).ok_or_else(|| {
+            RuntimeError::InvalidInput(format!("import file has no filename: {file:?}"))
+        })?
+    } else {
+        file.strip_prefix(root).map(PathBuf::from).map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "import file {file:?} is outside traversal root {root:?}"
+            ))
+        })?
+    };
+
+    let mut source_components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(RuntimeError::InvalidInput(format!(
+                "import source path is not root-relative: {relative:?}"
+            )));
+        };
+        let component = component.to_str().ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "import source path is not valid UTF-8: {relative:?}"
+            ))
+        })?;
+        source_components.push(component.to_string());
+    }
+    let source_path = source_components.join("/");
+    let filename = source_components.last().ok_or_else(|| {
+        RuntimeError::InvalidInput(format!("import source path is empty: {relative:?}"))
+    })?;
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "import source filename has no valid UTF-8 stem: {relative:?}"
+            ))
+        })?;
+
+    let mut slug_components = source_components[..source_components.len() - 1]
+        .iter()
+        .map(|component| to_slug(component))
+        .collect::<Vec<_>>();
+    slug_components.push(to_slug(stem));
+    if slug_components.iter().any(String::is_empty) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "import source path normalizes to an empty slug component: {source_path:?}"
+        )));
+    }
+
+    Ok(ImportSourceIdentity {
+        slug: slug_components.join("--"),
+        source_path,
+    })
+}
+
+#[derive(Debug)]
+struct PreparedSection {
+    section_type: SectionType,
+    heading: String,
+    content: String,
+}
+
+#[derive(Debug)]
+struct PreparedImportFile {
+    slug: String,
+    name: String,
+    atom_content: String,
+    properties: serde_json::Map<String, Value>,
+    source_uri: String,
+    source_type: &'static str,
+    sections: Vec<PreparedSection>,
+    sections_discovered: usize,
+    sections_skipped: usize,
+}
+
+fn prepare_import_file(
+    file: &Path,
+    identity: ImportSourceIdentity,
+    chunk_strategy: &str,
+) -> Result<PreparedImportFile, RuntimeError> {
+    let content = std::fs::read_to_string(file).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "failed to read import source {:?} before writes: {error}",
+            identity.source_path
+        ))
+    })?;
+    let (atom_name, atom_body, parsed_sections) = parse_atlas_md(&content);
+    let atlas_id = extract_atlas_id(&content);
+    let name = if atom_name.is_empty() {
+        identity
+            .slug
+            .rsplit("--")
+            .next()
+            .unwrap_or(&identity.slug)
+            .replace('-', " ")
+    } else {
+        atom_name
+    };
+    let atom_content = if chunk_strategy == "atom" {
+        content
+    } else if atom_body.split_whitespace().count() >= super::util::MIN_ATOM_CONTENT_WORDS {
+        atom_body
+    } else {
+        parsed_sections
+            .iter()
+            .map(|(_, _, body)| body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    validate_atom_content(&atom_content)?;
+
+    let citation_count = parsed_sections
+        .iter()
+        .filter(|(section_type, _, _)| *section_type == SectionType::References)
+        .map(|(_, _, body)| body.lines().filter(|line| !line.trim().is_empty()).count())
+        .sum::<usize>();
+    let source_uri = atlas_id
+        .as_ref()
+        .map(|id| format!("atlas:{id}"))
+        .unwrap_or_else(|| format!("file:{}", identity.source_path));
+    let source_type = if citation_count > 0 {
+        "paper"
+    } else {
+        "imported"
+    };
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "source_path".to_string(),
+        Value::String(identity.source_path.clone()),
+    );
+    if let Some(id) = atlas_id {
+        properties.insert("atlas_id".to_string(), Value::String(id));
+    }
+
+    let sections_discovered = parsed_sections.len();
+    let (sections, sections_skipped) = if chunk_strategy == "section" {
+        let mut prepared = Vec::new();
+        let mut skipped = 0usize;
+        for (section_type, heading, content) in parsed_sections {
+            if content.len() < super::util::MIN_SECTION_CONTENT_LEN {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            validate_section_content(&content)?;
+            khive_runtime::secret_gate::check(&heading)?;
+            khive_runtime::secret_gate::check(&content)?;
+            prepared.push(PreparedSection {
+                section_type,
+                heading,
+                content,
+            });
+        }
+        (prepared, skipped)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    khive_runtime::secret_gate::check(&identity.slug)?;
+    khive_runtime::secret_gate::check(&name)?;
+    khive_runtime::secret_gate::check(&atom_content)?;
+    khive_runtime::secret_gate::check_json(&Value::Object(properties.clone()))?;
+    khive_runtime::secret_gate::check(&source_uri)?;
+    khive_runtime::secret_gate::check(source_type)?;
+
+    Ok(PreparedImportFile {
+        slug: identity.slug,
+        name,
+        atom_content,
+        properties,
+        source_uri,
+        source_type,
+        sections,
+        sections_discovered,
+        sections_skipped,
+    })
 }
 
 fn extract_atlas_id(content: &str) -> Option<String> {
@@ -437,130 +758,108 @@ impl KnowledgeHandlers {
             )));
         }
 
-        let md_path = std::path::Path::new(&path_str);
-        if !md_path.exists() {
-            return Err(RuntimeError::NotFound(format!(
-                "path does not exist: {path_str:?}"
+        let normalized_md_path = normalize_import_root(Path::new(&path_str));
+        let md_path = normalized_md_path.as_path();
+        let metadata = std::fs::symlink_metadata(md_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                RuntimeError::NotFound(format!("path does not exist: {path_str:?}"))
+            } else {
+                RuntimeError::InvalidInput(format!(
+                    "failed to inspect import path {path_str:?}: {error}"
+                ))
+            }
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "import path must not be a symbolic link: {path_str:?}"
             )));
         }
 
-        let files: Vec<std::path::PathBuf> = if md_path.is_file() {
-            vec![md_path.to_path_buf()]
-        } else if md_path.is_dir() {
-            let mut v = Vec::new();
-            collect_md_files(md_path, &mut v);
-            v
+        let root_is_file = metadata.is_file();
+        let discovery = if root_is_file {
+            if md_path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "import file must have a .md extension: {path_str:?}"
+                )));
+            }
+            ImportDiscovery {
+                files: vec![md_path.to_path_buf()],
+                entries_visited: 1,
+                files_skipped: 0,
+            }
+        } else if metadata.is_dir() {
+            collect_md_files(md_path)?
         } else {
             return Err(RuntimeError::InvalidInput(format!(
-                "path is not a file or directory: {path_str:?}"
+                "path is not a regular file or directory: {path_str:?}"
             )));
         };
 
-        if files.is_empty() {
-            return Ok(json!({
-                "imported_atoms": 0,
-                "imported_sections": 0,
-                "files_processed": 0,
-            }));
+        let mut identities = Vec::with_capacity(discovery.files.len());
+        let mut sources_by_slug = BTreeMap::new();
+        for file in &discovery.files {
+            let identity = import_source_identity(md_path, file, root_is_file)?;
+            if let Some(previous_source) =
+                sources_by_slug.insert(identity.slug.clone(), identity.source_path.clone())
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "normalized slug collision for {:?}: {:?} and {:?}",
+                    identity.slug, previous_source, identity.source_path
+                )));
+            }
+            identities.push((file.clone(), identity));
         }
 
+        let mut prepared_files = Vec::with_capacity(identities.len());
+        for (file, identity) in identities {
+            prepared_files.push(prepare_import_file(&file, identity, &chunk_strategy)?);
+        }
+
+        let sections_discovered = prepared_files
+            .iter()
+            .map(|prepared| prepared.sections_discovered)
+            .sum::<usize>();
+        let sections_skipped = prepared_files
+            .iter()
+            .map(|prepared| prepared.sections_skipped)
+            .sum::<usize>();
         let mut imported_atoms = 0usize;
         let mut imported_sections = 0usize;
 
-        for file in &files {
-            let content = std::fs::read_to_string(file)
-                .map_err(|e| RuntimeError::Internal(format!("failed to read {:?}: {e}", file)))?;
-
-            let stem = file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
-            let slug = to_slug(stem);
-
-            let (atom_name, atom_body, sections) = parse_atlas_md(&content);
-            let name = if atom_name.is_empty() {
-                slug.replace('-', " ")
-            } else {
-                atom_name
-            };
-
-            // Atom content is its description. A section-only document (e.g.
-            // `# Title` followed entirely by `##` sections) has an empty/short
-            // pre-section body, which would fail the atom content minimum before
-            // the sections are imported. Synthesize atom content from the section
-            // bodies in that case so the atom carries meaningful text.
-            let atom_content =
-                if atom_body.split_whitespace().count() >= super::util::MIN_ATOM_CONTENT_WORDS {
-                    atom_body
-                } else {
-                    sections
-                        .iter()
-                        .map(|(_, _, body)| body.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                };
-
-            let atlas_id = extract_atlas_id(&content);
-            let citation_count = sections
-                .iter()
-                .filter(|(stype, _, _)| *stype == SectionType::References)
-                .map(|(_, _, body)| body.lines().filter(|line| !line.trim().is_empty()).count())
-                .sum::<usize>();
-            let source_uri = atlas_id.as_ref().map(|id| format!("atlas:{id}"));
-            let source_type = if citation_count > 0 {
-                "paper"
-            } else {
-                "imported"
-            };
-            let mut properties = serde_json::Map::new();
-            if let Some(ref id) = atlas_id {
-                properties.insert("atlas_id".to_string(), Value::String(id.clone()));
-            }
-
-            // finalized=true so imported atoms land at status="reviewed" instead of the
-            // upsert_atoms default "draft" — knowledge.search/suggest exclude "draft" by
-            // default (SearchParams::include_drafts defaults false), so a bulk-imported
-            // corpus was previously present (knowledge.list, no default status filter)
-            // but unretrievable through search/suggest until someone finalized every atom
-            // individually. Imported content is externally-authored source material the
-            // caller already chose to ingest, not an agent-proposed draft pending review.
+        for prepared in &prepared_files {
             let upsert_params = serde_json::json!({
                 "atoms": [{
-                    "slug": slug,
-                    "name": name,
-                    "content": atom_content,
-                    "properties": Value::Object(properties),
-                    "source_uri": source_uri,
-                    "source_type": source_type,
+                    "slug": prepared.slug,
+                    "name": prepared.name,
+                    "content": prepared.atom_content,
+                    "properties": Value::Object(prepared.properties.clone()),
+                    "source_uri": prepared.source_uri,
+                    "source_type": prepared.source_type,
                     "finalized": true,
                 }]
             });
-            KnowledgeHandlers::upsert_atoms(runtime, token, upsert_params).await?;
+            KnowledgeHandlers::upsert_import_atoms(runtime, token, upsert_params).await?;
             imported_atoms += 1;
 
-            if chunk_strategy == "section" && !sections.is_empty() {
-                // Filter out stub sections below the 80-char minimum to avoid
-                // errors during import of markdown files with short sections.
-                let section_updates: Vec<Value> = sections
+            if !prepared.sections.is_empty() {
+                let section_updates = prepared
+                    .sections
                     .iter()
-                    .filter(|(_, _, body)| body.len() >= super::util::MIN_SECTION_CONTENT_LEN)
-                    .map(|(stype, heading, body)| {
+                    .map(|section| {
                         json!({
-                            "section_type": stype.as_str(),
-                            "heading": heading,
-                            "content": body,
+                            "section_type": section.section_type.as_str(),
+                            "heading": section.heading,
+                            "content": section.content,
                         })
                     })
-                    .collect();
-                if !section_updates.is_empty() {
-                    let edit_params = json!({
-                        "id": slug,
-                        "sections": section_updates,
-                    });
-                    let result = KnowledgeHandlers::edit(runtime, token, edit_params, ann).await?;
-                    if let Some(n) = result.get("upserted").and_then(|v| v.as_u64()) {
-                        imported_sections += n as usize;
-                    }
+                    .collect::<Vec<_>>();
+                let edit_params = json!({
+                    "id": prepared.slug,
+                    "sections": section_updates,
+                });
+                let result = KnowledgeHandlers::edit(runtime, token, edit_params, ann).await?;
+                if let Some(count) = result.get("upserted").and_then(Value::as_u64) {
+                    imported_sections += count as usize;
                 }
             }
         }
@@ -568,7 +867,13 @@ impl KnowledgeHandlers {
         Ok(json!({
             "imported_atoms": imported_atoms,
             "imported_sections": imported_sections,
-            "files_processed": files.len(),
+            "files_processed": imported_atoms,
+            "entries_visited": discovery.entries_visited,
+            "files_discovered": discovery.files.len(),
+            "files_skipped": discovery.files_skipped,
+            "traversal_errors": 0,
+            "sections_discovered": sections_discovered,
+            "sections_skipped": sections_skipped,
         }))
     }
 
@@ -799,5 +1104,135 @@ impl KnowledgeHandlers {
             "new_status": new_status,
             "resolved": affected,
         }))
+    }
+}
+
+#[cfg(test)]
+mod import_traversal_tests {
+    use super::{collect_md_files_with_limits, ImportTraversalLimits};
+    use tempfile::TempDir;
+
+    #[test]
+    fn traversal_surfaces_root_read_errors() {
+        let root = TempDir::new().expect("temp root");
+        let missing = root.path().join("missing");
+        let error = collect_md_files_with_limits(
+            &missing,
+            ImportTraversalLimits {
+                max_depth: 8,
+                max_entries: 100,
+                max_files: 100,
+            },
+        )
+        .expect_err("missing traversal root must be surfaced");
+        assert!(error.to_string().contains("traversal failed"));
+    }
+
+    #[test]
+    fn traversal_enforces_depth_limit() {
+        let root = TempDir::new().expect("temp root");
+        let nested = root.path().join("nested");
+        std::fs::create_dir_all(&nested).expect("nested directory fixture");
+        let error = collect_md_files_with_limits(
+            root.path(),
+            ImportTraversalLimits {
+                max_depth: 0,
+                max_entries: 100,
+                max_files: 100,
+            },
+        )
+        .expect_err("depth over limit must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("depth limit"), "{message}");
+        assert!(
+            message.contains(nested.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(message.contains("depth=1"), "{message}");
+        assert!(message.contains("max_depth=0"), "{message}");
+        assert!(message.contains("entries_visited=1"), "{message}");
+        assert!(message.contains("max_entries=100"), "{message}");
+        assert!(message.contains("files_discovered=0"), "{message}");
+        assert!(message.contains("max_files=100"), "{message}");
+    }
+
+    #[test]
+    fn traversal_enforces_entry_limit() {
+        let root = TempDir::new().expect("temp root");
+        let first = root.path().join("a.md");
+        std::fs::write(&first, "a").expect("fixture");
+        let error = collect_md_files_with_limits(
+            root.path(),
+            ImportTraversalLimits {
+                max_depth: 8,
+                max_entries: 0,
+                max_files: 100,
+            },
+        )
+        .expect_err("entry over limit must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("entry limit"), "{message}");
+        assert!(
+            message.contains(first.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(message.contains("entries_visited=1"), "{message}");
+        assert!(message.contains("max_entries=0"), "{message}");
+        assert!(message.contains("files_discovered=0"), "{message}");
+        assert!(message.contains("max_files=100"), "{message}");
+        assert!(message.contains("depth=0"), "{message}");
+        assert!(message.contains("max_depth=8"), "{message}");
+    }
+
+    #[test]
+    fn traversal_enforces_markdown_file_limit() {
+        let root = TempDir::new().expect("temp root");
+        std::fs::write(root.path().join("a.md"), "a").expect("first fixture");
+        let second = root.path().join("b.md");
+        std::fs::write(&second, "b").expect("second fixture");
+        let error = collect_md_files_with_limits(
+            root.path(),
+            ImportTraversalLimits {
+                max_depth: 8,
+                max_entries: 100,
+                max_files: 1,
+            },
+        )
+        .expect_err("file over limit must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("markdown file limit"), "{message}");
+        assert!(
+            message.contains(second.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(message.contains("files_discovered=2"), "{message}");
+        assert!(message.contains("max_files=1"), "{message}");
+        assert!(message.contains("entries_visited=2"), "{message}");
+        assert!(message.contains("max_entries=100"), "{message}");
+        assert!(message.contains("depth=0"), "{message}");
+        assert!(message.contains("max_depth=8"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traversal_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("temp root");
+        let markdown = root.path().join("source.md");
+        std::fs::write(&markdown, "source").expect("source fixture");
+        symlink(&markdown, root.path().join("alias.md")).expect("symlink fixture");
+        let discovery = collect_md_files_with_limits(
+            root.path(),
+            ImportTraversalLimits {
+                max_depth: 8,
+                max_entries: 100,
+                max_files: 100,
+            },
+        )
+        .expect("traversal");
+
+        assert_eq!(discovery.files, vec![markdown]);
+        assert_eq!(discovery.files_skipped, 1);
     }
 }
