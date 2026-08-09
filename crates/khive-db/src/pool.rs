@@ -1544,10 +1544,11 @@ mod tests {
         let constrained = ConnectionPool::new(PoolConfig {
             path: Some(path.clone()),
             write_queue_enabled: Some(false),
-            disk_reserve_bytes: u64::MAX,
+            disk_reserve_bytes: 1,
             ..PoolConfig::default()
         })
         .unwrap();
+        constrained.force_available_bytes_for_test(0);
 
         for error in [
             constrained.try_writer().err().expect("pooled guard must refuse"),
@@ -1563,7 +1564,7 @@ mod tests {
                     volume,
                 } => {
                     assert!(available_bytes < reserve_bytes);
-                    assert_eq!(reserve_bytes, u64::MAX);
+                    assert_eq!(reserve_bytes, 1);
                     assert!(volume.contains("disk-reserve-old-reader"));
                 }
                 other => panic!("expected DiskCapacityFloor, got {other:?}"),
@@ -1577,6 +1578,31 @@ mod tests {
         old_reader.execute_batch("ROLLBACK").unwrap();
     }
 
+    #[test]
+    fn capacity_guard_refuses_first_open_before_creating_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("must-not-be-created.db");
+        let error = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            disk_reserve_bytes: u64::MAX,
+            ..PoolConfig::default()
+        })
+        .err()
+        .expect("impossible reserve must reject first open");
+        assert!(matches!(
+            error,
+            SqliteError::DiskCapacityFloor {
+                reserve_bytes: u64::MAX,
+                ..
+            }
+        ));
+        assert!(
+            !path.exists(),
+            "capacity refusal must happen before SQLite creates the database"
+        );
+    }
+
     #[tokio::test]
     async fn writer_task_rechecks_capacity_before_begin_and_never_runs_refused_operation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1585,11 +1611,12 @@ mod tests {
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
                 write_queue_enabled: Some(true),
-                disk_reserve_bytes: u64::MAX,
+                disk_reserve_bytes: 1,
                 ..PoolConfig::default()
             })
             .unwrap(),
         );
+        pool.force_available_bytes_for_test(0);
         let task = pool
             .writer_task_handle()
             .unwrap()
@@ -1616,7 +1643,7 @@ mod tests {
                 assert!(matches!(
                     source.downcast_ref::<SqliteError>(),
                     Some(SqliteError::DiskCapacityFloor {
-                        reserve_bytes: u64::MAX,
+                        reserve_bytes: 1,
                         ..
                     })
                 ));
