@@ -5,7 +5,7 @@
 //! exchange helpers, and in-process launcher together gives recovery tests one
 //! fail-closed teardown path instead of open-coded variants in `daemon.rs`.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ pub(super) static KILL_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(super) static FORCE_PID_IS_DAEMON: AtomicBool = AtomicBool::new(false);
 pub(super) static FORCE_PID_IS_FOREIGN: AtomicBool = AtomicBool::new(false);
+pub(super) static FORCED_CONNECT_ERROR: AtomicI32 = AtomicI32::new(0);
 pub(super) static DAEMON_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 
 /// Rendezvous after every recoverer independently observes an absent daemon.
@@ -30,6 +31,7 @@ pub(super) fn reset_counters() {
     SPAWN_COUNT.store(0, Ordering::SeqCst);
     FORCE_PID_IS_DAEMON.store(false, Ordering::SeqCst);
     FORCE_PID_IS_FOREIGN.store(false, Ordering::SeqCst);
+    FORCED_CONNECT_ERROR.store(0, Ordering::SeqCst);
     DAEMON_DISPATCH.store(0, Ordering::SeqCst);
     *RECOVERY_RACE_BARRIER
         .lock()

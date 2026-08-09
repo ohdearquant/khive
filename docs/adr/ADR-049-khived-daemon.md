@@ -277,3 +277,22 @@ lose their response only after the real frame is read and requires eight termina
 zero lifecycle actions, and no follow-up connections. Both scenarios repeat 25 times on every CI
 operating system. Shared recovery counters, framing fixtures, environment cleanup, and the
 in-process launcher live in `crates/khive-mcp/src/daemon/test_harness.rs`.
+
+## Amendment 4 (2026-08-09): an inaccessible socket is not an absent daemon
+
+This amendment narrows Amendment 2's phrase "genuinely absent or unreachable" and Amendment 3's
+generic reference to connection-establishment failure. Only an error that positively establishes
+there is no live listener is a recoverable `NoSocket` outcome:
+
+- `ENOENT` / `NotFound` means no socket path exists.
+- `ECONNREFUSED` / `ConnectionRefused` means a stale socket path exists with no listener.
+
+Both remain eligible for the ordinary `NoSocket` recovery path, including stale-socket self-heal.
+Any other connect error, including sandbox or filesystem-policy denial reported as `EACCES` or
+`EPERM` (`PermissionDenied`), is `Unreachable`. It proves only that this client cannot inspect the
+daemon rendezvous; it does not prove the daemon is dead. `Unreachable` therefore returns a
+structured `daemon_unreachable` hard error and performs no local dispatch, retry, kill, or spawn,
+regardless of `KHIVE_DAEMON_STRICT`.
+
+`KHIVE_NO_DAEMON=1` remains the explicit operator opt-out for intentionally daemonless execution.
+This amendment changes neither that opt-out nor the exactly-once boundary after a frame write.
