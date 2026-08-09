@@ -88,8 +88,8 @@ shared boot/recovery lock (bounded by `BOOT_QUIESCENCE_LOCK_TIMEOUT_MS` =
 500ms), then re-probes daemon identity — successfully reacquiring-then-
 dropping the lock proves neither a peer's kill+spawn nor a daemon's own cold
 boot is currently mid-critical-section. Before #838 this used an unbounded
-blocking `flock`, so `DEAD_CONFIRM_ROUNDS` bounded probe *count* but not
-elapsed *time* — a wedged lock holder blocked recovery forever. A
+blocking `flock`, so `DEAD_CONFIRM_ROUNDS` bounded probe _count_ but not
+elapsed _time_ — a wedged lock holder blocked recovery forever. A
 deadline-elapsed or otherwise-failed acquisition returns the distinct
 `ProbeOutcome::LockContended` rather than collapsing into `Timeout` (which
 means something different: "the daemon itself answered slowly").
@@ -122,8 +122,10 @@ The `daemon_fallback` event renders client and daemon configuration identifiers
 as stable, full SHA-256 identifiers rather than the path- and topology-bearing
 fingerprints used for the equality check. A configuration mismatch also carries
 `config_mismatch_field`, naming the first differing fingerprint field without
-emitting either field value. The wire equality check and fallback decision still
-use the original full fingerprints.
+emitting either field value. Its ordered vocabulary follows the production fingerprint:
+`packs`, `db`, `embed`, `extra`, `fresh_tail`, `backend`, `outbound`, `git_write`,
+`backends`, then `pack_backends`. The wire equality check and fallback decision still use
+the original full fingerprints.
 
 The `khive_strict_daemon_fallback` marker on a strict-fallback rejection's
 `McpError` (#947) lets `request()` in `server.rs` distinguish "the daemon was
@@ -139,11 +141,11 @@ outstanding client request when the mismatch fires, only the request that
 triggered this arm gets the ambiguous-error-then-resume treatment; any other
 in-flight request loses its response the same way it would if the process
 crashed — a pre-existing risk, not introduced by this change.
-`fire_pending_self_heal` fires on the next successful flush of *any*
+`fire_pending_self_heal` fires on the next successful flush of _any_
 message, not specifically the mismatch response's own flush — on this
 bridge's dominant single-request-at-a-time usage those are the same event,
 but a genuinely concurrent second in-flight request could in principle flush
-first. Strictly better than the pre-fix timer (which could fire before *any*
+first. Strictly better than the pre-fix timer (which could fire before _any_
 flush completed), and the same class of pre-existing risk, not a new one.
 
 `SelfHealOnFlushTransport` wraps the transport (rather than the handler)

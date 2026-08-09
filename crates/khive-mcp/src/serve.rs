@@ -2188,7 +2188,11 @@ fn build_registry_for_multi_backend_inner(
 
     let gate = default_runtime.config().gate.clone();
     let default_namespace = default_runtime.config().default_namespace.clone();
-    let config_id = crate::server::compute_config_id(default_runtime.config(), Some(khive_cfg));
+    let config_id = crate::server::compute_config_id_with_ann_fresh_tail(
+        default_runtime.config(),
+        Some(khive_cfg),
+        default_runtime.ann_fresh_tail_enabled(),
+    );
     let visible_namespaces = default_runtime.config().visible_namespaces.clone();
 
     let mut builder = khive_runtime::VerbRegistryBuilder::new();

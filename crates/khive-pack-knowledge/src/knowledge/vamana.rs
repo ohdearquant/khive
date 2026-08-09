@@ -1536,12 +1536,6 @@ async fn replay_final_states(
 
 // ── ADR-118: fresh-tail exact leg ─────────────────────────────────────────
 
-fn fresh_tail_enabled() -> bool {
-    std::env::var("KHIVE_ANN_FRESH_TAIL")
-        .map(|value| value != "0")
-        .unwrap_or(true)
-}
-
 struct FreshTailSnapshot {
     own_watermark: Option<i64>,
     registry_min: Option<i64>,
@@ -1831,7 +1825,7 @@ pub(crate) async fn fresh_tail_leg(
             source_exhausted: true,
         };
     }
-    if !fresh_tail_enabled() {
+    if !rt.ann_fresh_tail_enabled() {
         return match read_own_watermark(rt, ns, model).await {
             Ok(Some(watermark)) if watermark >= 0 => FreshTailOutcome::Skipped,
             Ok(_) => force_cold_after_registry_loss(rt, ann, key).await,

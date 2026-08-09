@@ -54,7 +54,7 @@ pub use atomic_runner::{
 };
 pub use blob::resolve_blob_store;
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
-pub use config::process_ref_from_env;
+pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_error, note_embedding_text,

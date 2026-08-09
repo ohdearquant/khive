@@ -80,6 +80,10 @@ pub struct KhiveRuntime {
     /// `None` when this runtime is already bound to the main backend.
     core_backend: Option<Arc<StorageBackend>>,
     config: RuntimeConfig,
+    /// ADR-118 exact-leg policy, sampled once at runtime construction.
+    /// Request-time memory/knowledge serving must never re-read the process
+    /// environment because tests and embedded runtimes share one process.
+    ann_fresh_tail_enabled: bool,
     /// Pack-extensible embedder registry.
     ///
     /// Shared across clones via `Arc<RwLock<_>>` so that
@@ -154,6 +158,7 @@ impl KhiveRuntime {
     /// For the preferred boot path in multi-backend deployments, use
     /// [`from_backend`](Self::from_backend) instead.
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
+        let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let backend = match &config.db_path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -175,6 +180,7 @@ impl KhiveRuntime {
             backend: Arc::new(backend),
             core_backend: None,
             config,
+            ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
@@ -194,6 +200,7 @@ impl KhiveRuntime {
     /// so `engine list` / `engine status` cannot mutate the registry as a side effect.
     /// Returns `None` when `db_path` is `None` and the default DB does not exist.
     pub fn new_readonly(config: RuntimeConfig) -> RuntimeResult<Self> {
+        let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let backend = match &config.db_path {
             Some(path) => StorageBackend::sqlite(path)?,
             None => StorageBackend::memory()?,
@@ -207,6 +214,7 @@ impl KhiveRuntime {
             backend: Arc::new(backend),
             core_backend: None,
             config,
+            ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
@@ -230,6 +238,7 @@ impl KhiveRuntime {
     /// storage access is through the provided `backend`. Set `backend_id` and
     /// `default_namespace` via the config builder pattern if non-defaults are needed.
     pub fn from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+        let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         if let Err(err) = register_configured_embedding_models(&backend, &config) {
             tracing::warn!(error = %err, "failed to register configured embedding models");
         }
@@ -238,6 +247,7 @@ impl KhiveRuntime {
             backend,
             core_backend: None,
             config,
+            ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
@@ -298,6 +308,7 @@ impl KhiveRuntime {
                     backend: main_arc.clone(),
                     core_backend: None,
                     config: core_config,
+                    ann_fresh_tail_enabled: self.ann_fresh_tail_enabled,
                     embedder_registry: self.embedder_registry.clone(),
                     default_embedder_name: self.default_embedder_name.clone(),
                     edge_rules: self.edge_rules.clone(),
@@ -345,6 +356,22 @@ impl KhiveRuntime {
     /// Return a reference to the runtime config.
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    /// Return the immutable ADR-118 fresh-tail serving policy captured when
+    /// this runtime was constructed.
+    pub fn ann_fresh_tail_enabled(&self) -> bool {
+        self.ann_fresh_tail_enabled
+    }
+
+    /// Override ADR-118's fresh-tail serving policy for this runtime instance.
+    ///
+    /// This is primarily useful for embedded runtimes and deterministic tests:
+    /// it avoids mutating process-global environment state. Clones and `core()`
+    /// handles preserve the chosen value.
+    pub fn with_ann_fresh_tail_enabled(mut self, enabled: bool) -> Self {
+        self.ann_fresh_tail_enabled = enabled;
+        self
     }
 
     /// Return a reference to the underlying storage backend.
@@ -1199,6 +1226,21 @@ mod tests {
     fn memory_runtime_creates_successfully() {
         let rt = KhiveRuntime::memory().expect("memory runtime should create");
         assert!(rt.config().db_path.is_none());
+    }
+
+    #[test]
+    fn fresh_tail_policy_is_instance_scoped_and_clone_stable() {
+        let enabled = KhiveRuntime::memory()
+            .expect("enabled memory runtime")
+            .with_ann_fresh_tail_enabled(true);
+        let disabled = KhiveRuntime::memory()
+            .expect("disabled memory runtime")
+            .with_ann_fresh_tail_enabled(false);
+
+        assert!(enabled.ann_fresh_tail_enabled());
+        assert!(enabled.clone().ann_fresh_tail_enabled());
+        assert!(!disabled.ann_fresh_tail_enabled());
+        assert!(!disabled.clone().ann_fresh_tail_enabled());
     }
 
     #[tokio::test]
