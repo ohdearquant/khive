@@ -735,6 +735,69 @@ mod tests {
             .capacity()
     }
 
+    #[test]
+    fn stale_staging_sweep_removes_a_direct_canonical_uuid_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let orphan = root.path().join(format!(".staging-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(orphan.join("partial.git/objects")).expect("create orphan");
+        std::fs::write(orphan.join("partial.git/objects/pack"), b"partial")
+            .expect("write orphan payload");
+        let observed_mtime = std::fs::symlink_metadata(&orphan)
+            .expect("orphan metadata")
+            .modified()
+            .expect("orphan mtime");
+
+        let removed = reap_stale_staging(
+            root.path(),
+            observed_mtime + std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("reap stale staging directory");
+
+        assert_eq!(removed, 1);
+        assert!(!orphan.exists(), "stale staging payload must be reclaimed");
+    }
+
+    #[test]
+    fn staging_sweep_preserves_fresh_foreign_nested_and_nondirectory_entries() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fresh = root.path().join(format!(".staging-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&fresh).expect("create fresh staging dir");
+        let fresh_mtime = std::fs::symlink_metadata(&fresh)
+            .expect("fresh metadata")
+            .modified()
+            .expect("fresh mtime");
+
+        let foreign = root.path().join(".staging-not-a-canonical-uuid");
+        std::fs::create_dir_all(&foreign).expect("create foreign prefix dir");
+        let staging_file = root.path().join(format!(".staging-{}", Uuid::new_v4()));
+        std::fs::write(&staging_file, b"operator file").expect("write staging-shaped file");
+        let nested = root
+            .path()
+            .join("operator-owned")
+            .join(format!(".staging-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&nested).expect("create nested staging-shaped dir");
+
+        let removed = reap_stale_staging(
+            root.path(),
+            fresh_mtime,
+            std::time::Duration::from_secs(24 * 60 * 60),
+        )
+        .expect("scan fresh staging entries");
+
+        assert_eq!(removed, 0);
+        assert!(
+            fresh.is_dir(),
+            "an in-flight fresh staging dir must survive"
+        );
+        assert!(foreign.is_dir(), "prefix alone is not ownership proof");
+        assert!(staging_file.is_file(), "the sweep removes directories only");
+        assert!(
+            nested.is_dir(),
+            "the sweep never descends below the cache root"
+        );
+    }
+
     /// A `git clone` failure must not leave a `.staging-<uuid>` dir behind.
     #[test]
     fn ensure_clone_cleans_up_staging_dir_on_clone_failure() {
