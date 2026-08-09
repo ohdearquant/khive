@@ -335,9 +335,12 @@ does not create a missing database or its parent directory.
 Read-only boot is an inspection path, not a migration path. It requires the
 snapshot's core migration ledger to be the exact contiguous canonical sequence
 through the build's latest migration; a missing middle row or foreign version
-is rejected even when `MAX(version)` matches. It skips configured
-embedding-model registration, lazy store-schema/repair writes, pack schema
-application, writer-task startup, checkpointing, and WAL sweeps. Optional
+is rejected even when `MAX(version)` matches. Core-ledger and optional-table
+inspection use genuine read-only reader connections. This remains true for a
+rollback-journal snapshot: a read-only file pool retains a dedicated reader
+instead of degrading `reader()` onto its query-only writer slot. It skips
+configured embedding-model registration, lazy store-schema/repair writes, pack
+schema application, writer-task startup, checkpointing, and WAL sweeps. Optional
 vector, sparse, and text tables are checked through reader connections and must
 already exist. Read-only ANN cache misses do not enqueue registration or
 rebuild work; memory uses exact sqlite-vec fallback and knowledge retains FTS
@@ -352,6 +355,16 @@ schedule ticker is omitted only when the schedule
 pack's own runtime is read-only: it remains enabled on a writable secondary
 beside a read-only main, and remains disabled on a read-only secondary beside a
 writable main.
+
+Feature-enabled email and Telegram background work is also admitted by the
+runtime that serves each loop's verbs, not by `--daemon` alone. Inbound polling
+requires the assigned `comm` runtime to be writable because it dispatches
+`comm.ingest`, heartbeat, and cursor writes. Outbound delivery requires the
+assigned `kg` runtime to be writable because it uses generic `list`/`update` to
+claim and mark a message; otherwise no external send task starts, avoiding a
+send followed by an inevitably failed `delivered_at` write. These gates are
+independent, so a mixed topology can admit one direction without admitting the
+other.
 
 The explicit `read_only` value participates in the backend-topology portion of
 the warm-daemon `config_id`. In multi-backend configuration it must agree with

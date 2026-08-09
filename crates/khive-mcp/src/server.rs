@@ -485,6 +485,44 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
     out
 }
 
+/// Runtime-mode admission for transport background work.
+///
+/// The inbound tasks dispatch only `comm.*` verbs (`comm.ingest`, heartbeat,
+/// and cursor operations), so their write authority is the comm pack's actual
+/// assigned runtime. The outbound tasks scan and mutate notes through the kg
+/// pack's generic `list`/`update` verbs, so they must not perform an external
+/// send unless that runtime can durably record the claim and `delivered_at`.
+/// Keeping the two decisions separate preserves mixed-backend topologies.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChannelLoopAdmission {
+    pub(crate) inbound_poll: bool,
+    pub(crate) outbound_delivery: bool,
+}
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+impl ChannelLoopAdmission {
+    fn for_single_runtime(runtime: &KhiveRuntime, packs: &[String]) -> Self {
+        let comm_loaded = packs.iter().any(|pack| pack == "comm");
+        let kg_loaded = packs.iter().any(|pack| pack == "kg");
+        let writable = !runtime.is_read_only();
+        Self {
+            inbound_poll: comm_loaded && writable,
+            outbound_delivery: comm_loaded && kg_loaded && writable,
+        }
+    }
+
+    pub(crate) fn for_pack_runtimes(
+        kg: Option<&KhiveRuntime>,
+        comm: Option<&KhiveRuntime>,
+    ) -> Self {
+        Self {
+            inbound_poll: comm.is_some_and(|runtime| !runtime.is_read_only()),
+            outbound_delivery: comm.is_some() && kg.is_some_and(|runtime| !runtime.is_read_only()),
+        }
+    }
+}
+
 /// MCP server that dispatches all verbs through a [`VerbRegistry`].
 #[derive(Clone)]
 pub struct KhiveMcpServer {
@@ -527,6 +565,12 @@ pub struct KhiveMcpServer {
     /// Shared by server clones but never persisted, so a replacement process
     /// cannot inherit a plausible-looking heartbeat from its predecessor.
     schedule_ticker_last_tick_micros: Arc<AtomicI64>,
+    /// Per-verb-runtime write admission for email and Telegram background
+    /// tasks. CLI daemon role is necessary but not sufficient: snapshot
+    /// runtimes must never poll into a failing ingest path or send externally
+    /// when delivery state cannot be durably marked.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    channel_loop_admission: ChannelLoopAdmission,
 }
 
 /// Failure reason inside a [`PackRegError`].
@@ -630,6 +674,8 @@ impl KhiveMcpServer {
     // deref for no real benefit.
     #[allow(clippy::result_large_err)]
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
+        #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+        let channel_loop_admission = ChannelLoopAdmission::for_single_runtime(&runtime, packs);
         let gate = runtime.config().gate.clone();
         let default_namespace = runtime.config().default_namespace.clone();
         let config_id = compute_config_id_with_runtime_policies(
@@ -716,6 +762,8 @@ impl KhiveMcpServer {
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             runtime: Some(runtime),
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            channel_loop_admission,
         })
     }
 
@@ -739,6 +787,8 @@ impl KhiveMcpServer {
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             runtime: None,
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            channel_loop_admission: ChannelLoopAdmission::default(),
         }
     }
 
@@ -761,6 +811,8 @@ impl KhiveMcpServer {
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             runtime: None,
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            channel_loop_admission: ChannelLoopAdmission::default(),
         }
     }
 
@@ -781,6 +833,20 @@ impl KhiveMcpServer {
     pub fn with_default_output_format(mut self, fmt: OutputFormat) -> Self {
         self.default_output_format = fmt;
         self
+    }
+
+    /// Attach the runtime-derived channel admission computed by the
+    /// multi-backend builder after pack routing has been resolved.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    pub(crate) fn with_channel_loop_admission(mut self, admission: ChannelLoopAdmission) -> Self {
+        self.channel_loop_admission = admission;
+        self
+    }
+
+    /// Return the fixed boot-time admission for channel background tasks.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    pub(crate) fn channel_loop_admission(&self) -> ChannelLoopAdmission {
+        self.channel_loop_admission
     }
 
     /// Attach a cross-backend coordinator (ADR-029 Phase 2).

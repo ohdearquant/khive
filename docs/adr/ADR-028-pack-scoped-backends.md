@@ -612,7 +612,11 @@ Boot and access obey these rules:
    exact contiguous canonical sequence through this build's latest migration.
    Matching only `MAX(version)` is insufficient: missing middle rows, foreign
    versions, renamed rows, behind ledgers, and ahead ledgers all fail without
-   writes and with an actionable compatibility diagnostic.
+   writes and with an actionable compatibility diagnostic. Validation checks
+   out a reader before any writer acquisition. A file-backed read-only pool
+   keeps at least one genuine read-only reader even when the snapshot uses a
+   rollback journal rather than WAL; `reader()` never aliases that inspection
+   onto the query-only writer slot.
 2. Boot does not register embedding models, apply pack-auxiliary schema, start a
    writer task, checkpoint, or schedule a WAL sweep for that backend. Daemon
    warm hooks remain per-pack-runtime aware: writer-bearing ANN warm and session
@@ -621,7 +625,13 @@ Boot and access obey these rules:
    there. The schedule ticker is admitted
    only when the schedule pack's own assigned backend is writable; a read-only
    main does not disable a schedule pack routed to a writable secondary, nor
-   does a writable main enable a read-only schedule secondary.
+   does a writable main enable a read-only schedule secondary. Feature-enabled
+   email and Telegram tasks apply the same per-runtime rule in addition to the
+   daemon-role gate: inbound polling is admitted only when the runtime serving
+   `comm.ingest`/heartbeat/cursor verbs is writable, while outbound delivery is
+   admitted only when the runtime serving generic `list`/`update` can durably
+   claim and mark delivery. The two decisions remain independent in a mixed
+   topology, and neither adapter polls or sends before its decision passes.
 3. Store acquisition does not run lazy DDL or repair DML. A requested optional
    vector, sparse, or text-search table must already exist in the snapshot and
    is checked through a reader connection, never the pool's query-only writer

@@ -298,9 +298,12 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
 /// - N reader connections in a lock-free queue (concurrent access)
 /// - All connections share the same database file in WAL mode
 ///
-/// For in-memory databases, or when WAL mode is disabled/unavailable, the pool
-/// degrades to single-connection mode and routes all operations through the
-/// writer connection.
+/// Writable in-memory databases, or writable file databases when WAL mode is
+/// disabled/unavailable, degrade to single-connection mode and route all
+/// operations through the writer connection. A file-backed read-only pool
+/// always retains at least one dedicated read-only connection: rollback-journal
+/// snapshots do not need WAL to support concurrent readers, and inspection must
+/// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
     /// Fail-closed guard for the legacy pool-mutex writer. A transaction
@@ -529,9 +532,9 @@ impl ConnectionPool {
     ///
     /// Opens 1 writer + N reader connections to the same database when pooling
     /// is enabled. All connections are configured consistently (busy timeout,
-    /// foreign keys, cache, mmap, temp store). For in-memory databases, or when
-    /// WAL is disabled or unavailable, the pool falls back to single-connection
-    /// mode.
+    /// foreign keys, cache, mmap, temp store). Writable in-memory databases and
+    /// writable non-WAL files fall back to single-connection mode. Read-only
+    /// files retain a dedicated reader regardless of journal mode.
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
         validate_write_admission_deadline(config.write_admission_deadline_ms)?;
@@ -1206,7 +1209,9 @@ fn resolve_symlink_chain(path: &Path) -> Result<PathBuf, SqliteError> {
 }
 
 fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
-    if config.path.is_some() && config.wal_mode && wal_enabled {
+    if config.path.is_some() && config.read_only {
+        config.max_readers.max(1)
+    } else if config.path.is_some() && config.wal_mode && wal_enabled {
         config.max_readers
     } else {
         0
