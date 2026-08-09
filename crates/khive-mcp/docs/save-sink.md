@@ -8,7 +8,7 @@ and returns a self-describing manifest instead of the raw results.
 
 A sink that self-reports null counts catches bulk export corruption (e.g.
 `content=null` across 10,000 rows) in one second rather than after a
-downstream agent fleet has graded blind. `write_and_manifest` computes
+downstream agent fleet has graded blind. `JsonlSaveSink`/`write_and_manifest` compute
 `per_column_null_counts`, a `schema_fingerprint` (SHA-256 of sorted field
 names), and a file `checksum` so a caller can sanity-check a large export
 without re-reading it.
@@ -36,10 +36,27 @@ path inside this root. The trusted operator CLI path
 check entirely and may write anywhere the operator points it — that is
 documented CLI behavior, not an oversight.
 
-## Why `write_atomic` uses a random temp file
+## Why the incremental sink uses a random temp file
 
-`write_atomic` uses `tempfile::Builder::tempfile_in` instead of a
+`JsonlSaveSink` uses `tempfile::Builder::tempfile_in` instead of a
 predictable `path.with_extension("tmp")` sibling. This closes the
 symlink-following / predictable-path race the previous sibling-tmp approach
 was open to, and the temp file always lives in the same directory as the
 destination so the final rename is same-filesystem and atomic.
+
+Rows are serialized directly to that sibling while the SHA-256 checksum,
+schema field set, and null counts are accumulated. `finish` flushes and
+renames only after every row is present; dropping an unfinished sink removes
+the temp and leaves any prior destination intact. `write_and_manifest` uses
+this same incremental implementation, so large exports do not require a
+second complete JSONL buffer in memory.
+
+For `kkernel exec --ops-file --save-file`, destination validation and temp-file
+creation happen before the first operation chunk is dispatched. Each validated
+ordered result row is then written before the next chunk begins. File I/O and
+database commits cannot form one cross-resource transaction: a later disk/full
+I/O failure can still occur after an earlier non-atomic chunk committed. That
+failure exits non-zero, never publishes a partial file, and leaves any old
+destination unchanged. Callers must use the per-op/idempotency contracts when
+retrying after this explicit boundary; atomic ops-files retain their separate
+all-or-nothing database contract.
