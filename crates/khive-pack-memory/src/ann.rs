@@ -3319,6 +3319,7 @@ mod tests {
     async fn pathless_pending_reader_waits_for_checkpoint_activation() {
         const MODEL: &str = "pathless-pending-publication-wait";
         let rt = KhiveRuntime::memory().expect("runtime");
+        provision_test_vector_store(&rt, MODEL, 4);
         let ann = new_shared();
         let key = AnnKey::new(MODEL);
         register_consumer(&rt, MODEL)
@@ -4024,6 +4025,23 @@ mod tests {
         async fn build(&self) -> Result<Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
             Ok(Arc::new(HashVecService { dims: self.dims }))
         }
+    }
+
+    /// Provision the real sqlite-vec store that backs a manually installed
+    /// test bridge. Production bridges are built from an existing store; tests
+    /// that install one directly must preserve that schema invariant.
+    fn provision_test_vector_store(rt: &KhiveRuntime, model: &str, dims: usize) {
+        rt.register_embedder(HashVecProvider {
+            model_name: model.to_owned(),
+            dims,
+        });
+        let token = rt
+            .authorize(Namespace::local())
+            .expect("authorize vector-store fixture");
+        drop(
+            rt.vectors_for_model(&token, model)
+                .expect("provision vector-store fixture"),
+        );
     }
 
     fn test_runtime_with_hash_embedder(model: &str, dims: usize) -> KhiveRuntime {
