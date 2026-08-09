@@ -777,9 +777,12 @@ mod tests {
     use crate::pool::PoolConfig;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
     use serial_test::serial;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc as std_mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::Duration;
 
     fn file_pool(path: &std::path::Path) -> ConnectionPool {
@@ -829,6 +832,180 @@ mod tests {
             }
             other => panic!("expected WriterTaskTerminated({expected:?}), got {other:?}"),
         }
+    }
+
+    struct ParkedWake {
+        entered: std_mpsc::SyncSender<()>,
+        release: Mutex<std_mpsc::Receiver<()>>,
+    }
+
+    impl Wake for ParkedWake {
+        fn wake(self: Arc<Self>) {
+            self.entered
+                .send(())
+                .expect("reply sender must rendezvous with the test");
+            self.release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .expect("test must release the parked reply sender");
+        }
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn arm_parked_wake<F: Future>(
+        mut future: Pin<&mut F>,
+    ) -> (std_mpsc::Receiver<()>, std_mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std_mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let waker = Waker::from(Arc::new(ParkedWake {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        let mut context = Context::from_waker(&waker);
+        assert!(
+            matches!(future.as_mut().poll(&mut context), Poll::Pending),
+            "writer send must remain pending until its operation replies"
+        );
+        (entered_rx, release_tx)
+    }
+
+    fn poll_ready<F: Future>(mut future: Pin<&mut F>) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("reply wake must make the writer send ready"),
+        }
+    }
+
+    fn database_tx_view(pool: &ConnectionPool) -> khive_storage::tx_registry::TxOriginFilter {
+        match pool.origin() {
+            khive_storage::tx_registry::TxOrigin::Database(identity) => {
+                khive_storage::tx_registry::TxOriginFilter::Secondary(identity)
+            }
+            other => panic!("expected a file-backed database origin, got {other:?}"),
+        }
+    }
+
+    async fn wait_for_writer_span_to_close(view: &khive_storage::tx_registry::TxOriginFilter) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while khive_storage::tx_registry::any_open_labeled(view, "writer_task_tx") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer task transaction span must eventually close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tx_registry)]
+    async fn successful_send_reply_waits_for_writer_tx_deregistration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_success_reply_lifecycle.db");
+        let pool = file_pool(&path);
+        let view = database_tx_view(&pool);
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+        let (op_started_tx, op_started_rx) = std_mpsc::sync_channel(0);
+        let (op_release_tx, op_release_rx) = std_mpsc::channel();
+
+        let send = handle.send(move |_conn| {
+            op_started_tx
+                .send(())
+                .expect("operation must rendezvous with the test");
+            op_release_rx
+                .recv()
+                .expect("test must release the operation");
+            Ok::<_, StorageError>(())
+        });
+        tokio::pin!(send);
+        let (reply_entered_rx, reply_release_tx) = arm_parked_wake(send.as_mut());
+
+        op_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer operation must start");
+        op_release_tx.send(()).expect("release writer operation");
+        reply_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reply sender must wake the waiting caller");
+
+        let reply = poll_ready(send.as_mut());
+        let span_was_open_at_reply =
+            khive_storage::tx_registry::any_open_labeled(&view, "writer_task_tx");
+
+        reply_release_tx
+            .send(())
+            .expect("release parked reply sender");
+        wait_for_writer_span_to_close(&view).await;
+
+        reply.expect("committed operation reply");
+        assert!(
+            !span_was_open_at_reply,
+            "a successful caller reply must not become observable while its committed writer_task_tx span remains registered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tx_registry)]
+    async fn begin_failure_reply_waits_for_writer_tx_deregistration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_reply_lifecycle.db");
+        let cfg = PoolConfig {
+            path: Some(path),
+            busy_timeout: Duration::from_millis(150),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        let view = database_tx_view(&pool);
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+        let lock_holder = pool.try_writer().expect("pool writer");
+        lock_holder
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold database write lock");
+        let op_ran = Arc::new(AtomicBool::new(false));
+        let op_ran_in_request = Arc::clone(&op_ran);
+
+        let send = handle.send(move |_conn| {
+            op_ran_in_request.store(true, Ordering::SeqCst);
+            Ok::<_, StorageError>(())
+        });
+        tokio::pin!(send);
+        let (reply_entered_rx, reply_release_tx) = arm_parked_wake(send.as_mut());
+        reply_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("BEGIN failure must wake the waiting caller");
+
+        let reply = poll_ready(send.as_mut());
+        let span_was_open_at_reply =
+            khive_storage::tx_registry::any_open_labeled(&view, "writer_task_tx");
+
+        reply_release_tx
+            .send(())
+            .expect("release parked reply sender");
+        wait_for_writer_span_to_close(&view).await;
+        lock_holder
+            .conn()
+            .execute_batch("ROLLBACK")
+            .expect("release database write lock");
+
+        assert!(
+            matches!(
+                &reply,
+                Err(StorageError::Pool { operation, .. }) if operation == "writer_task_begin"
+            ),
+            "expected writer_task_begin failure, got {reply:?}"
+        );
+        assert!(!op_ran.load(Ordering::SeqCst));
+        assert!(
+            !span_was_open_at_reply,
+            "a BEGIN-failure caller reply must not become observable while its writer_task_tx span remains registered"
+        );
     }
 
     // `#[serial(tx_registry)]`: `run_writer_task` registers a `writer_task_tx`
