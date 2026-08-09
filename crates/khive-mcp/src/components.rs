@@ -632,6 +632,23 @@ mod tests {
         (f, path)
     }
 
+    #[cfg(unix)]
+    fn freeze_snapshot_sidecars(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+            }
+        }
+    }
+
     async fn make_server(db_path: &str) -> KhiveMcpServer {
         let cfg = RuntimeConfig {
             db_path: Some(std::path::PathBuf::from(db_path)),
@@ -766,6 +783,8 @@ mod tests {
             ..Default::default()
         };
         KhiveRuntime::new(cfg.clone()).expect("create and migrate snapshot source");
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(cfg.db_path.as_ref().expect("db path"));
         let read_only = KhiveRuntime::new_readonly(cfg).expect("open schedule snapshot read-only");
         let before = read_only.backend().pool().writer_acquisition_snapshot();
 

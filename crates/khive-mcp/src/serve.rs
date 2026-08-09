@@ -9533,6 +9533,8 @@ backend = "kg-backend"
                 ..RuntimeConfig::no_embeddings()
             };
             KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            #[cfg(unix)]
+            freeze_snapshot_sidecars(config.db_path.as_ref().expect("db path"));
             let snapshot = KhiveRuntime::new_readonly(config).expect("open read-only snapshot");
             let server = KhiveMcpServer::new(snapshot).expect("build snapshot server");
 
@@ -9626,6 +9628,8 @@ backend = "kg-backend"
                 ..RuntimeConfig::no_embeddings()
             };
             KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            #[cfg(unix)]
+            freeze_snapshot_sidecars(config.db_path.as_ref().expect("db path"));
             let snapshot = KhiveRuntime::new_readonly(config).expect("open read-only snapshot");
             let server = KhiveMcpServer::new(snapshot).expect("build snapshot server");
             let daemon = Args::parse_from(["mcp", "--daemon"]);
