@@ -1068,6 +1068,48 @@ async fn generic_task_update_keeps_content_and_description_synchronized() {
 }
 
 #[tokio::test]
+async fn clearing_absent_description_preserves_legacy_task_body() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let body = "legacy task body that must survive clearing an absent description";
+    let mut task = khive_storage::Note::new("local", "task", body);
+    task.name = Some("legacy title".to_string());
+    task.properties = Some(json!({"status": "inbox", "priority": "p2"}));
+    let task_id = task.id;
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .upsert_note(task)
+        .await
+        .expect("seed legacy task");
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({
+                "id": task_id.to_string(),
+                "properties": {"description": null},
+            }),
+        )
+        .await
+        .expect("clearing an absent description must preserve legacy content");
+
+    assert_eq!(updated["content"].as_str(), Some(body));
+    assert!(updated["properties"]["description"].is_null());
+    let persisted = runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(task_id)
+        .await
+        .expect("read updated task")
+        .expect("task exists");
+    assert_eq!(persisted.content, body);
+}
+
+#[tokio::test]
 async fn renaming_legacy_task_without_description_preserves_body() {
     let runtime = rt();
     let pack = pack(runtime.clone());
@@ -1243,6 +1285,28 @@ async fn generic_task_update_rejects_title_clear_before_description_clear_can_wr
         .expect("read task after rejected update")
         .expect("task exists");
     assert_eq!(after, before, "rejected normalization must not write");
+}
+
+#[tokio::test]
+async fn generic_task_update_rejects_whitespace_only_title_patch() {
+    let pack = pack(rt());
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "note_kind": "task", "title": "stable title"}),
+        )
+        .await
+        .expect("task create");
+    let id = created["id"].as_str().expect("task id");
+
+    let err = pack
+        .dispatch("update", json!({"id": id, "name": " \t\n "}))
+        .await
+        .expect_err("a whitespace-only task title must be rejected");
+    assert_eq!(
+        err.to_string(),
+        "invalid input: task title must not be empty"
+    );
 }
 
 #[tokio::test]

@@ -752,6 +752,8 @@ pub async fn prepare_update_from_note_snapshot(
 /// exact-parity mismatch check against the resolved record's actual
 /// substrate/specific kind, mirroring `handle_update`'s
 /// `entity.kind != *k` / note kind checks (update.rs:200-201, :229-234).
+/// Task notes must pass the GTD pack hook before this or
+/// `prepare_op("update", ..)`; neither runs it.
 pub async fn prepare_update(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,

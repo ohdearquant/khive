@@ -109,12 +109,23 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
             root.insert("content".into(), json!(description));
         }
         (None, Some(None)) => {
-            let effective_title = name_patch
-                .as_deref()
-                .or(note.name.as_deref())
-                .filter(|title| !title.trim().is_empty())
-                .ok_or_else(|| RuntimeError::InvalidInput("task title must not be empty".into()))?;
-            root.insert("content".into(), json!(effective_title));
+            let stored_description_exists = note
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("description"))
+                .is_some_and(|description| !description.is_null());
+            let should_write_title_fallback =
+                stored_description_exists || stored_content_is_title_fallback(note);
+            if should_write_title_fallback {
+                let effective_title = name_patch
+                    .as_deref()
+                    .or(note.name.as_deref())
+                    .filter(|title| !title.trim().is_empty())
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput("task title must not be empty".into())
+                    })?;
+                root.insert("content".into(), json!(effective_title));
+            }
         }
         (None, None)
             if name_patch.is_some()

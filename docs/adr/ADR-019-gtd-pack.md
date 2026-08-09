@@ -337,9 +337,11 @@ Task body text has one mirror contract. With a description, `note.content` and
 `properties.description` contain the same string; without one, `note.content` falls
 back to the title. The task kind hook applies the same rule to generic `update`: a
 content-only patch fills the description mirror, a description-only patch fills
-content, conflicting simultaneous values are rejected, clearing description restores
-the title fallback, and renaming a description-less task updates that fallback. A task
-title remains required: `name=null` is rejected before any mirror patch can write,
+content, conflicting simultaneous values are rejected, clearing a stored non-null
+description restores the title fallback, clearing an absent description preserves a
+non-fallback body, and renaming a description-less task updates content only while its
+stored body is the title fallback. A task title remains required: `name=null` is
+rejected before any mirror patch can write,
 including when the same request clears `properties.description`. The
 canonical and atomic update paths run this same hook before building their writes. The
 hook snapshot is also the patch/write snapshot: canonical persistence compare-and-swaps
