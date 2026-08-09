@@ -24,6 +24,32 @@ pub(super) fn add_embedding_truncation_warning(response: &mut Value, truncated: 
     }
 }
 
+fn required_singleton_kind(params: &Value) -> Result<String, RuntimeError> {
+    match params.get("kind") {
+        None => Err(RuntimeError::InvalidInput("create requires 'kind'".into())),
+        Some(Value::String(kind)) => Ok(kind.clone()),
+        Some(value) => Err(RuntimeError::InvalidInput(format!(
+            "create: `kind` must be a string; got {value}"
+        ))),
+    }
+}
+
+fn optional_singleton_kind_alias(
+    params: &Value,
+    field: &str,
+) -> Result<Option<String>, RuntimeError> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Err(RuntimeError::InvalidInput(
+            format!("create: `{field}` must not be empty"),
+        )),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(value) => Err(RuntimeError::InvalidInput(format!(
+            "create: `{field}` must be a string or null; got {value}"
+        ))),
+    }
+}
+
 impl KgPack {
     pub(crate) async fn handle_create(
         &self,
@@ -31,15 +57,6 @@ impl KgPack {
         mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        // `kind` is required for the single-record path but NOT for the bulk
-        // `items` path (each item carries its own kind). Defer the requirement
-        // until after the bulk early-exit so `create(items=[...])` works without
-        // a redundant top-level `kind`.
-        let raw_kind_opt = params
-            .get("kind")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-
         const CREATE_USER_KEYS: &[&str] = &[
             "kind",
             "name",
@@ -224,19 +241,23 @@ impl KgPack {
         }
         // ── End bulk path ──────────────────────────────────────────────────────
 
-        let raw_kind = raw_kind_opt
-            .ok_or_else(|| RuntimeError::InvalidInput("create requires 'kind'".into()))?;
+        // Validate the raw singleton discriminants before resolving a hook or
+        // replacing them with canonical values. `Value::as_str` would turn a
+        // malformed present value into `None`, allowing (for example) an
+        // integer `note_kind` to silently fall back to `observation`. Both
+        // legacy aliases are checked eagerly even when the selected `kind`
+        // makes one of them irrelevant, so malformed caller input is never
+        // hidden by canonicalization.
+        let raw_kind = required_singleton_kind(&params)?;
+        let raw_entity_kind = optional_singleton_kind_alias(&params, "entity_kind")?;
+        let raw_note_kind = optional_singleton_kind_alias(&params, "note_kind")?;
         let spec = resolve_kind_spec(&raw_kind, registry)?;
 
         let (sub_kind, hook) = match &spec {
             KindSpec::Entity { specific } => {
-                let legacy = params
-                    .get("entity_kind")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
                 let canonical = reconcile_specific(
                     specific.clone(),
-                    legacy.as_deref(),
+                    raw_entity_kind.as_deref(),
                     |s| canonical_entity_kind(s, registry),
                     "entity_kind",
                 )?
@@ -249,14 +270,9 @@ impl KgPack {
                 (Some(canonical), hook)
             }
             KindSpec::Note { specific } => {
-                let legacy = params
-                    .get("note_kind")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty());
                 let canonical = reconcile_specific(
                     specific.clone(),
-                    legacy.as_deref(),
+                    raw_note_kind.as_deref(),
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?
@@ -307,6 +323,16 @@ impl KgPack {
             obj.entry("namespace")
                 .or_insert_with(|| json!(token.namespace().as_str()));
         }
+
+        // Validate the caller's raw shared-create fields before a kind hook
+        // can normalize or replace them. Task creation, for example, derives
+        // `name`, `content`, and `salience`; without this first pass a malformed
+        // caller value in one of those fields could be overwritten by the hook
+        // and therefore escape the canonical `CreateParams` type boundary.
+        // `CreateParams` intentionally accepts the flavored hook-only keys as
+        // unknown fields, so this validates the shared subset without
+        // precluding pack-specific input.
+        let _: CreateParams = deser(params.clone())?;
 
         if let Some(ref h) = hook {
             h.prepare_create(&self.runtime, &mut params).await?;

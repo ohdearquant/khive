@@ -3,7 +3,7 @@
 mod common;
 
 use common::{assign, pack, rt};
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[tokio::test]
 async fn assign_creates_depends_on_edge_between_tasks() {
@@ -608,6 +608,55 @@ async fn create_task_merges_explicit_annotates_with_context_entity_id() {
 }
 
 #[tokio::test]
+async fn create_task_treats_null_annotates_as_absent_with_context_entity_id() {
+    let pack = pack(rt());
+
+    let context = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Null annotates context"}),
+        )
+        .await
+        .unwrap();
+    let context_id = context["id"].as_str().unwrap().to_string();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "null annotates with context",
+                "annotates": null,
+                "context_entity_id": context_id.clone(),
+            }),
+        )
+        .await
+        .expect("null annotates must be absent when the context adds an annotation");
+    assert_eq!(
+        created["properties"]["context_entity_id"].as_str(),
+        Some(context_id.as_str())
+    );
+
+    let task_id = created["id"].as_str().unwrap();
+    let annotations = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": task_id, "direction": "out", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("context-derived annotates edge must be persisted");
+    assert!(
+        annotations
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|neighbor| neighbor.to_string().contains(context_id.as_str())),
+        "task must annotate its context entity; got {annotations:?}"
+    );
+}
+
+#[tokio::test]
 async fn assign_and_create_task_reject_malformed_context_entity_id() {
     let pack = pack(rt());
 
@@ -633,6 +682,652 @@ async fn assign_and_create_task_reject_malformed_context_entity_id() {
         .await
         .unwrap_err();
     assert!(create_err.to_string().contains("context_entity_id"));
+}
+
+#[tokio::test]
+async fn generic_create_rejects_malformed_raw_kind_discriminants_before_write() {
+    let pack = pack(rt());
+    let cases = vec![
+        (
+            "substrate note_kind type",
+            "note_kind",
+            json!({"kind": "note", "note_kind": 17, "content": "must not become an observation"}),
+        ),
+        (
+            "substrate entity_kind type",
+            "entity_kind",
+            json!({"kind": "entity", "entity_kind": 17, "name": "must not persist"}),
+        ),
+        (
+            "granular note_kind type",
+            "note_kind",
+            json!({"kind": "task", "note_kind": 17, "title": "must not persist"}),
+        ),
+        (
+            "granular entity_kind type",
+            "entity_kind",
+            json!({"kind": "concept", "entity_kind": 17, "name": "must not persist"}),
+        ),
+        (
+            "irrelevant entity_kind type",
+            "entity_kind",
+            json!({"kind": "task", "entity_kind": false, "title": "must not persist"}),
+        ),
+        (
+            "irrelevant note_kind type",
+            "note_kind",
+            json!({"kind": "concept", "note_kind": [], "name": "must not persist"}),
+        ),
+        (
+            "kind type",
+            "kind",
+            json!({"kind": 17, "content": "must not persist"}),
+        ),
+        (
+            "kind null",
+            "kind",
+            json!({"kind": null, "content": "must not persist"}),
+        ),
+        (
+            "substrate empty note_kind",
+            "note_kind",
+            json!({"kind": "note", "note_kind": "", "content": "must not persist"}),
+        ),
+        (
+            "substrate empty entity_kind",
+            "entity_kind",
+            json!({"kind": "entity", "entity_kind": "  ", "name": "must not persist"}),
+        ),
+        (
+            "granular empty note_kind",
+            "note_kind",
+            json!({"kind": "task", "note_kind": "", "title": "must not persist"}),
+        ),
+        (
+            "granular empty entity_kind",
+            "entity_kind",
+            json!({"kind": "concept", "entity_kind": "\t", "name": "must not persist"}),
+        ),
+    ];
+
+    for (case, field, args) in cases {
+        let err = match pack.dispatch("create", args).await {
+            Err(err) => err,
+            Ok(value) => panic!("{case} must fail, but created {value:?}"),
+        };
+        assert!(
+            err.to_string().contains(field),
+            "{case} error must name `{field}`; got {err}"
+        );
+    }
+
+    let stats = pack
+        .dispatch("stats", json!({}))
+        .await
+        .expect("stats after rejected creates");
+    assert_eq!(stats["entities"].as_u64(), Some(0));
+    assert_eq!(stats["notes"].as_u64(), Some(0));
+}
+
+#[tokio::test]
+async fn generic_task_create_rejects_wrong_typed_optional_fields_before_write() {
+    use khive_storage::types::PageRequest;
+
+    let rt = rt();
+    let pack = pack(rt.clone());
+    let top_level_cases: Vec<(&str, Value)> = vec![
+        ("title", json!(17)),
+        ("name", json!(17)),
+        ("content", json!(["not", "text"])),
+        ("description", json!(1)),
+        ("assignee", json!(["agent"])),
+        ("priority", json!(1)),
+        ("status", json!(true)),
+        ("due", json!({"date": "2026-08-06"})),
+        ("start", json!(1)),
+        ("end", json!([])),
+        ("depends_on", json!("not-an-array")),
+        ("context_entity_id", json!(17)),
+        ("tags", json!("not-an-array")),
+        ("salience", json!("high")),
+        ("annotates", json!("not-an-array")),
+        ("entity_type", json!(17)),
+        ("skip_dedup_check", json!("yes")),
+        ("edges", json!("not-an-array")),
+        ("embedding_content", json!(17)),
+        ("properties", json!("not-an-object")),
+    ];
+
+    for (field, bad_value) in top_level_cases {
+        let mut args = json!({
+            "kind": "note",
+            "note_kind": "task",
+            "title": format!("bad top-level {field}"),
+        });
+        args.as_object_mut()
+            .expect("create args object")
+            .insert(field.to_string(), bad_value);
+        let err = pack
+            .dispatch("create", args)
+            .await
+            .expect_err("wrong-typed optional task field must be rejected");
+        let message = err.to_string();
+        if [
+            "name",
+            "content",
+            "description",
+            "tags",
+            "salience",
+            "annotates",
+            "entity_type",
+            "skip_dedup_check",
+            "edges",
+            "embedding_content",
+        ]
+        .contains(&field)
+        {
+            assert!(
+                message.contains("bad params"),
+                "shared CreateParams must reject {field}; got: {message}"
+            );
+        } else {
+            assert!(
+                message.contains(field),
+                "error must name {field}; got: {message}"
+            );
+        }
+    }
+
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": 17,
+                "name": "must not hide malformed title",
+            }),
+        )
+        .await
+        .expect_err("a valid fallback must not hide a malformed present title");
+    assert!(
+        err.to_string().contains("title"),
+        "strict parser must report malformed title before fallback; got: {err}"
+    );
+
+    let nested_cases: Vec<(&str, Value)> = vec![
+        ("description", json!(1)),
+        ("assignee", json!(["agent"])),
+        ("priority", json!(1)),
+        ("status", json!(true)),
+        ("due", json!({"date": "2026-08-06"})),
+        ("start", json!(1)),
+        ("end", json!([])),
+        ("depends_on", json!("not-an-array")),
+        ("context_entity_id", json!(17)),
+        ("tags", json!("not-an-array")),
+    ];
+    for (field, bad_value) in nested_cases {
+        let mut properties = serde_json::Map::new();
+        properties.insert(field.to_string(), bad_value);
+        let err = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "note",
+                    "note_kind": "task",
+                    "title": format!("bad nested {field}"),
+                    "properties": properties,
+                }),
+            )
+            .await
+            .expect_err("wrong-typed nested task field must be rejected");
+        assert!(
+            err.to_string().contains(field),
+            "error must name properties.{field}; got: {err}"
+        );
+    }
+
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let tasks = rt
+        .notes(&token)
+        .expect("note store")
+        .query_notes(
+            "local",
+            Some("task"),
+            PageRequest {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("task query");
+    assert!(
+        tasks.items.is_empty(),
+        "no malformed generic task create may persist a note"
+    );
+}
+
+#[tokio::test]
+async fn generic_task_create_treats_null_as_absence_and_falls_back_to_name() {
+    let pack = pack(rt());
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "task",
+                "entity_kind": null,
+                "note_kind": null,
+                "title": null,
+                "name": "name fallback",
+                "content": null,
+                "description": null,
+                "assignee": null,
+                "priority": null,
+                "status": null,
+                "due": null,
+                "start": null,
+                "end": null,
+                "depends_on": null,
+                "context_entity_id": null,
+                "tags": null,
+                "salience": null,
+                "annotates": null,
+                "properties": null,
+            }),
+        )
+        .await
+        .expect("JSON null must retain optional-field semantics");
+    assert_eq!(created["name"], "name fallback");
+    assert_eq!(created["content"], "name fallback");
+    assert_eq!(created["properties"]["status"], "inbox");
+    assert_eq!(created["properties"]["priority"], "p2");
+    assert!(created["properties"].get("description").is_none());
+
+    let nested = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "nested nulls",
+                "properties": {
+                    "description": null,
+                    "assignee": null,
+                    "priority": null,
+                    "status": null,
+                    "due": null,
+                    "start": null,
+                    "end": null,
+                    "depends_on": null,
+                    "context_entity_id": null,
+                    "tags": null,
+                },
+            }),
+        )
+        .await
+        .expect("nested optional nulls must also be accepted");
+    assert_eq!(nested["content"], "nested nulls");
+    assert_eq!(nested["properties"]["status"], "inbox");
+    assert_eq!(nested["properties"]["priority"], "p2");
+    assert!(nested["properties"].get("description").is_none());
+
+    let err = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": null,
+                "name": null,
+            }),
+        )
+        .await
+        .expect_err("both task title spellings absent must be rejected");
+    assert!(
+        err.to_string().contains("title") && err.to_string().contains("name"),
+        "missing-title error must explain both accepted spellings; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn generic_task_update_keeps_content_and_description_synchronized() {
+    let pack = pack(rt());
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "sync task",
+                "description": "original body",
+            }),
+        )
+        .await
+        .expect("task create");
+    let id = created["id"].as_str().expect("task id").to_string();
+
+    let content_update = pack
+        .dispatch("update", json!({"id": id, "content": "body from content"}))
+        .await
+        .expect("content update");
+    assert_eq!(content_update["content"], "body from content");
+    assert_eq!(
+        content_update["properties"]["description"],
+        "body from content"
+    );
+
+    let description_update = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "properties": {"description": "body from property"}}),
+        )
+        .await
+        .expect("description update");
+    assert_eq!(description_update["content"], "body from property");
+    assert_eq!(
+        description_update["properties"]["description"],
+        "body from property"
+    );
+
+    let null_noop = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "content": null, "properties": null}),
+        )
+        .await
+        .expect("null generic note patches mean leave unchanged");
+    assert_eq!(null_noop["content"], "body from property");
+    assert_eq!(null_noop["properties"]["description"], "body from property");
+
+    let cleared = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "properties": {"description": null}}),
+        )
+        .await
+        .expect("explicit description clear");
+    assert_eq!(cleared["content"], "sync task");
+    assert!(cleared["properties"]["description"].is_null());
+
+    let err = pack
+        .dispatch(
+            "update",
+            json!({
+                "id": id,
+                "content": "one body",
+                "properties": {"description": "another body"},
+            }),
+        )
+        .await
+        .expect_err("conflicting mirrors must be rejected");
+    assert!(
+        err.to_string().contains("must match"),
+        "conflict error must explain the mirror contract; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn clearing_absent_description_preserves_legacy_task_body() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let body = "legacy task body that must survive clearing an absent description";
+    let mut task = khive_storage::Note::new("local", "task", body);
+    task.name = Some("legacy title".to_string());
+    task.properties = Some(json!({"status": "inbox", "priority": "p2"}));
+    let task_id = task.id;
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .upsert_note(task)
+        .await
+        .expect("seed legacy task");
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({
+                "id": task_id.to_string(),
+                "properties": {"description": null},
+            }),
+        )
+        .await
+        .expect("clearing an absent description must preserve legacy content");
+
+    assert_eq!(updated["content"].as_str(), Some(body));
+    assert!(updated["properties"]["description"].is_null());
+    let persisted = runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(task_id)
+        .await
+        .expect("read updated task")
+        .expect("task exists");
+    assert_eq!(persisted.content, body);
+}
+
+#[tokio::test]
+async fn renaming_legacy_task_without_description_preserves_body() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let body = "acceptance notes:\n- preserve this line\n- and this exact trailing line\n";
+    let mut task = khive_storage::Note::new("local", "task", body);
+    task.name = Some("legacy title".to_string());
+    task.properties = Some(json!({"status": "inbox", "priority": "p2"}));
+    let task_id = task.id;
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .upsert_note(task)
+        .await
+        .expect("seed legacy task");
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({"id": task_id.to_string(), "name": "renamed legacy title"}),
+        )
+        .await
+        .expect("rename legacy task");
+
+    assert_eq!(updated["name"], "renamed legacy title");
+    assert_eq!(updated["content"].as_str(), Some(body));
+    assert!(updated["properties"].get("description").is_none());
+    let persisted = runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(task_id)
+        .await
+        .expect("read renamed task")
+        .expect("task exists");
+    assert_eq!(persisted.content.as_bytes(), body.as_bytes());
+    assert!(persisted
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("description"))
+        .is_none());
+}
+
+#[tokio::test]
+async fn generic_task_update_rejects_lifecycle_properties_but_allows_other_properties() {
+    let pack = pack(rt());
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "note_kind": "task", "title": "owned lifecycle"}),
+        )
+        .await
+        .expect("task create");
+    let id = created["id"].as_str().expect("task id");
+
+    for (field, value) in [
+        ("status", json!("done")),
+        ("completed_at", json!(1234)),
+        ("transition_history", json!([])),
+    ] {
+        let err = pack
+            .dispatch("update", json!({"id": id, "properties": {field: value}}))
+            .await
+            .expect_err("generic update must reject lifecycle-owned properties");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid input: properties.{field} is lifecycle-owned and cannot be patched on a task; use gtd.transition for lifecycle changes or gtd.complete for terminal completion"
+            )
+        );
+    }
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({
+                "id": id,
+                "properties": {
+                    "priority": "p1",
+                    "due": "2026-08-09T12:00:00Z",
+                    "planning_label": "reviewed"
+                }
+            }),
+        )
+        .await
+        .expect("non-lifecycle task properties remain patchable");
+    assert_eq!(updated["properties"]["priority"], "p1");
+    assert_eq!(updated["properties"]["due"], "2026-08-09T12:00:00Z");
+    assert_eq!(updated["properties"]["planning_label"], "reviewed");
+    assert_eq!(updated["properties"]["status"], "inbox");
+}
+
+#[tokio::test]
+async fn salience_only_update_succeeds_for_legacy_nameless_task() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let body = "legacy task body without a title";
+    let mut task = khive_storage::Note::new("local", "task", body);
+    task.properties = Some(json!({"status": "inbox", "priority": "p2"}));
+    let task_id = task.id;
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .upsert_note(task)
+        .await
+        .expect("seed nameless task");
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({"id": task_id.to_string(), "salience": 0.2}),
+        )
+        .await
+        .expect("salience-only update must not require a title");
+    assert_eq!(updated["salience"], 0.2);
+    assert_eq!(updated["content"], body);
+    assert!(updated["name"].is_null());
+}
+
+#[tokio::test]
+async fn generic_task_update_rejects_title_clear_before_description_clear_can_write() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "preserved title",
+                "description": "preserved body",
+            }),
+        )
+        .await
+        .expect("task create");
+    let id = uuid::Uuid::parse_str(created["id"].as_str().expect("task id")).expect("task UUID");
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let before = runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(id)
+        .await
+        .expect("read task before rejected update")
+        .expect("task exists");
+
+    let err = pack
+        .dispatch(
+            "update",
+            json!({
+                "id": id.to_string(),
+                "name": null,
+                "properties": {"description": null},
+            }),
+        )
+        .await
+        .expect_err("a task title cannot be cleared");
+    assert!(
+        err.to_string().contains("task title cannot be cleared"),
+        "title-clear error must identify the task invariant; got: {err}"
+    );
+
+    let after = runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(id)
+        .await
+        .expect("read task after rejected update")
+        .expect("task exists");
+    assert_eq!(after, before, "rejected normalization must not write");
+}
+
+#[tokio::test]
+async fn generic_task_update_rejects_whitespace_only_title_patch() {
+    let pack = pack(rt());
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "note_kind": "task", "title": "stable title"}),
+        )
+        .await
+        .expect("task create");
+    let id = created["id"].as_str().expect("task id");
+
+    let err = pack
+        .dispatch("update", json!({"id": id, "name": " \t\n "}))
+        .await
+        .expect_err("a whitespace-only task title must be rejected");
+    assert_eq!(
+        err.to_string(),
+        "invalid input: task title must not be empty"
+    );
+}
+
+#[tokio::test]
+async fn renaming_task_without_description_updates_fallback_content() {
+    let pack = pack(rt());
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "note_kind": "task", "title": "old title"}),
+        )
+        .await
+        .expect("task create");
+    let id = created["id"].as_str().expect("task id");
+
+    let updated = pack
+        .dispatch("update", json!({"id": id, "name": "new title"}))
+        .await
+        .expect("task rename");
+    assert_eq!(updated["name"], "new title");
+    assert_eq!(updated["content"], "new title");
+    assert!(updated["properties"].get("description").is_none());
 }
 
 // ---- generic create must normalize nested properties -------------------------

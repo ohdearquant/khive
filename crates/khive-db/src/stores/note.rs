@@ -109,6 +109,70 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
     }
 }
 
+/// Full-note compare-and-swap update used after caller-side normalization was
+/// derived from a read snapshot. Unlike [`note_upsert_statement`], this never
+/// inserts and cannot overwrite a row whose revision or deletion marker moved
+/// after the snapshot was read. The replacement revision must also be strictly
+/// greater than the persisted snapshot revision; equality is a refused CAS,
+/// never a successful write with an unchanged concurrency token.
+pub fn note_replace_if_unchanged_statement(
+    note: &Note,
+    expected_updated_at: i64,
+    expected_deleted_at: Option<i64>,
+) -> SqlStatement {
+    let properties_str = note
+        .properties
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    SqlStatement {
+        sql: "UPDATE notes SET \
+                namespace = ?1, kind = ?2, status = ?3, name = ?4, content = ?5, \
+                salience = ?6, decay_factor = ?7, expires_at = ?8, properties = ?9, \
+                updated_at = ?10, deleted_at = ?11 \
+              WHERE id = ?12 AND updated_at = ?13 AND deleted_at IS ?14 \
+                AND ?10 > updated_at"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(note.namespace.clone()),
+            SqlValue::Text(note.kind.to_string()),
+            SqlValue::Text(note.status.clone()),
+            match &note.name {
+                Some(name) => SqlValue::Text(name.clone()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(note.content.clone()),
+            match note.salience {
+                Some(value) => SqlValue::Float(value),
+                None => SqlValue::Null,
+            },
+            match note.decay_factor {
+                Some(value) => SqlValue::Float(value),
+                None => SqlValue::Null,
+            },
+            match note.expires_at {
+                Some(value) => SqlValue::Integer(value),
+                None => SqlValue::Null,
+            },
+            match properties_str {
+                Some(value) => SqlValue::Text(value),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(note.updated_at),
+            match note.deleted_at {
+                Some(value) => SqlValue::Integer(value),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(note.id.to_string()),
+            SqlValue::Integer(expected_updated_at),
+            match expected_deleted_at {
+                Some(value) => SqlValue::Integer(value),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("note-replace-if-unchanged".to_string()),
+    }
+}
+
 /// The exact `properties`/`updated_at` `UPDATE` this store's
 /// `update_note_properties` issues. The row is patched in place without
 /// rewriting any other note column or its stable row identity (#780).
@@ -674,6 +738,15 @@ fn build_note_filter_where(
                     n = params.len()
                 ));
             }
+            FilterOp::TextEqOrNonText => {
+                let expr = json_extract_expr(&pf.json_path);
+                let type_expr = json_type_expr(&pf.json_path);
+                params.push(sql_value_param(&pf.value)?);
+                let n = params.len();
+                conditions.push(format!(
+                    "CASE WHEN {type_expr} = 'text' THEN {expr} ELSE ?{n} END = ?{n}"
+                ));
+            }
             FilterOp::JsonTypeEq => {
                 let type_expr = json_type_expr(&pf.json_path);
                 params.push(sql_value_param(&pf.value)?);
@@ -725,6 +798,7 @@ fn build_note_filter_where(
                     FilterOp::Gt => ">",
                     FilterOp::Gte => ">=",
                     FilterOp::EqOrMissing
+                    | FilterOp::TextEqOrNonText
                     | FilterOp::JsonTypeEq
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
@@ -761,6 +835,22 @@ impl NoteStore for SqlNoteStore {
             stmt.raw_execute()?;
             assign_note_seq(conn, &id_str)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn replace_note_if_unchanged(
+        &self,
+        note: Note,
+        expected_updated_at: i64,
+        expected_deleted_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        let statement =
+            note_replace_if_unchanged_statement(&note, expected_updated_at, expected_deleted_at);
+        self.with_writer("replace_note_if_unchanged", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }
