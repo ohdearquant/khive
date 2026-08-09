@@ -399,8 +399,8 @@ mod tests {
         let b = Uuid::new_v4();
         let base_edge = edge(a, b, 0.7);
         let mut rebuilt_edge = base_edge.clone();
-        rebuilt_edge.created_at = rebuilt_edge.created_at + chrono::TimeDelta::seconds(1);
-        rebuilt_edge.updated_at = rebuilt_edge.updated_at + chrono::TimeDelta::seconds(2);
+        rebuilt_edge.created_at += chrono::TimeDelta::seconds(1);
+        rebuilt_edge.updated_at += chrono::TimeDelta::seconds(2);
 
         let base = make_archive(vec![], vec![base_edge.clone()]);
         let branch = make_archive(vec![], vec![rebuilt_edge]);
