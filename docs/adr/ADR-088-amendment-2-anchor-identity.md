@@ -51,10 +51,10 @@ Every digest source resolves to one canonical **repo slug** stored in
   normalize) uses the fallback identity `local:<canonicalized-path>`.
 
 `properties.repo_url` remains display metadata; it is never the matching key
-for new anchors. The persisted `repo_url` is credential-redacted: userinfo,
-query, and fragment components of the caller-supplied URL are stripped before
-storage, so an access token embedded in a source URL is never written into
-entity properties.
+for new anchors. The persisted `repo_url` is credential-redacted: userinfo
+from either a scheme URL or SCP-style shorthand, plus query and fragment
+components, is stripped before storage, so an access token embedded in a
+source URL is never written into entity properties.
 
 ### Resolution order (replaces the Amendment 1 clause)
 
@@ -76,8 +76,10 @@ entity properties.
    `created_at` (id tie-break); exact-string resolution precedes normalized
    resolution. The selected anchor is backfilled with the canonical
    `properties.repo_slug`, and its stored `properties.repo_url` is redacted
-   (userinfo, query, fragment) in the same patch. The lazy-upgrade path also
-   closes out any credential-bearing legacy URL it touches.
+   (scheme or SCP-style userinfo, query, fragment) in the same patch. The
+   lazy-upgrade path also closes out any credential-bearing legacy URL it
+   touches. A remote-less local path's `local:<canonical-path>` fallback is a
+   canonical identity and participates in this normalized reconciliation.
 
    A canonical step-1 winner always keeps precedence, even when a normalized
    URL-equivalent anchor with a conflicting slug is older. Such anchors are

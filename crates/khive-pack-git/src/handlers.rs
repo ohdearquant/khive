@@ -639,19 +639,17 @@ async fn find_normalized_noncanonical_matches(
 /// as a local clone and resolved the same way `repo_identity` resolves a
 /// `DigestSource::Local` -- via its current `origin` remote -- so a legacy
 /// local-path anchor reconciles with a later remote-URL digest of the same
-/// repository. Returns `None` when neither path yields a URL-shaped identity
-/// (e.g. the path no longer exists, or has no matching origin -- there is
-/// nothing to reconcile against).
+/// repository. A remote-less local path's `local:<canonical-path>` fallback
+/// is itself canonical evidence and is retained for equality comparison.
+/// Returns `None` only when the stored value is neither a recognized remote
+/// spelling nor an absolute local path.
 async fn normalize_stored_repo_url(repo_url: &str) -> Option<String> {
     if let Some(slug) = remote_url_to_slug(repo_url) {
         return Some(slug);
     }
     if repo_url.starts_with('/') {
         let candidate = DigestSource::Local(std::path::PathBuf::from(repo_url));
-        let slug = repo_identity(&candidate).await;
-        if !slug.starts_with("local:") {
-            return Some(slug);
-        }
+        return Some(repo_identity(&candidate).await);
     }
     None
 }
@@ -1233,12 +1231,18 @@ mod tests {
         }
     }
 
-    /// Same as [`init_bare_repo_with_origin`] but with `user.*` configured
-    /// and one commit -- `git log` (and thus `git.digest`) needs a real
-    /// commit to walk; a freshly-inited repo with zero commits fails at
-    /// the `git log` step before anchor resolution is even exercised.
-    fn init_repo_with_origin_and_one_commit(dir: &Path, origin: &str) {
-        init_bare_repo_with_origin(dir, origin);
+    /// Initialize a remote-less repository with `user.*` configured and one
+    /// commit. `git log` (and thus `git.digest`) needs a real commit to walk;
+    /// a freshly-initialized repo with zero commits fails before anchor
+    /// resolution is exercised.
+    fn init_repo_with_one_commit(dir: &Path) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git init failed");
         for args in [
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "Test User"],
@@ -1264,6 +1268,31 @@ mod tests {
                 .expect("spawn git");
             assert!(status.success(), "git {args:?} failed");
         }
+    }
+
+    fn init_repo_with_origin_and_one_commit(dir: &Path, origin: &str) {
+        init_repo_with_one_commit(dir);
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["remote", "add", "origin", origin])
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git remote add failed");
+    }
+
+    async fn dispatch_local_commit_digest(registry: &VerbRegistry, dir: &Path) -> Value {
+        registry
+            .dispatch(
+                "git.digest",
+                json!({
+                    "source": dir.to_string_lossy(),
+                    "include": ["commits"],
+                    "max_items": 1,
+                }),
+            )
+            .await
+            .expect("git.digest dispatch")
     }
 
     /// A legacy anchor created before `repo_slug` existed at all, from a
@@ -1625,7 +1654,7 @@ mod tests {
                     "kind": "project",
                     "name": "noncanonical-repo",
                     "properties": {
-                        "repo_url": "https://alice@github.com/org/noncanonical-repo.git?view=compact#top",
+                        "repo_url": "legacy-token-user@github.com:org/noncanonical-repo.git?view=compact#top",
                         "repo_slug": "org/noncanonical-repo",
                     },
                 }),
@@ -1655,7 +1684,8 @@ mod tests {
         );
         assert_eq!(
             properties.get("repo_url").and_then(Value::as_str),
-            Some("https://github.com/org/noncanonical-repo.git")
+            Some("github.com:org/noncanonical-repo.git"),
+            "the full repair path must redact SCP-style userinfo"
         );
 
         let again = resolve_or_create_project(&rt, &registry, &token, &source)
@@ -1767,6 +1797,136 @@ mod tests {
                 .and_then(Value::as_str),
             Some("org/conflicting-slug-repo"),
             "a canonical winner makes the conflict diagnostic-only"
+        );
+    }
+
+    /// #1708 remote-less-local regression: `local:<canonical-path>` is a real
+    /// canonical identity, not a failed normalization. A noncanonical slug on
+    /// the same stored path must be repaired and reused through `git.digest`.
+    #[tokio::test]
+    async fn git_digest_repairs_noncanonical_slug_for_remote_less_local_repo() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_one_commit(dir.path());
+        let path = dir.path().to_string_lossy().to_string();
+        let identity = repo_identity(&DigestSource::Local(dir.path().to_path_buf())).await;
+        assert!(identity.starts_with("local:"), "{identity}");
+
+        let existing = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "remote-less-local",
+                    "properties": {
+                        "repo_url": path,
+                        "repo_slug": "hand-written-local-slug",
+                    },
+                }),
+            )
+            .await
+            .expect("create noncanonical local anchor");
+        let existing_id = Uuid::parse_str(existing["id"].as_str().unwrap()).expect("uuid");
+
+        let response = dispatch_local_commit_digest(&registry, dir.path()).await;
+        assert_eq!(response["project_created"], json!(false), "{response}");
+        assert_eq!(response["project_id"], json!(existing_id.to_string()));
+        assert_eq!(
+            find_projects_by_slug(&rt, &token, &identity)
+                .await
+                .expect("canonical lookup"),
+            vec![existing_id],
+            "the repaired anchor must be the sole canonical winner"
+        );
+        let repaired = rt
+            .get_entity(&token, existing_id)
+            .await
+            .expect("repaired anchor remains readable");
+        assert_eq!(
+            repaired
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("repo_slug"))
+                .and_then(Value::as_str),
+            Some(identity.as_str())
+        );
+    }
+
+    /// #1708 remote-less-local conflict regression: an exact canonical slug
+    /// winner keeps precedence, while an older same-path anchor with a
+    /// conflicting slug reaches the public warning and remains unchanged.
+    #[tokio::test]
+    async fn git_digest_warns_for_remote_less_local_noncanonical_slug_conflict() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_one_commit(dir.path());
+        let path = dir.path().to_string_lossy().to_string();
+        let identity = repo_identity(&DigestSource::Local(dir.path().to_path_buf())).await;
+        assert!(identity.starts_with("local:"), "{identity}");
+
+        let conflicting = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "remote-less-local-old",
+                    "properties": {
+                        "repo_url": path.clone(),
+                        "repo_slug": "hand-written-local-slug",
+                    },
+                }),
+            )
+            .await
+            .expect("create conflicting local anchor");
+        let conflicting_id = Uuid::parse_str(conflicting["id"].as_str().unwrap()).expect("uuid");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let winner = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "remote-less-local",
+                    "properties": {
+                        "repo_url": path,
+                        "repo_slug": identity.clone(),
+                    },
+                }),
+            )
+            .await
+            .expect("create canonical local anchor");
+        let winner_id = Uuid::parse_str(winner["id"].as_str().unwrap()).expect("uuid");
+
+        let response = dispatch_local_commit_digest(&registry, dir.path()).await;
+        assert_eq!(response["project_created"], json!(false), "{response}");
+        assert_eq!(response["project_id"], json!(winner_id.to_string()));
+        let warning = response["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|warning| warning.contains(&conflicting_id.to_string()))
+            .expect("conflicting local anchor must reach the public warning");
+        assert!(warning.contains(&winner_id.to_string()), "{warning}");
+        assert!(warning.contains("canonical resolution order"), "{warning}");
+        assert_eq!(
+            find_projects_by_slug(&rt, &token, &identity)
+                .await
+                .expect("canonical lookup"),
+            vec![winner_id],
+            "warning must not rewrite the conflicting row"
+        );
+        let conflicting = rt
+            .get_entity(&token, conflicting_id)
+            .await
+            .expect("conflicting anchor remains readable");
+        assert_eq!(
+            conflicting
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("repo_slug"))
+                .and_then(Value::as_str),
+            Some("hand-written-local-slug")
         );
     }
 }

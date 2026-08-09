@@ -47,7 +47,9 @@ route considers live anchors whose slug is absent or differs from the
 canonical slug. A URL-equivalent anchor with a present non-canonical slug is
 therefore repaired and reused rather than excluded and duplicated (#1708);
 the selected anchor receives the canonical slug and a credential-redacted
-`repo_url` in the same update.
+`repo_url` in the same update. This includes a remote-less local repository's
+canonical `local:<canonical-path>` identity. Redaction removes userinfo from
+both scheme URLs and SCP-style shorthand, plus query and fragment material.
 
 An exact canonical-slug winner retains precedence over an older
 URL-equivalent anchor with a conflicting slug. The conflicting row is left

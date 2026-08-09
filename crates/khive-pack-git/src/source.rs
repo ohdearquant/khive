@@ -301,9 +301,10 @@ fn strip_query_and_fragment(s: &str) -> &str {
 
 /// Redact credential and tracking material from a URL before it is
 /// persisted as `properties.repo_url` display metadata (ADR-088 Amendment
-/// 2): userinfo (`user[:pass]@`), the query string, and the fragment are
-/// stripped. This is for the STORED value only -- the in-memory canonical
-/// URL used for cloning/gh operations is never passed through this.
+/// 2): userinfo (`user[:pass]@` for scheme URLs and `user@` for SCP
+/// shorthand), the query string, and the fragment are stripped. This is for
+/// the STORED value only -- the in-memory canonical URL used for cloning/gh
+/// operations is never passed through this.
 pub(crate) fn redact_repo_url(url: &str) -> String {
     let stripped = strip_query_and_fragment(url);
     for scheme in ["https://", "http://", "git://", "ssh://"] {
@@ -316,6 +317,9 @@ pub(crate) fn redact_repo_url(url: &str) -> String {
             };
             return format!("{scheme}{authority}{path}");
         }
+    }
+    if let Some((host, path)) = scp_parts(stripped) {
+        return format!("{host}:{path}");
     }
     stripped.to_string()
 }
@@ -644,6 +648,13 @@ mod tests {
         assert_eq!(
             redact_repo_url("https://user:tok3n@github.com/org/repo?token=SECRET#frag"),
             "https://github.com/org/repo"
+        );
+        assert_eq!(
+            redact_repo_url(
+                "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@github.com:org/repo.git?token=SECRET#frag"
+            ),
+            "github.com:org/repo.git",
+            "SCP-style userinfo must not survive in stored display metadata"
         );
         assert_eq!(
             redact_repo_url("https://github.com/org/repo"),
