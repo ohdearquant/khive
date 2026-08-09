@@ -101,7 +101,8 @@ impl StorageBackend {
     /// Opens the database at `path` and sets `PRAGMA query_only = ON` on the
     /// writer connection so that any write attempt (INSERT/UPDATE/DELETE) returns
     /// an error. Reader connections are opened with `SQLITE_OPEN_READ_ONLY` by the
-    /// pool; this PRAGMA extends that protection to the writer slot.
+    /// pool; at least one remains dedicated even for a rollback-journal snapshot,
+    /// while this PRAGMA extends the protection to the otherwise-unused writer slot.
     ///
     /// The database file must already exist — unlike `sqlite()` this constructor
     /// does not create a new file.
@@ -203,10 +204,11 @@ impl StorageBackend {
     /// a query-only compatibility check and require the snapshot to be at this
     /// build's exact latest schema version.
     pub fn prepare_core_schema(&self) -> Result<u32, SqliteError> {
-        let mut writer = self.pool.try_writer()?;
         if self.is_read_only() {
-            crate::migrations::validate_schema_is_current(writer.conn())
+            let reader = self.pool.reader()?;
+            crate::migrations::validate_schema_is_current(reader.conn())
         } else {
+            let mut writer = self.pool.try_writer()?;
             crate::migrations::run_migrations(writer.conn_mut())
         }
     }

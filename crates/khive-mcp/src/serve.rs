@@ -202,6 +202,19 @@ fn is_daemon_role(args: &Args) -> bool {
     args.daemon
 }
 
+/// Combine process role with the fixed runtime-mode admission captured when
+/// the server was built. A daemon flag alone never authorizes background
+/// writes: each loop is admitted only when the runtime serving its verbs is
+/// writable in the resolved single- or multi-backend topology.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn channel_loop_plan(server: &KhiveMcpServer, args: &Args) -> crate::server::ChannelLoopAdmission {
+    if args.daemon {
+        server.channel_loop_admission()
+    } else {
+        crate::server::ChannelLoopAdmission::default()
+    }
+}
+
 /// Handle for the ADR-091 Amendment 2 Plank A session sweep task. Dropping
 /// the sender alone is NOT a sufficient shutdown contract (minor, ADR-091
 /// Amendment 2): the sweep task's own clean-shutdown heartbeat
@@ -332,23 +345,33 @@ async fn serve_holding_sweep(
     result
 }
 
-/// Spawn the email channel loops if — and only if — `args` indicates this
-/// process is the daemon (#602). Shared by both serve entrypoints (`run` and
-/// `serve_server`) so the role gate lives in exactly one place instead of
-/// being duplicated at each call site. Emits one `tracing::info!` line either
-/// way so the decision is visible at startup (seeds #606's health surface).
+/// Admit each email channel loop only when this is the daemon process and the
+/// runtime that backs that loop's verbs is writable. Shared by both serve
+/// entrypoints (`run` and `serve_server`) so neither role nor storage-mode
+/// gating can drift between single- and multi-backend boot paths.
 ///
 /// If no daemon is running, mail is simply not polled until one starts — that
 /// is the intended behavior, not a silent failure; the log line makes it
 /// observable.
 #[cfg(feature = "channel-email")]
 fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
-    if is_daemon_role(args) {
-        tracing::info!("email channel loops: spawning (daemon role)");
-        spawn_email_channel_loops(server);
-    } else {
+    let admission = channel_loop_plan(server, args);
+    if !is_daemon_role(args) {
         tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
+        return;
     }
+    if !admission.inbound_poll && !admission.outbound_delivery {
+        tracing::info!(
+            "email channel loops: skipped (assigned comm and kg runtimes do not admit writes)"
+        );
+        return;
+    }
+    tracing::info!(
+        inbound_poll = admission.inbound_poll,
+        outbound_delivery = admission.outbound_delivery,
+        "email channel loops: applying daemon/runtime admission"
+    );
+    spawn_email_channel_loops(server, admission);
 }
 
 /// Start ADR-119 daemon components in daemon role only. Non-daemon roles
@@ -379,11 +402,14 @@ fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRunti
 
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
-/// warning and returns on incomplete config. Only call this when
-/// [`is_daemon_role`] is true — use [`spawn_email_channel_loops_if_daemon`],
-/// which both serve entrypoints (`run` and `serve_server`) call.
+/// warning and returns on incomplete config. Only call this with the
+/// role-and-runtime admission returned by [`channel_loop_plan`] — use
+/// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
 #[cfg(feature = "channel-email")]
-fn spawn_email_channel_loops(server: &KhiveMcpServer) {
+fn spawn_email_channel_loops(
+    server: &KhiveMcpServer,
+    admission: crate::server::ChannelLoopAdmission,
+) {
     use khive_channel::ChannelRegistry;
     use khive_channel_email::EmailChannel;
     use std::sync::Arc;
@@ -414,30 +440,36 @@ fn spawn_email_channel_loops(server: &KhiveMcpServer) {
             let email_ch_clone = Arc::clone(&email_ch);
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                tokio::task::spawn(async move {
-                    if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await {
-                        tracing::error!(
-                            error = %error,
-                            "email polling disabled: quarantine blob storage is unavailable"
-                        );
-                        return;
-                    }
-                    channel_poll_loop(
-                        ch_registry,
-                        verb_reg_poll,
-                        ingest_ns_clone,
-                        default_actor_clone,
-                    )
-                    .await;
-                });
-                tokio::task::spawn(channel_outbox_loop(
-                    email_ch_clone,
-                    verb_reg_outbox,
-                    ingest_ns_outbox,
-                    mailbox_clone,
-                    allowlist_clone,
-                ));
-                tracing::info!("email channel polling and outbox loops started");
+                if admission.inbound_poll {
+                    tokio::task::spawn(async move {
+                        if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
+                        {
+                            tracing::error!(
+                                error = %error,
+                                "email polling disabled: quarantine blob storage is unavailable"
+                            );
+                            return;
+                        }
+                        channel_poll_loop(
+                            ch_registry,
+                            verb_reg_poll,
+                            ingest_ns_clone,
+                            default_actor_clone,
+                        )
+                        .await;
+                    });
+                    tracing::info!("email channel polling loop started");
+                }
+                if admission.outbound_delivery {
+                    tokio::task::spawn(channel_outbox_loop(
+                        email_ch_clone,
+                        verb_reg_outbox,
+                        ingest_ns_outbox,
+                        mailbox_clone,
+                        allowlist_clone,
+                    ));
+                    tracing::info!("email channel outbox loop started");
+                }
             });
             if !spawned {
                 tracing::error!(
@@ -1523,32 +1555,34 @@ async fn channel_outbox_loop(
     }
 }
 
-/// Whether this process owns the Telegram channel loops. Mirrors
-/// [`is_daemon_role`]'s email-channel role gate (#602): channel loops are a
-/// daemon-role responsibility, never spawned per client process.
-#[cfg(feature = "channel-telegram")]
-fn is_telegram_daemon_role(args: &Args) -> bool {
-    args.daemon
-}
-
-/// Spawn the Telegram channel loops if — and only if — `args` indicates this
-/// process is the daemon. Mirrors
-/// [`spawn_email_channel_loops_if_daemon`]. If no daemon is running, Telegram
-/// is simply not polled until one starts.
+/// Apply the same independent daemon/runtime admission as the email adapter:
+/// Telegram polling follows the comm runtime, while outbound delivery follows
+/// the kg runtime that must durably mark `delivered_at`.
 #[cfg(feature = "channel-telegram")]
 fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
-    if is_telegram_daemon_role(args) {
-        tracing::info!("telegram channel loops: spawning (daemon role)");
-        spawn_telegram_channel_loops(server);
-    } else {
+    let admission = channel_loop_plan(server, args);
+    if !args.daemon {
         tracing::info!("telegram channel loops: skipped (client role; daemon owns channel loops)");
+        return;
     }
+    if !admission.inbound_poll && !admission.outbound_delivery {
+        tracing::info!(
+            "telegram channel loops: skipped (assigned comm and kg runtimes do not admit writes)"
+        );
+        return;
+    }
+    tracing::info!(
+        inbound_poll = admission.inbound_poll,
+        outbound_delivery = admission.outbound_delivery,
+        "telegram channel loops: applying daemon/runtime admission"
+    );
+    spawn_telegram_channel_loops(server, admission);
 }
 
 /// Spawn the Telegram channel polling + outbox loops if the `channel-telegram`
 /// feature is enabled and `KHIVE_TELEGRAM_*` config resolves. Non-fatal: logs
-/// a warning and returns on incomplete config. Only call this when
-/// [`is_telegram_daemon_role`] is true — use
+/// a warning and returns on incomplete config. Only call this with the
+/// role-and-runtime admission returned by [`channel_loop_plan`] — use
 /// [`spawn_telegram_channel_loops_if_daemon`].
 ///
 /// Unlike the email adapter, Telegram's poll offset is held in memory inside
@@ -1559,7 +1593,10 @@ fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) 
 /// this ADR explicitly does not require for Telegram's simpler getUpdates
 /// durability model.
 #[cfg(feature = "channel-telegram")]
-fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
+fn spawn_telegram_channel_loops(
+    server: &KhiveMcpServer,
+    admission: crate::server::ChannelLoopAdmission,
+) {
     use khive_channel_telegram::TelegramChannel;
     use std::sync::Arc;
 
@@ -1577,22 +1614,28 @@ fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
             let tg_ch_outbox = Arc::clone(&tg_ch);
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                tokio::task::spawn(async move {
-                    if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await {
-                        tracing::error!(
-                            error = %error,
-                            "telegram polling disabled: quarantine blob storage is unavailable"
-                        );
-                        return;
-                    }
-                    telegram_poll_loop(tg_ch_poll, verb_reg_poll, ingest_ns_poll).await;
-                });
-                tokio::task::spawn(telegram_outbox_loop(
-                    tg_ch_outbox,
-                    verb_reg_outbox,
-                    ingest_ns_outbox,
-                ));
-                tracing::info!("telegram channel polling and outbox loops started");
+                if admission.inbound_poll {
+                    tokio::task::spawn(async move {
+                        if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
+                        {
+                            tracing::error!(
+                                error = %error,
+                                "telegram polling disabled: quarantine blob storage is unavailable"
+                            );
+                            return;
+                        }
+                        telegram_poll_loop(tg_ch_poll, verb_reg_poll, ingest_ns_poll).await;
+                    });
+                    tracing::info!("telegram channel polling loop started");
+                }
+                if admission.outbound_delivery {
+                    tokio::task::spawn(telegram_outbox_loop(
+                        tg_ch_outbox,
+                        verb_reg_outbox,
+                        ingest_ns_outbox,
+                    ));
+                    tracing::info!("telegram channel outbox loop started");
+                }
             });
             if !spawned {
                 tracing::error!(
@@ -2731,6 +2774,11 @@ pub fn build_server_from_multi_backend_registry(
     khive_cfg: &KhiveConfig,
     coordinator: Option<Arc<dyn crate::coordinator::CoordinatorService>>,
 ) -> KhiveMcpServer {
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    let channel_loop_admission = crate::server::ChannelLoopAdmission::for_pack_runtimes(
+        multi.per_pack_runtimes.get("kg").map(Arc::as_ref),
+        multi.per_pack_runtimes.get("comm").map(Arc::as_ref),
+    );
     // Wire the main backend's pool for background WAL checkpointing. The pool is
     // only present for file-backed databases; in-memory backends return None here
     // so that checkpoint_once never runs on a non-WAL connection.
@@ -2749,6 +2797,9 @@ pub fn build_server_from_multi_backend_registry(
     )
     .with_default_output_format(fmt)
     .with_secondary_pools(secondary_pools);
+
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    let server = server.with_channel_loop_admission(channel_loop_admission);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
@@ -2812,15 +2863,22 @@ pub struct WiringSurface {
     pub has_checkpoint_pool: bool,
     /// The resolved ADR-078 default output format.
     pub output_format: OutputFormat,
-    /// Whether the default ingest namespace would authorize the email
-    /// channel loops to start if this process runs in the daemon role
-    /// (#503/#602). The actual spawn is arg-driven at `run`/`serve_server`
-    /// (#610), not construction time, but the *authorization* outcome is a
-    /// function of how the registry's gate was wired during construction —
-    /// this field is the construction-time state that decision reads.
+    /// Whether the default ingest namespace passes the email loop's gate
+    /// preflight (#503/#602). This is only the authorization half of
+    /// admission; the runtime-mode fields below independently prevent tasks
+    /// backed by read-only runtimes from starting.
     /// Only meaningful when the `channel-email` feature is compiled in.
     #[cfg(feature = "channel-email")]
     pub channel_loop_eligible: bool,
+    /// Runtime-mode half of channel-loop admission. These values deliberately
+    /// remain independent in mixed topologies: inbound `comm.*` writes and
+    /// outbound generic KG mutations can resolve to different backends.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    pub channel_inbound_poll_admitted: bool,
+    /// Whether the runtime serving generic `list`/`update` is writable, so an
+    /// external delivery can be durably claimed and marked complete.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    pub channel_outbound_delivery_admitted: bool,
 }
 
 impl WiringSurface {
@@ -2834,6 +2892,10 @@ impl WiringSurface {
                 &ingest_namespace_from_env(),
                 &server.verb_registry_clone(),
             ),
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            channel_inbound_poll_admitted: server.channel_loop_admission().inbound_poll,
+            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+            channel_outbound_delivery_admitted: server.channel_loop_admission().outbound_delivery,
         }
     }
 }
@@ -8974,7 +9036,7 @@ backend = "kg-backend"
 
             // Must not panic: EmailChannel::from_env() fails closed on the missing
             // KHIVE_EMAIL_SMTP_HOST and the fn logs a warning and returns.
-            spawn_email_channel_loops(&server);
+            spawn_email_channel_loops(&server, server.channel_loop_admission());
         }
 
         /// Regression for #602: `spawn_email_channel_loops_if_daemon` is the
@@ -9058,11 +9120,11 @@ backend = "kg-backend"
                 default_namespace: Namespace::parse("test").unwrap(),
                 embedding_model: None,
                 additional_embedding_models: vec![],
-                packs: vec!["kg".to_string()],
+                packs: vec!["kg".to_string(), "comm".to_string()],
                 ..RuntimeConfig::default()
             };
             let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+            let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
 
             // Daemon role: the wrapper must take the spawn branch (still fails
             // closed on missing KHIVE_EMAIL_* — no network I/O — but must not
