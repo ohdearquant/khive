@@ -3989,6 +3989,7 @@ mod tests {
     /// a future test that calls either function without the tag fails this
     /// assertion instead of flaking on a loaded CI runner.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn all_checkpoint_metrics_callers_are_serial_tagged() {
         const SELF_SRC: &str = include_str!("checkpoint.rs");
         let lines: Vec<&str> = SELF_SRC.lines().collect();
