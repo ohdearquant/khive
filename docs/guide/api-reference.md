@@ -1501,10 +1501,10 @@ Time-triggered reminders and deferred verb dispatch. Optional; load with
 
 Create a time-triggered reminder.
 
-| Param     | Type   | Required | Notes                                                                                                                                            |
-| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `content` | string | yes      | Non-empty reminder message.                                                                                                                      |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                                                            |
+| Param     | Type   | Required | Notes                                                                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
+| `content` | string | yes      | Non-empty reminder message.                                                                           |
+| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                 |
 | `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`. Cron expressions are rejected because the executor cannot advance them. |
 
 ```
@@ -1517,7 +1517,7 @@ Schedule a future verb dispatch.
 
 | Param    | Type   | Required | Notes                                                               |
 | -------- | ------ | -------- | ------------------------------------------------------------------- |
-| `action` | string | yes      | One replayable verb call, e.g. `"gtd.assign(title=\"follow up\")"`.  |
+| `action` | string | yes      | One replayable verb call, e.g. `"gtd.assign(title=\"follow up\")"`. |
 | `at`     | string | yes      | RFC 3339 trigger time.                                              |
 | `repeat` | string | no       | Same recurrence grammar as `schedule.remind`.                       |
 
