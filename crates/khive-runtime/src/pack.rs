@@ -2634,13 +2634,6 @@ impl VerbRegistry {
                 .get(pack_name)
                 .copied()
                 .unwrap_or(default_backend);
-            if backend.is_read_only() {
-                tracing::info!(
-                    pack = pack_name,
-                    "skipping pack schema plan because its assigned backend is read-only"
-                );
-                continue;
-            }
             let backend_ptr = std::sync::Arc::as_ptr(&backend.pool_arc()) as *const ();
 
             // Pre-scan DDL for table names and detect collisions before applying.
@@ -2661,6 +2654,14 @@ impl VerbRegistry {
                         }
                     }
                 }
+            }
+
+            if backend.is_read_only() {
+                tracing::info!(
+                    pack = pack_name,
+                    "skipping pack schema plan because its assigned backend is read-only"
+                );
+                continue;
             }
 
             backend
@@ -8360,6 +8361,54 @@ mod help_tests {
         assert!(
             msg.contains("collision_table"),
             "collision error must name the table; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_schema_plans_with_map_read_only_collision_is_an_error_without_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("read_only_schema_collision.db");
+        {
+            let writable = khive_db::StorageBackend::sqlite(&path).expect("writable backend");
+            writable.prepare_core_schema().expect("current schema");
+        }
+        let backend = khive_db::StorageBackend::sqlite_read_only(&path).expect("read-only backend");
+        let empty_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_alpha",
+            statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_beta",
+            statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+        }));
+        let registry = builder.build().expect("registry builds");
+        let writes_before = backend.pool().writer_acquisition_snapshot();
+
+        let result = registry.apply_schema_plans_with_map(&empty_map, &backend);
+
+        let err = result.expect_err(
+            "read-only topology must reject the same cross-pack collision as writable topology",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pack_alpha"),
+            "collision error must name first pack; got: {msg}"
+        );
+        assert!(
+            msg.contains("pack_beta"),
+            "collision error must name second pack; got: {msg}"
+        );
+        assert!(
+            msg.contains("collision_table"),
+            "collision error must name the table; got: {msg}"
+        );
+        assert_eq!(
+            backend.pool().writer_acquisition_snapshot(),
+            writes_before,
+            "read-only collision validation must not acquire a writer"
         );
     }
 }
