@@ -4,6 +4,7 @@
 
 import { assertEquals, assertRejects } from "@std/assert";
 import { join } from "@std/path";
+import { adaptJson } from "../lib/importers/json.ts";
 import { importArchive, recoverImportJournal, runImport } from "./import.ts";
 
 // ─── Test harness ─────────────────────────────────────────────────────────────
@@ -400,6 +401,40 @@ Deno.test("#1758 runImport: generic JSON preserves labels and timestamps", async
     assertEquals(edge.properties.updated_at, undefined);
   } finally {
     await removeDir(dir);
+  }
+});
+
+Deno.test("#1758 generic JSON: canonical import rejects padded endpoint identities", async () => {
+  const cases = [
+    ["source", "must be a local UUID"],
+    ["target", "neither a UUID nor a valid remote ref"],
+  ] as const;
+
+  for (const [field, expectedError] of cases) {
+    const dir = await makeTempDir();
+    try {
+      const adapted = adaptJson(
+        JSON.stringify([
+          ENTITY_A,
+          { ...EDGE_SELF, [field]: ` ${EDGE_SELF[field]}\t` },
+        ]),
+      );
+      const archivePath = await writeArchive(dir, {
+        format: "khive-kg",
+        version: "0.1",
+        entities: adapted.entities,
+        edges: adapted.edges,
+      });
+
+      await assertRejects(
+        () => importArchive(dir, archivePath, { overwrite: true }),
+        Error,
+        expectedError,
+      );
+      assertEquals(await readEdgesLines(dir), []);
+    } finally {
+      await removeDir(dir);
+    }
   }
 });
 

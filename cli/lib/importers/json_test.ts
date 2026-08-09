@@ -148,6 +148,20 @@ Deno.test("#1758 adaptJson — preserves original nonblank entity name bytes", (
   assertEquals(result.entities[0].name, originalName);
 });
 
+Deno.test("#1758 adaptJson — preserves original nonblank edge endpoint bytes", () => {
+  const source = "  source-id\t";
+  const target = "\ttarget-id  ";
+  const result = adaptJson(JSON.stringify([{
+    source,
+    target,
+    relation: " depends_on ",
+  }]));
+
+  assertEquals(result.edges[0].source, source);
+  assertEquals(result.edges[0].target, target);
+  assertEquals(result.edges[0].relation, "depends_on");
+});
+
 Deno.test("#1758 adaptJson — from and to remain ordinary entity properties", () => {
   const result = adaptJson(JSON.stringify([{
     name: "Metadata",

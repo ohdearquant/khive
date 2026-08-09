@@ -225,8 +225,11 @@ function extractEdge(
   const targetVal = getField(obj, lm, "target");
   const relationVal = getField(obj, lm, "relation");
 
-  const source = String(sourceVal ?? "").trim();
-  const target = String(targetVal ?? "").trim();
+  // The dispatch loop already validates a trimmed view; retain the caller's
+  // exact accepted identity bytes so canonical validation can reject rather
+  // than silently coerce a whitespace-wrapped UUID or remote reference.
+  const source = typeof sourceVal === "string" ? sourceVal : "";
+  const target = typeof targetVal === "string" ? targetVal : "";
   const relation = String(relationVal ?? "").trim();
 
   const edgeIdVal = getField(obj, lm, "edge_id");
