@@ -763,6 +763,87 @@ mod tests {
         path
     }
 
+    const TOMBSTONE_WITNESS: i64 = 1_772_812_800_000_000;
+
+    fn mapped_batch(findings: &Path) -> CodeIngestBatch {
+        let bytes = std::fs::read(findings).expect("read findings fixture");
+        ingest_findings_json(
+            &bytes,
+            CodeIngestOptions {
+                namespace: "local",
+                observed_at: Utc::now(),
+                source_run: Some("test-run"),
+            },
+        )
+        .expect("map valid findings fixture")
+    }
+
+    async fn soft_delete_mapped_batch(db: &Path, batch: &CodeIngestBatch) {
+        let backend = StorageBackend::sqlite(db).expect("open tombstone writer");
+        let sql = backend.sql();
+        let mut writer = sql.writer().await.expect("acquire tombstone writer");
+
+        let rows = [
+            (
+                "entities",
+                SqlValue::Uuid(batch.entities[0].id),
+                "soft-delete mapped entity",
+            ),
+            (
+                "notes",
+                SqlValue::Uuid(batch.notes[0].id),
+                "soft-delete mapped note",
+            ),
+            (
+                "graph_edges",
+                SqlValue::Uuid(uuid::Uuid::from(batch.edges[0].id)),
+                "soft-delete mapped edge",
+            ),
+        ];
+
+        for (table, id, label) in rows {
+            let changed = writer
+                .execute(SqlStatement {
+                    sql: format!("UPDATE {table} SET deleted_at = ?1 WHERE id = ?2"),
+                    params: vec![SqlValue::Integer(TOMBSTONE_WITNESS), id],
+                    label: Some(label.to_string()),
+                })
+                .await
+                .expect("soft-delete mapped row");
+            assert_eq!(changed, 1, "fixture must tombstone exactly one {table} row");
+        }
+    }
+
+    async fn assert_mapped_batch_remains_tombstoned(db: &Path, batch: &CodeIngestBatch) {
+        let backend = StorageBackend::sqlite_read_only(db).expect("open tombstone reader");
+        let sql = backend.sql();
+        let mut reader = sql.reader().await.expect("acquire tombstone reader");
+
+        let rows = [
+            ("entities", SqlValue::Uuid(batch.entities[0].id)),
+            ("notes", SqlValue::Uuid(batch.notes[0].id)),
+            (
+                "graph_edges",
+                SqlValue::Uuid(uuid::Uuid::from(batch.edges[0].id)),
+            ),
+        ];
+
+        for (table, id) in rows {
+            let marker = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT deleted_at FROM {table} WHERE id = ?1"),
+                    params: vec![id],
+                    label: Some(format!("read mapped {table} tombstone")),
+                })
+                .await
+                .expect("read mapped tombstone");
+            assert!(
+                matches!(&marker, Some(SqlValue::Integer(value)) if *value == TOMBSTONE_WITNESS),
+                "re-ingest must preserve the exact {table} tombstone marker, got {marker:?}"
+            );
+        }
+    }
+
     #[serial]
     #[tokio::test]
     async fn code_ingest_creates_once_then_skips_on_rerun() {
@@ -790,6 +871,47 @@ mod tests {
         assert_eq!(second.notes_skipped_existing, 1);
         assert_eq!(second.entities_skipped_existing, 1);
         assert_eq!(second.edges_skipped_existing, 1);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_never_reactivates_consumed_tombstone_ids() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("tombstones.db");
+        let batch = mapped_batch(&findings);
+
+        code_ingest_batch(base_args(findings.clone(), db.clone()))
+            .await
+            .expect("initial ingest must succeed");
+        soft_delete_mapped_batch(&db, &batch).await;
+        assert_mapped_batch_remains_tombstoned(&db, &batch).await;
+
+        let mut dry_args = base_args(findings.clone(), db.clone());
+        dry_args.dry_run = true;
+        let dry = code_ingest_batch(dry_args)
+            .await
+            .expect("dry-run over tombstones must succeed");
+        assert!(dry.dry_run);
+        assert_eq!(dry.entities_created, 0);
+        assert_eq!(dry.entities_skipped_existing, 1);
+        assert_eq!(dry.notes_created, 0);
+        assert_eq!(dry.notes_skipped_existing, 1);
+        assert_eq!(dry.edges_created, 0);
+        assert_eq!(dry.edges_skipped_existing, 1);
+        assert_mapped_batch_remains_tombstoned(&db, &batch).await;
+
+        let real = code_ingest_batch(base_args(findings, db.clone()))
+            .await
+            .expect("real re-ingest over tombstones must succeed");
+        assert!(!real.dry_run);
+        assert_eq!(real.entities_created, 0);
+        assert_eq!(real.entities_skipped_existing, 1);
+        assert_eq!(real.notes_created, 0);
+        assert_eq!(real.notes_skipped_existing, 1);
+        assert_eq!(real.edges_created, 0);
+        assert_eq!(real.edges_skipped_existing, 1);
+        assert_mapped_batch_remains_tombstoned(&db, &batch).await;
     }
 
     #[serial]
