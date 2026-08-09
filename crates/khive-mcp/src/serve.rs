@@ -2101,6 +2101,22 @@ fn override_matches_declared_main_backend(
         == canonical_path_no_side_effects(std::path::Path::new(override_path))?)
 }
 
+/// Compute the engine-coherence key from the policies captured by the runtime
+/// that will actually serve the multi-backend registry. Environment-backed
+/// defaults may change after pool construction; re-reading them here could
+/// advertise a stronger reserve than the main backend enforces.
+fn compute_multi_backend_config_id(
+    default_runtime: &KhiveRuntime,
+    khive_cfg: &KhiveConfig,
+) -> String {
+    crate::server::compute_config_id_with_storage_policies(
+        default_runtime.config(),
+        Some(khive_cfg),
+        default_runtime.ann_fresh_tail_enabled(),
+        default_runtime.disk_reserve_bytes(),
+    )
+}
+
 fn build_registry_for_multi_backend_inner(
     mut base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -2229,11 +2245,7 @@ fn build_registry_for_multi_backend_inner(
 
     let gate = default_runtime.config().gate.clone();
     let default_namespace = default_runtime.config().default_namespace.clone();
-    let config_id = crate::server::compute_config_id_with_ann_fresh_tail(
-        default_runtime.config(),
-        Some(khive_cfg),
-        default_runtime.ann_fresh_tail_enabled(),
-    );
+    let config_id = compute_multi_backend_config_id(&default_runtime, khive_cfg);
     let visible_namespaces = default_runtime.config().visible_namespaces.clone();
 
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
@@ -4554,6 +4566,47 @@ id = "lambda:project-actor"
             backend_id: BackendId::main(),
             ..RuntimeConfig::default()
         }
+    }
+
+    struct DiskReserveEnvGuard(Option<std::ffi::OsString>);
+
+    impl DiskReserveEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("KHIVE_DB_DISK_RESERVE_BYTES");
+            std::env::set_var("KHIVE_DB_DISK_RESERVE_BYTES", value);
+            Self(previous)
+        }
+    }
+
+    impl Drop for DiskReserveEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("KHIVE_DB_DISK_RESERVE_BYTES", value),
+                None => std::env::remove_var("KHIVE_DB_DISK_RESERVE_BYTES"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn multi_backend_config_id_uses_the_default_runtimes_captured_reserve() {
+        let _env = DiskReserveEnvGuard::set("73");
+        let backend = Arc::new(StorageBackend::memory().unwrap());
+        let runtime = KhiveRuntime::from_backend(backend, RuntimeConfig::no_embeddings());
+        assert_eq!(runtime.disk_reserve_bytes(), 73);
+
+        // Change the process-global source after construction. The fingerprint
+        // must remain tied to the pool serving requests, not this later value.
+        std::env::set_var("KHIVE_DB_DISK_RESERVE_BYTES", "911");
+        let config_id = compute_multi_backend_config_id(&runtime, &KhiveConfig::default());
+        assert!(
+            config_id.contains(";disk_reserve=73;"),
+            "captured reserve missing from {config_id}"
+        );
+        assert!(
+            !config_id.contains(";disk_reserve=911;"),
+            "multi-backend fingerprint re-read the environment: {config_id}"
+        );
     }
 
     /// Two in-memory backends — `main` plus a second named `secondary`.

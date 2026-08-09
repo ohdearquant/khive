@@ -116,18 +116,23 @@ pub(crate) fn storage_driver_error(
     khive_storage::StorageError::driver(capability, operation, error)
 }
 
-/// Inspect an already-wrapped storage error for a raw or `SqliteError`-wrapped
-/// `SQLITE_FULL`. Writer-task closures return `StorageError`, so this closes
-/// the queue path without requiring every operation closure to duplicate the
-/// escalation.
+/// Walk an already-wrapped storage driver's complete source chain for
+/// `SQLITE_FULL`. Writer-task closures return `StorageError`, and runtime
+/// operations may add domain wrappers around `SqliteError`; following
+/// `Error::source` closes both shapes without teaching this layer every wrapper
+/// type.
 pub(crate) fn log_storage_sqlite_full(operation: &str, error: &khive_storage::StorageError) {
     let khive_storage::StorageError::Driver { source, .. } = error else {
         return;
     };
-    if let Some(error) = source.downcast_ref::<rusqlite::Error>() {
-        log_sqlite_full(operation, error);
-    } else if let Some(SqliteError::Rusqlite(error)) = source.downcast_ref::<SqliteError>() {
-        log_sqlite_full(operation, error);
+
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<rusqlite::Error>() {
+            log_sqlite_full(operation, error);
+            return;
+        }
+        current = error.source();
     }
 }
 
@@ -135,6 +140,21 @@ pub(crate) fn log_storage_sqlite_full(operation: &str, error: &khive_storage::St
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct NestedSqliteError(SqliteError);
+
+    impl std::fmt::Display for NestedSqliteError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "nested sqlite failure: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for NestedSqliteError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
 
     struct ErrorCapture {
         events: Arc<Mutex<Vec<(tracing::Level, String)>>>,
@@ -198,6 +218,32 @@ mod tests {
             },
             || log_sqlite_full("test_write", &error),
         );
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, tracing::Level::ERROR);
+        assert!(events[0].1.contains("SQLITE_FULL escalation"));
+    }
+
+    #[test]
+    fn storage_sqlite_full_escalation_walks_nested_error_sources() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        );
+        let storage_error = khive_storage::StorageError::driver(
+            khive_storage::StorageCapability::Entities,
+            "merge_entity",
+            NestedSqliteError(SqliteError::Rusqlite(error)),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        tracing::subscriber::with_default(
+            ErrorCapture {
+                events: Arc::clone(&events),
+            },
+            || log_storage_sqlite_full("writer_task_operation", &storage_error),
+        );
+
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, tracing::Level::ERROR);

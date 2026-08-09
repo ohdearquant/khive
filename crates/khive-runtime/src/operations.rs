@@ -5241,7 +5241,7 @@ impl KhiveRuntime {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(SqliteError::Rusqlite)?;
+            .map_err(SqliteError::from)?;
 
         if let Some(existing_id) = conflict_id {
             // Case (b): canonical row already exists — ADR-039's edge-conflict
@@ -5259,7 +5259,7 @@ impl KhiveRuntime {
                 khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                 rusqlite::params![&ns, &edge_id_str],
             )
-            .map_err(SqliteError::Rusqlite)?;
+            .map_err(SqliteError::from)?;
             Ok(Some(existing_id))
         } else {
             // Case (a): no conflict — update source_id/target_id in-place,
@@ -5278,7 +5278,7 @@ impl KhiveRuntime {
                         &edge_id_str,
                     ],
                 )
-                .map_err(SqliteError::Rusqlite)?;
+                .map_err(SqliteError::from)?;
             if affected == 0 {
                 // The edge row was not found under the record's namespace.
                 // This must never happen because ns = record_ns (fetched above).

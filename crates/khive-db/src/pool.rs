@@ -39,6 +39,11 @@ pub(crate) struct WriteCapacityGuard {
     reserve_bytes: u64,
     #[cfg(test)]
     available_override: AtomicU64,
+    /// The exact filesystem path the test sample is allowed to stand in for.
+    /// Binding the value to a path prevents a fake byte count from masking a
+    /// production bug that probes the link volume instead of SQLite's target.
+    #[cfg(test)]
+    available_override_probe: Mutex<Option<PathBuf>>,
 }
 
 impl WriteCapacityGuard {
@@ -64,7 +69,11 @@ impl WriteCapacityGuard {
                             .to_string(),
                     ));
                 }
-                let canonical = canonicalize_deepest_existing(path)?;
+                // Use the same final-component-symlink-aware authority as
+                // DbIdentity. In particular, a dangling `link.db ->
+                // /other-volume/real.db` first open must probe the target's
+                // parent volume, not the directory containing the link.
+                let canonical = canonical_database_path(path)?;
                 let mut probe = canonical.parent();
                 let existing_probe = loop {
                     let Some(candidate) = probe else {
@@ -92,6 +101,8 @@ impl WriteCapacityGuard {
             reserve_bytes: config.disk_reserve_bytes,
             #[cfg(test)]
             available_override: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            available_override_probe: Mutex::new(None),
         })
     }
 
@@ -107,6 +118,15 @@ impl WriteCapacityGuard {
         let override_bytes = self.available_override.load(Ordering::Acquire);
         #[cfg(test)]
         let available = if override_bytes != u64::MAX {
+            if let Some(expected_probe) = self.available_override_probe.lock().as_deref() {
+                if probe_path != expected_probe {
+                    return Err(SqliteError::InvalidData(format!(
+                        "test capacity sample was bound to {}, but the write guard probed {}",
+                        expected_probe.display(),
+                        probe_path.display()
+                    )));
+                }
+            }
             override_bytes
         } else {
             fs4::available_space(probe_path)?
@@ -128,6 +148,14 @@ impl WriteCapacityGuard {
 
     #[cfg(test)]
     fn force_available_bytes(&self, available_bytes: u64) {
+        *self.available_override_probe.lock() = self.probe_path.clone();
+        self.available_override
+            .store(available_bytes, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn force_available_bytes_at_path(&self, expected_probe_path: PathBuf, available_bytes: u64) {
+        *self.available_override_probe.lock() = Some(expected_probe_path);
         self.available_override
             .store(available_bytes, Ordering::Release);
     }
@@ -420,6 +448,17 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
 /// For in-memory databases, or when WAL mode is disabled/unavailable, the pool
 /// degrades to single-connection mode and routes all operations through the
 /// writer connection.
+///
+/// A cloneable raw writer handle is deliberately not public: it would let a
+/// caller acquire the underlying mutex after capacity changed without passing
+/// through [`Self::writer`]'s admission check.
+///
+/// ```compile_fail
+/// use khive_db::{ConnectionPool, PoolConfig};
+///
+/// let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+/// let _raw_writer = pool.legacy_conn();
+/// ```
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
     /// Fail-closed guard for the legacy pool-mutex writer. A transaction
@@ -924,6 +963,16 @@ impl ConnectionPool {
             .force_available_bytes(available_bytes);
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_available_bytes_at_path_for_test(
+        &self,
+        expected_probe_path: PathBuf,
+        available_bytes: u64,
+    ) {
+        self.write_capacity_guard
+            .force_available_bytes_at_path(expected_probe_path, available_bytes);
+    }
+
     /// Get the current number of available reader connections.
     pub fn available_readers(&self) -> usize {
         self.readers.len()
@@ -1127,11 +1176,11 @@ impl ConnectionPool {
         self.writer_task_join.lock().take()
     }
 
-    /// Compatibility method: returns the writer connection wrapped in `Arc<Mutex>`.
-    ///
-    /// WARNING: This exists only for backward compatibility with code that
-    /// calls `store.conn()`. New code should use `reader()` and `writer()`.
-    pub fn legacy_conn(&self) -> Arc<Mutex<Connection>> {
+    /// Test-only access to the retired writer connection so quarantine tests
+    /// can prove its SQLite authorizer denies direct use. Production code must
+    /// never receive a cloneable raw writer that bypasses admission.
+    #[cfg(test)]
+    pub(crate) fn raw_writer_for_test(&self) -> Arc<Mutex<Connection>> {
         Arc::clone(&self.writer)
     }
 
@@ -1249,12 +1298,14 @@ impl ConnectionPool {
 /// cycle.
 const MAX_SYMLINK_DEPTH: u32 = 40;
 
-/// Mint the canonical [`DbIdentity`] for a configured database path.
+/// Resolve the canonical database path shared by write-capacity admission and
+/// [`DbIdentity`] minting.
 ///
-/// The sole minting point (ADR-091 backend-scoped attribution design note):
-/// `tx_registry` origin threading and `sidecar_dir_for` re-keying both
-/// consume this function's output rather than re-deriving it. Operationally
-/// three steps:
+/// This is the sole filesystem-identity authority for SQLite paths. Keeping
+/// capacity probes and transaction attribution on one resolution result is
+/// load-bearing: otherwise a dangling final-component symlink can identify
+/// its target for attribution while the reserve guard samples the filesystem
+/// containing the link. Operationally it performs three steps:
 ///
 /// 1. A relative configured path is resolved against the process's current
 ///    directory BEFORE any canonicalization — a bare file name has an empty
@@ -1277,11 +1328,7 @@ const MAX_SYMLINK_DEPTH: u32 = 40;
 /// A resolved target whose parent directory does not exist fails minting
 /// exactly as the subsequent database open itself would fail.
 ///
-/// Returns the minted [`DbIdentity`] alongside the canonical [`PathBuf`] it
-/// was built from — `DbIdentity` has no path accessor by design, so callers
-/// that need the filesystem path (sidecar derivation) keep this pairing
-/// rather than re-deriving it from the raw configured path.
-fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), SqliteError> {
+fn canonical_database_path(configured_path: &Path) -> Result<PathBuf, SqliteError> {
     let absolute = if configured_path.is_absolute() {
         configured_path.to_path_buf()
     } else {
@@ -1301,10 +1348,7 @@ fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), Sql
                  {absolute:?}: {e}"
             ))
         })?;
-        return Ok((
-            DbIdentity::new(canonical.clone().into_os_string()),
-            canonical,
-        ));
+        return Ok(canonical);
     }
 
     let resolved_target = resolve_symlink_chain(&absolute)?;
@@ -1327,6 +1371,15 @@ fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), Sql
     })?;
     let mut identity_path = canonical_parent;
     identity_path.push(file_name);
+    Ok(identity_path)
+}
+
+/// Mint the canonical [`DbIdentity`] for a configured database path.
+///
+/// `tx_registry` origin threading and sidecar derivation retain the exact path
+/// returned beside the opaque identity rather than resolving it again.
+fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), SqliteError> {
+    let identity_path = canonical_database_path(configured_path)?;
     Ok((
         DbIdentity::new(identity_path.clone().into_os_string()),
         identity_path,
@@ -1685,8 +1738,8 @@ mod tests {
         seed.try_writer()
             .unwrap()
             .execute_batch(
-                "CREATE TABLE guarded_write (id INTEGER PRIMARY KEY);\
-                 INSERT INTO guarded_write (id) VALUES (1)",
+                "CREATE TABLE guarded_write (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);\
+                 INSERT INTO guarded_write (id, payload) VALUES (1, zeroblob(16))",
             )
             .unwrap();
 
@@ -1745,6 +1798,47 @@ mod tests {
             0,
             "a reserve refusal happens before writer admission is counted"
         );
+
+        // Safely model SQLite's eventual out-of-space boundary without
+        // consuming the host filesystem: max_page_count makes SQLite return
+        // primary SQLITE_FULL after only a bounded number of pages. The same
+        // old reader remains open, while the reserve-disabled control proves
+        // the driver would eventually fail inside an admitted write if the
+        // pre-write guard did not stop it first.
+        let control = seed.try_writer().expect("reserve-disabled control writer");
+        let page_count: i64 = control
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        let page_size: i64 = control
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .unwrap();
+        let bounded_page_limit = page_count + 2;
+        control
+            .pragma_update(None, "max_page_count", bounded_page_limit)
+            .unwrap();
+        let applied_limit: i64 = control
+            .query_row("PRAGMA max_page_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(applied_limit, bounded_page_limit);
+
+        let mut sqlite_full = None;
+        for id in 2..=64i64 {
+            match control.execute(
+                "INSERT INTO guarded_write (id, payload) VALUES (?1, zeroblob(?2))",
+                rusqlite::params![id, page_size * 4],
+            ) {
+                Ok(_) => {}
+                Err(error) if crate::error::is_sqlite_full(&error) => {
+                    sqlite_full = Some(error);
+                    break;
+                }
+                Err(error) => panic!("expected SQLITE_FULL control boundary, got {error:?}"),
+            }
+        }
+        assert!(
+            sqlite_full.is_some(),
+            "the bounded control must reach SQLite's primary FULL result after the guard refusal"
+        );
         old_reader.execute_batch("ROLLBACK").unwrap();
     }
 
@@ -1771,6 +1865,80 @@ mod tests {
             !path.exists(),
             "capacity refusal must happen before SQLite creates the database"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capacity_guard_resolves_dangling_file_symlink_target_before_first_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let link_dir = dir.path().join("link-volume");
+        let target_dir = dir.path().join("target-volume");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("real.db");
+        let link = link_dir.join("khive.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = ConnectionPool::new(PoolConfig {
+            path: Some(link),
+            write_queue_enabled: Some(false),
+            disk_reserve_bytes: u64::MAX,
+            ..PoolConfig::default()
+        })
+        .err()
+        .expect("the impossible reserve must refuse before following the link to create SQL");
+
+        let canonical_target = target_dir.canonicalize().unwrap().join("real.db");
+        match error {
+            SqliteError::DiskCapacityFloor { volume, .. } => {
+                assert_eq!(
+                    PathBuf::from(volume),
+                    canonical_target,
+                    "the first sample must identify the dangling link's SQLite target, not the link directory"
+                );
+            }
+            other => panic!("expected DiskCapacityFloor, got {other:?}"),
+        }
+        assert!(
+            !target.exists(),
+            "the real filesystem sample must remain safely bounded and precede SQLite creation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capacity_override_is_bound_to_the_resolved_target_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let link_dir = dir.path().join("link-volume");
+        let target_dir = dir.path().join("target-volume");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("real.db");
+        let link = link_dir.join("khive.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(link),
+            write_queue_enabled: Some(false),
+            disk_reserve_bytes: 1,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        let expected_probe = target_dir.canonicalize().unwrap();
+        pool.force_available_bytes_at_path_for_test(expected_probe, 0);
+
+        let error = pool
+            .try_writer()
+            .err()
+            .expect("the path-bound target-volume sample must refuse the write");
+        assert!(matches!(
+            error,
+            SqliteError::DiskCapacityFloor {
+                available_bytes: 0,
+                reserve_bytes: 1,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

@@ -445,7 +445,14 @@ impl std::fmt::Display for MergeEntitySqlError {
     }
 }
 
-impl std::error::Error for MergeEntitySqlError {}
+impl std::error::Error for MergeEntitySqlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(error),
+            Self::Refusal(_) => None,
+        }
+    }
+}
 
 impl From<SqliteError> for MergeEntitySqlError {
     fn from(error: SqliteError) -> Self {
@@ -455,7 +462,7 @@ impl From<SqliteError> for MergeEntitySqlError {
 
 impl From<rusqlite::Error> for MergeEntitySqlError {
     fn from(error: rusqlite::Error) -> Self {
-        Self::Sqlite(SqliteError::Rusqlite(error))
+        Self::Sqlite(SqliteError::from(error))
     }
 }
 
@@ -612,7 +619,7 @@ fn resolve_merge_edge_endpoint(
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
         .optional()
-        .map_err(SqliteError::Rusqlite)?
+        .map_err(SqliteError::from)?
     {
         return Ok(Some(("entity", kind, entity_type)));
     }
@@ -623,7 +630,7 @@ fn resolve_merge_edge_endpoint(
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(SqliteError::Rusqlite)?
+        .map_err(SqliteError::from)?
     {
         return Ok(Some(("note", kind, None)));
     }
@@ -2197,7 +2204,7 @@ fn merge_entity_sql(
                 |row| row.get(0),
             )
             .optional()
-            .map_err(SqliteError::Rusqlite)?
+            .map_err(SqliteError::from)?
         };
 
         if let Some(conflict_id) = conflict_id {
@@ -2743,7 +2750,7 @@ fn merge_note_sql(
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(SqliteError::Rusqlite)?
+                .map_err(SqliteError::from)?
             };
 
             if let Some(conflict_id) = conflict_id {
@@ -3433,6 +3440,26 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("2026-08-09T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn merge_entity_error_exposes_sqlite_full_through_its_source_chain() {
+        let wrapped = MergeEntitySqlError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        ));
+
+        let sqlite_source = std::error::Error::source(&wrapped)
+            .and_then(|source| source.downcast_ref::<SqliteError>())
+            .expect("merge wrapper must expose its SqliteError source");
+        let raw_source = std::error::Error::source(sqlite_source)
+            .and_then(|source| source.downcast_ref::<rusqlite::Error>())
+            .expect("SqliteError must expose the original rusqlite error");
+        assert!(matches!(
+            raw_source,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == rusqlite::ErrorCode::DiskFull
+        ));
     }
 
     fn secret_shaped_reason() -> String {

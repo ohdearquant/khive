@@ -44,6 +44,18 @@ With a nonzero reserve, the configured database must be a filesystem path.
 use the equivalent filesystem path. A URI remains available only when the
 caller explicitly disables the guard for a disposable store.
 
+Filesystem paths use the same canonical resolver as the pool's `DbIdentity`.
+That includes following a dangling final-component symlink before first open:
+for `link.db -> /other-volume/real.db`, the permanent capacity probe is the
+canonical parent of `real.db`, never the directory containing `link.db`.
+Path-bound test samples pin this target/probe identity so a fake byte count
+cannot let wrong-volume logic pass unnoticed.
+
+The pool exposes no cloneable raw writer connection in production. Such a
+handle could be retained and its mutex acquired after capacity changes,
+bypassing the post-lock admission check. The only raw clone is compiled under
+`cfg(test)` for retirement-authorizer quarantine coverage.
+
 The check is an admission snapshot, not a filesystem quota. One very large
 transaction or an external process can consume capacity after sampling; size
 the reserve above the largest expected in-flight transaction. Until the

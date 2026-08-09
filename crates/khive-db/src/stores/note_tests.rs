@@ -1489,12 +1489,12 @@ async fn pooled_transaction_rollback_failure_reports_unknown_and_retires_writer(
         "a connection with an unverified rollback must never be checked out again"
     );
 
-    let legacy = store.pool.legacy_conn();
-    let legacy_guard = legacy.lock();
-    let direct_probe = legacy_guard.query_row("SELECT 1", [], |row| row.get::<_, i64>(0));
+    let raw_writer = store.pool.raw_writer_for_test();
+    let raw_writer_guard = raw_writer.lock();
+    let direct_probe = raw_writer_guard.query_row("SELECT 1", [], |row| row.get::<_, i64>(0));
     assert!(
         direct_probe.is_err(),
-        "the compatibility raw-connection handle must not bypass retirement quarantine"
+        "the test-only raw connection must not bypass retirement quarantine"
     );
 }
 

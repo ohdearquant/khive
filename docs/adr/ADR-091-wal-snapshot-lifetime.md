@@ -1230,6 +1230,14 @@ execution with typed `SqliteError::DiskCapacityFloor`; the writer operation is
 not counted as acquired, and a writer task stays healthy for later work after
 capacity recovers.
 
+The database identity and capacity probe share one canonical path resolver.
+A dangling final-component symlink at first open is resolved to its ultimate
+target before the probe parent is selected, so a link crossing filesystem
+volumes can never make admission sample the link's volume while SQLite writes
+the target volume. Production exposes no cloneable raw pooled-writer handle;
+the retirement-quarantine escape hatch is test-only, because a retained raw
+mutex would otherwise bypass post-lock admission.
+
 Infrastructure connections remain deliberately available under pressure:
 the dedicated checkpoint and diagnostic opens use the untracked seam. They
 must not become request-DML bypasses. The writer task rechecks every request,

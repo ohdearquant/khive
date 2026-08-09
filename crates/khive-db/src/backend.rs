@@ -363,7 +363,7 @@ impl StorageBackend {
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(SqliteError::Rusqlite)?
+            .map_err(SqliteError::from)?
             .is_some();
 
         if table_exists {
@@ -523,7 +523,7 @@ impl StorageBackend {
         }
 
         let writer = self.pool.try_writer()?;
-        sparse::ensure_sparse_schema(writer.conn(), model_key).map_err(SqliteError::Rusqlite)?;
+        sparse::ensure_sparse_schema(writer.conn(), model_key).map_err(SqliteError::from)?;
 
         Ok(Arc::new(sparse::SqliteSparseStore::new(
             Arc::clone(&self.pool),
