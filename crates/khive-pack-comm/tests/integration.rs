@@ -7694,6 +7694,184 @@ async fn heartbeat_success_is_visible_via_health() {
     assert_eq!(ch["consecutive_failures"].as_u64(), Some(0));
 }
 
+/// khive #1383: quarantine is a terminal disposition for one message, not a
+/// channel failure. Healthy heartbeat facts therefore stay healthy while the
+/// read surface reports every live parked row, grouped by the exact transport
+/// identity that produced it. Legacy rows without a channel slug remain
+/// visible in an honest unattributed total instead of disappearing or being
+/// guessed onto an account.
+#[tokio::test]
+async fn health_counts_live_quarantines_by_channel_without_marking_polling_failed() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    for slug in ["acct-1", "acct-2"] {
+        registry
+            .dispatch(
+                "comm.heartbeat",
+                serde_json::json!({
+                    "namespace": "local",
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "poll_interval_secs": 5,
+                    "outcome": "success",
+                }),
+            )
+            .await
+            .expect("healthy channel heartbeat");
+    }
+
+    async fn ingest_quarantine(
+        registry: &khive_runtime::VerbRegistry,
+        external_id: &str,
+        channel_slug: Option<&str>,
+        quarantined: serde_json::Value,
+    ) -> String {
+        let mut args = serde_json::json!({
+            "namespace": "local",
+            "from": "email:quarantine",
+            "to": "local",
+            "content": format!("parked {external_id}"),
+            "channel_kind": "email",
+            "external_id": external_id,
+            "metadata": {
+                "quarantined": quarantined,
+                "quarantine_reason": "test",
+            },
+        });
+        if let Some(slug) = channel_slug {
+            args["channel_slug"] = serde_json::json!(slug);
+            args["metadata"]["channel_slug"] = serde_json::json!("spoofed-by-metadata");
+        }
+        registry
+            .dispatch("comm.ingest", args)
+            .await
+            .expect("quarantine ingest")["full_id"]
+            .as_str()
+            .expect("full_id")
+            .to_string()
+    }
+
+    // Both wire spellings produced by generic channel metadata are accepted.
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-acct-1-string",
+        Some("acct-1"),
+        serde_json::json!("true"),
+    )
+    .await;
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-acct-1-bool",
+        Some("acct-1"),
+        serde_json::json!(true),
+    )
+    .await;
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-acct-2",
+        Some("acct-2"),
+        serde_json::json!("true"),
+    )
+    .await;
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-legacy",
+        None,
+        serde_json::json!("true"),
+    )
+    .await;
+
+    // Purged/soft-deleted rows are no longer parked and must not contribute.
+    let deleted_id = ingest_quarantine(
+        &registry,
+        "quarantine-health-deleted",
+        Some("acct-2"),
+        serde_json::json!("true"),
+    )
+    .await;
+    registry
+        .dispatch(
+            "delete",
+            serde_json::json!({"id": deleted_id, "kind": "note"}),
+        )
+        .await
+        .expect("soft-delete quarantined message");
+
+    // A false marker is ordinary mail, not a parked item.
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-false",
+        Some("acct-1"),
+        serde_json::json!("false"),
+    )
+    .await;
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(health["quarantined_count"].as_u64(), Some(4));
+    assert_eq!(health["unattributed_quarantined_count"].as_u64(), Some(1));
+
+    let channels = health["channels"].as_array().expect("channels array");
+    assert_eq!(channels.len(), 2);
+    for (slug, expected) in [("acct-1", 2), ("acct-2", 1)] {
+        let channel = channels
+            .iter()
+            .find(|channel| channel["channel_slug"].as_str() == Some(slug))
+            .expect("channel health row");
+        assert_eq!(channel["consecutive_failures"].as_u64(), Some(0));
+        assert_eq!(channel["stalled"].as_bool(), Some(false));
+        assert_eq!(channel["quarantined_count"].as_u64(), Some(expected));
+    }
+}
+
+/// A deployment may intentionally keep operational heartbeats in `local`
+/// while routing message data into another authorized namespace. The scoped
+/// health read for that message namespace must still synthesize the parked
+/// channel entry from persisted quarantine provenance; it must not mislabel
+/// that evidence as a daemon heartbeat.
+#[tokio::test]
+async fn health_surfaces_quarantine_channel_without_a_heartbeat_in_that_namespace() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "tenant-a",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": "tenant parked message",
+                "channel_kind": "email",
+                "channel_slug": "tenant-mailbox",
+                "external_id": "quarantine-health-tenant-a",
+                "metadata": {
+                    "quarantined": "true",
+                    "quarantine_reason": "test",
+                },
+            }),
+        )
+        .await
+        .expect("tenant quarantine ingest");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({"namespace": "tenant-a"}))
+        .await
+        .expect("tenant health succeeds");
+    assert_eq!(health["namespace"].as_str(), Some("tenant-a"));
+    assert_eq!(health["role"].as_str(), Some("client"));
+    assert!(health["source"].is_null());
+    assert_eq!(health["quarantined_count"].as_u64(), Some(1));
+    assert_eq!(health["unattributed_quarantined_count"].as_u64(), Some(0));
+    let channels = health["channels"].as_array().expect("channels array");
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
+    assert_eq!(channels[0]["channel_slug"].as_str(), Some("tenant-mailbox"));
+    assert_eq!(channels[0]["quarantined_count"].as_u64(), Some(1));
+    assert!(channels[0]["last_poll_attempt_at"].is_null());
+    assert!(channels[0]["stalled"].is_null());
+}
+
 /// #1472: a silently stopped poller must be distinguishable from a healthy,
 /// idle channel even when its persisted failure count is zero.
 #[tokio::test]

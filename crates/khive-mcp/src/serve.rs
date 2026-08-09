@@ -8579,7 +8579,7 @@ backend = "kg-backend"
             let task = tokio::spawn(channel_poll_loop(
                 Arc::new(ch_registry),
                 registry.clone(),
-                "test-ns".to_string(),
+                "local".to_string(),
                 "actor:test".to_string(),
             ));
 
@@ -8653,7 +8653,7 @@ backend = "kg-backend"
             let inbox = registry
                 .dispatch(
                     "list",
-                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                    json!({"namespace": "local", "kind": "message", "limit": 50}),
                 )
                 .await
                 .expect("list must succeed");
@@ -8926,6 +8926,26 @@ backend = "kg-backend"
                 Some("missing-body"),
                 "the quarantine reason must survive comm.ingest: {props:?}"
             );
+            assert_eq!(
+                props.get("channel_slug").and_then(|v| v.as_str()),
+                Some("mock_quarantine"),
+                "the poll loop must persist the exact channel identity used by comm.health"
+            );
+
+            let health = registry
+                .dispatch("comm.health", json!({}))
+                .await
+                .expect("health succeeds after a quarantined poll");
+            let channel = health["channels"]
+                .as_array()
+                .expect("channels array")
+                .iter()
+                .find(|channel| channel["channel_slug"] == "mock_quarantine")
+                .expect("mock quarantine heartbeat");
+            assert_eq!(channel["consecutive_failures"].as_u64(), Some(0));
+            assert_eq!(channel["stalled"].as_bool(), Some(false));
+            assert_eq!(channel["quarantined_count"].as_u64(), Some(1));
+            assert_eq!(health["quarantined_count"].as_u64(), Some(1));
         }
 
         /// Restart-across-a-checkpoint round-trip (issue #449 part b): once a
