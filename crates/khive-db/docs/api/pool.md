@@ -39,7 +39,8 @@ registry tests for defense-in-depth against cross-test interference.
 ## Raw SQL bridge admission and writer-handle budget
 
 File-backed `SqlBridge` handles keep their standalone connection for the
-handle lifetime, preserving connection-local behavior across calls. The pool
+handle lifetime, preserving connection-local statement/cache behavior across
+calls but not caller-owned transactions on cached read-only handles. The pool
 therefore owns two shared permit sets across every bridge constructed over it:
 reader opens and active reads are capped at the effective `max_readers` (with a
 minimum of one in degraded mode), and standalone writer handles are capped at
@@ -52,6 +53,15 @@ until SQLite finishes and drops the resource, so a detached blocking call
 cannot escape the active-read cap.
 Reader-open saturation reports `sql_bridge.reader_open`; active-query
 saturation reports `sql_bridge.reader_operation`.
+
+Cached read-only handles reject `BEGIN`, `START`, `COMMIT`, `END`, `ROLLBACK`,
+`SAVEPOINT`, and `RELEASE` statement heads with `StorageError::InvalidInput`.
+As a defense-in-depth postcondition, they must also be in autocommit before an
+operation permit is released. If a cached reader reaches either side of an
+operation outside autocommit, the bridge rolls it back while still holding the
+permit and fails the operation; a connection that cannot be restored is
+discarded before the permit is released. An idle cached reader can therefore
+never retain a WAL snapshot outside the active-read budget.
 
 Cancelling an in-flight call also permanently invalidates a STANDALONE
 reader/writer handle: the call takes the boxed handle's connection on entry
@@ -77,6 +87,10 @@ standalone writer. A live `writer()` handle therefore makes such an
 do not hold a boxed writer handle across an `atomic_unit()` call on the same
 pool — drop the handle first. With the write queue enabled, `atomic_unit`
 runs inside the writer task instead and never touches this budget.
+The cached-reader autocommit postcondition does not apply to a standalone
+read-write writer: its handle-scoped writer permit remains held across the
+whole manual transaction, including reader-supertrait calls within that
+transaction, while each such read additionally uses an active-reader permit.
 
 When the write queue is enabled, `writer()` is queue-first (ADR-136 D1
 gate 1): it opens no standalone connection and holds no writer permit, and

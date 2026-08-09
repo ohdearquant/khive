@@ -530,10 +530,23 @@ connection and permit together until that work actually finishes. Cancellation
 therefore cannot oversubscribe active reads, while idle retained handles no
 longer consume permanent admission capacity.
 
+Cached read-only connections may not carry caller-owned transactions across
+operations. Their query boundary rejects transaction-control statement heads
+(`BEGIN`/`START`, `COMMIT`/`END`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE`) with a
+typed `StorageError::InvalidInput`. Defense in depth also checks autocommit
+inside the blocking closure before releasing the operation permit. A cached
+connection found outside autocommit is rolled back and the operation fails; if
+autocommit cannot be restored, the connection is discarded before the permit
+is released. Thus no idle cached reader can retain a WAL snapshot outside the
+`max_readers` active-operation budget.
+
 This amendment does not change the one-permit standalone writer budget. A
 read-write connection still retains its writer permit for its handle lifetime,
 including while one of its reader-supertrait methods runs; that read also
-acquires the ordinary active-read permit. Cached idle reader connections are
-autocommit connections and do not retain a WAL snapshot (ADR-091), but their
-count is no longer a `max_readers` contract: callers that retain arbitrarily
-many handles remain responsible for their process's file-descriptor budget.
+acquires the ordinary active-read permit. The cached-reader autocommit guard
+does not apply to this writer connection, so reader-supertrait calls within a
+legitimate manual `atomic_unit` do not terminate its transaction. Cached idle
+reader connections are enforced autocommit connections and do not retain a WAL
+snapshot (ADR-091), but their count is no longer a `max_readers` contract:
+callers that retain arbitrarily many handles remain responsible for their
+process's file-descriptor budget.
