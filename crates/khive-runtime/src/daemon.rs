@@ -2892,6 +2892,11 @@ mod tests {
             snapshot.wal_pages.is_some(),
             "wal_pages must be observed after a real checkpoint tick, got {snapshot:?}"
         );
+        assert_eq!(snapshot.wal_log_frames, snapshot.wal_pages);
+        assert!(snapshot.wal_checkpointed_frames.is_some());
+        assert!(snapshot.wal_pending_frames.is_some());
+        assert!(snapshot.wal_physical_bytes.is_some());
+        assert!(snapshot.wal_observed_at_unix_ms.is_some());
         // The snapshot carries the checkpoint-pressure fields read-only
         // (no mutation path reachable through `MetricsSnapshot`/`DaemonRequestFrame`);
         // an observed tick (not a skip) must report a zero-length skip streak.

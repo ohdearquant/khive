@@ -2074,4 +2074,53 @@ mod tests {
         assert_writer_task_terminal_state(result, WriterTaskRequestState::SideEffectsUnknown);
         assert!(!request_ran.load(Ordering::SeqCst));
     }
+
+    /// #1849: a deliberately slow transaction body with no queue backlog or
+    /// lock contention must be attributed to `body`, not flattened into one
+    /// opaque send-to-reply duration.
+    #[tokio::test]
+    async fn writer_stage_sample_attributes_a_slow_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_stage_sample.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).unwrap();
+
+        handle
+            .send(|conn| {
+                std::thread::sleep(Duration::from_millis(60));
+                conn.execute("INSERT INTO t VALUES (1)", [])
+                    .map_err(|error| StorageError::Pool {
+                        operation: "writer_stage_sample".into(),
+                        message: error.to_string(),
+                    })
+            })
+            .await
+            .unwrap();
+
+        let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
+        assert!(
+            sample.body_micros >= 50_000,
+            "the synthetic delay must land in the body stage: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.queue_wait_micros,
+            "fast queueing must not receive the body's delay: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.transaction_acquire_micros,
+            "an uncontended BEGIN must not receive the body's delay: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.commit_micros,
+            "a fast COMMIT must not receive the body's delay: {sample:?}"
+        );
+        assert!(sample.observed_at_unix_ms > 0);
+    }
 }

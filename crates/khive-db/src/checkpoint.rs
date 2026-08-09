@@ -2590,6 +2590,7 @@ fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
+    use rusqlite::hooks::{AuthAction, Authorization};
     use serial_test::serial;
     use tracing::field::{Field, Visit};
 
@@ -6063,5 +6064,110 @@ mod tests {
         // Either an explicit error or a nonsensical negative `log` value is
         // acceptable here — the requirement is just "does not panic".
         let _ = query_wal_pin_depth(writer.conn());
+    }
+
+    /// #1849: the periodic checkpoint's own PASSIVE row is the monitoring
+    /// sample. One tick must not issue the old no-arg probe followed by a
+    /// second PASSIVE, and the stored sample must distinguish logical
+    /// backlog from the physical sidecar high-water mark.
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_records_one_pass_logical_and_physical_wal_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routine_wal_sample.db");
+        let pool = file_pool(&path);
+
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "PRAGMA wal_autocheckpoint=0; \
+                     CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT); \
+                     INSERT INTO t VALUES (0, 'seed');",
+                )
+                .unwrap();
+        }
+
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+            for id in 1..=256_i64 {
+                writer
+                    .conn()
+                    .execute("INSERT INTO t VALUES (?1, printf('%.*c', 2048, 'x'))", [id])
+                    .unwrap();
+            }
+            writer.conn().execute_batch("COMMIT").unwrap();
+        }
+
+        let checkpoint_conn = pool.open_standalone_writer().unwrap();
+        let pragma_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pragma_calls_from_hook = Arc::clone(&pragma_calls);
+        checkpoint_conn.authorizer(Some(move |context| {
+            if matches!(
+                context.action,
+                AuthAction::Pragma { pragma_name, .. }
+                    if pragma_name.eq_ignore_ascii_case("wal_checkpoint")
+            ) {
+                pragma_calls_from_hook.fetch_add(1, Ordering::SeqCst);
+            }
+            Authorization::Allow
+        }));
+
+        checkpoint_once(
+            &pool,
+            &checkpoint_conn,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        )
+        .unwrap();
+        checkpoint_conn.authorizer(None::<fn(_) -> _>);
+
+        assert_eq!(
+            pragma_calls.load(Ordering::SeqCst),
+            1,
+            "one routine tick must issue exactly one PASSIVE checkpoint"
+        );
+        let pinned = routine_wal_observation(&pool).expect("routine sample");
+        assert!(pinned.log_frames > 0, "the test must create WAL frames");
+        assert!(
+            pinned.pending_frames > 0,
+            "the old reader must leave a logical backlog: {pinned:?}"
+        );
+        assert_eq!(
+            pinned.pending_frames,
+            pinned.log_frames.saturating_sub(pinned.checkpointed_frames)
+        );
+        assert!(
+            pinned.physical_wal_bytes.is_some_and(|bytes| bytes > 0),
+            "the physical sidecar high-water must be reported separately: {pinned:?}"
+        );
+
+        reader.execute_batch("COMMIT").unwrap();
+        checkpoint_once(
+            &pool,
+            &checkpoint_conn,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        )
+        .unwrap();
+        let drained = routine_wal_observation(&pool).expect("drained routine sample");
+        assert_eq!(drained.pending_frames, 0, "unpinned PASSIVE must drain");
+        assert!(
+            drained.physical_wal_bytes.is_some_and(|bytes| bytes > 0),
+            "PASSIVE may reuse rather than shrink the physical WAL; the two gauges must remain \
+             independently visible: {drained:?}"
+        );
     }
 }
