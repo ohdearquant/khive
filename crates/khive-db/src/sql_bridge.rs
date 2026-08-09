@@ -263,6 +263,100 @@ struct BatchFailure {
     poison_reason: Option<BatchPoisonReason>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchHandleDisposition {
+    Retain,
+    Poison,
+}
+
+/// Execute one standalone batch while every prepared statement remains scoped
+/// to the borrowed connection. The owned [`StandaloneHandle`] stays outside
+/// this helper, so it can be restored or dropped only after all statement
+/// borrows have ended.
+fn execute_standalone_batch(
+    conn: &rusqlite::Connection,
+    statements: &[SqlStatement],
+    origin: khive_storage::tx_registry::TxOrigin,
+) -> (BatchHandleDisposition, Result<u64, BatchFailure>) {
+    let prepared = match prepare_batch_statements(conn, statements) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return (
+                BatchHandleDisposition::Retain,
+                Err(BatchFailure {
+                    error,
+                    poison_reason: None,
+                }),
+            );
+        }
+    };
+    if let Err(begin_error) = conn.execute_batch("BEGIN IMMEDIATE") {
+        // Busy/locked is transient contention (another writer held SQLite's
+        // write lock past `busy_timeout`); the connection itself is untouched,
+        // so the handle remains reusable. Any other failure leaves transaction
+        // state suspect and poisons the handle.
+        drop(prepared);
+        let (disposition, poison_reason) = if crate::timeout_sink::is_busy_or_locked(&begin_error) {
+            (BatchHandleDisposition::Retain, None)
+        } else {
+            tracing::warn!(
+                %begin_error,
+                "execute_batch: BEGIN IMMEDIATE failed non-transiently; \
+                 poisoning the standalone connection — the handle is \
+                 dropped and must be re-acquired"
+            );
+            (
+                BatchHandleDisposition::Poison,
+                Some(BatchPoisonReason::BeginFailed),
+            )
+        };
+        return (
+            disposition,
+            Err(BatchFailure {
+                error: begin_error,
+                poison_reason,
+            }),
+        );
+    }
+
+    // Registered only after BEGIN succeeds, and retained through COMMIT or
+    // ROLLBACK so the registry never reports a transaction as finished early.
+    let _tx_handle =
+        khive_storage::tx_registry::register_scoped(Some("execute_batch".to_string()), origin);
+    let result = (|| -> Result<u64, rusqlite::Error> {
+        let total = execute_prepared_batch(conn, prepared, statements)?;
+        conn.execute_batch("COMMIT")?;
+        Ok(total)
+    })();
+
+    let mut disposition = BatchHandleDisposition::Retain;
+    let mut poison_reason = None;
+    if let Err(error) = &result {
+        if let Err(rollback_error) = conn.execute_batch("ROLLBACK") {
+            // A failed ROLLBACK leaves the connection in an unknown
+            // transaction state. Preserve the original statement error while
+            // making the poison cause explicit to the caller.
+            tracing::warn!(
+                %error,
+                %rollback_error,
+                "execute_batch: ROLLBACK after statement failure failed; \
+                 poisoning the standalone connection — the handle is \
+                 dropped and must be re-acquired"
+            );
+            disposition = BatchHandleDisposition::Poison;
+            poison_reason = Some(BatchPoisonReason::RollbackFailed(rollback_error));
+        }
+    }
+
+    (
+        disposition,
+        result.map_err(|error| BatchFailure {
+            error,
+            poison_reason,
+        }),
+    )
+}
+
 #[derive(Debug)]
 enum BatchPoisonReason {
     BeginFailed,
@@ -869,98 +963,12 @@ impl khive_storage::SqlWriter for SqliteWriter {
         })?;
         let origin = self.origin.clone();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            let prepared = match prepare_batch_statements(&handle.conn, &statements) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    return (
-                        Some(handle),
-                        Err(BatchFailure {
-                            error,
-                            poison_reason: None,
-                        }),
-                    );
-                }
+            let (disposition, result) = execute_standalone_batch(&handle.conn, &statements, origin);
+            let retained = match disposition {
+                BatchHandleDisposition::Retain => Some(handle),
+                BatchHandleDisposition::Poison => None,
             };
-            if let Err(begin_error) = handle.conn.execute_batch("BEGIN IMMEDIATE") {
-                // Busy/locked is transient contention (another writer held
-                // SQLite's write lock past `busy_timeout`); the connection
-                // itself is untouched, so the handle is restored as reusable.
-                // Any other failure leaves the connection's transaction state
-                // suspect (e.g. "cannot start a transaction within a
-                // transaction" after a caller-driven bare `BEGIN` on this
-                // same connection), so the handle is poisoned — dropped, not
-                // restored — and the returned error carries the poison
-                // context instead of letting a later call fail with only the
-                // generic "connection already consumed".
-                drop(prepared);
-                let mut poison_reason = None;
-                let retained = if crate::timeout_sink::is_busy_or_locked(&begin_error) {
-                    Some(handle)
-                } else {
-                    tracing::warn!(
-                        %begin_error,
-                        "execute_batch: BEGIN IMMEDIATE failed non-transiently; \
-                         poisoning the standalone connection — the handle is \
-                         dropped and must be re-acquired"
-                    );
-                    poison_reason = Some(BatchPoisonReason::BeginFailed);
-                    None
-                };
-                return (
-                    retained,
-                    Err(BatchFailure {
-                        error: begin_error,
-                        poison_reason,
-                    }),
-                );
-            }
-            // Registered only after BEGIN succeeds, so an unopened transaction is
-            // never counted. The handle is declared here — enclosing both the
-            // statement-execution closure below AND the ROLLBACK path — so it
-            // stays registered until the transaction is actually finished
-            // (COMMIT or ROLLBACK), not just until the inner closure returns.
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("execute_batch".to_string()),
-                origin,
-            );
-            let result = (|| -> Result<u64, rusqlite::Error> {
-                let total = execute_prepared_batch(&handle.conn, prepared, &statements)?;
-                handle.conn.execute_batch("COMMIT")?;
-                Ok(total)
-            })();
-            let mut poison_reason = None;
-            let retained = if let Err(error) = &result {
-                if let Err(rollback_error) = handle.conn.execute_batch("ROLLBACK") {
-                    // A failed ROLLBACK leaves the connection in an unknown
-                    // transaction state, so it must never be reused: the handle
-                    // is poisoned (dropped instead of restored) and every
-                    // subsequent call on this bridge fails with "connection
-                    // already consumed". The caller sees the ORIGINAL statement
-                    // error with the poison context attached (never masked by
-                    // the rollback failure alone).
-                    tracing::warn!(
-                        %error,
-                        %rollback_error,
-                        "execute_batch: ROLLBACK after statement failure failed; \
-                         poisoning the standalone connection — the handle is \
-                         dropped and must be re-acquired"
-                    );
-                    poison_reason = Some(BatchPoisonReason::RollbackFailed(rollback_error));
-                    None
-                } else {
-                    Some(handle)
-                }
-            } else {
-                Some(handle)
-            };
-            // `_tx_handle` drops here, after ROLLBACK (or COMMIT) has already run.
-            (
-                retained,
-                result.map_err(|error| BatchFailure {
-                    error,
-                    poison_reason,
-                }),
-            )
+            (retained, result)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
