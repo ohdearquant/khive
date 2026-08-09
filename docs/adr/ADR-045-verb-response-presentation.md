@@ -250,6 +250,13 @@ pub fn present_response(
 Pack handlers are unaware of mode. Tests against handler outputs always check
 verbose shape — golden outputs don't need to be mode-aware.
 
+ADR-016's optional envelope-level `advisories` array is outside the handler
+result and therefore outside every presentation and output-format transform.
+The runtime may add that transport-owned array after result presentation; its
+objects remain byte-for-byte machine-readable in Agent, Verbose, and Human
+modes. This preserves the central invariant here: presentation changes only a
+successful envelope's `result`, never sibling envelope metadata.
+
 ### 5. Handler invariants
 
 Handlers MUST:

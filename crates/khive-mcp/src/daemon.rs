@@ -2684,6 +2684,20 @@ mod tests {
     }
 
     #[test]
+    fn first_config_mismatch_field_recognizes_read_only_runtime_mode() {
+        let writable = "packs=[kg];db=/private/snapshot.db;embed=none;extra=[];\
+                        backend=main;outbound=[];git_write=policy";
+        let read_only = "packs=[kg];db=/private/snapshot.db;embed=none;extra=[];\
+                         backend=main:read_only;outbound=[];git_write=policy";
+
+        assert_eq!(
+            first_config_mismatch_field(read_only, Some(writable)),
+            "backend",
+            "storage-mode separation must retain a structured mismatch field"
+        );
+    }
+
+    #[test]
     #[serial]
     fn map_response_config_mismatch_logs_opaque_ids_and_field_without_values() {
         reset_fallback_counters();

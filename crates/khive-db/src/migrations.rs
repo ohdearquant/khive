@@ -341,6 +341,45 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
     read_schema_version(&conn)
 }
 
+/// Require an already-open database to match this build's latest core schema
+/// without applying migrations.
+///
+/// A read-only snapshot behind the current migration set cannot be repaired in
+/// place, while a snapshot ahead of the binary may contain schema this build
+/// does not understand. Both directions fail with an actionable diagnostic; an
+/// exact match performs no writes.
+pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError> {
+    let current_version = read_schema_version(conn)?;
+    let latest_version = MIGRATIONS
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or(0);
+
+    if current_version < latest_version {
+        return Err(SqliteError::InvalidData(format!(
+            "read-only database schema version {current_version} is behind the latest known \
+             migration {latest_version}; migrate a writable copy with this build before opening \
+             the snapshot read-only"
+        )));
+    }
+    if current_version > latest_version {
+        return Err(SqliteError::InvalidData(format!(
+            "read-only database schema version {current_version} is ahead of the latest known \
+             migration {latest_version}; use a compatible newer build or recreate the snapshot"
+        )));
+    }
+
+    // Numeric equality alone is not enough: a database can carry the current
+    // maximum version under renamed or foreign migration ledger entries while
+    // exposing a materially different schema. Writable boot runs this same
+    // closed-name validation in `run_migrations_locked`; snapshot inspection
+    // must not accept a history that ordinary boot would reject merely because
+    // it cannot repair it in place.
+    validate_applied_migration_names(conn, current_version)?;
+
+    Ok(current_version)
+}
+
 #[cfg(test)]
 pub(crate) mod test_sync {
     use std::sync::atomic::AtomicU32;

@@ -224,9 +224,9 @@ impl DispatchFailure {
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
 ///
 /// Two servers produce the same id iff they can safely share one warm engine:
-/// same pack set (order-independent), same storage target, same embedders, same
-/// backend topology/routing, and same construction-baked fresh-tail, outbound,
-/// and git-write policies.
+/// same pack set (order-independent), same storage target and effective access
+/// mode, same embedders, same backend topology/routing, and same
+/// construction-baked fresh-tail, outbound, and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects
@@ -234,12 +234,16 @@ impl DispatchFailure {
 /// execute through the broader default daemon.
 ///
 /// When `khive_cfg` is supplied and contains a non-empty `[[backends]]`
-/// declaration, the backend topology (sorted backend list and pack→backend
-/// assignments) is folded into the fingerprint so that two configs differing
-/// only in pack routing produce different ids (ADR-049 / B-SHOULD-FIX-4).
+/// declaration, the backend topology (sorted backend list, explicit read-only
+/// modes, and pack→backend assignments) is folded into the fingerprint so that
+/// two configs differing only in routing or access mode produce different ids
+/// (ADR-049 / B-SHOULD-FIX-4).
 ///
-/// When `khive_cfg` is `None` or its `backends` list is empty, the fingerprint
-/// is byte-identical to what it would have been before this parameter was added.
+/// When `khive_cfg` is `None` or its `backends` list is empty, a writable
+/// target remains byte-identical to what it would have been before this
+/// parameter was added. An existing path with no filesystem write bits gains
+/// the read-only backend marker before the runtime opens it, so forwarding and
+/// server fingerprints converge.
 ///
 /// `config.db_path` and each declared backend path are canonicalized against
 /// the process's current working directory before entering the fingerprint. A
@@ -252,10 +256,11 @@ pub fn compute_config_id(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
 ) -> String {
-    compute_config_id_with_ann_fresh_tail(
+    compute_config_id_with_runtime_policies(
         config,
         khive_cfg,
         khive_runtime::ann_fresh_tail_enabled_from_env(),
+        configured_storage_read_only(config, khive_cfg),
     )
 }
 
@@ -268,6 +273,59 @@ pub(crate) fn compute_config_id_with_ann_fresh_tail(
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
     ann_fresh_tail_enabled: bool,
 ) -> String {
+    compute_config_id_with_runtime_policies(
+        config,
+        khive_cfg,
+        ann_fresh_tail_enabled,
+        configured_storage_read_only(config, khive_cfg),
+    )
+}
+
+fn configured_storage_read_only(
+    config: &RuntimeConfig,
+    khive_cfg: Option<&khive_runtime::KhiveConfig>,
+) -> bool {
+    if let Some(main) = khive_cfg
+        .filter(|cfg| !cfg.backends.is_empty())
+        .and_then(|cfg| cfg.backends.iter().find(|backend| backend.name == "main"))
+    {
+        return main.kind == khive_runtime::BackendKind::Sqlite && main.read_only;
+    }
+
+    config.db_path.as_ref().is_some_and(|path| {
+        std::fs::metadata(khive_runtime::expand_tilde(path))
+            .is_ok_and(|metadata| metadata.permissions().readonly())
+    })
+}
+
+/// Runtime-aware variant of [`compute_config_id`].
+///
+/// A chmod-detected snapshot has the same configured path as its writable
+/// source but cannot safely share a warm daemon with it: the writable daemon
+/// would omit the audit advisory and could retain a write-capable file handle.
+/// Fold the effective main-backend mode into the existing `backend` component
+/// so the mismatch remains parseable as a structured backend mismatch without
+/// changing the legacy fingerprint for writable runtimes.
+pub(crate) fn compute_config_id_with_storage_mode(
+    config: &RuntimeConfig,
+    khive_cfg: Option<&khive_runtime::KhiveConfig>,
+    storage_read_only: bool,
+) -> String {
+    compute_config_id_with_runtime_policies(
+        config,
+        khive_cfg,
+        khive_runtime::ann_fresh_tail_enabled_from_env(),
+        storage_read_only,
+    )
+}
+
+pub(crate) fn compute_config_id_with_runtime_policies(
+    config: &RuntimeConfig,
+    khive_cfg: Option<&khive_runtime::KhiveConfig>,
+    ann_fresh_tail_enabled: bool,
+    storage_read_only: bool,
+) -> String {
+    let storage_read_only = storage_read_only || configured_storage_read_only(config, khive_cfg);
     let mut packs = config.packs.clone();
     packs.sort();
     let db = config
@@ -307,14 +365,19 @@ pub(crate) fn compute_config_id_with_ann_fresh_tail(
     }
     let git_write = format!("{:x}", git_write_hasher.finalize());
 
+    let backend = if storage_read_only {
+        format!("{:?}:read_only", config.backend_id)
+    } else {
+        format!("{:?}", config.backend_id)
+    };
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};backend={:?};outbound=[{}];git_write={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};backend={};outbound=[{}];git_write={}",
         packs.join(","),
         db,
         primary,
         extra.join(","),
         ann_fresh_tail_enabled,
-        config.backend_id,
+        backend,
         outbound.join(","),
         git_write,
     );
@@ -335,7 +398,8 @@ pub(crate) fn compute_config_id_with_ann_fresh_tail(
                         .as_deref()
                         .map(canonical_fingerprint_path)
                         .unwrap_or_else(|| ":memory:".to_string());
-                    format!("{}:{:?}:{}", b.name, b.kind, path)
+                    let read_only = if b.read_only { ":read_only" } else { "" };
+                    format!("{}:{:?}:{}{}", b.name, b.kind, path, read_only)
                 })
                 .collect();
             backend_entries.sort();
@@ -560,10 +624,11 @@ impl KhiveMcpServer {
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
         let gate = runtime.config().gate.clone();
         let default_namespace = runtime.config().default_namespace.clone();
-        let config_id = compute_config_id_with_ann_fresh_tail(
+        let config_id = compute_config_id_with_runtime_policies(
             runtime.config(),
             None,
             runtime.ann_fresh_tail_enabled(),
+            runtime.is_read_only(),
         );
         let visible_namespaces = runtime.config().visible_namespaces.clone();
         let actor_id = runtime.config().actor_id.clone();
@@ -572,8 +637,11 @@ impl KhiveMcpServer {
         builder.with_default_namespace(default_namespace.as_str());
         builder.with_visible_namespaces(visible_namespaces);
         builder.with_actor_id(actor_id);
-        // Wire the EventStore into the registry for audit persistence.
-        if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
+        // A read-only snapshot deliberately retains no EventStore handle; the
+        // registry exposes an advisory beside each successful result instead.
+        if runtime.is_read_only() {
+            builder.with_read_only_audit_store();
+        } else if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
             if let Ok(event_store) = runtime.events(&tok) {
                 builder.with_event_store(event_store);
             }
@@ -625,7 +693,7 @@ impl KhiveMcpServer {
         registry.apply_schema_plans(runtime.backend());
         // Capture the pool arc for the WAL checkpoint task. Only available for
         // file-backed databases; in-memory backends return None here.
-        let pool = if runtime.backend().is_file_backed() {
+        let pool = if runtime.backend().is_file_backed() && !runtime.is_read_only() {
             Some(runtime.backend().pool_arc())
         } else {
             None
@@ -2491,6 +2559,8 @@ impl KhiveMcpServer {
             )
             .await;
 
+        attach_audit_persistence_advisories(&mut result, &self.registry);
+
         if strict_refusals {
             attach_strict_refusal_reasons(&mut result);
         }
@@ -2519,6 +2589,62 @@ impl KhiveMcpServer {
             &self.registry,
             (origin == DispatchOrigin::Daemon).then_some(self.config_id.as_str()),
         ))
+    }
+}
+
+/// Attach a registry-level audit advisory to successful operation entries
+/// without changing their canonical `result` values.
+///
+/// Help introspection is excluded because it short-circuits before the
+/// gate/audit lifecycle and therefore would not append an audit row.
+fn attach_audit_persistence_advisories(response: &mut Value, registry: &VerbRegistry) {
+    let Some(advisory) = registry.audit_persistence_advisory() else {
+        return;
+    };
+    let Some(results) = response.get_mut("results").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for entry in results {
+        if entry.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let tool = entry.get("tool").and_then(Value::as_str);
+        let is_help = entry.get("result").is_some_and(|result| {
+            let identifiers = result.get("identifier_resolution");
+            result.get("verb").and_then(Value::as_str) == tool
+                && result.get("pack").is_some_and(Value::is_string)
+                && result.get("description").is_some_and(Value::is_string)
+                && result.get("category").is_some_and(Value::is_string)
+                && identifiers
+                    .and_then(|value| value.get("full_uuid"))
+                    .is_some_and(Value::is_string)
+                && identifiers
+                    .and_then(|value| value.get("short_prefix"))
+                    .is_some_and(Value::is_string)
+                && identifiers
+                    .and_then(|value| value.get("parameter_rule"))
+                    .is_some_and(Value::is_string)
+        });
+        if is_help {
+            continue;
+        }
+
+        if let Some(map) = entry.as_object_mut() {
+            if let Some(existing) = map.get_mut("advisories") {
+                if let Some(advisories) = existing.as_array_mut() {
+                    let code = advisory.get("code");
+                    if !advisories.iter().any(|item| item.get("code") == code) {
+                        advisories.push(advisory.clone());
+                    }
+                }
+            } else {
+                map.insert(
+                    "advisories".to_string(),
+                    Value::Array(vec![advisory.clone()]),
+                );
+            }
+        }
     }
 }
 
@@ -2771,6 +2897,7 @@ fn frame_budget_omission(entry: &Value) -> Value {
         "status",
         "partial",
         "missing_backends",
+        "advisories",
     ] {
         if let Some(value) = entry.get(key) {
             omitted.insert(key.to_string(), value.clone());
@@ -3412,6 +3539,49 @@ mod tests {
     }
 
     #[test]
+    fn read_only_audit_advisory_decorates_success_but_not_help_or_error() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_read_only_audit_store();
+        let registry = builder.build().expect("registry builds");
+        let mut response = json!({
+            "results": [
+                {"ok": true, "tool": "stats", "result": {"entities": 0}},
+                {"ok": true, "tool": "list", "result": {"items": []}},
+                {"ok": true, "tool": "stats", "result": {
+                    "verb": "stats", "pack": "kg", "description": "help", "category": "assertive",
+                    "identifier_resolution": {
+                        "full_uuid": "canonical", "short_prefix": "prefix",
+                        "parameter_rule": "strict"
+                    }
+                }},
+                {"ok": false, "tool": "create", "error": "read-only"}
+            ],
+            "summary": {"total": 4, "succeeded": 3, "failed": 1, "aborted": 0},
+            "status": "partial"
+        });
+
+        attach_audit_persistence_advisories(&mut response, &registry);
+
+        assert_eq!(
+            response["results"][0]["advisories"][0]["code"],
+            khive_runtime::AUDIT_PERSISTENCE_SKIPPED_READ_ONLY
+        );
+        assert_eq!(
+            response["results"][1]["advisories"][0]["code"],
+            khive_runtime::AUDIT_PERSISTENCE_SKIPPED_READ_ONLY
+        );
+        assert!(response["results"][1]["result"]["items"].is_array());
+        assert!(response["results"][2].get("advisories").is_none());
+        assert!(response["results"][3].get("advisories").is_none());
+
+        let omitted = frame_budget_omission(&response["results"][0]);
+        assert!(
+            omitted.get("advisories").is_some(),
+            "frame-budget degradation must preserve the warning"
+        );
+    }
+
+    #[test]
     fn frame_budget_omission_preserves_search_degradation_advisory() {
         let omitted = frame_budget_omission(&json!({
             "ok": true,
@@ -3905,6 +4075,87 @@ mod tests {
             "two projects declaring the same relative backend path string from \
              different working directories must not share a config_id; both \
              produced: {id_a}"
+        );
+    }
+
+    #[test]
+    fn config_id_separates_effective_read_only_storage_modes() {
+        use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
+
+        let dir = tempfile::tempdir().expect("config-mode tempdir");
+        let runtime = RuntimeConfig {
+            db_path: Some(dir.path().join("khive-config-mode.db")),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::default()
+        };
+
+        let writable = compute_config_id(&runtime, None);
+        assert_eq!(
+            writable,
+            compute_config_id_with_storage_mode(&runtime, None, false),
+            "the writable fingerprint must remain byte-identical"
+        );
+        let detected_read_only = compute_config_id_with_storage_mode(&runtime, None, true);
+        assert_ne!(
+            writable, detected_read_only,
+            "a chmod-detected snapshot must not reuse a write-capable warm daemon"
+        );
+        assert!(detected_read_only.contains(&format!("backend={:?}:read_only", runtime.backend_id)));
+
+        let writable_topology = KhiveConfig {
+            backends: vec![khive_runtime::BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: runtime.db_path.clone(),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+        let mut read_only_topology = writable_topology.clone();
+        read_only_topology.backends[0].read_only = true;
+        assert_ne!(
+            compute_config_id(&runtime, Some(&writable_topology)),
+            compute_config_id(&runtime, Some(&read_only_topology)),
+            "declared multi-backend read_only mode is part of backend topology"
+        );
+        assert_eq!(
+            compute_config_id(&runtime, Some(&read_only_topology)),
+            compute_config_id_with_storage_mode(&runtime, Some(&read_only_topology), true),
+            "the pre-open client and opened read-only server must fingerprint identically"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_id_auto_detects_chmod_read_only_single_backend() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("config-mode tempdir");
+        let path = dir.path().join("chmod-snapshot.db");
+        std::fs::write(&path, b"snapshot identity fixture").expect("create fixture");
+        let runtime = RuntimeConfig {
+            db_path: Some(path.clone()),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let writable = compute_config_id(&runtime, None);
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let detected = compute_config_id(&runtime, None);
+        assert_ne!(writable, detected);
+        assert!(detected.contains("backend=main:read_only"), "{detected}");
+        assert_eq!(
+            detected,
+            compute_config_id_with_storage_mode(&runtime, None, true),
+            "pre-open forwarding and opened-server identities must converge"
         );
     }
 

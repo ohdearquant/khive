@@ -426,6 +426,41 @@ Response envelope:
 After parsing succeeds, `results.length == summary.total == input ops count`.
 Order preserves input order regardless of parallel completion order.
 
+#### Transport-owned per-operation advisories (2026-08-09 amendment)
+
+A successful per-operation envelope MAY carry an `advisories` array beside
+`result`:
+
+```json
+{
+  "ok": true,
+  "tool": "stats",
+  "result": { "entities": 42 },
+  "advisories": [
+    {
+      "code": "audit_persistence_skipped_read_only",
+      "severity": "warning",
+      "component": "audit_event_store",
+      "reason": "read_only_backend",
+      "message": "operation completed, but its dispatch audit event was not persisted because the audit backend is read-only"
+    }
+  ]
+}
+```
+
+`advisories` is transport-owned metadata about delivery or execution context;
+it is not part of the verb-owned canonical `result`, does not change `ok` or
+the batch summary, and MUST NOT be injected into `result`. Advisory objects
+have stable `code`, `severity`, `component`, `reason`, and `message` fields.
+Presentation and output-format transforms apply only to `result`, so callers
+receive advisory objects unchanged. Frame-budget degradation preserves the
+array even if an oversized `result` is replaced by `result_omitted`.
+
+The first governed advisory is
+`audit_persistence_skipped_read_only` (ADR-028 Amendment A2). It appears on
+successful non-help operations when the configured audit backend is
+read-only. Failed, aborted, and help-introspection entries do not carry it.
+
 ### Gate enforcement
 
 Per ADR-003, gate enforcement is part of the agent-binary (`khive-mcp`)

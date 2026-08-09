@@ -56,6 +56,60 @@ fn insert_dependency_test_edge(
 }
 
 #[test]
+fn read_only_schema_validation_requires_exact_current_version_without_writes() {
+    let mut current = open_memory();
+    let latest = run_migrations(&mut current).expect("migrate current schema");
+    let changes_before = current.total_changes();
+    assert_eq!(
+        validate_schema_is_current(&current).expect("current schema validates"),
+        latest
+    );
+    assert_eq!(
+        current.total_changes(),
+        changes_before,
+        "compatibility validation must perform no writes"
+    );
+
+    let mut wrong_name = open_memory();
+    let wrong_name_latest = run_migrations(&mut wrong_name).expect("migrate name-check schema");
+    wrong_name
+        .execute(
+            "UPDATE _schema_migrations SET name = 'foreign_current_schema' WHERE version = ?1",
+            [wrong_name_latest],
+        )
+        .expect("inject a foreign current-version ledger name");
+    let wrong_name_error = validate_schema_is_current(&wrong_name)
+        .expect_err("numeric equality must not hide a foreign migration history");
+    assert!(
+        wrong_name_error
+            .to_string()
+            .contains("migration history does not match"),
+        "name-divergence diagnostic must match writable boot: {wrong_name_error}"
+    );
+
+    let behind = open_memory();
+    let behind_error = validate_schema_is_current(&behind)
+        .expect_err("an un-migrated read-only snapshot must be rejected");
+    assert!(
+        behind_error.to_string().contains("migrate a writable copy"),
+        "behind-version diagnostic must be actionable: {behind_error}"
+    );
+
+    current
+        .execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, 'future', 0)",
+            [latest + 1],
+        )
+        .expect("inject future schema ledger row");
+    let ahead_error = validate_schema_is_current(&current)
+        .expect_err("a snapshot newer than this build must be rejected");
+    assert!(
+        ahead_error.to_string().contains("compatible newer build"),
+        "ahead-version diagnostic must be actionable: {ahead_error}"
+    );
+}
+
+#[test]
 fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
     static MIGRATIONS: &[Migration] = &[Migration {
         id: "001_atomic",
