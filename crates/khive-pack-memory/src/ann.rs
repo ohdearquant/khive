@@ -3315,6 +3315,7 @@ mod tests {
     /// for the pathless publication lock and revalidate the now-active row,
     /// not evict the candidate that the checkpoint is about to publish.
     #[tokio::test]
+    #[serial(adr118_fresh_tail)]
     async fn pathless_pending_reader_waits_for_checkpoint_activation() {
         const MODEL: &str = "pathless-pending-publication-wait";
         let rt = KhiveRuntime::memory().expect("runtime");
@@ -3374,6 +3375,7 @@ mod tests {
     /// loses its registration while the reader is blocked, revalidation must
     /// still evict and return an empty replacement leg.
     #[tokio::test]
+    #[serial(adr118_fresh_tail)]
     async fn pathless_pending_reader_evicts_after_registration_loss() {
         const MODEL: &str = "pathless-pending-publication-loss";
         let rt = KhiveRuntime::memory().expect("runtime");
