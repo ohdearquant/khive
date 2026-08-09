@@ -94,6 +94,64 @@ response. Without `--strict`, a _partially_ failed request (`status: "partial"` 
 one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
 or aborted op into a nonzero process exit.
 
+### Stable refusal reasons
+
+Refused invocations retain their existing human-readable error and exit-code
+semantics, and additionally write `kkernel-refusal: <token>` to stderr. Failed
+per-operation JSON entries carry the same token in a sibling `reason` field.
+The following vocabulary is closed and append-only: new classifications may be
+added, but an existing token's spelling and meaning never change.
+
+| Token                   | Meaning                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------ |
+| `anonymous-actor`       | The resolved actor is anonymous while attributed execution is required.              |
+| `expect-actor-mismatch` | The resolved actor differs from `--expect-actor`.                                    |
+| `gate-refusal`          | Content was refused by the write-time secret gate.                                   |
+| `strict-op-failure`     | `--strict` observed at least one otherwise-unclassified failed or aborted operation. |
+| `parse-error`           | The operation expression or JSONL operation failed to parse.                         |
+| `verb-refused`          | The requested verb is unknown or is not loaded.                                      |
+
+For a multi-failure batch, stderr contains one line per classified failed or
+aborted operation. A specific dispatch reason (`gate-refusal` or
+`verb-refused`) takes precedence over the aggregate `strict-op-failure` reason
+for that entry. An invocation-level actor refusal emits one line and returns
+the same normal `results`/`summary` JSON shape over every parsed operation
+without dispatching. Those failed rows and the `summary.failed` count describe
+not-attempted operations, not per-operation execution failures. A malformed
+expression or JSONL line has no operation
+list, so it preserves the parse-before-envelope boundary and prints a dedicated
+invocation error instead of inventing a tool:
+
+```json
+{
+  "error": {
+    "code": "invalid_params",
+    "message": "<unchanged parser error>",
+    "reason": "parse-error"
+  },
+  "invocation": { "started": false }
+}
+```
+
+Carrier parsing precedes actor expectation, attributed-actor gates, and the
+explicit `--db` versus multi-backend `database_override_conflict` check. If an
+invocation is malformed and would also fail any of those later preflights,
+`parse-error` is therefore the deterministic first classification for inline
+DSL and JSONL alike.
+
+With `--strict --save-file`, classification happens before the save sink writes
+or hashes rows. The stdout manifest's `failures[].reason` is consequently an
+exact projection of the corresponding reason in the checksummed JSONL row.
+
+Atomic ops-file preflight and prepare failures use the real per-operation
+`results` shape: an unknown or unloaded verb receives `verb-refused`, while a
+known verb that is merely ineligible for `--atomic` remains unclassified.
+Secret-gate failures during atomic prepare receive `gate-refusal`. An atomic
+rollback passed with `--strict` receives `strict-op-failure` on each
+not-committed result without changing the atomic path's existing process-exit
+semantics. Ordinary validation, transport, storage, and authorization-gate
+failures remain unclassified unless `--strict` supplies the aggregate reason.
+
 When an explicit `--db` conflicts with a selected multi-backend config,
 dispatch does not begin. The command emits
 `error.code = "database_override_conflict"` with

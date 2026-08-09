@@ -3,7 +3,7 @@
 //! prepare pass -> commit pass -> post-commit reindex. See
 //! `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`
 //! for the full pipeline, why `propose`/`review`/`withdraw`/`merge` are
-//! rejected pre-runtime rather than partially supported, and the gtd-adapter
+//! rejected pre-target-runtime rather than partially supported, and the gtd-adapter
 //! ownership split with `khive-pack-gtd`.
 
 use std::collections::HashMap;
@@ -20,13 +20,180 @@ use khive_runtime::atomic_plan::{
 use khive_runtime::atomic_runner::{AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder};
 use khive_runtime::{
-    EdgeListFilter, KhiveConfig, KhiveRuntime, LinkSpec, NamespaceToken, Resolved, RuntimeConfig,
+    EdgeListFilter, KhiveConfig, KhiveRuntime, LinkSpec, Namespace, NamespaceToken, Resolved,
+    RuntimeConfig, RuntimeError,
 };
 use khive_storage::EdgeRelation;
 #[cfg(test)]
 use khive_storage::{types::SqlValue, SqlStatement};
+use khive_types::RefusalReason;
 
 use crate::exec::OpsFileEntry;
+
+#[derive(Clone, Debug)]
+struct AtomicFailureDetail {
+    op_index: usize,
+    tool: String,
+    error: String,
+    reason: Option<RefusalReason>,
+}
+
+/// Typed, pre-commit atomic failure returned to the CLI boundary.
+///
+/// The human `message` remains the command's terminal error text. `envelope`
+/// is an additive machine-readable view over the real operation list, allowing
+/// the CLI to emit stable refusal reasons without scraping that text.
+#[derive(Debug)]
+pub(crate) struct AtomicExecFailure {
+    message: String,
+    envelope: Value,
+}
+
+impl AtomicExecFailure {
+    fn new(ops: &[OpsFileEntry], message: String, failures: Vec<AtomicFailureDetail>) -> Self {
+        let by_index: std::collections::BTreeMap<usize, AtomicFailureDetail> = failures
+            .into_iter()
+            .map(|failure| (failure.op_index, failure))
+            .collect();
+        let first_failed = by_index.keys().next().copied();
+        let results = ops
+            .iter()
+            .enumerate()
+            .map(|(op_index, op)| {
+                if let Some(failure) = by_index.get(&op_index) {
+                    let mut entry = json!({
+                        "ok": false,
+                        "tool": failure.tool.as_str(),
+                        "op_index": op_index,
+                        "error": failure.error.as_str(),
+                    });
+                    if let Some(reason) = failure.reason {
+                        entry["reason"] = json!(reason.as_str());
+                    }
+                    entry
+                } else {
+                    json!({
+                        "ok": false,
+                        "tool": op.tool.as_str(),
+                        "op_index": op_index,
+                        "error": "not applied: atomic pre-commit validation rejected another operation",
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+        let envelope = json!({
+            "results": results,
+            "summary": {"total": ops.len(), "succeeded": 0, "failed": ops.len()},
+            "atomic": {
+                "committed": false,
+                "rolled_back": false,
+                "failed_op_index": first_failed,
+                "error": message.as_str(),
+            },
+        });
+        Self { message, envelope }
+    }
+
+    pub(crate) fn envelope(&self) -> Value {
+        self.envelope.clone()
+    }
+}
+
+impl std::fmt::Display for AtomicExecFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AtomicExecFailure {}
+
+fn atomic_failure_error(
+    ops: &[OpsFileEntry],
+    message: String,
+    failures: Vec<AtomicFailureDetail>,
+) -> anyhow::Error {
+    anyhow::Error::new(AtomicExecFailure::new(ops, message, failures))
+}
+
+/// Build a metadata-only in-memory registry for exactly the configured pack
+/// set. Atomic admissibility must run before the target database is opened,
+/// but classifying `verb-refused` requires the same loaded-vs-known distinction
+/// normal dispatch gets from `VerbRegistry::has_verb`.
+fn build_atomic_preflight_registry(cfg: &RuntimeConfig) -> Result<(VerbRegistry, KhiveRuntime)> {
+    let mut metadata_cfg = cfg.clone();
+    metadata_cfg.db_path = None;
+    metadata_cfg.embedding_model = None;
+    metadata_cfg.additional_embedding_models.clear();
+    metadata_cfg.default_namespace =
+        Namespace::parse("kkernel-atomic-preflight").unwrap_or_else(|_| Namespace::local());
+    let pack_names = metadata_cfg.packs.clone();
+    let runtime =
+        KhiveRuntime::new(metadata_cfg).context("building --atomic preflight registry runtime")?;
+    let mut builder = VerbRegistryBuilder::new();
+    PackRegistry::register_packs(&pack_names, runtime.clone(), &mut builder)
+        .map_err(|error| anyhow::anyhow!("build --atomic preflight registry: {error}"))?;
+    let registry = builder
+        .build()
+        .context("building --atomic preflight VerbRegistry")?;
+    Ok((registry, runtime))
+}
+
+fn classify_atomic_preflight(
+    ops: &[OpsFileEntry],
+    cfg: &RuntimeConfig,
+) -> Result<Vec<AtomicFailureDetail>> {
+    let parsed: Vec<khive_request::ParsedOp> = ops
+        .iter()
+        .map(|op| khive_request::ParsedOp {
+            tool: op.tool.clone(),
+            args: std::collections::BTreeMap::new(),
+        })
+        .collect();
+    let rejections: std::collections::BTreeMap<usize, khive_request::AtomicRejection> =
+        khive_request::atomic::check_atomic_admissible(&parsed)
+            .into_iter()
+            .map(|rejection| (rejection.op_index, rejection))
+            .collect();
+    let (registry, _runtime) = build_atomic_preflight_registry(cfg)?;
+
+    let mut failures = Vec::new();
+    for (op_index, op) in ops.iter().enumerate() {
+        let Some(rejection) = rejections.get(&op_index) else {
+            continue;
+        };
+        if !registry.has_verb(&op.tool) {
+            let static_detail = rejections
+                .get(&op_index)
+                .map(|rejection| format!("; static policy also reports: {rejection}"))
+                .unwrap_or_default();
+            let error = format!(
+                "op {op_index} (`{}`) cannot run under --atomic: verb is unknown or not loaded{static_detail}",
+                op.tool
+            );
+            failures.push(AtomicFailureDetail {
+                op_index,
+                tool: op.tool.clone(),
+                error,
+                reason: Some(RefusalReason::VerbRefused),
+            });
+        } else {
+            failures.push(AtomicFailureDetail {
+                op_index,
+                tool: op.tool.clone(),
+                error: rejection.to_string(),
+                reason: None,
+            });
+        }
+    }
+    Ok(failures)
+}
+
+fn refusal_reason_for_prepare_error(error: &anyhow::Error) -> Option<RefusalReason> {
+    match error.downcast_ref::<RuntimeError>() {
+        Some(RuntimeError::SecretDetected(_)) => Some(RefusalReason::GateRefusal),
+        _ => None,
+    }
+}
 
 fn add_post_commit_embedding_warning(
     result: &mut Value,
@@ -57,34 +224,16 @@ fn add_post_commit_embedding_warning(
 /// Run `ops` as ONE ADR-099 atomic unit against a freshly built in-process
 /// runtime. Returns the additive result envelope
 /// (`{"results", "summary", "atomic"}`) on success or a rolled-back run; the
-/// only `Err` cases are the parse-time admissibility rejection, the
-/// op-count guard, an unsupported multi-backend config, or a genuine
-/// `atomic_unit` seam failure (`AtomicRunnerError`) — every one of these
-/// happens before any write.
+/// `Err` cases are typed preflight/prepare failures, the op-count guard, an
+/// unsupported multi-backend config, or a genuine `atomic_unit` seam failure
+/// (`AtomicRunnerError`). Preflight and prepare failures happen before any
+/// target write and retain a per-operation envelope for the CLI boundary.
 pub(crate) async fn execute_atomic_ops_file(
     ops: Vec<OpsFileEntry>,
     cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     max_ops: usize,
 ) -> Result<Value> {
-    // ── parse-time admissibility (before any runtime / any write) ──────────
-    let parsed_for_check: Vec<khive_request::ParsedOp> = ops
-        .iter()
-        .map(|op| khive_request::ParsedOp {
-            tool: op.tool.clone(),
-            args: std::collections::BTreeMap::new(),
-        })
-        .collect();
-    let rejections = khive_request::atomic::check_atomic_admissible(&parsed_for_check);
-    if !rejections.is_empty() {
-        let messages: Vec<String> = rejections.iter().map(|r| r.to_string()).collect();
-        anyhow::bail!(
-            "--atomic rejected {} op(s) before any write:\n{}",
-            messages.len(),
-            messages.join("\n")
-        );
-    }
-
     // ── op-count guard (before any runtime / any write) ─────────────────────
     if ops.len() > max_ops {
         anyhow::bail!(
@@ -103,11 +252,33 @@ pub(crate) async fn execute_atomic_ops_file(
         );
     }
 
+    // ── parse-time admissibility (before target runtime / any target write) ─
+    // Resolve loaded-verb membership against a metadata-only in-memory
+    // registry. This keeps unknown/unloaded verbs distinct from known verbs
+    // that are merely ineligible for ADR-099 atomic execution.
+    let preflight_failures = classify_atomic_preflight(&ops, &cfg)?;
+    if !preflight_failures.is_empty() {
+        let messages: Vec<&str> = preflight_failures
+            .iter()
+            .map(|failure| failure.error.as_str())
+            .collect();
+        let message = format!(
+            "--atomic rejected {} op(s) before any write:\n{}",
+            messages.len(),
+            messages.join("\n")
+        );
+        return Err(atomic_failure_error(&ops, message, preflight_failures));
+    }
+
     // Guard cold construction (migrations) the same way every other local
     // `kkernel exec` path does — see `crate::exec::acquire_local_construction_guard`.
     // Dropped right after `KhiveRuntime::new` returns rather than held for the
     // whole atomic run: the race this closes is cold-boot schema init, not the
     // prepare/commit passes below.
+    let pack_names: Vec<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let boot_guard = crate::exec::acquire_local_construction_guard(&cfg)?;
     let namespace = cfg.default_namespace.clone();
     let runtime = KhiveRuntime::new(cfg).context("build in-process runtime for --atomic")?;
@@ -116,8 +287,8 @@ pub(crate) async fn execute_atomic_ops_file(
         .authorize(namespace)
         .context("authorize namespace for --atomic")?;
 
-    // ADR-099 B3: a `VerbRegistry` built from every
-    // discovered pack, reusing the REAL runtime just constructed above (via
+    // ADR-099 B3: a `VerbRegistry` built from the full discovered pack set,
+    // reusing the REAL runtime just constructed above (via
     // `.clone()` — `KhiveRuntime` derives `Clone`) rather than a second
     // throwaway one (the pattern `kkernel::pack_introspect::build_registry`
     // uses for introspection). This is what makes `resolve_kind_spec`
@@ -127,10 +298,6 @@ pub(crate) async fn execute_atomic_ops_file(
     // entity_kind/note_kind names from every loaded pack) can only be done
     // here, where both the runtime and the packs are visible.
     let mut verb_registry_builder = VerbRegistryBuilder::new();
-    let pack_names: Vec<String> = PackRegistry::discovered_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
     PackRegistry::register_packs(&pack_names, runtime.clone(), &mut verb_registry_builder)
         .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
     let verb_registry = verb_registry_builder
@@ -164,12 +331,24 @@ pub(crate) async fn execute_atomic_ops_file(
     // without re-parsing the ops file.
     let mut resolved_args_list: Vec<Value> = Vec::with_capacity(ops.len());
     for (op_index, op) in ops.iter().enumerate() {
-        let (plan, resolved_args) =
-            prepare_one(&runtime, &token, &verb_registry, &op.tool, &op.args)
-                .await
-                .with_context(|| format!("op {op_index} (`{}`) failed to prepare", op.tool))?;
-        plans.push(plan);
-        resolved_args_list.push(resolved_args);
+        match prepare_one(&runtime, &token, &verb_registry, &op.tool, &op.args).await {
+            Ok((plan, resolved_args)) => {
+                plans.push(plan);
+                resolved_args_list.push(resolved_args);
+            }
+            Err(error) => {
+                let reason = refusal_reason_for_prepare_error(&error);
+                let error_message =
+                    format!("op {op_index} (`{}`) failed to prepare: {error:#}", op.tool);
+                let failure = AtomicFailureDetail {
+                    op_index,
+                    tool: op.tool.clone(),
+                    error: error_message.clone(),
+                    reason,
+                };
+                return Err(atomic_failure_error(&ops, error_message, vec![failure]));
+            }
+        }
     }
 
     // ── synchronous commit pass (ADR-099 D1 phase 2, B2) ────────────────────
@@ -379,15 +558,11 @@ async fn prepare_one(
     validate_atomic_args(tool, args)?;
     match tool {
         "gtd.transition" => {
-            let plan = prepare_gtd_transition(runtime, token, args)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let plan = prepare_gtd_transition(runtime, token, args).await?;
             Ok((plan, args.clone()))
         }
         "gtd.complete" => {
-            let plan = prepare_gtd_complete(runtime, token, args)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let plan = prepare_gtd_complete(runtime, token, args).await?;
             Ok((plan, args.clone()))
         }
         "update" => {
@@ -420,11 +595,11 @@ async fn prepare_one(
                     &note,
                     &expected_kind,
                 )
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(anyhow::Error::new)?;
                 registry
                     .prepare_note_update_hook(runtime, token, &note, &mut resolved)
                     .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(anyhow::Error::new)?;
                 khive_runtime::atomic_prepare::prepare_update_from_note_snapshot(
                     runtime,
                     token,
@@ -433,7 +608,7 @@ async fn prepare_one(
                     note,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .map_err(anyhow::Error::new)?
             } else {
                 khive_runtime::atomic_prepare::prepare_update(
                     runtime,
@@ -442,7 +617,7 @@ async fn prepare_one(
                     expected_kind,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .map_err(anyhow::Error::new)?
             };
             Ok((plan, resolved))
         }
@@ -450,7 +625,7 @@ async fn prepare_one(
             let resolved = resolve_kg_ids_in_args(runtime, token, tool, args).await?;
             let plan = khive_runtime::atomic_prepare::prepare_op(runtime, token, tool, &resolved)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(anyhow::Error::new)?;
             let source_id = resolved
                 .get("source_id")
                 .and_then(Value::as_str)
@@ -481,7 +656,7 @@ async fn prepare_one(
             registry
                 .validate_link_hooks(runtime, token, std::slice::from_ref(&spec))
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(anyhow::Error::new)?;
             Ok((plan, resolved))
         }
         "delete" => {
@@ -494,13 +669,13 @@ async fn prepare_one(
                 expected_kind,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(anyhow::Error::new)?;
             Ok((plan, resolved))
         }
         _ => {
             let plan = khive_runtime::atomic_prepare::prepare_op(runtime, token, tool, args)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(anyhow::Error::new)?;
             Ok((plan, args.clone()))
         }
     }
@@ -957,7 +1132,7 @@ async fn prepare_gtd_transition(
     let decision =
         khive_pack_gtd::handlers::prepare_transition(runtime, token, raw_id, raw_status, note_arg)
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(anyhow::Error::new)?;
 
     match decision {
         khive_pack_gtd::handlers::TransitionDecision::NoOp { note, current, .. } => {
@@ -1027,7 +1202,7 @@ async fn prepare_gtd_complete(
     let decision =
         khive_pack_gtd::handlers::prepare_complete(runtime, token, raw_id, status_arg, result_arg)
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(anyhow::Error::new)?;
 
     let statement = khive_pack_gtd::handlers::gtd_transition_statement(
         &decision.note,

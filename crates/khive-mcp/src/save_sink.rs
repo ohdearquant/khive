@@ -130,9 +130,16 @@ fn validate_destination(root: &Path, requested: &Path) -> anyhow::Result<PathBuf
 ///   "rows": <N>,
 ///   "per_column_null_counts": { "<field>": <null_count>, ... },
 ///   "schema_fingerprint": "<sha256 of sorted field names>",
-///   "checksum": "<sha256 of file bytes>"
+///   "checksum": "<sha256 of file bytes>",
+///   "summary": { ... },
+///   "failures": [ {"op_index": 0, "tool": "...", "error": ..., "reason": "..."} ]
 /// }
 /// ```
+///
+/// `failures` is omitted for an all-successful result. It is a compact
+/// projection rather than the full result payload: `kkernel exec --save-file`
+/// callers still need structured refusal metadata in the stdout manifest,
+/// while the canonical per-op rows remain in the JSONL file.
 ///
 /// `restrict_to_export_root` gates the destination policy (root containment,
 /// `..` traversal rejection, symlink-destination rejection): `true` for the
@@ -219,14 +226,41 @@ pub fn write_and_manifest(
         })
     });
 
-    Ok(json!({
+    let failures: Vec<Value> = results_arr
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.get("ok").and_then(Value::as_bool) == Some(false))
+        .map(|(op_index, row)| {
+            let mut failure = json!({
+                "op_index": row
+                    .get("op_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(op_index as u64),
+                "tool": row.get("tool").and_then(Value::as_str).unwrap_or("?"),
+                "error": row
+                    .get("error")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("unknown error".to_string())),
+            });
+            if let Some(reason) = row.get("reason").and_then(Value::as_str) {
+                failure["reason"] = Value::String(reason.to_string());
+            }
+            failure
+        })
+        .collect();
+
+    let mut manifest = json!({
         "path": abs_path.to_string_lossy(),
         "rows": rows,
         "per_column_null_counts": null_counts_val,
         "schema_fingerprint": schema_fingerprint,
         "checksum": checksum,
         "summary": summary,
-    }))
+    });
+    if !failures.is_empty() {
+        manifest["failures"] = Value::Array(failures);
+    }
+    Ok(manifest)
 }
 
 fn hex_sha256(data: &[u8]) -> String {
@@ -301,13 +335,22 @@ mod tests {
 
         let envelope = make_envelope(vec![
             json!({ "ok": true, "tool": "stats", "result": {} }),
-            json!({ "ok": false, "tool": "get", "error": "not found" }),
+            json!({
+                "ok": false,
+                "tool": "not_loaded",
+                "error": "unknown verb",
+                "reason": "verb-refused"
+            }),
         ]);
 
         let manifest = write_and_manifest(&envelope, &path, false).unwrap();
         assert_eq!(manifest["summary"]["total"], json!(2));
         assert_eq!(manifest["summary"]["succeeded"], json!(1));
         assert_eq!(manifest["summary"]["failed"], json!(1));
+        assert_eq!(manifest["failures"][0]["op_index"], json!(1));
+        assert_eq!(manifest["failures"][0]["tool"], json!("not_loaded"));
+        assert_eq!(manifest["failures"][0]["error"], json!("unknown verb"));
+        assert_eq!(manifest["failures"][0]["reason"], json!("verb-refused"));
     }
 
     #[test]

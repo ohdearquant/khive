@@ -48,7 +48,9 @@ pub struct RequestParams {
     ///
     /// When set, the full results are written as JSONL to this path and the
     /// caller receives a self-describing manifest instead of the raw results:
-    /// `{path, rows, per_column_null_counts, schema_fingerprint, checksum}`.
+    /// `{path, rows, per_column_null_counts, schema_fingerprint, checksum,
+    /// summary, failures?}`. Each failure retains its `error` payload and
+    /// optional stable refusal `reason`.
     ///
     /// The manifest lets agents detect bulk-export corruption (e.g. 10 000 null
     /// rows) in one call rather than after a downstream judgment fleet has graded

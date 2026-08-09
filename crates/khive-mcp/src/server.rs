@@ -36,6 +36,7 @@ use khive_runtime::{
     PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
     VerbRegistry, VerbRegistryBuilder,
 };
+use khive_types::RefusalReason;
 
 use khive_storage::{EdgeRelation, StorageCapability};
 
@@ -172,6 +173,52 @@ struct RunParsedContext<'a> {
     enforce_response_budget: bool,
     from_wire: bool,
     identity: Option<&'a khive_runtime::RequestIdentity>,
+}
+
+/// Typed failure crossing the dispatch/envelope seam.
+///
+/// `error` retains the pre-existing human or structured payload. `reason` is
+/// an additive machine classification and is absent for ordinary validation,
+/// storage, transport, coordinator, and authorization-gate failures.
+#[derive(Debug)]
+struct DispatchFailure {
+    tool: String,
+    error: Value,
+    reason: Option<RefusalReason>,
+}
+
+impl DispatchFailure {
+    fn unclassified(tool: impl Into<String>, error: Value) -> Self {
+        Self {
+            tool: tool.into(),
+            error,
+            reason: None,
+        }
+    }
+
+    fn from_runtime(tool: &str, error: RuntimeError) -> Self {
+        let reason = match &error {
+            // `gate-refusal` is deliberately limited to the write-time secret
+            // gate. Authorization denials and gate infrastructure errors keep
+            // their established, unclassified shapes.
+            RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
+            RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
+            _ => None,
+        };
+        Self {
+            tool: tool.to_string(),
+            error: runtime_error_value(error),
+            reason,
+        }
+    }
+
+    fn into_entry(self) -> Value {
+        let mut entry = json!({ "ok": false, "tool": self.tool, "error": self.error });
+        if let Some(reason) = self.reason {
+            entry["reason"] = json!(reason.as_str());
+        }
+        entry
+    }
 }
 
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
@@ -677,7 +724,7 @@ impl KhiveMcpServer {
     /// Result semantics mirror the per-op envelope from the registry:
     /// `Ok(OpSuccess)` → success payload plus any coordinator degradation
     /// metadata (caller wraps it in the per-op envelope).
-    /// `Err((tool, error_value))` → error payload (caller wraps in `{ok:false, tool, error}`).
+    /// `Err(DispatchFailure)` → error payload plus any stable refusal reason.
     ///
     /// `identity` mirrors the override [`Self::dispatch_op`] applies to the
     /// registry path (ADR-096 Fork 1): when present, its namespace is used
@@ -689,7 +736,7 @@ impl KhiveMcpServer {
         tool: &str,
         args_value: &Value,
         identity: Option<&khive_runtime::RequestIdentity>,
-    ) -> Option<Result<OpSuccess, (String, Value)>> {
+    ) -> Option<Result<OpSuccess, DispatchFailure>> {
         let coord = self.coordinator.as_ref()?;
         if coord.is_single_backend() {
             return None;
@@ -843,14 +890,14 @@ impl KhiveMcpServer {
     /// substituting `$prev` references) and calling the [`VerbRegistry`].
     ///
     /// Returns a per-op result object: `{ok, tool, result}` on success or
-    /// `{ok: false, tool, error}` on failure.
+    /// `{ok: false, tool, error, reason?}` on failure.
     async fn dispatch_op(
         &self,
         op: ParsedOp,
         prev_result: Option<&Value>,
         from_wire: bool,
         identity: Option<&khive_runtime::RequestIdentity>,
-    ) -> Result<Value, (String, Value)> {
+    ) -> Result<Value, DispatchFailure> {
         let ParsedOp { tool, args } = op;
 
         // Resolve args — substitute $prev references when prev_result is Some.
@@ -864,7 +911,7 @@ impl KhiveMcpServer {
                 // exactly when this is the chain's first op, so there is no
                 // preceding result to substitute from at all.
                 let prev = prev_result.ok_or_else(|| {
-                    (
+                    DispatchFailure::unclassified(
                         tool.clone(),
                         json!({
                             "kind": "substitution_error",
@@ -881,7 +928,7 @@ impl KhiveMcpServer {
                     )
                 })?;
                 let resolved_val = arg_val.resolve_all(prev).ok_or_else(|| {
-                    (
+                    DispatchFailure::unclassified(
                         tool.clone(),
                         substitution_error_payload(&name, &arg_val, prev),
                     )
@@ -893,7 +940,7 @@ impl KhiveMcpServer {
                     match &resolved_val {
                         Value::Object(map) => {
                             let fields: Vec<&str> = map.keys().map(String::as_str).collect();
-                            return Err((
+                            return Err(DispatchFailure::unclassified(
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
@@ -908,7 +955,7 @@ impl KhiveMcpServer {
                             ));
                         }
                         Value::Array(_) => {
-                            return Err((
+                            return Err(DispatchFailure::unclassified(
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
@@ -945,7 +992,7 @@ impl KhiveMcpServer {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if from_wire && !is_help && self.registry.is_subhandler_verb(&tool) {
-            return Err((
+            return Err(DispatchFailure::unclassified(
                 tool.clone(),
                 json!(format!(
                     "permission denied for verb {tool:?}: verb '{tool}' is an internal \
@@ -978,7 +1025,7 @@ impl KhiveMcpServer {
                 let success = op_success_from_registry_result(&tool, is_help, result);
                 chain_ok_envelope_or_depth_error(tool, success)
             }
-            Err(error) => Err((tool, runtime_error_value(error))),
+            Err(error) => Err(DispatchFailure::from_runtime(&tool, error)),
         }
     }
 
@@ -1195,9 +1242,7 @@ impl KhiveMcpServer {
                                             effective_mode,
                                             now_unix,
                                         ),
-                                        Err((_, error_payload)) => {
-                                            json!({ "ok": false, "tool": tool, "error": error_payload })
-                                        }
+                                        Err(failure) => failure.into_entry(),
                                     };
                                 }
                             }
@@ -1224,8 +1269,7 @@ impl KhiveMcpServer {
                                 )
                             }
                             Err(error) => {
-                                let error_payload = runtime_error_value(error);
-                                json!({ "ok": false, "tool": tool, "error": error_payload })
+                                DispatchFailure::from_runtime(&tool, error).into_entry()
                             }
                         }
                         })
@@ -1319,9 +1363,8 @@ impl KhiveMcpServer {
                                 }
                             }
                         }
-                        Err((tool, error_payload)) => {
-                            let mut entry =
-                                json!({ "ok": false, "tool": tool, "error": error_payload });
+                        Err(failure) => {
+                            let mut entry = failure.into_entry();
                             stamp_usage(&mut entry, &usage_ctx);
                             results.push(entry);
                             aborted_from = Some(i + 1);
@@ -1351,7 +1394,7 @@ impl KhiveMcpServer {
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
 /// Shared logic behind both dispatch sites (`dispatch_op` chain mode and the
 /// parallel/single closure in `run_parsed`). Returns `Some(Ok(OpSuccess))` when
-/// the coordinator handled the op, `Some(Err((tool, error_value)))` on a
+/// the coordinator handled the op, `Some(Err(DispatchFailure))` on a
 /// coordinator error (including fail-closed namespace rejection), `None` to
 /// fall through to the registry. Must apply the exact same fail-closed
 /// namespace rule as `VerbRegistry::dispatch` (RUNTIME-AUD-002, #433) — see
@@ -1362,7 +1405,7 @@ async fn dispatch_via_coordinator_inner(
     tool: &str,
     args_value: &Value,
     identity: Option<&khive_runtime::RequestIdentity>,
-) -> Option<Result<OpSuccess, (String, Value)>> {
+) -> Option<Result<OpSuccess, DispatchFailure>> {
     // Only link/search are ever intercepted here.
     if !matches!(tool, "link" | "search") {
         return None;
@@ -1415,7 +1458,7 @@ async fn dispatch_via_coordinator_inner(
             Some(
                 result
                     .map(OpSuccess::complete)
-                    .map_err(|error| runtime_error_payload(tool, error)),
+                    .map_err(|error| DispatchFailure::from_runtime(tool, error)),
             )
         }
         "search" => {
@@ -1521,8 +1564,8 @@ async fn dispatch_via_coordinator_inner(
                     // "no match" reading is not established when the answer
                     // may be sitting on the backend that never responded.
                     if outcome.metadata.is_partial() && is_empty {
-                        Err((
-                            tool.to_string(),
+                        Err(DispatchFailure::unclassified(
+                            tool,
                             search_incomplete_error(outcome.metadata.missing_backends),
                         ))
                     } else {
@@ -1532,7 +1575,7 @@ async fn dispatch_via_coordinator_inner(
                         })
                     }
                 }
-                Err(error) => Err(runtime_error_payload(tool, error)),
+                Err(error) => Err(DispatchFailure::from_runtime(tool, error)),
             })
         }
         _ => None,
@@ -1583,10 +1626,6 @@ fn coordinator_search_visibility(
     };
     extra_visible.push(khive_runtime::Namespace::local());
     extra_visible
-}
-
-fn runtime_error_payload(tool: &str, error: RuntimeError) -> (String, Value) {
-    (tool.to_string(), runtime_error_value(error))
 }
 
 /// Preserve the established flat-string payload for ordinary runtime errors,
@@ -1800,10 +1839,10 @@ fn decorate_schedule_agenda_with_ticker_health(
 fn chain_ok_envelope_or_depth_error(
     tool: String,
     success: OpSuccess,
-) -> Result<Value, (String, Value)> {
+) -> Result<Value, DispatchFailure> {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
-        return Err((
+        return Err(DispatchFailure::unclassified(
             tool,
             depth_error_payload("; cannot be used as $prev chain context"),
         ));
@@ -1959,6 +1998,17 @@ Tip: for one-shot calls, the single-op form is the densest. Use batch when
 several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
+        // Parse before the daemon decision. The daemon protocol's historical
+        // error channel is string-only, so forwarding malformed DSL would turn
+        // `invalid_params` plus its structured `parse-error` reason into an
+        // untyped `internal_error` on the bridge back to MCP. This cheap,
+        // side-effect-free preflight keeps the local and warm-daemon surfaces on
+        // the same RPC contract; valid requests are still parsed authoritatively
+        // inside `dispatch_request_inner` at the dispatch seam.
+        if let Err(error) = parse_request(&p.ops) {
+            return Err(dsl_err_to_mcp(error));
+        }
+
         // Forward to the warm daemon when reachable, auto-spawning it
         // on first use. An ordinary no-socket condition, a namespace
         // mismatch, or KHIVE_NO_DAEMON falls through to local dispatch.
@@ -2007,6 +2057,35 @@ fn batch_status(failed: usize, aborted: usize) -> &'static str {
         "success"
     } else {
         "partial"
+    }
+}
+
+/// Attach the CLI aggregate `strict-op-failure` reason before any save sink
+/// serializes and hashes the canonical result rows.
+///
+/// This function deliberately does not emit stderr: the operator boundary in
+/// `kkernel` owns emission. A dispatch-owned specific reason always wins, and
+/// an unfamiliar future sibling reason is preserved rather than overwritten.
+fn attach_strict_refusal_reasons(result: &mut Value) {
+    let failed = result["summary"]["failed"].as_u64().unwrap_or(0);
+    let aborted = result["summary"]["aborted"].as_u64().unwrap_or(0);
+    if failed == 0 && aborted == 0 {
+        return;
+    }
+
+    let Some(entries) = result["results"].as_array_mut() else {
+        return;
+    };
+    for entry in entries {
+        if entry["ok"].as_bool() == Some(true) || entry.get("reason").is_some() {
+            continue;
+        }
+        if let Some(object) = entry.as_object_mut() {
+            object.insert(
+                "reason".to_string(),
+                json!(RefusalReason::StrictOpFailure.as_str()),
+            );
+        }
     }
 }
 
@@ -2215,6 +2294,26 @@ impl KhiveMcpServer {
             .await
     }
 
+    /// Operator dispatch used by `kkernel exec`.
+    ///
+    /// When `strict_refusals` is true, otherwise-unclassified failed/aborted
+    /// rows receive `strict-op-failure` before `save_to` writes and checksums
+    /// JSONL. Stderr emission remains at the CLI boundary.
+    pub async fn dispatch_request_local_for_exec(
+        &self,
+        p: RequestParams,
+        strict_refusals: bool,
+    ) -> Result<String, McpError> {
+        self.dispatch_request_inner_with_strict_refusals(
+            p,
+            false,
+            None,
+            DispatchOrigin::Local,
+            strict_refusals,
+        )
+        .await
+    }
+
     /// Replay one stored public-surface request under a host-verified actor.
     ///
     /// An attributed actor must come from an out-of-band provenance check,
@@ -2279,6 +2378,18 @@ impl KhiveMcpServer {
         from_wire: bool,
         identity: Option<khive_runtime::RequestIdentity>,
         origin: DispatchOrigin,
+    ) -> Result<String, McpError> {
+        self.dispatch_request_inner_with_strict_refusals(p, from_wire, identity, origin, false)
+            .await
+    }
+
+    async fn dispatch_request_inner_with_strict_refusals(
+        &self,
+        p: RequestParams,
+        from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
+        origin: DispatchOrigin,
+        strict_refusals: bool,
     ) -> Result<String, McpError> {
         let save_to = p.save_to.clone();
         let identity = identity.or_else(|| {
@@ -2345,7 +2456,7 @@ impl KhiveMcpServer {
                 None
             };
 
-        let result = self
+        let mut result = self
             .run_parsed(
                 parsed.ops,
                 parsed.mode,
@@ -2358,6 +2469,10 @@ impl KhiveMcpServer {
                 },
             )
             .await;
+
+        if strict_refusals {
+            attach_strict_refusal_reasons(&mut result);
+        }
 
         if let Some(path_str) = save_to {
             let path = std::path::Path::new(&path_str);
@@ -2387,7 +2502,10 @@ impl KhiveMcpServer {
 }
 
 fn dsl_err_to_mcp(e: DslError) -> McpError {
-    McpError::invalid_params(e.to_string(), None)
+    McpError::invalid_params(
+        e.to_string(),
+        Some(json!({ "reason": RefusalReason::ParseError.as_str() })),
+    )
 }
 
 /// Parse an optional presentation mode string from the request envelope.
@@ -2620,11 +2738,15 @@ fn fit_rendered_batch_envelope(
 fn frame_budget_omission(entry: &Value) -> Value {
     let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let mut omitted = serde_json::Map::new();
+    // `reason` is stable machine metadata, not payload detail. It is tiny and
+    // must survive even when a large result/error body is omitted to fit the
+    // daemon frame.
     for key in [
         "ok",
         "tool",
         "usage",
         "aborted",
+        "reason",
         "status",
         "partial",
         "missing_backends",
@@ -2771,6 +2893,17 @@ mod tests {
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn dsl_parse_errors_carry_stable_reason_data() {
+        let parse_error = parse_request("stats(").expect_err("input must be malformed");
+        let error = dsl_err_to_mcp(parse_error);
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["reason"].as_str()),
+            Some("parse-error")
+        );
+    }
 
     async fn observed_batch_entry(
         _index: usize,
@@ -3340,6 +3473,31 @@ mod tests {
     }
 
     #[test]
+    fn daemon_frame_fitting_preserves_reason_when_error_body_is_omitted() {
+        let entry = json!({
+            "ok": false,
+            "tool": "create",
+            "error": "x".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1_024),
+            "reason": "gate-refusal",
+        });
+        let envelope = parallel_batch_envelope(vec![entry.clone()]);
+        let fitted = fit_rendered_batch_envelope(
+            envelope.as_object().expect("batch envelope object"),
+            std::slice::from_ref(&entry),
+            vec![entry.clone()],
+            "test-config",
+        );
+        let fitted = Value::Object(fitted);
+
+        assert_eq!(fitted["results"][0]["ok"], false);
+        assert_eq!(fitted["results"][0]["reason"], "gate-refusal");
+        assert!(fitted["results"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("frame budget was exceeded")));
+        assert!(response_value_fits_daemon_frame(&fitted, "test-config"));
+    }
+
+    #[test]
     fn auto_rendered_batch_stays_within_daemon_frame_cap() {
         let mut leaves = serde_json::Map::new();
         for index in 0..80_000 {
@@ -3892,11 +4050,11 @@ mod tests {
             OpSuccess::complete(pathological),
         )
         .expect_err("over-limit result must be rejected, not enveloped");
-        assert_eq!(err.0, "traverse");
-        assert_eq!(err.1["kind"], json!("result_too_deep"));
+        assert_eq!(err.tool, "traverse");
+        assert_eq!(err.error["kind"], json!("result_too_deep"));
         // The error payload must never embed the oversized value itself.
-        assert!(err.1.get("result").is_none());
-        assert!(err.1.get("nested").is_none());
+        assert!(err.error.get("result").is_none());
+        assert!(err.error.get("nested").is_none());
     }
 
     #[test]
@@ -4320,6 +4478,57 @@ mod tests {
         let _ = handle.await;
         clear_daemon_env();
         std::env::remove_var("KHIVE_SAVE_TO_ROOT");
+    }
+
+    /// A malformed MCP request must be rejected with the same typed RPC error
+    /// even when a matching warm daemon is available. The bridge protocol has a
+    /// string-only error channel, so this specifically fences the parse-before-
+    /// forward preflight in `request()`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn request_parse_error_stays_typed_with_warm_daemon_available() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let server = make_daemon_save_to_test_server();
+        let daemon_server = server.clone();
+        let handle = tokio::spawn(async move {
+            let _ = khive_runtime::daemon::run_daemon(daemon_server).await;
+        });
+        connect_when_daemon_ready(&sock).await;
+
+        let error = server
+            .request(Parameters(RequestParams {
+                ops: "stats(".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("malformed DSL must be rejected before forwarding");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["reason"].as_str()),
+            Some("parse-error")
+        );
+
+        // Prove this was the normal warm-daemon environment, not a no-daemon
+        // fallback that happened to retain the local error shape.
+        server
+            .request(Parameters(RequestParams {
+                ops: "stats()".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("valid follow-up must dispatch through the warm daemon");
+
+        handle.abort();
+        let _ = handle.await;
+        clear_daemon_env();
     }
 
     // ── #644 regression: ambiguous post-write outcome must not double-dispatch ──
@@ -4774,6 +4983,29 @@ mod tests {
             extra.is_empty(),
             "an explicit namespace= argument must narrow to an empty extra-visible \
              set, not widen: {extra:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_verb_with_invalid_namespace_is_not_classified_as_verb_refused() {
+        let server = in_memory_kg_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "not_loaded(namespace=5)".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("dispatch failures remain in the per-operation envelope");
+        let response: Value = serde_json::from_str(&response).expect("response envelope");
+        assert!(
+            response["results"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("invalid namespace")),
+            "unexpected error: {response}"
+        );
+        assert!(
+            response["results"][0].get("reason").is_none(),
+            "namespace validation is not an unknown-verb refusal: {response}"
         );
     }
 

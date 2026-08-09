@@ -339,6 +339,32 @@ The parser is hand-written recursive descent for the function-call form; JSON
 form parses via `serde_json` and converts. Parse errors carry input positions
 and expected-token hints.
 
+Parse failure remains outside the per-operation response envelope because no
+`ParsedRequest` — and therefore no authoritative operation count or tool name
+— exists. The MCP surface returns RPC-level `invalid_params` with
+`data.reason = "parse-error"`; the MCP bridge performs this parse preflight
+before warm-daemon forwarding because the daemon's historical error channel is
+string-only. The operator-facing `kkernel exec` CLI mirrors that boundary on
+its JSON stdout channel with a dedicated invocation error:
+
+```json
+{
+  "error": {
+    "code": "invalid_params",
+    "message": "<parser error>",
+    "reason": "parse-error"
+  },
+  "invocation": { "started": false }
+}
+```
+
+That CLI object deliberately has no `results` or `summary`; a synthetic tool
+name would violate the operation-count invariant below and make a malformed
+multi-line input indistinguishable from a real one-op dispatch failure.
+Parsing the selected inline/JSONL carrier also precedes `--expect-actor` and
+strict attributed-actor checks, so those gates cannot mask a malformed
+invocation with a different refusal token.
+
 ### Dispatch pipeline
 
 After parsing, the dispatch pipeline runs:
@@ -397,8 +423,8 @@ Response envelope:
 }
 ```
 
-`results.length == summary.total == input ops count`. Order preserves input
-order regardless of parallel completion order.
+After parsing succeeds, `results.length == summary.total == input ops count`.
+Order preserves input order regardless of parallel completion order.
 
 ### Gate enforcement
 

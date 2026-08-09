@@ -11,7 +11,16 @@ A sink that self-reports null counts catches bulk export corruption (e.g.
 downstream agent fleet has graded blind. `write_and_manifest` computes
 `per_column_null_counts`, a `schema_fingerprint` (SHA-256 of sorted field
 names), and a file `checksum` so a caller can sanity-check a large export
-without re-reading it.
+without re-reading it. The manifest also carries the dispatch `summary` and,
+when any row failed, a compact `failures` projection containing `op_index`,
+`tool`, the unchanged `error` payload, and an optional stable `reason`. This
+keeps `kkernel exec --save-file` machine-classifiable from stdout while the
+complete per-op rows remain in the JSONL file. The refusal vocabulary is
+defined in `crates/kkernel/docs/usage.md`. For `kkernel exec --strict
+--save-file`, the exec dispatch seam attaches otherwise-unclassified
+`strict-op-failure` reasons before this sink serializes anything, so the
+manifest projection, canonical JSONL rows, and checksum all describe the same
+classified data.
 
 ## Why the destination policy matters
 
@@ -22,7 +31,7 @@ sandbox. `validate_destination` enforces three things before any write:
 
 1. No `..` traversal components anywhere in the requested path.
 2. The resolved parent directory must stay inside the export root — checked
-   by walking up to the deepest *existing* ancestor and canonicalizing that,
+   by walking up to the deepest _existing_ ancestor and canonicalizing that,
    proving containment before any directory is created (an as-yet-missing
    suffix can only descend further beneath an already-contained ancestor).
 3. An existing symlink at the destination itself is rejected outright (no
