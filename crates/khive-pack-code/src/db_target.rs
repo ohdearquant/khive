@@ -23,9 +23,10 @@ fn default_production_db_path() -> Option<PathBuf> {
 /// Normalize `path` to its deepest *existing* canonical ancestor plus the
 /// still-not-yet-created suffix appended back on. This lets two lexically
 /// different paths that alias the same file — a symlinked parent directory,
-/// or a `db` target whose final file does not exist yet (as is normal for a
-/// not-yet-created database) — compare equal, instead of falling back to raw
-/// lexical equality the moment either side is missing.
+/// or the omitted workspace-local default whose final file does not exist yet
+/// — compare equal, instead of falling back to raw lexical equality the moment
+/// either side is missing. Explicit targets are admitted separately and must
+/// already exist before the handler opens them.
 fn normalize(path: &Path) -> PathBuf {
     let mut existing: &Path = path;
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();

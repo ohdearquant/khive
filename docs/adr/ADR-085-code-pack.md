@@ -1553,3 +1553,37 @@ one identity.
    advances.
 4. Both endpoints of every fixture `project contains module` edge expose the
    same non-empty `source_project` value.
+
+## Amendment 7 (2026-08-09): explicit map-target admission
+
+Amendment 4 made source ingest's explicit `db` create-capable. That made a
+caller typo indistinguishable from authorization to create and migrate a new
+database at the misspelled path. This amendment supersedes only that
+create-capable clause: an explicit target is now a claim that an
+operator-selected map already exists and is at the current khive schema
+version.
+
+The handler first inspects an explicit target through a read-only connection.
+It rejects a missing path, a non-database file, and any schema version other
+than the current migration head. Only after that check may it open a
+write-capable pool, and that pool omits `SQLITE_OPEN_CREATE`; the runtime does
+not run migrations on this path. The schema is checked again on the opened
+pool before model registration or ingest. An older schema error identifies
+`kkernel db migrate --db <path>` as the initialization/upgrade remedy; a
+newer schema error requires a khive build that supports that version rather
+than pretending a migration can downgrade it.
+
+Omitting `db` retains the intentional creation surface from Amendment 2:
+`<path>/.khive/code-map.db` is created and migrated through the ordinary
+runtime constructor. Owner-authorized orchestration that creates a fresh map
+and then calls the public verb (for example, `kkernel repo build`) must
+initialize that map explicitly before supplying it as `db`.
+
+### G1: Acceptance
+
+1. An explicit path whose file and parent do not exist is rejected and creates
+   neither one.
+2. An explicit empty/unmigrated file is rejected byte-identically, with no WAL
+   or shared-memory sidecar and with the migration remedy in the error.
+3. An explicit current-schema map remains writable through `code.ingest`.
+4. Omitting `db` still creates and migrates the workspace-local default.

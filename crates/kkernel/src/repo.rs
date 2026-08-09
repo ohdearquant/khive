@@ -405,6 +405,22 @@ async fn run_build(args: RepoBuildArgs) -> Result<()> {
     }
     require_unchanged_head(&source.repo, &initial_head, "git.digest")?;
 
+    // `code.ingest(db=...)` treats an explicit path as an operator-selected,
+    // already-current map. Repo build is itself the owner-authorized creation
+    // workflow for this fresh dedicated output, so initialize it explicitly
+    // before handing the path across the public verb boundary.
+    drop(
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(map_db.clone()),
+            default_namespace: Namespace::local(),
+            packs: vec!["kg".to_string(), "code".to_string()],
+            actor_id: None,
+            ..RuntimeConfig::no_embeddings()
+        })
+        .map_err(|error| anyhow::anyhow!(error))
+        .with_context(|| format!("initialize dedicated code map {}", map_db.display()))?,
+    );
+
     let code_value = dispatch_single(
         &server,
         "code.ingest",

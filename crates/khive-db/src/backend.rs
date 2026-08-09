@@ -51,6 +51,28 @@ impl StorageBackend {
         })
     }
 
+    /// Write-capable SQLite backend over an existing database file.
+    ///
+    /// Unlike [`Self::sqlite`], this constructor never passes
+    /// `SQLITE_OPEN_CREATE`: a missing path is rejected instead of created.
+    /// It does not apply or validate schema migrations; callers that require a
+    /// current schema must inspect it before construction.
+    pub fn sqlite_existing(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
+        crate::extension::ensure_extensions_loaded();
+        let resolved = path.as_ref().to_path_buf();
+        let config = PoolConfig {
+            path: Some(resolved.clone()),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new_existing(config)?;
+        Ok(Self {
+            pool: Arc::new(pool),
+            is_file_backed: true,
+            path: Some(resolved),
+            notes_seq_repair_runs: AtomicUsize::new(0),
+        })
+    }
+
     /// File-backed SQLite database opened read-only.
     ///
     /// Opens the database at `path` and sets `PRAGMA query_only = ON` on the

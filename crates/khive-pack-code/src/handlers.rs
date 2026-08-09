@@ -1,9 +1,10 @@
-//! `code.ingest` verb handler (ADR-085 Amendment 2 B1, B7).
+//! `code.ingest` verb handler (ADR-085 Amendment 2 B1/B7 and Amendment 7).
 //!
-//! Opens a fresh `KhiveRuntime` bound to the caller-selected (or default
-//! workspace-local) target database — never the shared production
-//! runtime/backend the pack itself was constructed with — and drives the
-//! caller-selected L1, L1.5, and L2 tiers in `source_ingest`.
+//! Opens a fresh `KhiveRuntime` bound to the target database — never the
+//! shared production runtime/backend the pack itself was constructed with —
+//! and drives the caller-selected L1, L1.5, and L2 tiers in `source_ingest`.
+//! An explicit `db` must already exist at the current schema version; omitting
+//! it intentionally creates/migrates the workspace-local default.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -114,8 +115,13 @@ impl CodePack {
             packs: vec!["kg".to_string(), "code".to_string()],
             ..RuntimeConfig::no_embeddings()
         };
-        let target_rt = KhiveRuntime::new(config).map_err(|e| {
-            RuntimeError::InvalidInput(format!("opening target db {db_path:?}: {e}"))
+        let target_rt = if db_param.is_some() {
+            KhiveRuntime::new_existing_current(config)
+        } else {
+            KhiveRuntime::new(config)
+        }
+        .map_err(|e| {
+            RuntimeError::InvalidInput(format!("opening target map database {db_path:?}: {e}"))
         })?;
         let token = target_rt
             .authorize(Namespace::local())

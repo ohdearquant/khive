@@ -194,6 +194,77 @@ impl KhiveRuntime {
         })
     }
 
+    /// Open an existing, already-current file-backed database without creating
+    /// it or applying migrations.
+    ///
+    /// The schema is inspected read-only before the write-capable pool is
+    /// opened, then checked again on that pool before any configured model is
+    /// registered. A missing, unmigrated, stale, or concurrently replaced
+    /// target therefore fails closed with an operator-facing migration remedy.
+    /// This constructor is intended for caller-selected write targets such as
+    /// an explicit `code.ingest(db=...)`; ordinary runtime boot should continue
+    /// to use [`Self::new`].
+    pub fn new_existing_current(config: RuntimeConfig) -> RuntimeResult<Self> {
+        let path = config.db_path.clone().ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "existing database target requires a file-backed db path".to_string(),
+            )
+        })?;
+        let latest_version = khive_db::MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
+        let schema_mismatch = |observed_version: u32, context: &str| {
+            let remedy = if observed_version < latest_version {
+                "run `kkernel db migrate --db <path>` first".to_string()
+            } else {
+                format!(
+                    "use a khive build that supports schema version {observed_version} (this \
+                     build supports up to {latest_version})"
+                )
+            };
+            RuntimeError::InvalidInput(format!(
+                "existing database schema {context} at {:?}: observed version \
+                 {observed_version}, expected {latest_version}; {remedy}",
+                path
+            ))
+        };
+        let inspected_version = khive_db::inspect_schema_version(&path).map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "explicit target must be an existing current khive database at {:?}: {error}; \
+                 initialize or upgrade it with `kkernel db migrate --db <path>`",
+                path
+            ))
+        })?;
+        if inspected_version != latest_version {
+            return Err(schema_mismatch(inspected_version, "is not current"));
+        }
+
+        let backend = StorageBackend::sqlite_existing(&path)?;
+        let reopened_version = {
+            let writer = backend.pool().try_writer()?;
+            khive_db::read_schema_version(&writer)?
+        };
+        if reopened_version != latest_version {
+            return Err(schema_mismatch(reopened_version, "changed while opening"));
+        }
+
+        register_configured_embedding_models(&backend, &config)?;
+        let (registry, default_embedder_name) = build_embedder_registry(&config);
+        Ok(Self {
+            backend: Arc::new(backend),
+            core_backend: None,
+            config,
+            embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
+            default_embedder_name,
+            edge_rules: Arc::new(RwLock::new(Vec::new())),
+            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
+            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
+            entity_type_validator: Arc::new(RwLock::new(None)),
+            note_mutation_hook: Arc::new(RwLock::new(None)),
+            note_write_validator: Arc::new(RwLock::new(None)),
+            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
+            blob_store: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Open a runtime for read-only inspection (no model registration, no DB creation).
     ///
     /// Runs migrations (idempotent) but skips `register_configured_embedding_models`,

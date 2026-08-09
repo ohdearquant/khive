@@ -533,6 +533,30 @@ impl ConnectionPool {
     /// WAL is disabled or unavailable, the pool falls back to single-connection
     /// mode.
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
+        Self::new_with_create_policy(config, true)
+    }
+
+    /// Open a pool over an existing file-backed database without
+    /// `SQLITE_OPEN_CREATE`.
+    ///
+    /// A normal configuration returns a write-capable pool; a configuration
+    /// with `read_only` set retains that restriction. In either case a missing
+    /// path is rejected atomically by SQLite instead of being created as a side
+    /// effect of a caller typo. In-memory configurations are invalid for this
+    /// constructor.
+    pub fn new_existing(config: PoolConfig) -> Result<Self, SqliteError> {
+        if config.path.is_none() {
+            return Err(SqliteError::InvalidConfig(
+                "existing-database pool requires a file-backed path".to_string(),
+            ));
+        }
+        Self::new_with_create_policy(config, false)
+    }
+
+    fn new_with_create_policy(
+        config: PoolConfig,
+        create_if_missing: bool,
+    ) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
         validate_write_admission_deadline(config.write_admission_deadline_ms)?;
 
@@ -551,7 +575,7 @@ impl ConnectionPool {
             );
         }
 
-        let writer = open_writer_connection(&config)?;
+        let writer = open_writer_connection(&config, create_if_missing)?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
 
@@ -1213,13 +1237,18 @@ fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
     }
 }
 
-fn open_writer_connection(config: &PoolConfig) -> Result<Connection, SqliteError> {
+fn open_writer_connection(
+    config: &PoolConfig,
+    create_if_missing: bool,
+) -> Result<Connection, SqliteError> {
     match config.path.as_ref() {
         Some(path) => {
             let flags = if config.read_only {
                 writer_read_only_open_flags()
-            } else {
+            } else if create_if_missing {
                 writer_open_flags()
+            } else {
+                writer_existing_open_flags()
             };
             Connection::open_with_flags(path, flags).map_err(Into::into)
         }
@@ -1238,6 +1267,12 @@ fn writer_open_flags() -> OpenFlags {
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
+}
+
+/// Write-capable existing-database flags: deliberately omits
+/// `SQLITE_OPEN_CREATE` so a missing target can never be minted by opening it.
+fn writer_existing_open_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
 /// Read-only writer-slot open flags: no `SQLITE_OPEN_CREATE`, so a missing
@@ -1496,6 +1531,52 @@ mod tests {
         );
         assert_eq!(cfg.busy_timeout, Duration::from_secs(30));
         assert_eq!(cfg.checkout_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn existing_pool_never_creates_a_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("mistyped").join("khive.db");
+        let result = ConnectionPool::new_existing(PoolConfig {
+            path: Some(missing.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        });
+
+        assert!(result.is_err(), "a missing existing-only target must fail");
+        assert!(!missing.exists(), "the target file must not be created");
+        assert!(
+            !missing.parent().unwrap().exists(),
+            "the target parent must not be created"
+        );
+    }
+
+    #[test]
+    fn existing_pool_opens_a_present_database_for_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("present.db");
+        drop(Connection::open(&path).unwrap());
+
+        let pool = ConnectionPool::new_existing(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("present database opens without SQLITE_OPEN_CREATE");
+        pool.try_writer()
+            .unwrap()
+            .execute_batch("CREATE TABLE existing_open_probe(value INTEGER);")
+            .unwrap();
+
+        let verify = Connection::open(&path).unwrap();
+        let count: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'existing_open_probe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

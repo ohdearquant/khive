@@ -42,6 +42,13 @@ fn rt_at(db_path: &Path) -> KhiveRuntime {
     KhiveRuntime::new(config).expect("target runtime opens")
 }
 
+/// Explicit wire targets are pre-existing map databases. Tests that exercise
+/// successful explicit routing initialize that operator-owned target first;
+/// omitted `db` tests continue to exercise workspace-local creation.
+fn initialize_explicit_map_db(db_path: &Path) {
+    drop(rt_at(db_path));
+}
+
 /// Default (omitted `tiers`) wire behavior and explicit `[l1, l1.5]`: L1 +
 /// L1.5 only, L2 disabled.
 fn default_opts<'a>(path: &'a Path) -> CodeSourceIngestOptions<'a> {
@@ -687,6 +694,7 @@ async fn wire_omitted_tiers_defaults_to_l1_and_l1_5() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_default");
     let db = root.path().join("default.db");
+    initialize_explicit_map_db(&db);
     let rt = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt);
 
@@ -723,6 +731,7 @@ async fn wire_null_tiers_defaults_to_l1_and_l1_5() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_null");
     let db = root.path().join("null.db");
+    initialize_explicit_map_db(&db);
     let rt = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt);
 
@@ -773,6 +782,7 @@ async fn wire_empty_tiers_write_no_map_rows() {
     let root = TempDir::new().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_wire_empty");
     let db = root.path().join("wire-empty.db");
+    initialize_explicit_map_db(&db);
     let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
 
     let result = dispatch(
@@ -963,6 +973,7 @@ async fn wire_duplicate_tiers_canonicalize() {
         (&db_dup, json!(["l2", "l2", "l2"])),
         (&db_single, json!(["l2"])),
     ] {
+        initialize_explicit_map_db(db);
         dispatch(
             &reg,
             "code.ingest",
@@ -994,6 +1005,7 @@ async fn wire_tier_order_is_caller_independent() {
     let db_a = root.path().join("order_a.db");
     let db_b = root.path().join("order_b.db");
     for (db, tiers) in [(&db_a, json!(["l2", "l1"])), (&db_b, json!(["l1", "l2"]))] {
+        initialize_explicit_map_db(db);
         dispatch(
             &reg,
             "code.ingest",
@@ -1030,6 +1042,7 @@ async fn default_and_explicit_l1_l1_5_are_report_byte_equivalent() {
     let pkg = root.path().join("pkg_bytes");
 
     let db_wire = root.path().join("bytes_wire.db");
+    initialize_explicit_map_db(&db_wire);
     let rt_wire = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt_wire);
     let value_wire = dispatch(
