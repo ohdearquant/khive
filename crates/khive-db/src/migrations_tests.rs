@@ -75,7 +75,7 @@ fn every_versioned_migration_error_uses_the_full_escalating_mapper() {
     );
     assert!(
         mapper.contains("SqliteError::Migration { version, error }"),
-        "the mapper must preserve ADR-015's public { version, error: String } shape"
+        "the mapper must preserve ADR-015's public {{ version, error: String }} shape"
     );
 }
 
