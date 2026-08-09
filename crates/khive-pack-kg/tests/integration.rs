@@ -127,9 +127,11 @@ fn pack_verbs_names_are_correct() {
 async fn dispatch_unknown_verb_returns_error() {
     let pack = pack();
     let err = pack.dispatch("frobnicate", json!({})).await.unwrap_err();
-    assert!(is_invalid_input(&err), "unknown verb must be InvalidInput");
+    let RuntimeError::UnknownVerb(message) = &err else {
+        panic!("unknown verb must be UnknownVerb, got: {err:?}");
+    };
     assert!(
-        invalid_input_message(&err).contains("frobnicate"),
+        message.contains("frobnicate"),
         "error message must name the unknown verb"
     );
 }
