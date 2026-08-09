@@ -1289,6 +1289,63 @@ class MakefileGateContractTests(unittest.TestCase):
                         "FLEET_ARTIFACT was evaluated as shell source",
                     )
 
+    def test_fleet_check_does_not_expand_make_functions_in_artifact_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            injection_record = root / "make-function-ran"
+            injection_command = shim_dir / "khive-fleet-injection"
+            injection_command.write_text(
+                "#!/bin/sh\nprintf invoked > \"$FLEET_INJECTION_RECORD\"\n"
+                "printf substituted\n",
+                encoding="utf-8",
+            )
+            injection_command.chmod(0o755)
+
+            artifact = root / "kkernel $(shell khive-fleet-injection)"
+            artifact.write_text(textwrap.dedent(FAKE_ARTIFACT), encoding="utf-8")
+            artifact.chmod(0o755)
+            probe_record = root / "probe.json"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "FAKE_MODE": "ok",
+                    "FAKE_RECORD": str(probe_record),
+                    "FLEET_INJECTION_RECORD": str(injection_record),
+                    "PATH": f"{shim_dir}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "make",
+                    "--no-print-directory",
+                    "fleet-check",
+                    f"FLEET_ARTIFACT={artifact}",
+                    f"FULL_PACKS={TEST_PACKS}",
+                    "LOCAL_VERB_FLOOR=3",
+                ],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            self.assertTrue(probe_record.is_file())
+            self.assertFalse(
+                injection_record.exists(),
+                "FLEET_ARTIFACT was expanded as a GNU Make function",
+            )
+
     def test_broken_pack_registration_fails_fleet_build_before_install_or_daemon_stop(
         self,
     ) -> None:

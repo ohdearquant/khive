@@ -11,6 +11,7 @@ FLEET_ARTIFACT ?=
 # Capture the caller's literal value before make can expand any `$` bytes, then
 # pass it to the recipe through the environment instead of shell source.
 override FLEET_ARTIFACT_VALUE := $(value FLEET_ARTIFACT)
+unexport FLEET_ARTIFACT
 export FLEET_ARTIFACT_VALUE
 
 .PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
