@@ -64,6 +64,13 @@ simultaneous samples. If SQLite nevertheless returns `SQLITE_FULL`, khive logs
 an ERROR-class escalation at the SQLite mapping/transaction boundary;
 that event is never flattened into ordinary timeout telemetry.
 
+The causal Linux acceptance lane mounts a private 32 MiB tmpfs and holds an old
+reader while WAL writes consume it. The production `fs4` sampler must refuse at
+the reserve with real free space remaining; a reserve-disabled control then
+reaches primary `SQLITE_FULL` on that same mount. Checkpoint, diagnostic, and
+migration paths also escalate raw FULL before their ordinary warning, response,
+or versioned-error handling.
+
 Infrastructure-only `open_standalone_writer_untracked` remains unguarded so a
 checkpoint/diagnostic connection can exist under pressure. Those connections
 must not issue request DML: the writer task rechecks before every request, and

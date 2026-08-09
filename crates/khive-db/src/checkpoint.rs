@@ -1958,6 +1958,7 @@ fn checkpoint_once_core(
     let wal_pages = query_wal_pages(conn);
 
     if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
+        crate::error::log_sqlite_full("checkpoint_passive", &e);
         tracing::warn!(error = %e, "WAL checkpoint failed");
         return Err(e);
     }
@@ -2071,6 +2072,7 @@ fn maybe_truncate(
             note_truncate_outcome(config, wal_pages_after, truncate_state);
         }
         Err(e) => {
+            crate::error::log_sqlite_full("checkpoint_truncate", &e);
             tracing::warn!(error = %e, wal_pages_before, "WAL TRUNCATE attempt failed");
             log_tx_registry_snapshot_warn(wal_pages_before);
             note_truncate_outcome(config, wal_pages_before, truncate_state);
@@ -2527,6 +2529,7 @@ fn log_wal_pin_depth(conn: &rusqlite::Connection) {
             );
         }
         Err(e) => {
+            crate::error::log_sqlite_full("checkpoint_pin_depth", &e);
             tracing::warn!(
                 error = %e,
                 "ADR-091 Amendment 2 Plank C: failed to query WAL pin depth"
@@ -2574,16 +2577,28 @@ fn crossing_warn(now_above: bool, was_above: &mut bool) -> bool {
 /// Returns 0 on any error (e.g. in-memory DB where WAL is not active, which
 /// reports `log = -1`).
 fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
-    let pages = conn
-        .query_row("PRAGMA wal_checkpoint", [], |row| row.get::<_, i64>(1))
-        .unwrap_or(0)
-        .max(0) as u64;
+    let pages = observed_wal_pages_or_zero(
+        conn.query_row("PRAGMA wal_checkpoint", [], |row| row.get::<_, i64>(1)),
+    );
     // Metrics read-surface (load/perf harness): mirror every observation into
     // the process-wide gauge, regardless of which caller (`checkpoint_once`
     // or `maybe_truncate`) triggered it.
     LAST_WAL_PAGES.store(pages, Ordering::Relaxed);
     note_checkpoint_observed(pages);
     pages
+}
+
+/// Preserve the historical zero fallback for unsupported/non-WAL probes while
+/// ensuring a raw SQLite capacity failure is escalated before that fallback
+/// can make the observation look like an ordinary empty WAL.
+fn observed_wal_pages_or_zero(result: rusqlite::Result<i64>) -> u64 {
+    match result {
+        Ok(pages) => pages.max(0) as u64,
+        Err(error) => {
+            crate::error::log_sqlite_full("checkpoint_wal_pages", &error);
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2595,6 +2610,7 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct CapturedEvent {
+        level: Option<tracing::Level>,
         message: Option<String>,
         oldest_tx_label: Option<String>,
         tx_label: Option<String>,
@@ -2650,10 +2666,116 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             let mut visitor = CapturedEventVisitor::default();
             event.record(&mut visitor);
+            visitor.0.level = Some(*event.metadata().level());
             self.events.lock().unwrap().push(visitor.0);
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split_once(start)
+            .unwrap_or_else(|| panic!("missing source marker {start:?}"))
+            .1
+            .split_once(end)
+            .unwrap_or_else(|| panic!("missing source marker {end:?}"))
+            .0
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn passive_checkpoint_failure_escalates_sqlite_full_before_warning() {
+        let source = include_str!("checkpoint.rs");
+        let body = source_section(
+            source,
+            "fn checkpoint_once_core(",
+            "/// Evaluate and, if due, attempt a TRUNCATE escalation",
+        );
+        let escalation = body
+            .find("crate::error::log_sqlite_full")
+            .expect("PASSIVE checkpoint failure must escalate SQLITE_FULL");
+        let warning = body
+            .find("WAL checkpoint failed")
+            .expect("PASSIVE checkpoint failure warning");
+        assert!(
+            escalation < warning,
+            "FULL escalation must happen before the generic warning/return path"
+        );
+    }
+
+    #[test]
+    fn truncate_checkpoint_failure_escalates_sqlite_full_before_warning() {
+        let source = include_str!("checkpoint.rs");
+        let body = source_section(
+            source,
+            "fn maybe_truncate(",
+            "#[cfg(test)]\nmod truncate_report_test_sync",
+        );
+        let error_arm = body
+            .split_once("match outcome {")
+            .expect("TRUNCATE outcome match")
+            .1
+            .split_once("Err(e) => {")
+            .expect("TRUNCATE failure arm")
+            .1;
+        let escalation = error_arm
+            .find("crate::error::log_sqlite_full")
+            .expect("TRUNCATE failure must escalate SQLITE_FULL");
+        let warning = error_arm
+            .find("WAL TRUNCATE attempt failed")
+            .expect("TRUNCATE failure warning");
+        assert!(
+            escalation < warning,
+            "FULL escalation must happen before the generic TRUNCATE warning"
+        );
+    }
+
+    #[test]
+    fn wal_page_probe_logs_full_before_its_documented_zero_fallback() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&events),
+        };
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        );
+
+        let pages = tracing::subscriber::with_default(subscriber, || {
+            observed_wal_pages_or_zero(Err(error))
+        });
+
+        assert_eq!(pages, 0);
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| {
+            event.level == Some(tracing::Level::ERROR)
+                && event.message.as_deref()
+                    == Some(
+                        "SQLITE_FULL escalation: SQLite exhausted capacity inside an admitted operation",
+                    )
+        }));
+    }
+
+    #[test]
+    fn wal_pin_depth_probe_escalates_sqlite_full_before_warning() {
+        let source = include_str!("checkpoint.rs");
+        let body = source_section(
+            source,
+            "fn log_wal_pin_depth(",
+            "/// ADR-091 Amendment 2 Plank C: issue",
+        );
+        let error_arm = body
+            .split_once("Err(e) => {")
+            .expect("pin-depth failure arm")
+            .1;
+        let escalation = error_arm
+            .find("crate::error::log_sqlite_full")
+            .expect("pin-depth PASSIVE failure must escalate SQLITE_FULL");
+        let warning = error_arm
+            .find("failed to query WAL pin depth")
+            .expect("pin-depth warning");
+        assert!(escalation < warning);
     }
 
     /// `log_tx_registry_oldest_debug` names the oldest open registry entry.

@@ -5,6 +5,70 @@ fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")
 }
 
+#[test]
+fn migration_failure_preserves_the_raw_sqlite_full_source() {
+    let error = migration_error(
+        7,
+        "migration_body",
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        ),
+    );
+
+    match &error {
+        SqliteError::Migration { version, source } => {
+            assert_eq!(*version, 7);
+            assert!(matches!(
+                source,
+                rusqlite::Error::SqliteFailure(code, _)
+                    if code.code == rusqlite::ErrorCode::DiskFull
+            ));
+        }
+        other => panic!("expected migration error, got {other:?}"),
+    }
+    let source = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<rusqlite::Error>())
+        .expect("migration error must retain the raw rusqlite source");
+    assert!(matches!(
+        source,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::DiskFull
+    ));
+}
+
+#[test]
+fn every_versioned_migration_error_uses_the_full_escalating_mapper() {
+    let source = include_str!("migrations.rs");
+    let body = source
+        .split_once("fn run_migrations_locked(")
+        .expect("migration runner source")
+        .1
+        .split_once("/// Preserve a versioned migration's raw SQLite source")
+        .expect("end of migration runner source")
+        .0;
+    assert_eq!(
+        body.matches("migration_error(").count(),
+        6,
+        "BEGIN, ledger read, migration SQL, V19 repair, ledger insert, and COMMIT must all preserve/log raw FULL"
+    );
+    assert!(
+        !body.contains("SqliteError::Migration {"),
+        "the runner must not bypass the common FULL-escalating mapper"
+    );
+    let mapper = source
+        .split_once("fn migration_error(")
+        .expect("migration error mapper")
+        .1
+        .split_once("\n}")
+        .expect("end of migration error mapper")
+        .0;
+    assert!(
+        mapper.contains("crate::error::log_sqlite_full(operation, &source)"),
+        "the common migration mapper must ERROR-escalate SQLITE_FULL before wrapping it"
+    );
+}
+
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",

@@ -1249,10 +1249,20 @@ exempt.
 `kind="resource_exhausted"`, `code/stage="sqlite_disk_reserve"` object carrying
 the volume, available bytes, reserve bytes, optional capability/operation,
 `retryable=true`, and null timeout/retry-after fields. If SQLite nonetheless
-returns primary result code `SQLITE_FULL`, the common store/SQL-bridge and
-writer-transaction mapping paths ensure an ERROR-class escalation is emitted.
+returns primary result code `SQLITE_FULL`, every raw write-capable SQLite
+boundary emits an ERROR-class escalation before it can flatten, render, or
+swallow that result. This includes common store/SQL-bridge and writer-
+transaction mapping, versioned migration mapping, the deliberately unguarded
+PASSIVE/TRUNCATE checkpoint recovery paths, and the diagnostic PASSIVE probe.
 It is never recorded as an ordinary writer checkout, queue, busy, or lock
-timeout.
+timeout; a failed WAL-size probe may retain its documented zero fallback only
+after emitting the escalation.
+
+CI exercises the production sampler on a private bounded Linux tmpfs: an old
+reader pins the WAL, repeated guarded writes cross the configured reserve while
+real free space remains, and a reserve-disabled control on that same filesystem
+then reaches SQLite's primary `SQLITE_FULL`. The lane never fills the host
+filesystem; environments without mount privilege report an explicit skip.
 
 **Residual boundary.** The sample cannot reserve bytes atomically at the
 filesystem. An admitted transaction larger than the headroom or a concurrent

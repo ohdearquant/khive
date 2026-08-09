@@ -209,6 +209,34 @@ jobs:
         uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
           tool: cargo-nextest
+      # #1844's causal disk-reserve acceptance test must observe the production
+      # fs4 sampler and a real filesystem ENOSPC without consuming the runner's
+      # host disk. Each Linux shard gets its own bounded tmpfs because nextest's
+      # count partition decides which shard owns the integration test. A runner
+      # without mount privilege reports an explicit test skip via the empty
+      # output; GitHub-hosted Linux VMs normally take the mounted path.
+      - name: Prepare bounded disk-reserve filesystem (Linux)
+        id: disk-reserve-fs
+        if: env.CI_SUITE == 'full' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -u
+          mount_dir="$RUNNER_TEMP/khive-disk-reserve-${{ matrix.shard }}"
+          mkdir -p "$mount_dir"
+          if sudo mount -t tmpfs -o size=32m,nosuid,nodev,noexec khive-disk-reserve "$mount_dir"; then
+            fstype="$(findmnt --noheadings --output FSTYPE --target "$mount_dir" | xargs)"
+            if sudo chown "$(id -u):$(id -g)" "$mount_dir" && [ "$fstype" = "tmpfs" ]; then
+              echo "path=$mount_dir" >> "$GITHUB_OUTPUT"
+              df -h "$mount_dir"
+            else
+              echo "::notice title=Disk-reserve acceptance skipped::Mounted path could not be verified as writable tmpfs"
+              sudo umount "$mount_dir" || true
+              echo "path=" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::notice title=Disk-reserve acceptance skipped::Runner does not permit a private bounded tmpfs mount"
+            echo "path=" >> "$GITHUB_OUTPUT"
+          fi
       # Sharded across both matrix.shard values via nextest's count-based
       # partitioning (cargo-nextest's default and simplest partition scheme;
       # hash-based partitioning was considered but count is deterministic
@@ -221,7 +249,18 @@ jobs:
         if: env.CI_SUITE == 'full'
         env:
           NEXTEST_PARTITION: ${{ matrix.shard }}/2
+          KHIVE_TEST_CONSTRAINED_FS_DIR: ${{ steps.disk-reserve-fs.outputs.path }}
         run: ../scripts/ci.sh tests
+      - name: Remove bounded disk-reserve filesystem (Linux)
+        if: always() && env.CI_SUITE == 'full' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mount_dir="$RUNNER_TEMP/khive-disk-reserve-${{ matrix.shard }}"
+          if mountpoint --quiet "$mount_dir"; then
+            sudo umount "$mount_dir"
+          fi
+          rmdir "$mount_dir" 2>/dev/null || true
       - name: Workspace doctests
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh tests-doc

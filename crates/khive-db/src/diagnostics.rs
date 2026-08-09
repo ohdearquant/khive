@@ -622,10 +622,13 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
 
     let (checkpoint_probe, checkpoint_probe_error) = match checkpoint_probe(&conn) {
         Ok(probe) => (Some(probe), None),
-        Err(e) => (
-            None,
-            Some(format!("PRAGMA wal_checkpoint(PASSIVE) failed: {e}")),
-        ),
+        Err(e) => {
+            crate::error::log_sqlite_full("diagnostic_checkpoint_probe", &e);
+            (
+                None,
+                Some(format!("PRAGMA wal_checkpoint(PASSIVE) failed: {e}")),
+            )
+        }
     };
     let (graph_edge_integrity, graph_edge_integrity_error) = match graph_edge_integrity(&conn) {
         Ok(integrity) => (Some(integrity), None),
@@ -677,6 +680,37 @@ mod tests {
                 .expect("seed writes");
         }
         (pool, path)
+    }
+
+    #[test]
+    fn diagnostic_checkpoint_failure_escalates_full_before_rendering_the_error_field() {
+        let source = include_str!("diagnostics.rs");
+        let body = source
+            .split_once("fn inspect_pool(")
+            .expect("inspect_pool source")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("end of inspect_pool source")
+            .0;
+        let error_arm = body
+            .split_once(
+                "let (checkpoint_probe, checkpoint_probe_error) = match checkpoint_probe(&conn) {",
+            )
+            .expect("checkpoint probe match")
+            .1
+            .split_once("Err(e) => {")
+            .expect("checkpoint probe failure arm")
+            .1;
+        let escalation = error_arm
+            .find("crate::error::log_sqlite_full")
+            .expect("diagnostic PASSIVE failure must escalate SQLITE_FULL");
+        let rendered = error_arm
+            .find("PRAGMA wal_checkpoint(PASSIVE) failed")
+            .expect("diagnostic response error text");
+        assert!(
+            escalation < rendered,
+            "FULL escalation must precede string-only diagnostic rendering"
+        );
     }
 
     #[test]

@@ -57,12 +57,14 @@ pub enum SqliteError {
     Io(#[from] std::io::Error),
 
     /// A versioned migration failed to apply.
-    #[error("migration v{version} failed: {error}")]
+    #[error("migration v{version} failed: {source}")]
     Migration {
         /// The migration version number that failed.
         version: u32,
-        /// Human-readable description of the failure.
-        error: String,
+        /// Original SQLite failure, retained so callers and escalation
+        /// telemetry never have to recover a result code from display text.
+        #[source]
+        source: rusqlite::Error,
     },
 }
 

@@ -473,10 +473,7 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         }
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+            .map_err(|error| migration_error(migration.version, "migration_begin", error))?;
 
         // Re-check under the write lock: a sibling process may have applied
         // this migration (and possibly later ones) while we waited. Running
@@ -487,10 +484,7 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+            .map_err(|error| migration_error(migration.version, "migration_ledger_read", error))?;
         #[cfg(test)]
         if instrumented_first_begin {
             use std::sync::atomic::Ordering::SeqCst;
@@ -536,10 +530,7 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         }
 
         tx.execute_batch(migration.up)
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+            .map_err(|error| migration_error(migration.version, "migration_body", error))?;
 
         // V19's repair contract includes normalizing the two known-divergent
         // recorded names. `_schema_migrations` is created and owned by this
@@ -552,10 +543,7 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 "UPDATE _schema_migrations SET name = 'list_cursor_sequences' WHERE version = 13;\n\
                  UPDATE _schema_migrations SET name = 'graph_edges_id_unique' WHERE version = 14;",
             )
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+            .map_err(|error| migration_error(migration.version, "migration_v19_repair", error))?;
         }
 
         let now = chrono::Utc::now().timestamp_micros();
@@ -564,20 +552,15 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
              ON CONFLICT(version) DO NOTHING",
             rusqlite::params![migration.version, migration.name, now],
         )
-        .map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        .map_err(|error| migration_error(migration.version, "migration_ledger_insert", error))?;
 
         #[cfg(test)]
         if instrumented_first_begin {
             test_sync::WINNER_COMMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
-        tx.commit().map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        tx.commit()
+            .map_err(|error| migration_error(migration.version, "migration_commit", error))?;
 
         applied_version = migration.version;
     }
@@ -587,6 +570,14 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     }
 
     Ok(applied_version)
+}
+
+/// Preserve a versioned migration's raw SQLite source and emit the same
+/// ERROR-class FULL escalation as ordinary stores before any outer layer can
+/// render or otherwise flatten the failure.
+fn migration_error(version: u32, operation: &'static str, source: rusqlite::Error) -> SqliteError {
+    crate::error::log_sqlite_full(operation, &source);
+    SqliteError::Migration { version, source }
 }
 
 #[derive(Debug)]
