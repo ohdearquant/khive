@@ -264,12 +264,15 @@ The observable failure contract stays mode-specific:
 - Combined non-atomic `--ops-file --save-file` keeps those incremental database commits but makes
   only destination-file publication atomic. Once a chunk has been dispatched, every termination
   emits a reconciliation manifest. Success publishes the complete JSONL and preserves the ordinary
-  manifest shape. Failure discards the incomplete temp file, preserves any prior destination, and
+  manifest shape. A failure before the manifest is finalized discards the incomplete temp file,
+  preserves any prior destination, and
   emits an additive `status="aborted"` manifest naming the confirmed `committed_chunks` plus any
   unverified `dispatched_chunk`; that unverified chunk may already have database effects. Its
   `summary` covers confirmed rows and `unconfirmed_ops` accounts for the remainder without
   classifying unknown outcomes as aborted. The manifest, not existence of a newly published result
-  file, is the recovery boundary.
+  file, is the recovery boundary. A batch that runs to completion publishes the ordinary manifest
+  first, so the later non-zero exits from `--strict` or from an all-failed file retain that
+  manifest rather than replacing it with an aborted one; every op outcome is known on those paths.
 - `--ops-file --atomic` holds one bounded, DML-only `BEGIN IMMEDIATE` during its commit pass, per
   ADR-099. Daemon writes wait behind that unit and can fail if its hold exceeds their own busy
   timeout. Admissibility and prepare failures print a typed per-op result envelope over the real

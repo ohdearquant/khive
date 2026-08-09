@@ -588,11 +588,14 @@ against an idle daemon or in a maintenance window. A plan-level rollback prints
 than relying on process status. Admissibility, prepare, and atomic-unit seam errors instead exit
 non-zero before printing an atomic result envelope. For combined non-atomic
 `--ops-file --save-file`, file publication is atomic but database chunks commit incrementally.
-Every exit after dispatch prints a reconciliation manifest: success uses the ordinary shape;
-failure uses `status="aborted"`, lists confirmed `committed_chunks`, and identifies any unverified
-`dispatched_chunk` that may still have database effects. Its `summary` covers confirmed rows and
-`unconfirmed_ops` accounts for the remainder. An abort discards the incomplete temp file and leaves
-any prior destination unchanged. For successful `--save-file`, the manifest `summary`
+Every exit after dispatch prints a reconciliation manifest: success uses the ordinary shape; a
+failure before the manifest is finalized uses `status="aborted"`, lists confirmed
+`committed_chunks`, and identifies any unverified `dispatched_chunk` that may still have database
+effects. Its `summary` covers confirmed rows and `unconfirmed_ops` accounts for the remainder. An
+abort discards the incomplete temp file and leaves any prior destination unchanged. A `--strict`
+failure or an all-failed file exits non-zero after the ordinary manifest has been published, and
+keeps that manifest; those paths have a known outcome for every op, so inspect the printed manifest
+rather than expecting an aborted one. For successful `--save-file`, the manifest `summary`
 carries failure counts and the saved JSONL rows carry per-op error details. Retry only after
 checking the manifest and the result file when one was published, and only when the operations are
 known to be idempotent.

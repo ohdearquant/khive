@@ -74,12 +74,19 @@ transaction.
 
 Once dispatch begins, every termination prints a reconciliation manifest.
 Success retains the ordinary manifest shape and publishes the complete JSONL.
-A post-dispatch error instead prints `status="aborted"`,
+A post-dispatch error that prevents the manifest from being finalized instead
+prints `status="aborted"`,
 `file_published=false`, the confirmed `committed_chunks`, and, when its response
 could not be verified, `dispatched_chunk`. Its `summary` covers confirmed rows
 only; `unconfirmed_ops` accounts for the remainder without falsely classifying
 them as aborted. That dispatched chunk can have database effects even though it
 is not listed as confirmed. The incomplete temp file is discarded and any old
-destination remains unchanged. Callers reconcile
+destination remains unchanged.
+
+Policy exits are different and keep the ordinary manifest. When the batch runs
+to completion and the manifest is published, a non-zero exit from `--strict` or
+from an all-failed file happens after that publication. The outcome of every op
+is known in those cases, so the ordinary manifest is the correct reconciliation
+record and no aborted manifest is emitted. Callers reconcile
 the manifest before applying the per-op/idempotency contracts to a retry;
 atomic ops-files retain their separate all-or-nothing database contract.

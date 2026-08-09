@@ -151,9 +151,13 @@ aggregate summary shape, so its compatibility `failures` objects do not gain a
 Combined `--ops-file --save-file` has two separate commit boundaries. The
 destination file is published by one atomic rename, while non-atomic database
 chunks commit incrementally. After dispatch starts, success emits the ordinary
-manifest unchanged. Any later error, including malformed JSON or a structurally
-self-contradictory response envelope, emits an aborted manifest before the
-non-zero exit. Its `committed_chunks` are the structurally confirmed prefix;
+manifest unchanged. Any later error that stops the run before the manifest is
+finalized, including malformed JSON or a structurally self-contradictory
+response envelope, emits an aborted manifest before the non-zero exit. A
+`--strict` failure or an all-failed file is a policy exit taken after the
+ordinary manifest has already been published, so those runs keep the ordinary
+manifest and exit non-zero without an aborted one. Its `committed_chunks` are
+the structurally confirmed prefix;
 `dispatched_chunk`, when present, is unverified and may still have database
 effects. Its `summary` covers confirmed rows, while `unconfirmed_ops` accounts
 for the remainder without calling them aborted. `file_published=false` means
