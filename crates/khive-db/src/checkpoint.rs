@@ -6255,7 +6255,7 @@ mod tests {
         let pragma_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pragma_calls_from_hook = Arc::clone(&pragma_calls);
         checkpoint_conn
-            .authorizer(Some(move |context| {
+            .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
                 if matches!(
                     context.action,
                     AuthAction::Pragma { pragma_name, .. }
