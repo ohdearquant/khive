@@ -82,25 +82,83 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
-    // No handle-relative, no-follow directory API (`openat`/`O_NOFOLLOW`) is
-    // exercised on this platform today (this crate's Windows CI tier is
-    // compile-check only, matching `walpin.rs`'s Windows lane scope), so
-    // this checks each shard path component with `symlink_metadata` before
-    // the delete instead. `std::fs::symlink_metadata` reports Windows
-    // junctions and reparse-point symlinks through `file_type().is_symlink()`
-    // without following them, so a junction planted at the root or either
-    // shard level is refused rather than walked into by the final
-    // `remove_file`.
+    // Windows equivalent of the Unix arm's fd-pinned walk, built from two
+    // handle properties instead of `openat`:
+    //
+    // 1. No-follow verification BY HANDLE: each directory level is opened
+    //    with `FILE_FLAG_OPEN_REPARSE_POINT` (plus `FILE_FLAG_BACKUP_SEMANTICS`,
+    //    which is what permits opening a directory handle at all), so a
+    //    junction or symlink planted at that level yields a handle to the
+    //    reparse point itself rather than to its target, and the
+    //    handle-derived metadata (`File::metadata`, which queries the handle,
+    //    not a re-resolved path) exposes it for refusal.
+    // 2. Pinning: the handles are opened WITHOUT `FILE_SHARE_DELETE`. Both
+    //    deleting and renaming a directory require an open with `DELETE`
+    //    access, and that open fails with a sharing violation while any
+    //    handle that did not share delete access is held. Holding all three
+    //    verified handles across the final `remove_file` therefore prevents
+    //    every checked component from being swapped for a junction in the
+    //    check-to-use window the previous `symlink_metadata`-then-delete
+    //    shape left open.
+    //
+    // The final `remove_file` re-resolves `root/<s1>/<s2>/<hex>` through
+    // those pinned, verified directories; if the leaf entry itself is a
+    // symlink, Windows `DeleteFile` removes the link entry, not its target —
+    // the same semantics `unlinkat` gives the Unix arm.
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    fn open_dir_pinned_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let file_type = dir.metadata()?.file_type();
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to unlink blob shard file through non-directory or \
+                     reparse-point path component: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(dir)
+    }
+
+    let hex = content_ref.as_str();
+    let shard1 = root.join(&hex[0..2]);
+    let shard2 = shard1.join(&hex[2..4]);
+    let _root_pin = open_dir_pinned_no_follow(root)?;
+    let _shard1_pin = open_dir_pinned_no_follow(&shard1)?;
+    let _shard2_pin = open_dir_pinned_no_follow(&shard2)?;
+    fs::remove_file(shard2.join(hex))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
+    // Neither `openat`/`O_NOFOLLOW` nor Windows directory-handle pinning is
+    // available on this tier (which no release artifact targets), so this
+    // checks each shard path component with `symlink_metadata` before the
+    // delete. `std::fs::symlink_metadata` reports symlinks through
+    // `file_type().is_symlink()` without following them, so a link planted
+    // at the root or either shard level is refused rather than walked into
+    // by the final `remove_file`.
     //
     // Residual limitation, accepted for this descriptorless platform tier:
-    // unlike the Unix arm's fd-pinned `openat`/`unlinkat` walk, nothing here
-    // holds an open, referentially-verified handle on the checked
-    // directories between this check and the `remove_file` call below, so a
-    // component could still be swapped for a junction in that window
-    // (TOCTOU). Closing that fully would need a handle-relative, no-follow
-    // API this platform tier does not exercise.
+    // nothing here holds an open, referentially-verified handle on the
+    // checked directories between this check and the `remove_file` call
+    // below, so a component could still be swapped for a link in that
+    // window (TOCTOU).
     let hex = content_ref.as_str();
     let shard1 = root.join(&hex[0..2]);
     let shard2 = shard1.join(&hex[2..4]);
