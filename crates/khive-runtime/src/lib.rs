@@ -52,7 +52,7 @@ pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
     CommittedPostCommitEffects,
 };
-pub use blob::resolve_blob_store;
+pub use blob::{resolve_blob_store, resolve_blob_store_for_mode};
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
 pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
@@ -112,7 +112,7 @@ pub use pack::{
     NoteKindSpec, NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError,
     PackRegistration, PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan,
     ParamDef, RequestIdentity, SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry,
-    VerbRegistryBuilder, VerifiedActor, Visibility,
+    VerbRegistryBuilder, VerifiedActor, Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};

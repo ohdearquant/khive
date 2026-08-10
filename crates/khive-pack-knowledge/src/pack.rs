@@ -126,7 +126,12 @@ impl PackRuntime for KnowledgePack {
     }
 
     async fn warm(&self) {
-        crate::knowledge::vamana::warm_known_snapshots(&self.runtime, &self.ann).await;
+        // Vamana warm may register a missing ANN consumer or publish a rebuilt
+        // checkpoint. A snapshot runtime keeps only the pure embedder warm
+        // below; it must not enter a writer-bearing ANN lifecycle.
+        if !self.runtime.is_read_only() {
+            crate::knowledge::vamana::warm_known_snapshots(&self.runtime, &self.ann).await;
+        }
         if !self.runtime.default_embedder_name().is_empty() {
             let runtime = self.runtime.clone();
             // ADR-103 Amendment 1 Part 2: the phase span brackets ONLY this
@@ -594,7 +599,8 @@ impl PackByIdResolver for KnowledgePack {
 #[cfg(test)]
 mod tests {
     use khive_runtime::pack::PackRuntime;
-    use khive_runtime::{KhiveRuntime, Namespace};
+    use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+    use lattice_embed::EmbeddingModel;
 
     use super::KnowledgePack;
 
@@ -632,6 +638,59 @@ mod tests {
              (configured-only branch must not fire, and warm_known_snapshots must not \
              independently emit): {:?}",
             page.items
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_knowledge_cache_miss_does_not_start_ann_writer_lifecycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("read-only-knowledge-ann.db")),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::no_embeddings()
+        };
+        drop(KhiveRuntime::new(config.clone()).expect("migrate snapshot source"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let db_path = config.db_path.as_ref().expect("db path");
+            for suffix in ["-wal", "-shm"] {
+                let mut name = db_path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = db_path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+
+        let read_only = KhiveRuntime::new_readonly(config).expect("open snapshot read-only");
+        let token = read_only
+            .authorize(Namespace::local())
+            .expect("authorize local");
+        let pack = KnowledgePack::new(read_only.clone());
+        let key = crate::knowledge::vamana::AnnKey::new(
+            token.namespace().as_str(),
+            read_only.default_embedder_name(),
+        );
+        let before = read_only.backend().pool().writer_acquisition_snapshot();
+
+        crate::knowledge::vamana::ensure_ann_background(&read_only, &token, &pack.ann);
+
+        assert!(
+            !crate::knowledge::vamana::is_warming_not_loaded(&pack.ann, &key),
+            "a read-only search cache miss must not claim or spawn an ANN warm slot"
+        );
+        assert_eq!(
+            read_only.backend().pool().writer_acquisition_snapshot(),
+            before,
+            "read-only ANN admission must not acquire a writer"
         );
     }
 }

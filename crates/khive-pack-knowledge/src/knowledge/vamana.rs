@@ -1855,6 +1855,16 @@ async fn force_cold_after_registry_loss(
     ann: &SharedAnn,
     key: &AnnKey,
 ) -> FreshTailOutcome {
+    if rt.is_read_only() {
+        // Registry loss normally publishes the cross-process `-1` rebuild
+        // fence. A frozen snapshot cannot acquire that authority, so evict
+        // only process-local candidates and remain on the FTS path.
+        clear_namespace(ann, &key.namespace).await;
+        return FreshTailOutcome::Replace {
+            candidates: Vec::new(),
+            source_exhausted: true,
+        };
+    }
     // Publish the cross-process fence before yielding or evicting local state.
     // A peer checkpoint therefore cannot compact/publish through the gap while
     // this process is transitioning its loaded bridge to Cold.
@@ -2631,6 +2641,12 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
 /// `Warming`/`Ready` states suppress duplicates; `Failed` remains retryable by
 /// the next search.
 pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, ann: &SharedAnn) {
+    // Searches against a frozen snapshot may use FTS, an already-loaded
+    // bridge, and the load-only fresh-tail leg, but must not turn a cache miss
+    // into consumer registration or checkpoint publication.
+    if rt.is_read_only() {
+        return;
+    }
     let model = rt.default_embedder_name().to_string();
     if model.is_empty() {
         return;
@@ -3122,6 +3138,63 @@ mod tests {
             "registry loss must publish the cross-process rebuild sentinel"
         );
         assert!(force_rebuild_required(&ann, &key));
+    }
+
+    #[tokio::test]
+    async fn read_only_fresh_tail_registry_loss_stays_process_local() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = khive_runtime::RuntimeConfig {
+            db_path: Some(dir.path().join("read-only-fresh-tail.db")),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        };
+        drop(KhiveRuntime::new(config.clone()).expect("migrate snapshot source"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let db_path = config.db_path.as_ref().expect("db path");
+            for suffix in ["-wal", "-shm"] {
+                let mut name = db_path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = db_path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+        let rt = KhiveRuntime::new_readonly(config).expect("open snapshot read-only");
+        let ann = new_shared();
+        let namespace = "local";
+        let model = "read-only-fresh-tail-model";
+        let key = AnnKey::new(namespace, model);
+        let before = rt.backend().pool().writer_acquisition_snapshot();
+
+        let outcome = force_cold_after_registry_loss(&rt, &ann, &key).await;
+
+        assert!(matches!(
+            outcome,
+            FreshTailOutcome::Replace { ref candidates, source_exhausted: true }
+                if candidates.is_empty()
+        ));
+        assert_eq!(
+            read_own_watermark(&rt, namespace, model)
+                .await
+                .expect("registry read"),
+            None,
+            "read-only registry loss must not publish a rebuild sentinel"
+        );
+        assert!(
+            !force_rebuild_required(&ann, &key),
+            "read-only registry loss must not claim local rebuild authority"
+        );
+        assert_eq!(
+            rt.backend().pool().writer_acquisition_snapshot(),
+            before,
+            "read-only fresh-tail degradation must not acquire a writer"
+        );
     }
 
     #[tokio::test]

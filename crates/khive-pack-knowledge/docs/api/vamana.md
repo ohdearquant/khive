@@ -27,6 +27,13 @@ serialization logic. These
 responsibilities are tightly coupled through the shared `AnnState` and cannot be split
 without obscuring the generation-fenced install and warm-ownership lock protocol.
 
+`warm_known_snapshots` is not a read-only lifecycle: classification may register
+a missing consumer, replay and checkpoint a tail, or publish a rebuild. The
+pack therefore omits this ANN warm when its assigned runtime is an ADR-028 A2
+read-only snapshot. Request-time exact/vector fallback remains available from
+the already-materialized snapshot tables; no rejected writer path is used as a
+substitute for warm persistence.
+
 ## Fresh-tail serving (ADR-118)
 
 `knowledge.search` and `knowledge.suggest` capture ANN candidates and the loaded bridge's

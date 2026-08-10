@@ -40,6 +40,26 @@ writer-task acquisition class once per dequeued top-level request or successful
 `PoolConfig::write_queue_capacity` resolves the default from
 `KHIVE_WRITE_QUEUE_CAPACITY`).
 
+## Writer-stage telemetry (#1849)
+
+Every completed writer-task request records a backend-scoped in-memory sample
+with four independent stages: `queue_wait_micros` starts before bounded-channel
+admission and ends when the drain loop dequeues the request;
+`transaction_acquire_micros` measures only `BEGIN IMMEDIATE`; `body_micros`
+measures the typed operation closure; and `commit_micros` measures only
+SQLite's `COMMIT`. `total_micros`, queue depth at entry, and observation time
+remain siblings. A top-level request has zero acquisition/commit stages; a
+request that fails before a stage runs likewise reports zero for that stage.
+Rollback/recovery work remains visible in the difference between the total
+and named stages rather than being falsely attributed to COMMIT.
+
+`last_writer_stage_observation(pool)` is a pure per-backend read used by the
+daemon metrics frame. When a request crosses the existing slow-write
+threshold, the durable `slow_write` sink row also carries the four stage
+fields (while retaining `elapsed_ms` and `queue_depth` for compatibility).
+Observation is completed before the oneshot reply wakes the caller, so a
+successful response cannot race ahead of its telemetry sample.
+
 ## `run_writer_task` — drain loop and failure modes
 
 See `crates/khive-db/src/writer_task.rs` — private fn `run_writer_task`.

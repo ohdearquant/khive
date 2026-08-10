@@ -268,40 +268,109 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
 ];
 
-/// Confirm every applied migration through `through_version` is recorded
-/// under its canonical name. A deployment-time rename of an applied
-/// migration (the divergence #1649 repairs for versions 13/14) must not be
-/// silently accepted for any other version: an unknown name mismatch means
-/// this database's history cannot be trusted to match `MIGRATIONS`, so
-/// startup fails loudly instead of treating the recorded name as
-/// informational.
-fn validate_applied_migration_names(
+/// Read the ordered migration ledger prefix without interpreting its rows.
+fn read_applied_migration_ledger(
     conn: &Connection,
     through_version: u32,
-) -> Result<(), SqliteError> {
-    let mut stmt =
-        conn.prepare("SELECT version, name FROM _schema_migrations WHERE version <= ?1")?;
-    let applied = stmt
+) -> Result<Vec<(u32, String)>, SqliteError> {
+    let mut stmt = conn.prepare(
+        "SELECT version, name FROM _schema_migrations \
+         WHERE version <= ?1 ORDER BY version ASC",
+    )?;
+    let rows = stmt
         .query_map([through_version], |row| {
             Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
 
-    for (version, applied_name) in applied {
-        if let Some(migration) = MIGRATIONS.iter().find(|m| m.version == version) {
-            if migration.name != applied_name {
-                return Err(SqliteError::InvalidData(format!(
-                    "migration version {version} is recorded under name '{applied_name}', \
-                     expected '{expected}'. This database's migration history does not match \
-                     the current binary; recreate it from the current schema or repair the \
-                     specific known divergence via a dedicated migration.",
-                    expected = migration.name,
-                )));
+/// Require the applied versions through `through_version` to be the exact
+/// contiguous canonical prefix of [`MIGRATIONS`]. A matching `MAX(version)` is
+/// insufficient: a missing middle row or foreign version can expose a
+/// materially different schema while retaining the same maximum.
+fn validate_applied_migration_versions(
+    applied: &[(u32, String)],
+    through_version: u32,
+) -> Result<(), SqliteError> {
+    let expected: Vec<&VersionedMigration> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= through_version)
+        .collect();
+    let mut applied_index = 0;
+
+    for migration in expected {
+        let Some((version, applied_name)) = applied.get(applied_index) else {
+            return Err(SqliteError::InvalidData(format!(
+                "migration history is missing version {} ('{}'); the applied ledger must be \
+                 the exact contiguous canonical sequence through version {through_version}",
+                migration.version, migration.name,
+            )));
+        };
+        if *version < migration.version {
+            return Err(SqliteError::InvalidData(format!(
+                "migration history contains unknown version {version} recorded as \
+                 '{applied_name}'; the applied ledger must contain only canonical versions"
+            )));
+        }
+        if *version > migration.version {
+            return Err(SqliteError::InvalidData(format!(
+                "migration history is missing version {} ('{}'); found version {version} \
+                 next instead",
+                migration.version, migration.name,
+            )));
+        }
+        applied_index += 1;
+    }
+
+    if let Some((version, name)) = applied.get(applied_index) {
+        return Err(SqliteError::InvalidData(format!(
+            "migration history contains unknown version {version} recorded as '{name}'; \
+             the applied ledger must contain only canonical versions"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_applied_migration_names(
+    applied: &[(u32, String)],
+    through_version: u32,
+    allow_known_v19_repairs: bool,
+) -> Result<(), SqliteError> {
+    for ((version, applied_name), migration) in applied.iter().zip(
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= through_version),
+    ) {
+        debug_assert_eq!(*version, migration.version);
+        if migration.name != applied_name.as_str() {
+            if allow_known_v19_repairs && matches!(*version, 13 | 14) {
+                continue;
             }
+            return Err(SqliteError::InvalidData(format!(
+                "migration version {version} is recorded under name '{applied_name}', \
+                 expected '{expected}'. This database's migration history does not match \
+                 the current binary; recreate it from the current schema or repair the \
+                 specific known divergence via a dedicated migration.",
+                expected = migration.name,
+            )));
         }
     }
 
     Ok(())
+}
+
+/// Confirm the complete applied ledger is the canonical prefix, including
+/// names. The only historical V13/V14 name divergence is repaired by V19
+/// before this validator runs for a pre-V19 database.
+fn validate_applied_migration_ledger(
+    conn: &Connection,
+    through_version: u32,
+) -> Result<(), SqliteError> {
+    let applied = read_applied_migration_ledger(conn, through_version)?;
+    validate_applied_migration_versions(&applied, through_version)?;
+    validate_applied_migration_names(&applied, through_version, false)
 }
 
 const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
@@ -334,11 +403,47 @@ pub fn read_schema_version(conn: &Connection) -> Result<u32, SqliteError> {
 /// missing file read-only errors rather than creating it. This is the path used
 /// by schema-inspection commands that must not mutate the database.
 pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError> {
-    let conn = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
     read_schema_version(&conn)
+}
+
+/// Require an already-open database to match this build's latest core schema
+/// without applying migrations.
+///
+/// A read-only snapshot behind the current migration set cannot be repaired in
+/// place, while a snapshot ahead of the binary may contain schema this build
+/// does not understand. Both directions fail with an actionable diagnostic; an
+/// exact match performs no writes.
+pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError> {
+    let current_version = read_schema_version(conn)?;
+    let latest_version = MIGRATIONS
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or(0);
+
+    if current_version < latest_version {
+        return Err(SqliteError::InvalidData(format!(
+            "read-only database schema version {current_version} is behind the latest known \
+             migration {latest_version}; migrate a writable copy with this build before opening \
+             the snapshot read-only"
+        )));
+    }
+    if current_version > latest_version {
+        return Err(SqliteError::InvalidData(format!(
+            "read-only database schema version {current_version} is ahead of the latest known \
+             migration {latest_version}; use a compatible newer build or recreate the snapshot"
+        )));
+    }
+
+    // Numeric equality alone is not enough: a database can carry the current
+    // maximum version under renamed or foreign migration ledger entries while
+    // exposing a materially different schema. Writable boot runs this same
+    // closed-name validation in `run_migrations_locked`; snapshot inspection
+    // must not accept a history that ordinary boot would reject merely because
+    // it cannot repair it in place.
+    validate_applied_migration_ledger(conn, current_version)?;
+
+    Ok(current_version)
 }
 
 #[cfg(test)]
@@ -439,15 +544,15 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         )));
     }
 
-    // A database already at or past V19 has no known-divergence repair left
-    // to run; validate its recorded names up front rather than after
-    // fast-forwarding past migrations that will not execute again. A
-    // pre-V19 database may still carry the V13/V14 divergence V19 exists to
-    // repair, so it is validated after the loop instead, once V19 (if
-    // still pending) has had a chance to run.
-    if current_version >= 19 {
-        validate_applied_migration_names(conn, current_version)?;
-    }
+    // Every writable upgrade starts from an exact canonical version sequence;
+    // fail before applying new migrations if MAX(version) hides a missing or
+    // foreign row. A pre-V19 database may still carry the V13/V14 name
+    // divergence that V19 exists to repair. Name validation therefore permits
+    // exactly those two rows before V19, while every unrelated mismatch still
+    // fails before any new migration is applied.
+    let applied = read_applied_migration_ledger(conn, current_version)?;
+    validate_applied_migration_versions(&applied, current_version)?;
+    validate_applied_migration_names(&applied, current_version, current_version < 19)?;
 
     let mut applied_version = current_version;
     // Floor advanced when a sibling's work is observed under the write lock,
@@ -546,7 +651,7 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         // runner (not by any migration file), so the normalization lives
         // here, in the same transaction that applies V19's SQL. Exact,
         // closed set — versions 13 and 14 only; any other (version, name)
-        // mismatch still fails startup via validate_applied_migration_names.
+        // mismatch still fails startup via validate_applied_migration_ledger.
         if migration.version == 19 {
             tx.execute_batch(
                 "UPDATE _schema_migrations SET name = 'list_cursor_sequences' WHERE version = 13;\n\
@@ -582,9 +687,10 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         applied_version = migration.version;
     }
 
-    if current_version < 18 {
-        validate_applied_migration_names(conn, applied_version)?;
-    }
+    // Validate again after the loop: our own commits and any under-lock
+    // sibling fast-forward must both leave the exact canonical ledger, not
+    // merely advance its maximum version.
+    validate_applied_migration_ledger(conn, applied_version)?;
 
     Ok(applied_version)
 }
