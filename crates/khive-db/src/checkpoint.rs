@@ -2057,11 +2057,23 @@ fn observe_checkpoint_pressure_tick(
     pending_recovery: &mut Option<khive_storage::CheckpointOutcomeRecordedPayload>,
     mut try_emit: impl FnMut(khive_storage::CheckpointOutcomeRecordedPayload) -> bool,
 ) {
-    if let Some(payload) = pending_recovery.clone() {
+    // An undelivered recovery summary is a BARRIER, not merely a retry:
+    // lifecycle consumers assert on the ordered event history (ADR-094), so
+    // a later episode's opening must never be appended ahead of an earlier
+    // episode's recovery. If the retry fails, the in-memory aggregate still
+    // advances below, but no other emission is attempted this tick — a
+    // deferred opening or recovery re-derives from state on a later tick,
+    // after the pending summary has been delivered in order.
+    let pending_blocks_emission = if let Some(payload) = pending_recovery.clone() {
         if try_emit(payload) {
             *pending_recovery = None;
+            false
+        } else {
+            true
         }
-    }
+    } else {
+        false
+    };
 
     if above_warn {
         match pressure_episode.as_mut() {
@@ -2069,13 +2081,24 @@ fn observe_checkpoint_pressure_tick(
             None => *pressure_episode = Some(CheckpointPressureEpisode::start(wal_pages)),
         }
     } else if !*event_elevation_open {
-        // No elevation row reached the bounded handoff. There is no
-        // durable episode to close, while the process counters still
-        // retain the honest observed/dropped totals.
+        // No elevation row reached the bounded handoff, so from any
+        // consumer's view this episode never opened; discarding it keeps
+        // the delivered history self-consistent. When the discard happens
+        // because the barrier suppressed the opening attempt entirely, the
+        // loss would otherwise be invisible even to the drop counters that
+        // record failed attempts, so it is counted and logged here.
+        if pending_blocks_emission && pressure_episode.is_some() {
+            CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                wal_pages,
+                "checkpoint pressure episode elapsed unreported behind an undelivered recovery summary"
+            );
+        }
         *pressure_episode = None;
     }
 
-    if !checkpoint_outcome_should_emit(above_warn, *event_elevation_open) {
+    if pending_blocks_emission || !checkpoint_outcome_should_emit(above_warn, *event_elevation_open)
+    {
         return;
     }
     let Some(episode) = *pressure_episode else {
@@ -2108,16 +2131,15 @@ fn observe_checkpoint_pressure_tick(
         // elevated tick would extend this (already finished) episode's
         // aggregate instead of starting a fresh one for what is genuinely a
         // new pressure incident. The dropped summary itself isn't thrown
-        // away: it is retried on later ticks via `pending_recovery`, ahead
-        // of any new episode's own transition handling. A recovery row
-        // still in flight when a second one drops is intentionally
-        // superseded — process counters already record every drop — rather
-        // than growing an unbounded backlog.
-        if pending_recovery.is_some() {
-            tracing::warn!(
-                "checkpoint pressure episode recovery summary superseded before delivery"
-            );
-        }
+        // away: it is stashed in `pending_recovery` and delivered on a
+        // later tick, ahead of (and as a barrier to) every subsequent
+        // emission, so lifecycle ordering survives the retry. The slot is
+        // structurally empty here: a tick that entered with an undelivered
+        // summary returned at the barrier above and never reached this arm.
+        debug_assert!(
+            pending_recovery.is_none(),
+            "recovery emission attempted while an earlier summary was still pending"
+        );
         *event_elevation_open = false;
         *pressure_episode = None;
         *pending_recovery = Some(payload);
@@ -5334,14 +5356,18 @@ mod tests {
     }
 
     /// #1857 regression: a dropped recovery handoff must not fold the next,
-    /// separate, pressure incident into the closed episode's aggregate.
+    /// separate, pressure incident into the closed episode's aggregate — and
+    /// the undelivered recovery is a BARRIER, so episode 2's opening must not
+    /// be delivered ahead of episode 1's recovery (ADR-094: consumers assert
+    /// on the ordered event history).
     ///
     /// Sequence: episode 1 opens and sustains for 3 ticks, then its recovery
-    /// row is dropped (call index 1), and a retry two ticks later is also
-    /// dropped (call indices 2 and 3) — simulating a busy append worker
-    /// spanning the boundary into episode 2, which opens immediately with
-    /// no quiet gap. Once the worker frees up, both episode 1's delayed
-    /// recovery and episode 2's own rows deliver normally.
+    /// row is dropped (call index 1) and two retries are also dropped (call
+    /// indices 2 and 3) — the second of them on the tick where episode 2
+    /// begins, so the barrier defers episode 2's opening. Once the worker
+    /// frees up, episode 1's delayed recovery delivers first, then episode
+    /// 2's opening (reflecting its state at emission time), then episode 2's
+    /// recovery.
     #[test]
     fn dropped_recovery_handoff_does_not_merge_pressure_episodes() {
         let config = CheckpointConfig {
@@ -5354,10 +5380,9 @@ mod tests {
             (true, 2_000), // sustained, no emit attempt
             (false, 500),  // call 1: episode 1 recovery — DROPPED
             (false, 400),  // call 2: retry episode 1 recovery — DROPPED
-            (true, 3_000), // call 3: retry — DROPPED; call 4: episode 2 opens — delivered
-            (true, 3_500), // sustained, no emit attempt
-            (false, 300),  // call 5: episode 1's delayed recovery — delivered
-                           // call 6: episode 2 recovery — delivered
+            (true, 3_000), // call 3: retry — DROPPED; barrier defers episode 2's opening
+            (true, 3_500), // call 4: retry — delivered; call 5: episode 2 opens — delivered
+            (false, 300),  // call 6: episode 2 recovery — delivered
         ];
 
         let delivered = drive_pressure_ticks(&config, &ticks, |idx| matches!(idx, 1..=3));
@@ -5365,7 +5390,7 @@ mod tests {
         assert_eq!(
             delivered.len(),
             4,
-            "expected episode-1 open, episode-2 open, episode-1 delayed recovery, \
+            "expected episode-1 open, episode-1 delayed recovery, episode-2 open, \
              episode-2 recovery: {delivered:?}"
         );
 
@@ -5374,17 +5399,12 @@ mod tests {
         assert_eq!(ep1_open.episode_elevated_ticks, Some(1));
         assert_eq!(ep1_open.episode_peak_wal_pages, Some(1_500));
 
-        let ep2_open = &delivered[1];
-        assert!(ep2_open.above_warn);
-        assert_eq!(
-            ep2_open.episode_elevated_ticks,
-            Some(1),
-            "episode 2 must open fresh at 1 elevated tick, not continue episode 1's count"
+        let ep1_recovery = &delivered[1];
+        assert!(
+            !ep1_recovery.above_warn,
+            "episode 1's recovery must be delivered BEFORE episode 2's opening; \
+             an opening in this slot means the barrier failed: {delivered:?}"
         );
-        assert_eq!(ep2_open.episode_peak_wal_pages, Some(3_000));
-
-        let ep1_recovery = &delivered[2];
-        assert!(!ep1_recovery.above_warn);
         assert_eq!(
             ep1_recovery.episode_elevated_ticks,
             Some(3),
@@ -5392,6 +5412,16 @@ mod tests {
              not ticks absorbed from episode 2"
         );
         assert_eq!(ep1_recovery.episode_peak_wal_pages, Some(2_000));
+
+        let ep2_open = &delivered[2];
+        assert!(ep2_open.above_warn);
+        assert_eq!(
+            ep2_open.episode_elevated_ticks,
+            Some(2),
+            "episode 2 opens fresh (never continuing episode 1's count), deferred one \
+             tick by the barrier, so its opening reports 2 elevated ticks"
+        );
+        assert_eq!(ep2_open.episode_peak_wal_pages, Some(3_500));
 
         let ep2_recovery = &delivered[3];
         assert!(!ep2_recovery.above_warn);
@@ -5401,6 +5431,47 @@ mod tests {
             "episode 2's recovery must report only its own 2 elevated ticks"
         );
         assert_eq!(ep2_recovery.episode_peak_wal_pages, Some(3_500));
+    }
+
+    /// Degenerate barrier arm: an episode whose entire lifetime falls inside
+    /// the window where an earlier recovery is still undelivered is discarded
+    /// rather than reported out of order — from any consumer's view it never
+    /// opened, so no stale opening or recovery for it may surface after the
+    /// queue frees. The loss itself is counted and logged at the discard
+    /// site; this test pins the delivered-history shape.
+    #[test]
+    fn episode_elapsed_entirely_behind_barrier_is_discarded_not_reordered() {
+        let config = CheckpointConfig {
+            warn_pages: 1_000,
+            ..CheckpointConfig::default()
+        };
+        let ticks = [
+            (true, 1_500), // call 0: episode 1 opens — delivered
+            (false, 500),  // call 1: episode 1 recovery — DROPPED
+            (true, 9_000), // call 2: retry — DROPPED; barrier defers episode 2's opening
+            (false, 400),  // call 3: retry — DROPPED; episode 2 discarded behind barrier
+            (false, 300),  // call 4: retry — delivered
+            (true, 2_500), // call 5: episode 3 opens — delivered
+            (false, 200),  // call 6: episode 3 recovery — delivered
+        ];
+
+        let delivered = drive_pressure_ticks(&config, &ticks, |idx| matches!(idx, 1..=3));
+
+        let peaks: Vec<_> = delivered
+            .iter()
+            .map(|payload| (payload.above_warn, payload.episode_peak_wal_pages))
+            .collect();
+        assert_eq!(
+            peaks,
+            vec![
+                (true, Some(1_500)),  // episode 1 open
+                (false, Some(1_500)), // episode 1 delayed recovery
+                (true, Some(2_500)),  // episode 3 open — episode 2 (peak 9_000) never surfaces
+                (false, Some(2_500)), // episode 3 recovery
+            ],
+            "an episode elapsed entirely behind the barrier must not surface late or \
+             out of order: {delivered:?}"
+        );
     }
 
     /// ASCII-simple control for the regression above: the identical tick
