@@ -143,6 +143,11 @@ pub(crate) async fn handle_put(
     _token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    if runtime.is_read_only() {
+        return Err(RuntimeError::InvalidInput(
+            "blob.put is unavailable because the blob pack runtime is read-only".to_string(),
+        ));
+    }
     let store = blob_store(runtime)?;
 
     let b64 = params.get("bytes").and_then(Value::as_str).ok_or_else(|| {

@@ -672,7 +672,11 @@ pub(crate) async fn ensure_ann_background(
     ann: &SharedAnn,
     model: &str,
 ) -> bool {
-    if model.is_empty() {
+    // Request-time recall and mutation hooks share this entry point with
+    // daemon warm. A snapshot may use an already-loaded bridge or the exact
+    // sqlite-vec fallback, but it must never enqueue registration,
+    // checkpoint, or compaction work against its read-only backend.
+    if rt.is_read_only() || model.is_empty() {
         return false;
     }
     let key = AnnKey::from_token(model);

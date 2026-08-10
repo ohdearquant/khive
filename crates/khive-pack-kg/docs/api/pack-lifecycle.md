@@ -12,9 +12,12 @@ embedder warmup is attributed to the daemon principal instead of remaining invis
 event plane. A mint failure only removes this pass's telemetry — the warmup itself still
 runs.
 
-Every `warm()` call emits exactly one `PhaseStarted` and one terminal event
-(`PhaseCompleted`/`PhaseCancelled`) — this phase-span contract is regression-covered
-end to end.
+Every writable-runtime `warm()` call emits exactly one `PhaseStarted` and one
+terminal event (`PhaseCompleted`/`PhaseCancelled`) — this phase-span contract is
+regression-covered end to end. On an ADR-028 A2 read-only snapshot the embedder
+warm still runs, but phase persistence is deliberately absent: the shared
+emitter returns before resolving an `EventStore`, so warm never enters a writer
+path merely to produce best-effort telemetry.
 
 ## Entity-type validator installation
 

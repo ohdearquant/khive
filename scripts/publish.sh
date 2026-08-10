@@ -52,6 +52,7 @@ CRATES=(
     khive-quant
     khive-vamana
     khive-fold
+    khive-wire-protocol # no khive-* dependencies; shared native frame contract
     khive-storage
     khive-text          # khive-bm25 depends on it (normal dep); the old dev-dep cycle is gone
     khive-bm25
@@ -70,6 +71,7 @@ CRATES=(
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
+    khive-pack-agent     # needs khive-runtime/storage/types + dev-dep khive-pack-kg (all above)
     khive-pack-git       # needs khive-runtime/storage + khive-pack-kg (all above)
     khive-pack-code      # needs khive-runtime/storage + khive-pack-kg (all above)
     khive-pack-gtd
@@ -87,6 +89,7 @@ CRATES=(
     khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp
     khive-channel-telegram # needs khive-channel (above); optional dep of khive-mcp
     khive-mcp
+    khive-repo-showcase    # no khive-* dependencies; normal dep of kkernel, so publish first
     kkernel
 )
 

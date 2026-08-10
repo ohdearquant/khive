@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use khive_runtime::{
-    config_from_env, parse_pack_list, run_migrations, runtime_config_from_khive_config,
-    BackendConfig, BackendId, BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat,
-    RuntimeConfig, StorageBackend,
+    config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
+    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat, RuntimeConfig,
+    StorageBackend,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -202,6 +202,19 @@ fn is_daemon_role(args: &Args) -> bool {
     args.daemon
 }
 
+/// Combine process role with the fixed runtime-mode admission captured when
+/// the server was built. A daemon flag alone never authorizes background
+/// writes: each loop is admitted only when the runtime serving its verbs is
+/// writable in the resolved single- or multi-backend topology.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn channel_loop_plan(server: &KhiveMcpServer, args: &Args) -> crate::server::ChannelLoopAdmission {
+    if args.daemon {
+        server.channel_loop_admission()
+    } else {
+        crate::server::ChannelLoopAdmission::default()
+    }
+}
+
 /// Handle for the ADR-091 Amendment 2 Plank A session sweep task. Dropping
 /// the sender alone is NOT a sufficient shutdown contract (minor, ADR-091
 /// Amendment 2): the sweep task's own clean-shutdown heartbeat
@@ -332,23 +345,33 @@ async fn serve_holding_sweep(
     result
 }
 
-/// Spawn the email channel loops if — and only if — `args` indicates this
-/// process is the daemon (#602). Shared by both serve entrypoints (`run` and
-/// `serve_server`) so the role gate lives in exactly one place instead of
-/// being duplicated at each call site. Emits one `tracing::info!` line either
-/// way so the decision is visible at startup (seeds #606's health surface).
+/// Admit each email channel loop only when this is the daemon process and the
+/// runtime that backs that loop's verbs is writable. Shared by both serve
+/// entrypoints (`run` and `serve_server`) so neither role nor storage-mode
+/// gating can drift between single- and multi-backend boot paths.
 ///
 /// If no daemon is running, mail is simply not polled until one starts — that
 /// is the intended behavior, not a silent failure; the log line makes it
 /// observable.
 #[cfg(feature = "channel-email")]
 fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
-    if is_daemon_role(args) {
-        tracing::info!("email channel loops: spawning (daemon role)");
-        spawn_email_channel_loops(server);
-    } else {
+    let admission = channel_loop_plan(server, args);
+    if !is_daemon_role(args) {
         tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
+        return;
     }
+    if !admission.inbound_poll && !admission.outbound_delivery {
+        tracing::info!(
+            "email channel loops: skipped (assigned comm and kg runtimes do not admit writes)"
+        );
+        return;
+    }
+    tracing::info!(
+        inbound_poll = admission.inbound_poll,
+        outbound_delivery = admission.outbound_delivery,
+        "email channel loops: applying daemon/runtime admission"
+    );
+    spawn_email_channel_loops(server, admission);
 }
 
 /// Start ADR-119 daemon components in daemon role only. Non-daemon roles
@@ -368,13 +391,25 @@ fn start_daemon_components_if_daemon(
     crate::components::start_daemon_components_with_schedule(server, schedule_rt)
 }
 
+/// Admit the schedule runtime to daemon supervision only when its own assigned
+/// backend is writable. This decision is deliberately per runtime: a read-only
+/// main backend must not disable a schedule pack routed to a writable secondary,
+/// while a writable main must not accidentally start a ticker for a schedule
+/// pack routed to a read-only secondary.
+fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRuntime> {
+    runtime.filter(|runtime| !runtime.is_read_only())
+}
+
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
-/// warning and returns on incomplete config. Only call this when
-/// [`is_daemon_role`] is true — use [`spawn_email_channel_loops_if_daemon`],
-/// which both serve entrypoints (`run` and `serve_server`) call.
+/// warning and returns on incomplete config. Only call this with the
+/// role-and-runtime admission returned by [`channel_loop_plan`] — use
+/// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
 #[cfg(feature = "channel-email")]
-fn spawn_email_channel_loops(server: &KhiveMcpServer) {
+fn spawn_email_channel_loops(
+    server: &KhiveMcpServer,
+    admission: crate::server::ChannelLoopAdmission,
+) {
     use khive_channel::ChannelRegistry;
     use khive_channel_email::EmailChannel;
     use std::sync::Arc;
@@ -387,7 +422,7 @@ fn spawn_email_channel_loops(server: &KhiveMcpServer) {
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
-            let runtime = server.runtime_clone();
+            let runtime = server.channel_outbox_runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
             let default_actor = default_inbound_actor_from_env();
             let mut allowlist = allowed_recipients_from_env();
@@ -407,41 +442,46 @@ fn spawn_email_channel_loops(server: &KhiveMcpServer) {
             let runtime_outbox = runtime.clone();
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                tokio::task::spawn(async move {
-                    if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await {
-                        tracing::error!(
-                            error = %error,
-                            "email polling disabled: quarantine blob storage is unavailable"
-                        );
-                        return;
-                    }
-                    channel_poll_loop(
-                        ch_registry,
-                        verb_reg_poll,
-                        ingest_ns_clone,
-                        default_actor_clone,
-                    )
-                    .await;
-                });
-                match runtime_outbox {
-                    Some(rt) => {
-                        tokio::task::spawn(channel_outbox_loop(
-                            email_ch_clone,
-                            verb_reg_outbox,
-                            rt,
-                            ingest_ns_outbox,
-                            mailbox_clone,
-                            allowlist_clone,
-                        ));
-                        tracing::info!("email channel polling and outbox loops started");
-                    }
-                    None => {
-                        tracing::error!(
-                            "email polling started but the outbox loop was NOT started: server \
-                             has no default-backend runtime handle, which the outbox loop needs \
-                             to claim external_id on outbound notes; outbound mail will not be \
-                             sent"
-                        );
+                if admission.inbound_poll {
+                    tokio::task::spawn(async move {
+                        if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
+                        {
+                            tracing::error!(
+                                error = %error,
+                                "email polling disabled: quarantine blob storage is unavailable"
+                            );
+                            return;
+                        }
+                        channel_poll_loop(
+                            ch_registry,
+                            verb_reg_poll,
+                            ingest_ns_clone,
+                            default_actor_clone,
+                        )
+                        .await;
+                    });
+                    tracing::info!("email channel polling loop started");
+                }
+                if admission.outbound_delivery {
+                    match runtime_outbox {
+                        Some(rt) => {
+                            tokio::task::spawn(channel_outbox_loop(
+                                email_ch_clone,
+                                verb_reg_outbox,
+                                rt,
+                                ingest_ns_outbox,
+                                mailbox_clone,
+                                allowlist_clone,
+                            ));
+                            tracing::info!("email channel outbox loop started");
+                        }
+                        None => {
+                            tracing::error!(
+                                "email outbox loop was NOT started: server has no KG-routed \
+                                 runtime handle, which the loop needs to claim external_id on \
+                                 outbound notes; outbound mail will not be sent"
+                            );
+                        }
                     }
                 }
             });
@@ -1334,10 +1374,6 @@ async fn channel_outbox_loop(
     mailbox: String,
     allowlist: Vec<String>,
 ) {
-    use chrono::Utc;
-    use khive_channel::{Channel, ChannelEnvelope};
-    use serde_json::json;
-
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
     let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
         Ok(ns) => ns,
@@ -1353,234 +1389,233 @@ async fn channel_outbox_loop(
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        channel_outbox_once(
+            email_channel.as_ref(),
+            &registry,
+            &runtime,
+            &namespace,
+            &ingest_namespace,
+            &mailbox,
+            &domain,
+            &allowlist,
+        )
+        .await;
+    }
+}
 
-        // Query outbound messages via the registry. The note `list` handler applies
-        // the `direction` filter server-side (scanning up to its internal cap) and
-        // returns a bare JSON array of full note objects. There is no `delivered_at`
-        // or recipient-prefix filter, so the `email:` prefix and the
-        // already-delivered check are applied per-note below.
-        let list_params = json!({
-            "namespace": ingest_namespace,
-            "kind": "message",
-            "direction": "outbound",
-            "delivered": false,
-            "limit": 200,
-        });
-        let list_result = match registry.dispatch("list", list_params).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "outbox loop: list failed");
-                continue;
-            }
+/// Execute one email outbox scan. Kept separate from the five-second loop so
+/// routing and owner-claim behavior can be verified without sleeping or
+/// opening a network transport.
+#[cfg(feature = "channel-email")]
+#[allow(clippy::too_many_arguments)]
+async fn channel_outbox_once(
+    email_channel: &dyn khive_channel::Channel,
+    registry: &khive_runtime::VerbRegistry,
+    runtime: &khive_runtime::KhiveRuntime,
+    namespace: &khive_runtime::Namespace,
+    ingest_namespace: &str,
+    mailbox: &str,
+    domain: &str,
+    allowlist: &[String],
+) {
+    use chrono::Utc;
+    use khive_channel::ChannelEnvelope;
+    use serde_json::json;
+
+    // Query outbound messages via the registry. The note `list` handler applies
+    // the `direction` filter server-side (scanning up to its internal cap) and
+    // returns a bare JSON array of full note objects. There is no recipient-prefix
+    // filter, so the `email:` prefix is applied per-note below.
+    let list_params = json!({
+        "namespace": ingest_namespace,
+        "kind": "message",
+        "direction": "outbound",
+        "delivered": false,
+        "limit": 200,
+    });
+    let list_result = match registry.dispatch("list", list_params).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(error = %error, "outbox loop: list failed");
+            return;
+        }
+    };
+
+    let Some(notes) = list_result.as_array() else {
+        return;
+    };
+    for note_val in notes {
+        let props = match note_val.get("properties") {
+            Some(serde_json::Value::Object(properties)) => properties.clone(),
+            _ => continue,
         };
 
-        let notes = match list_result.as_array() {
-            Some(arr) => arr.clone(),
+        if props.get("direction").and_then(|value| value.as_str()) != Some("outbound") {
+            continue;
+        }
+        let to_actor = match props.get("to_actor").and_then(|value| value.as_str()) {
+            Some(actor) if actor.starts_with("email:") => actor.to_string(),
+            _ => continue,
+        };
+        if note_already_delivered(&props) {
+            continue;
+        }
+        let note_id = match note_val.get("id").and_then(|value| value.as_str()) {
+            Some(id) => id.to_string(),
             None => continue,
         };
+        let recipient = to_actor
+            .strip_prefix("email:")
+            .unwrap_or(to_actor.as_str())
+            .to_string();
+        if !allowlist.is_empty() && !allowlist.contains(&recipient) {
+            tracing::warn!(
+                note_id = %note_id,
+                recipient = %recipient,
+                "outbox loop: recipient not in allowlist; skipping"
+            );
+            continue;
+        }
 
-        for note_val in notes {
-            let props = match note_val.get("properties") {
-                Some(serde_json::Value::Object(m)) => m.clone(),
-                _ => continue,
-            };
+        let subject = props
+            .get("subject")
+            .and_then(|value| value.as_str())
+            .unwrap_or("(no subject)")
+            .to_string();
+        let content = match note_val.get("content").and_then(|value| value.as_str()) {
+            Some(content) => content.to_string(),
+            None => continue,
+        };
+        let thread_id = props
+            .get("thread_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let in_reply_to = props
+            .get("in_reply_to_message_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let references = props
+            .get("references_chain")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
 
-            // Only outbound direction. The `delivered=false` filter on the list query
-            // ensures only undelivered notes are returned; this check is a cheap
-            // defensive guard for any note that slips through.
-            if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
-                continue;
-            }
-
-            // Only email-addressed notes.
-            let to_actor = match props.get("to_actor").and_then(|v| v.as_str()) {
-                Some(a) if a.starts_with("email:") => a.to_string(),
-                _ => continue,
-            };
-
-            // Defensive: skip already-delivered notes in case the query filter missed any.
-            if note_already_delivered(&props) {
-                continue;
-            }
-
-            let note_id = match note_val.get("id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-
-            let recipient = to_actor
-                .strip_prefix("email:")
-                .unwrap_or(to_actor.as_str())
-                .to_string();
-
-            // Allowlist check.
-            if !allowlist.is_empty() && !allowlist.contains(&recipient) {
-                tracing::warn!(
-                    note_id = %note_id,
-                    recipient = %recipient,
-                    "outbox loop: recipient not in allowlist; skipping"
-                );
-                continue;
-            }
-
-            let subject = props
-                .get("subject")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(no subject)")
-                .to_string();
-
-            let content = match note_val.get("content").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => continue,
-            };
-
-            let thread_id = props
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Issue #403: the parent's wire Message-ID, computed at reply time by
-            // comm.reply (khive-pack-comm) and stored on this note. Forwarded
-            // verbatim so the SMTP layer can set In-Reply-To for native MUA
-            // conversation grouping; absent for non-reply sends.
-            let in_reply_to = props
-                .get("in_reply_to_message_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Issue #403: the full References chain (parent's existing
-            // chain, if any, followed by the parent's Message-ID), computed at
-            // reply time by comm.reply. Forwarded verbatim so the SMTP layer can
-            // set References without truncating ancestry; absent for non-reply sends.
-            let references = props
-                .get("references_chain")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Mint-before-send: derive or reuse the Message-ID.
-            let message_id = match props.get("external_id").and_then(|v| v.as_str()) {
-                Some(eid) if !eid.is_empty() => eid.to_string(),
-                _ => {
-                    let mid = format!("<{note_id}@{domain}>");
-                    // Persist the claimed external_id before sending, through the
-                    // non-wire owner path: the generic `update` verb refuses any
-                    // patch naming `external_id` on a `message` note (it is an
-                    // owner-established property), so this cannot go through
-                    // `registry.dispatch`.
-                    let claim_result = match uuid::Uuid::parse_str(&note_id) {
-                        Ok(uuid) => match runtime.authorize(namespace.clone()) {
-                            Ok(token) => {
-                                runtime
-                                    .claim_outbound_message_external_id(&token, uuid, mid.clone())
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                            "note id {note_id} is not a valid UUID: {e}"
-                        ))),
-                    };
-                    if let Err(e) = claim_result {
-                        tracing::warn!(
-                            note_id = %note_id,
-                            error = %e,
-                            "outbox loop: failed to claim external_id; skipping"
-                        );
-                        continue;
-                    }
-                    mid
-                }
-            };
-
-            // Build and send the envelope.
-            let mut env = ChannelEnvelope::new(
-                format!("email:{mailbox}"),
-                format!("email:{recipient}"),
-                content,
-            )
-            .with_subject(subject)
-            .with_message_id(message_id.clone());
-
-            if let Some(tid) = thread_id {
-                env = env.with_correlation(tid);
-            }
-            if let Some(irt) = in_reply_to {
-                env = env.with_in_reply_to(irt);
-            }
-            if let Some(refs) = references {
-                env = env.with_references(refs);
-            }
-
-            match email_channel.send(env).await {
-                Ok(()) => {
-                    let delivered_at = Utc::now().to_rfc3339();
-                    let mark_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "delivered_at": delivered_at },
-                            }),
-                        )
-                        .await;
-                    match mark_result {
-                        Ok(_) => {
-                            tracing::info!(
-                                note_id = %note_id,
-                                recipient = %recipient,
-                                message_id = %message_id,
-                                "outbox loop: delivered"
-                            );
+        // Mint-before-send through the KG runtime's owner-only path. Generic
+        // `update` correctly refuses caller patches to `external_id`.
+        let message_id = match props.get("external_id").and_then(|value| value.as_str()) {
+            Some(external_id) if !external_id.is_empty() => external_id.to_string(),
+            _ => {
+                let message_id = format!("<{note_id}@{domain}>");
+                let claim_result = match uuid::Uuid::parse_str(&note_id) {
+                    Ok(uuid) => match runtime.authorize(namespace.clone()) {
+                        Ok(token) => {
+                            runtime
+                                .claim_outbound_message_external_id(
+                                    &token,
+                                    uuid,
+                                    message_id.clone(),
+                                )
+                                .await
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                note_id = %note_id,
-                                error = %e,
-                                "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                        "note id {note_id} is not a valid UUID: {error}"
+                    ))),
+                };
+                if let Err(error) = claim_result {
                     tracing::warn!(
                         note_id = %note_id,
-                        recipient = %recipient,
-                        error = %e,
-                        "outbox loop: send failed; will retry next cycle"
+                        error = %error,
+                        "outbox loop: failed to claim external_id; skipping"
                     );
+                    continue;
+                }
+                message_id
+            }
+        };
+
+        let mut envelope = ChannelEnvelope::new(
+            format!("email:{mailbox}"),
+            format!("email:{recipient}"),
+            content,
+        )
+        .with_subject(subject)
+        .with_message_id(message_id.clone());
+        if let Some(thread_id) = thread_id {
+            envelope = envelope.with_correlation(thread_id);
+        }
+        if let Some(in_reply_to) = in_reply_to {
+            envelope = envelope.with_in_reply_to(in_reply_to);
+        }
+        if let Some(references) = references {
+            envelope = envelope.with_references(references);
+        }
+
+        match email_channel.send(envelope).await {
+            Ok(()) => {
+                let delivered_at = Utc::now().to_rfc3339();
+                match registry
+                    .dispatch(
+                        "update",
+                        json!({
+                            "namespace": ingest_namespace,
+                            "id": note_id,
+                            "properties": { "delivered_at": delivered_at },
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) => tracing::info!(
+                        note_id = %note_id,
+                        recipient = %recipient,
+                        message_id = %message_id,
+                        "outbox loop: delivered"
+                    ),
+                    Err(error) => tracing::warn!(
+                        note_id = %note_id,
+                        error = %error,
+                        "outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
+                    ),
                 }
             }
+            Err(error) => tracing::warn!(
+                note_id = %note_id,
+                recipient = %recipient,
+                error = %error,
+                "outbox loop: send failed; will retry next cycle"
+            ),
         }
     }
 }
 
-/// Whether this process owns the Telegram channel loops. Mirrors
-/// [`is_daemon_role`]'s email-channel role gate (#602): channel loops are a
-/// daemon-role responsibility, never spawned per client process.
-#[cfg(feature = "channel-telegram")]
-fn is_telegram_daemon_role(args: &Args) -> bool {
-    args.daemon
-}
-
-/// Spawn the Telegram channel loops if — and only if — `args` indicates this
-/// process is the daemon. Mirrors
-/// [`spawn_email_channel_loops_if_daemon`]. If no daemon is running, Telegram
-/// is simply not polled until one starts.
+/// Apply the same independent daemon/runtime admission as the email adapter:
+/// Telegram polling follows the comm runtime, while outbound delivery follows
+/// the kg runtime that must durably mark `delivered_at`.
 #[cfg(feature = "channel-telegram")]
 fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
-    if is_telegram_daemon_role(args) {
-        tracing::info!("telegram channel loops: spawning (daemon role)");
-        spawn_telegram_channel_loops(server);
-    } else {
+    let admission = channel_loop_plan(server, args);
+    if !args.daemon {
         tracing::info!("telegram channel loops: skipped (client role; daemon owns channel loops)");
+        return;
     }
+    if !admission.inbound_poll && !admission.outbound_delivery {
+        tracing::info!(
+            "telegram channel loops: skipped (assigned comm and kg runtimes do not admit writes)"
+        );
+        return;
+    }
+    tracing::info!(
+        inbound_poll = admission.inbound_poll,
+        outbound_delivery = admission.outbound_delivery,
+        "telegram channel loops: applying daemon/runtime admission"
+    );
+    spawn_telegram_channel_loops(server, admission);
 }
 
 /// Spawn the Telegram channel polling + outbox loops if the `channel-telegram`
 /// feature is enabled and `KHIVE_TELEGRAM_*` config resolves. Non-fatal: logs
-/// a warning and returns on incomplete config. Only call this when
-/// [`is_telegram_daemon_role`] is true — use
+/// a warning and returns on incomplete config. Only call this with the
+/// role-and-runtime admission returned by [`channel_loop_plan`] — use
 /// [`spawn_telegram_channel_loops_if_daemon`].
 ///
 /// Unlike the email adapter, Telegram's poll offset is held in memory inside
@@ -1591,7 +1626,10 @@ fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) 
 /// this ADR explicitly does not require for Telegram's simpler getUpdates
 /// durability model.
 #[cfg(feature = "channel-telegram")]
-fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
+fn spawn_telegram_channel_loops(
+    server: &KhiveMcpServer,
+    admission: crate::server::ChannelLoopAdmission,
+) {
     use khive_channel_telegram::TelegramChannel;
     use std::sync::Arc;
 
@@ -1609,22 +1647,28 @@ fn spawn_telegram_channel_loops(server: &KhiveMcpServer) {
             let tg_ch_outbox = Arc::clone(&tg_ch);
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
-                tokio::task::spawn(async move {
-                    if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await {
-                        tracing::error!(
-                            error = %error,
-                            "telegram polling disabled: quarantine blob storage is unavailable"
-                        );
-                        return;
-                    }
-                    telegram_poll_loop(tg_ch_poll, verb_reg_poll, ingest_ns_poll).await;
-                });
-                tokio::task::spawn(telegram_outbox_loop(
-                    tg_ch_outbox,
-                    verb_reg_outbox,
-                    ingest_ns_outbox,
-                ));
-                tracing::info!("telegram channel polling and outbox loops started");
+                if admission.inbound_poll {
+                    tokio::task::spawn(async move {
+                        if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
+                        {
+                            tracing::error!(
+                                error = %error,
+                                "telegram polling disabled: quarantine blob storage is unavailable"
+                            );
+                            return;
+                        }
+                        telegram_poll_loop(tg_ch_poll, verb_reg_poll, ingest_ns_poll).await;
+                    });
+                    tracing::info!("telegram channel polling loop started");
+                }
+                if admission.outbound_delivery {
+                    tokio::task::spawn(telegram_outbox_loop(
+                        tg_ch_outbox,
+                        verb_reg_outbox,
+                        ingest_ns_outbox,
+                    ));
+                    tracing::info!("telegram channel outbox loop started");
+                }
             });
             if !spawned {
                 tracing::error!(
@@ -2101,6 +2145,50 @@ fn override_matches_declared_main_backend(
         == canonical_path_no_side_effects(std::path::Path::new(override_path))?)
 }
 
+/// Refuse a declared writable SQLite backend whose current filesystem mode is
+/// already read-only, without opening SQLite or creating any path.
+///
+/// The multi-backend boot path performs the same check after open so its
+/// captured runtime identity remains authoritative. Pre-open clients must run
+/// this narrower probe before daemon forwarding as well: a warm daemon may
+/// still hold a write-capable handle acquired before a later chmod, and the
+/// declaration-only topology fingerprint would otherwise route the request to
+/// that retained writer. A force-memory override supersedes every declared
+/// path and must skip this helper entirely at its call site.
+pub fn validate_declared_backend_access_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
+    for backend in backends {
+        if backend.kind != BackendKind::Sqlite || backend.read_only {
+            continue;
+        }
+        let Some(path) = backend.path.as_ref() else {
+            continue;
+        };
+        let expanded = khive_runtime::expand_tilde(path);
+        let metadata = match std::fs::metadata(&expanded) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "backend {}: cannot inspect filesystem access mode for {} before daemon \
+                     forwarding: {error}",
+                    backend.name,
+                    expanded.display(),
+                ));
+            }
+        };
+        if metadata.permissions().readonly() {
+            anyhow::bail!(
+                "backend {}: path {} has no filesystem write bits; declare `read_only = true` \
+                 so backend topology and daemon config identity describe the snapshot-inspection \
+                 mode explicitly (request was refused before daemon forwarding)",
+                backend.name,
+                expanded.display(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn build_registry_for_multi_backend_inner(
     mut base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -2127,18 +2215,25 @@ fn build_registry_for_multi_backend_inner(
         let canonical = canonical_backend_path(backend_cfg)?;
         if let Some(ref canon) = canonical {
             if let Some(existing) = path_to_backend.get(canon) {
+                if existing.is_read_only() != backend_cfg.read_only {
+                    anyhow::bail!(
+                        "backend {} aliases {} but declares read_only={} while the same \
+                         physical database was already opened with read_only={}; every alias \
+                         of one database must use the same access mode",
+                        backend_cfg.name,
+                        canon.display(),
+                        backend_cfg.read_only,
+                        existing.is_read_only(),
+                    );
+                }
                 backends.insert(backend_cfg.name.clone(), existing.clone());
                 continue;
             }
         }
         let backend = open_backend(backend_cfg)?;
-        {
-            let mut writer = backend.pool().try_writer().map_err(|e| {
-                anyhow::anyhow!("backend {}: migration writer: {e}", backend_cfg.name)
-            })?;
-            run_migrations(writer.conn_mut())
-                .map_err(|e| anyhow::anyhow!("backend {}: migration: {e}", backend_cfg.name))?;
-        }
+        backend.prepare_core_schema().map_err(|e| {
+            anyhow::anyhow!("backend {}: schema preparation: {e}", backend_cfg.name)
+        })?;
         let arc = Arc::new(backend);
         if let Some(canon) = canonical {
             path_to_backend.insert(canon, arc.clone());
@@ -2191,8 +2286,11 @@ fn build_registry_for_multi_backend_inner(
     // boot produces (`default_runtime` plus each per-pack runtime), so a
     // pack that later reads `KhiveRuntime::blob_store()` sees the same
     // selection regardless of which backend its own KG data lives on.
+    let blob_store_runtime = per_pack_runtimes_local
+        .get("blob")
+        .unwrap_or(&default_runtime);
     if let Some(store) =
-        install_resolved_blob_store(&default_runtime, khive_cfg, main_backend.as_ref())?
+        install_resolved_blob_store(blob_store_runtime, khive_cfg, main_backend.as_ref())?
     {
         for rt in per_pack_runtimes_local.values() {
             rt.install_blob_store(store.clone());
@@ -2229,10 +2327,11 @@ fn build_registry_for_multi_backend_inner(
 
     let gate = default_runtime.config().gate.clone();
     let default_namespace = default_runtime.config().default_namespace.clone();
-    let config_id = crate::server::compute_config_id_with_ann_fresh_tail(
+    let config_id = crate::server::compute_config_id_with_runtime_policies(
         default_runtime.config(),
         Some(khive_cfg),
         default_runtime.ann_fresh_tail_enabled(),
+        default_runtime.is_read_only(),
     );
     let visible_namespaces = default_runtime.config().visible_namespaces.clone();
 
@@ -2242,7 +2341,9 @@ fn build_registry_for_multi_backend_inner(
     builder.with_visible_namespaces(visible_namespaces);
     builder.with_actor_id(default_runtime.config().actor_id.clone());
 
-    if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
+    if default_runtime.is_read_only() {
+        builder.with_read_only_audit_store();
+    } else if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
         if let Ok(event_store) = default_runtime.events(&tok) {
             builder.with_event_store(event_store);
         }
@@ -2397,12 +2498,13 @@ pub fn enforce_strict_actor_mode(
 
 /// Build a fully-configured server from parsed args (without serving).
 ///
-/// Returns, alongside the server, the resolved [`KhiveRuntime`] handle the
-/// `"schedule"` pack is bound to — `None` when the resolved pack set does
-/// not include `"schedule"` — for `start_daemon_components_if_daemon` to
-/// drain against (ADR-106). This is the SAME runtime the server itself
-/// dispatches through, never an independently re-resolved one (PR #782 —
-/// see `crates/khive-mcp/docs/api/pending-events.md`).
+/// Returns, alongside the server, the resolved writable [`KhiveRuntime`]
+/// handle the `"schedule"` pack is bound to. It is `None` when the resolved
+/// pack set omits `"schedule"` or that pack's own assigned backend is
+/// read-only, because every ticker pass begins with reclaim DML. This is the
+/// SAME runtime the server itself dispatches through, never an independently
+/// re-resolved one (PR #782 — see
+/// `crates/khive-mcp/docs/api/pending-events.md`).
 ///
 /// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
 /// `(namespace, namespace_explicit)` pair from a real CLI parse and, because
@@ -2524,12 +2626,14 @@ pub fn build_server_with_explicit_namespace(
                  Set KHIVE_ACTOR or --actor to this lambda's id."
             );
         }
-        let schedule_rt = runtime
-            .config()
-            .packs
-            .iter()
-            .any(|p| p == "schedule")
-            .then(|| runtime.clone());
+        let schedule_rt = writable_schedule_runtime(
+            runtime
+                .config()
+                .packs
+                .iter()
+                .any(|p| p == "schedule")
+                .then(|| runtime.clone()),
+        );
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
         let server = KhiveMcpServer::new(runtime)
             .map(|s| s.with_default_output_format(fmt))
@@ -2544,21 +2648,24 @@ pub fn build_server_with_explicit_namespace(
         args.db.as_deref(),
         db_anchor.as_deref(),
     )?;
-    let schedule_rt = multi
-        .per_pack_runtimes
-        .get("schedule")
-        .map(|rt| (**rt).clone());
+    let schedule_rt = writable_schedule_runtime(
+        multi
+            .per_pack_runtimes
+            .get("schedule")
+            .map(|rt| (**rt).clone()),
+    );
     let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
     Ok((server, schedule_rt))
 }
 
 /// Canonicalize a SQLite backend path for deduplication (ADR-028 §8).
 ///
-/// The database file may not exist yet at boot time, so we cannot call
-/// `std::fs::canonicalize` on the file itself. Instead we canonicalize the
-/// parent directory (which must exist after `open_backend` creates it) and
-/// rejoin the file name. `None` is returned for in-memory backends, which
-/// are never deduplicated.
+/// The database file may not exist yet at boot time, so this uses the shared
+/// no-side-effect path resolver rather than creating the parent as part of
+/// identity resolution. That distinction is mandatory for a missing
+/// read-only snapshot: boot must fail without materializing either the parent
+/// or database. `None` is returned for in-memory backends, which are never
+/// deduplicated.
 fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>> {
     if cfg.kind == BackendKind::Memory {
         return Ok(None);
@@ -2567,28 +2674,9 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
         Some(p) => khive_runtime::expand_tilde(p),
         None => return Ok(None),
     };
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("backend {}: path has no parent directory", cfg.name))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("backend {}: path has no file name", cfg.name))?;
-    // Create the parent so canonicalize succeeds even before the DB file is written.
-    std::fs::create_dir_all(parent).map_err(|e| {
-        anyhow::anyhow!(
-            "backend {}: cannot create parent dir {}: {e}",
-            cfg.name,
-            parent.display()
-        )
-    })?;
-    let canon_parent = parent.canonicalize().map_err(|e| {
-        anyhow::anyhow!(
-            "backend {}: cannot canonicalize parent dir {}: {e}",
-            cfg.name,
-            parent.display()
-        )
-    })?;
-    Ok(Some(canon_parent.join(file_name)))
+    canonical_path_no_side_effects(&path)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("backend {}: cannot resolve path: {e}", cfg.name))
 }
 
 /// Bound on final-component symlink hops [`canonical_path_no_side_effects`]
@@ -2766,6 +2854,16 @@ pub fn build_server_from_multi_backend_registry(
     khive_cfg: &KhiveConfig,
     coordinator: Option<Arc<dyn crate::coordinator::CoordinatorService>>,
 ) -> KhiveMcpServer {
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    let channel_loop_admission = crate::server::ChannelLoopAdmission::for_pack_runtimes(
+        multi.per_pack_runtimes.get("kg").map(Arc::as_ref),
+        multi.per_pack_runtimes.get("comm").map(Arc::as_ref),
+    );
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    let channel_outbox_runtime = multi
+        .per_pack_runtimes
+        .get("kg")
+        .map(|runtime| runtime.as_ref().clone());
     // Wire the main backend's pool for background WAL checkpointing. The pool is
     // only present for file-backed databases; in-memory backends return None here
     // so that checkpoint_once never runs on a non-WAL connection.
@@ -2786,6 +2884,11 @@ pub fn build_server_from_multi_backend_registry(
     .with_default_output_format(fmt)
     .with_secondary_pools(secondary_pools)
     .with_runtime(default_runtime);
+
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    let server = server
+        .with_channel_outbox_runtime(channel_outbox_runtime)
+        .with_channel_loop_admission(channel_loop_admission);
 
     let server = match coordinator {
         Some(c) => server.with_coordinator(c),
@@ -2820,7 +2923,7 @@ fn secondary_file_backed_pools(multi: &MultiBackendRegistry) -> Vec<Arc<Connecti
     let mut pools = Vec::new();
     for rt in multi.per_pack_runtimes.values() {
         let backend = rt.backend();
-        if !backend.is_file_backed() {
+        if !backend.is_file_backed() || backend.is_read_only() {
             continue;
         }
         let pool = backend.pool_arc();
@@ -2849,12 +2952,10 @@ pub struct WiringSurface {
     pub has_checkpoint_pool: bool,
     /// The resolved ADR-078 default output format.
     pub output_format: OutputFormat,
-    /// Whether the default ingest namespace would authorize the email
-    /// channel loops to start if this process runs in the daemon role
-    /// (#503/#602). The actual spawn is arg-driven at `run`/`serve_server`
-    /// (#610), not construction time, but the *authorization* outcome is a
-    /// function of how the registry's gate was wired during construction —
-    /// this field is the construction-time state that decision reads.
+    /// Whether the default ingest namespace passes the email loop's gate
+    /// preflight (#503/#602). This captures only the existing public
+    /// authorization surface; runtime-mode admission remains private server
+    /// wiring and independently prevents read-only-backed tasks from starting.
     /// Only meaningful when the `channel-email` feature is compiled in.
     #[cfg(feature = "channel-email")]
     pub channel_loop_eligible: bool,
@@ -2886,7 +2987,7 @@ impl WiringSurface {
 /// constructor, so this derivation is no longer hand-copied at each call site
 /// (#601, #604).
 pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<ConnectionPool>> {
-    if main_backend.is_file_backed() {
+    if main_backend.is_file_backed() && !main_backend.is_read_only() {
         Some(main_backend.pool_arc())
     } else {
         None
@@ -2918,7 +3019,7 @@ pub fn install_resolved_blob_store(
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<dyn khive_storage::BlobStore>>> {
-    match khive_runtime::resolve_blob_store(khive_cfg, backend) {
+    match khive_runtime::resolve_blob_store_for_mode(khive_cfg, backend, rt.is_read_only()) {
         Ok(store) => {
             rt.install_blob_store(store.clone());
             Ok(Some(store))
@@ -2969,22 +3070,34 @@ fn open_backend(cfg: &BackendConfig) -> anyhow::Result<StorageBackend> {
                 )
             })?;
             let expanded = khive_runtime::expand_tilde(path);
-            if let Some(parent) = expanded.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    anyhow::anyhow!(
-                        "backend {}: cannot create parent dir {}: {e}",
-                        cfg.name,
-                        parent.display()
-                    )
-                })?;
+            if !cfg.read_only {
+                if let Some(parent) = expanded.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!(
+                            "backend {}: cannot create parent dir {}: {e}",
+                            cfg.name,
+                            parent.display()
+                        )
+                    })?;
+                }
             }
             if cfg.read_only {
                 StorageBackend::sqlite_read_only(&expanded).map_err(|e| {
                     anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name)
                 })
             } else {
-                StorageBackend::sqlite(&expanded)
-                    .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))
+                let backend = StorageBackend::sqlite(&expanded)
+                    .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))?;
+                if backend.is_read_only() {
+                    anyhow::bail!(
+                        "backend {}: path {} has no filesystem write bits; declare \
+                         `read_only = true` so backend topology and daemon config identity \
+                         describe the snapshot-inspection mode explicitly",
+                        cfg.name,
+                        expanded.display()
+                    );
+                }
+                Ok(backend)
             }
         }
     }
@@ -3394,6 +3507,26 @@ fn apply_config_pack_selection(
 mod tests {
     use super::*;
     use khive_runtime::{BlobConfig, Namespace, StorageSectionConfig};
+
+    // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
+    // connections close asynchronously; read-only admission rejects a writable
+    // `-shm` as potentially live.
+    #[cfg(unix)]
+    fn freeze_snapshot_sidecars(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+            }
+        }
+    }
     use serial_test::serial;
     use std::io::Write;
 
@@ -5218,11 +5351,12 @@ region = "us-east-1"
     }
 
     impl ClearedKhiveEnvGuard {
-        const VARS: [&'static str; 4] = [
+        const VARS: [&'static str; 5] = [
             "KHIVE_DB",
             "KHIVE_ACTOR",
             "KHIVE_PACKS",
             "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
+            "KHIVE_BLOB_ROOT",
         ];
 
         fn clear() -> Self {
@@ -5428,6 +5562,187 @@ region = "us-east-1"
             Err(khive_storage::StorageError::CapacityFloor { .. }) => {}
             Err(other) => panic!("fs-default store must accept a write: {other:?}"),
         }
+    }
+
+    fn prepare_current_snapshot_source(path: &std::path::Path) {
+        let backend = StorageBackend::sqlite(path).expect("create snapshot source");
+        backend
+            .prepare_core_schema()
+            .expect("prepare exact-current migration ledger");
+        drop(backend);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(path);
+    }
+
+    fn blob_only_runtime_config() -> RuntimeConfig {
+        RuntimeConfig {
+            packs: vec!["blob".to_string()],
+            ..base_runtime_config_for_multi_backend()
+        }
+    }
+
+    /// The default fs root is optional when no `[storage.blob]` section was
+    /// declared. A snapshot boot must not create that directory merely by
+    /// installing the blob pack, and `blob.put` must report the pack runtime's
+    /// read-only mode before attempting any physical store write.
+    #[tokio::test]
+    #[serial]
+    async fn read_only_single_backend_neither_creates_blob_root_nor_accepts_blob_put() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("snapshot.db");
+        let blob_root = dir.path().join("blobs");
+        prepare_current_snapshot_source(&main_path);
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: BackendId::MAIN.to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: true,
+            }],
+            ..KhiveConfig::default()
+        };
+        let multi = build_registry_for_multi_backend(blob_only_runtime_config(), &khive_cfg, None)
+            .expect("read-only blob-pack registry must boot without creating a store");
+        assert!(
+            !blob_root.exists(),
+            "snapshot boot must not materialize the default FsBlobStore root"
+        );
+
+        let error = multi
+            .registry
+            .dispatch("blob.put", serde_json::json!({"bytes": "YQ=="}))
+            .await
+            .expect_err("blob.put must reject on its read-only pack runtime");
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert!(
+            !blob_root.exists(),
+            "the rejected put must remain side-effect free"
+        );
+    }
+
+    /// Mixed topology is governed by the runtime assigned to the blob pack,
+    /// not by the main audit backend. A writable main must not accidentally
+    /// make a read-only blob secondary writable or create its default fs root.
+    #[tokio::test]
+    #[serial]
+    async fn read_only_blob_secondary_refuses_put_beside_writable_main() {
+        use khive_runtime::PackConfig;
+
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let archive_path = dir.path().join("blob-snapshot.db");
+        let blob_root = dir.path().join("blobs");
+        prepare_current_snapshot_source(&main_path);
+        prepare_current_snapshot_source(&archive_path);
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "blob-snapshot".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(archive_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: true,
+                },
+            ],
+            packs: HashMap::from([(
+                "blob".to_string(),
+                PackConfig {
+                    backend: "blob-snapshot".to_string(),
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+        let multi = build_registry_for_multi_backend(blob_only_runtime_config(), &khive_cfg, None)
+            .expect("mixed topology must boot");
+        let error = multi
+            .registry
+            .dispatch("blob.put", serde_json::json!({"bytes": "YQ=="}))
+            .await
+            .expect_err("read-only blob secondary must reject put");
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert!(
+            !blob_root.exists(),
+            "main writability must not create storage for a read-only blob pack"
+        );
+    }
+
+    /// Positive mixed-topology counterpart: a read-only main does not disable
+    /// a blob pack explicitly routed to a writable secondary.
+    #[tokio::test]
+    #[serial]
+    async fn writable_blob_secondary_accepts_put_beside_read_only_main() {
+        use khive_runtime::PackConfig;
+
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-snapshot.db");
+        let blob_db = dir.path().join("blob-writable.db");
+        let blob_root = dir.path().join("writable-blobs");
+        prepare_current_snapshot_source(&main_path);
+        prepare_current_snapshot_source(&blob_db);
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: true,
+                },
+                BackendConfig {
+                    name: "blob-writable".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(blob_db),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: HashMap::from([(
+                "blob".to_string(),
+                PackConfig {
+                    backend: "blob-writable".to_string(),
+                },
+            )]),
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.display().to_string()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let multi = build_registry_for_multi_backend(blob_only_runtime_config(), &khive_cfg, None)
+            .expect("writable blob secondary must boot beside read-only main");
+        let result = multi
+            .registry
+            .dispatch("blob.put", serde_json::json!({"bytes": "YQ=="}))
+            .await;
+        assert!(
+            result.is_ok(),
+            "writable blob secondary must accept put: {result:?}"
+        );
+        assert!(
+            blob_root.exists(),
+            "writable blob storage may materialize its root"
+        );
     }
 
     /// Regression for ADR-073: a pack assigned to a secondary backend must
@@ -6392,6 +6707,8 @@ region = "us-east-1"
         ])
         .expect("DDL on rw backend");
         drop(rw);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&db_path);
 
         // Re-open read-only and confirm writes fail.
         let ro = StorageBackend::sqlite_read_only(&db_path).expect("ro backend");
@@ -6399,6 +6716,272 @@ region = "us-east-1"
         assert!(
             result.is_err(),
             "write to a read-only backend must fail; got Ok(())"
+        );
+        assert!(
+            checkpoint_pool_for(&ro).is_none(),
+            "read-only backends must not drive checkpoint or WAL sweep writers"
+        );
+    }
+
+    #[test]
+    fn read_only_backend_open_does_not_create_missing_parent_or_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("missing-parent");
+        let db_path = parent.join("missing.db");
+        let config = BackendConfig {
+            name: "archive".to_string(),
+            kind: BackendKind::Sqlite,
+            path: Some(db_path.clone()),
+            cache_mb: None,
+            journal_mode: None,
+            read_only: true,
+        };
+
+        let canonical = canonical_backend_path(&config)
+            .expect("read-only identity resolution must be lexical and side-effect free");
+        assert!(canonical.is_some());
+        assert!(
+            !parent.exists(),
+            "canonical backend identity must not create a missing read-only parent"
+        );
+
+        let error = match open_backend(&config) {
+            Ok(_) => panic!("missing read-only snapshot must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("read-only open"),
+            "error must identify the read-only open: {error}"
+        );
+        assert!(!parent.exists(), "read-only boot must not create parents");
+        assert!(
+            !db_path.exists(),
+            "read-only boot must not create a database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_backend_requires_read_only_mode_to_be_declared_explicitly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chmod_snapshot.db");
+        drop(StorageBackend::sqlite(&db_path).expect("create snapshot source"));
+
+        let mut permissions = std::fs::metadata(&db_path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&db_path, permissions).unwrap();
+        freeze_snapshot_sidecars(&db_path);
+
+        let config = BackendConfig {
+            name: "archive".to_string(),
+            kind: BackendKind::Sqlite,
+            path: Some(db_path),
+            cache_mb: None,
+            journal_mode: None,
+            read_only: false,
+        };
+        let error = match open_backend(&config) {
+            Ok(_) => panic!("an undeclared multi-backend storage-mode change must fail closed"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("read_only = true"), "{message}");
+        assert!(message.contains("config identity"), "{message}");
+    }
+
+    #[test]
+    #[serial]
+    fn multi_backend_read_only_construction_and_pack_schema_paths_acquire_no_writer() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-snapshot.db");
+        let comm_path = dir.path().join("comm-snapshot.db");
+        let config_for = |read_only: bool| KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only,
+                },
+                BackendConfig {
+                    name: "comm-store".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(comm_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only,
+                },
+            ],
+            packs: HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "comm-store".to_string(),
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let writable = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(false),
+            None,
+        )
+        .expect("prepare exact-current core and pack schemas");
+        drop(writable);
+
+        for path in [&main_path, &comm_path] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mode: String = conn
+                .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "delete");
+        }
+
+        let snapshot = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(true),
+            None,
+        )
+        .expect("open both declared backends for inspection");
+
+        assert_eq!(
+            snapshot
+                .default_runtime
+                .backend()
+                .pool()
+                .writer_acquisition_snapshot(),
+            khive_db::pool::WriterAcquisitionSnapshot::default(),
+            "main snapshot construction, exact-ledger validation, and kg pack boot must stay \
+             writer-free"
+        );
+        assert!(
+            snapshot.default_runtime.backend().pool().max_readers() > 0,
+            "the main rollback-journal snapshot must retain a dedicated reader pool"
+        );
+        for (pack, runtime) in &snapshot.per_pack_runtimes {
+            assert_eq!(
+                runtime.backend().pool().writer_acquisition_snapshot(),
+                khive_db::pool::WriterAcquisitionSnapshot::default(),
+                "pack {pack:?} snapshot boot must keep its construction-inclusive writer \
+                 baseline at zero"
+            );
+            assert!(
+                runtime.backend().pool().max_readers() > 0,
+                "pack {pack:?} must read its rollback-journal snapshot through a dedicated \
+                 reader"
+            );
+        }
+    }
+
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[test]
+    #[serial]
+    fn mixed_topology_channel_admission_follows_the_runtime_that_backs_each_loop() {
+        use clap::Parser;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-channel.db");
+        let comm_path = dir.path().join("comm-channel.db");
+        let config_for = |main_read_only: bool, comm_read_only: bool| KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: main_read_only,
+                },
+                BackendConfig {
+                    name: "comm-store".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(comm_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: comm_read_only,
+                },
+            ],
+            packs: HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "comm-store".to_string(),
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let seeded = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(false, false),
+            None,
+        )
+        .expect("seed exact-current snapshots");
+        drop(seeded);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&comm_path);
+        let daemon = Args::parse_from(["mcp", "--daemon"]);
+
+        let comm_snapshot = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(false, true),
+            None,
+        )
+        .expect("writable kg plus read-only comm topology");
+        let server =
+            build_server_from_multi_backend_registry(comm_snapshot, &config_for(false, true), None);
+        let admission = channel_loop_plan(&server, &daemon);
+        assert!(
+            !admission.inbound_poll,
+            "comm.ingest/cursor/heartbeat are backed by the read-only comm runtime"
+        );
+        assert!(
+            admission.outbound_delivery,
+            "list/update are backed by the writable kg runtime"
+        );
+        drop(server);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            freeze_snapshot_sidecars(&main_path);
+            // The second arm reopens comm writable, so its sidecars must thaw.
+            for suffix in ["-wal", "-shm"] {
+                let mut name = comm_path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = comm_path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o644);
+                    std::fs::set_permissions(&sidecar, permissions).expect("thaw sidecar");
+                }
+            }
+        }
+
+        let kg_snapshot = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &config_for(true, false),
+            None,
+        )
+        .expect("read-only kg plus writable comm topology");
+        let server =
+            build_server_from_multi_backend_registry(kg_snapshot, &config_for(true, false), None);
+        let admission = channel_loop_plan(&server, &daemon);
+        assert!(
+            admission.inbound_poll,
+            "comm.ingest/cursor/heartbeat are backed by the writable comm runtime"
+        );
+        assert!(
+            !admission.outbound_delivery,
+            "a read-only kg runtime cannot durably claim or mark delivery, so no external send \
+             task may start"
         );
     }
 
@@ -6564,6 +7147,28 @@ region = "us-east-1"
                 "two backends with the same canonical path must share one Arc and boot ok; got: {e}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn duplicate_sqlite_aliases_reject_conflicting_read_only_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared-mode.db");
+        let mut khive_cfg = duplicate_sqlite_path_config(&db_path);
+        assert!(khive_cfg.backends.len() >= 2);
+        khive_cfg.backends[1].read_only = true;
+
+        let error = match build_server_multi_backend(
+            base_runtime_config_for_multi_backend(),
+            &khive_cfg,
+            None,
+        ) {
+            Ok(_) => panic!("one physical database cannot be both writable and read-only"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("same physical database"), "{message}");
+        assert!(message.contains("read_only"), "{message}");
     }
 
     /// Regression for #720: changing `HOME` after runtime-config resolution but
@@ -7777,6 +8382,195 @@ region = "us-east-1"
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn default_read_only_server_omits_schedule_tick_and_warms_without_a_writer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let db = seat_dir.path().join("read-only-schedule.db");
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("create migrated snapshot source");
+        let mut permissions = std::fs::metadata(&db).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&db, permissions).unwrap();
+        freeze_snapshot_sidecars(&db);
+
+        use clap::Parser;
+        let args = Args::parse_from(["mcp", "--db", db.to_str().expect("utf8 path"), "--no-embed"]);
+
+        let (_server, schedule_rt) = build_server(&args).expect("read-only server must build");
+        assert!(
+            schedule_rt.is_none(),
+            "the default pack set must not return a writer-dependent ticker runtime for a snapshot"
+        );
+
+        // Read-only pools are intentionally omitted from `server.pool()` so
+        // checkpoint ownership cannot see them. Build the same default pack
+        // registry over a retained runtime clone to inspect its actual pool
+        // while exercising the identical `warm_all` implementation.
+        let runtime = KhiveRuntime::new_readonly(RuntimeConfig {
+            db_path: Some(db),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("retained read-only runtime");
+        let pool = runtime.backend().pool_arc();
+        let warm_server = KhiveMcpServer::new(runtime).expect("default read-only pack registry");
+        let before = pool.writer_acquisition_snapshot();
+        warm_server.warm_all().await;
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            before,
+            "default daemon pack warm must remain outside the read-only writer plane"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_schedule_tick_and_warm_use_each_assigned_backend_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let main_db = seat_dir.path().join("read-only-main.db");
+        let schedule_db = seat_dir.path().join("writable-schedule.db");
+        for path in [&main_db, &schedule_db] {
+            KhiveRuntime::new(RuntimeConfig {
+                db_path: Some(path.clone()),
+                ..RuntimeConfig::no_embeddings()
+            })
+            .expect("create migrated backend");
+        }
+        let mut permissions = std::fs::metadata(&main_db).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&main_db, permissions).unwrap();
+        freeze_snapshot_sidecars(&main_db);
+
+        let config_path = write_config(
+            seat_dir.path(),
+            &format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{main}"
+read_only = true
+
+[[backends]]
+name = "schedule-backend"
+kind = "sqlite"
+path = "{schedule}"
+
+[packs.schedule]
+backend = "schedule-backend"
+"#,
+                main = main_db.display(),
+                schedule = schedule_db.display(),
+            ),
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--no-embed",
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+        ]);
+        let (server, schedule_rt) = build_server(&args).expect("mixed-mode server must build");
+        assert!(
+            schedule_rt.is_some(),
+            "a read-only main backend must not suppress schedule when schedule's own backend is writable"
+        );
+        let schedule_pool = schedule_rt
+            .as_ref()
+            .expect("writable schedule runtime")
+            .backend()
+            .pool_arc();
+        let schedule_before = schedule_pool.writer_acquisition_snapshot();
+        server.warm_all().await;
+        assert_eq!(
+            schedule_pool.writer_acquisition_snapshot(),
+            schedule_before,
+            "warming other packs must not add schedule-backend writer traffic"
+        );
+
+        let read_only_schedule_db = seat_dir.path().join("read-only-schedule-secondary.db");
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(read_only_schedule_db.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("create migrated read-only schedule source");
+        let mut permissions = std::fs::metadata(&read_only_schedule_db)
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&read_only_schedule_db, permissions).unwrap();
+        freeze_snapshot_sidecars(&read_only_schedule_db);
+        let writable_main_db = seat_dir.path().join("writable-main.db");
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(writable_main_db.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("create migrated writable main");
+        let config_path = write_config(
+            seat_dir.path(),
+            &format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{main}"
+
+[[backends]]
+name = "schedule-backend"
+kind = "sqlite"
+path = "{schedule}"
+read_only = true
+
+[packs.schedule]
+backend = "schedule-backend"
+"#,
+                main = writable_main_db.display(),
+                schedule = read_only_schedule_db.display(),
+            ),
+        );
+        let args = Args::parse_from([
+            "mcp",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--no-embed",
+            "--pack",
+            "kg",
+            "--pack",
+            "schedule",
+        ]);
+        let (_server, schedule_rt) = build_server(&args).expect("mixed-mode server must build");
+        assert!(
+            schedule_rt.is_none(),
+            "a writable main backend must not enable schedule when schedule's own backend is read-only"
+        );
+    }
+
     #[test]
     fn client_role_never_starts_the_schedule_component() {
         use clap::Parser;
@@ -8467,6 +9261,176 @@ backend = "kg-backend"
         }
     }
 
+    /// #1856 multi-backend regression: the owner-only `external_id` claim
+    /// must use the same KG-routed runtime as outbox list/update dispatch.
+    /// The default backend deliberately contains no message row; using its
+    /// runtime makes the claim fail and suppresses the external send.
+    #[cfg(feature = "channel-email")]
+    mod routed_email_outbox_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use khive_runtime::PackConfig;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingChannel {
+            sent: Mutex<Vec<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for RecordingChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                self.sent.lock().unwrap().push(envelope);
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(Vec::new())
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn kg_secondary_runtime_owns_external_id_claim_and_delivery_mark() {
+            let dir = tempfile::tempdir().unwrap();
+            let main_path = dir.path().join("main.db");
+            let kg_path = dir.path().join("kg-secondary.db");
+            let khive_cfg = KhiveConfig {
+                backends: vec![
+                    BackendConfig {
+                        name: BackendId::MAIN.to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(main_path.clone()),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                    BackendConfig {
+                        name: "kg-store".to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(kg_path.clone()),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                ],
+                packs: HashMap::from([
+                    (
+                        "kg".to_string(),
+                        PackConfig {
+                            backend: "kg-store".to_string(),
+                        },
+                    ),
+                    (
+                        "comm".to_string(),
+                        PackConfig {
+                            backend: "kg-store".to_string(),
+                        },
+                    ),
+                ]),
+                ..KhiveConfig::default()
+            };
+
+            let multi = build_registry_for_multi_backend_inner(
+                base_runtime_config_for_multi_backend(),
+                &khive_cfg,
+                None,
+            )
+            .expect("mixed-topology registry must build");
+            assert_eq!(
+                multi.per_pack_runtimes["kg"].backend_id().as_str(),
+                "kg-store"
+            );
+            let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+            let registry = server.verb_registry_clone();
+            let owner_runtime = server
+                .channel_outbox_runtime_clone()
+                .expect("email outbox must retain the KG-routed runtime");
+            assert_eq!(owner_runtime.backend_id().as_str(), "kg-store");
+
+            let send = registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({
+                        "to": "email:recipient@example.com",
+                        "subject": "routed owner claim",
+                        "content": "kg-secondary-outbox-probe",
+                    }),
+                )
+                .await
+                .expect("comm.send must create the outbound secondary row");
+            let note_id = send["full_id"]
+                .as_str()
+                .expect("comm.send returns full_id")
+                .to_string();
+
+            let channel = RecordingChannel::default();
+            let namespace = Namespace::parse("local").unwrap();
+            channel_outbox_once(
+                &channel,
+                &registry,
+                &owner_runtime,
+                &namespace,
+                "local",
+                "maintainer@example.com",
+                "example.com",
+                &["recipient@example.com".to_string()],
+            )
+            .await;
+            assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+            let note = registry
+                .dispatch("get", serde_json::json!({ "id": note_id }))
+                .await
+                .expect("KG-routed get must read the delivered secondary row");
+            assert!(
+                note["properties"]["external_id"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "owner claim must persist external_id on the KG backend: {note}"
+            );
+            assert!(
+                note["properties"]["delivered_at"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "successful send must persist delivered_at on the KG backend: {note}"
+            );
+
+            let main = rusqlite::Connection::open(&main_path).unwrap();
+            let main_count: i64 = main
+                .query_row(
+                    "SELECT COUNT(*) FROM notes WHERE content = 'kg-secondary-outbox-probe'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(main_count, 0, "default backend must not own the message");
+
+            let kg = rusqlite::Connection::open(&kg_path).unwrap();
+            let (external_id, delivered_at): (String, String) = kg
+                .query_row(
+                    "SELECT json_extract(properties, '$.external_id'), \
+                            json_extract(properties, '$.delivered_at') \
+                     FROM notes WHERE content = 'kg-secondary-outbox-probe' \
+                       AND json_extract(properties, '$.direction') = 'outbound'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(!external_id.is_empty());
+            assert!(!delivered_at.is_empty());
+        }
+    }
+
     // --- spawn_email_channel_loops: shared helper regression (multi-backend gap fix) ---
     //
     // Both `run` and `serve_server` call this same extracted fn (source-verified —
@@ -8551,7 +9515,7 @@ backend = "kg-backend"
 
             // Must not panic: EmailChannel::from_env() fails closed on the missing
             // KHIVE_EMAIL_SMTP_HOST and the fn logs a warning and returns.
-            spawn_email_channel_loops(&server);
+            spawn_email_channel_loops(&server, server.channel_loop_admission());
         }
 
         /// Regression for #602: `spawn_email_channel_loops_if_daemon` is the
@@ -8582,6 +9546,49 @@ backend = "kg-backend"
             );
         }
 
+        #[test]
+        fn email_plan_gates_poll_and_outbox_on_daemon_role_and_backing_runtime_modes() {
+            use clap::Parser;
+
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("email-read-only.db");
+            let config = RuntimeConfig {
+                db_path: Some(path),
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+            KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            #[cfg(unix)]
+            freeze_snapshot_sidecars(config.db_path.as_ref().expect("db path"));
+            let snapshot = KhiveRuntime::new_readonly(config).expect("open read-only snapshot");
+            let server = KhiveMcpServer::new(snapshot).expect("build snapshot server");
+
+            let daemon = Args::parse_from(["mcp", "--daemon"]);
+            let admitted = channel_loop_plan(&server, &daemon);
+            assert!(
+                !admitted.inbound_poll,
+                "email polling must not start when comm.ingest/cursor/heartbeat resolve to a \
+                 read-only runtime"
+            );
+            assert!(
+                !admitted.outbound_delivery,
+                "email delivery must not start when list/update resolve to a read-only runtime"
+            );
+
+            let writable = KhiveRuntime::memory().expect("writable runtime");
+            let server =
+                KhiveMcpServer::with_packs(writable, &["kg".to_string(), "comm".to_string()])
+                    .expect("build writable server");
+            let admitted = channel_loop_plan(&server, &daemon);
+            assert!(admitted.inbound_poll);
+            assert!(admitted.outbound_delivery);
+
+            let client = Args::parse_from(["mcp"]);
+            let admitted = channel_loop_plan(&server, &client);
+            assert!(!admitted.inbound_poll);
+            assert!(!admitted.outbound_delivery);
+        }
+
         #[tokio::test]
         #[serial]
         async fn daemon_role_gate_spawns_without_panic() {
@@ -8594,11 +9601,11 @@ backend = "kg-backend"
                 default_namespace: Namespace::parse("test").unwrap(),
                 embedding_model: None,
                 additional_embedding_models: vec![],
-                packs: vec!["kg".to_string()],
+                packs: vec!["kg".to_string(), "comm".to_string()],
                 ..RuntimeConfig::default()
             };
             let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+            let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
 
             // Daemon role: the wrapper must take the spawn branch (still fails
             // closed on missing KHIVE_EMAIL_* — no network I/O — but must not
@@ -8627,6 +9634,50 @@ backend = "kg-backend"
             // Client role: the wrapper must take the skip branch and never
             // attempt to construct an EmailChannel at all.
             spawn_email_channel_loops_if_daemon(&server, &args);
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    mod telegram_channel_loop_admission_tests {
+        use super::*;
+
+        #[test]
+        fn telegram_plan_gates_poll_and_outbox_on_backing_runtime_modes() {
+            use clap::Parser;
+
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("telegram-read-only.db");
+            let config = RuntimeConfig {
+                db_path: Some(path),
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+            KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            #[cfg(unix)]
+            freeze_snapshot_sidecars(config.db_path.as_ref().expect("db path"));
+            let snapshot = KhiveRuntime::new_readonly(config).expect("open read-only snapshot");
+            let server = KhiveMcpServer::new(snapshot).expect("build snapshot server");
+            let daemon = Args::parse_from(["mcp", "--daemon"]);
+
+            let admitted = channel_loop_plan(&server, &daemon);
+            assert!(
+                !admitted.inbound_poll,
+                "Telegram getUpdates must not start when comm.ingest resolves to a read-only \
+                 runtime"
+            );
+            assert!(
+                !admitted.outbound_delivery,
+                "Telegram sendMessage must not start when delivered_at cannot be durably \
+                 recorded by list/update's runtime"
+            );
+
+            let writable = KhiveRuntime::memory().expect("writable runtime");
+            let server =
+                KhiveMcpServer::with_packs(writable, &["kg".to_string(), "comm".to_string()])
+                    .expect("build writable server");
+            let admitted = channel_loop_plan(&server, &daemon);
+            assert!(admitted.inbound_poll);
+            assert!(admitted.outbound_delivery);
         }
     }
 

@@ -1240,3 +1240,34 @@ This regression does not reproduce or close #1460 or #1812. An idle autocommit c
 not pin WAL; those issues concern production stdio/multiprocess pinning and continuous
 concurrent-session WAL bounds, respectively, and remain open pending their own
 production-shaped regressions and fixes.
+
+### 2026-08-09 amendment (Amendment 8): routine logical WAL and writer-stage telemetry
+
+**Motivation.** Physical `-wal` bytes are an allocation high-water mark, not a logical backlog:
+SQLite can reset and reuse a large sidecar after every frame has been backfilled. Conversely, the
+old periodic path discarded most of the PASSIVE result and operational writer telemetry flattened
+queue admission, write-lock acquisition, application work, and COMMIT/fsync into one duration.
+Those shapes could not distinguish retained allocation from a pinned checkpoint boundary, or
+queue contention from a slow transaction body (#1849).
+
+**Routine WAL decision.** A normal checkpoint tick issues exactly one
+`PRAGMA wal_checkpoint(PASSIVE)` and retains its complete `(busy, log, checkpointed)` row. The
+former no-argument observation followed by an explicit PASSIVE second pass is removed. Thresholds
+continue to use `log`; `pending = max(log - checkpointed, 0)` is exposed independently. The same
+tick records physical sidecar bytes and an observation timestamp. Samples are keyed by canonical
+backend identity because checkpoint tasks fan out in multi-backend deployments. The daemon's
+metrics-only frame reads the sample for its own main pool and exposes `wal_log_frames`,
+`wal_checkpointed_frames`, `wal_pending_frames`, `wal_physical_bytes`, and sample time; `wal_pages`
+remains a compatibility alias for logical log frames. A scrape is a pure memory read and causes no
+additional checkpoint I/O or filesystem stat. The explicit `db_diagnostics` probe remains an
+on-demand, checkpoint-performing diagnostic with its existing contract.
+
+**Writer-stage decision.** Each writer-task request timestamps (1) construction before bounded
+channel admission through dequeue (`queue_wait`), (2) only `BEGIN IMMEDIATE`
+(`transaction_acquire`), (3) only the typed operation closure (`body`), and (4) only `COMMIT`.
+Backend-keyed latest-stage gauges and the existing slow-write row expose those microsecond fields,
+the total, queue depth, and observation time. Telemetry is published before the typed reply. A
+top-level request or a phase that never ran reports zero for the inapplicable phase; rollback and
+recovery time is not mislabeled as COMMIT and remains visible as total minus the named stages.
+This is observation only: no timing value changes admission, retry, rollback, checkpoint, or
+TRUNCATE behavior.

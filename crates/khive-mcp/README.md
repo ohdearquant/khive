@@ -12,7 +12,8 @@ lifetime.
 ## Features
 
 - **One tool, `request`** — `RequestParams { ops, presentation, format, save_to, .. }` is
-  the entire MCP-visible surface (ADR-016); verb-specific schemas live in packs, not here
+  the entire MCP-visible surface (ADR-016); its outer envelope is closed to undeclared
+  fields, while verb-specific schemas live in packs
 - **Pluggable transports** — `Transport` trait + `TransportRegistry`; ships `StdioTransport`,
   open for more (e.g. Streamable HTTP) via `TransportRegistry::register`
 - **Daemon-aware dispatch** — `compute_config_id` fingerprints a resolved `RuntimeConfig`

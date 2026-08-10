@@ -1,6 +1,6 @@
 # ADR-117: Session Continuity — Cross-Session Search and Remote Ingestion
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-07-19
 **Authors**: khive maintainers
 **Depends on**:
@@ -13,8 +13,9 @@
 - [ADR-014](ADR-014-curation-operations.md) — Curation Operations (deletion is a curation-layer
   operation that removes data, not a view-layer filter)
 - [ADR-018](ADR-018-authorization-gate.md) — Authorization Gate (the pre-dispatch `Gate::check`
-  contract the isolation requirement must compose with, and whose fail-open default a follow-on ADR
-  carves a fail-closed verb class out of)
+  contract the isolation requirement must compose with, and whose fail-open default — current at this
+  ADR's 2026-07-19 authoring, since reversed to fail-closed on infra error by ADR-018 Amendment 3,
+  2026-07-25 — a follow-on ADR carves a fail-closed verb class out of)
 - [ADR-021](ADR-021-memory-pack.md) — Memory Pack (the hybrid FTS + vector recall with RRF fusion
   the search capability reuses rather than re-implements)
 - [ADR-025](ADR-025-verb-speech-acts.md) — Verb Speech Acts (the Assertive category `session.search`
@@ -192,8 +193,9 @@ design wrong:
 ADR-117a must therefore enforce isolation **where the rows exist** — a non-widenable predicate at the
 handler seam, keyed to the authenticated tenant — and make the verb **fail-closed by construction**:
 `session.search` requires a positive authenticated tenant scope to execute, so that ADR-018's fail-open
-default cannot leak session data (fail-open yields no authenticated scope, and no scope yields no
-results). ADR-117a codifies this at the contract level by amending ADR-018 to designate a **fail-closed
+default (as authored; since reversed to fail-closed on infra error by ADR-018 Amendment 3, 2026-07-25)
+cannot leak session data (fail-open yields no authenticated scope, and no scope yields no
+results — a guarantee independent of the Gate's error posture, so the reversal does not alter it). ADR-117a codifies this at the contract level by amending ADR-018 to designate a **fail-closed
 verb class**, with `session.search` as its first member — and the enforcement structure is
 construction-primary: the safety property holds in the shipped seam without depending on the amendment
 landing first, and the amendment is contract-level codification of a property the seam already
