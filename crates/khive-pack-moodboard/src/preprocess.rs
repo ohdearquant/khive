@@ -1,17 +1,20 @@
 use std::io::Cursor;
 
 use image::imageops::{overlay, resize, FilterType};
-use image::{DynamicImage, ImageFormat, ImageReader, Limits, Rgb, RgbImage};
+use image::{
+    ColorType, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, Rgb, RgbImage,
+};
 
 use khive_runtime::RuntimeError;
 
 pub(crate) const MAX_SOURCE_SIDE: u32 = 8192;
 pub(crate) const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
-/// RGBA (4) + matted RGB (3) working buffers per pixel. Decoder `Limits`
-/// bound only the decoder's own allocations; these post-decode buffers are
-/// invisible to them, so admission is enforced against this factor from the
-/// header dimensions before any full-raster buffer exists.
-pub(crate) const POST_DECODE_BYTES_PER_PIXEL: u64 = 7;
+/// Post-decode working buffers per pixel. Decoder `Limits` bound only the
+/// decoder's own allocations; the conversion and compositing buffers are
+/// invisible to them, so admission is enforced from the header dimensions
+/// and the decoded color format before any full-raster buffer exists.
+pub(crate) const RGBA_BYTES_PER_PIXEL: u64 = 4;
+pub(crate) const RGB_BYTES_PER_PIXEL: u64 = 3;
 pub(crate) const MAX_INFERENCE_SIDE: u32 = 448;
 pub(crate) const ALIGNMENT: u32 = 32;
 pub(crate) const MATTE: Rgb<u8> = Rgb([128, 128, 128]);
@@ -67,18 +70,21 @@ pub(crate) fn prepare_raster(
         }
     }
 
-    let (header_width, header_height) = ImageReader::new(Cursor::new(bytes))
+    let header_decoder = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| {
             RuntimeError::InvalidInput(format!("moodboard.ingest cannot identify raster: {error}"))
         })?
-        .into_dimensions()
+        .into_decoder()
         .map_err(|error| {
             RuntimeError::InvalidInput(format!(
-                "moodboard.ingest cannot read raster dimensions: {error}"
+                "moodboard.ingest cannot read raster header: {error}"
             ))
         })?;
-    post_decode_admission(header_width, header_height)?;
+    let (header_width, header_height) = header_decoder.dimensions();
+    let decoded_color = header_decoder.color_type();
+    drop(header_decoder);
+    post_decode_admission(header_width, header_height, decoded_color)?;
 
     let decoded = reader.decode().map_err(|error| {
         RuntimeError::InvalidInput(format!("moodboard.ingest cannot decode raster: {error}"))
@@ -91,10 +97,11 @@ pub(crate) fn prepare_raster(
         ));
     }
 
-    // `into_rgba8` consumes the decoded image (reusing its buffer when it is
-    // already RGBA8) so the decode-format buffer and the RGBA buffer never
-    // coexist; the explicit drop below releases the RGBA buffer before the
-    // resize allocates.
+    // `into_rgba8` reuses the decoded buffer only when it is already RGBA8;
+    // for every other decode format it copies, so the decoded and RGBA
+    // buffers coexist. Admission budgets for that peak per pixel; the
+    // explicit drop below releases the RGBA buffer before the resize
+    // allocates.
     let rgba = decoded.into_rgba8();
     let mut rgb = RgbImage::new(original_width, original_height);
     for (target, source) in rgb.pixels_mut().zip(rgba.pixels()) {
@@ -150,20 +157,43 @@ pub(crate) fn prepare_raster(
     })
 }
 
-/// Admission for the post-decode working set, judged from header dimensions
-/// alone. Pure and allocation-free on purpose, exactly so the rejection
-/// boundary is unit-testable without materializing the buffers it refuses —
-/// an over-budget raster is refused before decode, so no full-raster
-/// allocation ever backs the check.
-fn post_decode_admission(width: u32, height: u32) -> Result<(), RuntimeError> {
-    let required = u64::from(width) * u64::from(height) * POST_DECODE_BYTES_PER_PIXEL;
-    if required > MAX_DECODE_ALLOC {
-        return Err(RuntimeError::InvalidInput(format!(
-            "moodboard.ingest raster {width}x{height} requires {required} bytes of post-decode \
-             working memory, exceeding the {MAX_DECODE_ALLOC}-byte budget"
-        )));
+/// Peak post-decode working bytes per pixel for a raster decoding to
+/// `color_type`: the decoded buffer coexists with the RGBA8 conversion copy
+/// (`into_rgba8` reuses the buffer only for RGBA8 sources), and the RGBA
+/// buffer later coexists with the matted RGB buffer. The larger phase
+/// bounds the request.
+fn post_decode_working_bytes_per_pixel(color_type: ColorType) -> u64 {
+    let decoded = u64::from(color_type.bytes_per_pixel());
+    let conversion_peak = if color_type == ColorType::Rgba8 {
+        RGBA_BYTES_PER_PIXEL
+    } else {
+        decoded + RGBA_BYTES_PER_PIXEL
+    };
+    conversion_peak.max(RGBA_BYTES_PER_PIXEL + RGB_BYTES_PER_PIXEL)
+}
+
+/// Admission for the post-decode working set, judged from the header
+/// dimensions and decoded color format alone. Pure and allocation-free on
+/// purpose, exactly so the rejection boundary is unit-testable without
+/// materializing the buffers it refuses — an over-budget raster is refused
+/// before decode, so no full-raster allocation ever backs the check.
+/// Arithmetic overflow on attacker-controlled dimensions fails closed.
+fn post_decode_admission(
+    width: u32,
+    height: u32,
+    color_type: ColorType,
+) -> Result<(), RuntimeError> {
+    let bytes_per_pixel = post_decode_working_bytes_per_pixel(color_type);
+    match u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+    {
+        Some(required) if required <= MAX_DECODE_ALLOC => Ok(()),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "moodboard.ingest raster {width}x{height} at {bytes_per_pixel} bytes per pixel \
+             exceeds the {MAX_DECODE_ALLOC}-byte post-decode working memory budget"
+        ))),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -260,21 +290,75 @@ mod tests {
     // buffers the admission exists to refuse.
     #[test]
     fn post_decode_admission_enforces_the_working_set_budget_at_the_exact_boundary() {
-        let budget_pixels = MAX_DECODE_ALLOC / POST_DECODE_BYTES_PER_PIXEL;
+        let bytes_per_pixel = post_decode_working_bytes_per_pixel(ColorType::Rgb8);
+        assert_eq!(bytes_per_pixel, 7);
+        let budget_pixels = MAX_DECODE_ALLOC / bytes_per_pixel;
         assert!(u64::from(u32::MAX) >= budget_pixels);
 
         // Exactly at the budget: admitted.
-        post_decode_admission(1, budget_pixels as u32)
+        post_decode_admission(1, budget_pixels as u32, ColorType::Rgb8)
             .expect("a raster exactly at the working-set budget is admitted");
         // One pixel past the budget: refused, naming the post-decode class.
-        let error = post_decode_admission(1, budget_pixels as u32 + 1)
+        let error = post_decode_admission(1, budget_pixels as u32 + 1, ColorType::Rgb8)
             .expect_err("one pixel past the budget must be refused");
         assert!(error.to_string().contains("post-decode working memory"));
 
         // The decoder's own per-side caps admit 8192x8192, whose working set
         // (7 bytes/pixel) exceeds the budget — the arm that motivated this
         // admission must be refused here.
-        post_decode_admission(MAX_SOURCE_SIDE, MAX_SOURCE_SIDE)
+        post_decode_admission(MAX_SOURCE_SIDE, MAX_SOURCE_SIDE, ColorType::Rgb8)
             .expect_err("a max-side square raster exceeds the post-decode budget");
+
+        // Attacker-controlled header dimensions fail closed on arithmetic
+        // overflow instead of panicking in checked builds or wrapping in
+        // release builds.
+        post_decode_admission(u32::MAX, u32::MAX, ColorType::Rgba16)
+            .expect_err("dimension overflow is refused, never wrapped or panicked");
+    }
+
+    // The working-set budget follows the decoded format: 16-bit rasters
+    // decode into wider buffers that coexist with the RGBA8 conversion copy,
+    // so their per-pixel peak exceeds the 8-bit figure.
+    #[test]
+    fn working_set_budget_tracks_the_decoded_format() {
+        assert_eq!(post_decode_working_bytes_per_pixel(ColorType::L8), 7);
+        assert_eq!(post_decode_working_bytes_per_pixel(ColorType::L16), 7);
+        assert_eq!(post_decode_working_bytes_per_pixel(ColorType::Rgb8), 7);
+        assert_eq!(post_decode_working_bytes_per_pixel(ColorType::Rgba8), 7);
+        assert_eq!(post_decode_working_bytes_per_pixel(ColorType::La16), 8);
+        assert_eq!(post_decode_working_bytes_per_pixel(ColorType::Rgb16), 10);
+        assert_eq!(post_decode_working_bytes_per_pixel(ColorType::Rgba16), 12);
+    }
+
+    #[test]
+    fn sixteen_bit_rasters_admit_against_their_wider_working_set() {
+        // A real 16-bit RGB PNG reports its decoded format through the header
+        // probe the admission reads, and small 16-bit rasters still flow
+        // end-to-end through preprocessing.
+        let image =
+            image::ImageBuffer::<Rgb<u16>, Vec<u16>>::from_pixel(13, 9, Rgb([1000, 2000, 3000]));
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb16(image)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .unwrap();
+        let bytes = cursor.into_inner();
+        let decoder = ImageReader::new(Cursor::new(bytes.as_slice()))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert_eq!(decoder.color_type(), ColorType::Rgb16);
+        let prepared = prepare_raster(&bytes, Some("image/png")).unwrap();
+        assert_eq!((prepared.original_width, prepared.original_height), (13, 9));
+
+        // 8192x4681 fits an 8-bit RGB working set (7 bytes/pixel) but a
+        // 16-bit RGB decode coexisting with its RGBA conversion copy peaks at
+        // 10 bytes/pixel and exceeds the budget: the same dimensions produce
+        // different verdicts under the two formats.
+        post_decode_admission(8192, 4681, ColorType::Rgb8)
+            .expect("8-bit RGB at 8192x4681 fits the working-set budget");
+        let error = post_decode_admission(8192, 4681, ColorType::Rgb16)
+            .expect_err("16-bit RGB at 8192x4681 exceeds the working-set budget");
+        assert!(error.to_string().contains("post-decode working memory"));
     }
 }
