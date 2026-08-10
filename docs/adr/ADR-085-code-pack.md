@@ -757,10 +757,14 @@ subcommand (`crates/kkernel/src/code_ingest.rs`), following the same shape as
 set, validates the whole document before any write (Amendment 1 A3's
 fail-closed, all-or-nothing contract, unchanged), and persists the resulting
 entity/note/edge batch by content-derived id: a record whose id already
-exists is reported as skipped, never overwritten, so re-running the same
-sweep is a no-op and a `finding`'s curated lifecycle state (`kind_status`) is
-never reset by re-ingestion. `--dry-run` runs the same validation and
-existence checks and reports what would happen without writing.
+exists is reported as skipped, never overwritten. "Exists" is
+history-preserving here: a soft-deleted row has already consumed its id and
+is skipped by both the real path and `--dry-run`; re-ingestion never clears
+its `deleted_at` marker or otherwise resurrects it. Thus re-running the same
+sweep is a no-op and a `finding`'s curated lifecycle state (`kind_status`)
+and deletion state are never reset by re-ingestion. `--dry-run` runs the same
+including-tombstones existence checks and reports what would happen without
+writing.
 
 No MCP verb calls this path, and none is added. Agents that participate in
 an audit never hold a bulk-ingest verb; only the CLI, run by the audit

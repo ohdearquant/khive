@@ -46,6 +46,11 @@ String impact renders verbatim in note content, other JSON uses canonical JSON t
 impact renders empty. The batch is ready for existing storage/runtime paths but is not committed by
 this function.
 
+The sole persistence surface, `kkernel code-ingest`, treats every deterministic ID as consumed once
+any row with that ID exists. This check includes soft-deleted entity, note, and edge rows: both real
+ingest and `--dry-run` report those records as skipped, and re-ingest never reactivates a tombstone
+or resets its curated lifecycle state.
+
 ## Error taxonomy
 
 `CodeIngestError` distinguishes invalid roots, missing fields, wrong types, invalid governed values,
