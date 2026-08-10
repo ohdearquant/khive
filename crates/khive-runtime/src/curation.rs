@@ -1999,6 +1999,30 @@ pub(crate) fn note_fts_scalars(note: &Note) -> NoteFtsScalars {
 // Transactional merge SQL helpers
 // ---------------------------------------------------------------------------
 
+/// Cheap SQL-side byte-length probe for one merge entity, evaluated BEFORE
+/// [`read_merge_entity`] copies its columns into Rust `String`s and parses
+/// `properties`/`tags` as JSON. `LENGTH()` still requires SQLite to touch the
+/// stored bytes, but skips the Rust-side allocation and JSON parse — the
+/// expensive part for an oversized record. Charging this probe against the
+/// budget before the full read means an over-budget record is rejected
+/// without ever being materialized or parsed inside the writer transaction.
+/// A missing row probes as zero; `read_merge_entity`'s own "not found" error
+/// fires on the subsequent full read and is unaffected by this probe.
+fn probe_merge_entity_bytes(conn: &rusqlite::Connection, id: Uuid) -> Result<usize, SqliteError> {
+    let id_str = id.to_string();
+    let len: Option<i64> = conn
+        .query_row(
+            "SELECT LENGTH(name) + COALESCE(LENGTH(description), 0) \
+                    + COALESCE(LENGTH(properties), 0) + LENGTH(tags) \
+             FROM entities WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id_str],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(SqliteError::Rusqlite)?;
+    Ok(128_usize.saturating_add(len.unwrap_or(0).max(0) as usize))
+}
+
 /// Read one entity row by ID within a namespace, returning `SqliteError` on missing/wrong-ns.
 fn read_merge_entity(
     conn: &rusqlite::Connection,
@@ -2110,19 +2134,18 @@ fn merge_entity_sql(
         "preparing pack and vector fanout",
     )?;
 
+    budget.charge(
+        1,
+        probe_merge_entity_bytes(conn, into_id)?,
+        "reading merge records",
+    )?;
     let into_entity = read_merge_entity(conn, into_id, &namespace)?;
+    budget.charge(
+        1,
+        probe_merge_entity_bytes(conn, from_id)?,
+        "reading merge records",
+    )?;
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
-    let entity_bytes = |entity: &Entity| {
-        128 + entity.name.len()
-            + entity.description.as_deref().map_or(0, str::len)
-            + entity
-                .properties
-                .as_ref()
-                .map_or(0, |p| p.to_string().len())
-            + entity.tags.iter().map(String::len).sum::<usize>()
-    };
-    budget.charge(1, entity_bytes(&into_entity), "reading merge records")?;
-    budget.charge(1, entity_bytes(&from_entity), "reading merge records")?;
 
     match validation {
         EntityMergeValidation::LegacyKind if into_entity.kind != from_entity.kind => {
@@ -2569,6 +2592,24 @@ fn merge_entity_sql(
 // Note merge SQL helpers
 // ---------------------------------------------------------------------------
 
+/// Cheap SQL-side byte-length probe for one merge note — see
+/// [`probe_merge_entity_bytes`] for why this runs before
+/// [`read_merge_note`]'s full column copy and JSON parse.
+fn probe_merge_note_bytes(conn: &rusqlite::Connection, id: Uuid) -> Result<usize, SqliteError> {
+    let id_str = id.to_string();
+    let len: Option<i64> = conn
+        .query_row(
+            "SELECT COALESCE(LENGTH(name), 0) + LENGTH(content) \
+                    + COALESCE(LENGTH(properties), 0) \
+             FROM notes WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id_str],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(SqliteError::Rusqlite)?;
+    Ok(128_usize.saturating_add(len.unwrap_or(0).max(0) as usize))
+}
+
 /// Read one note row by ID within a namespace, returning `SqliteError` on missing/wrong-ns.
 fn read_merge_note(
     conn: &rusqlite::Connection,
@@ -2691,15 +2732,18 @@ fn merge_note_sql(
         "preparing pack and vector fanout",
     )?;
 
+    budget.charge(
+        1,
+        probe_merge_note_bytes(conn, into_id)?,
+        "reading merge records",
+    )?;
     let into_note = read_merge_note(conn, into_id, &namespace)?;
+    budget.charge(
+        1,
+        probe_merge_note_bytes(conn, from_id)?,
+        "reading merge records",
+    )?;
     let from_note = read_merge_note(conn, from_id, &namespace)?;
-    let note_bytes = |note: &khive_storage::note::Note| {
-        128 + note.name.as_deref().map_or(0, str::len)
-            + note.content.len()
-            + note.properties.as_ref().map_or(0, |p| p.to_string().len())
-    };
-    budget.charge(1, note_bytes(&into_note), "reading merge records")?;
-    budget.charge(1, note_bytes(&from_note), "reading merge records")?;
 
     if into_note.kind != from_note.kind {
         return Err(SqliteError::InvalidData(format!(
@@ -8760,6 +8804,89 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "from-note must survive a budget-rejected merge"
+        );
+    }
+
+    /// The byte budget must be charged from a cheap SQL-side length probe
+    /// BEFORE the merge fully loads and JSON-parses a record's `properties`
+    /// column — never after. Prove it adversarially: store an oversized
+    /// `properties` value that is also invalid JSON directly on `from`,
+    /// bypassing the create path's own validation. If the budget were still
+    /// charged only after `read_merge_entity`'s full load-and-parse (the
+    /// pre-fix ordering), this merge would fail with a JSON parse error
+    /// instead of a budget error, because the parse would run before the
+    /// stale post-read charge was ever reached. Charging from the pre-parse
+    /// length probe must reject on budget first, so `serde_json::from_str`
+    /// never runs on this column at all.
+    #[tokio::test]
+    async fn merge_entity_rejects_byte_budget_before_parsing_oversized_malformed_properties() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        let huge_malformed_properties = format!("{{not valid json: {}", "x".repeat(8192));
+        let pool = rt.backend().pool_arc();
+        let from_id = from.id;
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().unwrap();
+            guard.transaction(|conn| {
+                conn.execute(
+                    "UPDATE entities SET properties = ?1 WHERE id = ?2",
+                    rusqlite::params![huge_malformed_properties, from_id.to_string()],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let error = run_entity_merge_with_limits(
+            &rt,
+            into.id,
+            from.id,
+            MergeTxLimits {
+                max_rows: usize::MAX,
+                max_bytes: 4096,
+            },
+        )
+        .await
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("merge transaction budget exceeded"),
+            "expected an early budget rejection, not a JSON parse failure; got: {msg}"
+        );
+        assert!(msg.contains("reading merge records"), "got: {msg}");
+
+        // `get_entity` would itself fail to parse the malformed properties this
+        // test deliberately stored, so check survival via a raw row count
+        // instead of the parsing read path.
+        let pool = rt.backend().pool_arc();
+        let still_present: i64 = tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().unwrap();
+            guard.transaction(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entities WHERE id = ?1 AND deleted_at IS NULL",
+                    rusqlite::params![from_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(SqliteError::Rusqlite)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            still_present, 1,
+            "from-entity must survive a budget-rejected merge"
         );
     }
 

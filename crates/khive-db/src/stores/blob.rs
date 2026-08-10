@@ -42,6 +42,105 @@ fn shard_path(root: &Path, content_ref: &ContentRef) -> PathBuf {
     root.join(&hex[0..2]).join(&hex[2..4]).join(hex)
 }
 
+/// Unlink one blob's shard-relative file using `O_NOFOLLOW`-verified
+/// descriptor traversal instead of a plain path-based delete.
+///
+/// A path-based `fs::remove_file(shard_path(root, content_ref))` resolves
+/// every path component through the kernel exactly like any other path
+/// lookup. If either shard-directory level (`root/<hex[0..2]>` or
+/// `root/<hex[0..2]>/<hex[2..4]>`) has been replaced with a symlink —
+/// through a misconfigured root, a shared/writable parent directory, or a
+/// race with another process — that lookup follows it and can unlink a file
+/// entirely outside the blob root. Each shard component is instead opened
+/// relative to the previous, already-verified descriptor with
+/// `O_DIRECTORY | O_NOFOLLOW`, so a symlink planted at either level is
+/// refused (`ELOOP`) rather than followed, and the final `unlinkat` runs
+/// relative to the verified leaf descriptor rather than a re-resolved path
+/// string. Same fd-pinned idiom as `khive-db`'s walpin sidecar writes
+/// (`walpin.rs`) and `khive-vamana`'s external-id sidecar
+/// (`external_ids.rs`) use for the same TOCTOU hazard.
+#[cfg(unix)]
+fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let hex = content_ref.as_str();
+    let root_dir = open_dir_no_follow(root)?;
+    let shard1_dir = openat_dir_no_follow(root_dir.as_raw_fd(), &hex[0..2])?;
+    let shard2_dir = openat_dir_no_follow(shard1_dir.as_raw_fd(), &hex[2..4])?;
+    let c_name = std::ffi::CString::new(hex)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `shard2_dir` is a live, open directory descriptor for the
+    // duration of this call, and `c_name` is NUL-terminated. `unlinkat`
+    // removes the named directory entry only — it acts on the shard
+    // directory's entry table, not through any symlink that entry might
+    // itself be, so this is safe even if `content_ref`'s target happens to
+    // be replaced by a symlink at unlink time.
+    let rc = unsafe { libc::unlinkat(shard2_dir.as_raw_fd(), c_name.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
+    // No handle-relative, no-follow directory API is exercised on this
+    // platform today (this crate's Windows CI tier is compile-check only,
+    // matching `walpin.rs`'s Windows lane scope); fall back to the
+    // path-based delete used before this hardening.
+    fs::remove_file(shard_path(root, content_ref))
+}
+
+#[cfg(unix)]
+fn open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_path` is NUL-terminated for the call; a successful fd is
+    // uniquely owned and wrapped immediately below.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by the successful `open` above and is
+    // uniquely owned by this `File`, which closes it exactly once on drop.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn openat_dir_no_follow(
+    parent_fd: std::os::unix::io::RawFd,
+    name: &str,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::FromRawFd;
+
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_name` is NUL-terminated; `parent_fd` is a live, open
+    // directory descriptor for the duration of this call. A successful fd
+    // is uniquely owned and wrapped immediately below.
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by the successful `openat` above and is
+    // uniquely owned by this `File`, which closes it exactly once on drop.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 /// Collision-resistant diagnostic identity for one canonical blob root.
 ///
 /// Paths are not required to be UTF-8. Hash the platform-native path bytes
@@ -297,6 +396,7 @@ fn within_publish_grace(path: &Path, now: SystemTime, grace_period: Duration) ->
 }
 
 fn sweep_blob_candidates(
+    root: &Path,
     files: Vec<(ContentRef, PathBuf)>,
     live_refs: &std::collections::HashSet<ContentRef>,
     dry_run: bool,
@@ -315,7 +415,8 @@ fn sweep_blob_candidates(
         }
         result.would_delete += 1;
         if !dry_run {
-            fs::remove_file(&path).map_err(|e| map_io_err(e, "orphan_sweep_delete"))?;
+            unlink_blob_shard_file_no_follow(root, &content_ref)
+                .map_err(|e| map_io_err(e, "orphan_sweep_delete"))?;
             result.deleted += 1;
         }
     }
@@ -372,28 +473,56 @@ fn invalid_content_ref(message: String) -> StorageError {
     }
 }
 
-async fn validate_blob_gc_evidence(sql: &dyn SqlAccess) -> StorageResult<()> {
+/// Whether this database has ever applied the V20 `blob_gc_claims` migration.
+///
+/// `transactional_orphan_sweep` is reachable from any `SqlAccess` a caller
+/// hands it, including a `StorageBackend` constructed directly (e.g.
+/// `StorageBackend::memory()`/`sqlite()` used without `prepare_core_schema`)
+/// that never ran core migrations. The claims table and its fencing triggers
+/// (`sql/020-blob-gc-claims.sql`) are optional durability/fencing
+/// infrastructure, not a hard dependency of the sweep contract itself, so
+/// their absence must degrade the sweep rather than fail it outright.
+async fn blob_gc_claims_table_exists(sql: &dyn SqlAccess) -> StorageResult<bool> {
+    let mut reader = sql.reader().await?;
+    let found = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'blob_gc_claims' \
+                  LIMIT 1"
+                .to_string(),
+            params: vec![],
+            label: Some("blob_gc_claims_table_exists".to_string()),
+        })
+        .await?;
+    Ok(found.is_some())
+}
+
+async fn validate_blob_gc_evidence(
+    sql: &dyn SqlAccess,
+    has_claims_table: bool,
+) -> StorageResult<()> {
     // These full-table integrity probes are statement-scoped reads. Keep them
     // off the single writer; only their one-row result is materialized. The
     // database sweep owner excludes another claim producer, and each bounded
     // claim unit anti-joins the then-current live rows under its writer lock.
     let mut reader = sql.reader().await?;
-    let invalid_claim = reader
-        .query_row(SqlStatement {
-            sql: "SELECT content_ref FROM blob_gc_claims \
-                  WHERE typeof(content_ref) <> 'text' \
-                     OR length(content_ref) <> 64 \
-                     OR content_ref GLOB '*[^0-9a-f]*' \
-                  LIMIT 1"
-                .to_string(),
-            params: vec![],
-            label: Some("blob_gc_validate_existing_claims".to_string()),
-        })
-        .await?;
-    if invalid_claim.is_some() {
-        return Err(invalid_content_ref(
-            "blob_gc_claims.content_ref contained a non-canonical value".into(),
-        ));
+    if has_claims_table {
+        let invalid_claim = reader
+            .query_row(SqlStatement {
+                sql: "SELECT content_ref FROM blob_gc_claims \
+                      WHERE typeof(content_ref) <> 'text' \
+                         OR length(content_ref) <> 64 \
+                         OR content_ref GLOB '*[^0-9a-f]*' \
+                      LIMIT 1"
+                    .to_string(),
+                params: vec![],
+                label: Some("blob_gc_validate_existing_claims".to_string()),
+            })
+            .await?;
+        if invalid_claim.is_some() {
+            return Err(invalid_content_ref(
+                "blob_gc_claims.content_ref contained a non-canonical value".into(),
+            ));
+        }
     }
 
     let invalid_live = reader
@@ -448,6 +577,7 @@ async fn claim_blob_gc_batch(
     root_key: String,
     candidates: &[(ContentRef, bool)],
     dry_run: bool,
+    has_claims_table: bool,
 ) -> StorageResult<BlobGcBatchRows> {
     debug_assert!(candidates.len() <= BLOB_GC_CLAIM_BATCH_SIZE);
     let eligible_refs = candidates
@@ -489,6 +619,38 @@ async fn claim_blob_gc_batch(
                     .await?,
                 "blob_gc_count_grace_candidates_batch",
             )?;
+
+            // No `blob_gc_claims` table (a direct `StorageBackend` that never
+            // applied the V20 migration): there is nothing to durably claim
+            // and no entity-trigger fence to rely on, so this degrades to
+            // the same snapshot-then-delete guarantee `orphan_sweep`
+            // documents — the anti-join is evaluated here, one bounded batch
+            // at a time, but a reference committed live between this read
+            // and the physical delete below is not protected against.
+            if !has_claims_table {
+                let eligible_rows = writer
+                    .query_all(SqlStatement {
+                        sql: "SELECT candidate.value AS content_ref \
+                              FROM json_each(?1) AS candidate \
+                              WHERE NOT EXISTS ( \
+                                SELECT 1 FROM entities \
+                                WHERE deleted_at IS NULL \
+                                  AND content_ref = candidate.value \
+                              ) ORDER BY candidate.value"
+                            .to_string(),
+                        params: vec![SqlValue::Text(eligible_json)],
+                        label: Some(
+                            "blob_gc_select_eligible_candidates_batch_no_claims_table".to_string(),
+                        ),
+                    })
+                    .await?;
+                let would_delete = eligible_rows.len() as u64;
+                return Ok(Box::new(BlobGcBatchRows {
+                    grace_period_skipped,
+                    would_delete,
+                    claimed_rows: if dry_run { Vec::new() } else { eligible_rows },
+                }) as Box<dyn std::any::Any + Send>);
+            }
 
             if dry_run {
                 let would_delete = required_nonnegative_count(
@@ -600,7 +762,7 @@ fn sweep_blob_files(
     grace_period: Duration,
 ) -> StorageResult<BlobOrphanSweepResult> {
     let files = walk_blob_files(root).map_err(|e| map_io_err(e, "orphan_sweep_walk"))?;
-    sweep_blob_candidates(files, live_refs, dry_run, grace_period)
+    sweep_blob_candidates(root, files, live_refs, dry_run, grace_period)
 }
 
 /// Process-wide database owner fence for transactional blob sweeps.
@@ -831,11 +993,14 @@ impl BlobStore for FsBlobStore {
     }
 
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool> {
-        let path = shard_path(&self.root, content_ref);
-        tokio::task::spawn_blocking(move || match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(map_io_err(e, "delete")),
+        let root = self.root.clone();
+        let content_ref = content_ref.clone();
+        tokio::task::spawn_blocking(move || {
+            match unlink_blob_shard_file_no_follow(&root, &content_ref) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(map_io_err(e, "delete")),
+            }
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Blob, "delete", e))?
@@ -932,8 +1097,9 @@ impl BlobStore for FsBlobStore {
             )
         })??;
         let root_key = blob_root_key(&canonical_root);
-        validate_blob_gc_evidence(sql).await?;
-        if !dry_run {
+        let has_claims_table = blob_gc_claims_table_exists(sql).await?;
+        validate_blob_gc_evidence(sql, has_claims_table).await?;
+        if !dry_run && has_claims_table {
             loop {
                 let released = release_abandoned_blob_gc_claim_batch(sql).await?;
                 if released < BLOB_GC_CLAIM_BATCH_SIZE as u64 {
@@ -959,7 +1125,9 @@ impl BlobStore for FsBlobStore {
         // between batches instead of receiving one orphan-population-sized
         // transaction.
         for candidates in prepared.candidates.chunks(BLOB_GC_CLAIM_BATCH_SIZE) {
-            let batch = claim_blob_gc_batch(sql, root_key.clone(), candidates, dry_run).await?;
+            let batch =
+                claim_blob_gc_batch(sql, root_key.clone(), candidates, dry_run, has_claims_table)
+                    .await?;
             result.grace_period_skipped += batch.grace_period_skipped;
             result.would_delete += batch.would_delete;
             if dry_run {
@@ -996,8 +1164,7 @@ impl BlobStore for FsBlobStore {
                     let mut deleted = 0_u64;
                     let mut first_error = None;
                     for content_ref in claimed_refs {
-                        let path = shard_path(&delete_root, &content_ref);
-                        match fs::remove_file(&path) {
+                        match unlink_blob_shard_file_no_follow(&delete_root, &content_ref) {
                             Ok(()) => deleted += 1,
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => {
@@ -1028,8 +1195,11 @@ impl BlobStore for FsBlobStore {
             // Release only this bounded batch after its physical phase. On
             // cancellation or process death before this commit, the claims
             // remain fail-closed and the next exclusive database owner
-            // reevaluates them rather than resuming deletion blindly.
-            release_blob_gc_batch(sql, root_key.clone()).await?;
+            // reevaluates them rather than resuming deletion blindly. No
+            // claims table means nothing was inserted to release.
+            if has_claims_table {
+                release_blob_gc_batch(sql, root_key.clone()).await?;
+            }
             if batch_delete_error.is_some() {
                 delete_error = batch_delete_error;
                 break;
@@ -1165,6 +1335,85 @@ mod tests {
         let mut expected = database.as_os_str().as_bytes().to_vec();
         expected.extend_from_slice(DATABASE_GC_LOCK_SUFFIX.as_bytes());
         assert_eq!(lock_path.as_os_str().as_bytes(), expected);
+    }
+
+    /// A shard directory replaced by a symlink (an attacker with write access
+    /// to the blob root, a misconfigured shared parent, or a race between
+    /// this sweep's directory walk and its physical delete) must be refused,
+    /// never followed, and an unrelated real shard must keep sweeping
+    /// normally. This is the fix for the shard-directory symlink-replacement
+    /// hazard: a plain `fs::remove_file(shard_path(root, content_ref))`
+    /// would resolve straight through the symlink and unlink whatever file
+    /// its target names.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unlink_blob_shard_refuses_symlinked_shard_dir_and_still_sweeps_real_shard() {
+        let (dir, store) = store(0);
+        let root = dir.path().join("blobs");
+
+        // Real, non-attacked blob: written through the normal `put` path and
+        // must still sweep after the fix.
+        let real = store.put(b"real blob content".to_vec()).await.unwrap();
+
+        // Attack setup: a `content_ref` whose first shard directory does not
+        // exist yet is replaced by a symlink to a directory entirely outside
+        // the blob root, with a file planted at the exact name a path-based
+        // delete would target.
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        fs::write(&victim, b"do not delete me").unwrap();
+
+        let real_prefix = &real.as_str()[0..2];
+        let attack_prefix = if real_prefix == "aa" { "bb" } else { "aa" };
+        let fake_ref = ContentRef::from_hex(format!("{attack_prefix}{}", "0".repeat(62))).unwrap();
+        let fake_hex = fake_ref.as_str().to_string();
+
+        let shard1 = root.join(attack_prefix);
+        std::os::unix::fs::symlink(outside.path(), &shard1).unwrap();
+        // Plant the file a naive path-based delete would actually resolve
+        // to through the symlink: `<outside>/<shard2>/<full-hex>` is never
+        // reached because the fix refuses at the `shard1` open itself, but
+        // planting it this deep proves the refusal isn't accidental — there
+        // was a real target for the naive path to have deleted.
+        fs::create_dir_all(outside.path().join(&fake_hex[2..4])).unwrap();
+        fs::write(
+            outside.path().join(&fake_hex[2..4]).join(&fake_hex),
+            b"decoy",
+        )
+        .unwrap();
+
+        let error = unlink_blob_shard_file_no_follow(&root, &fake_ref).unwrap_err();
+        // `O_DIRECTORY | O_NOFOLLOW` against a symlink refuses to follow it,
+        // but the exact errno is platform-dependent: Linux reports `ELOOP`,
+        // Darwin reports `ENOTDIR` (the symlink itself is not a directory
+        // once `O_NOFOLLOW` stops it from being resolved). Either way it
+        // must be an outright refusal, not a successful open/unlink.
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ),
+            "opening a symlinked shard directory must be refused, not followed; got: {error}"
+        );
+        assert!(
+            victim.exists(),
+            "the file outside the blob root must never be touched by a refused shard-dir open"
+        );
+
+        // The unrelated real shard, never touched by the attack, must still
+        // sweep normally after the fix.
+        let swept = store
+            .orphan_sweep(&BlobOrphanSweepConfig {
+                live_refs: std::collections::HashSet::new(),
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            swept.deleted, 1,
+            "the real, unsymlinked shard must still sweep"
+        );
+        assert!(!store.exists(&real).await.unwrap());
     }
 
     /// Block on `rx.recv()` on a dedicated thread so a `#[tokio::test]`
@@ -1571,6 +1820,54 @@ mod tests {
              snapshot was taken — callers MUST quiesce entity writes before running it \
              (ADR-111 §8)"
         );
+    }
+
+    /// A `StorageBackend` constructed directly and never run through the
+    /// versioned migration ledger (`run_migrations`/`prepare_core_schema`) —
+    /// only the ad hoc, idempotent `entities` DDL a plain `entities()` call
+    /// applies, exactly the "tests that create stores directly" pattern
+    /// `backend.rs`'s own `prepare_core_schema` doc comment names — must
+    /// still be able to run `transactional_orphan_sweep`. `blob_gc_claims`
+    /// is V20, migration-only DDL; it must not exist on this backend, and
+    /// the sweep must not require it to.
+    #[tokio::test]
+    async fn transactional_orphan_sweep_works_without_the_blob_gc_claims_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        backend.entities().unwrap();
+        {
+            let reader = backend.pool().reader().unwrap();
+            let present: bool = reader
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' \
+                     AND name = 'blob_gc_claims'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                !present,
+                "this test's premise requires blob_gc_claims to be absent"
+            );
+        }
+
+        let root = dir.path().join("blobs");
+        let store = std::sync::Arc::new(
+            FsBlobStore::new(root.clone(), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let orphan = store.put(b"direct-backend orphan".to_vec()).await.unwrap();
+
+        let sql = backend.sql();
+        let result = store
+            .transactional_orphan_sweep(sql.as_ref(), false)
+            .await
+            .expect("sweep must succeed on a direct backend without the blob_gc_claims migration");
+        assert_eq!(result.deleted, 1);
+        assert!(!store.exists(&orphan).await.unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
