@@ -7,6 +7,11 @@ use khive_runtime::RuntimeError;
 
 pub(crate) const MAX_SOURCE_SIDE: u32 = 8192;
 pub(crate) const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+/// RGBA (4) + matted RGB (3) working buffers per pixel. Decoder `Limits`
+/// bound only the decoder's own allocations; these post-decode buffers are
+/// invisible to them, so admission is enforced against this factor from the
+/// header dimensions before any full-raster buffer exists.
+pub(crate) const POST_DECODE_BYTES_PER_PIXEL: u64 = 7;
 pub(crate) const MAX_INFERENCE_SIDE: u32 = 448;
 pub(crate) const ALIGNMENT: u32 = 32;
 pub(crate) const MATTE: Rgb<u8> = Rgb([128, 128, 128]);
@@ -62,6 +67,19 @@ pub(crate) fn prepare_raster(
         }
     }
 
+    let (header_width, header_height) = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| {
+            RuntimeError::InvalidInput(format!("moodboard.ingest cannot identify raster: {error}"))
+        })?
+        .into_dimensions()
+        .map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "moodboard.ingest cannot read raster dimensions: {error}"
+            ))
+        })?;
+    post_decode_admission(header_width, header_height)?;
+
     let decoded = reader.decode().map_err(|error| {
         RuntimeError::InvalidInput(format!("moodboard.ingest cannot decode raster: {error}"))
     })?;
@@ -73,7 +91,11 @@ pub(crate) fn prepare_raster(
         ));
     }
 
-    let rgba = decoded.to_rgba8();
+    // `into_rgba8` consumes the decoded image (reusing its buffer when it is
+    // already RGBA8) so the decode-format buffer and the RGBA buffer never
+    // coexist; the explicit drop below releases the RGBA buffer before the
+    // resize allocates.
+    let rgba = decoded.into_rgba8();
     let mut rgb = RgbImage::new(original_width, original_height);
     for (target, source) in rgb.pixels_mut().zip(rgba.pixels()) {
         let alpha = u32::from(source[3]);
@@ -83,6 +105,7 @@ pub(crate) fn prepare_raster(
             target[channel] = ((foreground * alpha + background * (255 - alpha) + 127) / 255) as u8;
         }
     }
+    drop(rgba);
 
     let longest = original_width.max(original_height);
     let (resized_width, resized_height) = if longest > MAX_INFERENCE_SIDE {
@@ -125,6 +148,22 @@ pub(crate) fn prepare_raster(
         original_width,
         original_height,
     })
+}
+
+/// Admission for the post-decode working set, judged from header dimensions
+/// alone. Pure and allocation-free on purpose, exactly so the rejection
+/// boundary is unit-testable without materializing the buffers it refuses —
+/// an over-budget raster is refused before decode, so no full-raster
+/// allocation ever backs the check.
+fn post_decode_admission(width: u32, height: u32) -> Result<(), RuntimeError> {
+    let required = u64::from(width) * u64::from(height) * POST_DECODE_BYTES_PER_PIXEL;
+    if required > MAX_DECODE_ALLOC {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard.ingest raster {width}x{height} requires {required} bytes of post-decode \
+             working memory, exceeding the {MAX_DECODE_ALLOC}-byte budget"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -214,5 +253,28 @@ mod tests {
         let error = prepare_raster(&png(28, 28, Rgba([10, 20, 30, 255])), Some("image/jpeg"))
             .expect_err("mismatch must fail");
         assert!(error.to_string().contains("does not match"));
+    }
+
+    // Tested at the pure boundary, like the blob-store floor check: exercising
+    // the rejection through a real decode would require materializing the very
+    // buffers the admission exists to refuse.
+    #[test]
+    fn post_decode_admission_enforces_the_working_set_budget_at_the_exact_boundary() {
+        let budget_pixels = MAX_DECODE_ALLOC / POST_DECODE_BYTES_PER_PIXEL;
+        assert!(u64::from(u32::MAX) >= budget_pixels);
+
+        // Exactly at the budget: admitted.
+        post_decode_admission(1, budget_pixels as u32)
+            .expect("a raster exactly at the working-set budget is admitted");
+        // One pixel past the budget: refused, naming the post-decode class.
+        let error = post_decode_admission(1, budget_pixels as u32 + 1)
+            .expect_err("one pixel past the budget must be refused");
+        assert!(error.to_string().contains("post-decode working memory"));
+
+        // The decoder's own per-side caps admit 8192x8192, whose working set
+        // (7 bytes/pixel) exceeds the budget — the arm that motivated this
+        // admission must be refused here.
+        post_decode_admission(MAX_SOURCE_SIDE, MAX_SOURCE_SIDE)
+            .expect_err("a max-side square raster exceeds the post-decode budget");
     }
 }

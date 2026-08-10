@@ -57,24 +57,25 @@ pub(crate) fn acquire_train_permit() -> Result<SemaphorePermit<'static>, Runtime
 /// Full-batch preference fitting is CPU-bound for up to `MAX_TRAINING_EVENTS`
 /// events; running it inline on the async executor lets concurrent attributed
 /// callers monopolize worker threads. The caller obtains `permit` from
-/// [`acquire_train_permit`] before loading its snapshot; it is held across the
-/// `spawn_blocking` join so at most `TRAIN_CONCURRENCY` fits run at once, and
-/// the fit itself runs on the blocking-worker pool.
+/// [`acquire_train_permit`] before loading its snapshot; the permit is moved
+/// INTO the blocking task so the training slot is released only when the fit
+/// itself finishes. Held by this future instead, cancellation at the join
+/// point would free the slot while the blocking fit kept running, admitting a
+/// second concurrent fit.
 pub(crate) async fn fit_preference_bounded(
     permit: SemaphorePermit<'static>,
     records: Vec<(i64, JudgmentRecord)>,
     scope: PreferenceScope,
 ) -> Result<TrainedModel, RuntimeError> {
-    let result = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let data = prepare_training_data(&records, &scope)?;
         train_model(&data, scope)
     })
     .await
     .map_err(|error| {
         RuntimeError::Internal(format!("joining moodboard training worker: {error}"))
-    })?;
-    drop(permit);
-    result
+    })?
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +199,22 @@ pub(crate) async fn handle_serve(
         "moodboard.serve source_report_sha256",
     )?;
     validate_selection(&input.selection)?;
+    // The immutable serve record must be able to reconstruct what was shown:
+    // a persisted source_rank_shown=true with absent ranks would record an
+    // exposure the record cannot reproduce. Checked before any lookup or
+    // hydration — it is pure input validation.
+    if input.presentation.source_rank_shown
+        && input
+            .candidates
+            .iter()
+            .any(|candidate| candidate.source_rank.is_none())
+    {
+        return Err(RuntimeError::InvalidInput(
+            "moodboard.serve presentation.source_rank_shown=true requires source_rank on both \
+             candidates"
+                .to_string(),
+        ));
+    }
 
     let board_entity_id =
         parse_canonical_uuid(&input.board_entity_id, "moodboard.serve board_entity_id")?;
@@ -209,6 +226,12 @@ pub(crate) async fn handle_serve(
         &input.descriptor,
     );
 
+    // Candidate hydration (bounded source-blob read + BLAKE3 verify inside
+    // validate_asset) rides the pack-wide preprocessing gate exactly like the
+    // ingest and search paths: without it, concurrent serve calls could each
+    // hydrate two source blobs with no concurrency bound. The blob pack's own
+    // hydration semaphore is private to that crate and unreachable here.
+    let hydration_permit = pack.model_state().acquire_preprocessing_permit().await?;
     let mut validated = Vec::with_capacity(2);
     for (index, candidate) in input.candidates.into_iter().enumerate() {
         debug_assert_eq!(candidate.state, CandidateState::Scored);
@@ -234,6 +257,7 @@ pub(crate) async fn handle_serve(
             features: candidate.features,
         });
     }
+    drop(hydration_permit);
     if validated[0].asset_id == validated[1].asset_id
         || validated[0].content_ref == validated[1].content_ref
     {
@@ -473,10 +497,15 @@ pub(crate) async fn handle_preference(
     validate_board(&core, token, board_entity_id, &input.board_id).await?;
     let scope = scope_from_input(token, board_entity_id, input.board_id, &input.descriptor);
 
+    // Same gate as handle_serve: candidate hydration inside
+    // validate_inference_candidate rides the pack-wide preprocessing gate so
+    // concurrent preference calls cannot hydrate source blobs unboundedly.
+    let hydration_permit = pack.model_state().acquire_preprocessing_permit().await?;
     let (left_asset_id, left_content_ref) =
         validate_inference_candidate(&core, token, &input.left, "left").await?;
     let (right_asset_id, right_content_ref) =
         validate_inference_candidate(&core, token, &input.right, "right").await?;
+    drop(hydration_permit);
     if left_asset_id == right_asset_id || left_content_ref == right_content_ref {
         return Err(RuntimeError::InvalidInput(
             "moodboard.preference requires two distinct asset identities".to_string(),

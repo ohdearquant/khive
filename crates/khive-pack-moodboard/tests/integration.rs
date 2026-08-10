@@ -605,3 +605,52 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
         .expect("right probability");
     assert!((left_probability + right_probability - 1.0).abs() <= f64::EPSILON);
 }
+
+#[tokio::test]
+async fn serve_rejects_source_rank_shown_without_candidate_ranks() {
+    // Pure input validation: the pairing rule fires before any board or asset
+    // lookup, so no fixture entities exist behind this registry on purpose —
+    // reaching a "board not found" error instead would mean the check ran too
+    // late to protect the immutable record cheaply.
+    let registry = registry_with_actor(Some("moodboard-tester"));
+    let error = registry
+        .dispatch(
+            "moodboard.serve",
+            serde_json::json!({
+                "board_entity_id": "00000000-0000-4000-8000-000000000201",
+                "board_id": "a".repeat(64),
+                "descriptor": {
+                    "model_key": "fixture_visual_model",
+                    "descriptor_fingerprint": "b".repeat(64),
+                },
+                "source_report_sha256": "c".repeat(64),
+                "candidates": [
+                    {
+                        "state": "scored",
+                        "asset_id": "00000000-0000-4000-8000-000000000101",
+                        "content_ref": "1".repeat(64),
+                        "features": [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0],
+                    },
+                    {
+                        "state": "scored",
+                        "asset_id": "00000000-0000-4000-8000-000000000102",
+                        "content_ref": "2".repeat(64),
+                        "source_rank": 2,
+                        "features": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+                    }
+                ],
+                "selection": {
+                    "policy_revision": "support-fixture-v1",
+                },
+                "presentation": {
+                    "source_rank_shown": true,
+                }
+            }),
+        )
+        .await
+        .expect_err("source_rank_shown without both ranks must be refused");
+    assert!(
+        error.to_string().contains("requires source_rank"),
+        "unexpected error: {error}"
+    );
+}
