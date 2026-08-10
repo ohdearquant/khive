@@ -9,15 +9,29 @@ mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 
 ## WAL autocheckpoint ownership
 
-Every writer-capable connection is created with `PRAGMA wal_autocheckpoint = 0`.
-This includes the pool's startup writer and every connection opened later through
-the standalone boundary. Store writers, raw SQL bridge writers, the writer task,
-diagnostics, and the dedicated checkpoint task all inherit one of those two open
-paths. There is no environment or `PoolConfig` override that can put routine
-checkpoint I/O back on an application commit path. The dedicated ADR-091 task owns
-routine PASSIVE checkpointing; its separately bounded TRUNCATE policy is unchanged.
-The standalone embedding-model registry query is opened read-only and is not a
-third writer constructor.
+Routine WAL reclamation has exactly two owners, selected by whether a dedicated
+checkpoint task actually runs against the pool:
+
+- **Claimed** — the scheduled ADR-091 checkpoint task calls
+  `ConnectionPool::claim_checkpoint_ownership` at startup (and
+  `propagate_checkpoint_claim_to_writer_task` for a writer task spawned before
+  the claim). From then on every writer-capable connection sets
+  `PRAGMA wal_autocheckpoint = 0`: the pool's startup writer is re-configured
+  under the writer mutex, and every later open through the standalone boundary
+  (store writers, raw SQL bridge writers, the writer task, diagnostics, the
+  dedicated checkpoint connection) inherits the setting. Routine checkpoint
+  I/O stays off application commit paths; the task's separately bounded
+  TRUNCATE policy is unchanged.
+- **Unclaimed** — no checkpoint task runs (embedded runtimes, one-shot CLI
+  executions). Writer-capable connections keep a bounded autocheckpoint
+  (4,000 pages), so SQLite's own reclamation prevents unbounded WAL growth
+  and eventual disk exhaustion on writable pools that have no other
+  checkpoint owner.
+
+There is no environment or `PoolConfig` override in either direction: the only
+way to move between the two postures is an actual ownership claim, which only
+the scheduled checkpoint task makes. The standalone embedding-model registry
+query is opened read-only and is not a third writer constructor.
 
 ## `ConnectionPool::writer_task_handle` — single-writer-task rationale
 

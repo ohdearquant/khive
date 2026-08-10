@@ -1592,6 +1592,19 @@ impl CheckpointConnection {
         if self.conn.is_none() {
             match pool.open_standalone_writer_untracked() {
                 Ok(conn) => {
+                    // This is the dedicated owner's own connection: disable
+                    // autocheckpoint on it unconditionally, independent of
+                    // whether the pool-level ownership claim has landed yet
+                    // (the standalone open applies the claim-dependent
+                    // value; this connection must never run an implicit
+                    // checkpoint inside its own PASSIVE/TRUNCATE work).
+                    if let Err(e) = conn.pragma_update(None, "wal_autocheckpoint", 0) {
+                        tracing::warn!(
+                            error = %e,
+                            "could not disable autocheckpoint on the dedicated checkpoint \
+                             connection"
+                        );
+                    }
                     if self.consecutive_open_failures > 0 {
                         tracing::info!(
                             prior_consecutive_failures = self.consecutive_open_failures,
@@ -1672,6 +1685,26 @@ pub async fn run_checkpoint_task(
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
     is_main: bool,
 ) {
+    // This task IS the dedicated checkpoint owner: claim the pool so writer
+    // connections drop the bounded autocheckpoint fallback and routine
+    // checkpoint I/O stays off application commit paths. Pools without a
+    // running checkpoint task never claim and keep SQLite's bounded WAL
+    // reclamation. A failed claim leaves connections on the bounded fallback
+    // — safe, just not the low-latency posture — so it warns and continues.
+    if let Err(e) = pool.claim_checkpoint_ownership() {
+        tracing::warn!(
+            error = %e,
+            "checkpoint task could not re-apply the ownership pragma on the pooled writer; \
+             writer connections keep the bounded autocheckpoint fallback until reopened"
+        );
+    }
+    if let Err(e) = pool.propagate_checkpoint_claim_to_writer_task().await {
+        tracing::warn!(
+            error = %e,
+            "checkpoint task could not reach the writer task's connection; it keeps the \
+             bounded autocheckpoint fallback"
+        );
+    }
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut severity_state = CheckpointSeverityState::default();

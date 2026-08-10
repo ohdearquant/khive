@@ -74,6 +74,12 @@ const MAX_FATTEN_ROWS: u32 = 1_024;
 /// disables connection-local autocheckpoint, so this fixture also fails loud
 /// if that writer invariant regresses.
 fn fatten_wal(pool: &ConnectionPool, db_path: &Path) {
+    // This test exercises the dedicated-owner posture (`checkpoint_once` is
+    // the owner's tick), so claim ownership exactly as the scheduled task
+    // does at startup — that is what disables the writer's bounded
+    // autocheckpoint fallback and lets the WAL grow for the fixture.
+    pool.claim_checkpoint_ownership()
+        .expect("claim checkpoint ownership for the dedicated-owner posture");
     let writer = pool.writer().expect("acquire writer to seed the WAL");
     let autocheckpoint: u32 = writer
         .conn()
@@ -81,7 +87,7 @@ fn fatten_wal(pool: &ConnectionPool, db_path: &Path) {
         .expect("read writer wal_autocheckpoint");
     assert_eq!(
         autocheckpoint, 0,
-        "fixture requires the production writer invariant before allocating WAL bytes"
+        "fixture requires the claimed-owner writer invariant before allocating WAL bytes"
     );
     writer
         .conn()

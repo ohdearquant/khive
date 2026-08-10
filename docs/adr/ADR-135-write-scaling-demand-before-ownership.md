@@ -246,8 +246,11 @@ This decision is grounded in a static write-path code census (every cited path a
 ### 2026-08-09 amendment: autocheckpoint is no longer an application-path experiment
 
 Production checkpoint ownership now disables `wal_autocheckpoint` on every writer-capable
-connection, as specified by ADR-091 Amendment 7. This supersedes the Context and Consequences
-statements that describe `wal_autocheckpoint=4000` as current behavior, and removes F7's
-current-versus-disabled comparison from the production topology matrix. An isolated benchmark may
-still issue a raw pragma to construct a historical control, but neither `PoolConfig` nor an
-environment variable can re-enable implicit checkpoint I/O in a shipped connection constructor.
+connection of a pool the scheduled checkpoint task has claimed, as specified by ADR-091
+Amendment 8; pools without a running checkpoint task keep a bounded 4,000-page fallback so a
+writable pool never loses WAL reclamation entirely. This supersedes the Context and Consequences
+statements that describe `wal_autocheckpoint=4000` as unconditional current behavior, and removes
+F7's current-versus-disabled comparison from the production topology matrix. An isolated benchmark
+may still issue a raw pragma to construct a historical control, but neither `PoolConfig` nor an
+environment variable selects the posture in a shipped connection constructor — only the ownership
+claim does.

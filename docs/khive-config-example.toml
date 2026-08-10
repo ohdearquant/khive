@@ -260,7 +260,8 @@ fusion_weight = 0.5
 #   An unparseable numeric value here is treated as unset (falls back to the default).
 #   KHIVE_BUSY_TIMEOUT_SECS=30           SQLite busy_timeout per connection.
 #   KHIVE_CHECKOUT_TIMEOUT_SECS=5        Max wait to check out a pooled reader connection.
-#   WAL autocheckpoint is always disabled; the dedicated checkpoint task owns routine passes.
+#   WAL autocheckpoint is not configurable: disabled where the dedicated checkpoint task runs
+#   (it owns routine passes), bounded at 4000 pages on pools without one.
 #   KHIVE_WAL_HIGH_WATER_PAGES=6000      WAL size that logs a high-pressure warning. Must be > 0.
 #   KHIVE_WAL_WARN_PAGES=2000            WAL size that logs a warning. Must be > 0.
 #   KHIVE_JOURNAL_SIZE_LIMIT_BYTES=67108864   PRAGMA journal_size_limit (64 MiB).

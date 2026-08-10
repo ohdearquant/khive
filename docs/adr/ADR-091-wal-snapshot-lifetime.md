@@ -1247,16 +1247,25 @@ ordinary writer still runs an implicit PASSIVE checkpoint synchronously in the c
 crosses it. Disabling the threshold only on the dedicated connection therefore cannot keep
 checkpoint I/O off application commit paths.
 
-**Decision.** Every writer-capable connection sets `PRAGMA wal_autocheckpoint = 0` when it is
-opened. The pool's startup writer applies the invariant in `configure_writer_connection`; the
-single standalone-writer constructor applies it to store and SQL-bridge writers as well as the
-writer task, diagnostics connection, and dedicated checkpoint connection, including every later
-open or checkpoint reconnect. The former `PoolConfig::wal_autocheckpoint_pages` field and
+**Decision.** Checkpoint ownership is claimed, not assumed. The scheduled checkpoint task claims
+ownership of its pool at startup (`ConnectionPool::claim_checkpoint_ownership`, plus a
+propagation call that reaches a writer task spawned before the claim). On a claimed pool every
+writer-capable connection sets `PRAGMA wal_autocheckpoint = 0`: the already-open pooled writer
+is re-configured under the writer mutex, and the single standalone-writer constructor applies
+the claimed value to store and SQL-bridge writers as well as the writer task, diagnostics
+connection, and dedicated checkpoint connection, including every later open or checkpoint
+reconnect. On a pool no checkpoint task claims — embedded runtimes and one-shot CLI executions
+have writable pools but never start the scheduled task — writer-capable connections keep a
+bounded 4,000-page autocheckpoint, so SQLite's own reclamation still bounds WAL growth where no
+dedicated owner exists. The former `PoolConfig::wal_autocheckpoint_pages` field and
 `KHIVE_WAL_AUTOCHECKPOINT_PAGES` override are removed: routine checkpoint ownership is a safety
-invariant, not a tuning parameter.
+invariant, not a tuning parameter, and neither posture is selectable by configuration.
 
-The scheduled task remains the only in-process source of routine PASSIVE checkpoint I/O.
-Amendment 5's dedicated-connection admission contract, TRUNCATE gates and busy bound, sidecar
-collection, counters, and severity ladder are otherwise unchanged. Regressions read the pragma on
-each connection class and grow a WAL past the former 4,000-page threshold before observing it, so
-configuration-only coverage cannot mask a later-created connection reverting to SQLite's default.
+The scheduled task remains the only in-process source of routine PASSIVE checkpoint I/O on
+claimed pools. Amendment 5's dedicated-connection admission contract, TRUNCATE gates and busy
+bound, sidecar collection, counters, and severity ladder are otherwise unchanged. Regressions
+read the pragma on each connection class in both postures and grow a WAL past the 4,000-page
+threshold before observing it, so configuration-only coverage cannot mask a later-created
+connection reverting to the wrong posture — including the unclaimed-pool regression that the
+bounded fallback exists to prevent: unbounded WAL growth on a writable pool with no checkpoint
+owner.
