@@ -318,16 +318,30 @@ enum CachedReadTransactionControl {
 fn cached_read_transaction_control(sql: &str) -> Option<CachedReadTransactionControl> {
     let (keyword, tail) = transaction_control_parts(sql)?;
     match keyword {
-        "BEGIN" => match next_sqlite_token(tail).map(|(token, _)| token) {
-            None => Some(CachedReadTransactionControl::BeginDeferred),
-            Some(token)
-                if token.eq_ignore_ascii_case(b"DEFERRED")
-                    || token.eq_ignore_ascii_case(b"TRANSACTION") =>
-            {
-                Some(CachedReadTransactionControl::BeginDeferred)
+        "BEGIN" => {
+            // Accept exactly `BEGIN`, `BEGIN TRANSACTION`, `BEGIN DEFERRED`,
+            // or `BEGIN DEFERRED TRANSACTION`, with no trailing tokens.
+            // SQLite's grammar also admits `BEGIN TRANSACTION <name>` (the
+            // name parses as an identifier and is ignored), so a mode keyword
+            // in that trailing position — `BEGIN TRANSACTION IMMEDIATE` —
+            // still parses, and classifying it by its first token alone would
+            // launder what reads as a write-reserving start into a deferred
+            // one. Every trailing token is therefore Unsupported.
+            let mut rest = tail;
+            let mut saw_deferred = false;
+            let mut saw_transaction = false;
+            while let Some((token, next)) = next_sqlite_token(rest) {
+                if !saw_deferred && !saw_transaction && token.eq_ignore_ascii_case(b"DEFERRED") {
+                    saw_deferred = true;
+                } else if !saw_transaction && token.eq_ignore_ascii_case(b"TRANSACTION") {
+                    saw_transaction = true;
+                } else {
+                    return Some(CachedReadTransactionControl::Unsupported(keyword));
+                }
+                rest = next;
             }
-            Some(_) => Some(CachedReadTransactionControl::Unsupported(keyword)),
-        },
+            Some(CachedReadTransactionControl::BeginDeferred)
+        }
         "COMMIT" | "END" => Some(CachedReadTransactionControl::Finish(keyword)),
         "ROLLBACK" => {
             let first = next_sqlite_token(tail);
@@ -2729,6 +2743,13 @@ mod tests {
         for (sql, keyword) in [
             ("BEGIN IMMEDIATE", "BEGIN"),
             ("BEGIN EXCLUSIVE", "BEGIN"),
+            // Trailing-mode spellings parse in SQLite as a NAMED deferred
+            // transaction, but the mode keyword in name position reads as
+            // lock intent; the classifier must refuse rather than launder
+            // them into a deferred start the cached reader would then hold.
+            ("BEGIN TRANSACTION IMMEDIATE", "BEGIN"),
+            ("BEGIN TRANSACTION EXCLUSIVE", "BEGIN"),
+            ("BEGIN DEFERRED TRANSACTION trailing", "BEGIN"),
             ("START TRANSACTION", "START"),
             ("COMMIT", "COMMIT"),
         ] {
@@ -3931,8 +3952,19 @@ mod tests {
                 "/* p */ \u{feff} ; BEGIN /* mode */ DEFERRED",
                 Some(BeginDeferred),
             ),
+            ("BEGIN DEFERRED TRANSACTION", Some(BeginDeferred)),
             ("BEGIN IMMEDIATE", Some(Unsupported("BEGIN"))),
             ("BEGIN /* lock */ EXCLUSIVE", Some(Unsupported("BEGIN"))),
+            ("BEGIN TRANSACTION IMMEDIATE", Some(Unsupported("BEGIN"))),
+            ("begin transaction exclusive", Some(Unsupported("BEGIN"))),
+            ("BEGIN TRANSACTION DEFERRED", Some(Unsupported("BEGIN"))),
+            ("BEGIN IMMEDIATE TRANSACTION", Some(Unsupported("BEGIN"))),
+            ("BEGIN TRANSACTION named_txn", Some(Unsupported("BEGIN"))),
+            (
+                "BEGIN DEFERRED TRANSACTION trailing",
+                Some(Unsupported("BEGIN")),
+            ),
+            ("BEGIN DEFERRED DEFERRED", Some(Unsupported("BEGIN"))),
             ("START TRANSACTION", Some(Unsupported("START"))),
             ("COMMIT", Some(Finish("COMMIT"))),
             ("END TRANSACTION", Some(Finish("END"))),
