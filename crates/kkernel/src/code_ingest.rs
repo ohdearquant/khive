@@ -856,8 +856,15 @@ mod tests {
         }
     }
 
+    /// Read back the three tombstone markers through an ordinary writable
+    /// backend's reader connection. The read-only constructor is not usable
+    /// here: it refuses a database whose WAL `-shm` sidecar is still
+    /// writable, and this fixture's earlier ingest and tombstone writers
+    /// legitimately leave that sidecar behind. The production dry-run path
+    /// satisfies that guard by snapshot-copying and freezing sidecars; this
+    /// assertion needs only three scalar reads on the live fixture file.
     async fn assert_mapped_batch_remains_tombstoned(db: &Path, batch: &CodeIngestBatch) {
-        let backend = StorageBackend::sqlite_read_only(db).expect("open tombstone reader");
+        let backend = StorageBackend::sqlite(db).expect("open tombstone reader");
         let sql = backend.sql();
         let mut reader = sql.reader().await.expect("acquire tombstone reader");
 
