@@ -338,10 +338,11 @@ def first_op_result(resp: dict) -> dict:
     return op["result"]
 
 
-# `list` always returns the stable
-# {items, effective_limit, limit_clamped, requested_limit} offset envelope.
-# Keep the bare-array fallback so this workspace helper can still read from an
-# older server during a rolling upgrade.
+# The server clamps `list` limit to 200 and, only when the caller's requested
+# limit exceeded that clamp, wraps the array in
+# {items, effective_limit, limit_clamped, requested_limit} instead of
+# returning a bare array. Requesting <=200 always yields a bare array; we
+# still normalize defensively in case that changes.
 def list_items(result) -> list:
     if isinstance(result, dict) and "items" in result:
         return result["items"]
@@ -349,7 +350,7 @@ def list_items(result) -> list:
 
 
 def fetch_all(kk: KKernel, kind: str, page_limit: int = 200, max_pages: int = 50) -> list[dict]:
-    """Fetch rows via bounded offset pagination until the server returns an empty page."""
+    """Fetch every row of `kind` via bounded pagination. Read-only."""
     rows_all: list[dict] = []
     offset = 0
     for _ in range(max_pages):
@@ -358,7 +359,9 @@ def fetch_all(kk: KKernel, kind: str, page_limit: int = 200, max_pages: int = 50
         if not rows:
             break
         rows_all.extend(rows)
-        offset += len(rows)
+        if len(rows) < page_limit:
+            break
+        offset += page_limit
     return rows_all
 
 
@@ -417,9 +420,7 @@ def load_existing_ws_ingest_notes(
     """(source_path, content_sha256_16) -> note id, for notes already ingested
     by this script, across kinds. The note id is retained (not just the key)
     so a match can be reconciled — its `annotates` edges verified/backfilled
-    — rather than accepted as complete on sight; see reconcile_existing_note.
-    Pagination advances by rows returned and stops only on an empty page so a
-    server-clamped page cannot skip rows or terminate the scan early."""
+    — rather than accepted as complete on sight; see reconcile_existing_note."""
     seen: dict[tuple[str, str], str] = {}
     for kind in note_kinds:
         offset = 0
@@ -437,7 +438,9 @@ def load_existing_ws_ingest_notes(
                 sha = props.get("content_sha256_16")
                 if sp and sha:
                     seen[(sp, sha)] = row["id"]
-            offset += len(rows)
+            if len(rows) < page_limit:
+                break
+            offset += page_limit
     return seen
 
 
