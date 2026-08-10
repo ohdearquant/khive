@@ -36,11 +36,15 @@ forever for a possibly-wedged holder — needs a deadline instead.
 ## build_metrics_snapshot
 
 `tx_registry` (ADR-091 Plank 0) is a process-global singleton reachable directly, with no plumbing
-through `dispatcher`. `wal_pages` and the TRUNCATE counters (ADR-091 Plank 2) are read from
-`khive_db::checkpoint`'s module-scoped atomics, updated wherever the checkpoint task already calls
-`query_wal_pages`/`note_truncate_outcome` — mirroring the fallback-counter pattern in
-`khive-mcp/src/daemon.rs` rather than threading a metrics handle through every checkpoint call
-site, since the checkpoint task itself is a fire-and-forget `tokio::spawn` with no handle retained
-anywhere this accept loop can reach. `write_queue_depth`/`_capacity` (ADR-067 Component A) come
-from the dispatcher's own pool, if any, and are `None` unless `KHIVE_WRITE_QUEUE=1` actually
-spawned a writer task.
+through `dispatcher`. TRUNCATE counters remain module-scoped atomics. The logical WAL fields
+(`wal_log_frames`, `wal_checkpointed_frames`, and `wal_pending_frames`) and
+`wal_physical_bytes` come from the dispatcher's exact pool's last routine PASSIVE tick; building a
+metrics frame does not issue an on-demand checkpoint or stat the sidecar. `wal_pages` remains the
+compatibility projection of `wal_log_frames`. The backend key is load-bearing in a multi-backend
+daemon: a secondary task's later tick cannot relabel its state as the main pool's sample.
+
+`write_queue_depth`/`_capacity` (ADR-067 Component A) come from the same pool and are `None`
+unless a writer task exists. The `write_last_*_micros` fields expose that task's latest completed
+queue-wait, transaction-acquisition, body, commit, and total stages, plus the observation time.
+All new fields are additive `serde(default)` metrics-only fields; older peers can omit them without
+changing request dispatch or the canonical verb result.
