@@ -36,9 +36,10 @@
 //! from ordinary ticks, the dedicated-connection invariant, and why Plank 1
 //! is a sweep rather than the ADR's originally-described per-statement guard).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::pool::ConnectionPool;
@@ -47,8 +48,8 @@ use crate::pool::ConnectionPool;
 // Read-only process-wide gauges (never reset outside #[cfg(test)]). See
 // crates/khive-db/docs/api/checkpoint.md#metrics-read-surface-loadperf-harness
 
-/// Last-observed WAL page count (`query_wal_pages`'s return value on its
-/// most recent call, from either `checkpoint_once` or `maybe_truncate`).
+/// Last-observed WAL page count (the routine PASSIVE row's `log` value, or a
+/// rare post-TRUNCATE observation from `maybe_truncate`).
 /// `u64::MAX` is the "never observed" sentinel — no checkpoint tick has run
 /// yet in this process — distinct from a genuine zero-page WAL.
 static LAST_WAL_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -79,6 +80,85 @@ static CHECKPOINT_CONSECUTIVE_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// moment a skip occurs. `u64::MAX` is the "no skip has recorded a snapshot
 /// yet" sentinel, mirroring `LAST_WAL_PAGES`.
 static CHECKPOINT_LAST_SKIP_WAL_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// One backend-scoped observation produced by the periodic checkpoint task's
+/// own PASSIVE pass. Logical frame counts and the physical `-wal` allocation
+/// are intentionally separate: SQLite may retain/reuse the sidecar after the
+/// logical backlog drains (#1849).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutineWalObservation {
+    pub busy: i64,
+    pub log_frames: u64,
+    pub checkpointed_frames: u64,
+    pub pending_frames: u64,
+    pub physical_wal_bytes: Option<u64>,
+    pub observed_at_unix_ms: u64,
+}
+
+/// Latest routine observation by canonical database identity. Checkpoint
+/// tasks fan out per backend, so a single process-global "last task wins"
+/// gauge would misattribute a secondary backend to the main metrics frame.
+static ROUTINE_WAL_OBSERVATIONS: OnceLock<Mutex<HashMap<Option<PathBuf>, RoutineWalObservation>>> =
+    OnceLock::new();
+
+fn routine_wal_observations() -> &'static Mutex<HashMap<Option<PathBuf>, RoutineWalObservation>> {
+    ROUTINE_WAL_OBSERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn checkpoint_db_key_from_path(path: Option<&Path>) -> Option<PathBuf> {
+    path.map(Path::to_path_buf)
+}
+
+fn checkpoint_db_key(pool: &ConnectionPool) -> Option<PathBuf> {
+    checkpoint_db_key_from_path(pool.canonical_path())
+}
+
+fn observed_at_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn physical_wal_bytes(pool: &ConnectionPool) -> Option<u64> {
+    let path = pool.canonical_path()?;
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push("-wal");
+    std::fs::metadata(PathBuf::from(sidecar))
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
+fn record_routine_wal_observation(
+    pool: &ConnectionPool,
+    raw: RawCheckpointObservation,
+) -> RoutineWalObservation {
+    let log_frames = raw.log_frames.max(0) as u64;
+    let checkpointed_frames = raw.checkpointed_frames.max(0) as u64;
+    let observation = RoutineWalObservation {
+        busy: raw.busy,
+        log_frames,
+        checkpointed_frames,
+        pending_frames: log_frames.saturating_sub(checkpointed_frames),
+        physical_wal_bytes: physical_wal_bytes(pool),
+        observed_at_unix_ms: observed_at_unix_ms(),
+    };
+    routine_wal_observations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(checkpoint_db_key(pool), observation.clone());
+    observation
+}
+
+/// Latest periodic checkpoint sample for this exact backend. This is a pure
+/// in-memory read: it never issues `wal_checkpoint` or stats the filesystem.
+pub fn routine_wal_observation(pool: &ConnectionPool) -> Option<RoutineWalObservation> {
+    routine_wal_observations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&checkpoint_db_key(pool))
+        .cloned()
+}
 
 /// Last-observed WAL page count, if any checkpoint tick has run yet in this
 /// process. Read surface for the daemon-frame metrics snapshot.
@@ -1955,13 +2035,35 @@ fn checkpoint_once_core(
 ) -> Result<CheckpointCoreOutcome, rusqlite::Error> {
     #[cfg(unix)]
     truncate_state.begin_tick();
-    let wal_pages = query_wal_pages(conn);
+    let raw_observation = match query_checkpoint_observation(conn) {
+        Ok(observation) => observation,
+        Err(e) => {
+            tracing::warn!(error = %e, "WAL checkpoint failed");
+            return Err(e);
+        }
+    };
+    let observation = record_routine_wal_observation(pool, raw_observation);
+    let wal_pages = observation.log_frames;
+    LAST_WAL_PAGES.store(wal_pages, Ordering::Relaxed);
+    note_checkpoint_observed(wal_pages);
 
-    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
-        tracing::warn!(error = %e, "WAL checkpoint failed");
-        return Err(e);
+    if raw_observation.busy != 0 {
+        tracing::debug!(
+            busy = raw_observation.busy,
+            wal_log_frames = raw_observation.log_frames,
+            wal_checkpointed_frames = raw_observation.checkpointed_frames,
+            wal_pending_frames = observation.pending_frames,
+            wal_physical_bytes = ?observation.physical_wal_bytes,
+            "WAL PASSIVE checkpoint reported incomplete progress"
+        );
     }
-    tracing::debug!(wal_pages, "WAL checkpoint issued");
+    tracing::debug!(
+        wal_pages,
+        wal_checkpointed_frames = observation.checkpointed_frames,
+        wal_pending_frames = observation.pending_frames,
+        wal_physical_bytes = ?observation.physical_wal_bytes,
+        "WAL checkpoint issued"
+    );
 
     let sidecar_attribution = maybe_truncate(pool, conn, config, wal_pages, truncate_state);
 
@@ -2561,21 +2663,36 @@ fn crossing_warn(now_above: bool, was_above: &mut bool) -> bool {
     fire
 }
 
-/// Query the current WAL frame count via `PRAGMA wal_checkpoint`.
+#[derive(Debug, Clone, Copy)]
+struct RawCheckpointObservation {
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+}
+
+/// Issue one PASSIVE checkpoint and retain the complete SQLite result row.
+/// This is the periodic task's one routine checkpoint call: the same row
+/// drives thresholds and the logical-backlog monitoring sample (#1849).
+fn query_checkpoint_observation(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<RawCheckpointObservation> {
+    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+        Ok(RawCheckpointObservation {
+            busy: row.get(0)?,
+            log_frames: row.get(1)?,
+            checkpointed_frames: row.get(2)?,
+        })
+    })
+}
+
+/// Query the current WAL frame count with one PASSIVE checkpoint.
 ///
-/// The pragma returns a 3-column row `(busy, log, checkpointed)`, where `log`
-/// (column index 1) is the number of frames currently in the WAL file — the
-/// backlog the high-water threshold keys off. (Column 2 is `checkpointed`, the
-/// frames moved *by this call*, which is not the WAL size.) The no-arg pragma
-/// also performs a PASSIVE checkpoint as a side effect; the subsequent explicit
-/// `PRAGMA wal_checkpoint(PASSIVE)` in `checkpoint_once` is a deliberate second
-/// pass that can checkpoint any frames written between the two calls.
-///
-/// Returns 0 on any error (e.g. in-memory DB where WAL is not active, which
-/// reports `log = -1`).
+/// Used only for rare post-TRUNCATE outcome measurement. The ordinary
+/// periodic path calls [`query_checkpoint_observation`] directly and stores
+/// its complete row, avoiding the former double-checkpoint pass.
 fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
-    let pages = conn
-        .query_row("PRAGMA wal_checkpoint", [], |row| row.get::<_, i64>(1))
+    let pages = query_checkpoint_observation(conn)
+        .map(|observation| observation.log_frames)
         .unwrap_or(0)
         .max(0) as u64;
     // Metrics read-surface (load/perf harness): mirror every observation into
@@ -2590,6 +2707,7 @@ fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
+    use rusqlite::hooks::{AuthAction, Authorization};
     use serial_test::serial;
     use tracing::field::{Field, Visit};
 
@@ -5414,6 +5532,23 @@ mod tests {
                 .unwrap();
         }
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path.clone()),
@@ -6086,5 +6221,137 @@ mod tests {
         // Either an explicit error or a nonsensical negative `log` value is
         // acceptable here — the requirement is just "does not panic".
         let _ = query_wal_pin_depth(writer.conn());
+    }
+
+    /// #1849: a canonical filesystem identity is an OS path, not a display
+    /// label. Distinct non-UTF-8 Unix paths can render to the same lossy
+    /// string and must still occupy distinct backend telemetry slots.
+    #[cfg(unix)]
+    #[test]
+    fn routine_wal_backend_key_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_a = PathBuf::from(OsString::from_vec(b"/tmp/khive-wal-\x80.db".to_vec()));
+        let path_b = PathBuf::from(OsString::from_vec(b"/tmp/khive-wal-\x81.db".to_vec()));
+        assert_eq!(
+            path_a.display().to_string(),
+            path_b.display().to_string(),
+            "fixture must reproduce the lossy display-label collision"
+        );
+        assert_ne!(
+            checkpoint_db_key_from_path(Some(&path_a)),
+            checkpoint_db_key_from_path(Some(&path_b)),
+            "backend keys must retain the canonical path's exact OS bytes"
+        );
+    }
+
+    /// #1849: the periodic checkpoint's own PASSIVE row is the monitoring
+    /// sample. One tick must not issue the old no-arg probe followed by a
+    /// second PASSIVE, and the stored sample must distinguish logical
+    /// backlog from the physical sidecar high-water mark.
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_records_one_pass_logical_and_physical_wal_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routine_wal_sample.db");
+        let pool = file_pool(&path);
+
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "PRAGMA wal_autocheckpoint=0; \
+                     CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT); \
+                     INSERT INTO t VALUES (0, 'seed');",
+                )
+                .unwrap();
+        }
+
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+            for id in 1..=256_i64 {
+                writer
+                    .conn()
+                    .execute("INSERT INTO t VALUES (?1, printf('%.*c', 2048, 'x'))", [id])
+                    .unwrap();
+            }
+            writer.conn().execute_batch("COMMIT").unwrap();
+        }
+
+        let checkpoint_conn = pool.open_standalone_writer().unwrap();
+        let pragma_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pragma_calls_from_hook = Arc::clone(&pragma_calls);
+        checkpoint_conn
+            .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Pragma { pragma_name, .. }
+                        if pragma_name.eq_ignore_ascii_case("wal_checkpoint")
+                ) {
+                    pragma_calls_from_hook.fetch_add(1, Ordering::SeqCst);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+
+        checkpoint_once(
+            &pool,
+            &checkpoint_conn,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        )
+        .unwrap();
+        checkpoint_conn
+            .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
+            .unwrap();
+
+        assert_eq!(
+            pragma_calls.load(Ordering::SeqCst),
+            1,
+            "one routine tick must issue exactly one PASSIVE checkpoint"
+        );
+        let pinned = routine_wal_observation(&pool).expect("routine sample");
+        assert!(pinned.log_frames > 0, "the test must create WAL frames");
+        assert!(
+            pinned.pending_frames > 0,
+            "the old reader must leave a logical backlog: {pinned:?}"
+        );
+        assert_eq!(
+            pinned.pending_frames,
+            pinned.log_frames.saturating_sub(pinned.checkpointed_frames)
+        );
+        assert!(
+            pinned.physical_wal_bytes.is_some_and(|bytes| bytes > 0),
+            "the physical sidecar high-water must be reported separately: {pinned:?}"
+        );
+
+        reader.execute_batch("COMMIT").unwrap();
+        checkpoint_once(
+            &pool,
+            &checkpoint_conn,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        )
+        .unwrap();
+        let drained = routine_wal_observation(&pool).expect("drained routine sample");
+        assert_eq!(drained.pending_frames, 0, "unpinned PASSIVE must drain");
+        assert!(
+            drained.physical_wal_bytes.is_some_and(|bytes| bytes > 0),
+            "PASSIVE may reuse rather than shrink the physical WAL; the two gauges must remain \
+             independently visible: {drained:?}"
+        );
     }
 }

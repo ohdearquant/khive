@@ -14,7 +14,7 @@ Verb categories are intentional: recall and its dotted stages are assertive; rem
 
 ## Warm phase
 
-`PackRuntime::warm` schedules ANN warming for registered embedding models, then runs an FTS population guard. The guard compares live base rows with unified FTS rows and warns when a database with more than 100 rows has less than half represented in FTS. It never hard-fails boot and skips legitimately new or empty databases. This detects the V3-to-V4 migration failure mode where empty unified tables stranded recall until manual reindexing.
+`PackRuntime::warm` schedules ANN warming for registered embedding models, then runs an FTS population guard. ANN warm is writer-bearing: it may register a consumer, publish a checkpoint, and compact a tail. It is therefore skipped when this pack's assigned runtime is an ADR-028 A2 read-only snapshot, and a recall-time cache miss likewise falls through to the exact sqlite-vec reader instead of scheduling a detached rebuild. The FTS population guard is genuinely load-only and still runs there. The guard compares live base rows with unified FTS rows and warns when a database with more than 100 rows has less than half represented in FTS. It never hard-fails boot and skips legitimately new or empty databases. This detects the V3-to-V4 migration failure mode where empty unified tables stranded recall until manual reindexing.
 
 ## Note-mutation hook
 

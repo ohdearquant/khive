@@ -131,6 +131,181 @@ async fn agent_one(
     Ok(first["result"].clone())
 }
 
+#[cfg(unix)]
+async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServer) {
+    use std::os::unix::fs::PermissionsExt;
+
+    use khive_mcp::tools::request::RequestParams;
+
+    disable_daemon();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("read_only_snapshot.db");
+    let config = RuntimeConfig {
+        db_path: Some(path.clone()),
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string()],
+        ..RuntimeConfig::default()
+    };
+
+    {
+        let runtime = KhiveRuntime::new(config.clone()).expect("writable snapshot source");
+        let server = KhiveMcpServer::new(runtime).expect("writable server");
+        let seeded = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"create(kind="concept", name="snapshot entity")"#.to_string(),
+                presentation: Some("verbose".to_string()),
+                presentation_per_op: None,
+                save_to: None,
+                format: Some("json".to_string()),
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("seed dispatch");
+        let seeded: Value = serde_json::from_str(&seeded).expect("seed response JSON");
+        assert_eq!(seeded["results"][0]["ok"], json!(true), "{seeded}");
+    }
+
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o444);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    // Freeze lingering `-wal`/`-shm` sidecars left by the writable fixture's
+    // asynchronously closing connections; read-only admission rejects a
+    // writable `-shm` as potentially live.
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.file_name().expect("db file name").to_os_string();
+        name.push(suffix);
+        let sidecar = path.parent().expect("db parent dir").join(name);
+        if sidecar.exists() {
+            let mut sidecar_permissions = std::fs::metadata(&sidecar)
+                .expect("sidecar metadata")
+                .permissions();
+            sidecar_permissions.set_mode(0o444);
+            std::fs::set_permissions(&sidecar, sidecar_permissions).expect("freeze sidecar");
+        }
+    }
+
+    let runtime = KhiveRuntime::new(config)
+        .expect("normal boot must detect and validate the read-only snapshot");
+    assert!(runtime.is_read_only());
+    let server = KhiveMcpServer::new(runtime).expect("read-only server builds");
+    (dir, server)
+}
+
+/// Issue #1602: normal runtime boot detects a chmod-read-only SQLite snapshot,
+/// keeps assertive verbs usable, and surfaces the deliberately skipped audit
+/// append beside each canonical result. The same backend still rejects writes.
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advisory() {
+    use khive_mcp::tools::request::RequestParams;
+
+    let (_dir, server) = seeded_read_only_snapshot_server().await;
+
+    let reads = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"[stats(), list(kind="entity", limit=501)]"#.to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("read dispatch");
+    let reads: Value = serde_json::from_str(&reads).expect("read response JSON");
+    let results = reads["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["ok"], json!(true), "stats must succeed: {reads}");
+    assert_eq!(results[0]["result"]["entities"], json!(1));
+    assert_eq!(results[1]["ok"], json!(true), "list must succeed: {reads}");
+    assert!(
+        results[1]["result"]["items"].is_array(),
+        "list's stable envelope must be preserved: {}",
+        results[1]
+    );
+    assert_eq!(results[1]["result"]["requested_limit"], json!(501));
+    assert_eq!(results[1]["result"]["effective_limit"], json!(500));
+    assert_eq!(results[1]["result"]["limit_clamped"], json!(true));
+    for entry in results {
+        assert_eq!(
+            entry["advisories"][0]["code"],
+            json!(khive_runtime::AUDIT_PERSISTENCE_SKIPPED_READ_ONLY),
+            "successful read must surface the skipped audit write: {entry}"
+        );
+        assert!(
+            entry["result"].get("advisories").is_none(),
+            "advisory belongs beside the result, not inside its verb-owned shape"
+        );
+    }
+
+    let mutation = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"create(kind="concept", name="must fail")"#.to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("mutation returns a per-op error envelope");
+    let mutation: Value = serde_json::from_str(&mutation).expect("mutation response JSON");
+    assert_eq!(mutation["results"][0]["ok"], json!(false));
+    let mutation_error = mutation["results"][0]["error"]
+        .to_string()
+        .to_ascii_lowercase();
+    assert!(
+        mutation_error.contains("read-only") || mutation_error.contains("readonly"),
+        "mutating verbs must remain rejected: {mutation}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_read_only_snapshot_default_list_keeps_array_and_sibling_audit_advisory() {
+    use khive_mcp::tools::request::RequestParams;
+
+    let (_dir, server) = seeded_read_only_snapshot_server().await;
+    let response = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"list(kind="entity")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("default-presentation read dispatch");
+    let response: Value = serde_json::from_str(&response).expect("read response JSON");
+    let entry = &response["results"][0];
+
+    assert_eq!(entry["ok"], json!(true), "list must succeed: {response}");
+    assert_eq!(entry["tool"], json!("list"));
+    let items = entry["result"]
+        .as_array()
+        .expect("within-cap list must preserve main's bare-array result");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], json!("snapshot entity"));
+    assert_eq!(items[0]["id"].as_str().map(str::len), Some(8));
+    assert_eq!(
+        entry["advisories"][0]["code"],
+        json!(khive_runtime::AUDIT_PERSISTENCE_SKIPPED_READ_ONLY)
+    );
+    assert!(
+        entry["result"].get("advisories").is_none(),
+        "the transport advisory must remain outside the verb-owned array"
+    );
+    assert_eq!(response["summary"]["succeeded"], json!(1));
+    assert_eq!(response["status"], json!("success"));
+}
+
 // ── server info / surface shape ──────────────────────────────────────────────
 
 #[tokio::test]

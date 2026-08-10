@@ -51,6 +51,12 @@ pub async fn emit_phase_event<P: serde::Serialize>(
     kind: khive_types::EventKind,
     payload: P,
 ) {
+    // A snapshot-inspection runtime has no durable audit sink by contract.
+    // Returning before store resolution is stronger than merely swallowing a
+    // rejected append: no writer-bearing EventStore path is entered at all.
+    if rt.is_read_only() {
+        return;
+    }
     // Best-effort exactly like ADR-094's other lifecycle-event emitters: a
     // backend that cannot resolve an `EventStore` for this token's namespace
     // is treated as an unconfigured audit sink, not an error to propagate.
@@ -84,6 +90,71 @@ pub async fn emit_phase_event<P: serde::Serialize>(
             event_kind = %kind.name(),
             label,
             "ADR-103 phase-span event append failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::RuntimeConfig;
+
+    struct MustNotSerialize;
+
+    impl serde::Serialize for MustNotSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            panic!("a read-only phase event must return before payload serialization")
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_phase_event_returns_before_store_or_payload_work() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("read-only-phase-events.db")),
+            ..RuntimeConfig::no_embeddings()
+        };
+        drop(KhiveRuntime::new(config.clone()).expect("migrate snapshot source"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let db_path = config.db_path.as_ref().expect("db path");
+            for suffix in ["-wal", "-shm"] {
+                let mut name = db_path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = db_path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+        let runtime = KhiveRuntime::new_readonly(config).expect("open snapshot read-only");
+        let token = runtime
+            .authorize(crate::Namespace::local())
+            .expect("authorize local");
+        let before = runtime.backend().pool().writer_acquisition_snapshot();
+
+        emit_phase_event(
+            &runtime,
+            &token,
+            "read-only.phase-test",
+            khive_types::EventKind::PhaseStarted,
+            MustNotSerialize,
+        )
+        .await;
+
+        assert_eq!(
+            runtime.backend().pool().writer_acquisition_snapshot(),
+            before,
+            "read-only phase suppression must not enter the writer plane"
         );
     }
 }

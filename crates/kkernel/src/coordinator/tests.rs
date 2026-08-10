@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2184,6 +2185,89 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
             entity_kind.and_then(|v| v.as_str()),
             Some("concept"),
             "T7a: entity_kind must be 'concept', got: {hit}"
+        );
+    }
+}
+
+/// #1676 acceptance: row-shape parity is a symmetric contract.
+///
+/// A one-way "coordinator contains the currently known fields" assertion does
+/// not catch a later field added only to the direct handler. Drive both server
+/// routes over the same primary runtime and require their complete key sets to
+/// be identical for both substrates.
+#[tokio::test]
+async fn multi_backend_and_direct_search_rows_have_exact_key_set_parity() {
+    async fn first_hit_keys(
+        server: &khive_mcp::server::KhiveMcpServer,
+        ops: &str,
+    ) -> BTreeSet<String> {
+        let raw = server
+            .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+                ops: ops.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("search dispatch must succeed");
+        let response: serde_json::Value =
+            serde_json::from_str(&raw).expect("search response must be valid JSON");
+        response["results"][0]["result"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("search must return an object row: {response}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    let primary = memory_runtime();
+    let empty_secondary = memory_runtime();
+    let namespace = RuntimeNamespace::local();
+    let token = primary.authorize(namespace).expect("authorize primary");
+    primary
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "ExactShapeEntityProbe",
+            Some("entity used to compare direct and coordinator row keys"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity shape probe");
+    primary
+        .create_note(
+            &token,
+            "observation",
+            Some("Exact shape note probe"),
+            "exactshapenoteprobe content used to compare search row keys",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note shape probe");
+
+    let direct = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+        packs_registry(Arc::clone(&primary), &["kg"]),
+        "local",
+        "test-direct-shape",
+    );
+    let coordinated = two_backend_server(Arc::clone(&primary), empty_secondary);
+
+    for ops in [
+        r#"search(kind="concept", query="ExactShapeEntityProbe")"#,
+        r#"search(kind="observation", query="exactshapenoteprobe")"#,
+    ] {
+        let direct_keys = first_hit_keys(&direct, ops).await;
+        let coordinated_keys = first_hit_keys(&coordinated, ops).await;
+        assert_eq!(
+            coordinated_keys, direct_keys,
+            "neither search route may add or omit a row field for {ops}"
         );
     }
 }

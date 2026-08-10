@@ -1442,6 +1442,67 @@ impl KhiveRuntime {
         Ok((note, embedding_report))
     }
 
+    /// Claim `external_id` on an outbound `message` note through the
+    /// ADR-124-sanctioned store-level one-key atomic path, bypassing the
+    /// caller-facing owner-established-property refusal in
+    /// [`Self::update_note`] (and its crate-internal prepare path). This is deliberately
+    /// NOT exposed through any registered verb (ADR-124's stated bound): it is
+    /// reachable only from pack/runtime code that owns outbox bookkeeping for
+    /// the `message` note kind.
+    ///
+    /// Refuses (returns `Err`, never writes) unless the live row is a
+    /// `message` note, `properties.direction == "outbound"`, and
+    /// `properties.external_id` is currently absent or empty.
+    pub async fn claim_outbound_message_external_id(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        external_id: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let store = self.notes(token)?;
+        let note = store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+        if note.kind != "message" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "external_id can only be claimed on a `message` note; note {id} is a `{}`",
+                note.kind
+            )));
+        }
+        let props = note.properties.as_ref().and_then(|v| v.as_object());
+        let direction = props
+            .and_then(|p| p.get("direction"))
+            .and_then(|v| v.as_str());
+        if direction != Some("outbound") {
+            return Err(RuntimeError::InvalidInput(format!(
+                "external_id can only be claimed on an outbound message note; note {id} has \
+                 direction {:?}",
+                direction
+            )));
+        }
+        let existing = props
+            .and_then(|p| p.get("external_id"))
+            .and_then(|v| v.as_str());
+        if existing.is_some_and(|v| !v.is_empty()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} already has an external_id claimed"
+            )));
+        }
+        store
+            .set_note_property(
+                id,
+                "external_id",
+                Value::String(external_id),
+                note.updated_at,
+            )
+            .await?;
+        store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
+    }
+
     /// Merge `from_id` note into `into_id` note.
     ///
     /// Both notes must exist in the namespace and have the same `kind`. Content is merged
@@ -3175,6 +3236,203 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    fn outbound_message_note() -> Note {
+        let mut note = Note::new("local", "message", "hello");
+        note.properties = Some(serde_json::json!({"direction": "outbound"}));
+        note
+    }
+
+    #[tokio::test]
+    async fn claim_outbound_message_external_id_sets_value_and_survives_readback() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let note = outbound_message_note();
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let claimed = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<abc@example.com>".to_string())
+            .await
+            .expect("claim succeeds on a fresh outbound message note");
+        assert_eq!(
+            claimed
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("external_id"))
+                .and_then(|v| v.as_str()),
+            Some("<abc@example.com>")
+        );
+
+        // Reads the persisted row back independently of the claim call's own
+        // return value. This is the check that fails if the fix is reverted
+        // to routing the claim through `dispatch("update", ...)`: that path is
+        // refused by the owner-established-property gate exercised in
+        // `generic_update_still_refuses_external_id_on_message_note` below, so
+        // external_id would never actually persist and this read would come
+        // back `None`.
+        let reread = rt
+            .notes(&tok)
+            .expect("note store")
+            .get_note(note_id)
+            .await
+            .expect("read note")
+            .expect("note still exists");
+        assert_eq!(
+            reread
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("external_id"))
+                .and_then(|v| v.as_str()),
+            Some("<abc@example.com>")
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_update_still_refuses_external_id_on_message_note() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let note = outbound_message_note();
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = rt
+            .update_note(
+                &tok,
+                note_id,
+                NotePatch {
+                    properties: Some(serde_json::json!({"external_id": "<forged@example.com>"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("caller-facing update must keep refusing external_id on a message note");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+        assert!(err.to_string().contains("is not patchable"), "error: {err}");
+
+        // The owner path is unaffected by the caller-side refusal above.
+        let claimed = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<claimed@example.com>".to_string())
+            .await
+            .expect("owner-bookkeeping path still claims after a refused caller patch");
+        assert_eq!(
+            claimed
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("external_id"))
+                .and_then(|v| v.as_str()),
+            Some("<claimed@example.com>")
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_non_message_note() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let mut note = Note::new("local", "observation", "not a message");
+        note.properties = Some(serde_json::json!({"direction": "outbound"}));
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<x@example.com>".to_string())
+            .await
+            .expect_err("a non-message note must never accept the claim");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_inbound_message() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let mut note = Note::new("local", "message", "inbound content");
+        note.properties = Some(serde_json::json!({"direction": "inbound"}));
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<x@example.com>".to_string())
+            .await
+            .expect_err("an inbound message note must never accept the claim");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_when_external_id_already_set() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let mut note = outbound_message_note();
+        note.properties = Some(
+            serde_json::json!({"direction": "outbound", "external_id": "<already@example.com>"}),
+        );
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<new@example.com>".to_string())
+            .await
+            .expect_err("a note that already carries external_id must refuse re-claim");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn generic_update_can_still_patch_delivered_at_on_message_note() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let note = outbound_message_note();
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let updated = rt
+            .update_note(
+                &tok,
+                note_id,
+                NotePatch {
+                    properties: Some(serde_json::json!({"delivered_at": "2026-08-09T00:00:00Z"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delivered_at is not owner-established and must remain patchable");
+        assert_eq!(
+            updated
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("delivered_at"))
+                .and_then(|v| v.as_str()),
+            Some("2026-08-09T00:00:00Z")
+        );
     }
 
     fn secret_shaped_reason() -> String {

@@ -15,6 +15,45 @@ use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
 use crate::stores::{agents, blob, entity, event, graph, note, sparse, text, vectors};
 
+fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, SqliteError> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(SqliteError::Rusqlite)
+}
+
+fn validate_vector_table_columns(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> Result<(), SqliteError> {
+    let pragma = format!("PRAGMA table_xinfo({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    let mut has_field = false;
+    let mut has_embedding_model = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "field" {
+            has_field = true;
+        }
+        if name == "embedding_model" {
+            has_embedding_model = true;
+        }
+    }
+    if !has_field || !has_embedding_model {
+        return Err(SqliteError::InvalidData(format!(
+            "vec0 table '{table}' is missing required column(s) (field={has_field}, \
+             embedding_model={has_embedding_model}); this is a pre-v0.2.8 vector schema and is \
+             not supported — recreate the database"
+        )));
+    }
+    Ok(())
+}
+
 /// Concrete storage backend providing capability traits.
 pub struct StorageBackend {
     pool: Arc<ConnectionPool>,
@@ -32,16 +71,24 @@ pub struct StorageBackend {
 impl StorageBackend {
     /// File-backed SQLite database.
     ///
-    /// Opens (or creates) the database at `path`. The underlying pool provides
+    /// Opens (or creates) the database at `path`. An existing filesystem path
+    /// whose mode is read-only is opened with the same locked-down pool
+    /// configuration as [`Self::sqlite_read_only`]. The writable pool provides
     /// 1 writer + N readers in WAL mode for concurrent access.
     /// No schema is applied — call `apply_schema()` for each service.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
         let resolved = path.as_ref().to_path_buf();
-        let config = PoolConfig {
+        let read_only =
+            std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.permissions().readonly());
+        let mut config = PoolConfig {
             path: Some(resolved.clone()),
+            read_only,
             ..PoolConfig::default()
         };
+        if read_only {
+            config.write_queue_enabled = Some(false);
+        }
         let pool = ConnectionPool::new(config)?;
         Ok(Self {
             pool: Arc::new(pool),
@@ -56,7 +103,8 @@ impl StorageBackend {
     /// Opens the database at `path` and sets `PRAGMA query_only = ON` on the
     /// writer connection so that any write attempt (INSERT/UPDATE/DELETE) returns
     /// an error. Reader connections are opened with `SQLITE_OPEN_READ_ONLY` by the
-    /// pool; this PRAGMA extends that protection to the writer slot.
+    /// pool; at least one remains dedicated even for a rollback-journal snapshot,
+    /// while this PRAGMA extends the protection to the otherwise-unused writer slot.
     ///
     /// The database file must already exist — unlike `sqlite()` this constructor
     /// does not create a new file.
@@ -66,6 +114,7 @@ impl StorageBackend {
         let config = PoolConfig {
             path: Some(resolved.clone()),
             read_only: true,
+            write_queue_enabled: Some(false),
             ..PoolConfig::default()
         };
         // `ConnectionPool::new` opens the writer slot with `SQLITE_OPEN_READ_ONLY`
@@ -151,6 +200,21 @@ impl StorageBackend {
         })
     }
 
+    /// Prepare the core schema for runtime boot.
+    ///
+    /// Writable backends apply pending migrations. Read-only backends perform
+    /// a query-only compatibility check and require the snapshot to be at this
+    /// build's exact latest schema version.
+    pub fn prepare_core_schema(&self) -> Result<u32, SqliteError> {
+        if self.is_read_only() {
+            let reader = self.pool.reader()?;
+            crate::migrations::validate_schema_is_current(reader.conn())
+        } else {
+            let mut writer = self.pool.try_writer()?;
+            crate::migrations::run_migrations(writer.conn_mut())
+        }
+    }
+
     /// Get an EntityStore. Applies the entities DDL if not already present.
     ///
     /// Idempotent — safe to call multiple times.
@@ -170,8 +234,10 @@ impl StorageBackend {
                 "entities namespace must be non-empty".to_string(),
             ));
         }
-        let writer = self.pool.try_writer()?;
-        entity::ensure_entities_schema(writer.conn())?;
+        if !self.is_read_only() {
+            let writer = self.pool.try_writer()?;
+            entity::ensure_entities_schema(writer.conn())?;
+        }
 
         Ok(Arc::new(entity::SqlEntityStore::new(
             Arc::clone(&self.pool),
@@ -197,8 +263,10 @@ impl StorageBackend {
                 "graph namespace must be non-empty".to_string(),
             ));
         }
-        let writer = self.pool.try_writer()?;
-        graph::ensure_graph_schema(writer.conn())?;
+        if !self.is_read_only() {
+            let writer = self.pool.try_writer()?;
+            graph::ensure_graph_schema(writer.conn())?;
+        }
 
         Ok(Arc::new(graph::SqlGraphStore::new_scoped(
             Arc::clone(&self.pool),
@@ -226,18 +294,20 @@ impl StorageBackend {
                 "notes namespace must be non-empty".to_string(),
             ));
         }
-        let writer = self.pool.try_writer()?;
-        note::ensure_notes_schema(writer.conn())?;
+        if !self.is_read_only() {
+            let writer = self.pool.try_writer()?;
+            note::ensure_notes_schema(writer.conn())?;
 
-        // The anti-join repair is a full `notes` scan -- gate it to run at
-        // most once per backend/pool. `try_writer()` blocks for exclusive
-        // access to the single writer connection for this whole function,
-        // so this load-then-run-then-store is race-free: no other caller on
-        // this pool can observe or advance `notes_seq_repair_runs` while we
-        // hold the writer guard (khive #827).
-        if self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0 {
-            note::repair_notes_seq(writer.conn())?;
-            self.notes_seq_repair_runs.fetch_add(1, Ordering::Relaxed);
+            // The anti-join repair is a full `notes` scan -- gate it to run at
+            // most once per backend/pool. `try_writer()` blocks for exclusive
+            // access to the single writer connection for this whole function,
+            // so this load-then-run-then-store is race-free: no other caller on
+            // this pool can observe or advance `notes_seq_repair_runs` while we
+            // hold the writer guard (khive #827).
+            if self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0 {
+                note::repair_notes_seq(writer.conn())?;
+                self.notes_seq_repair_runs.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         Ok(Arc::new(note::SqlNoteStore::new(
@@ -272,8 +342,10 @@ impl StorageBackend {
                 "events namespace must be non-empty".to_string(),
             ));
         }
-        let writer = self.pool.try_writer()?;
-        event::ensure_events_schema(writer.conn())?;
+        if !self.is_read_only() {
+            let writer = self.pool.try_writer()?;
+            event::ensure_events_schema(writer.conn())?;
+        }
 
         Ok(Arc::new(event::SqlEventStore::new_scoped(
             Arc::clone(&self.pool),
@@ -287,8 +359,10 @@ impl StorageBackend {
     /// other stores here, agent-process records are not namespace-scoped, so
     /// there is no `_for_namespace` variant.
     pub fn agents(&self) -> Result<Arc<dyn khive_storage::AgentStore>, SqliteError> {
-        let writer = self.pool.try_writer()?;
-        agents::ensure_agents_schema(writer.conn())?;
+        if !self.is_read_only() {
+            let writer = self.pool.try_writer()?;
+            agents::ensure_agents_schema(writer.conn())?;
+        }
 
         Ok(Arc::new(agents::SqlAgentStore::new(
             Arc::clone(&self.pool),
@@ -347,6 +421,30 @@ impl StorageBackend {
         crate::extension::ensure_extensions_loaded();
 
         let table = format!("vec_{}", model_key);
+
+        if self.is_read_only() {
+            // Snapshot inspection must not check schema through the pool's
+            // query-only writer slot: even a SELECT there is a writer-class
+            // acquisition and violates ADR-028 A2's write-free lifecycle.
+            let reader = self.pool.reader()?;
+            if !sqlite_table_exists(reader.conn(), &table)? {
+                return Err(SqliteError::InvalidData(format!(
+                    "read-only database has no vector table '{table}'; create and populate it in \
+                     a writable copy before opening the snapshot"
+                )));
+            }
+            validate_vector_table_columns(reader.conn(), &table)?;
+            drop(reader);
+            return Ok(Arc::new(vectors::SqliteVecStore::new(
+                Arc::clone(&self.pool),
+                self.is_file_backed,
+                model_key.to_string(),
+                embedding_model.to_string(),
+                dimensions,
+                namespace.trim().to_string(),
+            )?));
+        }
+
         let writer = self.pool.try_writer()?;
 
         // Detect old-schema vec0 tables that predate the `field` column.
@@ -355,16 +453,7 @@ impl StorageBackend {
         // callers can re-embed from the source record after the table is rebuilt.
         // Use pragma_table_info to check columns directly; substring matching on the
         // CREATE DDL is fragile (a model_key containing "field" would false-match).
-        let table_exists: bool = writer
-            .conn()
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-                rusqlite::params![&table],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(SqliteError::Rusqlite)?
-            .is_some();
+        let table_exists = sqlite_table_exists(writer.conn(), &table)?;
 
         if table_exists {
             // V17 migration (vector_embedding_model_tag_preserving_rebuild) adds
@@ -372,28 +461,7 @@ impl StorageBackend {
             // migration time.  If this table still lacks either column post-migration
             // that indicates the database was not migrated — return a hard error
             // rather than silently dropping data.
-            let pragma = format!("PRAGMA table_xinfo({})", table);
-            let mut stmt = writer.conn().prepare(&pragma)?;
-            let mut rows = stmt.query([])?;
-            let mut has_field = false;
-            let mut has_embedding_model = false;
-            while let Some(row) = rows.next()? {
-                let name: String = row.get(1)?;
-                if name == "field" {
-                    has_field = true;
-                }
-                if name == "embedding_model" {
-                    has_embedding_model = true;
-                }
-            }
-            if !has_field || !has_embedding_model {
-                return Err(SqliteError::InvalidData(format!(
-                    "vec0 table '{}' is missing required column(s) (field={}, \
-                     embedding_model={}); this is a pre-v0.2.8 vector schema and is \
-                     not supported — recreate the database",
-                    table, has_field, has_embedding_model,
-                )));
-            }
+            validate_vector_table_columns(writer.conn(), &table)?;
         }
 
         // Ensure the _embedding_models registry table exists.
@@ -522,8 +590,20 @@ impl StorageBackend {
             ));
         }
 
-        let writer = self.pool.try_writer()?;
-        sparse::ensure_sparse_schema(writer.conn(), model_key).map_err(SqliteError::Rusqlite)?;
+        if self.is_read_only() {
+            let table = format!("sparse_{model_key}");
+            let reader = self.pool.reader()?;
+            if !sqlite_table_exists(reader.conn(), &table)? {
+                return Err(SqliteError::InvalidData(format!(
+                    "read-only database has no sparse table '{table}'; create and populate it in \
+                     a writable copy before opening the snapshot"
+                )));
+            }
+        } else {
+            let writer = self.pool.try_writer()?;
+            sparse::ensure_sparse_schema(writer.conn(), model_key)
+                .map_err(SqliteError::Rusqlite)?;
+        }
 
         Ok(Arc::new(sparse::SqliteSparseStore::new(
             Arc::clone(&self.pool),
@@ -592,8 +672,19 @@ impl StorageBackend {
              )",
             table_key, tokenizer
         );
-        let writer = self.pool.try_writer()?;
-        writer.conn().execute_batch(&ddl)?;
+        if self.is_read_only() {
+            let table = format!("fts_{table_key}");
+            let reader = self.pool.reader()?;
+            if !sqlite_table_exists(reader.conn(), &table)? {
+                return Err(SqliteError::InvalidData(format!(
+                    "read-only database has no text-search table '{table}'; create and populate \
+                     it in a writable copy before opening the snapshot"
+                )));
+            }
+        } else {
+            let writer = self.pool.try_writer()?;
+            writer.conn().execute_batch(&ddl)?;
+        }
 
         Ok(Arc::new(text::Fts5TextSearch::new(
             Arc::clone(&self.pool),
@@ -619,9 +710,29 @@ impl StorageBackend {
         Ok(Arc::new(blob::FsBlobStore::new(root, floor)?))
     }
 
+    /// Resolve the filesystem blob root exactly like [`Self::blob_store`] but
+    /// require it to exist instead of creating it. Snapshot runtimes wrap the
+    /// returned capability so its read methods remain available while every
+    /// mutator is refused.
+    pub fn blob_store_read_only(
+        &self,
+        config_root: Option<&Path>,
+        floor_bytes: Option<u64>,
+    ) -> Result<Arc<dyn khive_storage::BlobStore>, SqliteError> {
+        let root = blob::resolve_blob_root(self.data_dir().as_deref(), config_root)?;
+        let floor = floor_bytes.unwrap_or(blob::FsBlobStore::DEFAULT_FLOOR_BYTES);
+        Ok(Arc::new(blob::FsBlobStore::open_existing(root, floor)?))
+    }
+
     /// Is this a file-backed backend?
     pub fn is_file_backed(&self) -> bool {
         self.is_file_backed
+    }
+
+    /// Whether this backend was opened with SQLite's read-only/query-only
+    /// contract, explicitly or after filesystem-mode detection.
+    pub fn is_read_only(&self) -> bool {
+        self.pool.config().read_only
     }
 
     /// Return the directory containing the backend's database file, or `None`
@@ -666,6 +777,96 @@ fn ann_root_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use khive_storage::types::{SqlStatement, SqlValue};
+
+    /// A writable fixture backend can leave `-wal`/`-shm` sidecars behind at
+    /// scope drop (their owning connection closes asynchronously), and
+    /// read-only admission rejects a writable `-shm` as potentially live.
+    /// Freeze any lingering sidecars so the reopened path is the documented
+    /// frozen-snapshot form: read-only `-wal` plus read-only `-shm`.
+    #[cfg(unix)]
+    fn freeze_snapshot_sidecars(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_detects_chmod_read_only_snapshot_and_core_reads_succeed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chmod_snapshot.db");
+        {
+            let writable = StorageBackend::sqlite(&path).expect("create writable database");
+            writable
+                .prepare_core_schema()
+                .expect("migrate writable snapshot source");
+        }
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        freeze_snapshot_sidecars(&path);
+
+        let read_only = StorageBackend::sqlite(&path).expect("auto-detect read-only mode");
+        assert!(read_only.is_read_only());
+        assert_eq!(
+            read_only.pool().config().write_queue_enabled,
+            Some(false),
+            "read-only boot must not attempt to spawn a writer task"
+        );
+        assert!(read_only
+            .pool()
+            .writer_task_handle()
+            .expect("disabled writer task is a valid configuration")
+            .is_none());
+        read_only
+            .prepare_core_schema()
+            .expect("current snapshot validates without migration writes");
+
+        let entities = read_only.entities().expect("entity store opens read-only");
+        let graph = read_only.graph().expect("graph store opens read-only");
+        let notes = read_only.notes().expect("note store opens read-only");
+        let events = read_only.events().expect("event store opens read-only");
+        assert_eq!(
+            entities
+                .count_entities("local", khive_storage::EntityFilter::default())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            graph
+                .count_edges(khive_storage::types::EdgeFilter::default())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(notes.count_notes("local", None).await.unwrap(), 0);
+        assert_eq!(
+            events
+                .count_events(khive_storage::EventFilter::default())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            read_only.notes_seq_repair_run_count(),
+            0,
+            "read-only store acquisition must not run the DML repair"
+        );
+    }
 
     #[test]
     fn memory_backend_creates_successfully() {
@@ -828,6 +1029,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sqlite_read_only_sparse_store_requires_existing_table_without_writer_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_sparse_tables.db");
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable
+                .prepare_core_schema()
+                .expect("migrate snapshot source");
+            writable
+                .sparse("present")
+                .expect("create the optional sparse table while writable");
+        }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
+
+        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        read_only
+            .prepare_core_schema()
+            .expect("validate exact current migration ledger");
+        read_only
+            .sparse("present")
+            .expect("an existing sparse table must open read-only");
+        let missing = match read_only.sparse("missing") {
+            Ok(_) => panic!("a missing sparse table must fail during store acquisition"),
+            Err(error) => error,
+        };
+        assert!(
+            missing.to_string().contains("sparse_missing"),
+            "the diagnostic must name the absent table: {missing}"
+        );
+        assert_eq!(
+            read_only.pool().writer_acquisition_snapshot(),
+            crate::pool::WriterAcquisitionSnapshot::default(),
+            "construction, exact-ledger validation, and optional sparse-table inspection must \
+             use reader connections only"
+        );
+    }
+
+    #[test]
+    fn sqlite_read_only_text_store_requires_existing_table_without_writer_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_text_tables.db");
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable
+                .prepare_core_schema()
+                .expect("migrate snapshot source");
+            writable
+                .text("present")
+                .expect("create the optional FTS table while writable");
+        }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
+
+        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        read_only
+            .prepare_core_schema()
+            .expect("validate exact current migration ledger");
+        read_only
+            .text("present")
+            .expect("an existing FTS table must open read-only");
+        let missing = match read_only.text("missing") {
+            Ok(_) => panic!("a missing FTS table must fail during store acquisition"),
+            Err(error) => error,
+        };
+        assert!(
+            missing.to_string().contains("fts_missing"),
+            "the diagnostic must name the absent table: {missing}"
+        );
+        assert_eq!(
+            read_only.pool().writer_acquisition_snapshot(),
+            crate::pool::WriterAcquisitionSnapshot::default(),
+            "construction, exact-ledger validation, and optional FTS inspection must use reader \
+             connections only"
+        );
+    }
+
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn sqlite_read_only_vector_store_schema_check_uses_no_writer_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_vector_tables.db");
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            writable
+                .prepare_core_schema()
+                .expect("migrate snapshot source");
+            writable
+                .vectors("present", "present", 3)
+                .expect("create the optional vector table while writable");
+        }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
+
+        let read_only = StorageBackend::sqlite_read_only(&path).unwrap();
+        read_only
+            .prepare_core_schema()
+            .expect("validate exact current migration ledger");
+        read_only
+            .vectors("present", "present", 3)
+            .expect("an existing vector table must open read-only");
+        assert!(
+            read_only.vectors("missing", "missing", 3).is_err(),
+            "a missing vector table must fail during store acquisition"
+        );
+        assert_eq!(
+            read_only.pool().writer_acquisition_snapshot(),
+            crate::pool::WriterAcquisitionSnapshot::default(),
+            "construction, exact-ledger validation, and optional vector inspection must use \
+             reader connections only"
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_read_only_sql_writer_rejects_ddl_and_insert() {
         let dir = tempfile::tempdir().unwrap();
@@ -843,6 +1158,8 @@ mod tests {
                 .await
                 .unwrap();
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let ro = StorageBackend::sqlite_read_only(&path).unwrap();
         let sql = ro.sql();
@@ -1009,6 +1326,8 @@ mod tests {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable.graph().unwrap();
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let ro = StorageBackend::sqlite_read_only(&path).unwrap();
         let store = match ro.graph() {
@@ -1051,6 +1370,8 @@ mod tests {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable.events().unwrap();
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let ro = StorageBackend::sqlite_read_only(&path).unwrap();
         let store = match ro.events() {
@@ -1086,6 +1407,8 @@ mod tests {
             let writable = StorageBackend::sqlite(&path).unwrap();
             writable.text("ro_test").unwrap();
         }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
 
         let ro = StorageBackend::sqlite_read_only(&path).unwrap();
         let store = match ro.text("ro_test") {

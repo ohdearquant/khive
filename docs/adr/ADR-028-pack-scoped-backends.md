@@ -591,3 +591,84 @@ let runtime     = if pack_cfg.backend != BackendId::MAIN {
 
 All other ADR-028 mechanics (TOML shape, 1:1 pack-to-backend assignment, schema collision
 detection, declaration-order application, cross-pack composition) are unchanged.
+
+## Amendment A2: Read-only backends are snapshot-inspection runtimes (2026-08-09)
+
+ADR-028 names `archive` as a read-only storage profile but did not define a
+write-free boot and request lifecycle. A runtime cannot claim read-only support
+if opening a store, registering a configured embedding model, applying pack
+schema, or appending the dispatch audit row still acquires the SQLite writer.
+
+The SQLite implementation therefore treats a read-only backend as an existing
+snapshot-inspection runtime. Read-only mode is selected either by an explicit
+backend option or, for normal single-backend boot, by detecting that an existing
+database file has no filesystem write bits. The pool opens every connection
+with SQLite read-only flags and additionally applies `query_only` to its writer
+slot.
+
+Boot and access obey these rules:
+
+1. The snapshot must already exist and its core migration ledger must be the
+   exact contiguous canonical sequence through this build's latest migration.
+   Matching only `MAX(version)` is insufficient: missing middle rows, foreign
+   versions, renamed rows, behind ledgers, and ahead ledgers all fail without
+   writes and with an actionable compatibility diagnostic. Validation checks
+   out a reader before any writer acquisition. A file-backed read-only pool
+   keeps at least one genuine read-only reader even when the snapshot uses a
+   rollback journal rather than WAL; `reader()` never aliases that inspection
+   onto the query-only writer slot. Persistent-WAL inspection also leaves the
+   source files and directory unchanged. A clean checkpointed main file with no
+   sidecars uses an encoded read-only `immutable=1` URI solely to prevent
+   SQLite from creating fresh `-wal`/`-shm`. If committed frames remain, the
+   frozen snapshot must include both `-wal` and a filesystem-read-only `-shm`;
+   ordinary read-only WAL semantics then preserve frame visibility. A
+   non-empty `-wal` without that index is rejected before open because
+   immutable SQLite would omit the committed frames, and a writable `-shm` is
+   rejected as potentially live. Rollback-journal databases never use
+   immutable mode and retain SQLite change detection.
+2. Boot does not register embedding models, apply pack-auxiliary schema, start a
+   writer task, checkpoint, or schedule a WAL sweep for that backend. Daemon
+   warm hooks remain per-pack-runtime aware: writer-bearing ANN warm and session
+   mirroring are suppressed on a read-only assigned backend, and warm phase
+   telemetry and lazy embedder-initialization telemetry perform no event append
+   there. The schedule ticker is admitted
+   only when the schedule pack's own assigned backend is writable; a read-only
+   main does not disable a schedule pack routed to a writable secondary, nor
+   does a writable main enable a read-only schedule secondary. Feature-enabled
+   email and Telegram tasks apply the same per-runtime rule in addition to the
+   daemon-role gate: inbound polling is admitted only when the runtime serving
+   `comm.ingest`/heartbeat/cursor verbs is writable, while outbound delivery is
+   admitted only when the runtime serving generic `list`/`update` can durably
+   claim and mark delivery. The two decisions remain independent in a mixed
+   topology, and neither adapter polls or sends before its decision passes.
+   Filesystem blob-store construction is gated by the runtime assigned to the
+   `blob` pack as well: a read-only blob runtime opens only an existing root,
+   never materializes the default directory, and rejects put/delete/sweep
+   mutators. A writable blob secondary beside a read-only main remains
+   writable, while a read-only blob secondary beside a writable main does not.
+3. Store acquisition does not run lazy DDL or repair DML. A requested optional
+   vector, sparse, or text-search table must already exist in the snapshot and
+   is checked through a reader connection, never the pool's query-only writer
+   slot. An ANN cache miss does not enqueue registration, rebuild, checkpoint,
+   or compaction work: memory recall uses its exact sqlite-vec reader fallback,
+   while knowledge search retains its FTS and load-only fresh-tail paths.
+4. Mutation semantics are unchanged: DDL and DML remain rejected by the SQLite
+   open flags and `query_only`, regardless of verb metadata.
+5. When the main audit backend is read-only, the registry deliberately omits the
+   `EventStore` instead of attempting a known-failing append. Every successful
+   non-help MCP operation carries an envelope-level advisory with stable code
+   `audit_persistence_skipped_read_only`; the verb-owned `result` is unchanged.
+   Error entries do not claim that an audit write was skipped.
+6. The effective main-backend mode is part of the warm-daemon engine identity,
+   and each declared backend's explicit `read_only` mode is part of the
+   topology fingerprint. A chmod-detected single-backend snapshot therefore
+   cannot forward through a daemon that retained a writable handle to the same
+   path. Multi-backend configurations must declare `read_only = true`
+   explicitly when a SQLite path has no write bits; boot rejects an undeclared
+   mode change instead of fingerprinting it as writable.
+
+This mode is for offline analysis of frozen snapshots. It provides neither a
+durable dispatch audit trail nor durable accounting and says so on every
+successful operation. Deployments that require ADR-103/ADR-133 audit durability
+must use a writable audit backend. These constraints preserve ADR-028's physical
+isolation and do not weaken any mutation path.

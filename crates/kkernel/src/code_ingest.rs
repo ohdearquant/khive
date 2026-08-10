@@ -509,11 +509,13 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
 /// ordinary WAL shared-memory maintenance on open, which creates or updates
 /// the `-shm` sidecar next to whatever path it is pointed at. Opening the
 /// target path directly would therefore still touch it. Instead, the
-/// database file (and its `-wal` sidecar, if one exists — an existing WAL
-/// file holds uncheckpointed rows that a plain copy of the main db file
-/// alone would miss) are copied into a scratch temp directory first, and
-/// the read-only checks run against that copy. No migrations run and no
-/// embedding models are registered, unlike `KhiveRuntime::new`.
+/// database file (and its `-wal`/`-shm` sidecars, if present — an existing
+/// WAL file holds uncheckpointed rows that a plain copy of the main db file
+/// alone would miss, and the read-only open requires the shared-memory
+/// index beside a non-empty WAL) are copied into a scratch temp directory
+/// and marked read-only, and the checks run against that frozen copy. No
+/// migrations run and no embedding models are registered, unlike
+/// `KhiveRuntime::new`.
 async fn dry_run_report(
     db_path: Option<&Path>,
     batch: &CodeIngestBatch,
@@ -605,6 +607,36 @@ fn open_read_only_snapshot(db_path: &Path) -> Result<(StorageBackend, tempfile::
         std::fs::copy(&wal_path, &snapshot_wal)
             .with_context(|| format!("failed to snapshot {} for dry-run", wal_path.display()))?;
     }
+    // The read-only open below refuses a non-empty WAL sidecar with no
+    // shared-memory index beside it (immutable mode would drop committed
+    // frames) and refuses a writable one (a live index is not a snapshot).
+    // Carry the `-shm` beside the WAL copy and mark both copies read-only:
+    // this private point-in-time copy is exactly the frozen snapshot form
+    // that open accepts. `fs::copy` preserves the source's (writable)
+    // permission bits, so the freeze is required, not decorative.
+    let shm_path = shm_sidecar_path(db_path);
+    if shm_path.exists() {
+        let snapshot_shm = shm_sidecar_path(&snapshot_db);
+        std::fs::copy(&shm_path, &snapshot_shm)
+            .with_context(|| format!("failed to snapshot {} for dry-run", shm_path.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for sidecar in [
+            wal_sidecar_path(&snapshot_db),
+            shm_sidecar_path(&snapshot_db),
+        ] {
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .with_context(|| format!("stat snapshot sidecar {}", sidecar.display()))?
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions)
+                    .with_context(|| format!("freeze snapshot sidecar {}", sidecar.display()))?;
+            }
+        }
+    }
 
     let backend =
         StorageBackend::sqlite_read_only(&snapshot_db).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -615,6 +647,14 @@ fn open_read_only_snapshot(db_path: &Path) -> Result<(StorageBackend, tempfile::
 fn wal_sidecar_path(db_path: &Path) -> PathBuf {
     let mut name = db_path.as_os_str().to_owned();
     name.push("-wal");
+    PathBuf::from(name)
+}
+
+/// The `-shm` shared-memory index path SQLite uses alongside a WAL-mode
+/// database file.
+fn shm_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push("-shm");
     PathBuf::from(name)
 }
 
