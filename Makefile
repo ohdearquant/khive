@@ -13,8 +13,19 @@ FLEET_ARTIFACT ?=
 override FLEET_ARTIFACT_VALUE := $(value FLEET_ARTIFACT)
 unexport FLEET_ARTIFACT
 export FLEET_ARTIFACT_VALUE
+# FULL_PACKS is `:=` above but a caller can still override it on the command
+# line (`make FULL_PACKS=...`) — plain `:=` loses to command-line assignments.
+# Apply the same literal-capture-then-environment pattern as FLEET_ARTIFACT so
+# recipes never splice the raw value into a shell command line (Make performs
+# no shell escaping on `$(FULL_PACKS)`, so a value containing `"` or `;` would
+# otherwise break out of the quoted argument and run as shell code), and gate
+# every consumer on `validate-full-packs` so a hostile value is rejected
+# before it reaches a shell at all.
+override FULL_PACKS_VALUE := $(value FULL_PACKS)
+unexport FULL_PACKS
+export FULL_PACKS_VALUE
 
-.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-full-packs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
 
 check:
 	cd crates && cargo check --workspace
@@ -48,10 +59,21 @@ build-local:
 		--features channel-email,channel-telegram \
 		--receipt "$(LOCAL_BUILD_RECEIPT)"
 
-verify-local-artifact: build-local
+# Reject a FULL_PACKS value (from the Makefile default or a caller override)
+# that contains anything outside the allowlisted pack-list character class.
+# Every recipe below reads the sanitized value from FULL_PACKS_VALUE via the
+# shell environment, never via a raw `$(FULL_PACKS)` splice, so this gate is
+# what stands between a hostile override and a shell.
+validate-full-packs:
+	@case "$$FULL_PACKS_VALUE" in \
+		"") echo "==> ERROR: FULL_PACKS is empty" >&2; exit 1 ;; \
+		*[!A-Za-z0-9_,-]*) echo "==> ERROR: FULL_PACKS contains characters outside the allowed [A-Za-z0-9_,-] set: $$FULL_PACKS_VALUE" >&2; exit 1 ;; \
+	esac
+
+verify-local-artifact: validate-full-packs build-local
 	@python3 scripts/verify_local_artifact.py \
 		--build-receipt "$(LOCAL_BUILD_RECEIPT)" \
-		--packs "$(FULL_PACKS)" \
+		--packs "$$FULL_PACKS_VALUE" \
 		--min-verbs "$(LOCAL_VERB_FLOOR)" \
 		--stamp "$(LOCAL_VERIFY_STAMP)"
 
@@ -64,16 +86,16 @@ fleet-build: verify-local-artifact
 # exact Cargo artifact named by the current build receipt. Set FLEET_ARTIFACT to
 # check any executable directly, including the installed kkernel binary:
 #   make fleet-check FLEET_ARTIFACT="$HOME/.cargo/bin/kkernel"
-fleet-check:
+fleet-check: validate-full-packs
 	@if [ -n "$$FLEET_ARTIFACT_VALUE" ]; then \
 		python3 scripts/verify_local_artifact.py \
 			--artifact "$$FLEET_ARTIFACT_VALUE" \
-			--packs "$(FULL_PACKS)" \
+			--packs "$$FULL_PACKS_VALUE" \
 			--min-verbs "$(LOCAL_VERB_FLOOR)"; \
 	else \
 		python3 scripts/verify_local_artifact.py \
 			--build-receipt "$(LOCAL_BUILD_RECEIPT)" \
-			--packs "$(FULL_PACKS)" \
+			--packs "$$FULL_PACKS_VALUE" \
 			--min-verbs "$(LOCAL_VERB_FLOOR)"; \
 	fi
 
@@ -148,7 +170,7 @@ local: verify-local-artifact
 	echo "==> Re-verifying the SIGNED artifact (codesign rewrites the file, so the pre-sign verification does not cover the bytes that get installed)..."; \
 	if ! python3 scripts/verify_local_artifact.py \
 	  --artifact "$$DEST.new" \
-	  --packs "$(FULL_PACKS)" \
+	  --packs "$$FULL_PACKS_VALUE" \
 	  --min-verbs "$(LOCAL_VERB_FLOOR)" >/dev/null; then \
 	  echo "==> ERROR: signed artifact failed verification — refusing to install"; \
 	  rm -f "$$DEST.new"; \
