@@ -8625,11 +8625,19 @@ mod tests {
             .await
             .unwrap();
         let annotator = rt
-            .create_entity(&tok, "concept", None, "Annotator", None, None, vec![])
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "annotator note",
+                None,
+                None,
+                vec![],
+            )
             .await
             .unwrap();
         let nested_annotator = rt
-            .create_entity(&tok, "concept", None, "Nested", None, None, vec![])
+            .create_note(&tok, "observation", None, "nested note", None, None, vec![])
             .await
             .unwrap();
         rt.link(&tok, into.id, shared.id, EdgeRelation::Extends, 0.9, None)
