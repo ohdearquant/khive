@@ -79,6 +79,13 @@ the subject is new and needs no second delete. Cross-identity repair therefore
 retains the original delete-then-upsert log order. Every statement shares the
 caller's transaction/savepoint, so all of them commit or roll back together.
 
+The public `insert_exact_only` seam passes `record_ann_delta=false` for vector
+identities whose contract permanently excludes an approximate-index consumer.
+That path still performs the same atomic replacement and metadata repair, but
+deletes a mismatched prior row directly and emits neither delete nor upsert
+rows into `ann_write_log`. Ordinary `insert`, `update`, and `insert_batch`
+always pass `true`; their restart-classification behavior is unchanged.
+
 `failpoint_flag`, when `Some` in a `cfg(test)` build, is checked between the
 DELETE and the INSERT so tests can force an error at that exact point and
 assert the caller's rollback restores the prior row (no-worse-than-stale
