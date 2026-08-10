@@ -45,15 +45,39 @@ process-wide `EVICTION_LOCK`), and that pass defers — rather than blocks on
 — any candidate whose per-slot lock is currently held. See `slot_lock` and
 `evict_lru` below.
 
-Every cache mutation opens the root through `prepare_cache_root`, which
-reclaims crash residue named by the exact canonical `.staging-<uuid>` shape
-once its directory mtime is more than 24 hours old. This is deliberately
-separate from LRU accounting: a staging clone has not yet earned an ownership
-marker or addressable cache key. The exact-name, direct-child, real-directory,
-and age checks leave files, symlinks, nested paths, prefix lookalikes, and
-fresh clones untouched. The age fence lets separate daemon processes clone
-different repositories concurrently without one deleting another process's
-ordinary in-flight staging directory.
+### Private staging namespace and liveness-based reaping
+
+Fresh clones never stage directly in `root` (which may be shared, or
+`KHIVE_GIT_DIGEST_SCRATCH_ROOT`-overridden to a broader or pre-existing
+directory). They stage under `<root>/.khive-git-staging/`, a subdirectory
+this cache owns outright — a staging entry's canonical-UUID shape can never
+collide with unrelated operator data sitting in a shared root, closing the
+class of bug where a broad scratch-root override made shape-matching alone
+an unsafe ownership test.
+
+Each staging entry (`<namespace>/<uuid>/`, containing a `.khive-staging.lock`
+file and a `repo/` clone destination) holds an exclusive advisory lock
+(`std::fs::File::try_lock` — `flock` on unix, `LockFileEx` on Windows,
+portable stable API since Rust 1.89) on that lock file for the entire span
+of `install_fresh_clone`. Reaping is a liveness check, not an age check:
+`reap_stale_staging` tries to acquire the same lock with `try_lock`. If it
+succeeds, nothing holds it — the owning process is gone (including a
+`SIGKILL`, which the kernel releases the lock for automatically) — and the
+entry is abandoned. If it would block, a live process holds it, and the
+entry survives no matter how old it looks; there is no documented wall-clock
+bound on a digest pass, so age alone was never a sound staleness signal for
+an active clone. A missing lock file (the brief mkdir-then-open-lock gap at
+the very start of `install_fresh_clone`, or residue from before this design)
+falls back to the old age-only check (`STALE_STAGING_AGE`, 24h) as a narrow
+belt-and-suspenders case — this cannot false-positive against a live clone,
+since a live clone writes its lock file within microseconds of creating its
+staging directory, well before `git clone` itself starts.
+
+`prepare_cache_root` runs this sweep before every public cache mutation, but
+throttled to at most once per `REAP_THROTTLE_INTERVAL` (5 minutes, tracked
+by a `.khive-last-swept` marker file's mtime) rather than on every single
+mutation — once the namespace is clean, a full scan+liveness pass on every
+`ensure_clone` call is unbounded latency for no benefit.
 
 ## `CacheError::UnsafeToReplace`
 
@@ -146,39 +170,81 @@ caps is covered under `evict_lru` below.
 ## `install_fresh_clone`
 
 Shared staging-clone-then-move path for both a first-time `ensure_clone`
-and a `reclone` repair: clones into a private staging directory outside the
-cache root, measures it against the per-clone cap, writes the
-`.khive-last-used` ownership marker into the staging directory itself, and
-only then moves it into the addressable `<root>/<cache_key>/` slot — an
-oversized clone never enters the cache slot, and because the marker is
-written before the atomic rename, a process interruption between clone and
-rename can never leave a live, markerless slot at the cache-key path (issue
-#765).
+and a `reclone` repair: creates a per-call wrapper directory under the
+private staging namespace, opens and `try_lock`s its `.khive-staging.lock`
+file (held for this whole function — see "Private staging namespace and
+liveness-based reaping" above), clones into `<wrapper>/repo`, measures it
+against the per-clone cap, writes the `.khive-last-used` ownership marker
+into it, and only then moves it into the addressable `<root>/<cache_key>/`
+slot — an oversized clone never enters the cache slot, and because the
+marker is written before the atomic rename, a process interruption between
+clone and rename can never leave a live, markerless slot at the cache-key
+path (issue #765). The wrapper (lock file included) is removed on both the
+success and every failure path.
 
 A kill can still interrupt the process before any Rust cleanup guard runs and
-leave the unaddressable staging directory behind. `prepare_cache_root` /
-`reap_stale_staging` are the cross-process recovery boundary for that case:
-the next cache operation removes exact staging directories only after the
-24-hour freshness fence has elapsed.
+leave the wrapper directory behind. `prepare_cache_root` / `reap_stale_staging`
+are the cross-process recovery boundary for that case: the kernel releases
+the wrapper's lock the instant the process dies, and the next sweep reaps it
+regardless of age.
 
-## `prepare_cache_root` / `reap_stale_staging`
+## `prepare_cache_root` / `reap_stale_staging` / `staging_liveness`
 
-Creates the scratch root when needed, then enumerates only its direct
-children. A deletion candidate must be a real directory whose name is exactly
-`.staging-` plus the lowercase canonical hyphenated spelling of a UUID, and
-its mtime must be strictly older than 24 hours. Future-dated entries are
-conservatively retained. Removal uses the same bounded retry helper as owned
-cache eviction and tolerates another process winning the same cleanup race;
-other I/O failures surface instead of silently leaving disk growth
-unobservable.
+`prepare_cache_root` creates the scratch root and the private staging
+namespace, then runs `reap_stale_staging` at most once per
+`REAP_THROTTLE_INTERVAL` (see above). `reap_stale_staging` enumerates only
+the namespace's direct children. A deletion candidate must be a real
+directory (never a symlink, file, or nested path) whose name is exactly the
+lowercase canonical hyphenated spelling of a UUID; its liveness is then
+decided by `staging_liveness` — `try_lock`-acquirable (or missing its lock
+file _and_ older than the 24h age fallback) means abandoned, anything else
+means live and untouched regardless of age. Removal uses the same bounded
+retry helper as owned cache eviction and tolerates another process winning
+the same cleanup race; other I/O failures surface instead of silently
+leaving disk growth unobservable.
 
-## `remove_owned_entry`
+## `remove_owned_entry` / `delete_verified_owned_entry`
 
-Removes `repo_dir` only when it is a direct child of `root` AND passes
-`is_owned_entry` — refuses (`CacheError::UnsafeToReplace`) rather than
-deleting anything else, including a not-yet-existing or foreign-shaped
-path. A slot that does not currently exist is not an error: there is
-simply nothing to remove before installing a fresh clone.
+`remove_owned_entry` removes `repo_dir` only when it is a direct child of
+`root` AND passes `is_owned_entry` — refuses (`CacheError::UnsafeToReplace`)
+rather than deleting anything else, including a not-yet-existing or
+foreign-shaped path. A slot that does not currently exist is not an error:
+there is simply nothing to remove before installing a fresh clone.
+
+The actual deletion is `delete_verified_owned_entry`. Unlike a staging
+wrapper (isolated in a namespace nothing else writes to), an owned cache
+slot necessarily lives in the shared, possibly-overridden root — so a
+pathname-based check-then-`remove_dir_all` leaves a TOCTOU window an
+external writer could race for as long as the recursive delete takes
+(potentially seconds against a large git tree). On unix,
+`delete_verified_owned_entry` instead: opens `root`, then `openat`s `name`
+with `O_DIRECTORY | O_NOFOLLOW` (refusing a symlink or non-directory
+outright); re-verifies ownership (`.git` entry present, `.khive-last-used`
+a regular file) against that fd, not a fresh pathname walk; `fstat`s it to
+capture `(dev, ino)`; moves it into the private staging namespace with one
+fd-relative `renameat` call; and confirms the entry that landed under the
+new name has the identical `(dev, ino)` before running the (possibly slow)
+recursive delete on it. This shrinks the external-writer race window from
+"however long the delete takes" down to the handful of syscalls between the
+`openat` and the `renameat` — POSIX has no primitive to rename "the exact
+inode this fd points to" without a name lookup, so this is race-_resistant_
+rather than race-proof, matching the residual-risk shape of every `rm -rf`
+implementation's final directory-removal step. Non-unix targets (Windows CI
+exists for this workspace) keep the prior pathname-based
+`remove_dir_all_retrying` behavior — no fd-relative directory API is stable
+there yet.
+
+## `unix_fd` / `is_owned_entry_via_fd`
+
+`unix_fd` is a small private module of `openat`/`fstatat`/`fstat`/`renameat`
+wrappers bound to an already-opened directory descriptor, mirroring the
+`O_NOFOLLOW`/`fstat` idiom already used by `khive-db`'s WAL-pin sidecar
+(`crates/khive-db/src/walpin.rs`) and `khive-vamana`'s external-id sidecar
+(`crates/khive-vamana/src/external_ids.rs`): every operation after the
+initial `open`/`openat` is relative to a handle the kernel resolved once,
+immune to the original pathname being swapped out from under it afterward.
+`is_owned_entry_via_fd` is `is_owned_entry`'s fd-relative mirror, used by
+`delete_verified_owned_entry` right before it acts.
 
 ## `remove_dir_all_retrying`
 
@@ -341,15 +407,32 @@ sync `#[test]`s).
 ## Test module notes
 
 - `ensure_clone_cleans_up_staging_dir_on_clone_failure`: a `git clone`
-  failure must not leave a `.staging-<uuid>` directory behind — `evict_lru`
-  deliberately never touches non-owned names, so a leaked staging dir
-  would otherwise accumulate forever across repeated failures.
-- `stale_staging_sweep_removes_a_direct_canonical_uuid_directory`: advances
-  the deterministic observation clock past the age fence and proves killed-
-  clone-shaped residue is deleted.
-- `staging_sweep_preserves_fresh_foreign_nested_and_nondirectory_entries`:
-  pins the containment and freshness boundary so a broad prefix match cannot
-  delete an in-flight clone or unrelated operator data.
+  failure must not leave a staging wrapper behind under the private
+  namespace — `evict_lru` deliberately never touches non-owned names, so a
+  leaked staging dir would otherwise accumulate forever across repeated
+  failures.
+- `stale_staging_sweep_removes_an_abandoned_wrapper_lacking_a_lock_file_once_old`:
+  the age-fallback path for a wrapper that crashed before writing its own
+  lock file.
+- `stale_staging_sweep_preserves_a_wrapper_whose_lock_is_still_held_past_the_age_fence`:
+  the blocking-finding acceptance test — a wrapper whose lock a live handle
+  still holds must survive the sweep a full year past the old 24h age
+  fence, proving liveness (not age) is the deletion criterion.
+- `stale_staging_sweep_removes_an_abandoned_wrapper_even_when_fresh`: the
+  flip side — an abandoned wrapper (lock file present, nothing holds it) is
+  reclaimed even when it was created moments ago.
+- `staging_sweep_preserves_foreign_nested_and_nondirectory_entries_even_when_stale`:
+  pins the containment/name/type boundary with every fixture entry driven
+  stale by a far-future `now`, so only those checks (never freshness) can
+  save them — regression coverage for a prior version of this fixture that
+  dated preserved entries in the future, so they never reached those checks
+  at all.
+- `remove_owned_entry_deletes_a_genuinely_owned_slot` /
+  `remove_owned_entry_refuses_a_symlink_planted_at_the_cache_key_path_after_the_check`:
+  the fd-verified deletion path (`delete_verified_owned_entry`) still
+  deletes a genuinely owned slot, and independently refuses a symlink at
+  the cache-key path even if some future caller skipped the earlier
+  pathname-based `is_owned_entry` gate.
 - `dir_size_errors_when_the_root_itself_is_missing` (PR #847): the walk
   root vanishing must surface as an error, never a laundered `Ok(0)` —
   distinct from a descendant vanishing beneath a still-existing root.

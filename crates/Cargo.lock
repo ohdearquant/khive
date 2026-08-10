@@ -2160,6 +2160,7 @@ dependencies = [
  "khive-storage",
  "khive-types",
  "lattice-embed",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
