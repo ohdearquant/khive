@@ -609,10 +609,10 @@ fn sweep_blob_files(
 /// so a root-only lock is insufficient: two differently configured roots for
 /// one database must not recover each other's live claims. File-backed pools
 /// additionally take [`acquire_database_gc_lock`] for cross-process exclusion.
-fn database_sweep_locks() -> &'static StdMutex<HashMap<Option<PathBuf>, Arc<tokio::sync::Mutex<()>>>>
-{
-    static REGISTRY: OnceLock<StdMutex<HashMap<Option<PathBuf>, Arc<tokio::sync::Mutex<()>>>>> =
-        OnceLock::new();
+type SweepLockMap = HashMap<Option<PathBuf>, Arc<tokio::sync::Mutex<()>>>;
+
+fn database_sweep_locks() -> &'static StdMutex<SweepLockMap> {
+    static REGISTRY: OnceLock<StdMutex<SweepLockMap>> = OnceLock::new();
     REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -2232,8 +2232,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transactional_orphan_sweep_protects_a_freshly_published_blob_before_its_reference_commits(
-    ) {
+    async fn transactional_orphan_sweep_protects_a_freshly_published_blob_before_its_reference_commits()
+     {
         // The exact two-step client protocol hazard: `put` completes and
         // releases its write lock (step 1) while the entity write that will
         // *later* commit a `content_ref` to this blob (step 2) has not
