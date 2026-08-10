@@ -174,13 +174,31 @@ fn canonicalize_https_url(url: &str) -> String {
 /// path decorations that do not identify a repository (`/` and `.git`)
 /// removed. The order matters for spellings such as `.git?token=...` and
 /// `.git/?view=...`, whose suffix is not visible until the query is gone.
+/// Finally the host is lowercased (DNS is case-insensitive, so
+/// `https://Example.com/repo` and `https://example.com/repo` are the same
+/// remote) -- the path is left untouched because owner/repo segments are
+/// case-sensitive on the host and folding them risks collapsing two
+/// genuinely distinct repositories onto one anchor.
 pub(crate) fn canonical_remote_identity(url: &str) -> String {
     let redacted = redact_repo_url(url);
     let without_slash = redacted.trim_end_matches('/');
-    without_slash
-        .strip_suffix(".git")
-        .unwrap_or(without_slash)
-        .to_string()
+    let without_git_suffix = without_slash.strip_suffix(".git").unwrap_or(without_slash);
+    lowercase_host_component(without_git_suffix)
+}
+
+/// Lowercase only the host component of a `scheme://host/path` string,
+/// leaving the scheme and path untouched. `parse_source` accepts only
+/// `https://` remotes, so `value` is always scheme-prefixed here; a value
+/// without a recognized scheme is returned unchanged.
+fn lowercase_host_component(value: &str) -> String {
+    for scheme in ["https://", "http://", "git://", "ssh://"] {
+        if let Some(rest) = value.strip_prefix(scheme) {
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(authority_end);
+            return format!("{scheme}{}{path}", authority.to_ascii_lowercase());
+        }
+    }
+    value.to_string()
 }
 
 /// Derive a credential-free `(owner, repo)` from a canonicalized
@@ -820,6 +838,32 @@ mod tests {
         assert!(
             canonical.contains("tok3n") && canonical.contains("SECRET"),
             "identity redaction must not mutate the in-memory clone URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_identity_unsluggable_remote_fallback_lowercases_host_only() {
+        let mixed_case_host = parse_source("https://Example.COM/Repo")
+            .expect("accepted mixed-case-host unsluggable HTTPS source");
+        let lowercase_host = parse_source("https://example.com/Repo")
+            .expect("accepted lowercase-host unsluggable HTTPS source");
+        let mixed_identity = repo_identity(&mixed_case_host).await;
+        assert_eq!(
+            mixed_identity,
+            repo_identity(&lowercase_host).await,
+            "mixed-case and lowercase host spellings of the same remote must converge"
+        );
+        assert_eq!(
+            mixed_identity, "https://example.com/Repo",
+            "host must be lowercased while path case is preserved"
+        );
+
+        let different_path = parse_source("https://example.com/OtherRepo")
+            .expect("accepted lowercase-host unsluggable HTTPS source with a different path");
+        assert_ne!(
+            repo_identity(&different_path).await,
+            mixed_identity,
+            "differing paths must not collapse onto the same anchor"
         );
     }
 
