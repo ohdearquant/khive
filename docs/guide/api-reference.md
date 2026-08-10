@@ -48,6 +48,10 @@ three schedule verbs remain available without `comm`.
 manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
 `findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
 path, not the MCP verb surface.
+That admin path is history-preserving: a deterministic entity, finding-note,
+or annotation-edge ID is skipped even when its row is soft-deleted, so neither
+real re-ingest nor `--dry-run` treats a tombstone as a new record or resurrects
+it.
 
 `blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
 `blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
