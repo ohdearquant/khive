@@ -361,7 +361,7 @@ fn require_blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, Runt
     })
 }
 
-async fn read_bounded_source_blob(
+pub(crate) async fn read_bounded_source_blob(
     blob_store: &dyn BlobStore,
     content_ref: &ContentRef,
 ) -> Result<Vec<u8>, RuntimeError> {

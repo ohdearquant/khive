@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use uuid::{Uuid, Version};
 
 use khive_runtime::{actor_is_unattributed, KhiveRuntime, NamespaceToken, RuntimeError};
@@ -40,27 +40,41 @@ static MODEL_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 const TRAIN_CONCURRENCY: usize = 1;
 static TRAIN_GATE: Semaphore = Semaphore::const_new(TRAIN_CONCURRENCY);
 
+/// Admission control for training, taken BEFORE the judgment snapshot is
+/// loaded. `try_acquire` (not `acquire().await`) keeps the gate's wait queue
+/// empty by construction: a refused caller holds no snapshot and no queued
+/// future, so concurrent callers cannot each retain up to
+/// `MAX_TRAINING_EVENTS` records while waiting on the one running fit.
+pub(crate) fn acquire_train_permit() -> Result<SemaphorePermit<'static>, RuntimeError> {
+    TRAIN_GATE.try_acquire().map_err(|_| {
+        RuntimeError::InvalidInput(
+            "moodboard.train_preference: another training run is in progress; retry after it completes"
+                .to_string(),
+        )
+    })
+}
+
 /// Full-batch preference fitting is CPU-bound for up to `MAX_TRAINING_EVENTS`
 /// events; running it inline on the async executor lets concurrent attributed
-/// callers monopolize worker threads. The permit is held across the
+/// callers monopolize worker threads. The caller obtains `permit` from
+/// [`acquire_train_permit`] before loading its snapshot; it is held across the
 /// `spawn_blocking` join so at most `TRAIN_CONCURRENCY` fits run at once, and
 /// the fit itself runs on the blocking-worker pool.
 pub(crate) async fn fit_preference_bounded(
+    permit: SemaphorePermit<'static>,
     records: Vec<(i64, JudgmentRecord)>,
     scope: PreferenceScope,
 ) -> Result<TrainedModel, RuntimeError> {
-    let _permit = TRAIN_GATE
-        .acquire()
-        .await
-        .map_err(|_| RuntimeError::Internal("moodboard training semaphore closed".to_string()))?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let data = prepare_training_data(&records, &scope)?;
         train_model(&data, scope)
     })
     .await
     .map_err(|error| {
         RuntimeError::Internal(format!("joining moodboard training worker: {error}"))
-    })?
+    })?;
+    drop(permit);
+    result
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,8 +362,11 @@ pub(crate) async fn handle_train_preference(
     )?;
     validate_board(&core, token, board_entity_id, &input.board_id).await?;
     let scope = scope_from_input(token, board_entity_id, input.board_id, &input.descriptor);
+    // Admission precedes the snapshot load so a refused caller never
+    // materializes the up-to-MAX_TRAINING_EVENTS record vector.
+    let train_permit = acquire_train_permit()?;
     let records = load_judgment_snapshot(&core, token).await?;
-    let mut trained = fit_preference_bounded(records, scope.clone()).await?;
+    let mut trained = fit_preference_bounded(train_permit, records, scope.clone()).await?;
 
     let blob_store = require_blob_store(&core)?;
     let network_content_ref = blob_store.put(trained.network_bytes.clone()).await?;
@@ -694,11 +711,17 @@ async fn validate_asset(
         )));
     }
     let blob_store = require_blob_store(runtime)?;
-    if !blob_store.exists(expected_ref).await? {
-        return Err(RuntimeError::InvalidInput(format!(
-            "moodboard asset {asset_id} references a missing BlobStore object"
-        )));
-    }
+    // ADR-149: corrupt candidate bytes fail closed. Existence alone would admit
+    // a corrupted object stored under a valid ref, so the bytes are read within
+    // the source-blob bound and BLAKE3-verified before any inference sees them.
+    crate::handlers::read_bounded_source_blob(blob_store.as_ref(), expected_ref)
+        .await
+        .map_err(|error| match error {
+            RuntimeError::NotFound(_) => RuntimeError::InvalidInput(format!(
+                "moodboard asset {asset_id} references a missing BlobStore object"
+            )),
+            other => other,
+        })?;
     Ok(entity)
 }
 
@@ -1559,32 +1582,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_bounded_trainings_all_complete_and_release_the_gate() {
+    async fn train_admission_refuses_concurrent_callers_and_releases_the_gate() {
         assert_eq!(
             TRAIN_GATE.available_permits(),
             TRAIN_CONCURRENCY,
             "training gate must start at its declared bound"
         );
-        let tasks: Vec<_> = (0..3)
-            .map(|_| {
-                tokio::spawn(async {
-                    fit_preference_bounded(
-                        crate::preference::tests::sufficient_records(false),
-                        crate::preference::tests::fixture_scope(),
-                    )
-                    .await
-                })
-            })
-            .collect();
-        for task in tasks {
-            task.await
-                .expect("join bounded training task")
-                .expect("bounded training must succeed under concurrency");
-        }
+        let permit = acquire_train_permit().expect("first caller must be admitted");
+        let refused = acquire_train_permit()
+            .expect_err("a second caller must be refused while a fit is admitted");
+        assert!(
+            refused
+                .to_string()
+                .contains("another training run is in progress"),
+            "refusal must name the running fit: {refused}"
+        );
+        fit_preference_bounded(
+            permit,
+            crate::preference::tests::sufficient_records(false),
+            crate::preference::tests::fixture_scope(),
+        )
+        .await
+        .expect("admitted training must succeed");
         assert_eq!(
             TRAIN_GATE.available_permits(),
             TRAIN_CONCURRENCY,
-            "every training must return its permit"
+            "the completed fit must return its permit"
+        );
+        drop(acquire_train_permit().expect("gate must re-admit after release"));
+        assert_eq!(
+            TRAIN_GATE.available_permits(),
+            TRAIN_CONCURRENCY,
+            "a dropped permit must return to the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_asset_rejects_corrupted_blob_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.db");
+        let blob_root = temp.path().join("blobs");
+        let runtime = persistent_runtime(&db_path, "alice");
+        let blob_store = Arc::new(FsBlobStore::new(blob_root.clone(), 0).unwrap());
+        runtime.install_blob_store(blob_store.clone());
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let content_ref = blob_store
+            .put(b"moodboard candidate raster bytes".to_vec())
+            .await
+            .unwrap();
+        let asset = runtime
+            .create_entity_with_content_ref(
+                &token,
+                "artifact",
+                Some("visual_asset"),
+                "corrupt-candidate-fixture",
+                None,
+                None,
+                vec![],
+                &content_ref,
+            )
+            .await
+            .unwrap();
+        validate_asset(&runtime, &token, asset.id, &content_ref)
+            .await
+            .expect("intact candidate bytes must validate");
+        let hex = content_ref.as_str();
+        let object_path = blob_root.join(&hex[0..2]).join(&hex[2..4]).join(hex);
+        std::fs::write(&object_path, b"corrupted candidate bytes").unwrap();
+        let error = validate_asset(&runtime, &token, asset.id, &content_ref)
+            .await
+            .expect_err("corrupted candidate bytes must fail closed before inference");
+        assert!(
+            error.to_string().contains("BLAKE3"),
+            "corruption must surface as digest verification failure: {error}"
         );
     }
 
