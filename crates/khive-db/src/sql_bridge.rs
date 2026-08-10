@@ -326,7 +326,15 @@ fn cached_read_transaction_control(sql: &str) -> Option<CachedReadTransactionCon
             // in that trailing position — `BEGIN TRANSACTION IMMEDIATE` —
             // still parses, and classifying it by its first token alone would
             // launder what reads as a write-reserving start into a deferred
-            // one. Every trailing token is therefore Unsupported.
+            // one. Every trailing token is therefore Unsupported — and the
+            // check cannot stop at `next_sqlite_token` returning `None`,
+            // because that tokenizer returns `None` for any non-identifier
+            // byte, not only end-of-input: a quoted or bracketed tail
+            // (`BEGIN TRANSACTION "IMMEDIATE"`, `[IMMEDIATE]`) would fall
+            // out of the loop and read as the end of an accepted form. After
+            // the accepted keywords, the remainder must reduce to nothing
+            // under the same trivia/empty-statement skipping SQLite applies
+            // (whitespace, comments, `;`), or the statement is Unsupported.
             let mut rest = tail;
             let mut saw_deferred = false;
             let mut saw_transaction = false;
@@ -339,6 +347,9 @@ fn cached_read_transaction_control(sql: &str) -> Option<CachedReadTransactionCon
                     return Some(CachedReadTransactionControl::Unsupported(keyword));
                 }
                 rest = next;
+            }
+            if !skip_sqlite_empty_prefix(rest).is_empty() {
+                return Some(CachedReadTransactionControl::Unsupported(keyword));
             }
             Some(CachedReadTransactionControl::BeginDeferred)
         }
@@ -2750,6 +2761,16 @@ mod tests {
             ("BEGIN TRANSACTION IMMEDIATE", "BEGIN"),
             ("BEGIN TRANSACTION EXCLUSIVE", "BEGIN"),
             ("BEGIN DEFERRED TRANSACTION trailing", "BEGIN"),
+            // Quoted/bracketed tails tokenize as no identifier at all, so a
+            // classifier that stops at the tokenizer's `None` reads them as
+            // an accepted form's end. They must be refused exactly like the
+            // bare-word spellings.
+            ("BEGIN TRANSACTION \"IMMEDIATE\"", "BEGIN"),
+            ("BEGIN TRANSACTION [IMMEDIATE]", "BEGIN"),
+            ("BEGIN TRANSACTION `IMMEDIATE`", "BEGIN"),
+            ("BEGIN TRANSACTION 'IMMEDIATE'", "BEGIN"),
+            ("BEGIN \"DEFERRED\"", "BEGIN"),
+            ("BEGIN; COMMIT", "BEGIN"),
             ("START TRANSACTION", "START"),
             ("COMMIT", "COMMIT"),
         ] {
@@ -3965,6 +3986,22 @@ mod tests {
                 Some(Unsupported("BEGIN")),
             ),
             ("BEGIN DEFERRED DEFERRED", Some(Unsupported("BEGIN"))),
+            // Non-identifier tails: the tokenizer yields no token for a
+            // quoted, bracketed, or backticked tail, which must read as a
+            // refused remainder, never as end-of-statement.
+            (
+                "BEGIN TRANSACTION \"IMMEDIATE\"",
+                Some(Unsupported("BEGIN")),
+            ),
+            ("BEGIN TRANSACTION [IMMEDIATE]", Some(Unsupported("BEGIN"))),
+            ("BEGIN TRANSACTION `IMMEDIATE`", Some(Unsupported("BEGIN"))),
+            ("BEGIN TRANSACTION 'IMMEDIATE'", Some(Unsupported("BEGIN"))),
+            ("BEGIN \"DEFERRED\"", Some(Unsupported("BEGIN"))),
+            ("BEGIN; COMMIT", Some(Unsupported("BEGIN"))),
+            // Trailing empty statements and trivia remain an accepted end.
+            ("BEGIN;", Some(BeginDeferred)),
+            ("BEGIN DEFERRED ; -- done", Some(BeginDeferred)),
+            ("BEGIN TRANSACTION /* t */ ;;", Some(BeginDeferred)),
             ("START TRANSACTION", Some(Unsupported("START"))),
             ("COMMIT", Some(Finish("COMMIT"))),
             ("END TRANSACTION", Some(Finish("END"))),
