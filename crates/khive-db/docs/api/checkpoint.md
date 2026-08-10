@@ -134,7 +134,8 @@ await with no further calls."
 ## Metrics read-surface (load/perf harness)
 
 See `crates/khive-db/src/checkpoint.rs` — the module-scoped `AtomicU64`
-statics (`LAST_WAL_PAGES`, `TRUNCATE_ATTEMPTS`, etc.) and their accessors.
+compatibility counters (`LAST_WAL_PAGES`, `TRUNCATE_ATTEMPTS`, etc.) plus the
+backend-keyed `RoutineWalObservation` registry.
 
 Mirrors the fallback-counter pattern in `khive-mcp/src/daemon.rs`
 (`FALLBACK_*` statics + their `pub(crate)` accessors): the checkpoint task is
@@ -151,6 +152,16 @@ Issue #1838 adds the pressure-episode and lifecycle-sink counters exposed by
 primary-store append attempts/failures, and bounded-handoff drops. These are
 process-lifetime aggregates across checkpoint tasks. They preserve per-attempt
 operator evidence without writing one event row per attempt into a pinned WAL.
+
+Each periodic tick issues exactly one routine `PRAGMA wal_checkpoint(PASSIVE)`
+and retains that row's `busy`, `log`, and `checkpointed` values. Logical
+backlog is `max(log - checkpointed, 0)`. The same tick stats the backend's
+physical `-wal` sidecar and records its byte allocation independently. This
+matters because PASSIVE can drain every logical frame while SQLite retains the
+sidecar's high-water allocation for reuse. `routine_wal_observation(pool)` is
+a pure backend-scoped memory read: a metrics scrape performs neither another
+checkpoint nor another filesystem stat, and a secondary backend cannot win a
+process-global race and masquerade as the main backend's sample (#1849).
 
 ## `run_checkpoint_task` — shutdown design history
 

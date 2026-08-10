@@ -529,3 +529,21 @@ there is no local retry that could duplicate a message.
    the actor; for hosted tenants it may need explicit per-connection scoping. Whether it must be
    threaded on the frame or derived Gate-side from the connection principal is **deferred to the
    future Gate-binding ADR** (§Acceptance conditions), since it only bites at the hosted bar.
+
+---
+
+## Amendment 4: read-only storage mode is engine coherence (2026-08-09)
+
+The engine-coherence definition above includes the effective access mode of the
+main SQLite backend and every declared backend's explicit `read_only` mode. A
+database path alone is insufficient: a daemon that opened the file while it was
+writable may retain a write-capable handle after the file is chmod-read-only,
+and it cannot truthfully serve the snapshot-inspection contract or its audit
+persistence advisory.
+
+Writable fingerprints remain byte-identical. A read-only main runtime adds its
+effective mode to the existing `backend` component, so structured mismatch
+diagnostics continue to report `backend`; declared per-backend modes live in the
+existing topology component. A mismatch remains a hard reject before verb
+dispatch and follows the ordinary local fallback path. Identity-derived frame
+fields remain excluded exactly as specified above.

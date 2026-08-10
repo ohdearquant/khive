@@ -549,9 +549,9 @@ pub struct DaemonResponseFrame {
 ///
 /// Every field here is a **server-side** gauge reachable from `handle_conn`
 /// without any mutation: [`khive_storage::tx_registry`] (ADR-091 Plank 0,
-/// process-global singleton), the WAL checkpoint task's last-observed page
-/// count and TRUNCATE counters (`khive_db::checkpoint`), and the ADR-067
-/// Component A write queue depth (only when `KHIVE_WRITE_QUEUE=1`). There is
+/// process-global singleton), the main pool's backend-keyed routine WAL
+/// sample and process TRUNCATE counters (`khive_db::checkpoint`), and the
+/// ADR-067 Component A write queue depth/latest writer-stage sample. There is
 /// no reset reachable through this type or through [`DaemonRequestFrame`] —
 /// gauges out, nothing in.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -561,6 +561,22 @@ pub struct MetricsSnapshot {
     /// (for example, an in-memory dispatcher with no pool, or a daemon that
     /// just started and hasn't hit its first tick yet).
     pub wal_pages: Option<u64>,
+    /// Logical frames present in the WAL at the main backend's most recent
+    /// periodic PASSIVE checkpoint. Kept separate from physical allocation.
+    #[serde(default)]
+    pub wal_log_frames: Option<u64>,
+    /// Frames backfilled by that same periodic PASSIVE pass.
+    #[serde(default)]
+    pub wal_checkpointed_frames: Option<u64>,
+    /// Logical frames still pending after that pass (`log - checkpointed`).
+    #[serde(default)]
+    pub wal_pending_frames: Option<u64>,
+    /// Physical `-wal` sidecar bytes captured at the same routine tick.
+    #[serde(default)]
+    pub wal_physical_bytes: Option<u64>,
+    /// Wall-clock timestamp of the routine WAL sample, for staleness checks.
+    #[serde(default)]
+    pub wal_observed_at_unix_ms: Option<u64>,
     /// Total WAL TRUNCATE escalation attempts (ADR-091 Plank 2) made in this
     /// process's lifetime, regardless of whether they succeeded in reclaiming
     /// pages.
@@ -600,6 +616,25 @@ pub struct MetricsSnapshot {
     /// (`PoolConfig::write_queue_capacity`), gated the same as
     /// `write_queue_depth`.
     pub write_queue_capacity: Option<usize>,
+    /// Latest completed writer-task span: bounded-channel admission/backlog.
+    #[serde(default)]
+    pub write_last_queue_wait_micros: Option<u64>,
+    /// Latest completed writer-task span: `BEGIN IMMEDIATE` acquisition.
+    #[serde(default)]
+    pub write_last_transaction_acquire_micros: Option<u64>,
+    /// Latest completed writer-task span: application transaction body.
+    #[serde(default)]
+    pub write_last_body_micros: Option<u64>,
+    /// Latest completed writer-task span: SQLite COMMIT/fsync phase.
+    #[serde(default)]
+    pub write_last_commit_micros: Option<u64>,
+    /// Whole latest writer-task request span, retained for compatibility and
+    /// comparison with the decomposed stages.
+    #[serde(default)]
+    pub write_last_total_micros: Option<u64>,
+    /// Wall-clock timestamp of the writer-stage sample.
+    #[serde(default)]
+    pub write_last_observed_at_unix_ms: Option<u64>,
 }
 
 // ── framing ───────────────────────────────────────────────────────────────────
@@ -933,14 +968,32 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
             None => (None, None),
         };
 
-    let (write_queue_depth, write_queue_capacity) = dispatcher
-        .pool_for_checkpoint()
+    let checkpoint_pool = dispatcher.pool_for_checkpoint();
+    let routine_wal = checkpoint_pool
+        .as_deref()
+        .and_then(khive_db::checkpoint::routine_wal_observation);
+    let writer_stages = checkpoint_pool
+        .as_deref()
+        .and_then(khive_db::writer_task::last_writer_stage_observation);
+    let (write_queue_depth, write_queue_capacity) = checkpoint_pool
+        .as_ref()
         .and_then(|pool| pool.writer_task_handle().ok().flatten())
         .map(|handle| (Some(handle.queue_depth()), Some(handle.capacity())))
         .unwrap_or((None, None));
 
     MetricsSnapshot {
-        wal_pages: khive_db::checkpoint::last_observed_wal_pages(),
+        wal_pages: routine_wal.as_ref().map(|sample| sample.log_frames),
+        wal_log_frames: routine_wal.as_ref().map(|sample| sample.log_frames),
+        wal_checkpointed_frames: routine_wal
+            .as_ref()
+            .map(|sample| sample.checkpointed_frames),
+        wal_pending_frames: routine_wal.as_ref().map(|sample| sample.pending_frames),
+        wal_physical_bytes: routine_wal
+            .as_ref()
+            .and_then(|sample| sample.physical_wal_bytes),
+        wal_observed_at_unix_ms: routine_wal
+            .as_ref()
+            .map(|sample| sample.observed_at_unix_ms),
         wal_truncate_attempts: khive_db::checkpoint::truncate_attempts(),
         wal_truncate_consecutive_failures: khive_db::checkpoint::truncate_consecutive_failures(),
         wal_checkpoint_skipped_ticks: khive_db::checkpoint::checkpoint_skipped_ticks(),
@@ -951,6 +1004,18 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
         open_tx_count,
         write_queue_depth,
         write_queue_capacity,
+        write_last_queue_wait_micros: writer_stages
+            .as_ref()
+            .map(|sample| sample.queue_wait_micros),
+        write_last_transaction_acquire_micros: writer_stages
+            .as_ref()
+            .map(|sample| sample.transaction_acquire_micros),
+        write_last_body_micros: writer_stages.as_ref().map(|sample| sample.body_micros),
+        write_last_commit_micros: writer_stages.as_ref().map(|sample| sample.commit_micros),
+        write_last_total_micros: writer_stages.as_ref().map(|sample| sample.total_micros),
+        write_last_observed_at_unix_ms: writer_stages
+            .as_ref()
+            .map(|sample| sample.observed_at_unix_ms),
     }
 }
 
@@ -2892,6 +2957,11 @@ mod tests {
             snapshot.wal_pages.is_some(),
             "wal_pages must be observed after a real checkpoint tick, got {snapshot:?}"
         );
+        assert_eq!(snapshot.wal_log_frames, snapshot.wal_pages);
+        assert!(snapshot.wal_checkpointed_frames.is_some());
+        assert!(snapshot.wal_pending_frames.is_some());
+        assert!(snapshot.wal_physical_bytes.is_some());
+        assert!(snapshot.wal_observed_at_unix_ms.is_some());
         // The snapshot carries the checkpoint-pressure fields read-only
         // (no mutation path reachable through `MetricsSnapshot`/`DaemonRequestFrame`);
         // an observed tick (not a skip) must report a zero-length skip streak.
@@ -2899,6 +2969,59 @@ mod tests {
             snapshot.wal_checkpoint_consecutive_skips, 0,
             "an observed (non-skipped) tick must report zero consecutive skips, got {snapshot:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_exposes_decomposed_writer_stages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("metrics_writer_stage_test.db");
+        let pool = Arc::new(
+            ConnectionPool::new(khive_db::PoolConfig {
+                path: Some(path),
+                ..khive_db::PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let handle = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("file-backed default writer task");
+        handle
+            .send(|conn| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                conn.execute("INSERT INTO t VALUES (1)", [])
+                    .map_err(|error| khive_storage::error::StorageError::Pool {
+                        operation: "metrics_writer_stage_test".into(),
+                        message: error.to_string(),
+                    })
+            })
+            .await
+            .unwrap();
+
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-writer-stages".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: Some(pool),
+            dispatch_err: None,
+        };
+        let snapshot = build_metrics_snapshot(&dispatcher);
+        assert!(snapshot.write_last_queue_wait_micros.is_some());
+        assert!(snapshot.write_last_transaction_acquire_micros.is_some());
+        assert!(snapshot.write_last_commit_micros.is_some());
+        assert!(
+            snapshot.write_last_body_micros >= Some(25_000),
+            "synthetic delay must be attributed to the body: {snapshot:?}"
+        );
+        assert!(snapshot.write_last_total_micros >= snapshot.write_last_body_micros);
+        assert!(snapshot.write_last_observed_at_unix_ms.is_some());
     }
 
     /// Test 3: the tx-pin oracle. The registry is process-global, so an

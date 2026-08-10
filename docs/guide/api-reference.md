@@ -155,6 +155,32 @@ its siblings (chain failures do abort the remainder of the chain):
 `aborted` counts ops skipped after an earlier failure in a `|` chain; it is always 0 for
 parallel batches, since parallel failures do not cascade.
 
+A successful entry can also carry a transport-owned `advisories` array beside `result`.
+These warnings describe execution context without changing the verb's canonical result or
+the batch summary. Presentation and output-format transforms apply only to `result`, and
+frame-budget degradation preserves advisories. For example, inspecting a read-only snapshot
+returns normal verb data while making the missing durable dispatch audit explicit:
+
+```json
+{
+  "ok": true,
+  "tool": "stats",
+  "result": { "entities": 42 },
+  "advisories": [
+    {
+      "code": "audit_persistence_skipped_read_only",
+      "severity": "warning",
+      "component": "audit_event_store",
+      "reason": "read_only_backend",
+      "message": "operation completed, but its dispatch audit event was not persisted because the audit backend is read-only"
+    }
+  ]
+}
+```
+
+That advisory appears on successful non-help operations only. Failed, aborted, and
+`help=true` entries do not claim that an audit write was skipped.
+
 ---
 
 ## `kg` pack — 20 verbs

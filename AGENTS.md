@@ -422,6 +422,11 @@ AlwaysVerbose (`get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`
 `memory.feedback`, `comm.delivered`) are exempt from
 the redundancy-drop even under `auto`/`table`, so agents still get their full output.
 
+A successful per-op envelope may also include transport-owned `advisories` beside `result`.
+These warnings do not change the verb result or batch summary and are never presentation- or
+format-transformed. In particular, a read-only snapshot inspection returns the normal result plus
+`audit_persistence_skipped_read_only` so callers know its dispatch audit event was not durable.
+
 **Precedence** (ADR-078 §2, highest to lowest):
 
 1. Per-call `format` on the `request` envelope, or `kkernel exec --output-format <json|auto|table>`

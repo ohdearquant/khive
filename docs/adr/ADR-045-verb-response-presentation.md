@@ -6,7 +6,7 @@
 **Extended by**: ADR-078 (Output Format and Shape-Aware Rendering), which introduces an orthogonal
 `format` axis (`json` / `auto` / `table`) and revises Agent-mode redundancy rules. ADR-078
 §7.1 partially supersedes the P-C1 implementation behavior that kept `full_id` present in all
-modes; see the note below at the `include_full_id` override section.
+modes; see Amendment 1 below.
 **Depends on**:
 
 - ADR-016 (Request DSL — short-UUID-prefix resolution on input)
@@ -140,18 +140,12 @@ full-UUID-only parameter is never shortened. Field-level exceptions keep
 record identifier is also included as `full_id` if the caller needs
 disambiguation, but is NOT included by default.
 
-### `include_full_id` override (envelope-level)
+### Canonical-ID retention
 
-Independent of `PresentationMode`, callers may pass `include_full_id=true` at the
-envelope level (alongside `presentation`) to force full UUIDs in the response even
-under `PresentationMode::Agent` (which normally returns 8-char shortcodes). This is
-a separate axis from presentation mode and does NOT create a fourth mode.
-
-> **Note (ADR-078 §7.1)**: ADR-078 makes `full_id` suppression explicit for `format=auto` and
-> `format=table`. In those formats, `full_id` is omitted regardless of `PresentationMode`. It is
-> retained in `format=json`, in `PresentationMode::Verbose`, and when `include_full_id=true` is
-> set. This resolves the discrepancy between this ADR's stated "NOT included by default" intent
-> and the P-C1 code rule in `presentation.rs` that was keeping `full_id` unconditionally.
+ADR-078 makes `full_id` suppression explicit for `format=auto` and `format=table`.
+The canonical field is retained by the lossless `format=json` default and by
+`PresentationMode::Verbose`; callers that require it must select one of those two
+implemented paths. Agent presentation continues to shorten the ordinary `id` field.
 
 Score truncation preserves ordering (3 sig figs is enough to compare scores)
 without burning tokens on float noise.
@@ -249,6 +243,13 @@ pub fn present_response(
 
 Pack handlers are unaware of mode. Tests against handler outputs always check
 verbose shape — golden outputs don't need to be mode-aware.
+
+ADR-016's optional envelope-level `advisories` array is outside the handler
+result and therefore outside every presentation and output-format transform.
+The runtime may add that transport-owned array after result presentation; its
+objects remain byte-for-byte machine-readable in Agent, Verbose, and Human
+modes. This preserves the central invariant here: presentation changes only a
+successful envelope's `result`, never sibling envelope metadata.
 
 ### 5. Handler invariants
 
@@ -572,6 +573,21 @@ Verbose remains the default for `kkernel exec` and library callers.
 Agents that previously parsed against full-shape MCP responses must either
 migrate to Agent-mode shapes or set `presentation=verbose` per call (or
 `KHIVE_DEFAULT_PRESENTATION=verbose` globally during the transition window).
+
+## Amendment 1 (2026-08-09): close the request envelope and withdraw the phantom override
+
+The original canonical-ID section described an envelope-level `include_full_id=true`
+override that was never implemented in `RequestParams`, daemon forwarding, or the
+renderer. That unshipped field is withdrawn rather than added as a third rendering
+axis. Canonical IDs remain available through the two implemented mechanisms above:
+the lossless `format=json` default and `presentation=verbose`.
+
+The MCP `request` envelope is now closed to undeclared fields. Its serde decoder and
+generated JSON Schema reject names outside the published `RequestParams` properties,
+so a misspelling such as `presentaton` fails at the call boundary instead of silently
+falling back to the default presentation. This closure applies only to the outer MCP
+tool envelope; verb arguments continue through the separately governed request DSL and
+pack validation seams.
 
 ## References
 
