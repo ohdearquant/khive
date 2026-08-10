@@ -84,8 +84,12 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
 
 #[cfg(windows)]
 fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
-    // Windows equivalent of the Unix arm's fd-pinned walk, built from two
-    // handle properties instead of `openat`:
+    // Windows equivalent of the Unix arm's fd-pinned walk. The Unix arm's
+    // guarantee is: the root's ancestors are resolved exactly once (at
+    // `open(root)`), every later step is relative to an already-verified
+    // open descriptor, and the final unlink acts on a descriptor, never on
+    // a re-resolved path string. This arm reproduces each property from
+    // handle semantics:
     //
     // 1. No-follow verification BY HANDLE: each directory level is opened
     //    with `FILE_FLAG_OPEN_REPARSE_POINT` (plus `FILE_FLAG_BACKUP_SEMANTICS`,
@@ -94,26 +98,54 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
     //    reparse point itself rather than to its target, and the
     //    handle-derived metadata (`File::metadata`, which queries the handle,
     //    not a re-resolved path) exposes it for refusal.
-    // 2. Pinning: the handles are opened WITHOUT `FILE_SHARE_DELETE`. Both
-    //    deleting and renaming a directory require an open with `DELETE`
-    //    access, and that open fails with a sharing violation while any
-    //    handle that did not share delete access is held. Holding all three
-    //    verified handles across the final `remove_file` therefore prevents
-    //    every checked component from being swapped for a junction in the
-    //    check-to-use window the previous `symlink_metadata`-then-delete
-    //    shape left open.
+    // 2. Pinning: the directory handles are opened WITHOUT
+    //    `FILE_SHARE_DELETE`. Deleting or renaming a directory requires an
+    //    open with `DELETE` access, which fails with a sharing violation
+    //    while these handles are held, so no checked component can be
+    //    swapped for the duration of the call.
+    // 3. Deletion BY HANDLE with a handle-anchored identity check. A
+    //    path-based `remove_file` here would re-resolve the full path from
+    //    the volume root, so a reparse point swapped at an UNPINNED ancestor
+    //    of `root` (which this function cannot pin — it does not own them)
+    //    could redirect the delete outside the blob root even while all
+    //    three pins hold. Instead the target file itself is opened with
+    //    `DELETE` access and `FILE_FLAG_OPEN_REPARSE_POINT` (a symlink leaf
+    //    opens as the link entry, matching `unlinkat` semantics), its TRUE
+    //    resolved path is read back from the handle with
+    //    `GetFinalPathNameByHandleW`, and the delete proceeds only if that
+    //    path equals the root pin's own handle-final path extended by the
+    //    verified shard components. The root pin's final path is a property
+    //    of the already-open handle — an ancestor swapped after the pin
+    //    opened cannot change it, while it does change (and thereby betrays)
+    //    the file handle's resolution. The delete itself is
+    //    `SetFileInformationByHandle(FileDispositionInfo)` on the verified
+    //    handle: no path is ever re-resolved between check and use.
     //
-    // The final `remove_file` re-resolves `root/<s1>/<s2>/<hex>` through
-    // those pinned, verified directories; if the leaf entry itself is a
-    // symlink, Windows `DeleteFile` removes the link entry, not its target —
-    // the same semantics `unlinkat` gives the Unix arm.
+    // An ancestor reparse point already in place BEFORE the root pin opens
+    // resolves identically for the pin and the file and is accepted — the
+    // same exposure the Unix arm accepts for a symlinked ancestor at
+    // `open(root)` time; that is the operator's configured deployment, not
+    // a check-to-use window.
     use std::fs::OpenOptions;
+    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle,
+        FILE_DISPOSITION_INFO,
+    };
 
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    /// `FILE_NAME_NORMALIZED | VOLUME_NAME_DOS` — both zero; named for the
+    /// contract (normalized on-disk case, drive-letter form) rather than
+    /// passing a bare 0.
+    const FINAL_PATH_FLAGS: u32 = 0x0;
 
     fn open_dir_pinned_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         let dir = OpenOptions::new()
@@ -135,13 +167,81 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
         Ok(dir)
     }
 
+    /// The handle's true, fully resolved path (`GetFinalPathNameByHandleW`,
+    /// normalized `\\?\`-prefixed DOS form). A handle property: later
+    /// changes to any directory the original path traversed cannot alter it.
+    fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+        let handle = file.as_raw_handle();
+        let mut buf: Vec<u16> = vec![0; 512];
+        loop {
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    handle as _,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    FINAL_PATH_FLAGS,
+                )
+            };
+            if len == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let len = len as usize;
+            if len <= buf.len() {
+                buf.truncate(len);
+                return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                    &buf,
+                )));
+            }
+            // Returned length is the required buffer size (in wide chars,
+            // including the terminator) when the buffer was too small.
+            buf.resize(len, 0);
+        }
+    }
+
     let hex = content_ref.as_str();
     let shard1 = root.join(&hex[0..2]);
     let shard2 = shard1.join(&hex[2..4]);
-    let _root_pin = open_dir_pinned_no_follow(root)?;
+    let root_pin = open_dir_pinned_no_follow(root)?;
     let _shard1_pin = open_dir_pinned_no_follow(&shard1)?;
     let _shard2_pin = open_dir_pinned_no_follow(&shard2)?;
-    fs::remove_file(shard2.join(hex))
+
+    let expected = final_path_by_handle(&root_pin)?
+        .join(&hex[0..2])
+        .join(&hex[2..4])
+        .join(hex);
+
+    let target = OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(shard2.join(hex))?;
+
+    let resolved = final_path_by_handle(&target)?;
+    if resolved != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing blob delete: handle resolved outside the verified blob root \
+                 (expected {}, resolved {})",
+                expected.display(),
+                resolved.display()
+            ),
+        ));
+    }
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            target.as_raw_handle() as _,
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
