@@ -516,28 +516,8 @@ async fn acquire_handle_slot(
 // =============================================================================
 
 fn open_standalone_reader(pool: &ConnectionPool) -> Result<rusqlite::Connection, StorageError> {
-    let config = pool.config();
-    let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-        operation: "reader".into(),
-        message: "in-memory databases do not support standalone readers; use pool-backed".into(),
-    })?;
-
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| map_rusqlite_err(e, "open_reader"))?;
-
-    conn.busy_timeout(config.busy_timeout)
-        .map_err(|e| map_rusqlite_err(e, "open_reader"))?;
-    conn.pragma_update(None, "cache_size", "-65536")
-        .map_err(|e| map_rusqlite_err(e, "open_reader"))?;
-    conn.pragma_update(None, "mmap_size", "1073741824")
-        .map_err(|e| map_rusqlite_err(e, "open_reader"))?;
-
-    Ok(conn)
+    pool.open_standalone_reader()
+        .map_err(|error| StorageError::driver(StorageCapability::Sql, "open_reader", error))
 }
 
 fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection, StorageError> {

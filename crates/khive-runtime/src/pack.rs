@@ -41,6 +41,10 @@ use crate::validation::ValidationRule;
 /// [`VerbRegistry::pack_owned_note_kinds`].
 pub const GENERIC_CRUD_PACK: &str = "kg";
 
+/// Stable advisory code emitted when a successful inspection cannot persist
+/// its dispatch audit because the configured audit backend is read-only.
+pub const AUDIT_PERSISTENCE_SKIPPED_READ_ONLY: &str = "audit_persistence_skipped_read_only";
+
 const FULL_UUID_IDENTIFIER_HELP: &str = "A complete UUID spelling accepted by the consuming \
     parameter directly names one globally unique record; direct UUID lookup is not a namespace \
     search. Strict identifier responses use canonical lowercase dashed UUIDs.";
@@ -460,6 +464,9 @@ pub struct VerbRegistryBuilder {
     /// registry does not depend on the full `KhiveRuntime` surface — only the
     /// audit-persistence capability is needed here.
     event_store: Option<Arc<dyn EventStore>>,
+    /// The configured audit backend is intentionally read-only, so dispatch
+    /// omits the known-failing append and the transport surfaces an advisory.
+    audit_store_read_only: bool,
     /// Optional post-dispatch hook.
     ///
     /// When set, every successful pack dispatch calls `hook.on_dispatch(view)`
@@ -479,6 +486,7 @@ impl VerbRegistryBuilder {
             visible_namespaces: vec![],
             actor_id: None,
             event_store: None,
+            audit_store_read_only: false,
             dispatch_hook: None,
         }
     }
@@ -568,6 +576,18 @@ impl VerbRegistryBuilder {
     /// a durable receipt and therefore fails safely when no store is configured.
     pub fn with_event_store(&mut self, store: Arc<dyn EventStore>) -> &mut Self {
         self.event_store = Some(store);
+        self.audit_store_read_only = false;
+        self
+    }
+
+    /// Mark audit persistence unavailable because its backend is read-only.
+    ///
+    /// No `EventStore` is retained, so dispatch never attempts a write that is
+    /// known to fail. Successful request entries expose a machine-readable
+    /// advisory without changing their canonical verb result shape.
+    pub fn with_read_only_audit_store(&mut self) -> &mut Self {
+        self.event_store = None;
+        self.audit_store_read_only = true;
         self
     }
 
@@ -688,6 +708,7 @@ impl VerbRegistryBuilder {
             visible_namespaces: self.visible_namespaces,
             actor_id: self.actor_id,
             event_store: self.event_store,
+            audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
@@ -867,6 +888,9 @@ pub struct VerbRegistry {
     actor_id: Option<String>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
+    /// Distinguishes ordinary tracing-only construction from a sink omitted
+    /// deliberately because its configured backend is read-only.
+    audit_store_read_only: bool,
     /// Post-dispatch hook: `None` means no real-time observation.
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
     /// Names of all `Visibility::Verb` handlers across all packs, precomputed
@@ -1197,10 +1221,28 @@ impl VerbRegistry {
     /// `dispatch` (e.g. the email channel poll loop) append best-effort
     /// lifecycle events to the same sink gate-check audit rows use, without
     /// threading a second `Option<Arc<dyn EventStore>>` field through every
-    /// caller. `None` means tracing-only, matching the registry's own
-    /// audit-persistence default.
+    /// caller. `None` means either the historical tracing-only default or an
+    /// intentionally read-only audit backend; callers that need to distinguish
+    /// those cases use [`Self::audit_persistence_advisory`].
     pub fn event_store(&self) -> Option<Arc<dyn EventStore>> {
         self.event_store.clone()
+    }
+
+    /// Advisory for a dispatch whose configured audit sink is read-only.
+    ///
+    /// The MCP transport places this beside successful per-operation results;
+    /// `None` means audit persistence is configured normally or was never
+    /// configured at all.
+    pub fn audit_persistence_advisory(&self) -> Option<Value> {
+        self.audit_store_read_only.then(|| {
+            serde_json::json!({
+                "code": AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
+                "severity": "warning",
+                "component": "audit_event_store",
+                "reason": "read_only_backend",
+                "message": "operation completed, but its dispatch audit event was not persisted because the audit backend is read-only",
+            })
+        })
     }
 
     /// Return the help schema envelope for a verb.
@@ -2528,6 +2570,12 @@ impl VerbRegistry {
     /// rest from loading. Callers that need hard-failure semantics should call
     /// `all_schema_plans()` and apply each plan individually.
     pub fn apply_schema_plans(&self, backend: &khive_db::StorageBackend) {
+        if backend.is_read_only() {
+            tracing::info!(
+                "skipping pack schema plans because the backend is read-only; snapshot schema is used as-is"
+            );
+            return;
+        }
         for plan in self.all_schema_plans() {
             if plan.is_empty() {
                 continue;
@@ -2606,6 +2654,14 @@ impl VerbRegistry {
                         }
                     }
                 }
+            }
+
+            if backend.is_read_only() {
+                tracing::info!(
+                    pack = pack_name,
+                    "skipping pack schema plan because its assigned backend is read-only"
+                );
+                continue;
             }
 
             backend
@@ -8305,6 +8361,70 @@ mod help_tests {
         assert!(
             msg.contains("collision_table"),
             "collision error must name the table; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_schema_plans_with_map_read_only_collision_is_an_error_without_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("read_only_schema_collision.db");
+        {
+            let writable = khive_db::StorageBackend::sqlite(&path).expect("writable backend");
+            writable.prepare_core_schema().expect("current schema");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+        let backend = khive_db::StorageBackend::sqlite_read_only(&path).expect("read-only backend");
+        let empty_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_alpha",
+            statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_beta",
+            statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+        }));
+        let registry = builder.build().expect("registry builds");
+        let writes_before = backend.pool().writer_acquisition_snapshot();
+
+        let result = registry.apply_schema_plans_with_map(&empty_map, &backend);
+
+        let err = result.expect_err(
+            "read-only topology must reject the same cross-pack collision as writable topology",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pack_alpha"),
+            "collision error must name first pack; got: {msg}"
+        );
+        assert!(
+            msg.contains("pack_beta"),
+            "collision error must name second pack; got: {msg}"
+        );
+        assert!(
+            msg.contains("collision_table"),
+            "collision error must name the table; got: {msg}"
+        );
+        assert_eq!(
+            backend.pool().writer_acquisition_snapshot(),
+            writes_before,
+            "read-only collision validation must not acquire a writer"
         );
     }
 }

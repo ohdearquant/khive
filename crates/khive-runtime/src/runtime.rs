@@ -168,13 +168,13 @@ impl KhiveRuntime {
             }
             None => StorageBackend::memory()?,
         };
-        // Migrations must run before any pack handler touches the DB; idempotent;
-        // failure aborts construction with a clear error.
-        {
-            let mut writer = backend.pool().try_writer()?;
-            khive_db::run_migrations(writer.conn_mut())?;
+        // Writable backends migrate before handlers touch the DB. A detected
+        // read-only snapshot is validated at the current schema version without
+        // attempting migration DDL.
+        backend.prepare_core_schema()?;
+        if !backend.is_read_only() {
+            register_configured_embedding_models(&backend, &config)?;
         }
-        register_configured_embedding_models(&backend, &config)?;
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Ok(Self {
             backend: Arc::new(backend),
@@ -196,19 +196,17 @@ impl KhiveRuntime {
 
     /// Open a runtime for read-only inspection (no model registration, no DB creation).
     ///
-    /// Runs migrations (idempotent) but skips `register_configured_embedding_models`,
-    /// so `engine list` / `engine status` cannot mutate the registry as a side effect.
-    /// Returns `None` when `db_path` is `None` and the default DB does not exist.
+    /// File-backed databases are opened with SQLite read-only/query-only flags
+    /// and must already be at this build's current schema version. No migrations
+    /// or configured-model registration writes are attempted. A `None` path
+    /// retains the historical ephemeral in-memory behavior for tests.
     pub fn new_readonly(config: RuntimeConfig) -> RuntimeResult<Self> {
         let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let backend = match &config.db_path {
-            Some(path) => StorageBackend::sqlite(path)?,
+            Some(path) => StorageBackend::sqlite_read_only(path)?,
             None => StorageBackend::memory()?,
         };
-        {
-            let mut writer = backend.pool().try_writer()?;
-            khive_db::run_migrations(writer.conn_mut())?;
-        }
+        backend.prepare_core_schema()?;
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Ok(Self {
             backend: Arc::new(backend),
@@ -239,8 +237,10 @@ impl KhiveRuntime {
     /// `default_namespace` via the config builder pattern if non-defaults are needed.
     pub fn from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
         let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
-        if let Err(err) = register_configured_embedding_models(&backend, &config) {
-            tracing::warn!(error = %err, "failed to register configured embedding models");
+        if !backend.is_read_only() {
+            if let Err(err) = register_configured_embedding_models(&backend, &config) {
+                tracing::warn!(error = %err, "failed to register configured embedding models");
+            }
         }
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Self {
@@ -377,6 +377,12 @@ impl KhiveRuntime {
     /// Return a reference to the underlying storage backend.
     pub fn backend(&self) -> &StorageBackend {
         &self.backend
+    }
+
+    /// Whether this runtime's bound backend is explicitly or filesystem-mode
+    /// detected read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.backend.is_read_only()
     }
 
     /// Return the directory containing the backend's database file, or `None`
@@ -1063,6 +1069,12 @@ impl KhiveRuntime {
         model_name: &str,
         duration_us: i64,
     ) {
+        // Lazy embedder construction can happen during daemon warm or an
+        // assertive request. A snapshot has no durable audit sink, so do not
+        // resolve an EventStore merely to attempt a known-rejected append.
+        if self.is_read_only() {
+            return;
+        }
         let Ok(store) = self.events(token) else {
             return;
         };
@@ -1346,6 +1358,123 @@ mod tests {
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
         assert_eq!(rt.config().default_namespace.as_str(), "test");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_boot_detects_read_only_snapshot_and_skips_model_registration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read_only_runtime.db");
+        let base = RuntimeConfig {
+            git_write: Default::default(),
+            db_path: Some(path.clone()),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        {
+            let writable = KhiveRuntime::new(base.clone()).expect("create migrated snapshot");
+            assert!(writable
+                .list_embedding_models(None)
+                .await
+                .expect("registry query")
+                .is_empty());
+        }
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        // A lingering writable `-shm` from the writable fixture's asynchronous
+        // connection close is rejected by read-only admission as potentially
+        // live; freeze any sidecars into the documented frozen-snapshot form.
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut sidecar_permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                sidecar_permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, sidecar_permissions).expect("freeze sidecar");
+            }
+        }
+
+        let read_only_config = RuntimeConfig {
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            ..base
+        };
+        let runtime = KhiveRuntime::new(read_only_config)
+            .expect("read-only boot must validate instead of migrating/registering");
+        assert!(runtime.is_read_only());
+        assert_eq!(
+            runtime.backend().pool().writer_acquisition_snapshot(),
+            khive_db::pool::WriterAcquisitionSnapshot::default(),
+            "the construction-inclusive acquisition baseline must stay at zero"
+        );
+        assert!(
+            runtime
+                .list_embedding_models(None)
+                .await
+                .expect("read-only registry query")
+                .is_empty(),
+            "configured models must remain in-memory only during read-only boot"
+        );
+    }
+
+    #[test]
+    fn explicit_readonly_constructor_uses_read_only_pool_even_on_writable_file_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit_read_only_runtime.db");
+        let config = RuntimeConfig {
+            git_write: Default::default(),
+            db_path: Some(path.clone()),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        KhiveRuntime::new(config.clone()).expect("create migrated database");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+
+        let runtime = KhiveRuntime::new_readonly(config).expect("explicit read-only boot");
+        assert!(runtime.is_read_only());
+        assert_eq!(
+            runtime.backend().pool().writer_acquisition_snapshot(),
+            khive_db::pool::WriterAcquisitionSnapshot::default(),
+            "explicit read-only construction must validate through a reader without ever \
+             acquiring the writer"
+        );
     }
 
     /// A `~/`-prefixed `--db`/`KHIVE_DB` override must resolve, boot, and
