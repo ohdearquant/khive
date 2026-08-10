@@ -77,8 +77,9 @@ pub struct CodeIngestReport {
 /// Run one `kkernel code-ingest` pass: resolve config, validate the
 /// `findings.json` document as a whole (fail-closed, before any write), then
 /// persist the deterministic entity/note/edge batch record-by-record.
-/// Records whose content-derived ID already exists are reported as skipped,
-/// not overwritten: a `finding` note's lifecycle state (`kind_status`) is
+/// Records whose content-derived ID has ever existed, including soft-deleted
+/// tombstones, are reported as skipped and never overwritten or reactivated:
+/// a `finding` note's lifecycle state (`kind_status`) and deletion state are
 /// curated data, not something re-ingesting the same sweep should reset.
 pub async fn run_code_ingest(args: CodeIngestArgs) -> Result<()> {
     let human = args.human;
@@ -220,7 +221,7 @@ where
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         for entity in &batch.entities {
             let existing = entities
-                .get_entity(entity.id)
+                .get_entity_including_deleted(entity.id)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if existing.is_some() {
@@ -293,7 +294,7 @@ where
         let notes = runtime.notes(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
         for note in &batch.notes {
             let existing = notes
-                .get_note(note.id)
+                .get_note_including_deleted(note.id)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if existing.is_some() {
@@ -359,7 +360,7 @@ where
         let graph = runtime.graph(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
         for edge in &batch.edges {
             let existing = graph
-                .get_edge(edge.id)
+                .get_edge_including_deleted(edge.id)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if existing.is_some() {
@@ -503,8 +504,9 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
 /// thereby creating) a database purely to answer "does this id exist" would
 /// itself be the mutation the dry-run contract forbids.
 ///
-/// When the path exists, existence is checked against a snapshot copy of
-/// it: `StorageBackend::sqlite_read_only`'s `SQLITE_OPEN_READ_ONLY` plus
+/// When the path exists, existence (including soft-deleted rows, because a
+/// deterministic ID is never reusable) is checked against a snapshot copy
+/// of it: `StorageBackend::sqlite_read_only`'s `SQLITE_OPEN_READ_ONLY` plus
 /// `PRAGMA query_only = ON` blocks logical writes, but SQLite still performs
 /// ordinary WAL shared-memory maintenance on open, which creates or updates
 /// the `-shm` sidecar next to whatever path it is pointed at. Opening the
@@ -540,7 +542,7 @@ async fn dry_run_report(
     for entity in &batch.entities {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM entities WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                sql: "SELECT 1 FROM entities WHERE id = ?1".to_string(),
                 params: vec![SqlValue::Uuid(entity.id)],
                 label: Some("code-ingest dry-run entity existence".to_string()),
             })
@@ -555,7 +557,7 @@ async fn dry_run_report(
     for note in &batch.notes {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM notes WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                sql: "SELECT 1 FROM notes WHERE id = ?1".to_string(),
                 params: vec![SqlValue::Uuid(note.id)],
                 label: Some("code-ingest dry-run note existence".to_string()),
             })
@@ -570,7 +572,7 @@ async fn dry_run_report(
     for edge in &batch.edges {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM graph_edges WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                sql: "SELECT 1 FROM graph_edges WHERE id = ?1".to_string(),
                 params: vec![SqlValue::Uuid(uuid::Uuid::from(edge.id))],
                 label: Some("code-ingest dry-run edge existence".to_string()),
             })
@@ -803,6 +805,94 @@ mod tests {
         path
     }
 
+    const TOMBSTONE_WITNESS: i64 = 1_772_812_800_000_000;
+
+    fn mapped_batch(findings: &Path) -> CodeIngestBatch {
+        let bytes = std::fs::read(findings).expect("read findings fixture");
+        ingest_findings_json(
+            &bytes,
+            CodeIngestOptions {
+                namespace: "local",
+                observed_at: Utc::now(),
+                source_run: Some("test-run"),
+            },
+        )
+        .expect("map valid findings fixture")
+    }
+
+    async fn soft_delete_mapped_batch(db: &Path, batch: &CodeIngestBatch) {
+        let backend = StorageBackend::sqlite(db).expect("open tombstone writer");
+        let sql = backend.sql();
+        let mut writer = sql.writer().await.expect("acquire tombstone writer");
+
+        let rows = [
+            (
+                "entities",
+                SqlValue::Uuid(batch.entities[0].id),
+                "soft-delete mapped entity",
+            ),
+            (
+                "notes",
+                SqlValue::Uuid(batch.notes[0].id),
+                "soft-delete mapped note",
+            ),
+            (
+                "graph_edges",
+                SqlValue::Uuid(uuid::Uuid::from(batch.edges[0].id)),
+                "soft-delete mapped edge",
+            ),
+        ];
+
+        for (table, id, label) in rows {
+            let changed = writer
+                .execute(SqlStatement {
+                    sql: format!("UPDATE {table} SET deleted_at = ?1 WHERE id = ?2"),
+                    params: vec![SqlValue::Integer(TOMBSTONE_WITNESS), id],
+                    label: Some(label.to_string()),
+                })
+                .await
+                .expect("soft-delete mapped row");
+            assert_eq!(changed, 1, "fixture must tombstone exactly one {table} row");
+        }
+    }
+
+    /// Read back the three tombstone markers through an ordinary writable
+    /// backend's reader connection. The read-only constructor is not usable
+    /// here: it refuses a database whose WAL `-shm` sidecar is still
+    /// writable, and this fixture's earlier ingest and tombstone writers
+    /// legitimately leave that sidecar behind. The production dry-run path
+    /// satisfies that guard by snapshot-copying and freezing sidecars; this
+    /// assertion needs only three scalar reads on the live fixture file.
+    async fn assert_mapped_batch_remains_tombstoned(db: &Path, batch: &CodeIngestBatch) {
+        let backend = StorageBackend::sqlite(db).expect("open tombstone reader");
+        let sql = backend.sql();
+        let mut reader = sql.reader().await.expect("acquire tombstone reader");
+
+        let rows = [
+            ("entities", SqlValue::Uuid(batch.entities[0].id)),
+            ("notes", SqlValue::Uuid(batch.notes[0].id)),
+            (
+                "graph_edges",
+                SqlValue::Uuid(uuid::Uuid::from(batch.edges[0].id)),
+            ),
+        ];
+
+        for (table, id) in rows {
+            let marker = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT deleted_at FROM {table} WHERE id = ?1"),
+                    params: vec![id],
+                    label: Some(format!("read mapped {table} tombstone")),
+                })
+                .await
+                .expect("read mapped tombstone");
+            assert!(
+                matches!(&marker, Some(SqlValue::Integer(value)) if *value == TOMBSTONE_WITNESS),
+                "re-ingest must preserve the exact {table} tombstone marker, got {marker:?}"
+            );
+        }
+    }
+
     #[serial]
     #[tokio::test]
     async fn code_ingest_creates_once_then_skips_on_rerun() {
@@ -830,6 +920,47 @@ mod tests {
         assert_eq!(second.notes_skipped_existing, 1);
         assert_eq!(second.entities_skipped_existing, 1);
         assert_eq!(second.edges_skipped_existing, 1);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_never_reactivates_consumed_tombstone_ids() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("tombstones.db");
+        let batch = mapped_batch(&findings);
+
+        code_ingest_batch(base_args(findings.clone(), db.clone()))
+            .await
+            .expect("initial ingest must succeed");
+        soft_delete_mapped_batch(&db, &batch).await;
+        assert_mapped_batch_remains_tombstoned(&db, &batch).await;
+
+        let mut dry_args = base_args(findings.clone(), db.clone());
+        dry_args.dry_run = true;
+        let dry = code_ingest_batch(dry_args)
+            .await
+            .expect("dry-run over tombstones must succeed");
+        assert!(dry.dry_run);
+        assert_eq!(dry.entities_created, 0);
+        assert_eq!(dry.entities_skipped_existing, 1);
+        assert_eq!(dry.notes_created, 0);
+        assert_eq!(dry.notes_skipped_existing, 1);
+        assert_eq!(dry.edges_created, 0);
+        assert_eq!(dry.edges_skipped_existing, 1);
+        assert_mapped_batch_remains_tombstoned(&db, &batch).await;
+
+        let real = code_ingest_batch(base_args(findings, db.clone()))
+            .await
+            .expect("real re-ingest over tombstones must succeed");
+        assert!(!real.dry_run);
+        assert_eq!(real.entities_created, 0);
+        assert_eq!(real.entities_skipped_existing, 1);
+        assert_eq!(real.notes_created, 0);
+        assert_eq!(real.notes_skipped_existing, 1);
+        assert_eq!(real.edges_created, 0);
+        assert_eq!(real.edges_skipped_existing, 1);
+        assert_mapped_batch_remains_tombstoned(&db, &batch).await;
     }
 
     #[serial]
