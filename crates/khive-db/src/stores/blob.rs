@@ -2232,8 +2232,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transactional_orphan_sweep_protects_a_freshly_published_blob_before_its_reference_commits()
-     {
+    async fn transactional_orphan_sweep_protects_a_freshly_published_blob_before_its_reference_commits(
+    ) {
         // The exact two-step client protocol hazard: `put` completes and
         // releases its write lock (step 1) while the entity write that will
         // *later* commit a `content_ref` to this blob (step 2) has not
