@@ -11,8 +11,11 @@ predicate, the ADR-018 amendment, and `session.search` itself)
 
 - [ADR-007](ADR-007-namespace.md) — Namespace as attribution (the tenant scope is the request's
   resolved storage namespace; a caller-supplied namespace string is never the scope)
-- [ADR-018](ADR-018-authorization-gate.md) — Authorization Gate (pre-dispatch, row-blind, fail-open
-  on infra error; this ADR carves the first fail-closed verb class out of that default)
+- [ADR-018](ADR-018-authorization-gate.md) — Authorization Gate (pre-dispatch, row-blind, and fail-open
+  on infra error at this ADR's 2026-07-19 authoring; ADR-018 Amendment 3, 2026-07-25, has since reversed
+  the infra-error posture to fail-closed. This ADR carves the first fail-closed verb class out of that
+  then-current default; the class's guarantee is independent of the Gate's error posture, so the
+  reversal does not affect it)
 - [ADR-021](ADR-021-memory-pack.md) — Memory Pack (the FTS5 + RRF retrieval primitives `session.search`
   reuses)
 - [ADR-025](ADR-025-verb-speech-acts.md) — Verb Speech Acts (`session.search` is Assertive)
@@ -139,7 +142,8 @@ content hash is an adjunct that is never the identity.
 ### D4 — Fail-closed tenant-isolation predicate at the handler seam
 
 Isolation is enforced **where the rows exist** — in the `session.search` handler — not at the Gate
-(which is pre-dispatch, row-blind, and fail-open per ADR-018). The enforcement is **construction-primary**:
+(which is pre-dispatch, row-blind, and — per ADR-018 as authored; since made fail-closed on infra error
+by ADR-018 Amendment 3 — fail-open). The enforcement is **construction-primary**:
 the safety property holds in the shipped seam by how the query is built, independent of any policy or
 amendment landing first.
 
@@ -158,7 +162,9 @@ amendment landing first.
    `PermissionDenied`) rather than running an unscoped query. Two properties then hold, and the boundary
    between them is the point of this ADR. First, **non-widenability**: the query is never emitted without
    the scope term, so no caller argument and no failed Gate can broaden it. Second, **the regime split for
-   ADR-018's fail-open default**: on the single-principal local socket the request identity is trusted by
+   ADR-018's fail-open default** (the default as authored; since reversed by ADR-018 Amendment 3 — the
+   split's conclusion holds under either posture): on the single-principal local socket the request
+   identity is trusted by
    socket ownership, the minted scope is the caller's own, and fail-open cannot cross tenants because there
    is only one. On a shared or hosted socket the frame namespace is caller-supplied and forgeable, so a
    positive-but-forged scope is possible — authenticating that scope is exactly what ADR-096's deferred
@@ -177,9 +183,11 @@ predicate is correct and fail-closed in both regimes — the deferred ADR only c
 
 ### The ADR-018 amendment — a fail-closed verb class (Amendment 2)
 
-ADR-018 §Fail-open establishes that a gate `Err` (infra failure) proceeds; only explicit `Deny` blocks.
-ADR-018 Amendment 1 §4 already carved one fail-closed exception (an unresolvable wire verb is denied
-before dispatch). This ADR adds Amendment 2: a **fail-closed verb class**.
+ADR-018 §Fail-open established, at this ADR's 2026-07-19 authoring, that a gate `Err` (infra failure)
+proceeds; only explicit `Deny` blocks. ADR-018 Amendment 3 (2026-07-25) has since reversed that posture:
+a gate `Err` now fails closed. ADR-018 Amendment 1 §4 had already carved one fail-closed exception (an
+unresolvable wire verb is denied before dispatch). This ADR adds Amendment 2: a **fail-closed verb
+class**.
 
 > **ADR-018 Amendment 2 (2026-07-19) — Fail-closed verb class.** A verb may declare membership in a
 > fail-closed class. A verb in this class carries a handler-seam requirement of a **positive authenticated
@@ -191,9 +199,14 @@ before dispatch). This ADR adds Amendment 2: a **fail-closed verb class**.
 > row-blind). `session.search` is the first member. Future verbs that return cross-tenant-sensitive rows
 > join the class by the same handler-seam contract.
 
-This keeps ADR-018's model intact — the Gate is still the pre-dispatch authorization seam, still fail-open
-on infra error — and names, at the contract level, the class of verbs whose safety must not depend on the
-Gate at all.
+The amendment text above is quoted as adopted on 2026-07-19; its references to the Gate's fail-open
+default describe the posture current at that date, since reversed by ADR-018 Amendment 3 (2026-07-25).
+
+This keeps ADR-018's model intact — the Gate is still the pre-dispatch authorization seam (fail-open on
+infra error at this ADR's authoring; fail-closed since ADR-018 Amendment 3) — and names, at the contract
+level, the class of verbs whose safety must not depend on the Gate at all. That independence is the
+point: the class's guarantee holds under either error posture, because the handler-seam refusal never
+consults the Gate's error handling.
 
 ### D-tests — isolation and no-scope-refusal land in the same PR
 
