@@ -1,6 +1,6 @@
 # ADR-121: Attachments — Role-Keyed Blob Renditions as a First-Class Substrate Property
 
-**Status**: proposed\
+**Status**: accepted\
 **Date**: 2026-07-23\
 **Authors**: khive maintainers\
 **Depends on**:
