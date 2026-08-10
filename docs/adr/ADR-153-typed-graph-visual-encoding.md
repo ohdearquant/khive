@@ -74,7 +74,9 @@ survives every overlay.
 ### D4 — Deterministic layout
 
 Same bundle, same view parameters, same layout: layout algorithms run with fixed seeds and
-stable input ordering (the deterministic ordering the bundles already guarantee). Review
+stable input ordering (the deterministic ordering the bundles already guarantee). The seed
+is defined once in the shared legend module and consumed by every view; a per-view seed
+would let determinism fragment silently as views are added. Review
 reproducibility depends on it — two reviewers of one change-set see one picture, and
 screenshot-based visual regression becomes possible. Force-directed animation may run at
 interaction time, but the settled state is the deterministic one.

@@ -94,7 +94,10 @@ Automated gates (token lint, contrast computation, icon contract test, `next bui
 necessary and not sufficient. A change that touches visual surface area ships with
 screenshots of the running app in the PR — dense view and reading view, both themes — and
 the review criterion is D1's stated character. Green CI with an unstyled or off-character
-page is a known failure class; the screenshot is the gate that catches it.
+page is a known failure class; the screenshot is the gate that catches it. The
+both-themes-both-densities screenshot requirement lives in the repository's PR template as
+a checklist item, so the gate survives contributor turnover rather than depending on
+reviewers remembering this clause.
 
 ## Consequences
 
