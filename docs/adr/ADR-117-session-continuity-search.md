@@ -1,6 +1,6 @@
 # ADR-117: Session Continuity — Cross-Session Search and Remote Ingestion
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-07-19
 **Authors**: khive maintainers
 **Depends on**:
