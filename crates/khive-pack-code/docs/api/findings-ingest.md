@@ -10,6 +10,10 @@ the KG namespace, an observation timestamp, and an optional stable `source_run`.
 non-empty run is supplied, the function derives `audit.date:audit.commit`; missing components are
 `CodeIngestError::MissingSourceRun`.
 
+The required audit identity strings (`date`, `scope`, `repo`, `branch`, `commit`, and
+`standards_file`) and every `findings[].id` must contain at least one non-whitespace character.
+Their original bytes are retained after validation; ingest does not trim or otherwise rewrite them.
+
 `observed_at` becomes record creation/update time but is excluded from identity, so retrying the
 same audit later reproduces the same IDs.
 
@@ -31,9 +35,18 @@ is treated as absence. Unknown finding keys are preserved under `raw`.
 
 All IDs are UUIDv5 values under `CODE_INGEST_NAMESPACE`. Object keys are recursively sorted before
 identity serialization; array order remains significant content. The project tuple includes
-namespace, repository, and scope. A finding tuple includes source run, normalized title, all
-validated/preserved content, and raw extensions, but excludes observation time. Any substantive
-content change creates a new ID rather than overwriting the prior finding.
+namespace, repository, and scope. Finding identity schema v2 includes that project UUID and the
+repository string in addition to source run, normalized title, all validated/preserved content,
+and raw extensions; it excludes observation time. Equal findings in different repositories are
+therefore disjoint, while a retry in the same repository reproduces its ID. Any substantive content
+change creates a new ID rather than overwriting the prior finding.
+
+Identity v1 omitted repository/project scope. Existing v1 rows are immutable and are not guessed,
+rewritten, or auto-merged because one collided v1 UUID may already have evidence from more than one
+repository. Every v2 note carries `identity_schema_version=2`, `repo`, `project_id`, and the exact
+deterministic `legacy_id_v1` witness. Operators or a future migration can use that witness plus the
+annotation target to adjudicate a merge; the normal ingest path creates the correctly scoped v2 row
+once and leaves curated v1 history untouched.
 
 ## Output records
 
@@ -53,6 +66,7 @@ or resets its curated lifecycle state.
 
 ## Error taxonomy
 
-`CodeIngestError` distinguishes invalid roots, missing fields, wrong types, invalid governed values,
+`CodeIngestError` distinguishes invalid roots, missing fields, blank/wrong-typed identity strings,
+invalid governed values,
 missing failure scenarios, invalid indexed evidence, unavailable source-run identity, and JSON parse
 failures. Messages include the accepted value set or shape so callers can repair input directly.
