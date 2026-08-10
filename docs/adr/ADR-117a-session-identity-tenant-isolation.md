@@ -1,6 +1,6 @@
 # ADR-117a: Session Identity and Tenant Isolation
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-07-19
 **Authors**: khive maintainers
 **Implements**: [ADR-117](ADR-117-session-continuity-search.md) D1, D2, D4 (the direction ADR names
