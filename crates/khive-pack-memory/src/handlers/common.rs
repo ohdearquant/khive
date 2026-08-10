@@ -1282,6 +1282,13 @@ async fn collect_model_ann_hits_inner(
     let mut model_ann_degrade_reason: Option<String> = None;
     let initial_raw_hits: Option<(Vec<(Uuid, f32)>, u64)> = match search_result {
         Ok(Some(hits_and_seq)) => Some(hits_and_seq),
+        Ok(None) if runtime.is_read_only() => {
+            // Daemon warm deliberately leaves ANN state cold for a snapshot,
+            // and the request path must not replace that omitted lifecycle
+            // with a detached writer-bearing rebuild. Fall through to the
+            // exact sqlite-vec reader below.
+            None
+        }
         Ok(None) => {
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             let rt_detached = runtime.clone();

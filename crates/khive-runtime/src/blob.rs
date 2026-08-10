@@ -8,9 +8,13 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use khive_db::stores::blob_s3::{S3BlobStore, S3BlobStoreConfig};
 use khive_db::{SqliteError, StorageBackend};
-use khive_storage::BlobStore;
+use khive_storage::{
+    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, SqlAccess,
+    StorageCapability, StorageError, StorageResult,
+};
 
 use crate::engine_config::BlobConfig;
 use crate::KhiveConfig;
@@ -53,6 +57,104 @@ pub fn resolve_blob_store(
             let store = S3BlobStore::new(s3_cfg)?;
             Ok(Arc::new(store))
         }
+    }
+}
+
+/// Resolve the configured store for one pack runtime's effective access mode.
+///
+/// A read-only runtime retains `get`/`exists`/`size` against an already-present
+/// fs root (or a configured S3 store), but boot never creates the default fs
+/// root and the wrapper rejects every physical mutator. The mode belongs to the
+/// runtime assigned to the `blob` pack; a mixed topology must not infer it from
+/// the main audit backend.
+pub fn resolve_blob_store_for_mode(
+    cfg: &KhiveConfig,
+    backend: &StorageBackend,
+    read_only: bool,
+) -> Result<Arc<dyn BlobStore>, SqliteError> {
+    if !read_only {
+        return resolve_blob_store(cfg, backend);
+    }
+
+    let inner: Arc<dyn BlobStore> = match &cfg.storage.blob {
+        None => backend.blob_store_read_only(None, None)?,
+        Some(BlobConfig::Fs { root, floor_bytes }) => {
+            let root_path = root.as_ref().map(std::path::PathBuf::from);
+            backend.blob_store_read_only(root_path.as_deref(), *floor_bytes)?
+        }
+        Some(BlobConfig::S3 {
+            bucket,
+            region,
+            endpoint,
+            prefix,
+            allow_http,
+        }) => {
+            let mut s3_cfg = S3BlobStoreConfig::new(bucket.clone(), region.clone());
+            if let Some(endpoint) = endpoint {
+                s3_cfg = s3_cfg.with_endpoint(endpoint.clone());
+            }
+            if let Some(prefix) = prefix {
+                s3_cfg = s3_cfg.with_prefix(prefix.clone());
+            }
+            if let Some(allow_http) = allow_http {
+                s3_cfg = s3_cfg.with_allow_http(*allow_http);
+            }
+            Arc::new(S3BlobStore::new(s3_cfg)?)
+        }
+    };
+    Ok(Arc::new(ReadOnlyBlobStore { inner }))
+}
+
+#[derive(Debug)]
+struct ReadOnlyBlobStore {
+    inner: Arc<dyn BlobStore>,
+}
+
+impl ReadOnlyBlobStore {
+    fn mutation_error(operation: &'static str) -> StorageError {
+        StorageError::Unsupported {
+            capability: StorageCapability::Blob,
+            operation: operation.into(),
+            message: "blob storage is read-only for this pack runtime".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl BlobStore for ReadOnlyBlobStore {
+    async fn put(&self, _bytes: Vec<u8>) -> StorageResult<ContentRef> {
+        Err(Self::mutation_error("put"))
+    }
+
+    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
+        self.inner.get(content_ref).await
+    }
+
+    async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool> {
+        self.inner.exists(content_ref).await
+    }
+
+    async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        self.inner.size(content_ref).await
+    }
+
+    async fn delete(&self, _content_ref: &ContentRef) -> StorageResult<bool> {
+        Err(Self::mutation_error("delete"))
+    }
+
+    async fn orphan_sweep(
+        &self,
+        _config: &BlobOrphanSweepConfig,
+    ) -> StorageResult<BlobOrphanSweepResult> {
+        Err(Self::mutation_error("orphan_sweep"))
+    }
+
+    async fn transactional_orphan_sweep(
+        &self,
+        _sql: &dyn SqlAccess,
+        _dry_run: bool,
+    ) -> StorageResult<BlobOrphanSweepResult> {
+        Err(Self::mutation_error("transactional_orphan_sweep"))
     }
 }
 

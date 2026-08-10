@@ -132,7 +132,9 @@ the process that invokes them during startup through
 not run that daemon warm path. So, like the email channel loops described in
 [Communication and Email](communication.md), running `kkernel mcp --daemon`
 is what actually starts background ingestion; a stdio session never spawns
-its own mirror poller.
+its own mirror poller. A daemon whose session pack is assigned to an ADR-028 A2
+read-only snapshot also suppresses the mirror: its polling loop eventually
+writes session rows and cursor state, so it is not a snapshot-inspection task.
 
 | Variable                         | Default                  |
 | -------------------------------- | ------------------------ |
