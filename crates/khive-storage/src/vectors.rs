@@ -30,6 +30,27 @@ pub trait VectorStore: Send + Sync + 'static {
         field: &str,
         vectors: Vec<Vec<f32>>,
     ) -> StorageResult<()>;
+    /// Store one or more vectors in a permanently exact-only space.
+    ///
+    /// Unlike [`Self::insert`], a backend implementation of this seam must not
+    /// emit ANN-consumer deltas. Callers may use it only for an identity whose
+    /// contract excludes later approximate-index consumption. Backends that do
+    /// not have a distinct exact-only write path reject the operation.
+    async fn insert_exact_only(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> StorageResult<()> {
+        let _ = (subject_id, kind, namespace, field, vectors);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Vectors,
+            operation: "insert_exact_only".into(),
+            message: "backend has no exact-only write seam".into(),
+        })
+    }
     /// Insert a batch of pre-assembled vector records in one call.
     async fn insert_batch(&self, records: Vec<VectorRecord>) -> StorageResult<BatchWriteSummary>;
     /// Delete all vectors associated with the given subject ID.
