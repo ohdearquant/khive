@@ -84,11 +84,39 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
 
 #[cfg(not(unix))]
 fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
-    // No handle-relative, no-follow directory API is exercised on this
-    // platform today (this crate's Windows CI tier is compile-check only,
-    // matching `walpin.rs`'s Windows lane scope); fall back to the
-    // path-based delete used before this hardening.
-    fs::remove_file(shard_path(root, content_ref))
+    // No handle-relative, no-follow directory API (`openat`/`O_NOFOLLOW`) is
+    // exercised on this platform today (this crate's Windows CI tier is
+    // compile-check only, matching `walpin.rs`'s Windows lane scope), so
+    // this checks each shard path component with `symlink_metadata` before
+    // the delete instead. `std::fs::symlink_metadata` reports Windows
+    // junctions and reparse-point symlinks through `file_type().is_symlink()`
+    // without following them, so a junction planted at the root or either
+    // shard level is refused rather than walked into by the final
+    // `remove_file`.
+    //
+    // Residual limitation, accepted for this descriptorless platform tier:
+    // unlike the Unix arm's fd-pinned `openat`/`unlinkat` walk, nothing here
+    // holds an open, referentially-verified handle on the checked
+    // directories between this check and the `remove_file` call below, so a
+    // component could still be swapped for a junction in that window
+    // (TOCTOU). Closing that fully would need a handle-relative, no-follow
+    // API this platform tier does not exercise.
+    let hex = content_ref.as_str();
+    let shard1 = root.join(&hex[0..2]);
+    let shard2 = shard1.join(&hex[2..4]);
+    for component in [root, shard1.as_path(), shard2.as_path()] {
+        let metadata = fs::symlink_metadata(component)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to unlink blob shard file through symlinked path component: {}",
+                    component.display()
+                ),
+            ));
+        }
+    }
+    fs::remove_file(shard2.join(hex))
 }
 
 #[cfg(unix)]

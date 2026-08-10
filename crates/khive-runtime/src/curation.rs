@@ -2006,14 +2006,21 @@ pub(crate) fn note_fts_scalars(note: &Note) -> NoteFtsScalars {
 /// expensive part for an oversized record. Charging this probe against the
 /// budget before the full read means an over-budget record is rejected
 /// without ever being materialized or parsed inside the writer transaction.
+/// Each column is wrapped in `CAST(... AS BLOB)` — plain `LENGTH(text)`
+/// returns SQLite's *character* count for TEXT values, not the UTF-8 byte
+/// count the budget is denominated in, so a multibyte (CJK/emoji) record
+/// could under-report and pass a probe its true byte size exceeds. Casting
+/// to BLOB forces `LENGTH()` to report octets instead.
 /// A missing row probes as zero; `read_merge_entity`'s own "not found" error
 /// fires on the subsequent full read and is unaffected by this probe.
 fn probe_merge_entity_bytes(conn: &rusqlite::Connection, id: Uuid) -> Result<usize, SqliteError> {
     let id_str = id.to_string();
     let len: Option<i64> = conn
         .query_row(
-            "SELECT LENGTH(name) + COALESCE(LENGTH(description), 0) \
-                    + COALESCE(LENGTH(properties), 0) + LENGTH(tags) \
+            "SELECT LENGTH(CAST(name AS BLOB)) \
+                    + COALESCE(LENGTH(CAST(description AS BLOB)), 0) \
+                    + COALESCE(LENGTH(CAST(properties AS BLOB)), 0) \
+                    + LENGTH(CAST(tags AS BLOB)) \
              FROM entities WHERE id = ?1 AND deleted_at IS NULL",
             rusqlite::params![id_str],
             |row| row.get(0),
@@ -2594,13 +2601,15 @@ fn merge_entity_sql(
 
 /// Cheap SQL-side byte-length probe for one merge note — see
 /// [`probe_merge_entity_bytes`] for why this runs before
-/// [`read_merge_note`]'s full column copy and JSON parse.
+/// [`read_merge_note`]'s full column copy and JSON parse, and why each
+/// column is cast to BLOB before `LENGTH()`.
 fn probe_merge_note_bytes(conn: &rusqlite::Connection, id: Uuid) -> Result<usize, SqliteError> {
     let id_str = id.to_string();
     let len: Option<i64> = conn
         .query_row(
-            "SELECT COALESCE(LENGTH(name), 0) + LENGTH(content) \
-                    + COALESCE(LENGTH(properties), 0) \
+            "SELECT COALESCE(LENGTH(CAST(name AS BLOB)), 0) \
+                    + LENGTH(CAST(content AS BLOB)) \
+                    + COALESCE(LENGTH(CAST(properties AS BLOB)), 0) \
              FROM notes WHERE id = ?1 AND deleted_at IS NULL",
             rusqlite::params![id_str],
             |row| row.get(0),
@@ -8551,6 +8560,141 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// Preview-only variant of [`run_entity_merge_with_limits`]: runs
+    /// `merge_entity_sql` with `dry_run = true` and an unlimited budget, and
+    /// returns the observed byte charge without committing any write. Lets a
+    /// test read back the probe's true cost for a record and then reuse that
+    /// exact number to place a tight `MergeTxLimits` threshold, instead of
+    /// guessing at fanout/overhead constants.
+    async fn preview_entity_merge_bytes(rt: &KhiveRuntime, into_id: Uuid, from_id: Uuid) -> usize {
+        let pack_rules = rt.pack_edge_rules();
+        let pool = rt.backend().pool_arc();
+        let (summary, _) = tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().unwrap();
+            guard.transaction(|conn| {
+                merge_entity_sql(
+                    conn,
+                    "local".to_string(),
+                    "fts_entities".to_string(),
+                    Vec::new(),
+                    into_id,
+                    from_id,
+                    EntityDedupMergePolicy::PreferInto,
+                    ContentMergeStrategy::Append,
+                    true,
+                    pack_rules,
+                    EntityMergeValidation::LegacyKind,
+                    MergeTxLimits {
+                        max_rows: usize::MAX,
+                        max_bytes: usize::MAX,
+                    },
+                )
+                .map_err(|error| match error {
+                    MergeEntitySqlError::Sqlite(error) => error,
+                    MergeEntitySqlError::Refusal(_) => SqliteError::InvalidData(
+                        "unexpected transactional policy refusal".to_string(),
+                    ),
+                })
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        summary.tx_budget.bytes_charged
+    }
+
+    /// The byte-budget probe must count actual UTF-8 bytes, not SQLite's
+    /// `LENGTH(text)` character count. Two records with an identical
+    /// character count but different UTF-8 byte sizes (an ASCII control vs.
+    /// a CJK payload, each 200 characters) must charge the budget
+    /// differently — proving the probe casts to BLOB before measuring —
+    /// and a budget threshold placed strictly between the two true costs
+    /// must accept the ASCII control and reject the multibyte payload.
+    #[tokio::test]
+    async fn merge_entity_byte_budget_rejects_multibyte_properties_char_count_would_pass() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let ascii_payload = "x".repeat(200);
+        let multibyte_payload = "\u{4e2d}".repeat(200);
+        assert_eq!(
+            ascii_payload.chars().count(),
+            multibyte_payload.chars().count(),
+            "control and payload must share one character count"
+        );
+        assert!(
+            multibyte_payload.len() > ascii_payload.len(),
+            "multibyte payload must have more UTF-8 bytes than the ASCII control"
+        );
+
+        let into_ascii = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from_ascii = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "From",
+                None,
+                Some(serde_json::json!({ "note": ascii_payload })),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let into_multi = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from_multi = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "From",
+                None,
+                Some(serde_json::json!({ "note": multibyte_payload })),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let ascii_total_bytes = preview_entity_merge_bytes(&rt, into_ascii.id, from_ascii.id).await;
+        let multi_total_bytes = preview_entity_merge_bytes(&rt, into_multi.id, from_multi.id).await;
+        assert!(
+            multi_total_bytes > ascii_total_bytes,
+            "byte-accurate probe must charge more for the multibyte record: \
+             ascii={ascii_total_bytes} multi={multi_total_bytes}"
+        );
+
+        // A threshold pinned exactly at the ASCII control's true cost must
+        // accept it and reject the multibyte record, which a character-
+        // counting probe would have under-charged into passing too.
+        let limits = MergeTxLimits {
+            max_rows: usize::MAX,
+            max_bytes: ascii_total_bytes,
+        };
+
+        run_entity_merge_with_limits(&rt, into_ascii.id, from_ascii.id, limits)
+            .await
+            .expect("ASCII control's true byte cost must fit its own threshold");
+
+        let error = run_entity_merge_with_limits(&rt, into_multi.id, from_multi.id, limits)
+            .await
+            .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("merge transaction budget exceeded"),
+            "multibyte properties must be rejected by the byte-accurate probe; got: {msg}"
+        );
+        assert!(msg.contains("reading merge records"), "got: {msg}");
+        assert!(
+            rt.get_entity(&tok, from_multi.id).await.is_ok(),
+            "from-entity must survive a budget-rejected merge"
+        );
     }
 
     async fn run_note_merge_with_limits(
