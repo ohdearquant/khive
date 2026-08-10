@@ -15,6 +15,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use khive_types::{EdgeRelation, EndpointKind};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 #[allow(dead_code)]
 fn rt() -> KhiveRuntime {
@@ -533,6 +534,94 @@ fn ingest_findings_json_same_ids_across_different_observed_at() {
     );
     assert_eq!(batch_early.notes[0].id, batch_late.notes[0].id);
     assert_eq!(batch_early.edges[0].id, batch_late.edges[0].id);
+}
+
+#[test]
+fn ingest_rejects_whitespace_only_audit_identity_fields() {
+    for field in [
+        "date",
+        "scope",
+        "repo",
+        "branch",
+        "commit",
+        "standards_file",
+    ] {
+        let mut doc = sample_findings_json();
+        doc["audit"][field] = json!("   ");
+        let bytes = serde_json::to_vec(&doc).expect("serializes");
+
+        let err = ingest_findings_json(&bytes, ingest_options(Some("fixed-run")))
+            .expect_err("whitespace-only audit identity must be rejected before construction");
+        assert!(
+            err.to_string().contains(field),
+            "the validation error must identify audit.{field}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn ingest_rejects_whitespace_only_finding_id() {
+    let mut doc = sample_findings_json();
+    doc["findings"][0]["id"] = json!("   ");
+    let bytes = serde_json::to_vec(&doc).expect("serializes");
+
+    let err = ingest_findings_json(&bytes, ingest_options(Some("fixed-run")))
+        .expect_err("a whitespace-only finding id must be rejected before record construction");
+    assert!(
+        err.to_string().contains("findings[].id"),
+        "the validation error must identify findings[].id, got: {err}"
+    );
+}
+
+#[test]
+fn ingest_finding_identity_is_disjoint_across_repositories() {
+    let doc_a = sample_findings_json();
+    let mut doc_b = doc_a.clone();
+    doc_b["audit"]["repo"] = json!("fork-owner/khive");
+
+    let batch_a = ingest_findings_json(
+        &serde_json::to_vec(&doc_a).expect("serializes"),
+        ingest_options(Some("fixed-run")),
+    )
+    .expect("first repository ingests");
+    let batch_b = ingest_findings_json(
+        &serde_json::to_vec(&doc_b).expect("serializes"),
+        ingest_options(Some("fixed-run")),
+    )
+    .expect("second repository ingests");
+
+    assert_ne!(batch_a.entities[0].id, batch_b.entities[0].id);
+    assert_ne!(
+        batch_a.notes[0].id, batch_b.notes[0].id,
+        "the same finding content and source_run in two repositories must not share a note id"
+    );
+    assert_ne!(
+        batch_a.edges[0].id, batch_b.edges[0].id,
+        "repository-disjoint finding notes must also produce disjoint annotation edges"
+    );
+}
+
+#[test]
+fn ingest_finding_v2_identity_carries_project_and_legacy_witnesses() {
+    let batch = ingest_findings_json(&valid_findings_bytes(), ingest_options(Some("fixed-run")))
+        .expect("valid finding ingests");
+    let props = batch.notes[0]
+        .properties
+        .as_ref()
+        .expect("finding carries identity properties");
+
+    assert_eq!(props["identity_schema_version"], 2);
+    assert_eq!(props["repo"], "khive");
+    assert_eq!(props["project_id"], batch.entities[0].id.to_string());
+    let legacy_id = props["legacy_id_v1"]
+        .as_str()
+        .expect("v2 finding exposes its deterministic v1 identity witness");
+    assert!(Uuid::parse_str(legacy_id).is_ok());
+    assert_eq!(
+        legacy_id, "0a6d294d-26ca-568f-8986-814e94843d25",
+        "the migration witness must remain byte-identical to the shipped v1 tuple"
+    );
+    assert_ne!(legacy_id, batch.notes[0].id.to_string());
 }
 
 #[test]
