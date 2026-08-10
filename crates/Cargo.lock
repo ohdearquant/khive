@@ -2228,6 +2228,7 @@ dependencies = [
  "khive-types",
  "khive-vamana",
  "lattice-embed",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

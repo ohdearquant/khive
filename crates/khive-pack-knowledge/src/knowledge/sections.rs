@@ -84,6 +84,22 @@ const MAX_IMPORT_DEPTH: usize = 32;
 const MAX_IMPORT_ENTRIES: usize = 100_000;
 const MAX_IMPORT_FILES: usize = 10_000;
 
+/// Per-file cap for `knowledge.import` source reads. Sized generously above
+/// any legitimate markdown atom (a full research paper rarely exceeds a few
+/// hundred KiB of prose) while still bounding worst-case memory for a single
+/// file read. Mirrors the crate-wide byte-limit idiom used for
+/// `MAX_CARGO_MANIFEST_BYTES` (khive-repo-showcase) and `DAEMON_LOG_MAX_BYTES`
+/// (khive-mcp): a `metadata.len()` pre-check plus a `take(cap + 1)` read-time
+/// re-check so a file that grows after the pre-check is still caught.
+const MAX_IMPORT_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Aggregate cap across every file read by one `knowledge.import` call.
+/// `MAX_IMPORT_FILES` alone bounds file *count*, not total bytes — up to
+/// 10,000 files each just under `MAX_IMPORT_FILE_BYTES` could otherwise sum
+/// to tens of GB of prepared document content in one call. This caps total
+/// import size independent of how it's distributed across files.
+const MAX_IMPORT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug)]
 struct ImportTraversalLimits {
     max_depth: usize,
@@ -327,17 +343,105 @@ struct PreparedImportFile {
     sections_skipped: usize,
 }
 
+/// Open `file` for reading without following a symlink at its final
+/// component. Closes the gap between [`collect_md_files_with_limits`]'s
+/// traversal-time `file_type()` check (or the root-file `symlink_metadata`
+/// check in [`import`](super::KnowledgeHandlers::import)) and the later
+/// content read: without `O_NOFOLLOW` an attacker who swaps the path for a
+/// symlink or special file in that window would have their read followed
+/// transparently. The subsequent [`read_import_file`] call `fstat`s this
+/// same handle rather than the path, so the type check and the read
+/// observe the same inode.
+#[cfg(unix)]
+fn open_import_file_handle(file: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(file)
+}
+
+/// Best-effort fallback where `O_NOFOLLOW` isn't available: the opened
+/// handle is still `fstat`-checked in [`read_import_file`], just without
+/// the open-time symlink refusal.
+#[cfg(not(unix))]
+fn open_import_file_handle(file: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(file)
+}
+
+/// Read one import source through an opened, `fstat`-checked handle and
+/// enforce the per-file and running aggregate byte caps. `total_bytes` is
+/// threaded across every file in one `knowledge.import` call so the
+/// aggregate cap trips regardless of how the total is distributed across
+/// files.
+fn read_import_file(
+    file: &Path,
+    source_path: &str,
+    total_bytes: &mut u64,
+) -> Result<String, RuntimeError> {
+    use std::io::Read;
+
+    let mut handle = open_import_file_handle(file).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "failed to open import source {source_path:?}: {error}"
+        ))
+    })?;
+    let metadata = handle.metadata().map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "failed to inspect opened import source {source_path:?}: {error}"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "import source {source_path:?} is not a regular file on the opened handle \
+             (symlink or special-file swap after validation)"
+        )));
+    }
+    if metadata.len() > MAX_IMPORT_FILE_BYTES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "import source {source_path:?} is {} bytes, exceeding the per-file cap of \
+             {MAX_IMPORT_FILE_BYTES} bytes",
+            metadata.len()
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    handle
+        .by_ref()
+        .take(MAX_IMPORT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "failed to read import source {source_path:?}: {error}"
+            ))
+        })?;
+    if bytes.len() as u64 > MAX_IMPORT_FILE_BYTES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "import source {source_path:?} grew beyond the per-file cap of \
+             {MAX_IMPORT_FILE_BYTES} bytes while being read"
+        )));
+    }
+
+    *total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+    if *total_bytes > MAX_IMPORT_TOTAL_BYTES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "knowledge.import aggregate size {total_bytes} bytes exceeds the total-import \
+             cap of {MAX_IMPORT_TOTAL_BYTES} bytes at {source_path:?}"
+        )));
+    }
+
+    String::from_utf8(bytes).map_err(|_| {
+        RuntimeError::InvalidInput(format!("import source {source_path:?} is not valid UTF-8"))
+    })
+}
+
 fn prepare_import_file(
     file: &Path,
     identity: ImportSourceIdentity,
     chunk_strategy: &str,
+    total_bytes: &mut u64,
 ) -> Result<PreparedImportFile, RuntimeError> {
-    let content = std::fs::read_to_string(file).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "failed to read import source {:?} before writes: {error}",
-            identity.source_path
-        ))
-    })?;
+    let content = read_import_file(file, &identity.source_path, total_bytes)?;
     let (atom_name, atom_body, parsed_sections) = parse_atlas_md(&content);
     let atlas_id = extract_atlas_id(&content);
     let name = if atom_name.is_empty() {
@@ -811,8 +915,14 @@ impl KnowledgeHandlers {
         }
 
         let mut prepared_files = Vec::with_capacity(identities.len());
+        let mut total_bytes = 0u64;
         for (file, identity) in identities {
-            prepared_files.push(prepare_import_file(&file, identity, &chunk_strategy)?);
+            prepared_files.push(prepare_import_file(
+                &file,
+                identity,
+                &chunk_strategy,
+                &mut total_bytes,
+            )?);
         }
 
         let sections_discovered = prepared_files
@@ -1234,5 +1344,97 @@ mod import_traversal_tests {
 
         assert_eq!(discovery.files, vec![markdown]);
         assert_eq!(discovery.files_skipped, 1);
+    }
+}
+
+#[cfg(test)]
+mod import_read_tests {
+    use super::{read_import_file, MAX_IMPORT_FILE_BYTES, MAX_IMPORT_TOTAL_BYTES};
+    use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_swap_at_read_time_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("temp root");
+        let outside = TempDir::new().expect("outside root");
+        let secret = outside.path().join("secret.md");
+        std::fs::write(&secret, "outside content").expect("secret fixture");
+
+        // Simulates the post-validation swap: the path traversal accepted
+        // as a regular file is, by read time, a symlink pointing outside
+        // the import root.
+        let swapped = root.path().join("swapped.md");
+        symlink(&secret, &swapped).expect("swap symlink fixture");
+
+        let mut total_bytes = 0u64;
+        let error = read_import_file(&swapped, "swapped.md", &mut total_bytes)
+            .expect_err("a symlink swapped in after validation must be refused at read time");
+        assert!(
+            error.to_string().contains("failed to open import source"),
+            "{error}"
+        );
+        assert_eq!(
+            total_bytes, 0,
+            "a rejected read must not count toward the aggregate cap"
+        );
+    }
+
+    #[test]
+    fn oversize_single_file_is_refused() {
+        let root = TempDir::new().expect("temp root");
+        let big = root.path().join("big.md");
+        let file = std::fs::File::create(&big).expect("create big fixture");
+        file.set_len(MAX_IMPORT_FILE_BYTES + 1)
+            .expect("grow big fixture past the per-file cap");
+        drop(file);
+
+        let mut total_bytes = 0u64;
+        let error = read_import_file(&big, "big.md", &mut total_bytes)
+            .expect_err("a file over the per-file cap must be refused");
+        assert!(
+            error.to_string().contains("exceeding the per-file cap"),
+            "{error}"
+        );
+        assert_eq!(
+            total_bytes, 0,
+            "a rejected read must not count toward the aggregate cap"
+        );
+    }
+
+    #[test]
+    fn aggregate_cap_is_refused_once_tripped() {
+        let root = TempDir::new().expect("temp root");
+        let small = root.path().join("small.md");
+        std::fs::write(
+            &small,
+            "a small file that pushes the running total over the cap",
+        )
+        .expect("small fixture");
+
+        // Seed the running total just under the aggregate cap so this one
+        // small read is what tips it over, without needing to write a
+        // 256 MiB fixture to disk.
+        let mut total_bytes = MAX_IMPORT_TOTAL_BYTES - 5;
+        let error = read_import_file(&small, "small.md", &mut total_bytes)
+            .expect_err("a read that crosses the aggregate cap must be refused");
+        assert!(
+            error.to_string().contains("exceeds the total-import cap"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn clean_read_under_both_caps_succeeds() {
+        let root = TempDir::new().expect("temp root");
+        let clean = root.path().join("clean.md");
+        std::fs::write(&clean, "# Clean\n\nWell under every cap.").expect("clean fixture");
+
+        let mut total_bytes = 0u64;
+        let content = read_import_file(&clean, "clean.md", &mut total_bytes)
+            .expect("a file under both caps must read successfully");
+        assert_eq!(content, "# Clean\n\nWell under every cap.");
+        assert_eq!(total_bytes, content.len() as u64);
     }
 }

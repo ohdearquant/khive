@@ -247,3 +247,31 @@ async fn import_report_counts_discovery_and_intentional_skips() {
     assert_eq!(response["imported_sections"], 0);
     assert_eq!(response["sections_skipped"], 1);
 }
+
+#[tokio::test]
+async fn clean_directory_import_still_succeeds_under_the_byte_caps() {
+    let f = fixture();
+    let root = TempDir::new().expect("temp root");
+    for (dir, title) in [("alpha", "Alpha Topic"), ("beta", "Beta Topic")] {
+        let nested = root.path().join(dir);
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(nested.join("topic.md"), markdown(title)).expect("markdown fixture");
+    }
+
+    let response = f
+        .dispatch(
+            "knowledge.import",
+            json!({ "path": root.path().to_str().expect("utf-8 root") }),
+        )
+        .await
+        .expect("a clean, well-under-cap import must still succeed");
+
+    assert_eq!(response["imported_atoms"], 2);
+    assert_eq!(response["files_processed"], 2);
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+            .await,
+        2,
+        "both well-under-cap atoms must be persisted"
+    );
+}
