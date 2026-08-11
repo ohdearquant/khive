@@ -47,6 +47,7 @@ import {
   OntologyLegend,
   RelationMark,
 } from "@/components/ontology-mark";
+import { settleGraphLayout } from "@/lib/graph-layout";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import {
   isReviewReport,
@@ -455,14 +456,22 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
     id: bundle.graph.nodes.items[0]?.id ?? "",
   });
 
-  const nodeById = useMemo(() => new Map(bundle.graph.nodes.items.map((node) => [node.id, node])), [bundle.graph.nodes.items]);
+  const settledNodes = useMemo(
+    () => settleGraphLayout(bundle.graph.nodes.items, bundle.graph.edges.items),
+    [bundle.graph.edges.items, bundle.graph.nodes.items],
+  );
+
+  const nodeById = useMemo(
+    () => new Map(settledNodes.map((node) => [node.id, node])),
+    [settledNodes],
+  );
   const edgeById = useMemo(() => new Map(bundle.graph.edges.items.map((edge) => [edge.id, edge])), [bundle.graph.edges.items]);
 
   const selectNode = (id: string) => setSelection({ type: "node", id });
   const selectEdge = (id: string) => setSelection({ type: "edge", id });
 
   const selected = selection.type === "node"
-    ? bundle.graph.nodes.items.find((node) => node.id === selection.id) ?? bundle.graph.nodes.items[0]
+    ? settledNodes.find((node) => node.id === selection.id) ?? settledNodes[0]
     : undefined;
   const selectedEdge = selection.type === "edge" ? edgeById.get(selection.id) : undefined;
   const selectedEdgeSource = selectedEdge ? nodeById.get(selectedEdge.source) : undefined;
@@ -539,7 +548,7 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
             );
           })}
         </svg>
-        {bundle.graph.nodes.items.map((node) => (
+        {settledNodes.map((node) => (
           <button
             type="button"
             className={`graph-node ${node.state} ${selection.type === "node" && node.id === selection.id ? "selected" : ""}`}
