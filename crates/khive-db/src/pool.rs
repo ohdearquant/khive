@@ -1,6 +1,6 @@
 //! Connection pool for SQLite: one exclusive writer, N concurrent readers.
 use crossbeam_queue::ArrayQueue;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
 use std::fs;
@@ -33,6 +33,92 @@ const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 /// ownership claim ([`ConnectionPool::claim_checkpoint_ownership`]), which a
 /// runtime may make only when it really runs the scheduled checkpoint task.
 pub(crate) const FALLBACK_WAL_AUTOCHECKPOINT_PAGES: u32 = 4_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointOwnership {
+    Unclaimed,
+    Claiming,
+    Claimed,
+}
+
+struct CheckpointOwnershipState {
+    phase: CheckpointOwnership,
+    #[cfg(test)]
+    connection_waiters: usize,
+}
+
+struct CheckpointOwnershipGate {
+    state: Mutex<CheckpointOwnershipState>,
+    changed: Condvar,
+}
+
+impl CheckpointOwnershipGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CheckpointOwnershipState {
+                phase: CheckpointOwnership::Unclaimed,
+                #[cfg(test)]
+                connection_waiters: 0,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Join an in-flight claim, or become the one caller that configures it.
+    /// Returns `false` when another caller has already completed the claim.
+    fn begin_claim(&self) -> bool {
+        let mut state = self.state.lock();
+        loop {
+            match state.phase {
+                CheckpointOwnership::Unclaimed => {
+                    state.phase = CheckpointOwnership::Claiming;
+                    self.changed.notify_all();
+                    return true;
+                }
+                CheckpointOwnership::Claiming => self.changed.wait(&mut state),
+                CheckpointOwnership::Claimed => return false,
+            }
+        }
+    }
+
+    fn finish_claim(&self, succeeded: bool) {
+        let mut state = self.state.lock();
+        debug_assert_eq!(state.phase, CheckpointOwnership::Claiming);
+        state.phase = if succeeded {
+            CheckpointOwnership::Claimed
+        } else {
+            CheckpointOwnership::Unclaimed
+        };
+        self.changed.notify_all();
+    }
+
+    /// Wait for an in-flight claim before selecting the connection-local
+    /// autocheckpoint posture. The condition variable makes the claim's
+    /// publication and every standalone open that encounters `Claiming` one
+    /// ordered decision: that open cannot retain the fallback after a
+    /// successful claim or lose the fallback after a failed one.
+    fn wal_autocheckpoint_pages(&self) -> u32 {
+        let mut state = self.state.lock();
+        while state.phase == CheckpointOwnership::Claiming {
+            #[cfg(test)]
+            {
+                state.connection_waiters += 1;
+                self.changed.notify_all();
+            }
+            self.changed.wait(&mut state);
+            #[cfg(test)]
+            {
+                state.connection_waiters -= 1;
+                self.changed.notify_all();
+            }
+        }
+        match state.phase {
+            CheckpointOwnership::Unclaimed => FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+            CheckpointOwnership::Claimed => 0,
+            CheckpointOwnership::Claiming => unreachable!("claim wait must settle the state"),
+        }
+    }
+}
 
 fn deny_retired_writer(_context: AuthContext<'_>) -> Authorization {
     Authorization::Deny
@@ -304,15 +390,15 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
-    /// Whether a dedicated checkpoint owner (the ADR-091 scheduled task) has
-    /// claimed routine WAL reclamation for this pool. Until claimed, every
+    /// Three-state gate for whether the ADR-091 scheduled task has claimed
+    /// routine WAL reclamation for this pool. Until claimed, every
     /// writer-capable connection keeps a bounded SQLite autocheckpoint
     /// ([`FALLBACK_WAL_AUTOCHECKPOINT_PAGES`]) so a writable pool without a
     /// checkpoint task cannot grow its WAL without bound. After
     /// [`Self::claim_checkpoint_ownership`], writer-capable connections open
     /// with `wal_autocheckpoint = 0` and routine checkpoint I/O stays off
     /// application commit paths.
-    checkpoint_owner_claimed: AtomicBool,
+    checkpoint_ownership: CheckpointOwnershipGate,
     /// Fail-closed guard for the legacy pool-mutex writer. A transaction
     /// owner retires this connection after a body panic or when it cannot
     /// prove that finalization restored autocommit mode; subsequent checkouts
@@ -589,7 +675,7 @@ impl ConnectionPool {
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
-            checkpoint_owner_claimed: AtomicBool::new(false),
+            checkpoint_ownership: CheckpointOwnershipGate::new(),
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             readers,
@@ -1078,11 +1164,7 @@ impl ConnectionPool {
     /// opened right now: `0` once a dedicated checkpoint owner has claimed
     /// the pool, the bounded fallback otherwise.
     pub(crate) fn effective_wal_autocheckpoint_pages(&self) -> u32 {
-        if self.checkpoint_owner_claimed.load(Ordering::Acquire) {
-            0
-        } else {
-            FALLBACK_WAL_AUTOCHECKPOINT_PAGES
-        }
+        self.checkpoint_ownership.wal_autocheckpoint_pages()
     }
 
     /// Claim routine WAL-checkpoint ownership for this pool.
@@ -1107,12 +1189,18 @@ impl ConnectionPool {
     /// the pooled writer is configured successfully; a failed attempt keeps
     /// the bounded fallback active and remains retryable.
     pub fn claim_checkpoint_ownership(&self) -> Result<(), SqliteError> {
-        if !self.config.read_only {
-            let writer = self.writer()?;
-            writer.conn().pragma_update(None, "wal_autocheckpoint", 0)?;
+        if !self.checkpoint_ownership.begin_claim() {
+            return Ok(());
         }
-        self.checkpoint_owner_claimed.store(true, Ordering::Release);
-        Ok(())
+        let result = (|| {
+            if !self.config.read_only {
+                let writer = self.writer()?;
+                writer.conn().pragma_update(None, "wal_autocheckpoint", 0)?;
+            }
+            Ok(())
+        })();
+        self.checkpoint_ownership.finish_claim(result.is_ok());
+        result
     }
 
     /// Flip an already-running writer task's long-lived connection to the
@@ -2550,6 +2638,70 @@ mod tests {
             wal_autocheckpoint_pages(memory_writer.conn()),
             FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
             "an unclaimed in-memory pool keeps the bounded fallback"
+        );
+    }
+
+    #[test]
+    fn standalone_writer_waits_for_checkpoint_claim_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_claim_race.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                checkout_timeout: Duration::from_secs(5),
+                write_queue_enabled: Some(false),
+                ..PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+
+        let legacy_conn = pool.legacy_conn();
+        let held_writer = legacy_conn.lock();
+        let claim_start = Arc::new(std::sync::Barrier::new(2));
+        let claim_pool = Arc::clone(&pool);
+        let claim_thread_start = Arc::clone(&claim_start);
+        let claim_thread = thread::spawn(move || {
+            claim_thread_start.wait();
+            claim_pool.claim_checkpoint_ownership()
+        });
+        claim_start.wait();
+
+        {
+            let mut state = pool.checkpoint_ownership.state.lock();
+            while state.phase != CheckpointOwnership::Claiming {
+                pool.checkpoint_ownership.changed.wait(&mut state);
+            }
+        }
+
+        let open_start = Arc::new(std::sync::Barrier::new(2));
+        let open_pool = Arc::clone(&pool);
+        let open_thread_start = Arc::clone(&open_start);
+        let open_thread = thread::spawn(move || {
+            open_thread_start.wait();
+            let conn = open_pool
+                .open_standalone_writer()
+                .expect("standalone writer after claim resolution");
+            wal_autocheckpoint_pages(&conn)
+        });
+        open_start.wait();
+
+        {
+            let mut state = pool.checkpoint_ownership.state.lock();
+            while state.connection_waiters == 0 {
+                pool.checkpoint_ownership.changed.wait(&mut state);
+            }
+            assert_eq!(state.phase, CheckpointOwnership::Claiming);
+        }
+
+        drop(held_writer);
+        claim_thread
+            .join()
+            .expect("claim thread joins")
+            .expect("claim succeeds");
+        assert_eq!(
+            open_thread.join().expect("standalone-open thread joins"),
+            0,
+            "a writer open concurrent with a successful claim must inherit claimed ownership"
         );
     }
 

@@ -1794,7 +1794,8 @@ pub async fn run_checkpoint_task(
         tracing::warn!(
             error = %e,
             "checkpoint task could not re-apply the ownership pragma on the pooled writer; \
-             writer connections keep the bounded autocheckpoint fallback until reopened"
+             writer connections keep the bounded autocheckpoint fallback unless ownership is \
+             claimed later"
         );
     }
     if let Err(e) = pool.propagate_checkpoint_claim_to_writer_task().await {
