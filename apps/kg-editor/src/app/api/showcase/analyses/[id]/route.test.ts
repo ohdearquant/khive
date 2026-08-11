@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createShowcaseAnalysisGet } from "./route";
+import { createShowcaseAnalysisGet } from "@/lib/server/showcase-analysis-route";
 
 const goldenPath = resolve(
   process.cwd(),
