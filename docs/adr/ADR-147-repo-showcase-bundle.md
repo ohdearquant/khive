@@ -285,3 +285,41 @@ the producer's Rust module-path rules differ from the earlier illustrative table
   bundle-contract discipline this ADR reuses
 - ADR-146: Forge-native KG review (proposed, in flight) — sibling lane
   sharing rendering components
+
+## Amendment 1 — Operator-configured DB snapshot delivery (2026-08-11)
+
+The static golden remains the portable contract fixture and the public, zero-service
+fallback. A local operator may additionally serve a completed repository analysis from
+a server-private materialization when the purpose is to inspect a repository already
+registered on that machine.
+
+This mode does not turn slice 1 into on-demand ingest:
+
+1. The operator runs `khive repo build` out of band. Each successful run owns a fresh,
+   dedicated history database, code-map database, pinned checkout, and canonical
+   `khive.repo.v1` report. A failed or incomplete run is never promoted.
+2. The Next.js server accepts only a closed, configured analysis ID. Browser input never
+   supplies a repository URL, filesystem path, database path, executable, or argument.
+   Looking up an unknown ID performs no filesystem or process work.
+3. Request handling performs no clone, ingest, export, SQLite open, or child-process
+   execution. It reads the completed server-private report, enforces the browser byte
+   ceiling, validates the closed wire model, and returns the exact bounded report.
+4. Analysis roots and their parents are operator-owned, server-private, and not writable
+   by untrusted local principals. A promoted analysis directory is immutable. The reader
+   refuses symlink components, verifies canonical containment both before and after open,
+   and compares the opened handle's file identity with the final path before reading.
+   Run directories, database paths, validation failures, and SQLite details remain
+   server-private. Responses use stable sanitized errors and are marked
+   `private, no-store`.
+5. A UI that selects this source calls it a **DB-backed snapshot** and names its pinned
+   SHA and generation time. It must not call it live: the two stores were reconciled at
+   build time and are immutable for that analysis ID until the operator promotes another
+   successful run.
+
+Here, SQLite is the analysis source of truth and JSON is the bounded read model between
+the Rust exporter and renderer. This defines how a later UI adapter can remove a
+checked-in browser asset from its active path without duplicating the cross-store join
+in TypeScript. The server boundary can land independently while the static adapter
+remains the default. This amendment does not authorize request-time `repo export`,
+arbitrary-URL ingestion, or direct browser/Next.js access to SQLite. Those remain slice
+2 and require the queueing, sandboxing, resource-limit, and abuse-control design in D4.

@@ -88,6 +88,34 @@ npm run build
 The production build is a statically rendered App Router page. There is intentionally no hosting
 or deployment configuration in this open-source slice.
 
+## Optional DB-backed snapshot delivery
+
+For a local analysis prepared with `kkernel repo build`, the Node server can expose a
+server-private materialized report without placing it under `public/`:
+
+```bash
+KHIVE_SHOWCASE_ANALYSIS_ROOT=/absolute/path/to/analyses \
+KHIVE_SHOWCASE_ANALYSIS_IDS=khive \
+npm run dev
+```
+
+The report must be located at
+`$KHIVE_SHOWCASE_ANALYSIS_ROOT/khive/khive.repo.v1.json`. Fetch it at
+`/api/showcase/analyses/khive`. IDs are a closed operator allowlist; the route rejects
+symlinks, reports above 8 MiB, malformed bundles, and unknown IDs. It never opens
+SQLite or starts a repository process. Responses deliberately omit server paths and
+carry `X-Khive-Analysis-Source: khive-db-snapshot` plus the analysis ID and a canonical
+byte ETag.
+
+The analysis root and its parent must be owned by the operator and unavailable for
+untrusted local writes. Promoted analysis directories are immutable: build into a fresh
+run directory, then publish only the completed report. The reader verifies path
+containment and file identity after opening and reads at most 8 MiB plus one sentinel
+byte.
+
+This is a pinned DB-backed snapshot, not a live mutable query and not arbitrary URL
+ingest. See ADR-147 Amendment 1 and the repository-showcase CLI guide.
+
 ## Adapter boundary
 
 `RepoBundle` in `src/lib/repo-bundle.ts` and `ReviewInput` in
