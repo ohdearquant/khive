@@ -33,7 +33,7 @@ import {
   OntologyLegend,
   RelationMark,
 } from "@/components/ontology-mark";
-import { DERIVED_EDGE_MARK, edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
+import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import type {
   RepoBundle,
   RepoModule,
@@ -76,6 +76,11 @@ const UI_ROW_LIMIT = 200;
 const UI_TREEMAP_LIMIT = 180;
 const UI_RESIDUAL_LIMIT = 80;
 const UI_GRAPH_EDGE_LIMIT = 50;
+
+function derivedDiamondPoints(x: number, y: number): string {
+  const r = 1.1;
+  return `${x},${y - r} ${x + r},${y} ${x},${y + r} ${x - r},${y}`;
+}
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat("en", { notation: value >= 10_000 ? "compact" : "standard" }).format(value);
@@ -284,9 +289,8 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
         </div>
         <OntologyLegend
           className="repo-ontology-legend"
-          entityKinds={["project", "concept"]}
-          includeDerived={displayedEdges.some((edge) => edge.origin === "derived")}
-          relations={displayedEdges.map((edge) => edge.relation)}
+          presentEntityKinds={["project", "concept"]}
+          presentRelations={displayedEdges.map((edge) => edge.relation)}
         />
         <div className="repo-graph-stage" aria-label={capability.views.structure_graph.label}>
           <div className="repo-graph-viewport" style={{ transform: `scale(${zoom})` }}>
@@ -337,13 +341,13 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
                       >›</text>
                     )}
                     {edge.origin === "derived" && (
-                      <text
-                        className="ontology-edge-glyph ontology-derived-glyph"
-                        x={source.x + (target.x - source.x) * 0.4}
-                        y={source.y + (target.y - source.y) * 0.4}
-                      >
-                        {DERIVED_EDGE_MARK.glyph}
-                      </text>
+                      <polygon
+                        className="ontology-derived-glyph"
+                        points={derivedDiamondPoints(
+                          source.x + (target.x - source.x) * 0.4,
+                          source.y + (target.y - source.y) * 0.4,
+                        )}
+                      />
                     )}
                   </g>
                 );
