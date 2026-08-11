@@ -47,9 +47,29 @@ struct CheckpointOwnershipState {
     connection_waiters: usize,
 }
 
+#[cfg(test)]
+struct CheckpointConnectionConfigPause {
+    selected: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl CheckpointConnectionConfigPause {
+    fn new() -> Self {
+        Self {
+            selected: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        }
+    }
+}
+
 struct CheckpointOwnershipGate {
     state: Mutex<CheckpointOwnershipState>,
     changed: Condvar,
+    #[cfg(test)]
+    connection_config_pause: Mutex<Option<Arc<CheckpointConnectionConfigPause>>>,
+    #[cfg(test)]
+    claim_lock_observed: Mutex<Option<std::sync::mpsc::SyncSender<bool>>>,
 }
 
 impl CheckpointOwnershipGate {
@@ -61,12 +81,34 @@ impl CheckpointOwnershipGate {
                 connection_waiters: 0,
             }),
             changed: Condvar::new(),
+            #[cfg(test)]
+            connection_config_pause: Mutex::new(None),
+            #[cfg(test)]
+            claim_lock_observed: Mutex::new(None),
         }
     }
 
     /// Join an in-flight claim, or become the one caller that configures it.
     /// Returns `false` when another caller has already completed the claim.
     fn begin_claim(&self) -> bool {
+        #[cfg(test)]
+        let claim_lock_observed = self.claim_lock_observed.lock().take();
+        #[cfg(test)]
+        let mut state = if let Some(observed) = claim_lock_observed {
+            match self.state.try_lock() {
+                Some(state) => {
+                    let _ = observed.send(false);
+                    state
+                }
+                None => {
+                    let _ = observed.send(true);
+                    self.state.lock()
+                }
+            }
+        } else {
+            self.state.lock()
+        };
+        #[cfg(not(test))]
         let mut state = self.state.lock();
         loop {
             match state.phase {
@@ -92,12 +134,7 @@ impl CheckpointOwnershipGate {
         self.changed.notify_all();
     }
 
-    /// Wait for an in-flight claim before selecting the connection-local
-    /// autocheckpoint posture. The condition variable makes the claim's
-    /// publication and every standalone open that encounters `Claiming` one
-    /// ordered decision: that open cannot retain the fallback after a
-    /// successful claim or lose the fallback after a failed one.
-    fn wal_autocheckpoint_pages(&self) -> u32 {
+    fn settled_state(&self) -> parking_lot::MutexGuard<'_, CheckpointOwnershipState> {
         let mut state = self.state.lock();
         while state.phase == CheckpointOwnership::Claiming {
             #[cfg(test)]
@@ -112,11 +149,37 @@ impl CheckpointOwnershipGate {
                 self.changed.notify_all();
             }
         }
+        state
+    }
+
+    fn wal_autocheckpoint_pages(&self) -> u32 {
+        let state = self.settled_state();
         match state.phase {
             CheckpointOwnership::Unclaimed => FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
             CheckpointOwnership::Claimed => 0,
             CheckpointOwnership::Claiming => unreachable!("claim wait must settle the state"),
         }
+    }
+
+    /// Wait for any in-flight claim, select the resulting posture, and retain
+    /// the gate until SQLite has applied that connection-local PRAGMA. A claim
+    /// therefore linearizes entirely before or after this configuration,
+    /// never between its state sample and side effect.
+    fn configure_wal_autocheckpoint(&self, conn: &Connection) -> Result<(), SqliteError> {
+        let state = self.settled_state();
+        let pages = match state.phase {
+            CheckpointOwnership::Unclaimed => FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+            CheckpointOwnership::Claimed => 0,
+            CheckpointOwnership::Claiming => unreachable!("claim wait must settle the state"),
+        };
+        #[cfg(test)]
+        if let Some(pause) = self.connection_config_pause.lock().take() {
+            pause.selected.wait();
+            pause.resume.wait();
+        }
+        conn.pragma_update(None, "wal_autocheckpoint", pages)?;
+        drop(state);
+        Ok(())
     }
 }
 
@@ -1150,11 +1213,8 @@ impl ConnectionPool {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(self.config.busy_timeout)?;
-        conn.pragma_update(
-            None,
-            "wal_autocheckpoint",
-            self.effective_wal_autocheckpoint_pages(),
-        )?;
+        self.checkpoint_ownership
+            .configure_wal_autocheckpoint(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)
@@ -2703,6 +2763,59 @@ mod tests {
             0,
             "a writer open concurrent with a successful claim must inherit claimed ownership"
         );
+    }
+
+    #[test]
+    fn standalone_fallback_application_linearizes_before_claim_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_open_before_claim.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                checkout_timeout: Duration::from_secs(5),
+                write_queue_enabled: Some(false),
+                ..PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+        let pause = Arc::new(CheckpointConnectionConfigPause::new());
+        *pool.checkpoint_ownership.connection_config_pause.lock() = Some(Arc::clone(&pause));
+
+        let open_pool = Arc::clone(&pool);
+        let open_thread = thread::spawn(move || {
+            let conn = open_pool
+                .open_standalone_writer()
+                .expect("standalone writer opens");
+            wal_autocheckpoint_pages(&conn)
+        });
+        pause.selected.wait();
+        assert!(
+            pool.checkpoint_ownership.state.try_lock().is_none(),
+            "standalone selection must retain the ownership gate until its PRAGMA is applied"
+        );
+
+        let (claim_observed_tx, claim_observed_rx) = std::sync::mpsc::sync_channel(0);
+        *pool.checkpoint_ownership.claim_lock_observed.lock() = Some(claim_observed_tx);
+        let claim_pool = Arc::clone(&pool);
+        let claim_thread = thread::spawn(move || claim_pool.claim_checkpoint_ownership());
+        assert!(
+            claim_observed_rx
+                .recv()
+                .expect("claim reports whether it observed gate contention"),
+            "the claim must attempt the gate between fallback selection and PRAGMA application"
+        );
+        pause.resume.wait();
+
+        assert_eq!(
+            open_thread.join().expect("standalone-open thread joins"),
+            FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+            "an open linearized before the claim keeps the fallback"
+        );
+        claim_thread
+            .join()
+            .expect("claim thread joins")
+            .expect("claim succeeds after standalone configuration");
+        assert_eq!(pool.effective_wal_autocheckpoint_pages(), 0);
     }
 
     #[test]
