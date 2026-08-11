@@ -3771,7 +3771,14 @@ mod tests {
         );
 
         let legacy_conn = pool.legacy_conn();
-        let held_writer = legacy_conn.lock();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _held_writer = legacy_conn.lock();
+            held_tx.send(()).expect("signal held pooled writer");
+            release_rx.recv().expect("release held pooled writer");
+        });
+        held_rx.await.expect("pooled writer holder started");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         drop(shutdown_tx);
         run_checkpoint_task(
@@ -3792,7 +3799,8 @@ mod tests {
             crate::pool::FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
             "failed pooled-writer claim must not partially propagate ownership"
         );
-        drop(held_writer);
+        release_tx.send(()).expect("release pooled writer");
+        holder.await.expect("pooled writer holder joined");
     }
 
     #[tokio::test]
