@@ -20,12 +20,15 @@ import type { CSSProperties } from "react";
 
 import {
   DERIVED_EDGE_MARK,
+  EDGE_RELATIONS,
   type EdgeLegendEntry,
   edgeLegendFor,
+  ENTITY_KINDS,
   entityLegendFor,
   isNoteKind,
   type KindLegendEntry,
   noteLegendFor,
+  NOTE_KINDS,
   type OntologyIconName,
 } from "@/lib/ontology-legend";
 
@@ -209,44 +212,76 @@ export function DerivedEdgeMark({
       className={classes("ontology-derived-mark", className)}
       title={DERIVED_EDGE_MARK.geometry}
     >
-      <b aria-hidden="true">{DERIVED_EDGE_MARK.glyph}</b>
+      <svg
+        aria-hidden="true"
+        className="ontology-derived-glyph-icon"
+        viewBox="0 0 24 24"
+      >
+        <polygon points="12,3 21,12 12,21 3,12" />
+      </svg>
       <span>{label}</span>
     </span>
   );
 }
 
-function unique(values: readonly string[]): string[] {
-  return [...new Set(values)];
+function dimClass(present: Set<string> | null, value: string): string | undefined {
+  return present && !present.has(value) ? "ontology-mark-dim" : undefined;
 }
 
+/**
+ * Renders the complete closed ontology (9 entity kinds, 17 relations, 5 note
+ * kinds, plus the derived-edge mark) per ADR-153 D1/D5 — the legend is a
+ * permanent, complete on-canvas affordance, not a per-graph subset. Passing
+ * `presentEntityKinds` / `presentNoteKinds` / `presentRelations` highlights
+ * which identities occur in the current graph by dimming the rest; it never
+ * removes an identity from the render.
+ */
 export function OntologyLegend({
-  entityKinds = [],
-  noteKinds = [],
-  relations = [],
-  includeDerived = false,
+  presentEntityKinds,
+  presentNoteKinds,
+  presentRelations,
   className,
 }: {
-  entityKinds?: readonly string[];
-  noteKinds?: readonly string[];
-  relations?: readonly string[];
-  includeDerived?: boolean;
+  presentEntityKinds?: readonly string[];
+  presentNoteKinds?: readonly string[];
+  presentRelations?: readonly string[];
   className?: string;
 }) {
+  const presentEntitySet = presentEntityKinds
+    ? new Set(presentEntityKinds)
+    : null;
+  const presentNoteSet = presentNoteKinds ? new Set(presentNoteKinds) : null;
+  const presentRelationSet = presentRelations
+    ? new Set(presentRelations)
+    : null;
+
   return (
     <div
       className={classes("ontology-legend", className)}
       aria-label="Ontology legend"
     >
-      {unique(entityKinds).map((kind) => (
-        <EntityKindMark kind={kind} key={`entity-${kind}`} />
+      {ENTITY_KINDS.map((kind) => (
+        <EntityKindMark
+          kind={kind}
+          key={`entity-${kind}`}
+          className={dimClass(presentEntitySet, kind)}
+        />
       ))}
-      {unique(noteKinds).map((kind) => (
-        <NoteKindMark kind={kind} key={`note-${kind}`} />
+      {NOTE_KINDS.map((kind) => (
+        <NoteKindMark
+          kind={kind}
+          key={`note-${kind}`}
+          className={dimClass(presentNoteSet, kind)}
+        />
       ))}
-      {unique(relations).map((relation) => (
-        <RelationMark relation={relation} key={`relation-${relation}`} />
+      {EDGE_RELATIONS.map((relation) => (
+        <RelationMark
+          relation={relation}
+          key={`relation-${relation}`}
+          className={dimClass(presentRelationSet, relation)}
+        />
       ))}
-      {includeDerived && <DerivedEdgeMark />}
+      <DerivedEdgeMark />
     </div>
   );
 }
