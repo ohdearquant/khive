@@ -67,12 +67,6 @@ impl SqlEventStore {
             .map_err(|e| map_sqlite_err(e, "open_event_writer"))
     }
 
-    fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_reader()
-            .map_err(|e| map_sqlite_err(e, "open_event_reader"))
-    }
-
     fn current_writer_task(
         &self,
         operation: &'static str,

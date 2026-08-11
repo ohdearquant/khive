@@ -680,7 +680,7 @@ fn execute_query_interruptibly(
             },
         )
     } else {
-        scope.mark_write_committed();
+        scope.mark_write_committed()?;
         execute_prepared_query(stmt).map_err(|error| map_rusqlite_err(error, operation))
     }
 }
@@ -710,7 +710,7 @@ fn execute_query_row_interruptibly(
             },
         )
     } else {
-        scope.mark_write_committed();
+        scope.mark_write_committed()?;
         execute_prepared_query_row(stmt).map_err(|error| map_rusqlite_err(error, operation))
     }
 }
@@ -742,7 +742,7 @@ fn execute_query_page_interruptibly(
             },
         )
     } else {
-        scope.mark_write_committed();
+        scope.mark_write_committed()?;
         execute_prepared_query_page(stmt, page).map_err(|error| map_rusqlite_err(error, operation))
     }
 }

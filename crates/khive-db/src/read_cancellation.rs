@@ -58,6 +58,8 @@ pub fn sqlite_interrupt_hard_cap_from_env() -> Duration {
 struct DbReadTestContext {
     progress_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
     fail_progress_clear: bool,
+    settlement_bounds: Option<(Duration, Duration)>,
+    bounded_wait_probe: Option<Arc<AtomicBool>>,
 }
 
 #[cfg(test)]
@@ -95,6 +97,22 @@ where
     DB_READ_TEST_CONTEXT.scope(context, future).await
 }
 
+#[cfg(test)]
+async fn scope_test_read_settlement_bounds<F>(
+    grace: Duration,
+    hard_cap: Duration,
+    bounded_wait_probe: Arc<AtomicBool>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    let mut context = current_test_context();
+    context.settlement_bounds = Some((grace, hard_cap));
+    context.bounded_wait_probe = Some(bounded_wait_probe);
+    DB_READ_TEST_CONTEXT.scope(context, future).await
+}
+
 const STOP_NONE: u8 = 0;
 const STOP_ABANDONED: u8 = 1;
 const STOP_REQUEST: u8 = 2;
@@ -103,6 +121,9 @@ const PHASE_WAITING: u8 = 0;
 const PHASE_RUNNING: u8 = 1;
 const PHASE_CLEANING: u8 = 2;
 const PHASE_FINISHED: u8 = 3;
+const WRITE_UNCLASSIFIED: u8 = 0;
+const WRITE_COMMITTED: u8 = 1;
+const WRITE_DETACH_AUTHORIZED: u8 = 2;
 
 fn stop_reason_code(reason: RequestReadStopReason) -> u8 {
     match reason {
@@ -129,42 +150,57 @@ struct ReadControl {
     stopped: AtomicBool,
     stop_reason: AtomicU8,
     registered: AtomicBool,
-    /// Set once a raw-SQL work closure classifies its prepared statement as
-    /// an admitted write/transaction-control statement and is about to run
-    /// it. Before this is set (including the entire `prepare`/bind phase),
-    /// cancellation must stay grace-bounded even though no read has
-    /// registered yet — nothing has executed against SQLite, so abandoning
-    /// the wait cannot strand a write mid-flight. After this is set, the
-    /// worker must reach its real completion (ADR-005's completion-
-    /// preserving write contract).
-    write_committed: AtomicBool,
+    /// Atomic arbitration between raw-SQL write admission and final read
+    /// detachment. A write may transition `UNCLASSIFIED -> COMMITTED`; the
+    /// async hard-cap boundary may transition `UNCLASSIFIED ->
+    /// DETACH_AUTHORIZED`. Exactly one wins, so the caller can never report a
+    /// timeout while a later-classified write starts executing.
+    write_phase: AtomicU8,
     cleanup_failed: AtomicBool,
     deadline: Option<WallInstant>,
     operation: &'static str,
+    interrupt_grace: Duration,
+    interrupt_hard_cap: Duration,
     #[cfg(test)]
     progress_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     fail_progress_clear: bool,
+    #[cfg(test)]
+    bounded_wait_probe: Option<Arc<AtomicBool>>,
 }
 
 impl ReadControl {
     fn new(context: &RequestReadContext, operation: &'static str) -> Arc<Self> {
         #[cfg(test)]
         let test_context = current_test_context();
+        let default_settlement_bounds = (
+            sqlite_interrupt_grace_from_env(),
+            sqlite_interrupt_hard_cap_from_env(),
+        );
+        #[cfg(test)]
+        let (interrupt_grace, interrupt_hard_cap) = test_context
+            .settlement_bounds
+            .unwrap_or(default_settlement_bounds);
+        #[cfg(not(test))]
+        let (interrupt_grace, interrupt_hard_cap) = default_settlement_bounds;
         let control = Arc::new(Self {
             state: parking_lot::Mutex::new(RegistrationState::Waiting),
             lifecycle: AtomicU8::new(PHASE_WAITING),
             stopped: AtomicBool::new(false),
             stop_reason: AtomicU8::new(STOP_NONE),
             registered: AtomicBool::new(false),
-            write_committed: AtomicBool::new(false),
+            write_phase: AtomicU8::new(WRITE_UNCLASSIFIED),
             cleanup_failed: AtomicBool::new(false),
             deadline: context.deadline().map(|deadline| deadline.blocking_at()),
             operation,
+            interrupt_grace,
+            interrupt_hard_cap,
             #[cfg(test)]
             progress_probe: test_context.progress_probe,
             #[cfg(test)]
             fail_progress_clear: test_context.fail_progress_clear,
+            #[cfg(test)]
+            bounded_wait_probe: test_context.bounded_wait_probe,
         });
         if let Some(reason) = context.stop_reason() {
             control.cancel(stop_reason_code(reason));
@@ -227,6 +263,26 @@ impl ReadControl {
     fn timeout_error(&self) -> StorageError {
         StorageError::Timeout {
             operation: self.operation.into(),
+        }
+    }
+
+    fn write_is_committed(&self) -> bool {
+        self.write_phase.load(Ordering::Acquire) == WRITE_COMMITTED
+    }
+
+    /// Atomically close the raw-SQL write-admission gate before detaching an
+    /// unclassified worker. `false` means write admission won the race, so the
+    /// async side must await the worker without another timeout.
+    fn authorize_detach_if_uncommitted(&self) -> bool {
+        match self.write_phase.compare_exchange(
+            WRITE_UNCLASSIFIED,
+            WRITE_DETACH_AUTHORIZED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(WRITE_DETACH_AUTHORIZED) => true,
+            Err(WRITE_COMMITTED) => false,
+            Err(other) => unreachable!("invalid raw-SQL write phase {other}"),
         }
     }
 
@@ -424,8 +480,17 @@ impl InterruptibleReadScope {
     /// about to change and the completion-preserving contract (ADR-005)
     /// applies from this point on, even though no interrupt target was
     /// ever registered for it.
-    pub(crate) fn mark_write_committed(&self) {
-        self.control.write_committed.store(true, Ordering::Release);
+    pub(crate) fn mark_write_committed(&self) -> StorageResult<()> {
+        match self.control.write_phase.compare_exchange(
+            WRITE_UNCLASSIFIED,
+            WRITE_COMMITTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(WRITE_COMMITTED) => Ok(()),
+            Err(WRITE_DETACH_AUTHORIZED) => Err(self.control.timeout_error()),
+            Err(other) => unreachable!("invalid raw-SQL write phase {other}"),
+        }
     }
 
     /// Run one read closure with interrupt and progress-handler ownership.
@@ -559,6 +624,10 @@ impl Drop for CancelReadOnDrop {
     fn drop(&mut self) {
         if self.armed {
             self.control.cancel(STOP_ABANDONED);
+            // No async waiter remains to arbitrate at the hard-cap boundary.
+            // Close the unclassified write gate now; if admission already
+            // won, the detached worker retains completion ownership.
+            let _ = self.control.authorize_detach_if_uncommitted();
         }
     }
 }
@@ -606,12 +675,26 @@ where
             // touched SQLite yet — stays bounded.
             if control.registered.load(Ordering::Acquire)
                 || declared_read_only
-                || !control.write_committed.load(Ordering::Acquire)
+                || !control.write_is_committed()
             {
-                match tokio::time::timeout(sqlite_interrupt_grace_from_env(), &mut worker).await {
+                #[cfg(test)]
+                if let Some(probe) = &control.bounded_wait_probe {
+                    probe.store(true, Ordering::Release);
+                }
+                match tokio::time::timeout(control.interrupt_grace, &mut worker).await {
                     Ok(joined) => joined
                         .map_err(|error| StorageError::driver(capability, operation, error))?,
                     Err(_) => {
+                        if control.write_is_committed() {
+                            tracing::warn!(
+                                operation,
+                                "raw SQLite work committed to an admitted write during the \
+                                 interrupt grace; awaiting its real completion"
+                            );
+                            worker.await.map_err(|error| {
+                                StorageError::driver(capability, operation, error)
+                            })?
+                        } else {
                         // `spawn_blocking` cannot be force-aborted once it has
                         // started, so the only way to prove admission was
                         // actually released before answering the caller is to
@@ -625,14 +708,12 @@ where
                         // exhaust the hard cap below.
                         tracing::error!(
                             operation,
-                            grace_ms = sqlite_interrupt_grace_from_env().as_millis(),
-                            hard_cap_ms = sqlite_interrupt_hard_cap_from_env().as_millis(),
+                            grace_ms = control.interrupt_grace.as_millis(),
+                            hard_cap_ms = control.interrupt_hard_cap.as_millis(),
                             "interrupted SQLite read did not settle within grace; \
                              escalating to a bounded join before reporting a timeout"
                         );
-                        match tokio::time::timeout(sqlite_interrupt_hard_cap_from_env(), &mut worker)
-                            .await
-                        {
+                        match tokio::time::timeout(control.interrupt_hard_cap, &mut worker).await {
                             Ok(joined) => {
                                 tracing::warn!(
                                     operation,
@@ -644,6 +725,16 @@ where
                                 })?
                             }
                             Err(_) => {
+                                if !control.authorize_detach_if_uncommitted() {
+                                    tracing::warn!(
+                                        operation,
+                                        "raw SQLite work committed to an admitted write before \
+                                         the interrupt hard cap; awaiting its real completion"
+                                    );
+                                    worker.await.map_err(|error| {
+                                        StorageError::driver(capability, operation, error)
+                                    })?
+                                } else {
                                 // Truly did not settle. Detach: the worker
                                 // still owns its connection and admission
                                 // until it eventually exits on its own, which
@@ -651,12 +742,14 @@ where
                                 worker.abort();
                                 tracing::error!(
                                     operation,
-                                    hard_cap_ms = sqlite_interrupt_hard_cap_from_env().as_millis(),
+                                    hard_cap_ms = control.interrupt_hard_cap.as_millis(),
                                     "interrupted SQLite read exceeded the hard cap; detaching \
                                      worker — its pool admission will not recover until it exits"
                                 );
                                 Err(control.timeout_error())
+                                }
                             }
+                        }
                         }
                     }
                 }
@@ -725,6 +818,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn write_admission_and_detachment_are_one_atomic_decision() {
+        let context = capture_request_read_context();
+        let detached = ReadControl::new(&context, "test_detach_wins");
+        assert!(detached.authorize_detach_if_uncommitted());
+        let detached_scope = InterruptibleReadScope {
+            control: detached,
+            capability: StorageCapability::Sql,
+        };
+        assert!(matches!(
+            detached_scope.mark_write_committed(),
+            Err(StorageError::Timeout { .. })
+        ));
+
+        let committed = ReadControl::new(&context, "test_write_wins");
+        let committed_scope = InterruptibleReadScope {
+            control: Arc::clone(&committed),
+            capability: StorageCapability::Sql,
+        };
+        committed_scope.mark_write_committed().unwrap();
+        assert!(!committed.authorize_detach_if_uncommitted());
+    }
+
     /// Regression for the PR #1897 review's HIGH finding: raw SQL prepares
     /// its statement before deciding whether it is a cancellable read, so a
     /// cancellation arriving during that window has no interrupt target
@@ -768,6 +884,72 @@ mod tests {
         );
     }
 
+    /// Cancellation may win the async select while raw SQL is still in
+    /// prepare/classification, then the blocking worker may commit to DML
+    /// before the grace window expires. The initial cancellation snapshot is
+    /// therefore insufficient: once write admission wins, both timeout
+    /// boundaries must yield to real completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_transition_during_grace_awaits_real_completion() {
+        let classification_waiting = Arc::new(AtomicBool::new(false));
+        let release_classification = Arc::new(AtomicBool::new(false));
+        let bounded_wait_started = Arc::new(AtomicBool::new(false));
+        let write_finished = Arc::new(AtomicBool::new(false));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let worker_waiting = Arc::clone(&classification_waiting);
+        let worker_release = Arc::clone(&release_classification);
+        let worker_finished = Arc::clone(&write_finished);
+        let call = scope_test_read_settlement_bounds(
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            Arc::clone(&bounded_wait_started),
+            scope_request_read_cancellation(cancel_rx, async move {
+                run_interruptible_read(StorageCapability::Sql, "test_write_transition", |scope| {
+                    worker_waiting.store(true, Ordering::Release);
+                    while !worker_release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    scope.mark_write_committed()?;
+                    std::thread::sleep(Duration::from_millis(120));
+                    worker_finished.store(true, Ordering::Release);
+                    Ok(73i64)
+                })
+                .await
+            }),
+        );
+        let handle = tokio::spawn(call);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !classification_waiting.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("raw-SQL worker never reached classification");
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !bounded_wait_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation never entered the bounded unclassified wait");
+
+        let admitted_at = WallInstant::now();
+        release_classification.store(true, Ordering::Release);
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("admitted write did not reach real completion")
+            .unwrap();
+        assert_eq!(result.ok(), Some(73));
+        assert!(write_finished.load(Ordering::Acquire));
+        assert!(
+            admitted_at.elapsed() >= Duration::from_millis(120),
+            "the grace/hard-cap path returned before the admitted write completed"
+        );
+    }
+
     /// Companion to the above: once a raw-SQL work closure has classified
     /// its statement as an admitted write and calls `mark_write_committed`,
     /// cancellation must NOT bound-wait — ADR-005's completion-preserving
@@ -779,7 +961,7 @@ mod tests {
         let started = std::time::Instant::now();
         let call = scope_request_read_cancellation(cancel_rx, async {
             run_interruptible_read(StorageCapability::Sql, "test_write_committed", |scope| {
-                scope.mark_write_committed();
+                scope.mark_write_committed()?;
                 std::thread::sleep(Duration::from_millis(900));
                 Ok(42i64)
             })

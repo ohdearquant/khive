@@ -1478,7 +1478,10 @@ a read or a write — takes the same bounded path rather than the
 completion-preserving one: nothing has executed against SQLite yet, so
 abandoning the wait cannot strand a write mid-flight. Only a statement that
 has actually been classified as an admitted write/transaction-control
-statement and started executing is completion-preserving.
+statement and started executing is completion-preserving. Write admission and
+final hard-cap detachment arbitrate through one atomic phase: if admission wins,
+the async boundary waits without another cancellation timeout; if detachment
+wins, a later classifier returns the typed timeout before executing SQLite.
 
 Operator controls are `KHIVE_REQUEST_READ_TIMEOUT_SECS` (default 30, valid
 1–3600 seconds, invalid/zero falls back to the nonzero default),

@@ -165,12 +165,6 @@ impl SqlEntityStore {
         }
     }
 
-    fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_reader()
-            .map_err(|error| map_sqlite_err(error, "open_entity_reader"))
-    }
-
     fn current_writer_task(
         &self,
         operation: &'static str,

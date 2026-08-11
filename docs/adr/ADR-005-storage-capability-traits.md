@@ -607,8 +607,11 @@ on its own. A cancellation that arrives before a raw-SQL statement is
 classified as a read or a write takes the same bounded path; only a
 statement already classified and executing as an admitted write or
 transaction-control statement is completion-preserving (see
-[ADR-091](ADR-091-wal-snapshot-lifetime.md) Amendment 11 for the full
-settlement contract).
+[ADR-091](ADR-091-wal-snapshot-lifetime.md) Amendment 12 for the full
+settlement contract). Final hard-cap detachment and late write admission use
+one atomic phase: an admitted write is joined to real completion, while a
+worker that loses to detachment must return the typed timeout before executing
+SQLite.
 
 The merged task-local scope, absolute deadline, child inheritance, and async
 phase guards live in `khive-storage` so runtime and pack callers depend only on
