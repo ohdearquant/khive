@@ -3,11 +3,11 @@
 `tx_registry` (`src/tx_registry.rs`, ADR-091 Plank 0) is a process-wide,
 observe-only registry of currently-open SQL transaction spans. Every
 caller-controllable transaction span (`WriterGuard::transaction`,
-`atomic_unit`'s own registered span, and the raw `BEGIN IMMEDIATE`/`COMMIT`
-batch-writer spans) registers on open and deregisters via `TxHandle`'s
-`Drop`. Nothing in this plank enforces anything from the registry — it exists
-so a checkpoint task can name which caller, if any, is holding a WAL snapshot
-open.
+`atomic_unit`'s own registered span, the raw `BEGIN IMMEDIATE`/`COMMIT`
+batch-writer spans, and admitted cached-reader transactions) registers on open
+and deregisters via `TxHandle`'s `Drop`. Nothing in this plank enforces anything
+from the registry — it exists so a checkpoint task can name which caller, if
+any, is holding a WAL snapshot open.
 
 ## `TxId`
 
