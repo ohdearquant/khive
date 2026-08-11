@@ -229,10 +229,19 @@ fn write_invalid_findings(dir: &Path) -> std::path::PathBuf {
 }
 
 fn code_ingest(args: &[&str]) -> std::process::Output {
+    // Config discovery is intentionally part of the real binary path this
+    // helper exercises, but the operator running the test is not. Isolate
+    // both cwd-anchored and HOME-anchored discovery so an unrelated local
+    // config (including a now-rejected legacy `[gate]` section) cannot abort
+    // before the code-ingest behavior under test is reached.
+    let seat = tempfile::tempdir().expect("isolated code-ingest config seat");
     Command::new(kkernel_bin())
         .arg("code-ingest")
         .args(args)
+        .current_dir(seat.path())
+        .env("HOME", seat.path())
         .env("KHIVE_NO_DAEMON", "1")
+        .env_remove("KHIVE_CONFIG")
         .output()
         .expect("run kkernel code-ingest")
 }

@@ -137,13 +137,24 @@ async fn code_ingest_batch_with_runtime_setup<F>(
 where
     F: FnOnce(&KhiveRuntime) -> Result<()>,
 {
+    code_ingest_batch_with_config_and_runtime_setup(args, None, runtime_setup).await
+}
+
+async fn code_ingest_batch_with_config_and_runtime_setup<F>(
+    args: CodeIngestArgs,
+    config: Option<&Path>,
+    runtime_setup: F,
+) -> Result<CodeIngestReport>
+where
+    F: FnOnce(&KhiveRuntime) -> Result<()>,
+{
     let bytes = std::fs::read(&args.findings)
         .with_context(|| format!("failed to read {}", args.findings.display()))?;
 
     let ns = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
     let cfg = resolve_runtime_config(RuntimeConfigInputs {
         db: args.db.as_deref(),
-        config: None,
+        config,
         namespace: ns,
         namespace_explicit: true,
         actor_explicit: false,
@@ -775,6 +786,38 @@ mod tests {
         }
     }
 
+    fn write_empty_test_config(dir: &Path) -> PathBuf {
+        let path = dir.join("empty-khive-config.toml");
+        std::fs::write(&path, "").expect("write isolated empty config");
+        path
+    }
+
+    async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
+        let config = write_empty_test_config(
+            args.findings
+                .parent()
+                .expect("findings fixture must have a parent directory"),
+        );
+        super::code_ingest_batch_with_config_and_runtime_setup(args, Some(&config), |_| Ok(()))
+            .await
+    }
+
+    async fn code_ingest_batch_with_runtime_setup<F>(
+        args: CodeIngestArgs,
+        runtime_setup: F,
+    ) -> Result<CodeIngestReport>
+    where
+        F: FnOnce(&KhiveRuntime) -> Result<()>,
+    {
+        let config = write_empty_test_config(
+            args.findings
+                .parent()
+                .expect("findings fixture must have a parent directory"),
+        );
+        super::code_ingest_batch_with_config_and_runtime_setup(args, Some(&config), runtime_setup)
+            .await
+    }
+
     fn write_valid_findings(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("findings.json");
         std::fs::write(
@@ -1359,9 +1402,10 @@ mod tests {
         .await
         .expect("ingest must succeed");
 
+        let config = write_empty_test_config(tmp.path());
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(db.to_str().expect("utf8 path")),
-            config: None,
+            config: Some(&config),
             namespace: Namespace::parse("local").expect("valid namespace"),
             namespace_explicit: true,
             actor_explicit: false,
@@ -1690,9 +1734,13 @@ mod tests {
     /// of any in-process `CodeIngestReport`, proving what was actually
     /// written to storage rather than trusting the report alone.
     async fn finding_note_count(db: &std::path::Path) -> u64 {
+        let config = write_empty_test_config(
+            db.parent()
+                .expect("scratch database must have a parent directory"),
+        );
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(db.to_str().expect("utf8 path")),
-            config: None,
+            config: Some(&config),
             namespace: Namespace::parse("local").expect("valid namespace"),
             namespace_explicit: true,
             actor_explicit: false,

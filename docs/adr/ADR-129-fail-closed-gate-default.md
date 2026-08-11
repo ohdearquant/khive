@@ -8,10 +8,18 @@
 - Depends on: ADR-127 (authenticated actor and grant primitive), the capability
   substrate this design builds on — the published `lion-core` crate (crates.io,
   Apache-2.0) plus `khive-capability`
-- Amended by: a forthcoming amendment on hierarchical subactor identity, which
-  supersedes Amendment 2's "no runtime registration API" invariant with an
-  audited grant surface and delivers its per-caller differentiation in
-  per-view form
+- Amended by: [ADR-143](ADR-143-store-held-caller-grants.md), which supersedes
+  Amendment 2's configuration-text roster and "no runtime registration API"
+  invariant with store-held caller grants and hierarchical subactor identity,
+  delivering per-caller differentiation in per-view form
+
+> **Implementation status (2026-08-08):** This accepted staged design is not
+> fully shipped. The current runtime default remains `AllowAllGate`, and the
+> ADR-143 store-held caller-grant model has not been implemented. Because
+> silently accepting Amendment 2's now-superseded `[gate]` roster would claim
+> enforcement that does not exist, this build rejects every `[gate]` table at
+> configuration load. This note records implementation state only; it does not
+> change the accepted fail-closed decision or ADR-143's superseding design.
 
 ## Context
 
