@@ -262,10 +262,15 @@ impl JsonlSaveSink {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_else(|| failure_projection(results));
+        // Atomic execution has a second, commit-authoritative status surface
+        // in addition to the ordinary result summary.  Keep that block in the
+        // stdout manifest: the JSONL rows alone cannot tell an automation that
+        // a post-commit degradation is non-retryable.
+        let atomic = results_envelope.get("atomic").cloned();
         for row in results {
             self.write_row(row)?;
         }
-        self.finish_with_failures(summary, failures)
+        self.finish_with_failures(summary, failures, atomic)
     }
 
     /// Publish the complete JSONL file and return its ordinary manifest.
@@ -275,13 +280,14 @@ impl JsonlSaveSink {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        self.finish_with_failures(summary, failures)
+        self.finish_with_failures(summary, failures, None)
     }
 
     fn finish_with_failures(
         mut self,
         summary: Value,
         failures: Vec<Value>,
+        atomic: Option<Value>,
     ) -> anyhow::Result<Value> {
         self.temp
             .as_file_mut()
@@ -320,6 +326,9 @@ impl JsonlSaveSink {
         if !failures.is_empty() {
             manifest["failures"] = Value::Array(failures);
         }
+        if let Some(atomic) = atomic {
+            manifest["atomic"] = atomic;
+        }
         Ok(manifest)
     }
 }
@@ -353,7 +362,7 @@ fn failure_projection(results: &[Value]) -> Vec<Value> {
 ///
 /// Layout of `results_envelope`:
 /// ```json
-/// { "results": [ {"ok": bool, "tool": str, "result": ...}, ... ], "summary": {...} }
+/// { "results": [ {"ok": bool, "tool": str, "result": ...}, ... ], "summary": {...}, "atomic": {...} }
 /// ```
 ///
 /// Each entry in `results` becomes one line of JSONL. The manifest returned is:
@@ -365,9 +374,13 @@ fn failure_projection(results: &[Value]) -> Vec<Value> {
 ///   "schema_fingerprint": "<sha256 of sorted field names>",
 ///   "checksum": "<sha256 of file bytes>",
 ///   "summary": { ... },
+///   "atomic": { ... },
 ///   "failures": [ {"op_index": 0, "tool": "...", "error": ..., "reason": "..."} ]
 /// }
 /// ```
+///
+/// `atomic` is copied unchanged when the input envelope has that block and is
+/// omitted for ordinary non-atomic result envelopes.
 ///
 /// `failures` is omitted for an all-successful result. It is a compact
 /// projection rather than the full result payload: callers still need stable
@@ -451,6 +464,42 @@ mod tests {
         assert_eq!(manifest["failures"][0]["tool"], json!("get"));
         assert_eq!(manifest["failures"][0]["error"], json!("not found"));
         assert_eq!(manifest["failures"][0]["reason"], json!("entity-not-found"));
+    }
+
+    #[test]
+    fn atomic_manifest_preserves_committed_degradation_contract() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("atomic.jsonl");
+        let mut envelope = make_envelope(vec![json!({
+            "ok": true,
+            "tool": "update",
+            "op_index": 0,
+            "result": null,
+            "status": "committed_degraded",
+            "retryable": false
+        })]);
+        envelope["atomic"] = json!({
+            "committed": true,
+            "rolled_back": false,
+            "status": "committed_degraded",
+            "retryable": false,
+            "degradations": [{
+                "stage": "post_commit_reindex",
+                "op_index": null,
+                "tool": null,
+                "error": "injected post-commit failure"
+            }]
+        });
+
+        let manifest = write_and_manifest(&envelope, &path, false).unwrap();
+
+        assert_eq!(manifest["atomic"], envelope["atomic"]);
+        assert_eq!(manifest["atomic"]["committed"], true);
+        assert_eq!(manifest["atomic"]["retryable"], false);
+        assert_eq!(
+            manifest["atomic"]["degradations"][0]["stage"],
+            "post_commit_reindex"
+        );
     }
 
     #[test]

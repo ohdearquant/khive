@@ -2153,6 +2153,45 @@ fn build_local_fallback_server(
     }
 }
 
+struct AtomicSavePublishFailure {
+    stdout: String,
+    error: anyhow::Error,
+}
+
+/// Render the authoritative atomic stdout value. A save sink is preflighted
+/// before execution, but its writes/flush/rename necessarily happen after the
+/// database outcome is known. If that publication fails after a commit, keep
+/// the process failure while returning a reconciliation envelope that makes
+/// the durable, non-retryable outcome explicit.
+fn render_atomic_output(
+    envelope: &mut serde_json::Value,
+    save_sink: Option<khive_mcp::save_sink::JsonlSaveSink>,
+) -> std::result::Result<String, AtomicSavePublishFailure> {
+    let Some(save_sink) = save_sink else {
+        return Ok(serde_json::to_string_pretty(envelope).expect("serialize atomic envelope"));
+    };
+
+    match save_sink.write_envelope(envelope) {
+        Ok(manifest) => {
+            Ok(serde_json::to_string(&manifest).expect("serialize atomic save manifest"))
+        }
+        Err(error) => {
+            let committed = crate::atomic_apply::record_save_file_publish_failure(envelope, &error);
+            let stdout = serde_json::to_string_pretty(envelope)
+                .expect("serialize atomic save failure reconciliation envelope");
+            let error = if committed {
+                error.context(
+                    "atomic database changes committed but --save-file publication failed; \
+                     do not replay the mutation (inspect stdout for reconciliation details)",
+                )
+            } else {
+                error.context("atomic --save-file publication failed")
+            };
+            Err(AtomicSavePublishFailure { stdout, error })
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
@@ -2260,11 +2299,15 @@ async fn run_exec_ops_file(
                 }
             };
         annotate_and_emit_refusals(&mut envelope, strict);
-        let output = if let Some(save_sink) = save_sink {
-            let manifest = save_sink.write_envelope(&envelope)?;
-            serde_json::to_string(&manifest).expect("serialize atomic save manifest")
-        } else {
-            serde_json::to_string_pretty(&envelope).expect("serialize atomic envelope")
+        let output = match render_atomic_output(&mut envelope, save_sink) {
+            Ok(output) => output,
+            Err(failure) => {
+                // stdout is the machine reconciliation channel. Emit it before
+                // returning the non-zero sink error so callers never infer that
+                // silence means the atomic database unit is safe to replay.
+                println!("{}", failure.stdout);
+                return Err(failure.error);
+            }
         };
         println!("{output}");
         return Ok(());
@@ -2300,6 +2343,7 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
     use tempfile::NamedTempFile;
+    use uuid::Uuid;
 
     // ── collect_op_failures: per-op error surfacing (#1228) ───────────────────
 
@@ -6372,6 +6416,20 @@ backend = "sessions"
         }
     }
 
+    async fn replace_fts_entities_with_incompatible_table(db_path: &str) {
+        let runtime = KhiveRuntime::new(atomic_cfg(db_path)).expect("runtime for FTS fault setup");
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.expect("writer for FTS fault setup");
+        writer
+            .execute_script(
+                "DROP TABLE fts_entities; \
+                 CREATE TABLE fts_entities (broken_column TEXT);"
+                    .to_string(),
+            )
+            .await
+            .expect("replace FTS table to inject post-commit reindex failure");
+    }
+
     #[tokio::test]
     async fn atomic_kg_only_config_keeps_gtd_hook_and_lifecycle_execution() {
         let db_file = NamedTempFile::new().expect("temp db");
@@ -6500,6 +6558,125 @@ backend = "sessions"
         let y_resp = dispatch_json(&server, &format!(r#"get(id="{y_id}")"#)).await;
         assert_eq!(x_resp["results"][0]["result"]["name"], "AtomicX-renamed");
         assert_eq!(y_resp["results"][0]["result"]["name"], "AtomicY-renamed");
+    }
+
+    #[tokio::test]
+    async fn atomic_post_commit_reindex_failure_returns_committed_non_retryable_envelope() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="PostCommitReindexBefore")"#,
+            )
+            .await;
+            response["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        // Migration state remains current, but an incompatible ordinary table
+        // occupies the post-commit FTS name. Store initialization cannot
+        // recreate the virtual table through IF NOT EXISTS; prepare and base
+        // DML do not touch it, so the failure occurs at the real reindex seam.
+        replace_fts_entities_with_incompatible_table(&db_path).await;
+
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![atomic_op(
+                "update",
+                serde_json::json!({"id": entity_id, "name": "PostCommitReindexAfter"}),
+            )],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("post-commit failure must return a reconciliation envelope");
+
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["atomic"]["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["degradations"][0]["stage"], "post_commit_reindex",
+            "{envelope}"
+        );
+        assert_eq!(envelope["summary"]["succeeded"], 1, "{envelope}");
+
+        let runtime =
+            KhiveRuntime::new(atomic_cfg(&db_path)).expect("runtime for committed-row check");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let entity = runtime
+            .get_entity(&token, Uuid::parse_str(&entity_id).unwrap())
+            .await
+            .expect("committed entity row");
+        assert_eq!(entity.name, "PostCommitReindexAfter");
+    }
+
+    #[tokio::test]
+    async fn atomic_result_read_failure_keeps_later_committed_delete_non_retryable() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="RenderThenDelete")"#,
+            )
+            .await;
+            response["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        // Both plans prepare against the same live row. The unit then updates
+        // and hard-deletes it atomically. Rendering op 0 performs its real
+        // post-commit read and cannot find the row removed by op 1.
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({"id": entity_id, "name": "NeverRendered"}),
+                ),
+                atomic_op("delete", serde_json::json!({"id": entity_id, "hard": true})),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("render failure after commit must be a reconciliation envelope");
+
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["atomic"]["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["degradations"][0]["stage"], "result_rendering",
+            "{envelope}"
+        );
+        assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+        assert_eq!(
+            envelope["results"][0]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["results"][0]["retryable"], false, "{envelope}");
+        assert_eq!(envelope["results"][1]["result"]["deleted"], true);
+
+        let runtime =
+            KhiveRuntime::new(atomic_cfg(&db_path)).expect("runtime for deleted-row check");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let deleted = runtime
+            .get_entity(&token, Uuid::parse_str(&entity_id).unwrap())
+            .await;
+        assert!(deleted.is_err(), "hard delete must remain committed");
     }
 
     /// Acceptance test 1b: a mid-unit failure rolls the WHOLE unit back —
@@ -6650,6 +6827,56 @@ backend = "sessions"
         assert_eq!(
             std::fs::read_to_string(save_path).unwrap().lines().count(),
             2
+        );
+    }
+
+    #[test]
+    fn atomic_save_persist_failure_returns_committed_reconciliation_stdout() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("publish-race.jsonl");
+        let sink = khive_mcp::save_sink::JsonlSaveSink::new(&save_path, false)
+            .expect("preflight save sink");
+        // Deterministic post-preflight publication failure: a directory wins
+        // the destination path after the sibling temp file has been created,
+        // so row writes and flush succeed but the final atomic rename fails.
+        std::fs::create_dir(&save_path).expect("occupy destination with a directory");
+        let mut envelope = serde_json::json!({
+            "results": [{
+                "ok": true,
+                "tool": "update",
+                "op_index": 0,
+                "result": {"id": Uuid::new_v4()}
+            }],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0},
+            "atomic": {
+                "committed": true,
+                "rolled_back": false,
+                "failed_op_index": null,
+                "error": null
+            }
+        });
+
+        let failure = render_atomic_output(&mut envelope, Some(sink))
+            .expect_err("persist failure must remain a non-zero CLI outcome");
+        let stdout: serde_json::Value =
+            serde_json::from_str(&failure.stdout).expect("structured stdout envelope");
+
+        assert_eq!(stdout["atomic"]["committed"], true, "{stdout}");
+        assert_eq!(stdout["atomic"]["status"], "committed_degraded", "{stdout}");
+        assert_eq!(stdout["atomic"]["retryable"], false, "{stdout}");
+        assert_eq!(
+            stdout["atomic"]["degradations"][0]["stage"], "save_file_publish",
+            "{stdout}"
+        );
+        assert!(
+            stdout["atomic"]["degradations"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("persist temp file")),
+            "{stdout}"
+        );
+        assert!(
+            format!("{:#}", failure.error).contains("do not replay the mutation"),
+            "terminal error must point automation at reconciliation"
         );
     }
 

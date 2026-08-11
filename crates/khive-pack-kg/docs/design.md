@@ -66,7 +66,9 @@ It is the first-party pack shipped with the khive binary.
    regardless of caller namespace (ADR-007). Note verbs use the caller namespace.
 5. Proposals follow the state machine:
    `open -> approved -> applying -> applied` or `open -> withdrawn`.
-   The `applying` state is transient and blocks concurrent withdraw.
+   The `applying` state blocks concurrent withdraw and replay. It is normally
+   transient, but remains as the reconciliation state when base changes commit
+   and a post-commit reindex or created-record read fails.
 
 ## Failure Modes
 
@@ -78,6 +80,11 @@ It is the first-party pack shipped with the khive binary.
   relations for the specific entity-kind pair.
 - **Proposal CAS miss**: returns success with `cas_hit: false`; no duplicate
   events are emitted.
+- **Proposal post-commit degradation**: once the atomic runner reports
+  `Committed`, a reindex or created-record resolution failure emits neither a
+  `ProposalApplied { Failed }` event nor an `applying -> approved` revert. The
+  durable graph changes remain visible and the proposal stays `applying` for
+  operator reconciliation; another worker pass skips it instead of replaying.
 
 ## Edge rules and the `context` verb
 
