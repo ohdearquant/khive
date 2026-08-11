@@ -104,7 +104,7 @@ bytemuck = "1.16"
 unicode-segmentation = "1.11"
 rust-stemmers = "1.2"
 tempfile = "3"
-lru = "0.12"
+lru = "0.18"
 sha2 = "0.10"
 hex = "0.4"
 blake3 = { version = "1", default-features = false }
