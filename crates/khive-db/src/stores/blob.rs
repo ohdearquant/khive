@@ -25,6 +25,7 @@ use khive_storage::types::{SqlRow, SqlStatement, SqlValue, StorageResult};
 use khive_storage::{AtomicUnitOp, SqlAccess, StorageCapability};
 
 use crate::error::SqliteError;
+use uuid::Uuid;
 
 const ROOT_WRITE_LOCK_FILE: &str = ".khive-blob-write.lock";
 const DATABASE_GC_LOCK_SUFFIX: &str = ".khive-blob-gc.lock";
@@ -718,6 +719,26 @@ const BLOB_GC_FENCE_TRIGGER_MESSAGE: &str = "content_ref is reserved by an activ
 /// other outcome — either write accepted, or rejected for a different
 /// reason — refuses the sweep with [`StorageError::Unsupported`].
 async fn blob_gc_fence_probe(sql: &dyn SqlAccess) -> StorageResult<()> {
+    let run = Uuid::new_v4().simple().to_string();
+    blob_gc_fence_probe_with_ids(
+        sql,
+        format!("__blob-gc-fence-probe-insert-{run}__"),
+        format!("__blob-gc-fence-probe-update-{run}__"),
+        format!("__fence_probe-{run}__"),
+    )
+    .await
+}
+
+/// Probe body with explicit row ids so tests can force an id collision.
+/// Production callers go through [`blob_gc_fence_probe`], which mints
+/// per-run random ids; the guard below still refuses to run — touching
+/// nothing — if any minted id already names a row.
+async fn blob_gc_fence_probe_with_ids(
+    sql: &dyn SqlAccess,
+    insert_id: String,
+    update_id: String,
+    claim_key: String,
+) -> StorageResult<()> {
     fn fence_rejection(result: Result<u64, StorageError>) -> Result<bool, String> {
         match result {
             Ok(_) => Ok(false),
@@ -734,12 +755,53 @@ async fn blob_gc_fence_probe(sql: &dyn SqlAccess) -> StorageResult<()> {
 
     let op: AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
+            // Ownership guard: the cleanup below deletes these ids
+            // unconditionally, so the probe may only proceed when it can
+            // prove every id is unclaimed. A hit means a collision with a
+            // real row (or a re-entered probe); deleting it would destroy
+            // data the probe does not own.
+            let preexisting = writer
+                .query_row(SqlStatement {
+                    sql: "SELECT (SELECT COUNT(*) FROM entities WHERE id IN (?1, ?2)) \
+                              + (SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = ?3)"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(insert_id.clone()),
+                        SqlValue::Text(update_id.clone()),
+                        SqlValue::Text(claim_key.clone()),
+                    ],
+                    label: Some("blob_gc_fence_probe_ownership_guard".to_string()),
+                })
+                .await?
+                .and_then(|row| row.columns.first().map(|c| c.value.clone()));
+            match preexisting {
+                Some(SqlValue::Integer(0)) => {}
+                Some(SqlValue::Integer(_)) => {
+                    return Err(StorageError::Unsupported {
+                        capability: StorageCapability::Blob,
+                        operation: "transactional_orphan_sweep".into(),
+                        message: "the blob GC fence probe's row ids collide with existing \
+                                  rows; refusing to probe rather than delete data the \
+                                  probe does not own"
+                            .into(),
+                    });
+                }
+                _ => {
+                    return Err(StorageError::Internal(
+                        "blob GC fence probe ownership guard returned no count".into(),
+                    ));
+                }
+            }
+
             writer
                 .execute(SqlStatement {
                     sql: "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
-                          VALUES ('__fence_probe__', ?1, 0)"
+                          VALUES (?1, ?2, 0)"
                         .to_string(),
-                    params: vec![SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string())],
+                    params: vec![
+                        SqlValue::Text(claim_key.clone()),
+                        SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string()),
+                    ],
                     label: Some("blob_gc_fence_probe_claim".to_string()),
                 })
                 .await?;
@@ -748,10 +810,12 @@ async fn blob_gc_fence_probe(sql: &dyn SqlAccess) -> StorageResult<()> {
                 .execute(SqlStatement {
                     sql: "INSERT INTO entities \
                           (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
-                          VALUES ('__blob-gc-fence-probe-insert__', 'local', 'document', \
-                                  'fence probe', '[]', 0, 0, ?1)"
+                          VALUES (?1, 'local', 'document', 'fence probe', '[]', 0, 0, ?2)"
                         .to_string(),
-                    params: vec![SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string())],
+                    params: vec![
+                        SqlValue::Text(insert_id.clone()),
+                        SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string()),
+                    ],
                     label: Some("blob_gc_fence_probe_insert_arm".to_string()),
                 })
                 .await;
@@ -761,40 +825,50 @@ async fn blob_gc_fence_probe(sql: &dyn SqlAccess) -> StorageResult<()> {
                 .execute(SqlStatement {
                     sql: "INSERT INTO entities \
                           (id, namespace, kind, name, tags, created_at, updated_at) \
-                          VALUES ('__blob-gc-fence-probe-update__', 'local', 'document', \
-                                  'fence probe', '[]', 0, 0)"
+                          VALUES (?1, 'local', 'document', 'fence probe', '[]', 0, 0)"
                         .to_string(),
-                    params: vec![],
+                    params: vec![SqlValue::Text(update_id.clone())],
                     label: Some("blob_gc_fence_probe_update_arm_seed".to_string()),
                 })
                 .await?;
             let update_attempt = writer
                 .execute(SqlStatement {
-                    sql: "UPDATE entities SET content_ref = ?1 \
-                          WHERE id = '__blob-gc-fence-probe-update__'"
-                        .to_string(),
-                    params: vec![SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string())],
+                    sql: "UPDATE entities SET content_ref = ?1 WHERE id = ?2".to_string(),
+                    params: vec![
+                        SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string()),
+                        SqlValue::Text(update_id.clone()),
+                    ],
                     label: Some("blob_gc_fence_probe_update_arm".to_string()),
                 })
                 .await;
             let update_fenced = fence_rejection(update_attempt);
 
             // Remove every probe row before this unit commits, including an
-            // entity row a dead fence let through.
+            // entity row a dead fence let through and the list-sequence
+            // ledger rows the seed inserts created. The ledger rows were
+            // never visible outside this uncommitted transaction, so no
+            // cursor can have observed them.
             writer
                 .execute(SqlStatement {
-                    sql: "DELETE FROM entities WHERE id IN \
-                          ('__blob-gc-fence-probe-insert__', '__blob-gc-fence-probe-update__')"
-                        .to_string(),
-                    params: vec![],
+                    sql: "DELETE FROM entities WHERE id IN (?1, ?2)".to_string(),
+                    params: vec![
+                        SqlValue::Text(insert_id.clone()),
+                        SqlValue::Text(update_id.clone()),
+                    ],
                     label: Some("blob_gc_fence_probe_cleanup_entities".to_string()),
                 })
                 .await?;
             writer
                 .execute(SqlStatement {
-                    sql: "DELETE FROM blob_gc_claims WHERE root_key = '__fence_probe__'"
-                        .to_string(),
-                    params: vec![],
+                    sql: "DELETE FROM entities_seq WHERE entity_id IN (?1, ?2)".to_string(),
+                    params: vec![SqlValue::Text(insert_id), SqlValue::Text(update_id)],
+                    label: Some("blob_gc_fence_probe_cleanup_entities_seq".to_string()),
+                })
+                .await?;
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM blob_gc_claims WHERE root_key = ?1".to_string(),
+                    params: vec![SqlValue::Text(claim_key)],
                     label: Some("blob_gc_fence_probe_cleanup_claim".to_string()),
                 })
                 .await?;
@@ -2276,14 +2350,63 @@ mod tests {
         let leftovers: i64 = reader
             .conn()
             .query_row(
-                "SELECT (SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = '__fence_probe__') \
-                      + (SELECT COUNT(*) FROM entities WHERE id IN \
-                         ('__blob-gc-fence-probe-insert__', '__blob-gc-fence-probe-update__'))",
+                "SELECT (SELECT COUNT(*) FROM blob_gc_claims \
+                         WHERE root_key GLOB '__fence_probe-*') \
+                      + (SELECT COUNT(*) FROM entities \
+                         WHERE id GLOB '__blob-gc-fence-probe-*') \
+                      + (SELECT COUNT(*) FROM entities_seq \
+                         WHERE entity_id GLOB '__blob-gc-fence-probe-*')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(leftovers, 0, "fence probe rows must not survive the probe");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fence_probe_refuses_id_collision_and_preserves_the_colliding_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, name, tags, created_at, updated_at) \
+                     VALUES ('victim-id', 'local', 'document', 'unrelated data', '[]', 7, 7)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let sql = backend.sql();
+        let error = super::blob_gc_fence_probe_with_ids(
+            sql.as_ref(),
+            "victim-id".to_string(),
+            "victim-update-id".to_string(),
+            "victim-claim-key".to_string(),
+        )
+        .await
+        .expect_err("the probe must refuse when an id it would delete already names a row");
+        assert!(
+            matches!(error, StorageError::Unsupported { .. }),
+            "expected StorageError::Unsupported, got {error:?}"
+        );
+
+        let reader = backend.pool().reader().unwrap();
+        let (name, created_at): (String, i64) = reader
+            .conn()
+            .query_row(
+                "SELECT name, created_at FROM entities WHERE id = 'victim-id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the colliding entity must survive the refused probe untouched");
+        assert_eq!(name, "unrelated data");
+        assert_eq!(created_at, 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
