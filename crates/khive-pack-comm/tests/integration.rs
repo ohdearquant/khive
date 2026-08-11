@@ -5113,7 +5113,7 @@ async fn ingest_dedup_without_stored_thread_id_falls_back_with_warning() {
     );
 }
 
-/// Regression (PR #1623 round 2): an all-hex >=8-char stored thread label that is NOT a UUID (e.g. "deadbeef") must still be matched exactly — the UUID-prefix arm in the resolver must not swallow it and error "no message thread matches prefix".
+/// Regression (PR #1623): an all-hex >=8-char stored thread label that is NOT a UUID (e.g. "deadbeef") must still be matched exactly — the UUID-prefix arm in the resolver must not swallow it and error "no message thread matches prefix".
 #[tokio::test]
 async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -5177,7 +5177,7 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
     assert_eq!(prefixed[0]["properties"]["thread_id"], thread);
 }
 
-/// Regression (PR #1623 round 3): the thread-prefix resolver must scan ONLY `message` notes.
+/// Regression (PR #1623): the thread-prefix resolver must scan ONLY `message` notes.
 #[tokio::test]
 async fn list_thread_prefix_resolution_ignores_non_message_notes() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -5227,7 +5227,7 @@ async fn list_thread_prefix_resolution_ignores_non_message_notes() {
     assert_eq!(notes[0]["properties"]["thread_id"], message_thread);
 }
 
-/// Regression (PR #1623 round 4): thread-prefix resolution must use the SAME visibility scope as the list read (`['local'] ∪ visible_namespaces`).
+/// Regression (PR #1623): thread-prefix resolution must use the SAME visibility scope as the list read (`['local'] ∪ visible_namespaces`).
 #[tokio::test]
 async fn list_thread_prefix_resolves_across_configured_visible_namespaces() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -5270,7 +5270,7 @@ async fn list_thread_prefix_resolves_across_configured_visible_namespaces() {
     assert_eq!(messages[0]["properties"]["thread_id"], thread);
 }
 
-/// Regression (PR #1623 round 4): when the same prefix matches two DIFFERENT thread UUIDs — one in the primary namespace, one in a configured visible namespace — the resolver must report the ambiguity instead of silently resolving to the primary row and omitting the visible one.
+/// Regression (PR #1623): when the same prefix matches two DIFFERENT thread UUIDs — one in the primary namespace, one in a configured visible namespace — the resolver must report the ambiguity instead of silently resolving to the primary row and omitting the visible one.
 #[tokio::test]
 async fn list_thread_prefix_collision_across_visible_namespaces_is_ambiguous() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");

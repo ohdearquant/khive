@@ -368,7 +368,7 @@ Only the genuinely new non-owned key (`added`) contributed to the fold, so `prop
 
 ### `merge_reports_zero_properties_merged_for_nested_union_reversion`
 
-The round-2 fix above corrected the flat case (`merge_reports_properties_merged_for_key_that_actually_survives`); this is the nested case that fix left uncorrected. Under `union` the fold recurses into `thread_id` and counts the absorbed note's nested key as a merged contribution, but restoration then reverts `thread_id` wholesale back to the into-note's pre-merge value — so nothing the fold counted actually survived, and `properties_merged` must report 0.
+The earlier #1690 fix corrected the flat case (`merge_reports_properties_merged_for_key_that_actually_survives`); this is the nested case that fix left uncorrected. Under `union` the fold recurses into `thread_id` and counts the absorbed note's nested key as a merged contribution, but restoration then reverts `thread_id` wholesale back to the into-note's pre-merge value — so nothing the fold counted actually survived, and `properties_merged` must report 0.
 
 ### `merge_reports_zero_properties_merged_when_restoration_reverts_the_only_new_key_through_the_route`
 
