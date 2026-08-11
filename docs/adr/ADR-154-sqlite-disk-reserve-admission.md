@@ -130,14 +130,14 @@ may run after space is recovered. A failed rollback retains the existing
 
 #### Other writer surfaces
 
-| Surface | Required admission point |
-| --- | --- |
-| Pooled `WriterGuard` transaction | Same sequence as the writer task: lease before `BEGIN`, probe after successful `BEGIN`, before the closure |
-| Standalone/manual transaction | Same sequence; no direct compatibility fallback may skip the shared guard |
-| Standalone autocommit statement/script | Lease and probe immediately before the first SQLite write call; retain the lease until SQLite returns to autocommit |
-| Startup bootstrap DDL | Resolve against the existing parent for a new file; lease and probe immediately before each current pre-`BEGIN` autocommit bootstrap call, and retain the lease until SQLite returns to autocommit |
-| Migration/schema transactions | Lease before each transaction, probe after `BEGIN`, before its first DDL/DML |
-| Top-level maintenance such as `VACUUM` | Lease and probe immediately before execution; retain it until the call returns |
+| Surface                                | Required admission point                                                                                                                                                                           |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pooled `WriterGuard` transaction       | Same sequence as the writer task: lease before `BEGIN`, probe after successful `BEGIN`, before the closure                                                                                         |
+| Standalone/manual transaction          | Same sequence; no direct compatibility fallback may skip the shared guard                                                                                                                          |
+| Standalone autocommit statement/script | Lease and probe immediately before the first SQLite write call; retain the lease until SQLite returns to autocommit                                                                                |
+| Startup bootstrap DDL                  | Resolve against the existing parent for a new file; lease and probe immediately before each current pre-`BEGIN` autocommit bootstrap call, and retain the lease until SQLite returns to autocommit |
+| Migration/schema transactions          | Lease before each transaction, probe after `BEGIN`, before its first DDL/DML                                                                                                                       |
+| Top-level maintenance such as `VACUUM` | Lease and probe immediately before execution; retain it until the call returns                                                                                                                     |
 
 Normal store modules do not each implement their own probe. After #1911 they inherit the
 writer-task seam. Pool, SQL-bridge, migration, and explicitly top-level/standalone entry points are
@@ -192,11 +192,11 @@ explicit attempt after operator action or a successful recovery checkpoint.
 
 ADR-135 F6 gains three stable stages:
 
-| Stage | Typed outcome | Meaning |
-| --- | --- | --- |
-| `sqlite_capacity_refused` | `StorageError::CapacityFloor` with `capability=Sql`, volume, available, reserve, and required-headroom bytes on the wire | Preflight ran and refused before the first logical write |
-| `sqlite_capacity_unavailable` | new typed capacity-probe/lease error with a `phase` of `identity`, `lock`, or `probe` | Safety could not be established, so the logical write did not run |
-| `sqlite_disk_full` | preserved native SQLite primary/extended result codes | SQLite returned `SQLITE_FULL`; the guard did not prevent exhaustion or a bypass path encountered it |
+| Stage                         | Typed outcome                                                                                                            | Meaning                                                                                             |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `sqlite_capacity_refused`     | `StorageError::CapacityFloor` with `capability=Sql`, volume, available, reserve, and required-headroom bytes on the wire | Preflight ran and refused before the first logical write                                            |
+| `sqlite_capacity_unavailable` | new typed capacity-probe/lease error with a `phase` of `identity`, `lock`, or `probe`                                    | Safety could not be established, so the logical write did not run                                   |
+| `sqlite_disk_full`            | preserved native SQLite primary/extended result codes                                                                    | SQLite returned `SQLITE_FULL`; the guard did not prevent exhaustion or a bypass path encountered it |
 
 `SQLITE_FULL` is never rewritten as `CapacityFloor`. It is a higher-severity error and counter than
 a guard refusal. The first escalation is structured tracing/stderr plus a best-effort non-database

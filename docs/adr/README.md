@@ -160,7 +160,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-151](ADR-151-kg-editor-design-language.md)                         | kg-editor Design Language and Token Contract                                                               |
 | [ADR-152](ADR-152-kg-editor-interaction-grammar.md)                     | kg-editor Interaction Grammar — Navigation, History, and Review Conversation                               |
 | [ADR-153](ADR-153-typed-graph-visual-encoding.md)                       | Typed Graph Visual Encoding                                                                                |
-| [ADR-154](ADR-154-sqlite-disk-reserve-admission.md)                    | SQLite Disk-Reserve Admission Before Logical Writes                                                        |
+| [ADR-154](ADR-154-sqlite-disk-reserve-admission.md)                     | SQLite Disk-Reserve Admission Before Logical Writes                                                        |
 
 <!-- END GENERATED ADR CATALOG -->
 
