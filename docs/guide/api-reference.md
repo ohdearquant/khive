@@ -2130,15 +2130,19 @@ becomes known.
 | ----------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `path`      | string          | yes      | Folder to ingest — a monorepo subtree (a single crate/package) is first-class, not a special case of whole-repo ingest.                                                                                                                      |
 | `db`        | string          | no       | Target map database path. Defaults to `<path>/.khive/code-map.db`. The shared production database — its default `$HOME/.khive/khive.db` location and the calling server's actual configured database — is always rejected, with no override. |
-| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Defaults to all three (auto-detected from manifests found under `path`).                                                                                                  |
+| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Omission accepts all three; the success report lists only languages observed under `path`.                                                                                |
+| `tiers`     | array\<string\> | no       | Select any of `l1` \| `l1.5` \| `l2`. Defaults to L1 and L1.5; L2 is opt-in and currently scans Rust sources only.                                                                                                                           |
 
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
 
-The success report includes `fts_indexed`, the number of entity documents written to the map's
-full-text index. Entity and FTS writes are a single success postcondition for this verb: an FTS
-failure makes the ingest fail rather than returning a structurally populated but unsearchable map.
+The argument object is closed: unknown names are rejected before filesystem or database access.
+The success report's sorted `languages` array describes languages observed by a selected tier,
+rather than echoing the caller's filter. It also includes `fts_indexed`, the number of entity
+documents written to the map's full-text index. Entity and FTS writes are a single success
+postcondition for this verb: an FTS failure makes the ingest fail rather than returning a
+structurally populated but unsearchable map.
 
 The map database uses the ordinary khive schema. To explore it with the generic KG read verbs,
 select it as a backend in a dedicated config:
