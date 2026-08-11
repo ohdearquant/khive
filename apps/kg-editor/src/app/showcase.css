@@ -503,7 +503,7 @@
   z-index: 2;
 }
 .repo-graph-node:hover,
-.repo-graph-node.selected { border-color: var(--ontology-kind-hue); box-shadow: 0 0 0 3px rgba(20, 125, 98, 0.12); }
+.repo-graph-node.selected { border-color: var(--ontology-kind-hue); box-shadow: 0 0 0 3px var(--selection-ring-accent); }
 .repo-graph-node.history.selected { border-color: var(--repo-violet); box-shadow: 0 0 0 3px rgba(113, 88, 188, 0.12); }
 .repo-graph-node span,
 .repo-graph-node strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

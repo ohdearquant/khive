@@ -41,6 +41,8 @@
   --ontology-unknown: #7c8795;
   --shadow: 0 16px 45px rgba(26, 37, 47, 0.07);
   --shadow-small: 0 4px 18px rgba(28, 39, 49, 0.06);
+  --selection-ring: rgba(20, 32, 51, 0.12);
+  --selection-ring-accent: rgba(20, 125, 98, 0.12);
   --radius: 12px;
   --space-1: 2px;
   --space-2: 4px;
@@ -97,6 +99,8 @@
     --ontology-unknown: #b9b7ae;
     --shadow: 0 16px 45px rgba(0, 0, 0, 0.45);
     --shadow-small: 0 4px 18px rgba(0, 0, 0, 0.35);
+    --selection-ring: rgba(233, 228, 217, 0.22);
+    --selection-ring-accent: rgba(120, 214, 183, 0.24);
   }
 }
 
@@ -130,6 +134,8 @@
   --ontology-unknown: #b9b7ae;
   --shadow: 0 16px 45px rgba(0, 0, 0, 0.45);
   --shadow-small: 0 4px 18px rgba(0, 0, 0, 0.35);
+  --selection-ring: rgba(233, 228, 217, 0.22);
+  --selection-ring-accent: rgba(120, 214, 183, 0.24);
 }
 
 * {
@@ -1745,7 +1751,7 @@ i.context,
 
 .edge-label.selected {
   border-color: var(--ontology-edge-hue, var(--ink));
-  box-shadow: 0 0 0 2px rgba(20, 32, 51, 0.12);
+  box-shadow: 0 0 0 2px var(--selection-ring);
 }
 
 .graph-edge-summary li button {
