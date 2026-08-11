@@ -152,6 +152,7 @@ impl CheckpointOwnershipGate {
         state
     }
 
+    #[cfg(test)]
     fn wal_autocheckpoint_pages(&self) -> u32 {
         let state = self.settled_state();
         match state.phase {
@@ -1223,6 +1224,7 @@ impl ConnectionPool {
     /// Effective `PRAGMA wal_autocheckpoint` for a writer-capable connection
     /// opened right now: `0` once a dedicated checkpoint owner has claimed
     /// the pool, the bounded fallback otherwise.
+    #[cfg(test)]
     pub(crate) fn effective_wal_autocheckpoint_pages(&self) -> u32 {
         self.checkpoint_ownership.wal_autocheckpoint_pages()
     }
