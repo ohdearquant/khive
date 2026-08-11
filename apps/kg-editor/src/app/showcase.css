@@ -462,7 +462,7 @@
 .repo-ontology-legend {
   border-bottom: 1px solid var(--repo-border);
   color: var(--repo-muted);
-  padding: 7px 14px;
+  padding: var(--space-4) var(--space-6);
 }
 
 .repo-graph-stage {
@@ -513,8 +513,8 @@
   color: var(--ontology-kind-hue);
   display: inline-flex;
   float: left;
-  font-size: 14px;
-  margin-right: 5px;
+  font-size: var(--font-size-icon);
+  margin-right: var(--space-3);
 }
 
 .repo-inspector { border-top: 1px solid var(--repo-border); padding: 13px 15px; }

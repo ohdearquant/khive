@@ -42,6 +42,94 @@
   --shadow: 0 16px 45px rgba(26, 37, 47, 0.07);
   --shadow-small: 0 4px 18px rgba(28, 39, 49, 0.06);
   --radius: 12px;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 10px;
+  --space-6: 14px;
+  --font-size-micro: 8px;
+  --font-size-2xs: 9px;
+  --font-size-xs: 10px;
+  --font-size-sm: 11px;
+  --font-size-icon: 14px;
+  --font-size-icon-lg: 15px;
+  --ontology-glyph-size: 3px;
+  --ontology-glyph-size-lg: 5px;
+  --ontology-stroke-thin: 1.3px;
+  --ontology-stroke-bold: 1.8px;
+  --ontology-stroke-epistemic: 1.6px;
+  --ontology-glyph-stroke: 0.7px;
+  --ontology-glyph-stroke-lg: 0.8px;
+}
+
+/* ADR-151 D1-D2: dark-first token remap for the shared surface/ontology
+   layer. OS preference is honored via prefers-color-scheme; an explicit
+   data-theme attribute always wins over it. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ink: #e8e6df;
+    --ink-soft: #b9b7ae;
+    --ink-faint: #8b8980;
+    --canvas: #17140f;
+    --surface: #1f1c16;
+    --surface-strong: #262219;
+    --line: #35312a;
+    --line-strong: #47423a;
+    --ontology-concept: #a68ee0;
+    --ontology-document: #6fa8d6;
+    --ontology-dataset: #3fc7c0;
+    --ontology-project: #4fd0a0;
+    --ontology-person: #e0b354;
+    --ontology-org: #e08a5e;
+    --ontology-artifact: #d08bcb;
+    --ontology-service: #5fb0d0;
+    --ontology-resource: #c7bd94;
+    --ontology-observation: #8fb0bd;
+    --ontology-insight: #b79bd9;
+    --ontology-question: #e0b354;
+    --ontology-decision: #6fd0b3;
+    --ontology-reference: #9aacd9;
+    --ontology-edge-neutral: #9aa4ab;
+    --ontology-support: #4fd0a0;
+    --ontology-refute: #e08a8a;
+    --ontology-derived: #a68ee0;
+    --ontology-unknown: #b9b7ae;
+    --shadow: 0 16px 45px rgba(0, 0, 0, 0.45);
+    --shadow-small: 0 4px 18px rgba(0, 0, 0, 0.35);
+  }
+}
+
+[data-theme="dark"] {
+  --ink: #e8e6df;
+  --ink-soft: #b9b7ae;
+  --ink-faint: #8b8980;
+  --canvas: #17140f;
+  --surface: #1f1c16;
+  --surface-strong: #262219;
+  --line: #35312a;
+  --line-strong: #47423a;
+  --ontology-concept: #a68ee0;
+  --ontology-document: #6fa8d6;
+  --ontology-dataset: #3fc7c0;
+  --ontology-project: #4fd0a0;
+  --ontology-person: #e0b354;
+  --ontology-org: #e08a5e;
+  --ontology-artifact: #d08bcb;
+  --ontology-service: #5fb0d0;
+  --ontology-resource: #c7bd94;
+  --ontology-observation: #8fb0bd;
+  --ontology-insight: #b79bd9;
+  --ontology-question: #e0b354;
+  --ontology-decision: #6fd0b3;
+  --ontology-reference: #9aacd9;
+  --ontology-edge-neutral: #9aa4ab;
+  --ontology-support: #4fd0a0;
+  --ontology-refute: #e08a8a;
+  --ontology-derived: #a68ee0;
+  --ontology-unknown: #b9b7ae;
+  --shadow: 0 16px 45px rgba(0, 0, 0, 0.45);
+  --shadow-small: 0 4px 18px rgba(0, 0, 0, 0.35);
 }
 
 * {
@@ -112,7 +200,7 @@ kbd {
 
 .ontology-kind-mark {
   color: var(--ontology-kind-hue);
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .ontology-kind-mark svg {
@@ -123,11 +211,10 @@ kbd {
 
 .ontology-relation-mark {
   color: var(--ontology-edge-hue);
-  gap: 4px;
+  gap: var(--space-2);
 }
 
-.ontology-relation-mark b,
-.ontology-derived-mark b {
+.ontology-relation-mark b {
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 1.15em;
   line-height: 1;
@@ -135,32 +222,47 @@ kbd {
 
 .ontology-derived-mark {
   color: var(--ontology-derived);
-  gap: 4px;
+  gap: var(--space-2);
+}
+
+.ontology-derived-glyph-icon {
+  fill: none;
+  flex: 0 0 auto;
+  height: 1em;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+  width: 1em;
+}
+
+.ontology-mark-dim {
+  opacity: 0.5;
 }
 
 .ontology-legend {
   flex-wrap: wrap;
-  gap: 6px 10px;
+  gap: var(--space-3) var(--space-5);
 }
 
 .ontology-legend > span {
-  font-size: 9px;
+  font-size: var(--font-size-2xs);
   white-space: nowrap;
 }
 
 svg line.ontology-edge {
   stroke: var(--ontology-edge-hue);
   stroke-linecap: round;
-  stroke-width: 1.3px;
+  stroke-width: var(--ontology-stroke-thin);
 }
 
 svg line.ontology-edge[data-edge-treatment="quiet-solid"] { opacity: 0.72; }
 svg line.ontology-edge[data-edge-treatment="directional"] { stroke-dasharray: 7 2; }
 svg line.ontology-edge[data-edge-treatment="dotted"] { stroke-dasharray: 1 3; }
-svg line.ontology-edge[data-edge-treatment="assertive-solid"] { stroke-width: 1.8px; }
+svg line.ontology-edge[data-edge-treatment="assertive-solid"] { stroke-width: var(--ontology-stroke-bold); }
 svg line.ontology-edge[data-edge-treatment="undirected"] { stroke-dasharray: 6 2 1 2; }
 svg line.ontology-edge[data-edge-treatment="recessive-dashed"] { opacity: 0.62; stroke-dasharray: 3 4; }
-svg line.ontology-edge[data-edge-treatment="epistemic"] { stroke-dasharray: 8 2; stroke-width: 1.6px; }
+svg line.ontology-edge[data-edge-treatment="epistemic"] { stroke-dasharray: 8 2; stroke-width: var(--ontology-stroke-epistemic); }
 svg line.ontology-edge[data-edge-variant="secondary"] { stroke-dashoffset: 2; }
 svg line.ontology-edge[data-edge-variant="tertiary"] { stroke-dashoffset: 4; }
 svg line.ontology-edge[data-edge-variant="quaternary"] { stroke-dashoffset: 6; }
@@ -170,10 +272,10 @@ svg line.ontology-edge[data-edge-origin="derived"] { stroke-dasharray: 2 2; }
   dominant-baseline: central;
   fill: var(--ontology-edge-hue);
   font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 3px;
+  font-size: var(--ontology-glyph-size);
   paint-order: stroke;
   stroke: var(--surface-strong);
-  stroke-width: 0.7px;
+  stroke-width: var(--ontology-glyph-stroke);
   text-anchor: middle;
 }
 
@@ -181,11 +283,11 @@ svg line.ontology-edge[data-edge-origin="derived"] { stroke-dasharray: 2 2; }
   dominant-baseline: central;
   fill: var(--ontology-edge-hue);
   font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 5px;
+  font-size: var(--ontology-glyph-size-lg);
   font-weight: 800;
   paint-order: stroke;
   stroke: var(--surface-strong);
-  stroke-width: 0.8px;
+  stroke-width: var(--ontology-glyph-stroke-lg);
   text-anchor: middle;
 }
 
@@ -1513,7 +1615,7 @@ i.context,
 
 .graph-legend-block {
   display: grid;
-  gap: 7px;
+  gap: var(--space-4);
   justify-items: end;
   max-width: min(62%, 620px);
 }
@@ -1604,9 +1706,9 @@ i.context,
 .node-kind {
   color: var(--ontology-kind-hue);
   display: flex;
-  font-size: 8px;
-  gap: 4px;
-  margin-bottom: 3px;
+  font-size: var(--font-size-micro);
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
   text-transform: uppercase;
 }
 
@@ -1621,12 +1723,13 @@ i.context,
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-soft);
+  cursor: pointer;
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 7px;
   padding: 3px 6px;
-  pointer-events: none;
   position: absolute;
   transform: translate(-50%, -50%);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
   z-index: 3;
 }
 
@@ -1638,6 +1741,28 @@ i.context,
 .edge-label.modified {
   background: var(--amber-pale);
   border-color: #ecd59c;
+}
+
+.edge-label.selected {
+  border-color: var(--ontology-edge-hue, var(--ink));
+  box-shadow: 0 0 0 2px rgba(20, 32, 51, 0.12);
+}
+
+.graph-edge-summary li button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+}
+
+.graph-edge-summary li button.selected {
+  outline: 2px solid var(--ontology-edge-hue, var(--ink));
+  outline-offset: 2px;
+}
+
+.edge-inspector {
+  margin-top: var(--space-4);
 }
 
 .graph-edge-summary {
@@ -1694,8 +1819,8 @@ i.context,
   color: var(--ontology-kind-hue);
   display: inline-flex;
   float: left;
-  font-size: 15px;
-  margin: 0 6px 2px 0;
+  font-size: var(--font-size-icon-lg);
+  margin: 0 var(--space-3) var(--space-1) 0;
 }
 
 .node-inspector code {
@@ -2537,12 +2662,15 @@ i.context,
   }
 
   .graph-edge-summary li {
+    font-size: 9px;
+  }
+
+  .graph-edge-summary li button {
     align-items: center;
     background: #f7f8f5;
     border: 1px solid var(--line);
     border-radius: 7px;
     display: grid;
-    font-size: 9px;
     gap: 7px;
     grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
     padding: 7px 8px;
