@@ -121,14 +121,14 @@ function availabilityText<T>(
 
 function isIncompleteRepoPage<T>(page: RepoPage<T>): boolean {
   return page.disclosure.status !== "unavailable"
-    && (page.truncated || page.next_cursor !== null || page.disclosure.status === "truncated");
+    && (page.truncated || page.next_cursor != null || page.disclosure.status === "truncated");
 }
 
 function isKnownEmptyRepoPage<T>(page: RepoPage<T>): boolean {
   return page.items.length === 0
     && page.disclosure.status === "complete"
     && !page.truncated
-    && page.next_cursor === null;
+    && page.next_cursor == null;
 }
 
 function BoundDisclosure<T>({ page, labels }: { page: RepoPage<T>; labels: Labels }) {

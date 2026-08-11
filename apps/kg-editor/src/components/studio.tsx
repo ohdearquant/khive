@@ -718,7 +718,7 @@ function ChecksView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =
           message="Stage-time validation checks belong here."
           action={{ label: "Import another review bundle", onClick: onImport }}
         />
-      ) : <><div className="checks-hero">
+      ) : bundle.checks.items.length > 0 ? <><div className="checks-hero">
         {failed > 0 ? <XCircle aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}
         <div>
           <strong>{failed > 0 ? `${failed} required check${failed === 1 ? "" : "s"} failed` : "No error-level findings"}</strong>
@@ -735,7 +735,7 @@ function ChecksView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =
           </article>
         ))}
       </div>
-      </>}
+      </> : null}
       <PageNotice page={bundle.checks} label="Checks" />
     </div>
   );

@@ -214,6 +214,27 @@ describe("repository showcase", () => {
     expect(state).toHaveAttribute("data-bound", String(cycles.bound.max_items));
   });
 
+  it.each([
+    ["nonempty", false],
+    ["empty", true],
+  ] as const)("treats an omitted cursor on a complete %s repository page as complete", async (_name, empty) => {
+    const bundle = structuredClone(golden());
+    const user = userEvent.setup();
+    const cycles = bundle.aggregates.dependency_topology.cycles;
+    cycles.items = empty ? [] : cycles.items.slice(0, 1);
+    cycles.truncated = false;
+    cycles.disclosure = { status: "complete", reason: null };
+    Reflect.deleteProperty(cycles, "next_cursor");
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="dependency_topology"]')!);
+
+    const card = screen.getByRole("heading", { name: bundle.capability.labels.metrics.cycle_count }).closest("section")!;
+    expect(card.querySelector('[data-state="truncated"]')).not.toBeInTheDocument();
+    if (empty) expect(card.querySelector('[data-state="empty"]')).toBeVisible();
+    else expect(card.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+  });
+
   it("keeps repository-wide ownership visible when the module join is unavailable", async () => {
     const bundle = structuredClone(golden());
     const user = userEvent.setup();

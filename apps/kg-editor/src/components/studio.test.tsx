@@ -103,6 +103,25 @@ describe("KG Studio", () => {
     expect(state).not.toHaveAttribute("data-bound");
   });
 
+  it.each([
+    ["truncated", { truncated: true, next_cursor: null }],
+    ["next cursor", { truncated: false, next_cursor: "next-page" }],
+  ] as const)("does not render the checks success hero for a zero-item %s page", async (_name, incomplete) => {
+    const bundle = structuredClone(atlasReviewFixture);
+    bundle.checks.items = [];
+    bundle.checks.truncated = incomplete.truncated;
+    bundle.checks.next_cursor = incomplete.next_cursor;
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    await user.click(screen.getAllByRole("button", { name: /^checks/i })[0]);
+
+    const surface = container.querySelector<HTMLElement>(".review-surface")!;
+    expect(within(surface).queryByText("No error-level findings")).not.toBeInTheDocument();
+    expect(surface.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+    expect(surface.querySelector('[data-state="truncated"]')).toBeVisible();
+  });
+
   it("navigates from semantic diff to the affected graph", async () => {
     const user = userEvent.setup();
     const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
