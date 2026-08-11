@@ -662,7 +662,7 @@ function HotspotQuadrantView({ bundle, moduleById }: { bundle: RepoBundle; modul
   return (
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
-        <svg viewBox="0 0 100 70" role="img" aria-labelledby="hotspot-title hotspot-desc">
+        <svg data-visualization="hotspot" viewBox="0 0 100 70" role="img" aria-labelledby="hotspot-title hotspot-desc">
           <title id="hotspot-title">{bundle.capability.views.hotspot_quadrant.label}</title>
           <desc id="hotspot-desc">{analysis.meta.inputs.join(", ")}</desc>
           <line className="repo-chart-grid" x1="50" y1="4" x2="50" y2="64" /><line className="repo-chart-grid" x1="8" y1="34" x2="96" y2="34" />
@@ -753,7 +753,7 @@ function CadenceView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: M
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
         <div className="repo-legend"><span><i className="green" />{labels.metrics.commits}</span></div>
-        <svg viewBox={`0 0 ${width} 70`} role="img" aria-labelledby="cadence-title cadence-desc">
+        <svg data-visualization="cadence" viewBox={`0 0 ${width} 70`} role="img" aria-labelledby="cadence-title cadence-desc">
           <title id="cadence-title">{bundle.capability.views.cadence_timeline.label}</title><desc id="cadence-desc">{analysis.meta.inputs.join(", ")}</desc>
           {commitRows.map((point, index) => {
             const x = index * 8 + 4;

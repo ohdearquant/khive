@@ -24,7 +24,8 @@ function isDataVisualization(relativePath: string, svgTag: string): boolean {
   }
   if (relativePath === "components/showcase/repo-showcase.tsx") {
     return svgTag.includes('className="repo-edges"') ||
-      svgTag.includes('role="img"');
+      svgTag.includes(' data-visualization="hotspot"') ||
+      svgTag.includes(' data-visualization="cadence"');
   }
   return false;
 }
@@ -32,6 +33,29 @@ function isDataVisualization(relativePath: string, svgTag: string): boolean {
 afterEach(cleanup);
 
 describe("shared icon contract", () => {
+  it("does not exempt an ordinary accessible SVG from icon lint", () => {
+    const showcase = "components/showcase/repo-showcase.tsx";
+    expect(isDataVisualization(showcase, '<svg role="img">')).toBe(false);
+    expect(
+      isDataVisualization(
+        showcase,
+        '<svg role="img" data-visualization="other">',
+      ),
+    ).toBe(false);
+    expect(
+      isDataVisualization(
+        showcase,
+        '<svg role="img" data-visualization="hotspot">',
+      ),
+    ).toBe(true);
+    expect(
+      isDataVisualization(
+        showcase,
+        '<svg role="img" data-visualization="cadence">',
+      ),
+    ).toBe(true);
+  });
+
   it("renders every icon through the same literal SVG contract", () => {
     expect(ICON_NAMES.length).toBeGreaterThan(0);
 
