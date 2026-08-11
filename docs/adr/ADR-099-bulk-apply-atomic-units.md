@@ -647,9 +647,9 @@ implementation was restructured to the seam this ADR mandates:
 ## Amendment 2 (2026-08-11) — committed post-processing degradation is non-retryable
 
 The successful commit is the irreversible retry-safety boundary. Once the commit pass returns
-`AtomicRunOutcome::Committed`, neither deferred index maintenance nor canonical result rendering
-may convert the invocation into an error that invites replay. The base DML is already durable at
-that point.
+`AtomicRunOutcome::Committed`, neither deferred index maintenance, canonical result rendering, nor
+publication of an optional `--save-file` may produce an outcome that invites replay. The base DML
+is already durable at that point.
 
 A post-commit reindex or result-rendering failure therefore returns the ordinary successful
 `results` and `summary` envelope with the D4 atomic facts preserved:
@@ -671,12 +671,22 @@ also carries these additive fields:
 }
 ```
 
-The closed stage spellings in this amendment are `post_commit_reindex` and `result_rendering`.
+The closed stage spellings in this amendment are `post_commit_reindex`, `result_rendering`, and
+`save_file_publish`.
 For a rendering failure, the affected result entry remains `ok=true` because its mutation
 committed; it carries `result=null`, `status="committed_degraded"`, `retryable=false`, and the same
 typed degradation object with its `op_index` and `tool`. `summary.succeeded` continues to count
 durable mutations, not successful presentation reads. Other committed results are still rendered,
 so one failed read does not erase the outcomes that remain available.
+
+With `--save-file`, a successful publication returns the ordinary manifest and copies the entire
+top-level `atomic` object from the execution envelope unchanged. The JSONL rows are not sufficient
+reconciliation evidence because they cannot carry this unit-level commit fact. If a row write,
+flush, or final rename fails after the database commit, the destination is not claimed as
+published; the CLI first writes the full execution envelope to stdout with a
+`save_file_publish` degradation and `retryable=false`, then exits non-zero for the requested file
+failure. The non-zero status reports output-publication failure, not mutation failure. Automation
+MUST inspect stdout and MUST NOT replay a unit whose envelope says `committed=true`.
 
 The reindex stage remains best-effort as D3 already requires. Its failure means the derived search
 index may need repair; it does not mean the source row update failed. Full success, pre-commit

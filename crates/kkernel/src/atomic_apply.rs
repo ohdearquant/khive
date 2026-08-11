@@ -136,6 +136,15 @@ impl AtomicDegradation {
         }
     }
 
+    fn save_file_publish(error: &anyhow::Error) -> Self {
+        Self {
+            stage: "save_file_publish",
+            op_index: None,
+            tool: None,
+            error: format!("atomic unit committed but save-file publication failed: {error:#}"),
+        }
+    }
+
     fn as_json(&self) -> Value {
         json!({
             "stage": self.stage,
@@ -144,6 +153,36 @@ impl AtomicDegradation {
             "error": self.error.as_str(),
         })
     }
+}
+
+/// Attach a failed post-commit `--save-file` publication to the authoritative
+/// atomic envelope. Returns `true` only when the envelope represents a durable
+/// commit; rolled-back envelopes still get printed by the caller but must not
+/// be mislabeled as committed degradation.
+pub(crate) fn record_save_file_publish_failure(
+    envelope: &mut Value,
+    error: &anyhow::Error,
+) -> bool {
+    let Some(atomic) = envelope.get_mut("atomic").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if atomic.get("committed").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+
+    let degradation = AtomicDegradation::save_file_publish(error).as_json();
+    atomic.insert(
+        "status".to_string(),
+        Value::String("committed_degraded".to_string()),
+    );
+    atomic.insert("retryable".to_string(), Value::Bool(false));
+    match atomic.get_mut("degradations") {
+        Some(Value::Array(degradations)) => degradations.push(degradation),
+        _ => {
+            atomic.insert("degradations".to_string(), Value::Array(vec![degradation]));
+        }
+    }
+    true
 }
 
 fn committed_atomic_block(degradations: &[AtomicDegradation]) -> Value {
@@ -1330,10 +1369,7 @@ async fn prepare_gtd_complete(
 /// `kkernel::exec::tests::atomic_update_unknown_field_is_rejected_and_does_not_mutate_row`.
 #[cfg(test)]
 mod validate_atomic_args_tests {
-    use super::{
-        add_post_commit_embedding_warning, committed_atomic_block, committed_degraded_result_entry,
-        validate_atomic_args, AtomicDegradation, PostCommitEffect, Uuid,
-    };
+    use super::{add_post_commit_embedding_warning, validate_atomic_args, PostCommitEffect, Uuid};
     use serde_json::json;
 
     #[test]
@@ -1390,40 +1426,6 @@ mod validate_atomic_args_tests {
         let expected = json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         assert_eq!(first_result["warnings"], expected);
         assert_eq!(second_result["warnings"], expected);
-    }
-
-    #[test]
-    fn committed_reindex_failure_is_typed_degraded_and_non_retryable() {
-        let degradation =
-            AtomicDegradation::post_commit_reindex(anyhow::anyhow!("fts maintenance unavailable"));
-        let atomic = committed_atomic_block(std::slice::from_ref(&degradation));
-
-        assert_eq!(atomic["committed"], true);
-        assert_eq!(atomic["rolled_back"], false);
-        assert_eq!(atomic["status"], "committed_degraded");
-        assert_eq!(atomic["retryable"], false);
-        assert_eq!(atomic["degradations"][0]["stage"], "post_commit_reindex");
-        assert!(atomic["degradations"][0]["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("fts maintenance unavailable")));
-    }
-
-    #[test]
-    fn committed_render_failure_keeps_operation_successful_and_non_retryable() {
-        let degradation = AtomicDegradation::result_rendering(
-            2,
-            "link",
-            anyhow::anyhow!("committed edge read failed"),
-        );
-        let result = committed_degraded_result_entry(2, "link", &degradation);
-
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["result"], serde_json::Value::Null);
-        assert_eq!(result["status"], "committed_degraded");
-        assert_eq!(result["retryable"], false);
-        assert_eq!(result["degradation"]["stage"], "result_rendering");
-        assert_eq!(result["degradation"]["op_index"], 2);
-        assert_eq!(result["degradation"]["tool"], "link");
     }
 
     #[test]

@@ -182,6 +182,13 @@ Treat `post_commit_reindex` as an index-repair requirement and
 failed. A render-degraded result remains `ok=true` with `result=null` and its
 own non-retryable degradation marker.
 
+When `--atomic` and `--save-file` are combined, a successful stdout manifest
+preserves that complete top-level `atomic` block. If JSONL write, flush, or
+final publication fails after commit, stdout is instead the full atomic
+envelope with `stage="save_file_publish"`, `committed=true`, and
+`retryable=false`; the process then exits non-zero because the requested file
+was not published. Reconcile from stdout and do not replay the durable unit.
+
 When an explicit `--db` conflicts with a selected multi-backend config,
 dispatch does not begin. The command emits
 `error.code = "database_override_conflict"` with

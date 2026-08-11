@@ -128,15 +128,23 @@ It runs, in order:
    update whose embedding input was bounded carries the same per-result `warnings` advisory as
    the canonical non-atomic handler.
 
-The commit pass is the retry-safety boundary. Once it returns `Committed`, a reindex or canonical
-result-rendering failure cannot turn the command back into `Err`: the base DML is already durable.
-The command instead returns success with `atomic.committed=true`,
+The commit pass is the retry-safety boundary. Once it returns `Committed`, a reindex, canonical
+result-rendering, or save-file publication failure cannot make the database mutation retryable:
+the base DML is already durable. Reindex and rendering failures return success with
+`atomic.committed=true`,
 `atomic.status="committed_degraded"`, `atomic.retryable=false`, and typed entries in
 `atomic.degradations` (`post_commit_reindex` or `result_rendering`). A render-degraded operation
 keeps `ok=true` and the committed summary count, carries `result=null`, and repeats the typed
 non-retry marker on that result entry. This prevents automation from replaying the mutation while
 still making index repair or result re-read work explicit. An ordinary committed run and every
 pre-commit/rollback shape remain unchanged.
+
+`--save-file` preflights its sibling temp file before execution. On successful publication, the
+stdout manifest preserves the envelope's complete top-level `atomic` block. A write, flush, or
+rename failure after commit instead appends the `save_file_publish` degradation, prints the full
+committed/non-retryable envelope to stdout, and then returns `Err` so the file request still exits
+non-zero. That error is about the sink only; the stdout commit fact is authoritative and forbids
+replay.
 
 Preflight and prepare failures cross back to `exec.rs` as a typed `AtomicExecFailure` containing
 the unchanged terminal message plus a result envelope over the real ops-file entries. The shared
