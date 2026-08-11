@@ -95,6 +95,14 @@ pub struct CheckpointOutcomeRecordedPayload {
     pub above_warn: bool,
     pub above_high_water: bool,
     pub above_truncate_high_water: bool,
+    /// Number of elevated observations aggregated into this episode so far.
+    /// Absent on rows written before the #1838 transition-summary contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_elevated_ticks: Option<u64>,
+    /// Highest WAL frame count observed during this episode so far. Absent on
+    /// rows written before the #1838 transition-summary contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_peak_wal_pages: Option<u64>,
 }
 
 /// Payload for [`khive_types::EventKind::PhaseStarted`] (ADR-103 Stage 1).
@@ -171,11 +179,30 @@ mod tests {
             above_warn: true,
             above_high_water: false,
             above_truncate_high_water: false,
+            episode_elevated_ticks: Some(7),
+            episode_peak_wal_pages: Some(3100),
         };
         let json = serde_json::to_value(&payload).expect("serialize");
         let parsed: CheckpointOutcomeRecordedPayload =
             serde_json::from_value(json).expect("deserialize");
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn checkpoint_outcome_recorded_payload_accepts_legacy_rows_without_episode_summary() {
+        let parsed: CheckpointOutcomeRecordedPayload = serde_json::from_value(serde_json::json!({
+            "wal_pages": 2500,
+            "warn_pages": 2000,
+            "high_water_pages": 6000,
+            "truncate_high_water_pages": 20000,
+            "above_warn": true,
+            "above_high_water": false,
+            "above_truncate_high_water": false
+        }))
+        .expect("legacy payload must remain readable");
+
+        assert_eq!(parsed.episode_elevated_ticks, None);
+        assert_eq!(parsed.episode_peak_wal_pages, None);
     }
 
     #[test]
