@@ -1310,8 +1310,8 @@ cannot release either advisory owner while already-started blocking deletion con
 request body, or `SqlAccess::atomic_unit` caller MUST update the applicable row (or add one) and
 show that all inputs/external results are prepared before the transaction opens. The
 `AtomicUnitOp` trait documentation repeats this requirement because first-poll enforcement catches
-async suspension but cannot detect synchronous filesystem calls. Reviewers must reject a new site
-whose table entry is absent or whose body violates the invariant.
+async suspension but cannot detect synchronous filesystem calls. A new site whose table entry is
+absent or whose body violates the invariant is a defect.
 
 The hold-time regression parks physical deletion indefinitely after the claim commit and gives an
 unrelated writer a 100 ms SQLite busy bound. The unrelated commit succeeds inside that bound while

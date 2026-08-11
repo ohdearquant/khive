@@ -663,56 +663,62 @@ fn invalid_content_ref(message: String) -> StorageError {
     }
 }
 
-/// Whether this database has ever applied the V20 `blob_gc_claims` migration.
+/// Whether this database carries the complete V20 `blob_gc_claims` fencing
+/// set: the claims table plus both entity triggers
+/// (`sql/020-blob-gc-claims.sql`).
 ///
 /// `transactional_orphan_sweep` is reachable from any `SqlAccess` a caller
 /// hands it, including a `StorageBackend` constructed directly (e.g.
 /// `StorageBackend::memory()`/`sqlite()` used without `prepare_core_schema`)
-/// that never ran core migrations. The claims table and its fencing triggers
-/// (`sql/020-blob-gc-claims.sql`) are optional durability/fencing
-/// infrastructure, not a hard dependency of the sweep contract itself, so
-/// their absence must degrade the sweep rather than fail it outright.
-async fn blob_gc_claims_table_exists(sql: &dyn SqlAccess) -> StorageResult<bool> {
+/// that never ran core migrations. The triggers are the fence that keeps a
+/// concurrent entity write from resurrecting a claimed digest in the
+/// released-writer window, so a database missing any element of the set
+/// cannot satisfy the fail-closed guarantee the
+/// [`BlobStore::transactional_orphan_sweep`] contract requires; the sweep
+/// refuses with [`StorageError::Unsupported`] rather than degrading to
+/// unfenced deletion.
+async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
     let mut reader = sql.reader().await?;
-    let found = reader
-        .query_scalar(SqlStatement {
-            sql: "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'blob_gc_claims' \
-                  LIMIT 1"
-                .to_string(),
-            params: vec![],
-            label: Some("blob_gc_claims_table_exists".to_string()),
-        })
-        .await?;
-    Ok(found.is_some())
+    let present = required_nonnegative_count(
+        reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM sqlite_master \
+                      WHERE (type = 'table' AND name = 'blob_gc_claims') \
+                         OR (type = 'trigger' AND name IN ( \
+                             'entities_reject_claimed_blob_insert', \
+                             'entities_reject_claimed_blob_update'))"
+                    .to_string(),
+                params: vec![],
+                label: Some("blob_gc_fencing_complete".to_string()),
+            })
+            .await?,
+        "blob_gc_fencing_complete",
+    )?;
+    Ok(present == 3)
 }
 
-async fn validate_blob_gc_evidence(
-    sql: &dyn SqlAccess,
-    has_claims_table: bool,
-) -> StorageResult<()> {
+async fn validate_blob_gc_evidence(sql: &dyn SqlAccess) -> StorageResult<()> {
     // These full-table integrity probes are statement-scoped reads. Keep them
     // off the single writer; only their one-row result is materialized. The
     // database sweep owner excludes another claim producer, and each bounded
     // claim unit anti-joins the then-current live rows under its writer lock.
     let mut reader = sql.reader().await?;
-    if has_claims_table {
-        let invalid_claim = reader
-            .query_row(SqlStatement {
-                sql: "SELECT content_ref FROM blob_gc_claims \
-                      WHERE typeof(content_ref) <> 'text' \
-                         OR length(content_ref) <> 64 \
-                         OR content_ref GLOB '*[^0-9a-f]*' \
-                      LIMIT 1"
-                    .to_string(),
-                params: vec![],
-                label: Some("blob_gc_validate_existing_claims".to_string()),
-            })
-            .await?;
-        if invalid_claim.is_some() {
-            return Err(invalid_content_ref(
-                "blob_gc_claims.content_ref contained a non-canonical value".into(),
-            ));
-        }
+    let invalid_claim = reader
+        .query_row(SqlStatement {
+            sql: "SELECT content_ref FROM blob_gc_claims \
+                  WHERE typeof(content_ref) <> 'text' \
+                     OR length(content_ref) <> 64 \
+                     OR content_ref GLOB '*[^0-9a-f]*' \
+                  LIMIT 1"
+                .to_string(),
+            params: vec![],
+            label: Some("blob_gc_validate_existing_claims".to_string()),
+        })
+        .await?;
+    if invalid_claim.is_some() {
+        return Err(invalid_content_ref(
+            "blob_gc_claims.content_ref contained a non-canonical value".into(),
+        ));
     }
 
     let invalid_live = reader
@@ -767,7 +773,6 @@ async fn claim_blob_gc_batch(
     root_key: String,
     candidates: &[(ContentRef, bool)],
     dry_run: bool,
-    has_claims_table: bool,
 ) -> StorageResult<BlobGcBatchRows> {
     debug_assert!(candidates.len() <= BLOB_GC_CLAIM_BATCH_SIZE);
     let eligible_refs = candidates
@@ -809,38 +814,6 @@ async fn claim_blob_gc_batch(
                     .await?,
                 "blob_gc_count_grace_candidates_batch",
             )?;
-
-            // No `blob_gc_claims` table (a direct `StorageBackend` that never
-            // applied the V20 migration): there is nothing to durably claim
-            // and no entity-trigger fence to rely on, so this degrades to
-            // the same snapshot-then-delete guarantee `orphan_sweep`
-            // documents — the anti-join is evaluated here, one bounded batch
-            // at a time, but a reference committed live between this read
-            // and the physical delete below is not protected against.
-            if !has_claims_table {
-                let eligible_rows = writer
-                    .query_all(SqlStatement {
-                        sql: "SELECT candidate.value AS content_ref \
-                              FROM json_each(?1) AS candidate \
-                              WHERE NOT EXISTS ( \
-                                SELECT 1 FROM entities \
-                                WHERE deleted_at IS NULL \
-                                  AND content_ref = candidate.value \
-                              ) ORDER BY candidate.value"
-                            .to_string(),
-                        params: vec![SqlValue::Text(eligible_json)],
-                        label: Some(
-                            "blob_gc_select_eligible_candidates_batch_no_claims_table".to_string(),
-                        ),
-                    })
-                    .await?;
-                let would_delete = eligible_rows.len() as u64;
-                return Ok(Box::new(BlobGcBatchRows {
-                    grace_period_skipped,
-                    would_delete,
-                    claimed_rows: if dry_run { Vec::new() } else { eligible_rows },
-                }) as Box<dyn std::any::Any + Send>);
-            }
 
             if dry_run {
                 let would_delete = required_nonnegative_count(
@@ -1287,9 +1260,19 @@ impl BlobStore for FsBlobStore {
             )
         })??;
         let root_key = blob_root_key(&canonical_root);
-        let has_claims_table = blob_gc_claims_table_exists(sql).await?;
-        validate_blob_gc_evidence(sql, has_claims_table).await?;
-        if !dry_run && has_claims_table {
+        if !blob_gc_fencing_complete(sql).await? {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Blob,
+                operation: "transactional_orphan_sweep".into(),
+                message: "this database lacks the complete V20 blob_gc_claims fencing set \
+                          (claims table plus both entity triggers); refusing unfenced \
+                          deletion — run core migrations (prepare_core_schema) to enable \
+                          the sweep"
+                    .into(),
+            });
+        }
+        validate_blob_gc_evidence(sql).await?;
+        if !dry_run {
             loop {
                 let released = release_abandoned_blob_gc_claim_batch(sql).await?;
                 if released < BLOB_GC_CLAIM_BATCH_SIZE as u64 {
@@ -1315,9 +1298,7 @@ impl BlobStore for FsBlobStore {
         // between batches instead of receiving one orphan-population-sized
         // transaction.
         for candidates in prepared.candidates.chunks(BLOB_GC_CLAIM_BATCH_SIZE) {
-            let batch =
-                claim_blob_gc_batch(sql, root_key.clone(), candidates, dry_run, has_claims_table)
-                    .await?;
+            let batch = claim_blob_gc_batch(sql, root_key.clone(), candidates, dry_run).await?;
             result.grace_period_skipped += batch.grace_period_skipped;
             result.would_delete += batch.would_delete;
             if dry_run {
@@ -1385,11 +1366,8 @@ impl BlobStore for FsBlobStore {
             // Release only this bounded batch after its physical phase. On
             // cancellation or process death before this commit, the claims
             // remain fail-closed and the next exclusive database owner
-            // reevaluates them rather than resuming deletion blindly. No
-            // claims table means nothing was inserted to release.
-            if has_claims_table {
-                release_blob_gc_batch(sql, root_key.clone()).await?;
-            }
+            // reevaluates them rather than resuming deletion blindly.
+            release_blob_gc_batch(sql, root_key.clone()).await?;
             if batch_delete_error.is_some() {
                 delete_error = batch_delete_error;
                 break;
@@ -2015,13 +1993,13 @@ mod tests {
     /// A `StorageBackend` constructed directly and never run through the
     /// versioned migration ledger (`run_migrations`/`prepare_core_schema`) —
     /// only the ad hoc, idempotent `entities` DDL a plain `entities()` call
-    /// applies, exactly the "tests that create stores directly" pattern
-    /// `backend.rs`'s own `prepare_core_schema` doc comment names — must
-    /// still be able to run `transactional_orphan_sweep`. `blob_gc_claims`
-    /// is V20, migration-only DDL; it must not exist on this backend, and
-    /// the sweep must not require it to.
+    /// applies — has no `blob_gc_claims` table and no entity fencing
+    /// triggers. Without that fence a reference committed between liveness
+    /// selection and physical deletion would dangle, so the trait contract
+    /// requires `StorageError::Unsupported` here rather than an unfenced
+    /// sweep, and every candidate must survive.
     #[tokio::test]
-    async fn transactional_orphan_sweep_works_without_the_blob_gc_claims_migration() {
+    async fn transactional_orphan_sweep_refuses_without_the_blob_gc_claims_migration() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
@@ -2052,12 +2030,59 @@ mod tests {
         let orphan = store.put(b"direct-backend orphan".to_vec()).await.unwrap();
 
         let sql = backend.sql();
-        let result = store
+        let error = store
             .transactional_orphan_sweep(sql.as_ref(), false)
             .await
-            .expect("sweep must succeed on a direct backend without the blob_gc_claims migration");
-        assert_eq!(result.deleted, 1);
-        assert!(!store.exists(&orphan).await.unwrap());
+            .expect_err("sweep must refuse a backend without the blob_gc_claims fencing set");
+        assert!(
+            matches!(error, StorageError::Unsupported { .. }),
+            "expected StorageError::Unsupported, got {error:?}"
+        );
+        assert!(
+            store.exists(&orphan).await.unwrap(),
+            "a refused sweep must not have deleted anything"
+        );
+    }
+
+    /// The fencing gate must demand the complete V20 set, not just the
+    /// claims table: with a fencing trigger dropped, a claim no longer
+    /// blocks a concurrent entity write from resurrecting the digest, so
+    /// the sweep must refuse exactly as it does with no migration at all.
+    #[tokio::test]
+    async fn transactional_orphan_sweep_refuses_with_incomplete_fencing_triggers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+            writer
+                .conn_mut()
+                .execute_batch("DROP TRIGGER entities_reject_claimed_blob_update")
+                .unwrap();
+        }
+
+        let root = dir.path().join("blobs");
+        let store = std::sync::Arc::new(
+            FsBlobStore::new(root.clone(), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let orphan = store.put(b"partial-fence orphan".to_vec()).await.unwrap();
+
+        let sql = backend.sql();
+        let error = store
+            .transactional_orphan_sweep(sql.as_ref(), false)
+            .await
+            .expect_err("sweep must refuse when any V20 fencing trigger is missing");
+        assert!(
+            matches!(error, StorageError::Unsupported { .. }),
+            "expected StorageError::Unsupported, got {error:?}"
+        );
+        assert!(
+            store.exists(&orphan).await.unwrap(),
+            "a refused sweep must not have deleted anything"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
