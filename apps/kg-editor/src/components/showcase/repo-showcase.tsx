@@ -24,6 +24,16 @@ import {
 } from "lucide-react";
 import { useMemo, useState } from "react";
 
+import {
+  DerivedEdgeMark,
+  edgeDirectionMark,
+  edgeHueStyle,
+  EntityKindMark,
+  kindHueStyle,
+  OntologyLegend,
+  RelationMark,
+} from "@/components/ontology-mark";
+import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import type {
   RepoBundle,
   RepoModule,
@@ -66,6 +76,11 @@ const UI_ROW_LIMIT = 200;
 const UI_TREEMAP_LIMIT = 180;
 const UI_RESIDUAL_LIMIT = 80;
 const UI_GRAPH_EDGE_LIMIT = 50;
+
+function derivedDiamondPoints(x: number, y: number): string {
+  const r = 1.1;
+  return `${x},${y - r} ${x + r},${y} ${x},${y + r} ${x - r},${y}`;
+}
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat("en", { notation: value >= 10_000 ? "compact" : "standard" }).format(value);
@@ -241,6 +256,7 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
   const nodeWidth = (id: string) => 92 + ((degrees.get(id) ?? 0) / maxDegree) * 46;
   const selectedModule = displayedModules.find((item) => item.id === selectedId);
   const selectedPackage = displayedPackages.find((item) => item.id === selectedId);
+  const selectedEntityKind = selectedModule ? "concept" : "project";
   const visibleLabel = new Map<string, string>([
     [graph.repository.id, graph.repository.label],
     ...displayedPackages.map((item) => [item.id, item.name] as const),
@@ -271,29 +287,87 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
             <button type="button" aria-label={`${capability.views.structure_graph.label} +`} onClick={() => setZoom((value) => Math.min(1.5, value + 0.25))}>+</button>
           </div>
         </div>
+        <OntologyLegend
+          className="repo-ontology-legend"
+          presentEntityKinds={["project", "concept"]}
+          presentRelations={displayedEdges.map((edge) => edge.relation)}
+        />
         <div className="repo-graph-stage" aria-label={capability.views.structure_graph.label}>
           <div className="repo-graph-viewport" style={{ transform: `scale(${zoom})` }}>
             <svg className="repo-edges" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              <defs>
+                <marker id="showcase-ontology-arrow" markerHeight="6" markerWidth="6" orient="auto" refX="5" refY="3" viewBox="0 0 6 6">
+                  <path d="M 0 0 L 6 3 L 0 6 z" fill="context-stroke" />
+                </marker>
+              </defs>
               {displayedEdges.map((edge) => {
                 const source = positions.get(edge.source);
                 const target = positions.get(edge.target);
                 if (!source || !target) return null;
-                return <line key={edge.id} className={edge.origin} x1={source.x} y1={source.y} x2={target.x} y2={target.y} vectorEffect="non-scaling-stroke" />;
+                const legend = edgeLegendFor(edge.relation);
+                const direction = edgeDirectionMark(legend, source, target);
+                return (
+                  <g key={edge.id}>
+                    <line
+                      className="ontology-edge"
+                      data-edge-family={legend.family}
+                      data-edge-origin={edge.origin}
+                      data-edge-treatment={legend.treatment}
+                      data-edge-variant={legend.variant}
+                      markerEnd={legend.directed ? "url(#showcase-ontology-arrow)" : undefined}
+                      style={edgeHueStyle(legend)}
+                      x1={source.x}
+                      y1={source.y}
+                      x2={target.x}
+                      y2={target.y}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                    <text
+                      className="ontology-edge-glyph"
+                      data-edge-directed={legend.directed}
+                      style={edgeHueStyle(legend)}
+                      x={(source.x + target.x) / 2}
+                      y={(source.y + target.y) / 2}
+                    >
+                      {legend.glyph}
+                    </text>
+                    {direction && (
+                      <text
+                        className="ontology-direction-glyph"
+                        style={edgeHueStyle(legend)}
+                        transform={direction.transform}
+                        x={direction.x}
+                        y={direction.y}
+                      >›</text>
+                    )}
+                    {edge.origin === "derived" && (
+                      <polygon
+                        className="ontology-derived-glyph"
+                        points={derivedDiamondPoints(
+                          source.x + (target.x - source.x) * 0.4,
+                          source.y + (target.y - source.y) * 0.4,
+                        )}
+                      />
+                    )}
+                  </g>
+                );
               })}
             </svg>
             <button
               className={`repo-graph-node ${selectedId === graph.repository.id ? "selected" : ""}`}
-              style={{ left: "50%", top: "9%", width: `${nodeWidth(graph.repository.id)}px` }}
+              style={{ left: "50%", top: "9%", width: `${nodeWidth(graph.repository.id)}px`, ...kindHueStyle(entityLegendFor("project")) }}
               type="button"
               aria-pressed={selectedId === graph.repository.id}
               onClick={() => setSelectedId(graph.repository.id)}
             >
+              <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
               <span>{labels.node_types.repository}</span><strong>{graph.repository.label}</strong>
             </button>
             {displayedPackages.map((item) => {
               const position = positions.get(item.id)!;
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px` }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+                  <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
                   <span>{labels.node_types.package}</span><strong>{item.name}</strong>
                 </button>
               );
@@ -301,7 +375,8 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
             {displayedModules.map((item) => {
               const position = positions.get(item.id)!;
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px` }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+                  <EntityKindMark className="repo-node-kind-icon" kind="concept" showLabel={false} />
                   <span>{labels.node_types.module}</span><strong>{item.module_path}</strong>
                 </button>
               );
@@ -310,7 +385,7 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
         </div>
         <div className="repo-inspector">
           <div className="repo-inspector-heading">
-            <CircleDot aria-hidden="true" />
+            <EntityKindMark kind={selectedEntityKind} showLabel={false} />
             <div>
               <span>{selectedModule ? labels.node_types.module : selectedPackage ? labels.node_types.package : labels.node_types.repository}</span>
               <strong>{selectedModule?.module_path ?? selectedPackage?.name ?? graph.repository.label}</strong>
@@ -325,7 +400,7 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
         <ul className="repo-edge-list" aria-label={capability.views.structure_graph.label}>
           {displayedEdges.map((edge) => (
             <li key={`${edge.id}-accessible`}>
-              <code>{visibleLabel.get(edge.source) ?? edge.source}</code><span>{edge.relation}</span><code>{visibleLabel.get(edge.target) ?? edge.target}</code><em>{edge.origin === "derived" ? labels.derived : labels.ingested}</em>
+              <code>{visibleLabel.get(edge.source) ?? edge.source}</code><RelationMark relation={edge.relation} /><code>{visibleLabel.get(edge.target) ?? edge.target}</code><em>{edge.origin === "derived" ? <DerivedEdgeMark label={labels.derived} /> : labels.ingested}</em>
             </li>
           ))}
         </ul>
