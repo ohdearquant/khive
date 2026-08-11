@@ -18,6 +18,17 @@ const showcaseCss = await readFile(
   new URL("../src/app/showcase.css", import.meta.url),
   "utf8",
 );
+const vitestConfig = await readFile(
+  new URL("../vitest.config.ts", import.meta.url),
+  "utf8",
+);
+
+test("Vitest leaves this Node-native suite to node:test", () => {
+  assert.match(
+    vitestConfig,
+    /exclude:\s*\[[\s\S]*?"scripts\/design-token-contract\.test\.mjs"[\s\S]*?\]/u,
+  );
+});
 
 function tokensForTheme(theme) {
   const tokens = {};
