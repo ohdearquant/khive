@@ -206,7 +206,7 @@ describe("repository showcase", () => {
   it("settles the structure graph without collapsing nodes onto a handful of shared coordinates", () => {
     const { container } = render(<RepoShowcase bundle={golden()} />);
     const nodes = Array.from(container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]"));
-    expect(nodes.length).toBeGreaterThan(40);
+    expect(nodes).toHaveLength(51);
 
     const coordinateCounts = new Map<string, number>();
     for (const node of nodes) {
@@ -222,7 +222,7 @@ describe("repository showcase", () => {
     const stageWidth = 300;
     const { container } = render(<RepoShowcase bundle={golden()} />);
     const nodes = Array.from(container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]"));
-    expect(nodes.length).toBeGreaterThan(40);
+    expect(nodes).toHaveLength(51);
 
     for (const node of nodes) {
       const leftPercent = Number.parseFloat(node.style.left);
