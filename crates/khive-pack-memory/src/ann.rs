@@ -4782,7 +4782,12 @@ mod tests {
 
     /// A subject present in the stale warm ANN index whose final tail op is
     /// `delete` must be dropped from the merged candidate list — the tail is
-    /// authoritative for every subject it names.
+    /// authoritative for every subject it names. This is also #1828's direct
+    /// file-backed fresh-tail regression: `fresh_tail_serving` must retain one
+    /// admitted reader across BEGIN → registry-min → tail → COMMIT. Its
+    /// `Skipped` failure arm reports the exact reason (notably
+    /// `fresh-tail: snapshot begin failed`) so this contract cannot regress as
+    /// an opaque candidate mismatch again.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_leg_drops_subject_whose_final_tail_op_is_delete() {
@@ -4855,7 +4860,9 @@ mod tests {
         let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
             FreshTailOutcome::Ops(ops) => ops,
             FreshTailOutcome::Replace(..) => panic!("fresh-tail leg unexpectedly re-resolved"),
-            FreshTailOutcome::Skipped(_) => panic!("fresh-tail leg unexpectedly skipped"),
+            FreshTailOutcome::Skipped(reason) => {
+                panic!("fresh-tail leg unexpectedly skipped: {reason}")
+            }
         };
         let merged = merge_fresh_tail(raw, &query, ops);
         assert!(
