@@ -84,8 +84,12 @@ Cached read-only handles admit one explicit top-level deferred read transaction:
 `BEGIN`, `BEGIN TRANSACTION`, and `BEGIN DEFERRED [TRANSACTION]` retain the
 opening operation's reader permit, subsequent queries reuse it, and
 `COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite returns to
-autocommit. Immediate/exclusive starts, `START`, nested `BEGIN`, `SAVEPOINT`,
-`RELEASE`, and `ROLLBACK ... TO` are rejected with
+autocommit. The same successful `BEGIN` registers a backend-scoped
+`sql_bridge_cached_read_transaction` span in `tx_registry`; queries and
+rejected nested controls retain it, and terminal control, cancellation,
+cleanup, or handle drop deregisters it only after the SQLite snapshot ends.
+Immediate/exclusive starts, `START`, nested `BEGIN`, `SAVEPOINT`, `RELEASE`,
+and `ROLLBACK ... TO` are rejected with
 `StorageError::InvalidInput`; `execute_batch` still rejects every transaction
 control form. A terminal statement that fails while SQLite remains in the
 transaction keeps the permit, allowing a later full rollback or safe handle

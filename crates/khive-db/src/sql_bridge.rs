@@ -725,6 +725,22 @@ async fn open_standalone_writer_on_blocking(
 // File-backed: SqliteReader (standalone connection)
 // =============================================================================
 
+const CACHED_READ_TRANSACTION_LABEL: &str = "sql_bridge_cached_read_transaction";
+
+/// Admission and observability guards for one explicit cached-reader
+/// transaction. Both guards are installed only after SQLite accepts `BEGIN`
+/// and are retained together until SQLite reports autocommit again or the
+/// owning connection is closed.
+///
+/// Field order is deliberate: after [`StandaloneHandle::conn`] closes, the
+/// reader permit is returned before the registry evidence disappears. There
+/// is therefore no interval in which SQLite can still own the snapshot while
+/// the transaction is absent from `tx_registry`.
+struct CachedReadTransaction {
+    _slot: OwnedSemaphorePermit,
+    _tx_handle: khive_storage::tx_registry::TxHandle,
+}
+
 struct StandaloneHandle {
     conn: rusqlite::Connection,
     /// Present only for a standalone read-write handle, whose one-permit
@@ -735,9 +751,10 @@ struct StandaloneHandle {
     _retained_slot: Option<OwnedSemaphorePermit>,
     /// Present only while a cached read-only connection owns one explicit
     /// multi-call read transaction. Field order is load-bearing: Rust drops
-    /// `conn` before this permit, so cancellation or handle drop closes the
-    /// SQLite transaction before returning reader admission.
-    read_transaction_slot: Option<OwnedSemaphorePermit>,
+    /// `conn` before these guards, so cancellation or handle drop closes the
+    /// SQLite transaction before returning reader admission or deregistering
+    /// the transaction span.
+    read_transaction_slot: Option<CachedReadTransaction>,
 }
 
 impl StandaloneHandle {
@@ -806,6 +823,7 @@ where
     let active_read_transaction = handle
         .as_ref()
         .is_some_and(|handle| handle.is_cached_reader() && handle.has_read_transaction());
+    let origin = pool.origin();
     let mut operation_slot = if active_read_transaction {
         None
     } else {
@@ -944,7 +962,26 @@ where
                     message: "deferred BEGIN completed without opening a read transaction".into(),
                 });
             } else {
-                owned_handle.read_transaction_slot = operation_slot.take();
+                match operation_slot.take() {
+                    Some(slot) => {
+                        let tx_handle = khive_storage::tx_registry::register_scoped(
+                            Some(CACHED_READ_TRANSACTION_LABEL.to_string()),
+                            origin,
+                        );
+                        owned_handle.read_transaction_slot = Some(CachedReadTransaction {
+                            _slot: slot,
+                            _tx_handle: tx_handle,
+                        });
+                    }
+                    None => {
+                        result = Err(StorageError::Pool {
+                            operation: operation.into(),
+                            message: "successful cached-reader BEGIN had no operation permit; \
+                                      its transaction was rolled back before returning"
+                                .into(),
+                        });
+                    }
+                }
             }
         }
 
@@ -2172,6 +2209,15 @@ mod tests {
     use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::{SqlAccess as _, SqlReader as _};
 
+    fn database_tx_view(pool: &ConnectionPool) -> khive_storage::tx_registry::TxOriginFilter {
+        match pool.origin() {
+            khive_storage::tx_registry::TxOrigin::Database(identity) => {
+                khive_storage::tx_registry::TxOriginFilter::Secondary(identity)
+            }
+            other => panic!("expected a file-backed database origin, got {other:?}"),
+        }
+    }
+
     struct NotifyOnDrop(Arc<tokio::sync::Notify>);
 
     impl Drop for NotifyOnDrop {
@@ -2622,6 +2668,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(tx_registry)]
     async fn cached_read_transaction_retains_one_permit_until_commit_or_rollback() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
@@ -2632,9 +2679,19 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let origin = pool.origin();
+        let origin_view = database_tx_view(&pool);
+        let unrelated_view = khive_storage::tx_registry::TxOriginFilter::Secondary(
+            khive_storage::tx_registry::DbIdentity::new("unrelated-sql-bridge.db"),
+        );
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut reader = bridge.reader().await.unwrap();
         let mut contender = bridge.reader().await.unwrap();
+
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+            "an idle cached reader must not register a transaction"
+        );
 
         reader
             .query_all(SqlStatement {
@@ -2644,6 +2701,14 @@ mod tests {
             })
             .await
             .expect("BEGIN DEFERRED must open an admitted cached-reader snapshot");
+        let opened = khive_storage::tx_registry::oldest_for(&origin_view)
+            .expect("successful BEGIN must register the cached-reader transaction");
+        assert_eq!(opened.label.as_deref(), Some(CACHED_READ_TRANSACTION_LABEL));
+        assert_eq!(opened.origin, origin);
+        assert!(
+            khive_storage::tx_registry::oldest_for(&unrelated_view).is_none(),
+            "the read transaction must be attributed only to its own backend"
+        );
         assert_eq!(
             pool.sql_bridge_reader_slots().available_permits(),
             0,
@@ -2659,6 +2724,13 @@ mod tests {
             .await
             .expect("a query inside the admitted transaction must reuse its retained permit");
         assert!(matches!(value, Some(SqlValue::Integer(7))));
+        assert_eq!(
+            khive_storage::tx_registry::oldest_for(&origin_view)
+                .expect("queries must retain the transaction registration")
+                .id,
+            opened.id,
+            "queries inside the transaction must retain the original span"
+        );
 
         let blocked = contender
             .query_scalar(SqlStatement {
@@ -2684,6 +2756,10 @@ mod tests {
             })
             .await
             .expect("COMMIT must close the admitted cached-reader snapshot");
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+            "COMMIT must deregister after SQLite returns to autocommit"
+        );
         assert_eq!(
             pool.sql_bridge_reader_slots().available_permits(),
             1,
@@ -2707,6 +2783,9 @@ mod tests {
             })
             .await
             .expect("plain deferred BEGIN TRANSACTION must also be admitted");
+        let reopened = khive_storage::tx_registry::oldest_for(&origin_view)
+            .expect("the second successful BEGIN must register a fresh span");
+        assert_ne!(reopened.id, opened.id);
         assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 0);
         let nested = reader
             .query_all(SqlStatement {
@@ -2724,6 +2803,29 @@ mod tests {
             0,
             "rejected nested control must not release the still-live transaction admission"
         );
+        assert_eq!(
+            khive_storage::tx_registry::oldest_for(&origin_view)
+                .expect("ROLLBACK TO rejection must retain the live span")
+                .id,
+            reopened.id
+        );
+        let savepoint = reader
+            .query_all(SqlStatement {
+                sql: "SAVEPOINT nested_snapshot".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(&savepoint, Err(StorageError::InvalidInput { .. })),
+            "SAVEPOINT must be rejected inside the admitted transaction; got {savepoint:?}"
+        );
+        assert_eq!(
+            khive_storage::tx_registry::oldest_for(&origin_view)
+                .expect("SAVEPOINT rejection must retain the live span")
+                .id,
+            reopened.id
+        );
         reader
             .query_all(SqlStatement {
                 sql: "ROLLBACK".into(),
@@ -2733,9 +2835,136 @@ mod tests {
             .await
             .expect("ROLLBACK must close the admitted cached-reader snapshot");
         assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 1);
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+            "full ROLLBACK must deregister after SQLite returns to autocommit"
+        );
     }
 
     #[tokio::test]
+    async fn failed_cached_reader_begin_does_not_register_a_transaction() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        fn deny_begin(ctx: AuthContext<'_>) -> Authorization {
+            match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Begin,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_reader_failed_begin.db")),
+            max_readers: 1,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let origin_view = database_tx_view(&pool);
+        let conn = open_standalone_reader(&pool).unwrap();
+        conn.authorizer(Some(deny_begin)).unwrap();
+        let mut reader = SqliteReader {
+            handle: Some(StandaloneHandle {
+                conn,
+                _retained_slot: None,
+                read_transaction_slot: None,
+            }),
+            pool: Arc::clone(&pool),
+        };
+
+        let begin = reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(begin.is_err(), "the authorizer must reject BEGIN");
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+            "a failed BEGIN must never enter the transaction registry"
+        );
+        assert_eq!(
+            pool.sql_bridge_reader_slots().available_permits(),
+            1,
+            "a failed BEGIN must return the operation permit"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(tx_registry)]
+    async fn failed_cached_reader_rollback_deregisters_only_when_connection_is_discarded() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        fn deny_rollback(ctx: AuthContext<'_>) -> Authorization {
+            match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_reader_failed_rollback.db")),
+            max_readers: 1,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let origin_view = database_tx_view(&pool);
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut reader = bridge.reader().await.unwrap();
+
+        reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("BEGIN must establish the registered transaction");
+        let opened = khive_storage::tx_registry::oldest_for(&origin_view)
+            .expect("the admitted transaction must be registered");
+        reader
+            .handle
+            .as_ref()
+            .expect("reader must retain its connection")
+            .conn
+            .authorizer(Some(deny_rollback))
+            .unwrap();
+
+        let rollback = reader
+            .query_all(SqlStatement {
+                sql: "ROLLBACK".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(rollback.is_err(), "the authorizer must reject ROLLBACK");
+        assert_eq!(
+            khive_storage::tx_registry::oldest_for(&origin_view)
+                .expect("failed ROLLBACK must retain registry evidence")
+                .id,
+            opened.id
+        );
+        assert_eq!(
+            pool.sql_bridge_reader_slots().available_permits(),
+            0,
+            "failed ROLLBACK must retain reader admission"
+        );
+
+        drop(reader);
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+            "discarding the connection must not leak its registry entry"
+        );
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(tx_registry)]
     async fn cached_read_only_handles_reject_unsupported_transaction_control_without_consumption() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
@@ -2850,6 +3079,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(tx_registry)]
     async fn dropping_cached_reader_transaction_closes_snapshot_before_releasing_permit() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
@@ -2859,6 +3089,7 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let origin_view = database_tx_view(&pool);
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut reader = bridge.reader().await.unwrap();
         let mut contender = bridge.reader().await.unwrap();
@@ -2880,8 +3111,16 @@ mod tests {
             .await
             .expect("materialize read snapshot");
         assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 0);
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_some(),
+            "the live snapshot must remain registered until handle drop"
+        );
 
         drop(reader);
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+            "handle drop must close SQLite before deregistering the snapshot"
+        );
         assert_eq!(
             pool.sql_bridge_reader_slots().available_permits(),
             1,
@@ -2898,6 +3137,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(tx_registry)]
     async fn cancelled_cached_reader_transaction_keeps_permit_until_connection_closes() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
@@ -2907,6 +3147,7 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let origin_view = database_tx_view(&pool);
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut reader = SqliteReader {
             handle: Some(open_cached_reader_handle(Arc::clone(&pool)).await.unwrap()),
@@ -2933,6 +3174,10 @@ mod tests {
         entered.notified().await;
         query.abort();
         assert!(matches!(query.await, Err(error) if error.is_cancelled()));
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_some(),
+            "cancellation must retain registry evidence while detached SQLite work runs"
+        );
 
         let blocked = contender
             .query_all(SqlStatement {
@@ -2956,6 +3201,17 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
             .await
             .expect("cancelled transaction connection did not close");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            // `completed` is fired while the first field (`conn`) drops. The
+            // registry guard is a later field by design, so let the detached
+            // blocking task finish the rest of the ordered drop before
+            // asserting the terminal state.
+            while khive_storage::tx_registry::oldest_for(&origin_view).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection cleanup after cancellation leaked the transaction span");
         contender
             .query_all(SqlStatement {
                 sql: "SELECT 1".into(),
@@ -2967,6 +3223,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(tx_registry)]
     async fn cached_reader_transaction_lifecycle_survives_sqlite_empty_prefixes() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {

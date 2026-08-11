@@ -1221,11 +1221,12 @@ process-local admission budget even when the connection is correctly in autocomm
 query acquires a permit for its blocking SQLite operation and releases it only after the statement
 is finalized and autocommit is verified. One explicit top-level deferred read transaction is
 allowed as one logical read operation: its successful `BEGIN` transfers the operation permit onto
-the handle; queries reuse it; `COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite
-reports autocommit. Immediate/exclusive starts and nested transaction controls remain rejected.
-Cancellation or handle drop destroys the connection before its retained transaction permit, so
-there is never an idle WAL snapshot outside admission. See ADR-005's 2026-08-09 amendment for the
-full raw-SQL capability contract.
+the handle and installs a backend-scoped `tx_registry` span; queries reuse both guards;
+`COMMIT`/`END` or full `ROLLBACK` releases them only after SQLite reports autocommit.
+Immediate/exclusive starts and nested transaction controls remain rejected. Cancellation or handle
+drop destroys the connection before its retained transaction permit and registry handle, so there
+is never an idle WAL snapshot outside admission or invisible to the checkpoint age sweep. See
+ADR-005's 2026-08-09 amendment for the full raw-SQL capability contract.
 
 **Checkpoint acceptance.** The integration regression
 `multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress` retains eight idle
