@@ -737,7 +737,7 @@ function DependencyTopology({ bundle, moduleById, onExploreStructure }: ViewProp
       </section>
       <section className="repo-card">
         <div className="repo-card-heading"><h3>{labels.metrics.cycle_count}</h3><p>{formatNumber(analysis.cycles.items.length)}</p></div>
-        <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>{cycle.module_ids.map((id) => moduleName(moduleById, id)).join(" → ")}</span></div></div>)}</div>
+        <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>SCC members: {cycle.module_ids.map((id) => moduleName(moduleById, id)).join(" · ")}</span></div></div>)}</div>
         {isKnownEmptyRepoPage(analysis.cycles) && <DataState className="repo-empty" state="empty" title="No dependency cycles in this bundle" message="Dependency cycles found by the captured topology analysis belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={cycleRows.length} total={analysis.cycles.items.length} label={labels.metrics.cycle_count} labels={labels} />
         <BoundDisclosure page={analysis.cycles} labels={labels} />

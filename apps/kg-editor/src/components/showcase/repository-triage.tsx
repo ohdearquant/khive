@@ -18,7 +18,7 @@ import {
   Signpost,
   Users,
 } from "@/icons";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import { DataState } from "@/components/data-state";
 import {
@@ -65,6 +65,37 @@ function MetricValue({
   );
 }
 
+function CoverageState({
+  metric,
+  title,
+}: {
+  metric: RepositoryMetric;
+  title: string;
+}) {
+  if (metric.status === "complete") return null;
+  if (metric.status === "unavailable") {
+    return (
+      <DataState
+        presentation="inline"
+        state="unavailable"
+        title={title}
+        message={metric.reason ?? metric.summary}
+      />
+    );
+  }
+  return (
+    <DataState
+      presentation="inline"
+      state="truncated"
+      title={title}
+      shown={metric.shown}
+      bound={metric.bound ?? undefined}
+      knownTotal={metric.total ?? undefined}
+      reason={metric.reason ?? metric.summary}
+    />
+  );
+}
+
 function signalIcon(kind: RepositorySignal["kind"]) {
   if (kind === "hotspot") return <Radar aria-hidden="true" />;
   if (kind === "dependency_cycle") return <GitFork aria-hidden="true" />;
@@ -107,6 +138,7 @@ function ModuleButton({
       className={styles.moduleButton}
       data-module-id={module.id}
       aria-label={`Inspect ${module.source_path}`}
+      aria-controls="repository-module-inspector"
       aria-pressed={selected}
       onClick={onSelect}
     >
@@ -140,6 +172,7 @@ export function RepositoryTriage({
   const [selectedModuleId, setSelectedModuleId] = useState<string | null>(
     initialModuleId,
   );
+  const inspectorRef = useRef<HTMLElement>(null);
   const [query, setQuery] = useState("");
   const selectedInsight = useMemo(
     () =>
@@ -153,6 +186,16 @@ export function RepositoryTriage({
 
   function selectModule(moduleId: string) {
     setSelectedModuleId(moduleId);
+    const inspector = inspectorRef.current;
+    if (!inspector) return;
+    inspector.focus({ preventScroll: true });
+    const reduceMotion = window.matchMedia?.(
+      "(prefers-reduced-motion: reduce)",
+    ).matches ?? false;
+    inspector.scrollIntoView?.({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
   }
 
   function selectSignal(signal: RepositorySignal) {
@@ -284,32 +327,47 @@ export function RepositoryTriage({
                 <div className={styles.startList}>
                   {brief.startHere.length
                     ? (
-                      brief.startHere.map((entry, index) => {
-                        const moduleNode = moduleById.get(entry.moduleId);
-                        if (!moduleNode) return null;
-                        return (
-                          <div className={styles.startRow} key={entry.moduleId}>
-                            <span className={styles.rank}>
-                              {String(index + 1).padStart(2, "0")}
-                            </span>
-                            <ModuleButton
-                              module={moduleNode}
-                              selected={moduleNode.id === selectedModuleId}
-                              detail={`${bundle.capability.views.api_surface.label} · ${
-                                formatNumber(entry.dependentCount)
-                              } ${labels.metrics.dependent_count} · ${entry.modulePath}`}
-                              onSelect={() =>
-                                selectModule(moduleNode.id)}
-                            />
-                          </div>
-                        );
-                      })
+                      <>
+                        {brief.startHere.map((entry, index) => {
+                          const moduleNode = moduleById.get(entry.moduleId);
+                          if (!moduleNode) return null;
+                          return (
+                            <div
+                              className={styles.startRow}
+                              key={entry.moduleId}
+                            >
+                              <span className={styles.rank}>
+                                {String(index + 1).padStart(2, "0")}
+                              </span>
+                              <ModuleButton
+                                module={moduleNode}
+                                selected={moduleNode.id === selectedModuleId}
+                                detail={`${bundle.capability.views.api_surface.label} · ${
+                                  formatNumber(entry.dependentCount)
+                                } ${labels.metrics.dependent_count} · ${entry.modulePath}`}
+                                onSelect={() => selectModule(moduleNode.id)}
+                              />
+                            </div>
+                          );
+                        })}
+                        <CoverageState
+                          metric={brief.startHereState}
+                          title={`${bundle.capability.views.api_surface.label} coverage`}
+                        />
+                      </>
+                    )
+                    : brief.startHereState.status !== "complete"
+                    ? (
+                      <CoverageState
+                        metric={brief.startHereState}
+                        title={`${bundle.capability.views.api_surface.label} coverage`}
+                      />
                     )
                     : (
                       <DataState
                         className={styles.empty}
                         state="empty"
-                        title="No API-surface recommendation is supported"
+                        title={`No ${bundle.capability.views.api_surface.label} recommendation is supported`}
                         message={`No captured ${moduleLabelLower} has a non-zero ${labels.metrics.dependent_count.toLocaleLowerCase()} in this snapshot.`}
                         action={{
                           label:
@@ -341,12 +399,18 @@ export function RepositoryTriage({
             </div>
             <div className={styles.signalGrid}>
               {brief.attentionSignals.length
-                ? brief.attentionSignals.map((signal) => (
-                  <article
-                    className={styles.signal}
-                    data-signal-kind={signal.kind}
-                    key={signal.id}
-                  >
+                ? (
+                  <>
+                    {brief.attentionSignals.map((signal) => {
+                      const inspectionTarget = signal.moduleIds
+                        .map((moduleId) => moduleById.get(moduleId))
+                        .find((module): module is RepoModule => module != null);
+                      return (
+                        <article
+                          className={styles.signal}
+                          data-signal-kind={signal.kind}
+                          key={signal.id}
+                        >
                     <div className={styles.signalTop}>
                       <span className={styles.signalIcon}>
                         {signalIcon(signal.kind)}
@@ -367,14 +431,12 @@ export function RepositoryTriage({
                       ))}
                     </dl>
                     <div className={styles.signalActions}>
-                      {signal.moduleIds.some((moduleId) =>
-                        moduleById.has(moduleId)
-                      ) && (
+                      {inspectionTarget && (
                         <button
                           type="button"
                           onClick={() => selectSignal(signal)}
                         >
-                          Inspect {moduleLabelLower}
+                          Inspect {inspectionTarget.source_path}
                         </button>
                       )}
                       <button
@@ -390,8 +452,22 @@ export function RepositoryTriage({
                         <ArrowRight aria-hidden="true" />
                       </button>
                     </div>
-                  </article>
-                ))
+                        </article>
+                      );
+                    })}
+                    <CoverageState
+                      metric={brief.attentionState}
+                      title="Attention-analysis availability"
+                    />
+                  </>
+                )
+                : brief.attentionState.status !== "complete"
+                ? (
+                  <CoverageState
+                    metric={brief.attentionState}
+                    title="Attention-analysis availability"
+                  />
+                )
                 : (
                   <DataState
                     className={styles.empty}
@@ -410,9 +486,12 @@ export function RepositoryTriage({
 
         <aside
           className={styles.inspector}
+          id="repository-module-inspector"
+          ref={inspectorRef}
           aria-label={`${moduleLabel} evidence`}
           data-module-inspector
           aria-live="polite"
+          tabIndex={-1}
         >
           {selectedInsight
             ? (
@@ -429,18 +508,33 @@ export function RepositoryTriage({
                 </header>
 
                 <dl className={styles.inspectorMetrics}>
-                  <div>
+                  <div data-inspector-metric="fan-in">
                     <dt>{labels.metrics.fan_in}</dt>
-                    <dd>{formatNumber(selectedInsight.topology.fanIn)}</dd>
+                    <dd>
+                      {selectedInsight.topology.coverage.status ===
+                          "unavailable"
+                        ? labels.unavailable
+                        : formatNumber(selectedInsight.topology.fanIn)}
+                    </dd>
                   </div>
-                  <div>
+                  <div data-inspector-metric="fan-out">
                     <dt>{labels.metrics.fan_out}</dt>
-                    <dd>{formatNumber(selectedInsight.topology.fanOut)}</dd>
+                    <dd>
+                      {selectedInsight.topology.coverage.status ===
+                          "unavailable"
+                        ? labels.unavailable
+                        : formatNumber(selectedInsight.topology.fanOut)}
+                    </dd>
                   </div>
-                  <div>
+                  <div data-inspector-metric="commits">
                     <dt>{labels.metrics.commits}</dt>
                     <dd>
-                      {formatNumber(selectedInsight.recentCommits.length)}
+                      {selectedInsight.history.status === "unavailable"
+                        ? labels.unavailable
+                        : formatNumber(
+                          selectedInsight.history.total ??
+                            selectedInsight.history.shown,
+                        )}
                     </dd>
                   </div>
                   <div>
@@ -448,6 +542,11 @@ export function RepositoryTriage({
                     <dd>{selectedInsight.ownership?.busFactor ?? "—"}</dd>
                   </div>
                 </dl>
+
+                <CoverageState
+                  metric={selectedInsight.topology.coverage}
+                  title={`${bundle.capability.views.dependency_topology.label} coverage`}
+                />
 
                 {selectedInsight.hotspot && (
                   <div className={styles.inspectorSignal}>
@@ -469,11 +568,29 @@ export function RepositoryTriage({
                     <h4>{labels.metrics.fan_in}</h4>
                     {selectedInsight.dependents.length
                       ? (
-                        <ul>
-                          {selectedInsight.dependents.slice(0, 6).map((
-                            module,
-                          ) => <li key={module.id}>{module.source_path}</li>)}
-                        </ul>
+                        <>
+                          <ul>
+                            {selectedInsight.dependents.slice(0, 6).map((
+                              module,
+                            ) => (
+                              <li key={module.id}>
+                                <button
+                                  type="button"
+                                  onClick={() => selectModule(module.id)}
+                                >
+                                  {module.source_path}
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                          {selectedInsight.dependents.length > 6 && (
+                            <p className={styles.sliceDisclosure}>
+                              Showing 6 of {selectedInsight.dependents.length}
+                              {" "}captured {labels.metrics.fan_in.toLocaleLowerCase()}
+                              {" "}records.
+                            </p>
+                          )}
+                        </>
                       )
                       : <p>No captured {labels.metrics.fan_in} evidence.</p>}
                   </section>
@@ -481,19 +598,68 @@ export function RepositoryTriage({
                     <h4>{labels.metrics.fan_out}</h4>
                     {selectedInsight.dependencies.length
                       ? (
-                        <ul>
-                          {selectedInsight.dependencies
-                            .slice(0, 6)
-                            .map((module) => (
-                              <li key={module.id}>{module.source_path}</li>
-                            ))}
-                        </ul>
+                        <>
+                          <ul>
+                            {selectedInsight.dependencies
+                              .slice(0, 6)
+                              .map((module) => (
+                                <li key={module.id}>
+                                  <button
+                                    type="button"
+                                    onClick={() => selectModule(module.id)}
+                                  >
+                                    {module.source_path}
+                                  </button>
+                                </li>
+                              ))}
+                          </ul>
+                          {selectedInsight.dependencies.length > 6 && (
+                            <p className={styles.sliceDisclosure}>
+                              Showing 6 of {selectedInsight.dependencies.length}
+                              {" "}captured {labels.metrics.fan_out.toLocaleLowerCase()}
+                              {" "}records.
+                            </p>
+                          )}
+                        </>
                       )
                       : <p>No captured {labels.metrics.fan_out} evidence.</p>}
                   </section>
                 </div>
 
-                {selectedInsight.couplings.length > 0
+                {selectedInsight.topology.cycles.length > 0 && (
+                  <section className={styles.inspectorSection}>
+                    <h4>{bundle.capability.views.dependency_topology.label}</h4>
+                    <ul>
+                      {selectedInsight.topology.cycles.map((cycle) => (
+                        <li key={cycle.id}>
+                          <code>{cycle.id}</code>
+                          <span className={styles.memberLinks}>
+                            SCC members: {cycle.modules.map((module, index) => (
+                              <span key={module.id}>
+                                <button
+                                  type="button"
+                                  onClick={() => selectModule(module.id)}
+                                >
+                                  {module.source_path}
+                                </button>
+                                {index < cycle.modules.length - 1 ? " · " : ""}
+                              </span>
+                            ))}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                )}
+
+                {selectedInsight.couplingState.status === "unavailable"
+                  ? (
+                    <CoverageState
+                      metric={selectedInsight.couplingState}
+                      title={`${bundle.capability.views.hidden_coupling.label} coverage`}
+                    />
+                  )
+                  : selectedInsight.couplings.length > 0
                   ? (
                     <section className={styles.inspectorSection}>
                       <h4>{bundle.capability.views.hidden_coupling.label}</h4>
@@ -502,7 +668,12 @@ export function RepositoryTriage({
                           coupling,
                         ) => (
                           <li key={coupling.module.id}>
-                            <span>{coupling.module.source_path}</span>
+                            <button
+                              type="button"
+                              onClick={() => selectModule(coupling.module.id)}
+                            >
+                              {coupling.module.source_path}
+                            </button>
                             <strong>
                               {coupling.cochangeCount}{" "}
                               {labels.metrics.cochange_count} ·{" "}
@@ -512,6 +683,17 @@ export function RepositoryTriage({
                           </li>
                         ))}
                       </ul>
+                      {selectedInsight.couplings.length > 4 && (
+                        <p className={styles.sliceDisclosure}>
+                          Showing 4 of {selectedInsight.couplings.length}
+                          {" "}captured pairs for this {moduleLabelLower}; the
+                          global analysis is independently bounded.
+                        </p>
+                      )}
+                      <CoverageState
+                        metric={selectedInsight.couplingState}
+                        title={`${bundle.capability.views.hidden_coupling.label} coverage`}
+                      />
                     </section>
                   )
                   : (
@@ -522,6 +704,10 @@ export function RepositoryTriage({
                         appears in the captured top-N. Inspect the coverage
                         evidence below before treating this as absence.
                       </p>
+                      <CoverageState
+                        metric={selectedInsight.couplingState}
+                        title={`${bundle.capability.views.hidden_coupling.label} coverage`}
+                      />
                     </section>
                   )}
 
@@ -529,16 +715,38 @@ export function RepositoryTriage({
                   <h4>{labels.metrics.commits}</h4>
                   {selectedInsight.recentCommits.length
                     ? (
-                      <ul>
-                        {selectedInsight.recentCommits.slice(0, 5).map((
-                          commit,
-                        ) => (
-                          <li key={commit.id}>
-                            <code>{shortSha(commit.sha)}</code>
-                            <span>{commit.subject}</span>
-                          </li>
-                        ))}
-                      </ul>
+                      <>
+                        <ul>
+                          {selectedInsight.recentCommits.slice(0, 5).map((
+                            commit,
+                          ) => (
+                            <li key={commit.id}>
+                              <code>{shortSha(commit.sha)}</code>
+                              <span>{commit.subject}</span>
+                            </li>
+                          ))}
+                        </ul>
+                        <p className={styles.sliceDisclosure}>
+                          Showing {Math.min(
+                            5,
+                            selectedInsight.recentCommits.length,
+                          )}
+                          {" "}recent records; the inspector sampled {selectedInsight.recentCommits.length}
+                          {" "}from {selectedInsight.history.shown} captured history
+                          IDs. {selectedInsight.history.summary}.
+                        </p>
+                        <CoverageState
+                          metric={selectedInsight.history}
+                          title={`${labels.metrics.commits} coverage`}
+                        />
+                      </>
+                    )
+                    : selectedInsight.history.status !== "complete"
+                    ? (
+                      <CoverageState
+                        metric={selectedInsight.history}
+                        title={`${labels.metrics.commits} coverage`}
+                      />
                     )
                     : (
                       <p>
@@ -589,6 +797,10 @@ export function RepositoryTriage({
         <span>
           Evidence is bounded by each analysis&apos;s declared window and export
           limits.
+        </span>
+        <span data-source-role-disclosure>
+          Source roles are not classified: captured ranks can include
+          production, test, example, and generated modules.
         </span>
       </footer>
     </section>

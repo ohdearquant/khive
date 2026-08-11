@@ -62,6 +62,8 @@ describe("repository triage model", () => {
 
   it("preserves unavailable and truncated page semantics in summary metrics", () => {
     const partial = structuredClone(bundle);
+    partial.capability.labels.truncated = "Contract partial";
+    partial.capability.labels.unavailable = "Contract unavailable";
     partial.graph.modules.items = partial.graph.modules.items.slice(0, 2);
     partial.graph.modules.total_count = { status: "available", value: 37 };
     partial.graph.modules.truncated = true;
@@ -86,13 +88,81 @@ describe("repository triage model", () => {
       total: 37,
       status: "truncated",
     });
-    expect(brief.metrics.modules.summary).toMatch(/2 captured of 37/i);
+    expect(brief.metrics.modules.summary).toMatch(/2 captured of 37; Contract partial/i);
     expect(brief.metrics.commits).toMatchObject({
       shown: 0,
       total: null,
       status: "unavailable",
     });
-    expect(brief.metrics.commits.summary).toMatch(/total unavailable/i);
+    expect(brief.metrics.commits.summary).toMatch(/total Contract unavailable/i);
+  });
+
+  it("keeps a complete captured page complete when only its total is unknown", () => {
+    const unknownTotal = structuredClone(bundle);
+    unknownTotal.graph.commits.total_count = {
+      status: "unavailable",
+      reason: "the producer did not count all commits",
+    };
+    unknownTotal.graph.commits.truncated = false;
+    unknownTotal.graph.commits.next_cursor = null;
+    unknownTotal.graph.commits.disclosure = { status: "complete", reason: null };
+
+    const metric = buildRepositoryBrief(unknownTotal).metrics.commits;
+
+    expect(metric).toMatchObject({
+      shown: unknownTotal.graph.commits.items.length,
+      total: null,
+      status: "complete",
+    });
+    expect(metric.summary).toMatch(/total unavailable/i);
+  });
+
+  it("keeps unavailable recommendation analyses distinct from measured empty", () => {
+    const unavailable = structuredClone(bundle);
+    unavailable.aggregates.api_surface.meta.status = "unavailable";
+    unavailable.aggregates.api_surface.meta.unavailable_reason = "API ranking was not produced";
+    for (const analysis of [
+      unavailable.aggregates.hotspot_quadrant,
+      unavailable.aggregates.dependency_topology,
+      unavailable.aggregates.hidden_coupling,
+      unavailable.aggregates.ownership,
+    ]) {
+      analysis.meta.status = "unavailable";
+      analysis.meta.unavailable_reason = "attention analysis was not produced";
+    }
+
+    const brief = buildRepositoryBrief(unavailable);
+
+    expect(brief.startHere).toEqual([]);
+    expect(brief.startHereState).toMatchObject({
+      status: "unavailable",
+      reason: "API ranking was not produced",
+    });
+    expect(brief.attentionSignals).toEqual([]);
+    expect(brief.attentionState).toMatchObject({ status: "unavailable" });
+    expect(brief.attentionState.reason).toContain("attention analysis was not produced");
+    expect(brief.metrics.cycles).toMatchObject({
+      status: "unavailable",
+      reason: "attention analysis was not produced",
+    });
+  });
+
+  it("discloses one unavailable attention analysis without hiding other signals", () => {
+    const partial = structuredClone(bundle);
+    partial.aggregates.hidden_coupling.meta.status = "unavailable";
+    partial.aggregates.hidden_coupling.meta.unavailable_reason =
+      "coupling analysis was not produced";
+
+    const brief = buildRepositoryBrief(partial);
+
+    expect(brief.attentionSignals.length).toBeGreaterThan(0);
+    expect(
+      brief.attentionSignals.some((signal) => signal.kind === "hidden_coupling"),
+    ).toBe(false);
+    expect(brief.attentionState).toMatchObject({
+      status: "unavailable",
+      reason: "coupling analysis was not produced",
+    });
   });
 
   it("does not fabricate recommendations from zero-evidence rows or cycle order", () => {
@@ -131,6 +201,8 @@ describe("repository triage model", () => {
     expect(insight?.module.source_path).toBe(target.sourcePath);
     expect(insight?.topology.fanIn).toBe(target.dependentCount);
     expect(insight?.recentCommits.length).toBeGreaterThan(0);
+    expect(insight?.history.shown).toBeGreaterThanOrEqual(insight?.recentCommits.length ?? 0);
+    expect(insight?.history.total).not.toBeNull();
     expect(insight?.recentCommits[0]).toMatchObject({
       sha: expect.stringMatching(/^[0-9a-f]{40}$/),
     });
@@ -144,6 +216,39 @@ describe("repository triage model", () => {
             `${bundle.capability.views.hidden_coupling.label} coverage`,
       ),
     ).toBe(true);
+    expect(
+      insight?.evidence.some((item) => item.value === "Not classified in this snapshot"),
+    ).toBe(true);
+  });
+
+  it("does not consume aggregate rows whose analysis is unavailable", () => {
+    const unavailable = structuredClone(bundle);
+    const target = buildRepositoryBrief(bundle).startHere[0];
+    for (const analysis of [
+      unavailable.aggregates.hotspot_quadrant,
+      unavailable.aggregates.dependency_topology,
+      unavailable.aggregates.hidden_coupling,
+      unavailable.aggregates.ownership,
+      unavailable.aggregates.api_surface,
+    ]) {
+      analysis.meta.status = "unavailable";
+      analysis.meta.unavailable_reason = "not produced";
+    }
+    unavailable.graph.structure_edges.disclosure.status = "unavailable";
+    unavailable.graph.structure_edges.disclosure.reason = "not produced";
+
+    expect(buildModuleInsight(unavailable, target.moduleId)).toMatchObject({
+      hotspot: null,
+      ownership: null,
+      apiSurface: null,
+      couplings: [],
+      couplingState: { status: "unavailable", reason: "not produced" },
+      topology: {
+        coverage: { status: "unavailable", reason: "not produced" },
+        cycles: [],
+        cycleIds: [],
+      },
+    });
   });
 
   it("finds a module by the path a user already knows", () => {

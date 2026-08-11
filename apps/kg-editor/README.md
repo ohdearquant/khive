@@ -29,6 +29,9 @@ scripts/generate-repo-showcase.sh
 The underlying one-shot pipeline is `khive repo build`: pinned clone → cursor-exhausted
 `git.digest` → separate `code.ingest` map → cross-store export.
 
+For the DB-backed interview walkthrough, investigation path, and evidence boundaries, see
+[DEMO.md](DEMO.md).
+
 ## KG review workbench
 
 KG Studio is the first read-only vertical slice of khive's local-first semantic review

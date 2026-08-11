@@ -83,6 +83,117 @@ describe("repository showcase", () => {
     expect(scrollIntoView).toHaveBeenCalledOnce();
   });
 
+  it("distinguishes unavailable recommendation analyses from measured empty", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.api_surface.meta.status = "unavailable";
+    bundle.aggregates.api_surface.meta.unavailable_reason = "API ranking was not produced";
+    for (const analysis of [bundle.aggregates.hotspot_quadrant, bundle.aggregates.dependency_topology, bundle.aggregates.hidden_coupling, bundle.aggregates.ownership]) {
+      analysis.meta.status = "unavailable";
+      analysis.meta.unavailable_reason = "attention analysis was not produced";
+    }
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    expect(within(triage).getByText("API ranking was not produced")).toBeVisible();
+    expect(within(triage).getAllByText(/attention analysis was not produced/i).length).toBeGreaterThan(0);
+    expect(triage.querySelectorAll('[data-state="unavailable"]').length).toBeGreaterThanOrEqual(2);
+    expect(triage).not.toHaveTextContent(/No captured module has a non-zero/i);
+  });
+
+  it("navigates inspector relationships and discloses cycles and history bounds", async () => {
+    const bundle = golden();
+    const cycle = bundle.aggregates.dependency_topology.cycles.items.find((candidate) => candidate.module_ids.length > 1)!;
+    const selected = bundle.graph.modules.items.find((module) => module.id === cycle.module_ids[0])!;
+    const peer = bundle.graph.modules.items.find((module) => module.id === cycle.module_ids[1])!;
+    const history = bundle.graph.history_navigation.by_module.items.find((row) => row.module_id === selected.id)!.commits;
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), selected.source_path);
+    await user.click(within(triage).getByRole("button", { name: `Inspect ${selected.source_path}` }));
+
+    const inspector = within(triage).getByRole("complementary", { name: "Module evidence" });
+    await waitFor(() => expect(inspector).toHaveFocus());
+    expect(scrollIntoView).toHaveBeenCalled();
+    expect(within(inspector).getByText(cycle.id)).toBeVisible();
+    expect(within(inspector).getByText("Not classified in this snapshot")).toBeVisible();
+    const historyMetric = inspector.querySelector<HTMLElement>('[data-inspector-metric="commits"]')!;
+    expect(historyMetric).toHaveTextContent(String(history.total_count.status === "available" ? history.total_count.value : history.items.length));
+    expect(inspector).toHaveTextContent(/inspector sampled/i);
+
+    const cycleSection = within(inspector).getByText(cycle.id).closest("section")!;
+    await user.click(within(cycleSection).getByRole("button", { name: peer.source_path }));
+    expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(peer.source_path);
+  });
+
+  it("renders strongly connected components as membership, not a directed path", async () => {
+    const bundle = golden();
+    const cycle = bundle.aggregates.dependency_topology.cycles.items[0];
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(screen.getByRole("button", { name: bundle.capability.views.dependency_topology.label }));
+
+    const cycleRow = screen.getByText(cycle.id).closest(".repo-list-row")!;
+    expect(cycleRow).toHaveTextContent("SCC members:");
+    expect(cycleRow).not.toHaveTextContent("→");
+    expect(container.querySelector("[data-repository-dashboard]")).toBeVisible();
+  });
+
+  it("renders missing module history as unavailable rather than zero", () => {
+    const bundle = structuredClone(golden());
+    const target = [...bundle.aggregates.api_surface.data.items].sort((left, right) => right.dependent_count - left.dependent_count)[0];
+    bundle.graph.history_navigation.by_module.items = bundle.graph.history_navigation.by_module.items.filter((row) => row.module_id !== target.module_id);
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>("[data-module-inspector]")!;
+    const commitMetric = inspector.querySelector<HTMLElement>('[data-inspector-metric="commits"]')!;
+
+    expect(commitMetric).toHaveTextContent(bundle.capability.labels.unavailable);
+    expect(commitMetric).not.toHaveTextContent(/^0$/);
+    expect(inspector).toHaveTextContent("No module history-navigation row was captured.");
+  });
+
+  it("renders unavailable topology metrics as unavailable rather than zero", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.dependency_topology.meta.status = "unavailable";
+    bundle.aggregates.dependency_topology.meta.unavailable_reason =
+      "topology analysis was not produced";
+    bundle.graph.structure_edges.disclosure.status = "unavailable";
+    bundle.graph.structure_edges.disclosure.reason =
+      "structure edges were not produced";
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+
+    for (const metric of ["fan-in", "fan-out"]) {
+      const row = inspector.querySelector<HTMLElement>(
+        `[data-inspector-metric="${metric}"]`,
+      )!;
+      expect(row).toHaveTextContent(bundle.capability.labels.unavailable);
+      expect(row).not.toHaveTextContent(/^0$/);
+    }
+    expect(inspector).toHaveTextContent("topology analysis was not produced");
+  });
+
+  it("shows unavailable coupling evidence instead of a measured-empty claim", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.hidden_coupling.meta.status = "unavailable";
+    bundle.aggregates.hidden_coupling.meta.unavailable_reason = "coupling analysis was not produced";
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>("[data-module-inspector]")!;
+
+    expect(inspector).toHaveTextContent("coupling analysis was not produced");
+    expect(inspector).not.toHaveTextContent(/No pair for this module appears/i);
+  });
+
   it("renders all ten capability-owned view labels", () => {
     const bundle = golden();
     render(<RepoShowcase bundle={bundle} />);

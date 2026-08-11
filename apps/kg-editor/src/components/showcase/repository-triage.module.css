@@ -546,6 +546,27 @@
   font-size: 8px;
   margin: 0;
 }
+.relationships button,
+.inspectorSection li > button,
+.memberLinks button {
+  background: transparent;
+  border: 0;
+  color: var(--repo-muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+}
+.relationships button:hover,
+.relationships button:focus-visible,
+.inspectorSection li > button:hover,
+.inspectorSection li > button:focus-visible,
+.memberLinks button:hover,
+.memberLinks button:focus-visible {
+  color: var(--repo-green);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 
 .inspectorSection {
   border-bottom: 1px solid var(--repo-border);
@@ -574,6 +595,15 @@
 .inspectorSection li strong {
   color: var(--repo-navy);
   font-size: 8px;
+}
+.memberLinks {
+  white-space: normal !important;
+}
+.sliceDisclosure {
+  color: var(--repo-muted);
+  font-size: 8px;
+  line-height: 1.45;
+  margin: 8px 0 0;
 }
 
 .evidence {
@@ -642,7 +672,7 @@
   .metrics > div:nth-child(2) {
     border-right: 0;
   }
-  .metrics > div:nth-child(-n+2) {
+  .metrics > div:nth-child(-n + 2) {
     border-bottom: 1px solid var(--repo-border);
   }
   .signalGrid {
