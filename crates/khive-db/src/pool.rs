@@ -1097,7 +1097,7 @@ impl ConnectionPool {
     /// [`Self::propagate_checkpoint_claim_to_writer_task`] reaches that one.
     ///
     /// Without a claim, writer-capable connections keep the bounded
-    /// [`FALLBACK_WAL_AUTOCHECKPOINT_PAGES`] threshold, so a writable pool
+    /// `FALLBACK_WAL_AUTOCHECKPOINT_PAGES` threshold, so a writable pool
     /// in a process that never runs the checkpoint task (embedded runtimes,
     /// one-shot CLI executions) retains SQLite's own WAL reclamation instead
     /// of growing its WAL without bound.
