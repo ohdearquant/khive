@@ -7,41 +7,30 @@
 //! outcome before finalizing the event lifecycle. Successful one-shots become
 //! `"fired"`; failed one-shots remain `"pending"` for recovery; named repeats
 //! advance to their next occurrence. Events overdue by more than the configured
-//! grace window are never dispatched. See "Missed-event policy" below.
+//! grace window are never dispatched, per the missed-event policy below.
 //!
-//! This module lives in `khive-mcp` (not `kkernel`, where it originated)
-//! because the daemon tick loop needs to call it in-process from
-//! `khive-mcp::serve`, and `khive-runtime` (where the daemon's socket/accept
-//! loop lives) cannot depend back on `khive-mcp` (`khive-mcp` already depends
-//! on `khive-runtime` — a dependency the other way would cycle). `kkernel`
-//! already depends on `khive-mcp`, so its `exec --pending-events` entry point
-//! simply calls [`run_pending_events`] here instead of a local module.
+//! Full design rationale (module placement, invocation-mode tradeoffs,
+//! namespace-isolation and missed-event-policy background) lives in
+//! `crates/khive-mcp/docs/pending-events.md`.
 //!
 //! ## Invocation modes
 //!
 //! - **One-shot** (`kkernel exec --pending-events`, cron-friendly): call
-//!   [`run_pending_events`] directly. Suitable for `* * * * * kkernel exec
-//!   --pending-events` to achieve minute-granularity delivery.
+//!   [`run_pending_events`] directly.
 //! - **Daemon-resident tick** (ADR-106): [`schedule_tick_loop`] calls
-//!   [`run_pending_events_on`] against the daemon's own resolved `KhiveRuntime`
-//!   handle on a fixed interval for the lifetime of the warm `khived` daemon
-//!   process. It runs as the ADR-119 `schedule-tick` component only in daemon
-//!   role, never from a short-lived stdio client, with tracked cancellation,
-//!   bounded restart, and component health. Running both an
-//!   external cron entry and the daemon tick at once is safe: the drain's
-//!   `pending -> firing` CAS claim (`claim_pending_event`) makes concurrent or
-//!   overlapping invocations harmless by construction — at most one caller
-//!   ever wins a given row.
+//!   [`run_pending_events_on`] on a fixed interval for the lifetime of the
+//!   warm `khived` daemon process. Running both an external cron entry and
+//!   the daemon tick at once is safe: the drain's `pending -> firing` CAS
+//!   claim (`claim_pending_event`) makes concurrent or overlapping
+//!   invocations harmless by construction — at most one caller ever wins a
+//!   given row.
 //!
 //! ## Namespace isolation
 //!
-//! Each event fires in its own namespace: the action is dispatched through the
-//! MCP server's registry with the event's namespace injected as the `namespace=`
-//! parameter, so all writes land in the event's namespace. Replay derives its
-//! actor from an immutable, target-bound provenance event written by the
-//! schedule handler; `created_by_actor` note metadata is never an authorization
-//! source. Executable `scheduled_event` state is schedule-managed and rejects
-//! generic KG update/merge, so provenance cannot authorize rewritten intent. A
+//! Each event fires in its own namespace, injected as the dispatched action's
+//! `namespace=` parameter. Replay derives its actor from an immutable,
+//! target-bound provenance event written by the schedule handler;
+//! `created_by_actor` note metadata is never an authorization source. A
 //! generic legacy row without provenance fails closed instead of inheriting
 //! daemon authority.
 //!
@@ -52,24 +41,18 @@
 //! - `"weekly"`  → `trigger_at + 7 days`
 //! - `"monthly"` → `trigger_at + 1 calendar month`
 //!
-//! Five-field cron is rejected by schedule creation because the executor cannot
-//! advance it. A legacy row carrying any unsupported repeat fails closed before
-//! invocation instead of silently degrading to one-shot delivery.
+//! Unsupported repeat expressions are rejected at schedule creation and fail
+//! closed for legacy rows rather than silently degrading to one-shot delivery.
 //!
 //! ## Missed-event policy (ADR-106 amendment)
 //!
-//! An event is "missed" when it is discovered overdue by more than
-//! `KHIVE_FIRE_GRACE_SECS` (default 300s / 5 minutes). A missed event is
-//! **never dispatched** — it is marked `status="missed"` with `missed_at`
-//! stamped (epoch µs) and `fired_at` left null. A missed *repeating* event is
-//! skipped for this occurrence and re-armed at the next occurrence strictly
-//! after now (looping past every accumulated occurrence) — it never fires a
-//! catch-up burst. This means a daemon that was offline for a long stretch
-//! (or a first boot against a store with a large stale backlog) marks the
-//! entire overdue backlog missed on its first tick and dispatches zero of
-//! them. See the ADR-106 amendment for the full rationale and the prior-art
-//! comparison. The creator-identity fence runs first for generic actions:
-//! an unattributed legacy row becomes `failed`, not `missed`, even when stale.
+//! An event is "missed" when discovered overdue by more than
+//! `KHIVE_FIRE_GRACE_SECS` (default 300s). A missed event is **never
+//! dispatched** — it is marked `status="missed"` with `missed_at` stamped and
+//! `fired_at` left null. A missed *repeating* event is re-armed at the next
+//! occurrence strictly after now rather than firing a catch-up burst. The
+//! creator-identity fence runs first for generic actions: an unattributed
+//! legacy row becomes `failed`, not `missed`, even when stale.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, Months, Utc};
@@ -399,50 +382,12 @@ pub async fn run_pending_events_with_config(
     namespace: &str,
     verbose: bool,
 ) -> Result<DrainSummary> {
-    // Resolve through the SAME multi-backend-aware construction the daemon
-    // boot path uses (`khive-mcp::serve::build_server_with_explicit_namespace`),
-    // rather than a throwaway `RuntimeConfig::default()` (PR #782):
-    // `RuntimeConfig::default()`
-    // is env-only — it never consulted `khive.toml` (`[[backends]]`,
-    // `[actor] id`, `[packs.*].backend`) at all, so a project with a
-    // declared multi-backend config or a tier-3 config-file actor identity
-    // was silently invisible to this one-shot CLI path even though
-    // `kkernel mcp --daemon` (and, for ordinary ops, `kkernel exec`'s own
-    // `resolve_runtime_config` call) both resolve it. The wrapper also
-    // returns the fully-wired `KhiveMcpServer` for the resolved pack set
-    // (single- or multi-backend), so replayed actions route through the
-    // correct per-pack backend exactly like the daemon tick now does — not a
-    // single runtime standing in for every pack (the same issue this fix
-    // closes for the daemon-resident tick). An explicit `kkernel exec
-    // --config` path is forwarded unchanged; otherwise `config: None` still
-    // triggers `khive.toml`'s standard cwd/home search order inside
-    // `resolve_runtime_config`.
-    //
-    // This does NOT call `crate::serve::build_server` directly (PR #782):
-    // `build_server` derives BOTH
-    // `namespace_explicit` and `actor_explicit` from `resolve_cli_namespace`,
-    // which treats "a namespace value is present" and "the operator typed
-    // `--actor`/`--namespace`" as the same fact — true for a real CLI parse,
-    // where there is no other way a namespace value could appear. This
-    // wrapper's `namespace` argument is not a CLI flag the operator typed;
-    // it is a plain default this function was called with (`"local"` unless
-    // the caller passed something else), and `resolve_runtime_config`
-    // (`serve.rs`) treats a genuine explicit actor override as authoritative
-    // — it clears any configured `[actor] id` for the resolved-to-"local"
-    // case rather than falling through to it. Routing this default namespace
-    // through `build_server` therefore silently discarded a project's
-    // configured `[actor] id`, contradicting Amendment B's claim that this
-    // CLI path honors it, and — under strict actor mode with the comm pack —
-    // could make server construction itself fail despite a valid config.
-    // `build_server_with_explicit_namespace` is the seam that lets this
-    // caller assert the narrower, correct semantic instead: the namespace
-    // *is* a real default (`namespace_explicit: true`, so it still becomes
-    // `default_namespace` and fills `actor_id` when non-"local"), but it is
-    // NOT an actor override (`actor_explicit: false`), so a `"local"`
-    // resolution keeps falling through to the project/db/env actor tiers —
-    // exactly the shape `kkernel exec`/`kkernel reindex` already use via
-    // their own direct `resolve_runtime_config` calls (see
-    // `RuntimeConfigInputs::actor_explicit`'s field doc).
+    // Resolves through the same multi-backend-aware construction the daemon
+    // boot path uses, with the namespace marked explicit but NOT an actor
+    // override — `namespace_explicit: true, actor_explicit: false` — so a
+    // `"local"`-resolved default namespace still falls through to the
+    // project-configured actor. See "Server construction: explicit namespace,
+    // implicit actor" in `crates/khive-mcp/docs/pending-events.md`.
     let ns = Namespace::parse(namespace)
         .map_err(|e| anyhow::anyhow!("pending-events: invalid namespace {namespace:?}: {e}"))?;
     let args = crate::args::Args {
@@ -485,7 +430,7 @@ pub async fn run_pending_events_with_config(
 }
 
 /// One-shot drain against an already-constructed [`KhiveRuntime`] +
-/// [`KhiveMcpServer`] pair (ADR-106; PR #782).
+/// [`KhiveMcpServer`] pair (ADR-106).
 ///
 /// The caller supplies an already-resolved, already-validated pair — both by
 /// reference — so the drain's storage target, actor identity, and pack set
@@ -557,65 +502,24 @@ async fn run_pending_events_on_with_lease(
             continue;
         }
 
-        // Bounded, mutation-immune keyset pagination (PR #782,
-        // a continuation of the prior fix).
-        //
-        // The prior version snapshotted every `status="pending"` row for the namespace
-        // into one `Vec` before any mutation, which fixed the LIMIT/OFFSET
-        // skip bug (mutating a row out of the `status="pending"` predicate
-        // mid-page shifted every subsequent page) but introduced a new
-        // failure mode: the snapshot filter checked only `status`, not
-        // `trigger_at`, so a namespace with one due event buried in a large
-        // FUTURE schedule pulled the entire future backlog into memory every
-        // tick. This version instead:
-        //   1. pushes the due-ness predicate (`trigger_at <= now`) into the
-        //      SQL `WHERE` clause directly, via a raw statement (bypassing
-        //      `NoteFilter`, whose `order_by`/property-filter surface can
-        //      only express JSON-path predicates, not compare a JSON path
-        //      against a bind parameter with `<=`) — future events are never
-        //      fetched at all, so the working set is bounded by the due
-        //      backlog, not the namespace's total schedule size;
-        //   2. pages via a `(created_at, id)` keyset cursor instead of
-        //      `LIMIT/OFFSET`. Both columns are immutable — this drain never
-        //      rewrites `created_at` or `id` — so a row's claim/dispatch/
-        //      finalize mutation between pages can never shift a later
-        // page's boundary (the prior bug class), and at most
-        //      `PAGE_SIZE` rows are held in memory at once (never the whole
-        //      namespace).
+        // Bounded, mutation-immune keyset pagination: the due-ness predicate
+        // (`trigger_at <= now`) runs in SQL directly so future events are
+        // never fetched, and pages advance on the immutable `(created_at,
+        // id)` keyset rather than `LIMIT/OFFSET`, so a row mutated between
+        // pages can never shift a later page's boundary. See "Keyset
+        // pagination and due-ness comparison" in
+        // `crates/khive-mcp/docs/pending-events.md`.
         const PAGE_SIZE: u32 = 200;
         let now_rfc = now.to_rfc3339();
         let mut cursor: Option<(i64, String)> = None;
         loop {
             let (sql, params): (String, Vec<SqlValue>) = match &cursor {
-                //
-                // The due-ness predicate compares via SQLite's `datetime()`,
-                // not a raw string `<=` (PR #782): stored
-                // `trigger_at` values are NOT normalized to UTC —
-                // `khive-pack-schedule`'s `handle_remind`/`handle_schedule`
-                // deliberately round-trip the caller's original string
-                // (offset included, H5), and `validate_at` accepts any RFC
-                // 3339 offset. A raw lexicographic `<=` against a UTC
-                // `now`-string therefore mis-ranks any non-UTC-offset
-                // `trigger_at`: e.g. `"2026-07-10T02:00:00+04:00"`
-                // (chronologically `2026-07-09T22:00:00Z`, overdue) sorts
-                // AFTER a UTC `now` string like
-                // `"2026-07-10T00:47:00.123+00:00"` as raw text, so it would
-                // never be fetched — never fire, never get marked missed,
-                // forever. `datetime(...)` normalizes both sides to UTC
-                // before comparing, so the predicate is chronological
-                // regardless of the stored string's offset. Storage itself
-                // is unchanged — only this fetch-bound comparison is
-                // normalized; the original string still round-trips
-                // faithfully.
-                //
-                // `datetime()` returns NULL for a value it cannot parse, and
-                // NULL <= anything is NULL (never true) — the OR clause below
-                // keeps an unparseable `trigger_at` row in the candidate set
-                // instead of silently dropping it, so the existing Rust-side
-                // unparseable-`trigger_at` branch (which logs and advances
-                // the cursor past it) still sees it. `validate_at` rejects
-                // unparseable `trigger_at` at write time, so this only
-                // matters for a hand-written or pre-validation row.
+                // Due-ness compares via SQLite's `datetime()`, not a raw
+                // string `<=`: stored `trigger_at` values are not normalized
+                // to UTC, so a raw lexicographic compare mis-ranks non-UTC
+                // offsets. `datetime()` returns NULL for an unparseable
+                // value; the `OR ... IS NULL` clause keeps such a row in the
+                // candidate set instead of silently dropping it.
                 None => (
                     "SELECT id, content, properties, created_at FROM notes \
                      WHERE namespace = ?1 AND kind = 'scheduled_event' \
@@ -756,28 +660,19 @@ async fn run_pending_events_on_with_lease(
 
                 summary.scanned += 1;
 
-                // Parse and check trigger_at.
                 let trigger_at_str = properties
                     .as_ref()
                     .and_then(|p| p.get("trigger_at"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                // Parsed as `DateTime<FixedOffset>` (not straight to
-                // `DateTime<Utc>`) so the caller's original UTC offset is
-                // retained alongside the UTC instant — `khive-pack-schedule`
-                // round-trips the caller's original `trigger_at` string
-                // verbatim, offset included, and that offset must
-                // survive repeat advancement (issue #792): rendering the
-                // advanced `trigger_at` via a bare `DateTime<Utc>::to_rfc3339`
-                // always stamps `+00:00`, silently rewriting a non-UTC
-                // schedule to UTC on its first advance.
-                //
-                // Uses the same relaxed grammar as the write boundary
-                // (`khive-pack-schedule`'s `at.parse::<DateTime<Utc>>()`),
-                // not the strict `DateTime::parse_from_rfc3339`: already
-                // persisted `trigger_at` strings can use the relaxed RFC
-                // 3339 form (space instead of `T`, offset without a colon),
-                // and the strict parser would silently skip them forever.
+                // Parsed as `DateTime<FixedOffset>`, not straight to
+                // `DateTime<Utc>`, so the caller's original offset survives
+                // repeat advancement instead of being silently rewritten to
+                // UTC. Uses the relaxed RFC 3339 grammar matching the write
+                // boundary, not the strict parser, since already-persisted
+                // strings may use the relaxed form. See "Offset preservation
+                // and relaxed RFC 3339 parsing" in
+                // `crates/khive-mcp/docs/pending-events.md`.
                 let trigger_at_fixed = match trigger_at_str.parse::<DateTime<FixedOffset>>() {
                     Ok(dt) => dt,
                     Err(_) => {
@@ -886,18 +781,11 @@ async fn run_pending_events_on_with_lease(
                     .and_then(Value::as_str)
                     .map(str::to_string);
 
-                // ── Claim the row before dispatch (issue #462, fire side) ──
-                // `properties` above is a page-query snapshot; a concurrent
-                // `schedule.cancel` could have transitioned the row to
-                // "cancelled" since then. CAS-claim pending -> firing now so
-                // that: (a) a concurrent cancel's own CAS (which only
-                // matches status='pending') fails once we've claimed it, and
-                // (b) if cancel already won the race, our claim fails and we
-                // skip — the drain can no longer clobber a cancel that
-                // landed between the read and this point. The same claim
-                // guards the missed path: a missed event still needs
-                // exclusive ownership before it can be marked "missed" or
-                // re-armed to a future occurrence.
+                // `properties` above is a page-query snapshot; CAS-claim
+                // pending -> firing now so a concurrent `schedule.cancel`
+                // cannot land between the read and this point (whichever
+                // side wins the CAS proceeds; the loser skips). The same
+                // claim gates the missed path too.
                 let occurrence_id = dispatch_occurrence_id(id, trigger_at);
                 let receipt_actor = creator
                     .as_ref()
@@ -1023,8 +911,8 @@ async fn run_pending_events_on_with_lease(
                     match advance_repeat_past_missed(&repeat, trigger_at, now) {
                         Some(next_at) => {
                             // Repeating event: skip this occurrence, re-arm
-                            // pending at the next future one. Rendered at the
-                            // original offset (issue #792), not UTC.
+                            // pending at the next future one, rendered at the
+                            // original offset, not UTC.
                             props["trigger_at"] =
                                 json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                             props["status"] = json!("pending");
@@ -2216,8 +2104,8 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, now_micros: i64) -> Resu
 /// pending | missed | failed}` (`pending` is an advanced repeat; `failed` is
 /// the unattributed-generic-action policy state). `claimed_firing_at` is
 /// the claim token from `claim_pending_event`; the CAS requires the row's
-/// CURRENT `firing_at` to still equal it, not merely `status='firing'`
-/// (issue #462). Clears `firing_at` on the terminal write. Returns
+/// CURRENT `firing_at` to still equal it, not merely `status='firing'`.
+/// Clears `firing_at` on the terminal write. Returns
 /// `Ok(true)` iff exactly one row was updated. See
 /// `crates/khive-mcp/docs/api/pending-events.md`.
 async fn finalize_fired_event(
@@ -2734,18 +2622,15 @@ async fn dispatch_action(
     server: &KhiveMcpServer,
     verbose: bool,
 ) -> std::result::Result<(), DispatchActionError> {
-    // Parse the stored DSL to inject namespace into each op.
     let parsed = khive_request::parse_request(action_dsl).map_err(|error| {
         DispatchActionError::known(DispatchFailure::plain(format!(
             "pending-events: action DSL parse error ({error}): {action_dsl:?}"
         )))
     })?;
 
-    // Re-serialize as JSON form with namespace injected.
-    //
-    // `$prev` references are rejected at schedule-creation time (issue #461),
-    // but legacy rows written before that guard may still carry one. Reject
-    // rather than silently drop: a dropped arg can dispatch successfully with
+    // `$prev` references are rejected at schedule-creation time, but legacy
+    // rows written before that guard may still carry one. Reject rather than
+    // silently drop: a dropped arg can dispatch successfully with
     // missing/wrong data, which is worse than a visible replay failure.
     let mut ops_json: Vec<Value> = Vec::with_capacity(parsed.ops.len());
     for op in &parsed.ops {
@@ -2832,10 +2717,9 @@ async fn dispatch_action(
 /// Discover all distinct namespaces that have at least one pending, due
 /// `scheduled_event` note (i.e. `status="pending"` AND `trigger_at <= now`).
 /// The `trigger_at` comparison uses SQLite's `datetime(...)` rather than a
-/// raw string comparison, since stored offsets are not normalized to UTC
-/// (PR #782); the Rust layer downstream re-checks each candidate with
-/// `DateTime<Utc>` as the final authority. See
-/// `crates/khive-mcp/docs/api/pending-events.md`.
+/// raw string comparison, since stored offsets are not normalized to UTC;
+/// the Rust layer downstream re-checks each candidate with `DateTime<Utc>`
+/// as the final authority. See `crates/khive-mcp/docs/api/pending-events.md`.
 async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> Result<Vec<String>> {
     use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -2845,23 +2729,12 @@ async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> R
         .await
         .context("pending-events: open SQL reader")?;
 
-    // Select distinct namespaces with at least one potentially-due event.
-    // We do a broad filter on `status` here; the Rust layer applies the
-    // parsed-timestamp check. This is a pre-filter gate for the per-namespace
-    // candidate scan below, not the final due-ness decision — but a
-    // namespace excluded HERE never reaches that scan at all, so it must be
-    // held to the same correctness bar as the candidate-page queries
-    // (`datetime(...)` normalization, PR #782): comparing
-    // `trigger_at` against `now` as raw TEXT is only chronologically correct
-    // when every stored string happens to share `now`'s UTC offset.
-    // `khive-pack-schedule` round-trips the caller's original `trigger_at`
-    // string verbatim (offset included, H5), so a non-UTC-offset value can
-    // sort on the wrong side of a raw-text comparison and silently exclude
-    // its entire namespace from every future pass — not just skip one row.
-    // `datetime(...)` normalizes both sides to UTC before comparing; the `OR
-    // ... IS NULL` clause keeps a namespace with an unparseable `trigger_at`
-    // visible rather than silently dropped, matching the candidate-page
-    // queries' same NULL-safety rider.
+    // This is a pre-filter gate for the per-namespace candidate scan below,
+    // not the final due-ness decision — but a namespace excluded HERE never
+    // reaches that scan, so it is held to the same `datetime(...)`
+    // normalization and NULL-safety as the candidate-page queries. See
+    // "Keyset pagination and due-ness comparison" in
+    // `crates/khive-mcp/docs/pending-events.md`.
     let now_rfc = now.to_rfc3339();
     let rows = reader
         .query_all(SqlStatement {
@@ -2921,11 +2794,6 @@ pub fn print_summary(summary: &DrainSummary) {
     );
 }
 
-// ── Need a reference to `rt.sql()` — check the public API ────────────────────
-
-// KhiveRuntime exposes `sql()` as an accessor to the SqlAccess trait object.
-// We use it here for the namespace-discovery query.
-
 /// Default interval between daemon-resident schedule ticks, in seconds.
 /// Matches the cadence the module doc already documents for the external-cron
 /// invocation (`* * * * * kkernel exec --pending-events` is minute-grain;
@@ -2951,7 +2819,7 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 /// daemon's own already-resolved runtime handle for the `"schedule"` pack.
 /// The host context carries the daemon's live [`KhiveMcpServer`] — never a
 /// freshly reconstructed server — or replayed actions can silently dispatch
-/// against the wrong backend (PR #782). Ticks on a fixed interval with
+/// against the wrong backend. Ticks on a fixed interval with
 /// `Skip`-missed-tick behavior so a long drain cannot make the loop drift
 /// behind. Drain-level failures are retryable component failures; individual
 /// event failures remain part of a successful drain summary and do not spend
@@ -3240,22 +3108,14 @@ mod tests {
         (f, path)
     }
 
-    /// An RFC 3339 timestamp a few seconds in the past — due, but comfortably
-    /// inside the default 300s missed-event grace window (ADR-106 amendment),
-    /// so tests exercising the normal fire/advance path aren't swept into the
-    /// missed path by a fixed year-2000 sentinel. Tests exercising the missed
-    /// path itself use their own far-past or `now`-relative timestamps.
+    /// Due, but inside the default missed-event grace window, so callers land
+    /// on the normal fire/advance path rather than the missed path.
     fn due_rfc3339() -> String {
         (Utc::now() - Duration::seconds(5)).to_rfc3339()
     }
 
-    /// A UTC "now" RFC 3339 string, formatted the same way the candidate-page
-    /// query's bind parameter is (`now.to_rfc3339()` on a `DateTime<Utc>`).
-    /// Used only by the offset-sorting regressions below to assert their own
-    /// test fixtures actually exercise the raw-text lexicographic-ordering
-    /// bug class they're named for, independent of the real query's own
-    /// `now` capture (a few milliseconds of drift between the two calls is
-    /// irrelevant next to the multi-hour offset margins those tests use).
+    /// "Now" formatted like the candidate-page query's own bind parameter,
+    /// for offset-sorting regressions to assert against independently.
     fn now_rfc3339_for_ordering_check() -> String {
         Utc::now().to_rfc3339()
     }
@@ -3272,35 +3132,19 @@ mod tests {
             additional_embedding_models: vec![],
             actor_id: actor_id.map(str::to_string),
             // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
-            // from the ambient environment (#1269). kg + schedule + comm: this
-            // module's tests drive schedule.remind / schedule.cancel through the
-            // drain path and assert delivery lands in the creator's comm inbox,
-            // on top of the kg-verb fixture actions.
+            // from the ambient environment: these tests drive schedule.remind
+            // / schedule.cancel through the drain path and assert delivery
+            // lands in the creator's comm inbox.
             packs: vec!["kg".to_string(), "schedule".to_string(), "comm".to_string()],
             ..Default::default()
         };
         KhiveRuntime::new(cfg).expect("runtime")
     }
 
-    /// Drive one drain pass directly through [`run_pending_events_on`] against
-    /// a fresh `make_rt`-built runtime, bypassing [`run_pending_events`] (the
-    /// CLI-facing one-shot entrypoint this test module used to call directly).
-    ///
-    /// `run_pending_events` now resolves through `khive-mcp::serve::build_server`
-    /// (PR #782), which is
-    /// TOML-aware (`KhiveConfig::load_with_home_fallback`) so that `kkernel
-    /// exec --pending-events` honors a project's `[[backends]]`/`[actor]`
-    /// config exactly like the daemon does. That makes it depend on process
-    /// `HOME`/cwd, which the tests in this module don't isolate (unlike
-    /// `serve.rs`'s own `SeatEnv`-guarded `build_server` tests) — on a
-    /// developer machine with a real `~/.khive/config.toml` declaring
-    /// `[[backends]]`, calling `run_pending_events` with a scratch `--db` path
-    /// would hit "cannot be combined with [[backends]]" instead of exercising
-    /// the drain logic these tests actually target. These tests are about
-    /// drain semantics (claim/dispatch/finalize/pagination/cadence), not CLI
-    /// config resolution, so they build their own runtime + server directly —
-    /// exactly what `run_pending_events_on` itself already required and what
-    /// `run_pending_events` did internally before the config-resolution fix.
+    /// Drives one drain pass directly through [`run_pending_events_on`],
+    /// bypassing [`run_pending_events`]'s TOML-aware config resolution (which
+    /// depends on process `HOME`/cwd, unisolated here) since these tests
+    /// target drain semantics, not CLI config resolution.
     async fn drain_for_test(db_path: &str) -> Result<DrainSummary> {
         let rt = make_rt(db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3987,25 +3831,10 @@ mod tests {
         );
     }
 
-    /// A due event whose `trigger_at` carries a POSITIVE offset must still
-    /// fire (PR #782).
-    ///
-    /// `khive-pack-schedule` round-trips the caller's original `trigger_at`
-    /// string verbatim, offset included — it is never normalized to
-    /// UTC in storage. The candidate-page SQL predicate used to compare
-    /// `trigger_at` against `now` as raw TEXT (`<=`), which is only
-    /// chronologically correct when every stored string happens to share the
-    /// same offset as the bind parameter. This event is chronologically due
-    /// (10s ago, well inside the default grace window) but stored at a
-    /// `+04:00` wall-clock offset, whose string sorts LEXICOGRAPHICALLY
-    /// AFTER a UTC `now` string (a later-looking hour digit) even though it
-    /// is chronologically earlier — under the pre-fix raw-text predicate
-    /// this row would never be fetched by the candidate query at all, so it
-    /// would never fire, never even reach the Rust-side missed check: it
-    /// would sit `pending` forever. The fix wraps both sides of the SQL
-    /// predicate in `datetime(...)`, which normalizes to UTC before
-    /// comparing, making the fetch chronologically correct regardless of the
-    /// stored string's offset.
+    /// A due event stored with a positive `trigger_at` offset (whose RFC 3339
+    /// string sorts lexicographically after a UTC "now" string) must still
+    /// fire — proves the SQL due-ness predicate compares chronologically via
+    /// `datetime(...)`, not as raw text.
     #[tokio::test]
     async fn due_event_with_positive_offset_trigger_at_fires() {
         let (_tmp, db_path) = tmp_db();
@@ -4042,19 +3871,10 @@ mod tests {
         );
     }
 
-    /// A FUTURE event whose `trigger_at` carries a NEGATIVE offset — whose
-    /// RFC 3339 string sorts BEFORE a UTC `now` string as raw text, a false
-    /// POSITIVE under the pre-fix raw-text predicate — must NOT fire.
-    ///
-    /// This exercises the other direction of the same lexicographic-ordering
-    /// bug class: a negative-offset string can make a genuinely FUTURE event
-    /// look due to a raw-text `<=` comparison. The SQL predicate's
-    /// `datetime(...)` normalization correctly excludes it from the
-    /// candidate page; even if it were fetched, the retained Rust-side
-    /// `trigger_at > now` re-check is the belt-and-suspenders backstop that
-    /// already made this direction benign before the SQL fix (PR #782):
-    /// "Negative-offset strings produce false POSITIVES, which the retained
-    /// Rust re-check filters — benign").
+    /// A future event stored with a negative `trigger_at` offset (whose RFC
+    /// 3339 string sorts lexicographically before a UTC "now" string) must
+    /// NOT fire — the mirror case of the positive-offset test above, with the
+    /// Rust-side `trigger_at > now` re-check as an additional backstop.
     #[tokio::test]
     async fn future_event_with_negative_offset_trigger_at_is_not_fired() {
         let (_tmp, db_path) = tmp_db();
@@ -4171,7 +3991,7 @@ mod tests {
         );
     }
 
-    /// Issue #792: repeat advancement must preserve the original
+    /// Repeat advancement must preserve the original
     /// `trigger_at` timezone offset — not silently re-serialize the advanced
     /// occurrence as UTC. A `+04:00` schedule that fires and advances must
     /// still carry `+04:00` (and the same local wall-clock hour) on its next
@@ -4862,39 +4682,12 @@ mod tests {
         assert!(props["dispatch_failed_at"].as_str().is_some(), "{props}");
     }
 
-    /// Issue #461: a `schedule.schedule` payload that write-time validation
-    /// now accepts (single op, exactly-registered handler name, literal args,
-    /// all required params present) must actually dispatch successfully at
-    /// trigger time — proving write-time acceptance and trigger-time replay
-    /// agree. Before the fix, a bare-shorthand payload could pass write-time
-    /// checks yet fail replay as an unknown verb; this asserts the *positive*
-    /// case: a canonical payload produces zero dispatch failures.
-    ///
-    /// Issue #575: a single drain pass can legitimately report `failed >= 1`
-    /// for this exact payload with no logic bug involved. `claim_pending_event`
-    /// checks out the pool's single writer connection via
-    /// `WriterPool::writer()`, which is `parking_lot::Mutex::try_lock_for(
-    /// checkout_timeout)` (default 5s, `khive-db/src/pool.rs`) — a bounded
-    /// wait, not a logic gate. On a CPU-oversubscribed CI runner (`cargo test
-    /// --workspace` runs dozens of test binaries, each further parallelized,
-    /// against 2-4 physical cores), a task can be scheduled off-CPU for longer
-    /// than the checkout timeout while queued for that mutex, so the checkout
-    /// times out *before the claim's SQL `UPDATE` ever runs*: the drain loop
-    /// counts `summary.failed += 1` and the row stays in `status="pending"`,
-    /// retryable on the next cron drain. A later dispatch-time error is also
-    /// durably recorded and a non-repeating event returns to pending, but the
-    /// zero-failure contract here still requires the first invocation to
-    /// succeed. Confirmed live: this test passed 100/100 serial runs, 8/8
-    /// full-suite runs, and 3/3 `cargo llvm-cov` runs on a 12-core box, yet
-    /// failed on CI on a commit whose kkernel source did not change from a
-    /// passing run — the signature of scheduler contention, not a
-    /// deterministic dispatch defect.
-    ///
-    /// Rather than weakening the assertion (retries could mask a genuine
-    /// first-drain dispatch regression), remove the contention boundary
-    /// deterministically: run serially and raise the checkout timeout for
-    /// the duration of the test, keeping the original single-drain
-    /// zero-failure contract intact.
+    /// A canonical `schedule.schedule` payload that passes write-time
+    /// validation must dispatch with zero failures at trigger time, proving
+    /// write-time acceptance and trigger-time replay agree. Runs serially
+    /// with a raised writer-pool checkout timeout to remove CI scheduler
+    /// contention as a source of flakiness — see "Writer-pool checkout
+    /// contention under CI" in `crates/khive-mcp/docs/pending-events.md`.
     #[tokio::test]
     #[serial_test::serial]
     async fn replayable_action_dispatches_without_failure_at_trigger_time() {
@@ -4954,16 +4747,12 @@ mod tests {
         assert_eq!(props["status"].as_str(), Some("fired"));
     }
 
-    /// Issue #461: a legacy stored action containing a `$prev` reference
-    /// (impossible to create through the handler after this fix, but
-    /// representative of a row written before the write-time guard existed)
-    /// must be rejected by `dispatch_action` with an error naming the
-    /// non-literal argument, not silently dropped and dispatched with
-    /// missing/wrong data. Asserting the specific error text (rather than
-    /// just "some failure occurred") matters here: a downstream handler
-    /// might independently reject a dropped-but-required argument as
-    /// "missing", which would make a weaker assertion pass even if the
-    /// silent-drop bug were reintroduced.
+    /// A legacy stored action containing a `$prev` reference must be
+    /// rejected by `dispatch_action` with an error naming the non-literal
+    /// argument, not silently dropped and dispatched with missing/wrong
+    /// data — asserted on the specific error text so a downstream handler's
+    /// unrelated "missing argument" rejection can't mask a reintroduced
+    /// silent-drop bug.
     #[tokio::test]
     async fn dispatch_action_rejects_non_literal_prev_reference() {
         let (_tmp, db_path) = tmp_db();
@@ -5862,16 +5651,9 @@ mod tests {
         assert_eq!(get_note_props(&rt, later_id).await["status"], "fired");
     }
 
-    /// Deterministic regression for the fire-side of issue #462: simulates
-    /// the exact interleaving where a drain claims a
-    /// row for firing (its read-then-act window), and only *after* that does
-    /// a `schedule.cancel` request arrive for the same id. Before this fix,
-    /// the drain read a `pending` snapshot and later did a full-row
-    /// `upsert_note` unconditionally, so a cancel landing in between would be
-    /// silently clobbered back to "fired". With the `pending -> firing` CAS
-    /// claim in place, the drain's claim (standing in for "drain read the row
-    /// before the cancel") must make the *subsequent* cancel fail — proving
-    /// cancel can no longer be lost to a fire that was already in flight.
+    /// A `schedule.cancel` arriving after the drain has already CAS-claimed
+    /// the row for firing must fail — proves a cancel can never be lost to a
+    /// fire that was already in flight.
     #[tokio::test]
     async fn fire_claim_wins_race_against_concurrent_cancel() {
         let (_tmp, db_path) = tmp_db();
@@ -5968,13 +5750,10 @@ mod tests {
         assert_eq!(rows, 1, "test setup: row must exist");
     }
 
-    /// Issue #462 (stale-`firing` recovery), case (a): a row claimed by a
-    /// drain that then crashed before finalizing — `status="firing"` with a
-    /// `firing_at` older than the documented timeout — must be reclaimed back
-    /// to `pending` and fired on the next drain pass, instead of being
-    /// wedged forever (the old behavior: only `status="pending"` rows are
-    /// ever scanned, so a stranded `firing` row was invisible to every future
-    /// drain).
+    /// A row claimed by a drain that then crashed before finalizing —
+    /// `status="firing"` with a `firing_at` older than the stale timeout —
+    /// must be reclaimed back to `pending` and fired on the next pass,
+    /// instead of being wedged forever.
     #[tokio::test]
     async fn stale_firing_row_is_reclaimed_and_fired() {
         let (_tmp, db_path) = tmp_db();
@@ -6025,9 +5804,9 @@ mod tests {
         );
     }
 
-    /// Issue #462, case (b): a row claimed *recently* (fresh `firing_at`,
-    /// well within the stale timeout) must NOT be reclaimed — a live drain's
-    /// in-flight claim is never stolen by the reclaim sweep.
+    /// A row claimed *recently* (fresh `firing_at`, well within the stale
+    /// timeout) must NOT be reclaimed — a live drain's in-flight claim is
+    /// never stolen by the reclaim sweep.
     #[tokio::test]
     async fn fresh_firing_row_is_not_reclaimed() {
         let (_tmp, db_path) = tmp_db();
@@ -6060,17 +5839,10 @@ mod tests {
         );
     }
 
-    /// Regression: finalize must be bound to the owning claim. This
-    /// reproduces the exact stale-claimant-resumes
-    /// interleaving. Drain A claims and (simulated) crashes/stalls past the
-    /// stale timeout with its own `firing_at` token recorded. A reclaim pass
-    /// then runs, and drain B re-claims the row, minting a fresh `firing_at`
-    /// token distinct from A's. A now resumes and attempts to finalize using
-    /// its stale token: before this fix, `finalize_fired_event` matched on
-    /// `status='firing'` alone and would have clobbered B's live claim with
-    /// A's stale final state. With the claim-token CAS in place, A's
-    /// finalize must be a no-op and B's claim (and eventual finalize) must
-    /// survive untouched.
+    /// Finalize must be bound to the owning claim token, not just
+    /// `status='firing'`: a stale claimant (A) that resumes after a reclaim
+    /// pass has already let a fresh claimant (B) re-claim the row must have
+    /// its finalize become a no-op, leaving B's claim untouched.
     #[tokio::test]
     async fn stale_claimant_cannot_finalize_over_a_fresh_reclaim() {
         let (_tmp, db_path) = tmp_db();
@@ -6210,14 +5982,9 @@ mod tests {
         );
     }
 
-    /// Issue #462, case (c): `schedule.cancel` on a row that is currently
-    /// `status="firing"` — even a *stale* one — must still fail cleanly.
-    /// Reclaim only happens as part of a drain pass; cancel itself never
-    /// reclaims, so a cancel that races a still-technically-firing (if
-    /// abandoned) row gets the same "not pending" rejection it would against
-    /// a live in-flight fire. This confirms the reclaim path does not weaken
-    /// the fire/cancel CAS contract asserted by
-    /// `fire_claim_wins_race_against_concurrent_cancel`.
+    /// `schedule.cancel` on a row that is currently `status="firing"` — even
+    /// a *stale* one — must still fail cleanly: reclaim only happens as part
+    /// of a drain pass, so cancel itself never reclaims.
     #[tokio::test]
     async fn cancel_on_stale_firing_row_still_fails_cleanly() {
         let (_tmp, db_path) = tmp_db();
@@ -6395,19 +6162,10 @@ mod tests {
         );
     }
 
-    /// The headline regression: 9 non-repeating events overdue well beyond
-    /// the default grace window (300s) must ALL be marked `"missed"` and
-    /// NONE dispatched. This is the first-boot-against-a-large-backlog
-    /// scenario the ADR-106 amendment calls out explicitly. The action DSL is
-    /// deliberately a genuinely side-effecting verb (`create`, writing a
-    /// distinctively-tagged `observation` note) rather than the read-only
-    /// `stats()`, and the test asserts that note is ABSENT after the drain —
-    /// not just that `summary.fired`/`summary.advanced` read zero. A
-    /// regression that accidentally fires the missed path would otherwise be
-    /// caught only by the summary counters, which is weaker evidence than
-    /// confirming the action's own write never landed (PR #782):
-    /// the previous fixture used `stats()`, contradicting this
-    /// comment's claim of a side-effecting action).
+    /// 9 non-repeating events overdue well beyond the default grace window
+    /// (the first-boot-against-a-large-backlog scenario) must ALL be marked
+    /// `"missed"` and NONE dispatched — asserted by the absence of the
+    /// side-effecting action's write, not just zeroed summary counters.
     #[tokio::test]
     async fn nine_overdue_events_beyond_grace_are_missed_with_zero_dispatch() {
         let (_tmp, db_path) = tmp_db();
@@ -6653,13 +6411,7 @@ mod tests {
 
     /// A backlog larger than the drain's internal page size (200) must be
     /// fully processed in ONE drain pass, not silently truncated at the page
-    /// boundary (PR #782): the previous
-    /// implementation paged `status="pending"` with `LIMIT/OFFSET` while
-    /// simultaneously mutating rows out of that predicate, so once the first
-    /// page's 200 rows left `"pending"`, the page-2 query at `OFFSET 200`
-    /// undercounted and silently skipped every row beyond the first page).
-    /// 201 rows — one more than `PAGE_SIZE` — reproduces the exact boundary
-    /// this fix addressed.
+    /// boundary — 201 rows exercises the exact boundary.
     #[tokio::test]
     async fn backlog_larger_than_page_size_is_fully_drained_in_one_pass() {
         let (_tmp, db_path) = tmp_db();
@@ -6705,21 +6457,11 @@ mod tests {
     }
 
     /// Two concurrent drain passes over the same store must never double-fire
-    /// a row: the `pending -> firing` CAS claim (`claim_pending_event`) makes
-    /// exactly one of the two concurrent callers win each row. PR #782
-    /// Amendment B requires Acceptance Criterion 2 to hold, but no regression
-    /// exercised concurrent drains until now.
-    ///
-    /// Each row's action is a genuinely side-effecting `create` writing a
-    /// row-distinct marker `observation` note, rather than the read-only
-    /// `stats()` an earlier version of this test used (PR #782):
-    /// a read-only action makes the summary
-    /// counters the ONLY signal, which cannot distinguish "claimed once,
-    /// dispatched once" from "claimed once, dispatched TWICE, only one
-    /// finalize succeeded" — the exact double-dispatch-one-finalize
-    /// regression this test exists to catch). After both drains, the test
-    /// asserts exactly ONE marker note per scheduled event exists — not just
-    /// that the summary counters sum to `ROW_COUNT`.
+    /// a row: the `pending -> firing` CAS claim makes exactly one of the two
+    /// concurrent callers win each row. Each action is a genuinely
+    /// side-effecting write (not a read-only op) so the test can assert
+    /// exactly ONE marker note per event exists, rather than trusting summary
+    /// counters alone to catch a double-dispatch-one-finalize regression.
     #[tokio::test]
     async fn concurrent_drains_fire_each_row_exactly_once() {
         let (_tmp, db_path) = tmp_db();
@@ -6808,22 +6550,14 @@ mod tests {
         }
     }
 
-    // ── PR #782: `run_pending_events`'s wrapper
-    //    seam must not misread a default namespace as an explicit actor
-    //    override ──────────────────────────────────────────────────────────
-    //
-    // These tests exercise the REAL config-discovery path (process cwd /
-    // `HOME`), exactly like `serve.rs`'s own ADR-096 Fork 2 regressions —
-    // that module's `SeatEnv`/`write_config` helpers are private to its own
-    // `#[cfg(test)]` module, so this module carries its own copies rather
-    // than exporting test-only scaffolding across a crate boundary that
-    // doesn't otherwise exist between these two files.
+    // `run_pending_events`'s wrapper seam must not misread a default
+    // namespace as an explicit actor override. These tests exercise the real
+    // config-discovery path (process cwd / `HOME`); the helpers below mirror
+    // `serve.rs`'s own equivalents, kept local since they are test-only.
 
-    /// RAII guard: temporarily redirects process cwd to `project_root` and
-    /// `HOME` to an isolated, empty tempdir (so tier 4 — `~/.khive/config.toml`
-    /// — never reaches whatever the real machine running this suite happens
-    /// to have configured globally). Restores both on drop, even on
-    /// panic/unwind. Mirrors `serve.rs`'s own `SeatEnv`.
+    /// RAII guard: redirects process cwd and `HOME` to isolated locations so
+    /// the real machine's global `~/.khive/config.toml` never leaks into a
+    /// test. Restores both on drop, even on panic/unwind.
     struct SeatEnv {
         original_cwd: std::path::PathBuf,
         original_home: Option<std::ffi::OsString>,
@@ -6944,12 +6678,9 @@ mod tests {
         );
     }
 
-    /// Sibling regression for the explicit-tier half of the same seam: an
-    /// explicit `--config` naming a MISSING file must fail loud, not run the
-    /// drain with defaults. The loader enforces the explicit tier
-    /// (`KhiveConfig::load_with_home_fallback_and_source` returns
-    /// `ExplicitConfigMissing`), and the error surfaces wrapped in the
-    /// generic build context — it is NOT a `DatabaseOverrideConflict`.
+    /// An explicit `--config` naming a MISSING file must fail loud, not run
+    /// the drain with defaults; the error surfaces wrapped in the generic
+    /// build context, not as a `DatabaseOverrideConflict`.
     #[tokio::test]
     #[serial_test::serial]
     async fn run_pending_events_fails_loud_for_missing_explicit_config() {
@@ -6987,19 +6718,11 @@ mod tests {
         );
     }
 
-    /// The wrapper seam (`build_server_with_explicit_namespace`, called by
-    /// `run_pending_events` with `namespace_explicit: true, actor_explicit:
-    /// false`) must let a `"local"`-resolved default namespace fall through
-    /// to the project-configured actor — never clear it the way a genuine
-    /// `--actor`/`--namespace` CLI override would (`build_server`'s own,
-    /// correctly-narrower semantic). Regression for PR #782:
-    /// before this fix, `run_pending_events` called
-    /// `build_server` directly with a synthesized `namespace: Some("local")`,
-    /// which `resolve_cli_namespace` reported as `explicit = true` and
-    /// `build_server` then fed into BOTH `namespace_explicit` AND
-    /// `actor_explicit`, tripping the "genuinely explicit actor tier
-    /// requesting anonymous" branch in `resolve_runtime_config` and silently
-    /// discarding the configured `[actor] id`.
+    /// The wrapper seam (`build_server_with_explicit_namespace`, called with
+    /// `namespace_explicit: true, actor_explicit: false`) must let a
+    /// `"local"`-resolved default namespace fall through to the
+    /// project-configured actor — never clear it the way a genuine
+    /// `--actor`/`--namespace` CLI override would.
     #[test]
     #[serial_test::serial]
     fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
@@ -7043,12 +6766,11 @@ mod tests {
         );
     }
 
-    /// Positive control for the failure mode the fix above closes: routing
-    /// the same inputs through `build_server` (the genuine CLI-flag seam,
-    /// unchanged by this fix) DOES clear the actor, because there a
-    /// present namespace value really does mean "the operator typed
-    /// --namespace". This documents why `run_pending_events` must not reuse
-    /// that entry point for a synthesized, non-CLI-parsed namespace default.
+    /// Positive control: routing the same inputs through `build_server` (the
+    /// genuine CLI-flag seam) DOES clear the actor, because there a present
+    /// namespace value really does mean "the operator typed --namespace" —
+    /// why `run_pending_events` must not reuse that entry point for a
+    /// synthesized, non-CLI-parsed namespace default.
     #[test]
     #[serial_test::serial]
     fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
