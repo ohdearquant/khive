@@ -222,7 +222,13 @@ but cannot eliminate it for clients that ignore the field.
     "kind": "search_incomplete",
     "message": "No-match was not established because selected backends failed.",
     "retryable": false,
-    "missing_backends": ["main"]
+    "missing_backends": ["main"],
+    "backend_errors": {
+      "main": {
+        "kind": "backend_error",
+        "message": "backend search timed out after 5000ms"
+      }
+    }
   }
 }
 ```
@@ -269,6 +275,12 @@ but cannot eliminate it for clients that ignore the field.
   "tool": "search",
   "status": "partial",
   "missing_backends": ["text"],
+  "backend_errors": {
+    "text": {
+      "kind": "backend_error",
+      "message": "text index unavailable"
+    }
+  },
   "partial": true,
   "result": [{
     "id": "797e929c",
@@ -312,7 +324,8 @@ fields, and envelope `status`.
 
 **MCP multi-backend search.** MUST add `status` to every success. MUST convert
 degraded-empty-after-filtering into the typed error. MUST preserve `status`,
-`missing_backends`, and the typed degradation error under frame-budget omission.
+`missing_backends`, `backend_errors`, and the typed degradation error under
+frame-budget omission.
 Verified by tests for complete-empty, partial-with-hit, backend-failure-empty,
 and post-threshold degraded-empty.
 
@@ -453,6 +466,34 @@ retry-policy row in Verification.
 13. An Agent-mode fixture for an evidence-free hit, asserting `signals` is
     `{}` in canonical form and dropped in Agent presentation while
     `rank_score` and `rank_score_kind` survive.
+14. Partial-success and degraded-empty fixtures asserting exact retained
+    backend/cause parity, deterministic bounded truncation, credential masking,
+    and frame-budget preservation of `backend_errors`.
+
+## Amendment 1 (2026-08-11): bounded per-backend failure evidence
+
+Every incomplete multi-backend search MUST carry `backend_errors`, an object
+keyed by exactly the same sorted backend ids retained in `missing_backends`.
+Each value is `{kind: "backend_error", message: <captured cause>}`. A partial
+success carries it beside `result`; degraded-empty `search_incomplete` carries
+it inside `error`. Complete searches omit it. Presentation and frame-budget
+omission preserve the diagnostics at the same location.
+
+Diagnostics are mandatory but bounded: retain at most 16 causes and no more
+than one fixed per-operation wire budget; cap backend ids at 256 Unicode scalar
+values using a stable hash suffix and cap cause messages at 1,024 scalar values
+plus an ellipsis. Before exposure or warning, scan at most 4,096 input scalar
+values with the canonical credential masker. Empty causes become
+`backend search failed without diagnostic detail`. If any failed legs are not
+retained, emit `backend_errors_truncated=true` and the exact
+`backend_errors_omitted` count. At least one cause MUST survive whenever a leg
+failed, and retained `missing_backends` and `backend_errors` keys MUST have
+exact parity. The server logs each retained masked cause at warning level and a
+bounded aggregate warning for omitted causes.
+
+This amendment is additive. It does not change completeness, retry, filtering,
+or ranking semantics; it supplies bounded evidence for the already-declared
+degradation state.
 
 ## References
 
@@ -460,3 +501,4 @@ retry-policy row in Verification.
 - ADR-006 deterministic scoring; ADR-012 retrieval composition; ADR-029
   substrate coordinator; ADR-033 recall pipeline; ADR-045 verb response
   presentation
+- issue #1829 (backend failure causes were discarded from response and logs)

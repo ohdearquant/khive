@@ -36,16 +36,28 @@ operation is successful but its operation envelope also carries:
 {
   "ok": true,
   "tool": "search",
-  "result": [],
+  "result": [{ "id": "..." }],
+  "status": "partial",
   "partial": true,
-  "missing_backends": ["archive"]
+  "missing_backends": ["archive"],
+  "backend_errors": {
+    "archive": {
+      "kind": "backend_error",
+      "message": "backend search timed out after 5000ms"
+    }
+  }
 }
 ```
 
 The advisory is part of a typed intercepted-dispatch outcome, not an optional
 mutex slot. The same value flows through single, batch, and chain execution;
 presentation transforms only `result`, and daemon frame-budget omission keeps
-`partial` and `missing_backends` even if the result itself must be omitted.
+the bounded diagnostics even if the result itself must be omitted. If no hit
+survives filtering, `missing_backends` and `backend_errors` instead live inside
+the `search_incomplete` error. Complete searches omit both fields. At most 16
+causes and one per-operation wire budget are retained; truncation is explicit
+through `backend_errors_truncated` and `backend_errors_omitted`. Messages are
+credential-masked and capped at 1,024 Unicode scalar values before exposure.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 
