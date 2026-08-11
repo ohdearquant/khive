@@ -40,6 +40,33 @@ writer-task acquisition class once per dequeued top-level request or successful
 `PoolConfig::write_queue_capacity` resolves the default from
 `KHIVE_WRITE_QUEUE_CAPACITY`).
 
+## Proposed disk-reserve admission (#1844; not implemented)
+
+[ADR-154](../../../../docs/adr/ADR-154-sqlite-disk-reserve-admission.md) proposes
+the disk-reserve contract. This section is an implementation map, not a claim
+about current behavior.
+
+The writer task does not sample free space when a caller enters the bounded
+channel. At execution time it acquires the shared volume lease, successfully
+executes `BEGIN IMMEDIATE`, and then probes the volume before invoking the
+request closure. A refusal or probe failure runs `ROLLBACK` and replies with
+the typed capacity error; a successful rollback does not retire the task. The
+lease remains held through the ordinary `COMMIT` or `ROLLBACK`.
+
+Every path follows the same lock order: volume lease, SQLite writer
+acquisition, capacity probe, first logical write. Top-level requests acquire
+the same lease and probe immediately before their first SQLite call because
+they deliberately have no explicit `BEGIN`. Pooled/standalone writers and
+startup migrations receive equivalent admission outside this drain loop.
+Volume-lease acquisition has its own configured deadline; it does not reuse
+the queue-only `write_admission_deadline_ms` governed by ADR-131.
+
+Transaction terminators, checkpointing, diagnostics, reader release, and
+recovery are explicit refusal bypasses. The guard therefore belongs at the
+logical-request boundary, never inside generic statement execution. Native
+`SQLITE_FULL` remains a separate higher-severity stage and is not rendered as
+a successful capacity refusal.
+
 ## Writer-stage telemetry (#1849)
 
 Every completed writer-task request records a backend-scoped in-memory sample
