@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
@@ -21,8 +21,9 @@ describe("KG Studio", () => {
 
     await user.click(screen.getAllByRole("button", { name: /affected graph/i })[0]);
     expect(screen.getByRole("heading", { name: "Affected subgraph" })).toBeVisible();
-    expect(screen.getByRole("button", { name: /Assertion-level provenance/i })).toBeVisible();
-    expect(screen.getByLabelText("Ontology legend")).toHaveTextContent(/Concept.*Document.*Unsupported kind/i);
+    expect(screen.getAllByRole("button", { name: /Assertion-level provenance/i })[0]).toBeVisible();
+    expect(screen.getByLabelText("Ontology legend")).toHaveTextContent(/Concept.*Document.*Dataset.*Project.*Person.*Organization.*Artifact.*Service.*Resource/i);
+    expect(screen.getByLabelText("Ontology legend")).toHaveTextContent(/Derived/i);
     expect(container.querySelector('[data-kind="domain"]')).toHaveAttribute("title", "Unsupported kind: domain");
     expect(container.querySelector('line[data-edge-family="epistemic"]')).toBeInTheDocument();
     expect(container.querySelector('line[data-edge-family="epistemic"]')).toHaveAttribute("marker-end", "url(#studio-ontology-arrow)");
@@ -31,6 +32,22 @@ describe("KG Studio", () => {
     expect(
       screen.getByRole("region", { name: "Affected graph relationships" }),
     ).toHaveTextContent(/introduced_by · 1\.00/i);
+  });
+
+  it("makes graph edges addressable with a shared selection and contextual inspector", async () => {
+    const user = userEvent.setup();
+    render(<Studio initialBundle={atlasReviewFixture} />);
+
+    await user.click(screen.getAllByRole("button", { name: /affected graph/i })[0]);
+    const edgeSummaryRegion = screen.getByRole("region", { name: "Affected graph relationships" });
+    const edgeRow = within(edgeSummaryRegion).getAllByRole("button")[0];
+
+    edgeRow.focus();
+    expect(edgeRow).toHaveFocus();
+
+    await user.click(edgeRow);
+    expect(edgeRow).toHaveAttribute("aria-pressed", "true");
+    expect(document.querySelector(".edge-inspector")).toBeInTheDocument();
   });
 
   it("dispatches retrieval note kinds through the note legend", async () => {

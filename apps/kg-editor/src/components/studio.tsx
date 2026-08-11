@@ -447,11 +447,26 @@ function ChangesView({ bundle, query, onQuery }: { bundle: ReviewBundle; query: 
   );
 }
 
+type GraphSelection = { type: "node" | "edge"; id: string };
+
 function GraphView({ bundle }: { bundle: ReviewBundle }) {
-  const [selectedId, setSelectedId] = useState(bundle.graph.nodes.items[0]?.id ?? "");
-  const selected = bundle.graph.nodes.items.find((node) => node.id === selectedId) ?? bundle.graph.nodes.items[0];
+  const [selection, setSelection] = useState<GraphSelection>({
+    type: "node",
+    id: bundle.graph.nodes.items[0]?.id ?? "",
+  });
 
   const nodeById = useMemo(() => new Map(bundle.graph.nodes.items.map((node) => [node.id, node])), [bundle.graph.nodes.items]);
+  const edgeById = useMemo(() => new Map(bundle.graph.edges.items.map((edge) => [edge.id, edge])), [bundle.graph.edges.items]);
+
+  const selectNode = (id: string) => setSelection({ type: "node", id });
+  const selectEdge = (id: string) => setSelection({ type: "edge", id });
+
+  const selected = selection.type === "node"
+    ? bundle.graph.nodes.items.find((node) => node.id === selection.id) ?? bundle.graph.nodes.items[0]
+    : undefined;
+  const selectedEdge = selection.type === "edge" ? edgeById.get(selection.id) : undefined;
+  const selectedEdgeSource = selectedEdge ? nodeById.get(selectedEdge.source) : undefined;
+  const selectedEdgeTarget = selectedEdge ? nodeById.get(selectedEdge.target) : undefined;
 
   return (
     <div className="view-stack">
@@ -468,8 +483,8 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
           </div>
           <OntologyLegend
             className="graph-ontology-legend"
-            entityKinds={bundle.graph.nodes.items.map((node) => node.kind)}
-            relations={bundle.graph.edges.items.map((edge) => edge.relation)}
+            presentEntityKinds={bundle.graph.nodes.items.map((node) => node.kind)}
+            presentRelations={bundle.graph.edges.items.map((edge) => edge.relation)}
           />
         </div>
       </div>
@@ -527,10 +542,10 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
         {bundle.graph.nodes.items.map((node) => (
           <button
             type="button"
-            className={`graph-node ${node.state} ${node.id === selectedId ? "selected" : ""}`}
+            className={`graph-node ${node.state} ${selection.type === "node" && node.id === selection.id ? "selected" : ""}`}
             style={{ left: `${node.x}%`, top: `${node.y}%`, ...kindHueStyle(entityLegendFor(node.kind)) }}
             key={node.id}
-            onClick={() => setSelectedId(node.id)}
+            onClick={() => selectNode(node.id)}
           >
             <EntityKindMark className="node-kind" kind={node.kind} />
             <strong>{node.label}</strong>
@@ -541,13 +556,16 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
           const target = nodeById.get(edge.target);
           if (!source || !target) return null;
           return (
-            <span
+            <button
+              type="button"
               key={`${edge.id}-label`}
-              className={`edge-label ${edge.state}`}
+              className={`edge-label ${edge.state} ${selection.type === "edge" && edge.id === selection.id ? "selected" : ""}`}
               style={{ left: `${(source.x + target.x) / 2}%`, top: `${(source.y + target.y) / 2}%` }}
+              aria-pressed={selection.type === "edge" && edge.id === selection.id}
+              onClick={() => selectEdge(edge.id)}
             >
               <RelationMark relation={edge.relation} /> · {edge.weight.toFixed(2)}
-            </span>
+            </button>
           );
         })}
       </div>
@@ -560,10 +578,17 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
             if (!source || !target) return null;
             return (
               <li key={`${edge.id}-summary`}>
-                <strong>{source.label}</strong>
-                <span><RelationMark relation={edge.relation} /><span className="visually-hidden">{edge.relation}</span> · {edge.weight.toFixed(2)}</span>
-                <strong>{target.label}</strong>
-                <em>{edge.state}</em>
+                <button
+                  type="button"
+                  className={selection.type === "edge" && edge.id === selection.id ? "selected" : ""}
+                  aria-pressed={selection.type === "edge" && edge.id === selection.id}
+                  onClick={() => selectEdge(edge.id)}
+                >
+                  <strong>{source.label}</strong>
+                  <span><RelationMark relation={edge.relation} /><span className="visually-hidden">{edge.relation}</span> · {edge.weight.toFixed(2)}</span>
+                  <strong>{target.label}</strong>
+                  <em>{edge.state}</em>
+                </button>
               </li>
             );
           })}
@@ -579,6 +604,18 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
             <p>{selected.description}</p>
           </div>
           <code>{shortHash(selected.id)}</code>
+        </div>
+      )}
+      {selectedEdge && selectedEdgeSource && selectedEdgeTarget && (
+        <div className="node-inspector edge-inspector" style={edgeHueStyle(edgeLegendFor(selectedEdge.relation))}>
+          <div className={`node-state-dot ${selectedEdge.state}`} />
+          <div>
+            <RelationMark className="node-inspector-kind" relation={selectedEdge.relation} showLabel={false} />
+            <span>{edgeLegendFor(selectedEdge.relation).label} · {selectedEdge.state}</span>
+            <strong>{selectedEdgeSource.label} → {selectedEdgeTarget.label}</strong>
+            <p>Weight {selectedEdge.weight.toFixed(2)}</p>
+          </div>
+          <code>{shortHash(selectedEdge.id)}</code>
         </div>
       )}
       <PageNotice page={bundle.graph.nodes} label="Graph nodes" />
