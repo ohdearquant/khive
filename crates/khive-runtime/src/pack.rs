@@ -1663,13 +1663,14 @@ impl VerbRegistry {
                             let payload = serde_json::json!({ "key": key, "value": value });
                             let storage_event = Event::new(
                                 gate_req.namespace.as_str(),
-                                verb,
+                                "config_ledger",
                                 EventKind::ConfigLocked,
                                 SubstrateKind::Event,
                                 format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                             )
                             .with_payload(payload);
-                            append_audit_event_best_effort(store, storage_event, verb).await;
+                            append_audit_event_best_effort(store, storage_event, "config_ledger")
+                                .await;
                         }
                     }
                 }
