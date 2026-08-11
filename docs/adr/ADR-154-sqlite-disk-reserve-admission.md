@@ -78,18 +78,23 @@ None of those live diagnostic fields is persisted into the compatibility fingerp
 
 A canonical database path identifies a database, not the capacity pool it consumes. The guard
 resolves the nearest existing canonical ancestor of the database path and derives a
-`VolumeIdentity` from the filesystem:
+`VolumeIdentity` with two deliberately separate parts:
 
-- Unix: device identity (`st_dev`) plus the canonical probe path used for operator display;
-- Windows: volume identity/serial plus the canonical volume root; and
-- another platform must provide an equivalently stable identity or fail closed for writable
-  SQLite. A canonical path string alone is not an acceptable volume key.
+- a stable `VolumeKey`: Unix `st_dev`, a stable Windows volume ID/serial, or an equivalently stable
+  platform identifier; and
+- diagnostic metadata: the canonical probe path and, where available, a canonical volume root.
+
+Only `VolumeKey` participates in `VolumeIdentity` equality/hashing, the in-process registry key, or
+the advisory-lock filename. Diagnostic path/root metadata is excluded from all four. Two database
+paths on the same filesystem therefore compare equal and select the same lease even when their
+canonical parent paths differ. A platform without a stable volume key fails closed for writable
+SQLite; a canonical path string alone is not an acceptable substitute.
 
 All participating khive writers on one host use:
 
 - an in-process guard registry keyed by `VolumeIdentity`; and
 - a bounded advisory lock in khive's per-user runtime lock namespace, with a filename derived from
-  a versioned hash of `VolumeIdentity`, so separate khive processes and separate database paths on
+  a versioned hash of `VolumeKey` only, so separate khive processes and separate database paths on
   the same volume share one cooperative admission lease.
 
 Identity resolution, lock-open, and lock acquisition failures are typed capacity-unavailable
@@ -130,12 +135,20 @@ may run after space is recovered. A failed rollback retains the existing
 | Pooled `WriterGuard` transaction | Same sequence as the writer task: lease before `BEGIN`, probe after successful `BEGIN`, before the closure |
 | Standalone/manual transaction | Same sequence; no direct compatibility fallback may skip the shared guard |
 | Standalone autocommit statement/script | Lease and probe immediately before the first SQLite write call; retain the lease until SQLite returns to autocommit |
-| Startup schema and migrations | Resolve against the existing parent for a new file; lease before each migration/schema transaction, probe after `BEGIN`, before its first DDL/DML |
+| Startup bootstrap DDL | Resolve against the existing parent for a new file; lease and probe immediately before each current pre-`BEGIN` autocommit bootstrap call, and retain the lease until SQLite returns to autocommit |
+| Migration/schema transactions | Lease before each transaction, probe after `BEGIN`, before its first DDL/DML |
 | Top-level maintenance such as `VACUUM` | Lease and probe immediately before execution; retain it until the call returns |
 
 Normal store modules do not each implement their own probe. After #1911 they inherit the
 writer-task seam. Pool, SQL-bridge, migration, and explicitly top-level/standalone entry points are
 the central enforcement boundary.
+
+The bootstrap row names two current writes which occur before any migration transaction:
+`apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and `run_migrations_locked` executes
+`MIGRATION_TRACKING_TABLE`. Each call must acquire the volume lease, probe before its
+`execute_batch`, skip the call on refusal/probe failure, and retain the lease until the connection
+is demonstrably back in autocommit. The later per-migration transaction then performs the normal
+post-`BEGIN` probe. These bootstrap writes are not exempt merely because they run during startup.
 
 Admission compares available bytes against the configured reserve plus any conservative
 operation-specific headroom. Addition is checked; overflow refuses. A top-level operation with a
@@ -159,7 +172,8 @@ the operation needed to make its outcome safe.
 The following bypass disk-refusal admission:
 
 - `COMMIT` and `ROLLBACK` for an already-admitted transaction;
-- PASSIVE and operator-authorized stronger checkpoints;
+- PASSIVE checkpoints, ADR-091's scheduled threshold-armed `maybe_truncate` escalation, and
+  operator-authorized stronger checkpoints;
 - read-only diagnostics, including the PASSIVE diagnostic probe;
 - reader cancellation/termination and holder-census operations needed to release a WAL pin; and
 - crash recovery and file/sidecar cleanup needed to return the store to an operable state.
@@ -213,23 +227,30 @@ workspace volume:
 2. A writer-task test that enqueues while space is available, changes the injected result while the
    request waits, and proves the execution-time sample refuses it, rolls back, leaves the closure
    uncalled, and keeps the task usable after the probe recovers.
-3. Parity tests for pooled, standalone/autocommit, startup migration/schema, and top-level
+3. Parity tests for pooled, standalone/autocommit, migration/schema transactions, and top-level
    maintenance entry points.
-4. Bypass tests proving an admitted request can always reach `COMMIT`/`ROLLBACK`, and checkpoint,
-   diagnostics, reader-release, and recovery paths are not capacity-refused.
-5. A two-database/same-volume concurrency test proving both paths derive one volume identity and
-   cannot hold the cooperative lease concurrently; a cross-process variant exercises the advisory
-   lock and its bounded timeout.
-6. A Linux-only constrained-filesystem integration test on an isolated loopback/tmpfs device. It
+4. Fresh-file bootstrap tests cover both `SCHEMA_VERSION_TABLE` and
+   `MIGRATION_TRACKING_TABLE`: below-floor and probe-failure cases must return the typed error before
+   the corresponding table exists, and must leave WAL bytes/frames unchanged from a baseline sampled
+   after connection open but before bootstrap admission. An above-floor case creates the ledger and
+   proceeds into the separately admitted migration transaction.
+5. Bypass tests proving an admitted request can always reach `COMMIT`/`ROLLBACK`, and PASSIVE,
+   scheduled threshold-armed `maybe_truncate`, operator checkpoint, diagnostics, reader-release,
+   and recovery paths are not capacity-refused.
+6. A same-volume/two-parent-path test proves distinct diagnostic canonical paths derive equal/hash-
+   equal `VolumeIdentity` values and the same lock filename, then proves two database paths cannot
+   hold the cooperative lease concurrently. A cross-process variant exercises the advisory lock
+   and its bounded timeout.
+7. A Linux-only constrained-filesystem integration test on an isolated loopback/tmpfs device. It
    must verify the device identity differs from the workspace/root volume before writing, cap the
    image size, use a cleanup trap, and abort rather than fall back to the host filesystem. A reader
    pins a real WAL snapshot while writes grow it; the next write must return
    `sqlite_capacity_refused` before any raw `SQLITE_FULL`. After the reader exits, a bypassed
    checkpoint reclaims space and an ordinary write succeeds.
-7. A separate raw-`SQLITE_FULL` classification test, using SQLite's bounded page limit or the
+8. A separate raw-`SQLITE_FULL` classification test, using SQLite's bounded page limit or the
    isolated device with the guard explicitly disabled, proves the native code is preserved and
    reported as `sqlite_disk_full`, never as a guard refusal.
-8. `config_id` tests prove equal effective reserve/deadline values fingerprint identically
+9. `config_id` tests prove equal effective reserve/deadline values fingerprint identically
    regardless of source, changed values differ, and backend ordering stays deterministic.
 
 No acceptance test may fill or intentionally pressure the checkout, home, or runner root

@@ -61,11 +61,21 @@ startup migrations receive equivalent admission outside this drain loop.
 Volume-lease acquisition has its own configured deadline; it does not reuse
 the queue-only `write_admission_deadline_ms` governed by ADR-131.
 
+The two current migration bootstrap writes happen before a migration
+transaction exists: `apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and
+`run_migrations_locked` executes `MIGRATION_TRACKING_TABLE`. Each acquires the
+volume lease and probes immediately before its autocommit `execute_batch`,
+skips that call on refusal, and holds the lease until the connection returns
+to autocommit. Subsequent migration transactions use the ordinary
+post-`BEGIN` probe.
+
 Transaction terminators, checkpointing, diagnostics, reader release, and
 recovery are explicit refusal bypasses. The guard therefore belongs at the
 logical-request boundary, never inside generic statement execution. Native
 `SQLITE_FULL` remains a separate higher-severity stage and is not rendered as
-a successful capacity refusal.
+a successful capacity refusal. Checkpoint bypass includes PASSIVE,
+ADR-091's scheduled threshold-armed `maybe_truncate`, and operator-authorized
+stronger checkpoints.
 
 ## Writer-stage telemetry (#1849)
 
