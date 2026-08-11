@@ -2914,8 +2914,15 @@ mod tests {
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let origin_view = database_tx_view(&pool);
-        let bridge = SqlBridge::new(Arc::clone(&pool), true);
-        let mut reader = bridge.reader().await.unwrap();
+        let conn = open_standalone_reader(&pool).unwrap();
+        let mut reader = SqliteReader {
+            handle: Some(StandaloneHandle {
+                conn,
+                _retained_slot: None,
+                read_transaction_slot: None,
+            }),
+            pool: Arc::clone(&pool),
+        };
 
         reader
             .query_all(SqlStatement {
