@@ -37,6 +37,39 @@ describe("repository showcase", () => {
     expect(container.querySelector("polygon.ontology-derived-glyph")).toBeInTheDocument();
   });
 
+  it("lays out the structure graph from the shared seeded layout, independent of input order", () => {
+    const bundle = golden();
+    const reversed = structuredClone(bundle);
+    reversed.graph.packages = {
+      ...reversed.graph.packages,
+      items: [...reversed.graph.packages.items].reverse(),
+    };
+    reversed.graph.modules = {
+      ...reversed.graph.modules,
+      items: [...reversed.graph.modules.items].reverse(),
+    };
+
+    function nodePositions(container: HTMLElement): Record<string, { left: string; top: string }> {
+      const positions: Record<string, { left: string; top: string }> = {};
+      for (const node of container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]")) {
+        const id = node.getAttribute("data-node-id")!;
+        positions[id] = { left: node.style.left, top: node.style.top };
+      }
+      return positions;
+    }
+
+    const forward = render(<RepoShowcase bundle={bundle} />);
+    const forwardPositions = nodePositions(forward.container);
+    expect(Object.keys(forwardPositions).length).toBeGreaterThan(0);
+    forward.unmount();
+
+    const backward = render(<RepoShowcase bundle={reversed} />);
+    const backwardPositions = nodePositions(backward.container);
+    backward.unmount();
+
+    expect(backwardPositions).toEqual(forwardPositions);
+  });
+
   it("navigates from a module to its precomputed commits and back to modules", async () => {
     const bundle = golden();
     const user = userEvent.setup();
