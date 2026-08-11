@@ -717,6 +717,57 @@ async fn wire_omitted_tiers_defaults_to_l1_and_l1_5() {
     );
 }
 
+#[tokio::test]
+async fn wire_unknown_arguments_are_rejected_before_db_open() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_unknown_arg");
+    let db = root.path().join("unknown-arg.db");
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+
+    let error = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": root.path().join("pkg_unknown_arg").to_string_lossy(),
+            "db": db.to_string_lossy(),
+            "zzz_not_a_real_param": "banana",
+        }),
+    )
+    .await
+    .expect_err("unknown arguments must be rejected");
+
+    let message = error.to_string();
+    assert!(message.contains("unknown field"), "{message}");
+    for expected in ["zzz_not_a_real_param", "path", "db", "languages", "tiers"] {
+        assert!(message.contains(expected), "{message}");
+    }
+    assert!(
+        !db.exists(),
+        "argument validation must run before the target database is opened"
+    );
+}
+
+#[tokio::test]
+async fn wire_report_languages_describe_observed_sources() {
+    let root = TempDir::new().expect("tempdir");
+    write_l2_symbol_fixture(root.path(), "pkg_observed_language");
+    let db = root.path().join("observed-language.db");
+    let reg = registry(KhiveRuntime::memory().expect("memory runtime"));
+
+    let report = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": root.path().join("pkg_observed_language").to_string_lossy(),
+            "db": db.to_string_lossy(),
+        }),
+    )
+    .await
+    .expect("default ingest succeeds");
+
+    assert_eq!(report["languages"], json!(["rust"]));
+}
+
 /// Explicit `null` tiers behaves identically to omitted.
 #[tokio::test]
 async fn wire_null_tiers_defaults_to_l1_and_l1_5() {
@@ -790,6 +841,7 @@ async fn wire_empty_tiers_write_no_map_rows() {
 
     assert!(result.get("symbols_created").is_none());
     assert!(result.get("symbol_parse_failures").is_none());
+    assert_eq!(result["languages"], json!([]));
     let target = rt_at(&db);
     assert_eq!(entity_count(&target).await, 0);
     assert_eq!(edge_count(&target).await, 0);
