@@ -841,6 +841,7 @@ async fn wire_empty_tiers_write_no_map_rows() {
 
     assert!(result.get("symbols_created").is_none());
     assert!(result.get("symbol_parse_failures").is_none());
+    assert_eq!(result["languages"], json!([]));
     let target = rt_at(&db);
     assert_eq!(entity_count(&target).await, 0);
     assert_eq!(edge_count(&target).await, 0);

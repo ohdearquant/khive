@@ -2109,10 +2109,10 @@ request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.p
 
 ## `code` pack — 1 verb
 
-Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Optional; load
-with `KHIVE_PACKS=kg,code`. Also registers the `finding` note kind used by the
-`kkernel code-ingest` admin CLI's `findings.json` batch ingest (not reachable via this
-MCP verb surface).
+Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Loaded by default;
+set `KHIVE_PACKS=kg,code` to select only the base and code packs. Also registers the
+`finding` note kind used by the `kkernel code-ingest` admin CLI's `findings.json` batch
+ingest (not reachable via this MCP verb surface).
 
 ### `code.ingest` — Commissive
 
