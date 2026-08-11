@@ -1847,6 +1847,13 @@ impl khive_types::Pack for ErrorInjectPack {
             category: VerbCategory::Assertive,
             params: &[],
         },
+        HandlerDef {
+            name: "writer_task_busy",
+            description: "returns a typed writer-task BEGIN contention error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
     ];
 }
 
@@ -1888,6 +1895,11 @@ impl PackRuntime for ErrorInjectPack {
         if verb == "write_queue_full" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriteQueueFull { timeout_ms: 175 },
+            ));
+        }
+        if verb == "writer_task_busy" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
             ));
         }
         let err = KhiveError::unavailable("downstream service offline")
@@ -2063,6 +2075,42 @@ async fn write_queue_full_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "retry_after_ms": 175,
         }),
         "the exact wire contract must preserve stage, deadline, retryability, and ADR-131:251's scope/retry_after_ms for queue saturation"
+    );
+
+    Ok(())
+}
+
+/// A writer task that exhausts SQLite's busy timeout before entering its
+/// request transaction has not invoked the operation and is therefore safe
+/// to retry. Keep that proof structured through the MCP boundary.
+#[tokio::test]
+async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_task_busy()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "writer_task_begin_busy",
+            "stage": "writer_task_begin_busy",
+            "message": "storage: writer task could not begin within 175ms because SQLite remained busy; request was not executed",
+            "retryable": true,
+            "timeout_ms": 175,
+            "capability": serde_json::Value::Null,
+            "operation": "writer_task_begin",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
+        }),
+        "BEGIN contention must remain distinguishable and safely retryable"
     );
 
     Ok(())

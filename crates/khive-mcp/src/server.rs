@@ -1931,17 +1931,16 @@ fn coordinator_search_visibility(
 }
 
 /// Preserve the established flat-string payload for ordinary runtime errors,
-/// while carrying pre-execution write-admission failures (ADR-135 F6 writer-
-/// pool checkout timeout; #1382/#1643 write-queue saturation) structurally,
-/// and marked retryable, through every MCP execution mode. Both admission
-/// failures happen before SQLite executes the request, so retrying is safe:
-/// there is no partial side effect to roll back.
+/// while carrying every typed safe-retry write failure structurally through
+/// every MCP execution mode. Pool checkout and queue saturation happen before
+/// admission; writer-task BEGIN contention happens after queue acceptance but
+/// before the operation closure runs. None can leave a partial side effect.
 fn runtime_error_value(error: RuntimeError) -> Value {
     match error {
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
         other => {
-            let Some(context) = other.admission_failure_context() else {
+            let Some(context) = other.retryable_failure_context() else {
                 return json!(other.to_string());
             };
             let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
@@ -2279,8 +2278,9 @@ it (or summary) rather than relying on the absence of a top-level error.
 
 A parallel write-heavy batch is best-effort, not atomic: `results` ordering is
 not a commit prefix (an earlier entry succeeding implies nothing about a later
-one, or vice versa), and one entry's admission failure (e.g. `retryable:
-true`, `code: "writer_pool_checkout_timeout"` or `"writer_queue_saturated"`)
+one, or vice versa), and one entry's safe-retry failure (e.g. `retryable:
+true`, `code: "writer_pool_checkout_timeout"`, `"writer_queue_saturated"`,
+or `"writer_task_begin_busy"`)
 never rolls back a sibling that already committed. Inspect each result
 entry's own `ok` field rather than assuming batch-level atomicity.
 

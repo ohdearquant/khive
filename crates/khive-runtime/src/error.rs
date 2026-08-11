@@ -17,6 +17,10 @@ pub const WRITER_POOL_CHECKOUT_TIMEOUT_STAGE: &str = "writer_pool_checkout_timeo
 /// accepted the request within its configured deadline (#1382, #1643).
 pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
 
+/// Stable wire code/stage for SQLite write-lock contention after the writer
+/// queue accepted a request but before its operation closure ran.
+pub const WRITER_TASK_BEGIN_BUSY_STAGE: &str = "writer_task_begin_busy";
+
 /// Stable ADR-131:251 `scope` discriminator carried on a
 /// [`WRITER_QUEUE_SATURATED_STAGE`] failure — distinguishes write-queue
 /// admission saturation from other `unavailable` failure kinds that share
@@ -54,6 +58,41 @@ pub struct AdmissionFailureContext {
     /// `Some(timeout_ms)` for [`WRITER_QUEUE_SATURATED_STAGE`]; `None`
     /// otherwise.
     pub retry_after_ms: Option<u64>,
+}
+
+/// Structured context for a failure that is proven safe to retry.
+///
+/// This includes the two pre-admission failures above and writer-task BEGIN
+/// contention after queue acceptance but before operation execution. Callers
+/// must inspect `scope`: only `writer_admission` means the queue never
+/// accepted the operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryableFailureContext {
+    /// Stable wire stage/code.
+    pub stage: &'static str,
+    /// Configured wait that ended before execution.
+    pub timeout: Duration,
+    /// Storage capability when the failure is capability-scoped.
+    pub capability: Option<khive_storage::StorageCapability>,
+    /// Storage operation when known.
+    pub operation: Option<String>,
+    /// Admission scope only when the queue never accepted the operation.
+    pub scope: Option<&'static str>,
+    /// Server backoff hint when a governing contract defines one.
+    pub retry_after_ms: Option<u64>,
+}
+
+impl From<AdmissionFailureContext> for RetryableFailureContext {
+    fn from(context: AdmissionFailureContext) -> Self {
+        Self {
+            stage: context.stage,
+            timeout: context.timeout,
+            capability: context.capability,
+            operation: context.operation,
+            scope: context.scope,
+            retry_after_ms: context.retry_after_ms,
+        }
+    }
 }
 
 /// Typed disposition for a channel message whose `comm.ingest` write failed.
@@ -391,13 +430,13 @@ impl RuntimeError {
     /// Classify a failed inbound channel write without inspecting rendered
     /// error text.
     ///
-    /// Existing typed admission failures remain retryable. Secret detection is
+    /// Existing typed safe-retry failures remain retryable. Secret detection is
     /// the first deterministic policy refusal and is permanent. `None` from
-    /// [`Self::admission_failure_context`] is deliberately not interpreted as
+    /// [`Self::retryable_failure_context`] is deliberately not interpreted as
     /// permanent: every other variant starts in the bounded `Unknown` bucket.
     pub fn channel_ingest_failure_class(&self) -> ChannelIngestFailureClass {
         let reason = self.variant_name();
-        if self.admission_failure_context().is_some() {
+        if self.retryable_failure_context().is_some() {
             ChannelIngestFailureClass::Retryable { reason }
         } else if matches!(self, Self::SecretDetected(_)) {
             ChannelIngestFailureClass::Permanent { reason }
@@ -502,6 +541,25 @@ impl RuntimeError {
         }
         None
     }
+
+    /// Recover every typed failure for which this process can prove that
+    /// retrying the one failed operation cannot duplicate a side effect.
+    pub fn retryable_failure_context(&self) -> Option<RetryableFailureContext> {
+        if let Some(context) = self.admission_failure_context() {
+            return Some(context.into());
+        }
+        let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = self else {
+            return None;
+        };
+        Some(RetryableFailureContext {
+            stage: WRITER_TASK_BEGIN_BUSY_STAGE,
+            timeout: Duration::from_millis(*timeout_ms),
+            capability: None,
+            operation: Some("writer_task_begin".to_string()),
+            scope: None,
+            retry_after_ms: None,
+        })
+    }
 }
 
 /// Resolve an FTS text-leg search result, failing loud on parser syntax
@@ -559,6 +617,7 @@ impl From<khive_types::KhiveError> for RuntimeError {
 mod channel_ingest_failure_class_tests {
     use super::{ChannelIngestFailureClass, RuntimeError};
     use crate::secret_gate::SecretMatch;
+    use std::time::Duration;
 
     #[test]
     fn secret_detected_is_permanent_by_typed_variant_not_display_text() {
@@ -593,6 +652,21 @@ mod channel_ingest_failure_class_tests {
             RuntimeError::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms: 25 });
         assert_eq!(
             retryable.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Retryable { reason: "Storage" }
+        );
+
+        let begin_busy =
+            RuntimeError::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 });
+        let context = begin_busy
+            .retryable_failure_context()
+            .expect("contended BEGIN must remain typed and retryable");
+        assert_eq!(context.stage, "writer_task_begin_busy");
+        assert_eq!(context.timeout, Duration::from_millis(175));
+        assert_eq!(context.operation.as_deref(), Some("writer_task_begin"));
+        assert_eq!(context.scope, None);
+        assert_eq!(context.retry_after_ms, None);
+        assert_eq!(
+            begin_busy.channel_ingest_failure_class(),
             ChannelIngestFailureClass::Retryable { reason: "Storage" }
         );
 
