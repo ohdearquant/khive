@@ -4,7 +4,38 @@ import { describe, expect, it } from "vitest";
 
 import { Studio } from "@/components/studio";
 import { atlasReviewFixture } from "@/lib/fixtures/atlas-review";
-import { REVIEW_IMPORT_MAX_BYTES, type ReviewReport } from "@/lib/review-bundle";
+import { REVIEW_IMPORT_MAX_BYTES, type ReviewBundle, type ReviewReport } from "@/lib/review-bundle";
+
+const zeroPageCases = [
+  {
+    name: "affected graph",
+    view: /affected graph/i,
+    empty: (bundle: ReviewBundle) => {
+      bundle.graph.nodes.items = [];
+      bundle.graph.edges.items = [];
+    },
+  },
+  {
+    name: "checks",
+    view: /^checks/i,
+    empty: (bundle: ReviewBundle) => { bundle.checks.items = []; },
+  },
+  {
+    name: "evidence",
+    view: /provenance/i,
+    empty: (bundle: ReviewBundle) => { bundle.evidence.items = []; },
+  },
+  {
+    name: "retrieval",
+    view: /khive context/i,
+    empty: (bundle: ReviewBundle) => { bundle.retrieval.search.items = []; },
+  },
+  {
+    name: "activity",
+    view: /^activity/i,
+    empty: (bundle: ReviewBundle) => { bundle.activity.items = []; },
+  },
+] as const;
 
 describe("KG Studio", () => {
   it("makes the no-write and unavailable capability boundary visible", () => {
@@ -26,6 +57,32 @@ describe("KG Studio", () => {
     expect(empty?.querySelectorAll("button")).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "Clear filter" }));
     expect(container.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+  });
+
+  it.each(zeroPageCases)("renders $name zero pages through one actionable empty state", async ({ view, empty }) => {
+    const bundle = structuredClone(atlasReviewFixture);
+    empty(bundle);
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    await user.click(screen.getAllByRole("button", { name: view })[0]);
+
+    const state = container.querySelector<HTMLElement>('[data-state="empty"]');
+    expect(state).toBeVisible();
+    expect(state?.querySelectorAll("button")).toHaveLength(1);
+    expect(within(state!).getByRole("button", { name: "Import another review bundle" })).toBeVisible();
+  });
+
+  it("renders Studio page bounds as the shared truncated state", () => {
+    const bundle = structuredClone(atlasReviewFixture);
+    bundle.changes.truncated = true;
+    bundle.changes.next_cursor = "next-page";
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    const state = container.querySelector<HTMLElement>('[data-state="truncated"]');
+    expect(state).toHaveAttribute("data-shown", String(bundle.changes.items.length));
+    expect(state).toHaveAttribute("data-bound", String(bundle.changes.items.length));
+    expect(state).toHaveTextContent(/graph changes.*bound/i);
   });
 
   it("navigates from semantic diff to the affected graph", async () => {

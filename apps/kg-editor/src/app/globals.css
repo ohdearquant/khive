@@ -202,7 +202,18 @@ kbd {
 }
 
 .data-state-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   min-width: 0;
+}
+
+.data-state.inline {
+  display: inline-flex;
+}
+
+.data-state-bound {
+  font-variant-numeric: tabular-nums;
 }
 
 .data-state-action {

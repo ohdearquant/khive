@@ -45,4 +45,64 @@ describe("shared data states", () => {
     await user.click(buttons[0]);
     expect(action).toHaveBeenCalledOnce();
   });
+
+  it("states the truncation bound, reason, and known total without inventing an action", () => {
+    const { container } = render(
+      <DataState
+        state="truncated"
+        title="Graph nodes are truncated"
+        shown={50}
+        bound={50}
+        knownTotal={143}
+        reason="The review export applied its node budget."
+      />,
+    );
+
+    const surface = screen.getByRole("status");
+    expect(surface).toHaveAttribute("data-state", "truncated");
+    expect(surface).toHaveAttribute("data-shown", "50");
+    expect(surface).toHaveAttribute("data-bound", "50");
+    expect(surface).toHaveAttribute("data-known-total", "143");
+    expect(container.querySelector('[data-icon="alert-triangle"]')).toBeInTheDocument();
+    expect(surface).toHaveTextContent(/50 shown.*bound 50.*143 total/i);
+    expect(surface).toHaveTextContent("The review export applied its node budget.");
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("offers one next action only when it declares a wider bound", async () => {
+    const action = vi.fn();
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <DataState
+        state="truncated"
+        title="Commits are truncated"
+        shown={25}
+        bound={25}
+        reason="A page remains."
+        next={{ bound: 50, label: "Show 50 commits", onClick: action }}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Show 50 commits" }));
+    expect(action).toHaveBeenCalledOnce();
+
+    rerender(
+      <DataState
+        state="truncated"
+        title="Commits are truncated"
+        shown={25}
+        bound={25}
+        reason="No wider page is available."
+        next={{ bound: 25, label: "Invalid same bound", onClick: action }}
+      />,
+    );
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
 });
+
+if (false) {
+  // @ts-expect-error Non-empty states cannot grow an untyped second action.
+  <DataState state="unavailable" title="Unavailable" message="Reason" action={{ label: "Retry", onClick() {} }} />;
+  // @ts-expect-error Arbitrary interactive detail is outside the state contract.
+  <DataState state="loading" title="Loading" message="Waiting" detail={<button type="button">Extra</button>} />;
+}

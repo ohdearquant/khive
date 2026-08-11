@@ -8,6 +8,8 @@ import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
 
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
+const showcaseSourcePath = resolve(process.cwd(), "src/components/showcase/repo-showcase.tsx");
+const studioSourcePath = resolve(process.cwd(), "src/components/studio.tsx");
 
 function golden(): RepoBundle {
   return parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
@@ -26,6 +28,16 @@ describe("repository showcase", () => {
     for (const view of Object.values(bundle.capability.views)) {
       expect(within(navigation).getByRole("button", { name: view.label })).toBeVisible();
     }
+  });
+
+  it("keeps legacy state markup out of Studio and repository showcase surfaces", () => {
+    const showcaseSource = readFileSync(showcaseSourcePath, "utf8");
+    const studioSource = readFileSync(studioSourcePath, "utf8");
+
+    expect(showcaseSource).not.toMatch(/<div className="repo-empty/);
+    expect(showcaseSource).not.toMatch(/<div className={`repo-bounded/);
+    expect(showcaseSource).not.toMatch(/return <em className="repo-inline-state"/);
+    expect(studioSource).not.toMatch(/<div className="page-notice"/);
   });
 
   it("uses the shared unavailable state and exposes the capability reason", async () => {
@@ -129,6 +141,9 @@ describe("repository showcase", () => {
     const commits = container.querySelector<HTMLElement>("[data-history-commits]")!;
     expect(within(commits).getAllByText("0").length).toBeGreaterThan(0);
     expect(within(commits).queryByText(bundle.capability.labels.unavailable)).not.toBeInTheDocument();
+    const empty = commits.querySelector<HTMLElement>('[data-state="empty"]');
+    expect(empty).toBeVisible();
+    expect(empty?.querySelectorAll("button")).toHaveLength(1);
     expect(within(container.querySelector<HTMLElement>("[data-history-capabilities]")!).getByText("false")).toBeVisible();
   });
 
@@ -164,10 +179,15 @@ describe("repository showcase", () => {
     bundle.graph.modules.disclosure = { status: "truncated", reason: "fixture node budget" };
     bundle.graph.modules.next_cursor = "opaque-cursor";
 
-    render(<RepoShowcase bundle={bundle} />);
+    const { container } = render(<RepoShowcase bundle={bundle} />);
 
-    expect(screen.getByText(/fixture node budget/i)).toBeVisible();
-    expect(screen.getAllByText((content) => content.includes(bundle.capability.labels.truncated)).length).toBeGreaterThan(0);
+    const state = container.querySelector<HTMLElement>('[data-state="truncated"]');
+    expect(state).toBeVisible();
+    expect(state).toHaveAttribute("data-bound", String(bundle.graph.modules.bound.max_items));
+    if (bundle.graph.modules.total_count.status === "available") {
+      expect(state).toHaveAttribute("data-known-total", String(bundle.graph.modules.total_count.value));
+    }
+    expect(state).toHaveTextContent(/fixture node budget/i);
   });
 
   it("keeps repository-wide ownership visible when the module join is unavailable", async () => {
