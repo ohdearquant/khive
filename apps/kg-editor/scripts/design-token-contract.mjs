@@ -6,10 +6,43 @@ const CSS_NAMED_COLORS = new Set(
   `aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen steelblue tan teal thistle tomato transparent turquoise violet wheat white whitesmoke yellow yellowgreen`
     .split(" "),
 );
-const TAILWIND_PALETTE =
-  /\b(?:bg|text|border|outline|ring|shadow|fill|stroke|from|via|to)-(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose|black|white)(?:-\d{2,3})?(?:\/\d{1,3})?\b/giu;
-const TAILWIND_ARBITRARY_COLOR =
-  /\b(?:bg|text|border|outline|ring|shadow|fill|stroke|from|via|to)-\[(?:#[\da-f]{3,8}|(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color)\([^\]]+\))\]/giu;
+const TAILWIND_PALETTES = new Set(
+  `slate gray zinc neutral stone red orange amber yellow lime green emerald teal cyan sky blue indigo violet purple fuchsia pink rose black white`
+    .split(" "),
+);
+const TAILWIND_COLOR_PREFIXES = [
+  "ring-offset",
+  "border-block-start",
+  "border-block-end",
+  "border-inline-start",
+  "border-inline-end",
+  "border-x",
+  "border-y",
+  "border-t",
+  "border-r",
+  "border-b",
+  "border-l",
+  "border-s",
+  "border-e",
+  "divide-x",
+  "divide-y",
+  "decoration",
+  "placeholder",
+  "accent",
+  "caret",
+  "divide",
+  "outline",
+  "border",
+  "shadow",
+  "stroke",
+  "fill",
+  "ring",
+  "from",
+  "via",
+  "to",
+  "text",
+  "bg",
+];
 
 function lineAt(content, index) {
   return content.slice(0, index).split("\n").length;
@@ -143,6 +176,7 @@ function cssDeclarationRanges(content) {
     ranges.push({
       content: clean.slice(valueStart, cursor),
       offset: valueStart,
+      property: property.toLowerCase(),
     });
     if (clean[cursor] === "}") depth = Math.max(0, depth - 1);
     segmentStart = cursor + 1;
@@ -165,50 +199,300 @@ function literalColorMatches(content, offset = 0, maskStrings = false) {
   return found;
 }
 
-function stringLiteralRanges(content) {
-  const ranges = [];
-  const strings = [
-    /"((?:\\.|[^"\\])*)"/gsu,
-    /'((?:\\.|[^'\\])*)'/gsu,
-    /`((?:\\.|[^`\\])*)`/gsu,
-  ];
-  for (const pattern of strings) {
-    for (const match of content.matchAll(pattern)) {
-      ranges.push({ content: match[1], offset: match.index + 1 });
-    }
-  }
-  return ranges;
+function isColorBearingCssProperty(property) {
+  const normalized = property.toLowerCase();
+  if (normalized.startsWith("--") || normalized.endsWith("-color")) return true;
+  if (
+    /^(?:color|fill|stroke|background(?:-image)?|outline|box-shadow|text-shadow|text-decoration|column-rule|scrollbar-color|border-image|filter|backdrop-filter)$/u
+      .test(normalized)
+  ) return true;
+  return /^border(?:-(?:top|right|bottom|left|block|inline)(?:-(?:start|end))?)?$/u
+    .test(normalized);
 }
 
-function javascriptColorRanges(content) {
-  const ranges = [];
-  const property =
-    "(?:color|background(?:Color)?|border(?:Top|Right|Bottom|Left)?Color|outlineColor|textDecorationColor|caretColor|accentColor|fill|stroke|stopColor|floodColor|lightingColor|boxShadow|textShadow)";
-  const patterns = [
-    new RegExp(`\\b${property}\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "gsu"),
-    new RegExp(`\\b${property}\\s*:\\s*'((?:\\\\.|[^'\\\\])*)'`, "gsu"),
-    new RegExp("\\b" + property + "\\s*:\\s*`((?:\\\\.|[^`\\\\])*)`", "gsu"),
-    new RegExp(`\\b${property}\\s*=\\s*"((?:\\\\.|[^"\\\\])*)"`, "gsu"),
-    new RegExp(`\\b${property}\\s*=\\s*'((?:\\\\.|[^'\\\\])*)'`, "gsu"),
-    new RegExp(
-      `\\b${property}\\s*=\\s*\\{\\s*"((?:\\\\.|[^"\\\\])*)"\\s*\\}`,
-      "gsu",
-    ),
-    new RegExp(
-      `\\b${property}\\s*=\\s*\\{\\s*'((?:\\\\.|[^'\\\\])*)'\\s*\\}`,
-      "gsu",
-    ),
-  ];
-  for (const pattern of patterns) {
-    for (const match of content.matchAll(pattern)) {
-      const value = match[1] ?? "";
-      ranges.push({
-        content: value,
-        offset: match.index + match[0].indexOf(value),
-      });
+function isJavaScriptColorProperty(property) {
+  const normalized = property.replaceAll("-", "").toLowerCase();
+  return normalized.startsWith("--") ||
+    /^(?:color|fill|stroke|background|backgroundcolor|bordertopcolor|borderrightcolor|borderbottomcolor|borderleftcolor|bordercolor|outlinecolor|textdecorationcolor|caretcolor|accentcolor|stopcolor|floodcolor|lightingcolor|boxshadow|textshadow)$/u
+      .test(normalized);
+}
+
+function tokenizeJavaScript(content) {
+  const tokens = [];
+
+  function push(type, value, start, end) {
+    tokens.push({ type, value, start, end });
+  }
+
+  function scanString(index, quote) {
+    const start = index + 1;
+    index += 1;
+    while (index < content.length && content[index] !== quote) {
+      if (content[index] === "\\") index += 1;
+      index += 1;
+    }
+    push("string", content.slice(start, index), start, index);
+    return Math.min(content.length, index + 1);
+  }
+
+  function scanTemplate(index) {
+    index += 1;
+    let chunkStart = index;
+    while (index < content.length) {
+      if (content[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (content[index] === "`") {
+        if (index > chunkStart) {
+          push("string", content.slice(chunkStart, index), chunkStart, index);
+        }
+        return index + 1;
+      }
+      if (content[index] === "$" && content[index + 1] === "{") {
+        if (index > chunkStart) {
+          push("string", content.slice(chunkStart, index), chunkStart, index);
+        }
+        push("punctuation", "{", index + 1, index + 2);
+        index = scanCode(index + 2, true);
+        chunkStart = index;
+        continue;
+      }
+      index += 1;
+    }
+    if (index > chunkStart) {
+      push("string", content.slice(chunkStart, index), chunkStart, index);
+    }
+    return index;
+  }
+
+  function scanCode(index, stopAtClosingBrace = false) {
+    while (index < content.length) {
+      const character = content[index];
+      if (/\s/u.test(character)) {
+        index += 1;
+        continue;
+      }
+      if (character === "/" && content[index + 1] === "/") {
+        index += 2;
+        while (index < content.length && content[index] !== "\n") index += 1;
+        continue;
+      }
+      if (character === "/" && content[index + 1] === "*") {
+        index += 2;
+        while (
+          index < content.length &&
+          !(content[index] === "*" && content[index + 1] === "/")
+        ) index += 1;
+        index = Math.min(content.length, index + 2);
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        index = scanString(index, character);
+        continue;
+      }
+      if (character === "`") {
+        index = scanTemplate(index);
+        continue;
+      }
+      if (character === "{") {
+        push("punctuation", character, index, index + 1);
+        index = scanCode(index + 1, true);
+        continue;
+      }
+      if (character === "}" && stopAtClosingBrace) {
+        push("punctuation", character, index, index + 1);
+        return index + 1;
+      }
+      if (/[a-z_$]/iu.test(character)) {
+        const start = index;
+        index += 1;
+        while (/[\w$]/u.test(content[index] ?? "")) index += 1;
+        push("identifier", content.slice(start, index), start, index);
+        continue;
+      }
+      push("punctuation", character, index, index + 1);
+      index += 1;
+    }
+    return index;
+  }
+
+  scanCode(0);
+  return tokens;
+}
+
+function matchingToken(tokens, start, opening, closing, limit = tokens.length) {
+  let depth = 0;
+  for (let index = start; index < limit; index += 1) {
+    if (tokens[index].value === opening) depth += 1;
+    else if (tokens[index].value === closing) {
+      depth -= 1;
+      if (depth === 0) return index;
     }
   }
-  return ranges;
+  return -1;
+}
+
+function classUtility(className) {
+  let squareDepth = 0;
+  let variantEnd = -1;
+  for (let index = 0; index < className.length; index += 1) {
+    if (className[index] === "[") squareDepth += 1;
+    else if (className[index] === "]") {
+      squareDepth = Math.max(0, squareDepth - 1);
+    } else if (className[index] === ":" && squareDepth === 0) {
+      variantEnd = index;
+    }
+  }
+  return className.slice(variantEnd + 1).replace(/^!/u, "");
+}
+
+function tailwindColorMatches(content, offset) {
+  const found = [];
+  for (const match of content.matchAll(/\S+/gu)) {
+    const className = match[0];
+    const utility = classUtility(className);
+    let hasLiteralColor = false;
+
+    if (utility.startsWith("[") && utility.endsWith("]")) {
+      const declaration = utility.slice(1, -1);
+      const colon = declaration.indexOf(":");
+      if (colon > 0 && isColorBearingCssProperty(declaration.slice(0, colon))) {
+        hasLiteralColor =
+          literalColorMatches(declaration.slice(colon + 1)).length > 0;
+      }
+    } else {
+      for (const prefix of TAILWIND_COLOR_PREFIXES) {
+        const marker = `${prefix}-`;
+        if (!utility.startsWith(marker)) continue;
+        const value = utility.slice(marker.length);
+        if (value.startsWith("[") && value.endsWith("]")) {
+          hasLiteralColor = literalColorMatches(value.slice(1, -1)).length > 0;
+        } else {
+          hasLiteralColor = TAILWIND_PALETTES.has(value.split(/[-/]/u, 1)[0]);
+        }
+        break;
+      }
+    }
+
+    if (hasLiteralColor) {
+      found.push({ index: offset + match.index, literal: className });
+    }
+  }
+  return found;
+}
+
+function colorMatchesInTokens(tokens, start, end) {
+  const found = [];
+  for (let index = start; index < end; index += 1) {
+    const token = tokens[index];
+    if (token.type !== "string") continue;
+    found.push(...literalColorMatches(token.value, token.start));
+  }
+  return found;
+}
+
+function tailwindMatchesInTokens(tokens, start, end) {
+  const found = [];
+  for (let index = start; index < end; index += 1) {
+    const token = tokens[index];
+    if (token.type !== "string") continue;
+    found.push(...tailwindColorMatches(token.value, token.start));
+  }
+  return found;
+}
+
+function styleColorMatches(tokens, start, end) {
+  const found = [];
+  for (let index = start; index < end - 1; index += 1) {
+    const key = tokens[index];
+    if (
+      (key.type !== "identifier" && key.type !== "string") ||
+      tokens[index + 1].value !== ":" ||
+      !isJavaScriptColorProperty(key.value)
+    ) continue;
+
+    let cursor = index + 2;
+    let braces = 0;
+    let brackets = 0;
+    let parentheses = 0;
+    while (cursor < end) {
+      const value = tokens[cursor].value;
+      if (value === "{") braces += 1;
+      else if (value === "}") {
+        if (braces === 0 && brackets === 0 && parentheses === 0) break;
+        braces -= 1;
+      } else if (value === "[") brackets += 1;
+      else if (value === "]") brackets -= 1;
+      else if (value === "(") parentheses += 1;
+      else if (value === ")") parentheses -= 1;
+      else if (
+        value === "," && braces === 0 && brackets === 0 && parentheses === 0
+      ) break;
+      cursor += 1;
+    }
+    found.push(...colorMatchesInTokens(tokens, index + 2, cursor));
+    index = cursor - 1;
+  }
+  return found;
+}
+
+function jsxColorMatches(content) {
+  const tokens = tokenizeJavaScript(content);
+  const found = [];
+  for (let open = 0; open < tokens.length; open += 1) {
+    if (tokens[open].value !== "<") continue;
+    const first = tokens[open + 1];
+    if (!first || (first.type !== "identifier" && first.value !== ">")) {
+      continue;
+    }
+
+    let close = open + 1;
+    let braces = 0;
+    for (; close < tokens.length; close += 1) {
+      const value = tokens[close].value;
+      if (value === "{") braces += 1;
+      else if (value === "}") braces = Math.max(0, braces - 1);
+      else if (value === ">" && braces === 0) break;
+    }
+    if (close >= tokens.length) continue;
+
+    braces = 0;
+    for (let index = open + 2; index < close; index += 1) {
+      const token = tokens[index];
+      if (token.value === "{") {
+        braces += 1;
+        continue;
+      }
+      if (token.value === "}") {
+        braces = Math.max(0, braces - 1);
+        continue;
+      }
+      if (
+        braces !== 0 || token.type !== "identifier" ||
+        tokens[index + 1]?.value !== "="
+      ) continue;
+
+      const attribute = token.value;
+      const valueStart = index + 2;
+      let valueEnd = valueStart + 1;
+      if (tokens[valueStart]?.value === "{") {
+        const matching = matchingToken(tokens, valueStart, "{", "}", close);
+        if (matching === -1) continue;
+        valueEnd = matching;
+      }
+      if (attribute === "className") {
+        found.push(...tailwindMatchesInTokens(tokens, valueStart, valueEnd));
+      } else if (attribute === "style") {
+        found.push(...styleColorMatches(tokens, valueStart, valueEnd));
+      } else if (isJavaScriptColorProperty(attribute)) {
+        found.push(...colorMatchesInTokens(tokens, valueStart, valueEnd));
+      }
+      index = valueEnd;
+    }
+    open = close;
+  }
+  return found;
 }
 
 export function findLiteralColorViolations(
@@ -224,18 +508,11 @@ export function findLiteralColorViolations(
     let found = [];
     if (path.endsWith(".css")) {
       for (const range of cssDeclarationRanges(source.content)) {
+        if (!isColorBearingCssProperty(range.property)) continue;
         found.push(...literalColorMatches(range.content, range.offset, true));
       }
     } else if (/\.[cm]?[jt]sx?$/u.test(path)) {
-      for (const range of stringLiteralRanges(source.content)) {
-        found.push(...matches(range.content, TAILWIND_PALETTE, range.offset));
-        found.push(
-          ...matches(range.content, TAILWIND_ARBITRARY_COLOR, range.offset),
-        );
-      }
-      for (const range of javascriptColorRanges(source.content)) {
-        found.push(...literalColorMatches(range.content, range.offset));
-      }
+      found.push(...jsxColorMatches(source.content));
     }
 
     found.sort((left, right) => left.index - right.index);
