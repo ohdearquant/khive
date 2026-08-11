@@ -2650,9 +2650,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61eae112521e52dfdd973e9a377489201c0162bdd2c440527d54f2079fc56f82"
+checksum = "186873eb55d987651cf21643a9b3d157128c655d83492a5781e67144d920a8ca"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2669,9 +2669,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.7.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84227647ece462f8551a4585f60a1edcace4b85255ecc27520f2324859853a84"
+checksum = "cd766cb81f951cc61af9519fd58c97e383dcb52a8e153069002b2f89f553d328"
 dependencies = [
  "rand 0.8.7",
  "rand_distr",
@@ -2681,9 +2681,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25dff8598bf6673578f01d8a08514a5082f3f69378587c79e5c7cfc4da6a89ad"
+checksum = "183b60dac1428baf58fc817d1c643448946d031399654c36945bac0485688158"
 dependencies = [
  "base64 0.22.1",
  "clap",
