@@ -697,6 +697,142 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
     Ok(present == 3)
 }
 
+/// The sentinel digest the fence probe claims. All zeros is canonical-form
+/// valid (64 lowercase hex) and unreachable as a real BLAKE3 digest for any
+/// stored object in practice; probe rows never survive the probe transaction.
+const BLOB_GC_FENCE_PROBE_REF: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The RAISE(ABORT) message both V20 fencing triggers carry. The probe
+/// requires the rejection to be OUR fence, not an incidental failure.
+const BLOB_GC_FENCE_TRIGGER_MESSAGE: &str = "content_ref is reserved by an active blob sweep";
+
+/// Prove the V20 fence actually fences, not merely that objects with the
+/// right NAMES exist in `sqlite_master`. Same-named no-op triggers (or a
+/// rewritten trigger body) would pass the name census while letting a
+/// claimed `content_ref` become live in the released-writer window, so the
+/// gate exercises the fence: inside one writer transaction it claims a
+/// sentinel digest, attempts the entity INSERT and the entity UPDATE that
+/// the triggers must reject, requires both to fail with the triggers' own
+/// RAISE message, and deletes every probe row before the unit commits. Any
+/// other outcome — either write accepted, or rejected for a different
+/// reason — refuses the sweep with [`StorageError::Unsupported`].
+async fn blob_gc_fence_probe(sql: &dyn SqlAccess) -> StorageResult<()> {
+    fn fence_rejection(result: Result<u64, StorageError>) -> Result<bool, String> {
+        match result {
+            Ok(_) => Ok(false),
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains(BLOB_GC_FENCE_TRIGGER_MESSAGE) {
+                    Ok(true)
+                } else {
+                    Err(text)
+                }
+            }
+        }
+    }
+
+    let op: AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                          VALUES ('__fence_probe__', ?1, 0)"
+                        .to_string(),
+                    params: vec![SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string())],
+                    label: Some("blob_gc_fence_probe_claim".to_string()),
+                })
+                .await?;
+
+            let insert_attempt = writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO entities \
+                          (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+                          VALUES ('__blob-gc-fence-probe-insert__', 'local', 'document', \
+                                  'fence probe', '[]', 0, 0, ?1)"
+                        .to_string(),
+                    params: vec![SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string())],
+                    label: Some("blob_gc_fence_probe_insert_arm".to_string()),
+                })
+                .await;
+            let insert_fenced = fence_rejection(insert_attempt);
+
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO entities \
+                          (id, namespace, kind, name, tags, created_at, updated_at) \
+                          VALUES ('__blob-gc-fence-probe-update__', 'local', 'document', \
+                                  'fence probe', '[]', 0, 0)"
+                        .to_string(),
+                    params: vec![],
+                    label: Some("blob_gc_fence_probe_update_arm_seed".to_string()),
+                })
+                .await?;
+            let update_attempt = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE entities SET content_ref = ?1 \
+                          WHERE id = '__blob-gc-fence-probe-update__'"
+                        .to_string(),
+                    params: vec![SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string())],
+                    label: Some("blob_gc_fence_probe_update_arm".to_string()),
+                })
+                .await;
+            let update_fenced = fence_rejection(update_attempt);
+
+            // Remove every probe row before this unit commits, including an
+            // entity row a dead fence let through.
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM entities WHERE id IN \
+                          ('__blob-gc-fence-probe-insert__', '__blob-gc-fence-probe-update__')"
+                        .to_string(),
+                    params: vec![],
+                    label: Some("blob_gc_fence_probe_cleanup_entities".to_string()),
+                })
+                .await?;
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM blob_gc_claims WHERE root_key = '__fence_probe__'"
+                        .to_string(),
+                    params: vec![],
+                    label: Some("blob_gc_fence_probe_cleanup_claim".to_string()),
+                })
+                .await?;
+
+            Ok(Box::new((insert_fenced, update_fenced)) as Box<dyn std::any::Any + Send>)
+        })
+    });
+    let outcome = sql.atomic_unit(op).await?;
+    let (insert_fenced, update_fenced) = *outcome
+        .downcast::<(Result<bool, String>, Result<bool, String>)>()
+        .map_err(|_| {
+            StorageError::Internal("blob GC fence probe returned an unexpected outcome type".into())
+        })?;
+    let arm_verdict = |arm: &str, fenced: Result<bool, String>| -> StorageResult<()> {
+        match fenced {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(StorageError::Unsupported {
+                capability: StorageCapability::Blob,
+                operation: "transactional_orphan_sweep".into(),
+                message: format!(
+                    "the V20 fencing triggers exist by name but did not reject a claimed \
+                     content_ref on the entity {arm} path; refusing unfenced deletion"
+                ),
+            }),
+            Err(other) => Err(StorageError::Unsupported {
+                capability: StorageCapability::Blob,
+                operation: "transactional_orphan_sweep".into(),
+                message: format!(
+                    "the blob GC fence probe could not verify the entity {arm} fence \
+                     (unexpected rejection: {other}); refusing unfenced deletion"
+                ),
+            }),
+        }
+    };
+    arm_verdict("INSERT", insert_fenced)?;
+    arm_verdict("UPDATE", update_fenced)
+}
+
 async fn validate_blob_gc_evidence(sql: &dyn SqlAccess) -> StorageResult<()> {
     // These full-table integrity probes are statement-scoped reads. Keep them
     // off the single writer; only their one-row result is materialized. The
@@ -1271,6 +1407,7 @@ impl BlobStore for FsBlobStore {
                     .into(),
             });
         }
+        blob_gc_fence_probe(sql).await?;
         validate_blob_gc_evidence(sql).await?;
         if !dry_run {
             loop {
@@ -2083,6 +2220,70 @@ mod tests {
             store.exists(&orphan).await.unwrap(),
             "a refused sweep must not have deleted anything"
         );
+    }
+
+    /// The gate must verify the fence FUNCTIONS, not that three names exist
+    /// in `sqlite_master`: triggers with the right names but no-op bodies
+    /// pass any name census while letting a claimed `content_ref` become
+    /// live during the released-writer deletion window. The fence probe must
+    /// catch them and refuse, deleting nothing and leaving no probe residue.
+    #[tokio::test]
+    async fn transactional_orphan_sweep_refuses_same_named_noop_fencing_triggers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+            writer
+                .conn_mut()
+                .execute_batch(
+                    "DROP TRIGGER entities_reject_claimed_blob_insert; \
+                     DROP TRIGGER entities_reject_claimed_blob_update; \
+                     CREATE TRIGGER entities_reject_claimed_blob_insert \
+                     BEFORE INSERT ON entities BEGIN SELECT 0; END; \
+                     CREATE TRIGGER entities_reject_claimed_blob_update \
+                     BEFORE UPDATE OF content_ref, deleted_at ON entities \
+                     BEGIN SELECT 0; END;",
+                )
+                .unwrap();
+        }
+
+        let root = dir.path().join("blobs");
+        let store = std::sync::Arc::new(
+            FsBlobStore::new(root.clone(), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let orphan = store.put(b"noop-trigger orphan".to_vec()).await.unwrap();
+
+        let sql = backend.sql();
+        let error = store
+            .transactional_orphan_sweep(sql.as_ref(), false)
+            .await
+            .expect_err("sweep must refuse when the fencing triggers are same-named no-ops");
+        assert!(
+            matches!(error, StorageError::Unsupported { .. }),
+            "expected StorageError::Unsupported, got {error:?}"
+        );
+        assert!(
+            store.exists(&orphan).await.unwrap(),
+            "a refused sweep must not have deleted anything"
+        );
+
+        // The probe must not leave residue behind either.
+        let reader = backend.pool().reader().unwrap();
+        let leftovers: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = '__fence_probe__') \
+                      + (SELECT COUNT(*) FROM entities WHERE id IN \
+                         ('__blob-gc-fence-probe-insert__', '__blob-gc-fence-probe-update__'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0, "fence probe rows must not survive the probe");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
