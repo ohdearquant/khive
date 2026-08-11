@@ -72,8 +72,11 @@ export function edgeDirectionMark(
   if (!entry.directed || (source.x === target.x && source.y === target.y)) {
     return null;
   }
-  const x = source.x + (target.x - source.x) * 0.82;
-  const y = source.y + (target.y - source.y) * 0.82;
+  // Keep the direction cue in the open edge span. Both graph canvases draw
+  // center-to-center beneath opaque node cards, so a cue near the target is
+  // hidden on short edges even though the SVG marker is present.
+  const x = source.x + (target.x - source.x) * 0.68;
+  const y = source.y + (target.y - source.y) * 0.68;
   const angle = Math.atan2(target.y - source.y, target.x - source.x) * 180 /
     Math.PI;
   return { x, y, transform: `rotate(${angle} ${x} ${y})` };
