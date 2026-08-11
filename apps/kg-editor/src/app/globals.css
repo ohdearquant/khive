@@ -196,6 +196,19 @@ kbd {
   width: 1px;
 }
 
+.data-state {
+  align-items: center;
+  display: flex;
+}
+
+.data-state-copy {
+  min-width: 0;
+}
+
+.data-state-action {
+  flex: 0 0 auto;
+}
+
 .ontology-kind-mark,
 .ontology-relation-mark,
 .ontology-derived-mark,

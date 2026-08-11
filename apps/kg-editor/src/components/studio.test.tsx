@@ -15,6 +15,19 @@ describe("KG Studio", () => {
     expect(screen.getByText(/not persisted/i)).toBeVisible();
   });
 
+  it("renders an actionable shared empty state for filtered graph changes", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+
+    await user.type(screen.getByPlaceholderText("Filter entities, edges, tiers…"), "nothing-matches-this");
+
+    const empty = container.querySelector<HTMLElement>('[data-state="empty"]');
+    expect(empty).toBeVisible();
+    expect(empty?.querySelectorAll("button")).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Clear filter" }));
+    expect(container.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+  });
+
   it("navigates from semantic diff to the affected graph", async () => {
     const user = userEvent.setup();
     const { container } = render(<Studio initialBundle={atlasReviewFixture} />);

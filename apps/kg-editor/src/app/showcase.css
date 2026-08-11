@@ -252,12 +252,14 @@
 
 .repo-state-card > svg { color: var(--repo-green); flex: 0 0 auto; height: 24px; width: 24px; }
 .repo-state-card.loading > svg { animation: repo-spin 1s linear infinite; }
-.repo-state-card.warning > svg { color: var(--amber); }
-.repo-state-card.miss > svg { color: var(--repo-violet); }
+.repo-state-card.unavailable > svg { color: var(--amber); }
+.repo-state-card.error > svg { color: var(--red); }
+.repo-state-card.empty > svg { color: var(--repo-violet); }
 .repo-state-card strong,
 .repo-state-card span { display: block; }
 .repo-state-card strong { font-size: 14px; }
 .repo-state-card span { color: var(--repo-muted); font-size: 11px; line-height: 1.5; margin-top: 4px; overflow-wrap: anywhere; }
+.repo-state-card .data-state-action { margin-left: auto; }
 
 @keyframes repo-spin { to { transform: rotate(360deg); } }
 

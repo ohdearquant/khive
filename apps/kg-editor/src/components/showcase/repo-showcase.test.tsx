@@ -28,6 +28,21 @@ describe("repository showcase", () => {
     }
   });
 
+  it("uses the shared unavailable state and exposes the capability reason", async () => {
+    const bundle = structuredClone(golden());
+    const user = userEvent.setup();
+    const view = bundle.capability.views.scorecard;
+    view.status = "unavailable";
+    view.unavailable_reason = "scorecard evidence was outside this export";
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="scorecard"]')!);
+
+    const unavailable = container.querySelector<HTMLElement>('[data-state="unavailable"]');
+    expect(unavailable).toBeVisible();
+    expect(unavailable).toHaveTextContent(view.unavailable_reason);
+  });
+
   it("uses the shared ontology legend and marks exporter-derived edges geometrically", () => {
     const { container } = render(<RepoShowcase bundle={golden()} />);
 

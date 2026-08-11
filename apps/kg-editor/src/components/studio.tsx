@@ -47,6 +47,7 @@ import {
   OntologyLegend,
   RelationMark,
 } from "@/components/ontology-mark";
+import { DataState } from "@/components/data-state";
 import { settleGraphLayout } from "@/lib/graph-layout";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import {
@@ -406,7 +407,17 @@ function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; sele
   );
 }
 
-function ChangesView({ bundle, query, onQuery }: { bundle: ReviewBundle; query: string; onQuery: (value: string) => void }) {
+function ChangesView({
+  bundle,
+  query,
+  onQuery,
+  onImport,
+}: {
+  bundle: ReviewBundle;
+  query: string;
+  onQuery: (value: string) => void;
+  onImport: () => void;
+}) {
   const filtered = bundle.changes.items.filter((change) => matchesReviewQuery(change, query));
   const grouped = groupChanges(filtered);
   const [selectedId, setSelectedId] = useState(bundle.changes.items.at(0)?.id ?? "");
@@ -440,7 +451,15 @@ function ChangesView({ bundle, query, onQuery }: { bundle: ReviewBundle; query: 
           />
         ))}
         {filtered.length === 0 && (
-          <div className="empty-state"><Search aria-hidden="true" /><strong>No changes match “{query}”</strong><span>Try a relation, entity kind, or tier.</span></div>
+          <DataState
+            className="empty-state"
+            state="empty"
+            title={query ? `No graph changes match “${query}”` : "No graph changes in this review bundle"}
+            message="Graph changes matching the selected relation, entity kind, or tier belong here."
+            action={query
+              ? { label: "Clear filter", onClick: () => onQuery("") }
+              : { label: "Import another review bundle", onClick: onImport }}
+          />
         )}
       </div>
       <PageNotice page={bundle.changes} label="Graph changes" />
@@ -861,7 +880,19 @@ function ReviewRail({
   );
 }
 
-function ViewSurface({ activeView, bundle, query, onQuery }: { activeView: View; bundle: ReviewBundle; query: string; onQuery: (value: string) => void }) {
+function ViewSurface({
+  activeView,
+  bundle,
+  query,
+  onQuery,
+  onImport,
+}: {
+  activeView: View;
+  bundle: ReviewBundle;
+  query: string;
+  onQuery: (value: string) => void;
+  onImport: () => void;
+}) {
   const unavailable =
     (activeView === "changes" && bundle.enrichment_status.semantic_changes === "unavailable") ||
     (activeView === "graph" && bundle.enrichment_status.affected_graph === "unavailable") ||
@@ -870,11 +901,12 @@ function ViewSurface({ activeView, bundle, query, onQuery }: { activeView: View;
     (activeView === "activity" && bundle.enrichment_status.activity === "unavailable");
   if (unavailable) {
     return (
-      <div className="unavailable-surface">
-        <Box aria-hidden="true" />
-        <strong>{viewLabels[activeView]} unavailable</strong>
-        <span>This review bundle did not claim or invent that enrichment.</span>
-      </div>
+      <DataState
+        className="unavailable-surface"
+        state="unavailable"
+        title={`${viewLabels[activeView]} unavailable`}
+        message="This review bundle did not claim or invent that enrichment."
+      />
     );
   }
   if (activeView === "graph") return <GraphView bundle={bundle} />;
@@ -882,7 +914,7 @@ function ViewSurface({ activeView, bundle, query, onQuery }: { activeView: View;
   if (activeView === "provenance") return <ProvenanceView bundle={bundle} />;
   if (activeView === "retrieval") return <RetrievalView bundle={bundle} />;
   if (activeView === "activity") return <ActivityView bundle={bundle} />;
-  return <ChangesView bundle={bundle} query={query} onQuery={onQuery} />;
+  return <ChangesView bundle={bundle} query={query} onQuery={onQuery} onImport={onImport} />;
 }
 
 function OperationOntologyMark({
@@ -1145,6 +1177,7 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
                 bundle={bundle}
                 query={query}
                 onQuery={setQuery}
+                onImport={() => fileInput.current?.click()}
               />
             </section>
             <ReviewRail

@@ -24,6 +24,7 @@ import {
 } from "@/icons";
 import { useMemo, useState } from "react";
 
+import { DataState } from "@/components/data-state";
 import {
   DerivedEdgeMark,
   edgeDirectionMark,
@@ -182,12 +183,13 @@ function ViewHeader({ capability }: { capability: ViewCapability }) {
 
 function UnavailableView({ capability, labels }: { capability: ViewCapability; labels: Labels }) {
   return (
-    <div className="repo-empty" role="status">
-      <AlertTriangle aria-hidden="true" />
-      <strong>{labels.unavailable}</strong>
-      <span>{capability.unavailable_reason}</span>
-      <code>{capability.granularity} · {capability.join}</code>
-    </div>
+    <DataState
+      className="repo-empty"
+      state="unavailable"
+      title={`${capability.label} ${labels.unavailable.toLocaleLowerCase()}`}
+      message={capability.unavailable_reason ?? "This bundle does not claim data for the view."}
+      detail={<code>{capability.granularity} · {capability.join}</code>}
+    />
   );
 }
 
