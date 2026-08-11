@@ -1063,6 +1063,16 @@ mod windows_impl {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+    #[cfg(test)]
+    std::thread_local! {
+        static OPEN_DIR_HANDLE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_dir_handle_call_count() -> usize {
+        OPEN_DIR_HANDLE_CALLS.with(std::cell::Cell::get)
+    }
+
     fn to_wide_nul(path: &Path) -> io::Result<Vec<u16>> {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         if wide.contains(&0) {
@@ -1324,6 +1334,9 @@ mod windows_impl {
     }
 
     fn open_dir_handle(dir: &Path) -> io::Result<fs::File> {
+        #[cfg(test)]
+        OPEN_DIR_HANDLE_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         lexical_prefilter(dir)?;
         let expected = fs::canonicalize(dir)?;
         let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
@@ -1463,9 +1476,9 @@ mod windows_impl {
         Ok(())
     }
 
-    pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
+    fn open_or_create_dir_handle(dir: &Path) -> io::Result<fs::File> {
         match open_dir_handle(dir) {
-            Ok(_) => Ok(()),
+            Ok(handle) => Ok(handle),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 ensure_ancestors_not_reparse(dir)?;
                 if let Err(create_error) = create_owner_only_dir(dir) {
@@ -1473,10 +1486,14 @@ mod windows_impl {
                         return Err(create_error);
                     }
                 }
-                open_dir_handle(dir).map(|_| ())
+                open_dir_handle(dir)
             }
             Err(error) => Err(error),
         }
+    }
+
+    pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
+        open_or_create_dir_handle(dir).map(|_| ())
     }
 
     fn open_relative(
@@ -1633,7 +1650,7 @@ mod windows_impl {
         tmp_name: &str,
         body: &[u8],
     ) -> io::Result<()> {
-        let dir_handle = open_dir_handle(dir)?;
+        let dir_handle = open_or_create_dir_handle(dir)?;
         remove_relative_if_exists(&dir_handle, tmp_name)?;
         let mut tmp_file = open_relative(
             &dir_handle,
@@ -2558,7 +2575,6 @@ pub fn write_heartbeat(dir: &Path, heartbeat: &WalpinHeartbeat) -> io::Result<()
     }
     #[cfg(windows)]
     {
-        windows_impl::ensure_sidecar_dir(dir)?;
         windows_impl::write_atomic(dir, &target, &tmp, &body)
     }
 }
@@ -2640,7 +2656,6 @@ pub fn write_beacon(dir: &Path, beacon: &WalpinBeacon) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        windows_impl::ensure_sidecar_dir(dir)?;
         windows_impl::write_atomic(dir, &target, &tmp, &body)
     }
 }
@@ -4842,6 +4857,26 @@ mod tests {
 
             remove_heartbeat(&dir, pid).expect("remove must succeed");
             assert!(!path.exists());
+        }
+
+        #[test]
+        fn repeated_heartbeat_write_validates_sidecar_root_once() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let first = heartbeat(pid);
+            write_heartbeat(&dir, &first).expect("initial write must create the sidecar");
+
+            let before = super::super::windows_impl::open_dir_handle_call_count();
+            let mut replacement = first;
+            replacement.oldest_tx_label = Some("replacement".to_string());
+            write_heartbeat(&dir, &replacement).expect("replacement write must succeed");
+            let validations = super::super::windows_impl::open_dir_handle_call_count() - before;
+
+            assert_eq!(
+                validations, 1,
+                "an existing sidecar root must be fully validated exactly once per record write"
+            );
         }
 
         #[test]
