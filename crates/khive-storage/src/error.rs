@@ -315,6 +315,17 @@ mod tests {
     }
 
     #[test]
+    fn writer_task_busy_is_retryable_without_claiming_queue_rejection() {
+        let error = StorageError::WriterTaskBusy { timeout_ms: 175 };
+        assert!(error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "writer task could not begin within 175ms because SQLite remained busy; request was not executed"
+        );
+        assert_eq!(error.capability(), None);
+    }
+
+    #[test]
     fn writer_task_terminated_is_uncapability_scoped_and_not_retryable() {
         for request_state in [
             WriterTaskRequestState::NotStarted,

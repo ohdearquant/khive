@@ -1221,9 +1221,9 @@ mod tests {
         assert!(
             matches!(
                 &reply,
-                Err(StorageError::Pool { operation, .. }) if operation == "writer_task_begin"
+                Err(StorageError::WriterTaskBusy { timeout_ms }) if *timeout_ms == 150
             ),
-            "expected writer_task_begin failure, got {reply:?}"
+            "expected typed retryable writer-task contention, got {reply:?}"
         );
         assert!(!op_ran.load(Ordering::SeqCst));
         assert!(
@@ -1283,10 +1283,9 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(StorageError::Pool { operation, .. }) if operation == "writer_task_begin"
+                Err(StorageError::WriterTaskBusy { timeout_ms }) if *timeout_ms == 150
             ),
-            "expected a writer_task_begin Pool error on BEGIN IMMEDIATE \
-             failure, got {result:?}"
+            "expected a typed retryable error on contended BEGIN IMMEDIATE, got {result:?}"
         );
         assert!(
             !op_ran.load(Ordering::SeqCst),

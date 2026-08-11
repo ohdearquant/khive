@@ -596,6 +596,22 @@ mod channel_ingest_failure_class_tests {
             ChannelIngestFailureClass::Retryable { reason: "Storage" }
         );
 
+        let begin_busy = RuntimeError::Storage(
+            khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
+        );
+        let context = begin_busy
+            .retryable_failure_context()
+            .expect("contended BEGIN must remain typed and retryable");
+        assert_eq!(context.stage, "writer_task_begin_busy");
+        assert_eq!(context.timeout, Duration::from_millis(175));
+        assert_eq!(context.operation.as_deref(), Some("writer_task_begin"));
+        assert_eq!(context.scope, None);
+        assert_eq!(context.retry_after_ms, None);
+        assert_eq!(
+            begin_busy.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Retryable { reason: "Storage" }
+        );
+
         let unknown = RuntimeError::InvalidInput(
             "write blocked: SecretDetected text must not affect classification".to_string(),
         );
