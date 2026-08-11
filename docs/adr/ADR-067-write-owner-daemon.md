@@ -97,7 +97,10 @@ open standalone connections and call `BEGIN IMMEDIATE` directly, blocking in `bu
 (30 seconds, `pool.rs:29`). Under sustained load from N agents, both paths degrade
 simultaneously.
 
-**WAL growth amplifier** (`pool.rs:15-16`):
+**WAL growth amplifier** (`pool.rs:15-16` as of this ADR's writing; the autocheckpoint
+constant and its later configurable form were both since removed — checkpoint ownership is
+now decided by the ADR-091 Amendment 10 ownership claim, with a bounded fallback only for
+pools no checkpoint task claims):
 
 ```rust
 const WAL_AUTOCHECKPOINT_PAGES: &str = "4000";   // ~16 MB threshold
@@ -525,6 +528,9 @@ Component A's `WriterTask` being the stable owner of write connections.
 Expose `WAL_AUTOCHECKPOINT_PAGES`, `JOURNAL_SIZE_LIMIT_BYTES`, and `busy_timeout` as
 configurable parameters and add the periodic passive checkpoint task. This reduces wedge
 probability under moderate load by keeping the WAL shorter and checkpointing more aggressively.
+(The autocheckpoint parameter described here was later removed entirely: per ADR-091
+Amendment 10, the effective value is decided by the checkpoint-ownership claim and is not
+configurable.)
 
 Rejected as the sole mitigation because it does not eliminate the root cause: standalone
 connections (graph, text, event, SqlBridge) still compete via `busy_timeout` waits, and pool

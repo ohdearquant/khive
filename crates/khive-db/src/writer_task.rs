@@ -1360,6 +1360,53 @@ mod tests {
         assert_eq!(counters.timeouts, 0);
     }
 
+    #[tokio::test]
+    async fn writer_task_connection_follows_checkpoint_ownership_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_autocheckpoint.db");
+        let pool = file_pool(&path);
+        // The pool-registered handle (not a directly spawned side task):
+        // `propagate_checkpoint_claim_to_writer_task` reaches exactly this
+        // task's connection.
+        let handle = pool
+            .writer_task_handle()
+            .expect("writer task should spawn")
+            .expect("file-backed pool resolves the write queue on");
+
+        let read_pages = |handle: &WriterTaskHandle| {
+            let handle = handle.clone();
+            async move {
+                handle
+                    .send_top_level(|conn| {
+                        conn.pragma_query_value(None, "wal_autocheckpoint", |row| {
+                            row.get::<_, u32>(0)
+                        })
+                        .map_err(|e| StorageError::Pool {
+                            operation: "test_wal_autocheckpoint".into(),
+                            message: e.to_string(),
+                        })
+                    })
+                    .await
+                    .expect("query writer-task connection pragma")
+            }
+        };
+
+        // Spawned before any claim: the task's long-lived connection keeps
+        // the bounded fallback.
+        assert_eq!(
+            read_pages(&handle).await,
+            crate::pool::FALLBACK_WAL_AUTOCHECKPOINT_PAGES
+        );
+
+        // After the claim propagates, the same connection is flipped to the
+        // dedicated-owner setting without reopening.
+        pool.claim_checkpoint_ownership().expect("claim ownership");
+        pool.propagate_checkpoint_claim_to_writer_task()
+            .await
+            .expect("propagate claim to the running writer task");
+        assert_eq!(read_pages(&handle).await, 0);
+    }
+
     #[test]
     fn spawn_fails_on_in_memory_pool() {
         // In-memory pools have no standalone-connection support

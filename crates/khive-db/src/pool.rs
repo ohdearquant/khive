@@ -22,9 +22,17 @@ const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
 const DEFAULT_READER_CAP: usize = 8;
 
-const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
+
+/// Bounded WAL autocheckpoint applied to writer-capable connections while no
+/// dedicated checkpoint owner has claimed the pool (4,000 pages ≈ 16 MiB at
+/// SQLite's default 4 KiB page size — SQLite's historic behaviour for this
+/// pool). Not a tuning parameter: there is no config field or environment
+/// override, and the only way to change the effective value is an actual
+/// ownership claim ([`ConnectionPool::claim_checkpoint_ownership`]), which a
+/// runtime may make only when it really runs the scheduled checkpoint task.
+pub(crate) const FALLBACK_WAL_AUTOCHECKPOINT_PAGES: u32 = 4_000;
 
 fn deny_retired_writer(_context: AuthContext<'_>) -> Authorization {
     Authorization::Deny
@@ -49,13 +57,6 @@ pub struct PoolConfig {
     ///
     /// Overridable via `KHIVE_CHECKOUT_TIMEOUT_SECS`.
     pub checkout_timeout: Duration,
-    /// Number of WAL pages that triggers an automatic checkpoint.
-    ///
-    /// Maps to `PRAGMA wal_autocheckpoint`. The default (4000 pages, ~16 MiB
-    /// at SQLite's default 4 KiB page size) matches the pre-config behaviour.
-    ///
-    /// Overridable via `KHIVE_WAL_AUTOCHECKPOINT_PAGES`.
-    pub wal_autocheckpoint_pages: u32,
     /// Maximum WAL journal size in bytes before SQLite resets the WAL.
     ///
     /// Maps to `PRAGMA journal_size_limit`. Default: 64 MiB.
@@ -154,10 +155,6 @@ impl Default for PoolConfig {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(5),
             ),
-            wal_autocheckpoint_pages: std::env::var("KHIVE_WAL_AUTOCHECKPOINT_PAGES")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(DEFAULT_WAL_AUTOCHECKPOINT_PAGES),
             journal_size_limit_bytes: std::env::var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok())
@@ -307,6 +304,15 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    /// Whether a dedicated checkpoint owner (the ADR-091 scheduled task) has
+    /// claimed routine WAL reclamation for this pool. Until claimed, every
+    /// writer-capable connection keeps a bounded SQLite autocheckpoint
+    /// ([`FALLBACK_WAL_AUTOCHECKPOINT_PAGES`]) so a writable pool without a
+    /// checkpoint task cannot grow its WAL without bound. After
+    /// [`Self::claim_checkpoint_ownership`], writer-capable connections open
+    /// with `wal_autocheckpoint = 0` and routine checkpoint I/O stays off
+    /// application commit paths.
+    checkpoint_owner_claimed: AtomicBool,
     /// Fail-closed guard for the legacy pool-mutex writer. A transaction
     /// owner retires this connection after a body panic or when it cannot
     /// prove that finalization restored autocommit mode; subsequent checkouts
@@ -583,6 +589,7 @@ impl ConnectionPool {
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            checkpoint_owner_claimed: AtomicBool::new(false),
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             readers,
@@ -1057,9 +1064,77 @@ impl ConnectionPool {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(self.config.busy_timeout)?;
+        conn.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            self.effective_wal_autocheckpoint_pages(),
+        )?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)
+    }
+
+    /// Effective `PRAGMA wal_autocheckpoint` for a writer-capable connection
+    /// opened right now: `0` once a dedicated checkpoint owner has claimed
+    /// the pool, the bounded fallback otherwise.
+    pub(crate) fn effective_wal_autocheckpoint_pages(&self) -> u32 {
+        if self.checkpoint_owner_claimed.load(Ordering::Acquire) {
+            0
+        } else {
+            FALLBACK_WAL_AUTOCHECKPOINT_PAGES
+        }
+    }
+
+    /// Claim routine WAL-checkpoint ownership for this pool.
+    ///
+    /// Called by the scheduled checkpoint task at startup — the one caller
+    /// that actually replaces SQLite's per-commit autocheckpoint with
+    /// dedicated PASSIVE checkpointing (ADR-091 Amendment 10). The claim
+    /// makes every subsequently opened writer-capable connection set
+    /// `PRAGMA wal_autocheckpoint = 0`, and re-applies that pragma on the
+    /// already-open pooled writer under the writer mutex. A writer task
+    /// spawned before the claim keeps its own long-lived connection;
+    /// [`Self::propagate_checkpoint_claim_to_writer_task`] reaches that one.
+    ///
+    /// Without a claim, writer-capable connections keep the bounded
+    /// `FALLBACK_WAL_AUTOCHECKPOINT_PAGES` threshold, so a writable pool
+    /// in a process that never runs the checkpoint task (embedded runtimes,
+    /// one-shot CLI executions) retains SQLite's own WAL reclamation instead
+    /// of growing its WAL without bound.
+    ///
+    /// Read-only pools record the claim but have no writer-capable
+    /// connections to reconfigure.
+    pub fn claim_checkpoint_ownership(&self) -> Result<(), SqliteError> {
+        self.checkpoint_owner_claimed.store(true, Ordering::Release);
+        if self.config.read_only {
+            return Ok(());
+        }
+        let writer = self.writer()?;
+        writer.conn().pragma_update(None, "wal_autocheckpoint", 0)?;
+        Ok(())
+    }
+
+    /// Flip an already-running writer task's long-lived connection to the
+    /// claimed-owner setting.
+    ///
+    /// Connections opened after [`Self::claim_checkpoint_ownership`] inherit
+    /// `wal_autocheckpoint = 0` at open; only a writer task spawned before
+    /// the claim still holds a connection on the bounded fallback. Returns
+    /// `Ok(())` without side effects when the pool's write queue is
+    /// disabled.
+    pub async fn propagate_checkpoint_claim_to_writer_task(&self) -> Result<(), StorageError> {
+        let Some(handle) = self.writer_task_handle()? else {
+            return Ok(());
+        };
+        handle
+            .send_top_level(|conn| {
+                conn.pragma_update(None, "wal_autocheckpoint", 0)
+                    .map_err(|e| StorageError::Pool {
+                        operation: "claim_checkpoint_ownership".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
     }
 
     /// Open a standalone read-only connection to the same file-backed database.
@@ -1476,11 +1551,19 @@ fn configure_writer_connection(
     conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
     conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
+    // The pool's startup writer always opens before any checkpoint owner can
+    // claim the pool, so it starts on the bounded fallback;
+    // `claim_checkpoint_ownership` re-applies the pragma on this connection
+    // under the writer mutex when a dedicated owner attaches.
+    conn.pragma_update(
+        None,
+        "wal_autocheckpoint",
+        FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+    )?;
 
     let wal_enabled = wants_wal && current_journal_mode(conn)?.eq_ignore_ascii_case("wal");
 
     if wal_enabled {
-        conn.pragma_update(None, "wal_autocheckpoint", config.wal_autocheckpoint_pages)?;
         conn.pragma_update(None, "journal_size_limit", config.journal_size_limit_bytes)?;
     }
 
@@ -1670,6 +1753,11 @@ mod tests {
             std::env::remove_var(var);
         }
         guard
+    }
+
+    fn wal_autocheckpoint_pages(conn: &Connection) -> u32 {
+        conn.pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .expect("read PRAGMA wal_autocheckpoint")
     }
 
     #[test]
@@ -2177,10 +2265,6 @@ mod tests {
         let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
         assert_eq!(
-            cfg.wal_autocheckpoint_pages,
-            DEFAULT_WAL_AUTOCHECKPOINT_PAGES
-        );
-        assert_eq!(
             cfg.journal_size_limit_bytes,
             DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
         );
@@ -2190,11 +2274,32 @@ mod tests {
 
     #[test]
     #[serial]
-    fn pool_config_env_override_wal_autocheckpoint() {
+    fn legacy_env_cannot_change_wal_autocheckpoint() {
+        let _pool_env = clear_pool_env();
         std::env::set_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES", "8000");
-        let cfg = PoolConfig::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_autocheckpoint_env.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            ..PoolConfig::default()
+        })
+        .expect("pool open");
+        {
+            let writer = pool.writer().expect("writer");
+            assert_eq!(
+                wal_autocheckpoint_pages(writer.conn()),
+                FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+                "the removed env override must not change the unclaimed fallback"
+            );
+        }
+        pool.claim_checkpoint_ownership().expect("claim ownership");
+        let writer = pool.writer().expect("writer after claim");
+        assert_eq!(
+            wal_autocheckpoint_pages(writer.conn()),
+            0,
+            "the removed env override must not change the claimed-owner setting"
+        );
         std::env::remove_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES");
-        assert_eq!(cfg.wal_autocheckpoint_pages, 8000);
     }
 
     #[test]
@@ -2362,16 +2467,10 @@ mod tests {
 
     #[test]
     #[serial]
-    fn pool_config_env_invalid_falls_back_to_default() {
-        std::env::set_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES", "not_a_number");
+    fn pool_config_invalid_journal_size_limit_falls_back_to_default() {
         std::env::set_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES", "");
         let cfg = PoolConfig::default();
-        std::env::remove_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES");
         std::env::remove_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES");
-        assert_eq!(
-            cfg.wal_autocheckpoint_pages,
-            DEFAULT_WAL_AUTOCHECKPOINT_PAGES
-        );
         assert_eq!(
             cfg.journal_size_limit_bytes,
             DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
@@ -2389,6 +2488,160 @@ mod tests {
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         assert!(path.exists());
         assert!(pool.max_readers() > 0);
+    }
+
+    #[test]
+    fn writer_connections_follow_checkpoint_ownership_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_autocheckpoint.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("pool open");
+
+        // Unclaimed: every writer-capable connection keeps the bounded
+        // fallback, so a pool without a checkpoint task retains SQLite's own
+        // WAL reclamation.
+        {
+            let writer = pool.writer().expect("pooled writer");
+            assert_eq!(
+                wal_autocheckpoint_pages(writer.conn()),
+                FALLBACK_WAL_AUTOCHECKPOINT_PAGES
+            );
+        }
+        let standalone = pool
+            .open_standalone_writer()
+            .expect("standalone writer opened before any claim");
+        assert_eq!(
+            wal_autocheckpoint_pages(&standalone),
+            FALLBACK_WAL_AUTOCHECKPOINT_PAGES
+        );
+        drop(standalone);
+
+        // Claimed: the already-open pooled writer is re-configured under the
+        // writer mutex, and every later writer-capable open disables the
+        // autocheckpoint entirely.
+        pool.claim_checkpoint_ownership().expect("claim ownership");
+        {
+            let writer = pool.writer().expect("pooled writer after claim");
+            assert_eq!(wal_autocheckpoint_pages(writer.conn()), 0);
+        }
+        let claimed_standalone = pool
+            .open_standalone_writer()
+            .expect("standalone writer opened after the claim");
+        assert_eq!(wal_autocheckpoint_pages(&claimed_standalone), 0);
+        drop(claimed_standalone);
+
+        let later_infrastructure = pool
+            .open_standalone_writer_untracked()
+            .expect("later infrastructure writer");
+        assert_eq!(wal_autocheckpoint_pages(&later_infrastructure), 0);
+
+        let memory_pool = ConnectionPool::new(PoolConfig {
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool open");
+        let memory_writer = memory_pool.writer().expect("in-memory writer");
+        assert_eq!(
+            wal_autocheckpoint_pages(memory_writer.conn()),
+            FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+            "an unclaimed in-memory pool keeps the bounded fallback"
+        );
+    }
+
+    #[test]
+    fn threshold_crossing_commits_do_not_run_an_implicit_checkpoint_once_claimed() {
+        const FORMER_AUTOCHECKPOINT_THRESHOLD_PAGES: i64 = FALLBACK_WAL_AUTOCHECKPOINT_PAGES as i64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_implicit_checkpoint.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("pool open");
+        pool.claim_checkpoint_ownership()
+            .expect("claim ownership for the dedicated-owner posture");
+        let writer = pool.writer().expect("pooled writer");
+        writer
+            .execute_batch("CREATE TABLE blobs (value BLOB NOT NULL)")
+            .expect("create fixture table");
+
+        let page_size: i64 = writer
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .expect("read page size");
+        let payload_bytes = page_size * 32;
+        for _ in 0..160 {
+            writer
+                .execute(
+                    "INSERT INTO blobs (value) VALUES (zeroblob(?1))",
+                    [payload_bytes],
+                )
+                .expect("autocommit fixture row");
+        }
+
+        let log_frames: i64 = writer
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
+            .expect("observe WAL frame count");
+        assert!(
+            log_frames > FORMER_AUTOCHECKPOINT_THRESHOLD_PAGES,
+            "the commit sequence must retain more than the former automatic threshold; \
+             observed {log_frames} frames"
+        );
+    }
+
+    /// The other half of the ownership model: a writable pool that no
+    /// checkpoint task ever claims must retain SQLite's own bounded WAL
+    /// reclamation. The same commit sequence that retains >4,000 frames under
+    /// a claimed owner must NOT accumulate them here — an implicit
+    /// autocheckpoint fires on the threshold-crossing commit and drains the
+    /// WAL, which is the regression guard against unbounded WAL growth (and
+    /// eventual disk exhaustion) on embedded / one-shot writable pools.
+    #[test]
+    fn unclaimed_pool_retains_bounded_autocheckpoint_reclamation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded_fallback_reclamation.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("pool open");
+        let writer = pool.writer().expect("pooled writer");
+        writer
+            .execute_batch("CREATE TABLE blobs (value BLOB NOT NULL)")
+            .expect("create fixture table");
+
+        let page_size: i64 = writer
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .expect("read page size");
+        let payload_bytes = page_size * 32;
+        for _ in 0..160 {
+            writer
+                .execute(
+                    "INSERT INTO blobs (value) VALUES (zeroblob(?1))",
+                    [payload_bytes],
+                )
+                .expect("autocommit fixture row");
+        }
+
+        // No PASSIVE pass here — read the frame count via wal_checkpoint's
+        // log column only after the fixture, exactly as the claimed-owner
+        // test does. With the bounded fallback live, the autocheckpoint that
+        // fired on a threshold-crossing commit already drained the WAL, so
+        // far fewer than the threshold's frames remain.
+        let log_frames: i64 = writer
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
+            .expect("observe WAL frame count");
+        assert!(
+            log_frames < FALLBACK_WAL_AUTOCHECKPOINT_PAGES as i64,
+            "an unclaimed pool must reclaim WAL frames via the bounded autocheckpoint; \
+             observed {log_frames} retained frames"
+        );
     }
 
     #[tokio::test]
