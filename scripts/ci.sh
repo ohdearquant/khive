@@ -39,6 +39,9 @@ phase_lint() {
 
     echo "=== Local Build Artifact Verification Tests ==="
     python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"
+
+    echo "=== Writer Census Contract Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_writer_census.py"
 }
 
 phase_no_stubs_scan() {
