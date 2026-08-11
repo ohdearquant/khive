@@ -1,0 +1,251 @@
+@theme inline {
+  --color-canvas: var(--khive-color-surface-base);
+  --color-surface: var(--khive-color-surface-raised);
+  --color-surface-overlay: var(--khive-color-surface-overlay);
+  --color-line: var(--khive-color-border);
+  --color-line-strong: var(--khive-color-border-strong);
+  --color-ink: var(--khive-color-text-primary);
+  --color-ink-secondary: var(--khive-color-text-secondary);
+  --color-ink-muted: var(--khive-color-text-muted);
+  --color-accent: var(--khive-color-accent);
+  --color-accent-strong: var(--khive-color-accent-strong);
+  --color-accent-soft: var(--khive-color-accent-soft);
+  --color-success: var(--khive-color-success);
+  --color-warning: var(--khive-color-warning);
+  --color-danger: var(--khive-color-danger);
+  --color-info: var(--khive-color-info);
+  --font-sans: var(--khive-font-ui);
+  --font-mono: var(--khive-font-mono);
+  --text-2xs: var(--khive-type-2xs);
+  --text-xs: var(--khive-type-xs);
+  --text-sm: var(--khive-type-sm);
+  --text-md: var(--khive-type-md);
+  --text-base: var(--khive-type-base);
+  --text-lg: var(--khive-type-lg);
+  --text-xl: var(--khive-type-xl);
+  --text-2xl: var(--khive-type-2xl);
+  --text-3xl: var(--khive-type-3xl);
+  --text-title: var(--khive-type-title);
+  --text-lead: var(--khive-type-lead);
+  --text-display: var(--khive-type-display);
+  --spacing-ui-1: var(--khive-space-1);
+  --spacing-ui-2: var(--khive-space-2);
+  --spacing-ui-3: var(--khive-space-3);
+  --spacing-ui-4: var(--khive-space-4);
+  --spacing-ui-5: var(--khive-space-5);
+  --spacing-ui-6: var(--khive-space-6);
+  --spacing-ui-7: var(--khive-space-7);
+  --spacing-ui-8: var(--khive-space-8);
+  --radius-ui-xs: var(--khive-radius-xs);
+  --radius-ui-sm: var(--khive-radius-sm);
+  --radius-ui-md: var(--khive-radius-md);
+  --radius-ui-lg: var(--khive-radius-lg);
+  --radius-ui-xl: var(--khive-radius-xl);
+  --radius-ui-pill: var(--khive-radius-pill);
+}
+
+:root {
+  --khive-font-ui:
+    Inter,
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  --khive-font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  --khive-type-micro: 0.1875rem;
+  --khive-type-icon-small: 0.3125rem;
+  --khive-type-icon-scale: 1.15em;
+  --khive-type-tiny: 0.4375rem;
+  --khive-type-2xs: 0.5rem;
+  --khive-type-xs: 0.5625rem;
+  --khive-type-sm: 0.625rem;
+  --khive-type-md: 0.6875rem;
+  --khive-type-base: 0.75rem;
+  --khive-type-lg: 0.875rem;
+  --khive-type-xl: 1rem;
+  --khive-type-2xl: 1.125rem;
+  --khive-type-3xl: 1.5rem;
+  --khive-type-title: clamp(1.625rem, 3vw, 2.375rem);
+  --khive-type-lead: clamp(0.875rem, 1.4vw, 1.0625rem);
+  --khive-type-display: clamp(2.375rem, 5.4vw, 4.25rem);
+
+  --khive-space-1: 0.125rem;
+  --khive-space-2: 0.25rem;
+  --khive-space-3: 0.375rem;
+  --khive-space-4: 0.5rem;
+  --khive-space-5: 0.75rem;
+  --khive-space-6: 1rem;
+  --khive-space-7: 1.5rem;
+  --khive-space-8: 2rem;
+
+  --khive-radius-xs: 0.25rem;
+  --khive-radius-sm: 0.375rem;
+  --khive-radius-md: 0.5rem;
+  --khive-radius-lg: 0.75rem;
+  --khive-radius-xl: 1rem;
+  --khive-radius-pill: 999px;
+
+  --khive-color-transparent: transparent;
+  --khive-shadow-none: none;
+
+  --ink: var(--khive-color-text-primary);
+  --ink-soft: var(--khive-color-text-secondary);
+  --ink-faint: var(--khive-color-text-muted);
+  --canvas: var(--khive-color-surface-base);
+  --surface: var(--khive-color-surface-raised);
+  --surface-strong: var(--khive-color-surface-overlay);
+  --line: var(--khive-color-border);
+  --line-strong: var(--khive-color-border-strong);
+  --green: var(--khive-color-accent);
+  --green-dark: var(--khive-color-accent-strong);
+  --green-pale: var(--khive-color-accent-soft);
+  --purple: var(--khive-color-ontology-derived);
+  --purple-pale: var(--khive-color-ontology-derived-soft);
+  --blue: var(--khive-color-info);
+  --blue-pale: var(--khive-color-info-soft);
+  --amber: var(--khive-color-warning);
+  --amber-pale: var(--khive-color-warning-soft);
+  --red: var(--khive-color-danger);
+  --red-pale: var(--khive-color-danger-soft);
+  --shadow: var(--khive-shadow-none);
+  --shadow-small: var(--khive-shadow-none);
+  --radius: var(--khive-radius-lg);
+  --selection-ring: var(--khive-color-border-strong);
+
+  --space-1: 0.125rem;
+  --space-2: 0.25rem;
+  --space-3: 0.375rem;
+  --space-4: 0.5rem;
+  --space-5: 0.625rem;
+  --space-6: 0.875rem;
+
+  --ontology-stroke-thin: 1.3px;
+  --ontology-stroke-bold: 1.8px;
+  --ontology-stroke-epistemic: 1.6px;
+  --ontology-glyph-stroke: 0.7px;
+  --ontology-glyph-stroke-lg: 0.8px;
+
+  --repo-navy: var(--khive-color-text-primary);
+  --repo-muted: var(--khive-color-text-secondary);
+  --repo-border: var(--khive-color-border);
+  --repo-paper: var(--khive-color-surface-raised);
+  --repo-green: var(--khive-color-accent);
+  --repo-violet: var(--khive-color-ontology-derived);
+
+  --ontology-concept: var(--khive-color-ontology-concept);
+  --ontology-document: var(--khive-color-ontology-document);
+  --ontology-dataset: var(--khive-color-ontology-dataset);
+  --ontology-project: var(--khive-color-ontology-project);
+  --ontology-person: var(--khive-color-ontology-person);
+  --ontology-org: var(--khive-color-ontology-org);
+  --ontology-artifact: var(--khive-color-ontology-artifact);
+  --ontology-service: var(--khive-color-ontology-service);
+  --ontology-resource: var(--khive-color-ontology-resource);
+  --ontology-observation: var(--khive-color-ontology-observation);
+  --ontology-insight: var(--khive-color-ontology-insight);
+  --ontology-question: var(--khive-color-ontology-question);
+  --ontology-decision: var(--khive-color-ontology-decision);
+  --ontology-reference: var(--khive-color-ontology-reference);
+  --ontology-edge-neutral: var(--khive-color-ontology-edge-neutral);
+  --ontology-support: var(--khive-color-support);
+  --ontology-refute: var(--khive-color-refute);
+  --ontology-derived: var(--khive-color-ontology-derived);
+  --ontology-unknown: var(--khive-color-text-muted);
+}
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --khive-color-surface-base: #181612;
+  --khive-color-surface-raised: #211e19;
+  --khive-color-surface-overlay: #2a261f;
+  --khive-color-text-primary: #f5efe5;
+  --khive-color-text-secondary: rgb(245 239 229 / 0.74);
+  --khive-color-text-muted: rgb(245 239 229 / 0.56);
+  --khive-color-text-disabled: rgb(245 239 229 / 0.4);
+  --khive-color-text-on-accent: #1d160e;
+  --khive-color-border: rgb(245 239 229 / 0.13);
+  --khive-color-border-strong: rgb(245 239 229 / 0.23);
+  --khive-color-grid: rgb(245 239 229 / 0.045);
+  --khive-color-backdrop: rgb(8 7 6 / 0.72);
+  --khive-color-accent: #d39a53;
+  --khive-color-accent-hover: #e1ad6b;
+  --khive-color-accent-strong: #b97838;
+  --khive-color-accent-soft: rgb(211 154 83 / 0.16);
+  --khive-color-success: #70b895;
+  --khive-color-success-soft: rgb(112 184 149 / 0.14);
+  --khive-color-warning: #d8ad61;
+  --khive-color-warning-soft: rgb(216 173 97 / 0.15);
+  --khive-color-danger: #dc8177;
+  --khive-color-danger-soft: rgb(220 129 119 / 0.14);
+  --khive-color-info: #7cacc9;
+  --khive-color-info-soft: rgb(124 172 201 / 0.14);
+  --khive-color-support: #78bd9c;
+  --khive-color-refute: #df8378;
+  --khive-color-ontology-derived: #b5a0df;
+  --khive-color-ontology-derived-soft: rgb(181 160 223 / 0.14);
+  --khive-color-ontology-concept: #b7a1dd;
+  --khive-color-ontology-document: #83acd0;
+  --khive-color-ontology-dataset: #75b8b2;
+  --khive-color-ontology-project: #78b99a;
+  --khive-color-ontology-person: #d0a968;
+  --khive-color-ontology-org: #ca8b70;
+  --khive-color-ontology-artifact: #c393bc;
+  --khive-color-ontology-service: #7fb2c8;
+  --khive-color-ontology-resource: #aca383;
+  --khive-color-ontology-observation: #8eabb7;
+  --khive-color-ontology-insight: #b59bc9;
+  --khive-color-ontology-question: #d3aa68;
+  --khive-color-ontology-decision: #82b7a4;
+  --khive-color-ontology-reference: #91a9d0;
+  --khive-color-ontology-edge-neutral: #9ba7ad;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --khive-color-surface-base: #f5f0e8;
+  --khive-color-surface-raised: #fbf8f2;
+  --khive-color-surface-overlay: #ffffff;
+  --khive-color-text-primary: #211d18;
+  --khive-color-text-secondary: rgb(33 29 24 / 0.74);
+  --khive-color-text-muted: rgb(33 29 24 / 0.56);
+  --khive-color-text-disabled: rgb(33 29 24 / 0.4);
+  --khive-color-text-on-accent: #fffaf2;
+  --khive-color-border: rgb(33 29 24 / 0.14);
+  --khive-color-border-strong: rgb(33 29 24 / 0.24);
+  --khive-color-grid: rgb(33 29 24 / 0.045);
+  --khive-color-backdrop: rgb(33 29 24 / 0.5);
+  --khive-color-accent: #98612d;
+  --khive-color-accent-hover: #7d4b20;
+  --khive-color-accent-strong: #72431c;
+  --khive-color-accent-soft: rgb(152 97 45 / 0.13);
+  --khive-color-success: #267353;
+  --khive-color-success-soft: rgb(38 115 83 / 0.12);
+  --khive-color-warning: #8a611d;
+  --khive-color-warning-soft: rgb(138 97 29 / 0.12);
+  --khive-color-danger: #9b443f;
+  --khive-color-danger-soft: rgb(155 68 63 / 0.11);
+  --khive-color-info: #396b8e;
+  --khive-color-info-soft: rgb(57 107 142 / 0.11);
+  --khive-color-support: #26785a;
+  --khive-color-refute: #9e4741;
+  --khive-color-ontology-derived: #6e58a6;
+  --khive-color-ontology-derived-soft: rgb(110 88 166 / 0.11);
+  --khive-color-ontology-concept: #6d55a5;
+  --khive-color-ontology-document: #356b91;
+  --khive-color-ontology-dataset: #20766f;
+  --khive-color-ontology-project: #267253;
+  --khive-color-ontology-person: #88601f;
+  --khive-color-ontology-org: #8e4c34;
+  --khive-color-ontology-artifact: #814c7d;
+  --khive-color-ontology-service: #326d87;
+  --khive-color-ontology-resource: #6b6248;
+  --khive-color-ontology-observation: #516c77;
+  --khive-color-ontology-insight: #72588e;
+  --khive-color-ontology-question: #8b601f;
+  --khive-color-ontology-decision: #3d705f;
+  --khive-color-ontology-reference: #566c99;
+  --khive-color-ontology-edge-neutral: #69767c;
+}
