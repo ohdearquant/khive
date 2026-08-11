@@ -21,7 +21,7 @@ import {
   Sparkles,
   TrendingUp,
   Users,
-} from "lucide-react";
+} from "@/icons";
 import { useMemo, useState } from "react";
 
 import {
