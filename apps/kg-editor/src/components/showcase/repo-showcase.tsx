@@ -119,10 +119,34 @@ function availabilityText<T>(
   return value.status === "available" ? render(value.value) : `${labels.unavailable} · ${value.reason}`;
 }
 
+function isIncompleteRepoPage<T>(page: RepoPage<T>): boolean {
+  return page.disclosure.status !== "unavailable"
+    && (page.truncated || page.next_cursor !== null || page.disclosure.status === "truncated");
+}
+
+function isKnownEmptyRepoPage<T>(page: RepoPage<T>): boolean {
+  return page.items.length === 0
+    && page.disclosure.status === "complete"
+    && !page.truncated
+    && page.next_cursor === null;
+}
+
 function BoundDisclosure<T>({ page, labels }: { page: RepoPage<T>; labels: Labels }) {
   const total = page.total_count.status === "available" ? formatNumber(page.total_count.value) : labels.unavailable;
   const reason = page.disclosure.reason ?? (page.truncated ? labels.truncated : undefined);
-  if (page.truncated) {
+  if (page.disclosure.status === "unavailable") {
+    return (
+      <DataState
+        className="repo-bounded"
+        presentation="inline"
+        state="unavailable"
+        title={labels.unavailable}
+        message={reason ?? "This bundle does not claim a complete collection."}
+        context={[`${formatNumber(page.items.length)} / ${total}`]}
+      />
+    );
+  }
+  if (isIncompleteRepoPage(page)) {
     return (
       <DataState
         className="repo-bounded"
@@ -136,18 +160,6 @@ function BoundDisclosure<T>({ page, labels }: { page: RepoPage<T>; labels: Label
       />
     );
   }
-  if (page.disclosure.status === "unavailable") {
-    return (
-      <DataState
-        className="repo-bounded"
-        presentation="inline"
-        state="unavailable"
-        title={labels.unavailable}
-        message={reason ?? "This bundle does not claim a complete collection."}
-        context={[`${formatNumber(page.items.length)} / ${total}`]}
-      />
-    );
-  }
   return (
     <span className="repo-bounded complete">
       <Info aria-hidden="true" />
@@ -157,8 +169,18 @@ function BoundDisclosure<T>({ page, labels }: { page: RepoPage<T>; labels: Label
 }
 
 function InlinePageState<T>({ page, labels }: { page: RepoPage<T>; labels: Labels }) {
-  if (!page.truncated && page.disclosure.status !== "unavailable") return null;
-  if (page.truncated) {
+  if (page.disclosure.status === "unavailable") {
+    return (
+      <DataState
+        className="repo-inline-state"
+        presentation="inline"
+        state="unavailable"
+        title={labels.unavailable}
+        message={page.disclosure.reason ?? "This bundle does not claim a complete collection."}
+      />
+    );
+  }
+  if (isIncompleteRepoPage(page)) {
     return (
       <DataState
         className="repo-inline-state"
@@ -172,15 +194,7 @@ function InlinePageState<T>({ page, labels }: { page: RepoPage<T>; labels: Label
       />
     );
   }
-  return (
-    <DataState
-      className="repo-inline-state"
-      presentation="inline"
-      state="unavailable"
-      title={labels.unavailable}
-      message={page.disclosure.reason ?? "This bundle does not claim a complete collection."}
-    />
-  );
+  return null;
 }
 
 function LocalSliceDisclosure({
@@ -555,16 +569,16 @@ function HistoryFacet({
       <div className="repo-card-heading"><h3>{label}</h3></div>
       {unavailableReason ? (
         <DataState className="repo-empty" state="unavailable" title={`${label} ${labels.unavailable.toLocaleLowerCase()}`} message={unavailableReason} />
-      ) : rows.length === 0 ? (
+      ) : page && isKnownEmptyRepoPage(page) ? (
         <DataState className="repo-empty" state="empty" title={`No ${label}`} message={`${label} captured for the selected module belong here.`} action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
-      ) : (
+      ) : rows.length > 0 ? (
         <div className="repo-list">
           {rows.map((id) => {
             const item = resolveItem(id);
             return <div className="repo-list-row" key={id}><Icon aria-hidden="true" /><div><strong>{item?.title ?? id}</strong>{item && <span>#{item.number}</span>}</div></div>;
           })}
         </div>
-      )}
+      ) : null}
       {page && <LocalSliceDisclosure shown={rows.length} total={page.items.length} label={label} labels={labels} />}
       {page && <BoundDisclosure page={page} labels={labels} />}
     </section>
@@ -616,13 +630,16 @@ function HistoryStructure({ bundle, moduleById, onExploreStructure }: ViewProps)
                 <GitCommitHorizontal aria-hidden="true" /><div><strong>{commit.subject}</strong><span>{commit.author} · {formatDate(commit.committed_at)}</span></div><code>{commit.short_sha}</code>
               </button>
             ))}
-            {commits.length === 0 && linkedCommitIds.size > 0 ? (
-              <DataState className="repo-empty" state="truncated" title={`${labels.node_types.commit} ${labels.truncated.toLocaleLowerCase()}`} shown={commits.length} bound={graph.commits.bound.max_items} knownTotal={linkedCommitIds.size} reason={graph.commits.disclosure.reason ?? "Referenced commits fall outside the captured graph bound."} />
-            ) : commits.length === 0 && (
+            {commits.length === 0 && (
               selectedModuleNavigation?.commits.disclosure.status === "unavailable" ||
-              graph.history_navigation.by_module.disclosure.status === "unavailable"
+              graph.history_navigation.by_module.disclosure.status === "unavailable" ||
+              graph.commits.disclosure.status === "unavailable"
                 ? <DataState className="repo-empty" state="unavailable" title={`${labels.node_types.commit} ${labels.unavailable.toLocaleLowerCase()}`} message={selectedModuleNavigation?.commits.disclosure.reason ?? graph.history_navigation.by_module.disclosure.reason ?? "This bundle does not claim commit navigation."} />
-                : <DataState className="repo-empty" state="empty" title={`No ${labels.node_types.commit}`} message="Commits captured for the selected module belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+                : linkedCommitIds.size > 0
+                  ? <DataState className="repo-empty" state="truncated" title={`${labels.node_types.commit} ${labels.truncated.toLocaleLowerCase()}`} shown={commits.length} bound={graph.commits.bound.max_items} knownTotal={linkedCommitIds.size} reason={graph.commits.disclosure.reason ?? "Referenced commits fall outside the captured graph bound."} />
+                  : selectedModuleNavigation && isKnownEmptyRepoPage(selectedModuleNavigation.commits)
+                    ? <DataState className="repo-empty" state="empty" title={`No ${labels.node_types.commit}`} message="Commits captured for the selected module belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+                    : null
             )}
           </div>
           <LocalSliceDisclosure shown={commits.length} total={linkedCommitIds.size} label={labels.node_types.commit} labels={labels} />
@@ -718,7 +735,7 @@ function DependencyTopology({ bundle, moduleById, onExploreStructure }: ViewProp
       <section className="repo-card">
         <div className="repo-card-heading"><h3>{labels.metrics.cycle_count}</h3><p>{formatNumber(analysis.cycles.items.length)}</p></div>
         <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>{cycle.module_ids.map((id) => moduleName(moduleById, id)).join(" → ")}</span></div></div>)}</div>
-        {analysis.cycles.items.length === 0 && <DataState className="repo-empty" state="empty" title="No dependency cycles in this bundle" message="Dependency cycles found by the captured topology analysis belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
+        {isKnownEmptyRepoPage(analysis.cycles) && <DataState className="repo-empty" state="empty" title="No dependency cycles in this bundle" message="Dependency cycles found by the captured topology analysis belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={cycleRows.length} total={analysis.cycles.items.length} label={labels.metrics.cycle_count} labels={labels} />
         <BoundDisclosure page={analysis.cycles} labels={labels} />
       </section>
@@ -765,7 +782,7 @@ function HiddenCouplingView({ bundle, moduleById, onExploreStructure }: ViewProp
     <div className="repo-view-body">
       <section className="repo-card repo-table-wrap">
         <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.node_types.module}</th><th>{labels.metrics.cochange_count}</th><th>{labels.metrics.support}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.left_module_id}-${row.right_module_id}`}><td><strong>{moduleName(moduleById, row.left_module_id)}</strong></td><td><strong>{moduleName(moduleById, row.right_module_id)}</strong></td><td>{formatNumber(row.cochange_count)}</td><td><div className="repo-bar violet" aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}><span style={{ width: `${Math.min(100, row.support * 100)}%` }} /></div></td></tr>)}</tbody></table>
-        {analysis.data.items.length === 0 && <DataState className="repo-empty" state="empty" title={`No ${bundle.capability.views.hidden_coupling.label.toLocaleLowerCase()} in this bundle`} message="Module pairs with captured co-change signals belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
+        {isKnownEmptyRepoPage(analysis.data) && <DataState className="repo-empty" state="empty" title={`No ${bundle.capability.views.hidden_coupling.label.toLocaleLowerCase()} in this bundle`} message="Module pairs with captured co-change signals belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.hidden_coupling.label} labels={labels} />
         <BoundDisclosure page={analysis.data} labels={labels} />
       </section>
@@ -804,7 +821,7 @@ function CadenceSeries({ id, page, label, labels, onExploreStructure }: { id: Ca
       <div className="repo-card-heading"><h3>{label}</h3><p>{page.total_count.status === "available" ? formatNumber(page.total_count.value) : labels.unavailable}</p></div>
       {page.disclosure.status === "unavailable" ? (
         <DataState className="repo-empty compact" state="unavailable" title={`${label} ${labels.unavailable.toLocaleLowerCase()}`} message={page.disclosure.reason ?? "This bundle does not claim cadence data."} />
-      ) : rows.length === 0 ? (
+      ) : isKnownEmptyRepoPage(page) ? (
         <DataState className="repo-empty compact" state="empty" title={`No ${label.toLocaleLowerCase()} cadence points`} message={`Captured weekly ${label.toLocaleLowerCase()} counts belong here.`} action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
       ) : (
         <table className="repo-table"><thead><tr><th>{labels.metrics.week}</th><th>{label}</th></tr></thead><tbody>{rows.map((point) => <tr key={point.week_start}><td>{point.week_start}</td><td>{formatNumber(point.count)}</td></tr>)}</tbody></table>

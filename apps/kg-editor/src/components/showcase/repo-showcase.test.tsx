@@ -190,6 +190,30 @@ describe("repository showcase", () => {
     expect(state).toHaveTextContent(/fixture node budget/i);
   });
 
+  it.each([
+    ["truncated", { truncated: true, next_cursor: null, disclosure: "truncated" }],
+    ["next cursor", { truncated: false, next_cursor: "next-page", disclosure: "complete" }],
+  ] as const)("does not mislabel a zero-item %s repository page as known-empty", async (_name, incomplete) => {
+    const bundle = structuredClone(golden());
+    const user = userEvent.setup();
+    const cycles = bundle.aggregates.dependency_topology.cycles;
+    cycles.items = [];
+    cycles.truncated = incomplete.truncated;
+    cycles.next_cursor = incomplete.next_cursor;
+    cycles.total_count = { status: "available", value: 3 };
+    cycles.disclosure = { status: incomplete.disclosure, reason: "fixture incomplete cycle page" };
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="dependency_topology"]')!);
+
+    const card = screen.getByRole("heading", { name: bundle.capability.labels.metrics.cycle_count }).closest("section")!;
+    expect(card.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+    const state = card.querySelector<HTMLElement>('[data-state="truncated"]');
+    expect(state).toBeVisible();
+    expect(state).toHaveAttribute("data-shown", "0");
+    expect(state).toHaveAttribute("data-bound", String(cycles.bound.max_items));
+  });
+
   it("keeps repository-wide ownership visible when the module join is unavailable", async () => {
     const bundle = structuredClone(golden());
     const user = userEvent.setup();

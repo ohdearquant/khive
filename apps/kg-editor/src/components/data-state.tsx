@@ -31,7 +31,8 @@ type DataStateProps = DataStateBase & (
   | Readonly<{
       state: "truncated";
       shown: number;
-      bound: number;
+      /** Omit when the producer stopped on a non-row budget or did not disclose a row bound. */
+      bound?: number;
       knownTotal?: number;
       reason: string;
       next?: Readonly<{ bound: number; label: string; onClick: () => void }>;
@@ -59,7 +60,10 @@ export function DataState(props: DataStateProps) {
     .filter(Boolean)
     .join(" ");
   const inline = props.presentation === "inline";
-  const canShowNext = props.state === "truncated" && props.next !== undefined && props.next.bound > props.bound;
+  const canShowNext = props.state === "truncated"
+    && props.bound !== undefined
+    && props.next !== undefined
+    && props.next.bound > props.bound;
   const Root = inline ? "span" : "section";
 
   return (
@@ -79,7 +83,7 @@ export function DataState(props: DataStateProps) {
           <>
             <span>{props.reason}</span>
             <span className="data-state-bound">
-              {props.shown} shown · bound {props.bound}
+              {props.shown} shown · {props.bound === undefined ? "bound unavailable" : `bound ${props.bound}`}
               {props.knownTotal === undefined ? " · total unavailable" : ` · ${props.knownTotal} total`}
             </span>
           </>

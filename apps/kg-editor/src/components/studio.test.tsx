@@ -81,8 +81,26 @@ describe("KG Studio", () => {
 
     const state = container.querySelector<HTMLElement>('[data-state="truncated"]');
     expect(state).toHaveAttribute("data-shown", String(bundle.changes.items.length));
-    expect(state).toHaveAttribute("data-bound", String(bundle.changes.items.length));
-    expect(state).toHaveTextContent(/graph changes.*bound/i);
+    expect(state).not.toHaveAttribute("data-bound");
+    expect(state).toHaveTextContent(/graph changes.*bound unavailable/i);
+  });
+
+  it.each([
+    ["truncated", { truncated: true, next_cursor: null }],
+    ["next cursor", { truncated: false, next_cursor: "next-page" }],
+  ] as const)("does not mislabel a zero-item %s page as known-empty", (_name, incomplete) => {
+    const bundle = structuredClone(atlasReviewFixture);
+    bundle.changes.items = [];
+    bundle.changes.truncated = incomplete.truncated;
+    bundle.changes.next_cursor = incomplete.next_cursor;
+
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    expect(container.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+    const state = container.querySelector<HTMLElement>('[data-state="truncated"]');
+    expect(state).toBeVisible();
+    expect(state).toHaveAttribute("data-shown", "0");
+    expect(state).not.toHaveAttribute("data-bound");
   });
 
   it("navigates from semantic diff to the affected graph", async () => {

@@ -69,6 +69,22 @@ describe("shared data states", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
+  it("keeps an unknown truncation bound distinct from the exact shown count", () => {
+    render(
+      <DataState
+        state="truncated"
+        title="Evidence anchors are truncated"
+        shown={0}
+        reason="The export stopped at a byte budget."
+      />,
+    );
+
+    const surface = screen.getByRole("status");
+    expect(surface).toHaveAttribute("data-shown", "0");
+    expect(surface).not.toHaveAttribute("data-bound");
+    expect(surface).toHaveTextContent(/0 shown.*bound unavailable/i);
+  });
+
   it("offers one next action only when it declares a wider bound", async () => {
     const action = vi.fn();
     const user = userEvent.setup();

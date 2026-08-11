@@ -115,25 +115,38 @@ function TierPill({ tier }: { tier: "tier_1" | "tier_2" }) {
   return <span className={`tier-pill ${tier}`}>{tier === "tier_1" ? "T1 fast path" : "T2 review"}</span>;
 }
 
+type CapturedPage = Readonly<{
+  items: readonly unknown[];
+  next_cursor: string | null;
+  truncated: boolean;
+}>;
+
+function isCompletePage(page: CapturedPage): boolean {
+  return !page.truncated && page.next_cursor === null;
+}
+
+function isKnownEmptyPage(page: CapturedPage): boolean {
+  return page.items.length === 0 && isCompletePage(page);
+}
+
 function PageNotice({
   page,
   label,
 }: {
-  page: { items: readonly unknown[]; next_cursor: string | null; truncated: boolean };
+  page: CapturedPage;
   label: string;
 }) {
-  if (!page.next_cursor && !page.truncated) return null;
+  if (isCompletePage(page)) return null;
   return (
     <DataState
       className="page-notice"
       state="truncated"
       title={`${label} are truncated`}
       shown={page.items.length}
-      bound={page.items.length}
       reason={page.truncated
         ? "A configured export budget truncated this collection."
         : "The bundle declares another page, but this static review surface only displays the captured page."}
-      context={page.next_cursor ? ["cursor available"] : undefined}
+      context={page.next_cursor !== null ? ["cursor available"] : undefined}
     />
   );
 }
@@ -462,7 +475,7 @@ function ChangesView({
             onSelect={() => setSelectedId((current) => current === change.id ? "" : change.id)}
           />
         ))}
-        {filtered.length === 0 && (
+        {filtered.length === 0 && isCompletePage(bundle.changes) && (
           <DataState
             className="empty-state"
             state="empty"
@@ -509,15 +522,16 @@ function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =>
   const selectedEdgeTarget = selectedEdge ? nodeById.get(selectedEdge.target) : undefined;
 
   if (settledNodes.length === 0) {
+    const graphKnownEmpty = isKnownEmptyPage(bundle.graph.nodes) && isKnownEmptyPage(bundle.graph.edges);
     return (
       <div className="view-stack">
-        <DataState
+        {graphKnownEmpty && <DataState
           className="empty-state"
           state="empty"
           title="No affected graph nodes in this review bundle"
           message="Affected graph nodes and their relationships belong here."
           action={{ label: "Import another review bundle", onClick: onImport }}
-        />
+        />}
         <PageNotice page={bundle.graph.nodes} label="Graph nodes" />
         <PageNotice page={bundle.graph.edges} label="Graph edges" />
       </div>
@@ -627,7 +641,7 @@ function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =>
       </div>
       <section className="graph-edge-summary" aria-label="Affected graph relationships">
         <h3>Relationships</h3>
-        {bundle.graph.edges.items.length === 0 ? (
+        {isKnownEmptyPage(bundle.graph.edges) ? (
           <DataState
             className="empty-state"
             state="empty"
@@ -696,7 +710,7 @@ function ChecksView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =
         <div><span className="eyebrow">Stage-time validation</span><h2>Semantic checks</h2></div>
         <span className="checks-runtime">{bundle.checks.items.reduce((total, check) => total + check.duration_ms, 0)} ms total</span>
       </div>
-      {bundle.checks.items.length === 0 ? (
+      {isKnownEmptyPage(bundle.checks) ? (
         <DataState
           className="empty-state"
           state="empty"
@@ -734,7 +748,7 @@ function ProvenanceView({ bundle, onImport }: { bundle: ReviewBundle; onImport: 
         <div><span className="eyebrow">Evidence contract</span><h2>Why these edits exist</h2></div>
         <span className="immutable-pill"><LockKeyhole aria-hidden="true" /> append-only anchors</span>
       </div>
-      {bundle.evidence.items.length === 0 ? (
+      {isKnownEmptyPage(bundle.evidence) ? (
         <DataState
           className="empty-state"
           state="empty"
@@ -795,7 +809,7 @@ function RetrievalView({ bundle, onImport }: { bundle: ReviewBundle; onImport: (
         <span>assertion provenance review auditability</span>
         <kbd>{mode}</kbd>
       </div>
-      {activePage.items.length === 0 && (
+      {isKnownEmptyPage(activePage) && (
         <DataState
           className="empty-state"
           state="empty"
@@ -849,7 +863,7 @@ function ActivityView({ bundle, onImport }: { bundle: ReviewBundle; onImport: ()
   return (
     <div className="view-stack">
       <div className="surface-toolbar"><div><span className="eyebrow">Replayable review thread</span><h2>Conversation</h2></div></div>
-      {bundle.activity.items.length === 0 && localNotes.length === 0 ? (
+      {isKnownEmptyPage(bundle.activity) && localNotes.length === 0 ? (
         <DataState
           className="empty-state"
           state="empty"
