@@ -22,6 +22,36 @@ fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
 }
 
+#[derive(Clone, Default)]
+struct CoordinatorLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CoordinatorLogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CoordinatorLogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).expect("captured logs are UTF-8")
+    }
+}
+
+struct MakeCoordinatorLogCapture(CoordinatorLogCapture);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeCoordinatorLogCapture {
+    type Writer = CoordinatorLogCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.clone()
+    }
+}
+
 fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
     SearchHit {
         entity_id,
@@ -662,6 +692,46 @@ async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate()
         err.contains("timed out"),
         "single-backend timeout error must be timeout-specific, got: {err:?}"
     );
+}
+
+/// Backend names are configuration strings, not trusted identifiers.  A
+/// credential-shaped name must be masked at the coordinator WARN site itself,
+/// before the later MCP envelope sanitizer ever receives the result.
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_timeout_masks_backend_credentials_in_coordinator_warning() {
+    let secret = format!("archive auth token sk_live_{}", "z".repeat(32));
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new(secret.clone()), memory_runtime());
+    let coord = SubstrateCoordinator::new(registry).with_hanging_backend(&secret);
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "credential-safe timeout",
+        "limit": 10,
+    }));
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    let (_hits, _note_hits, per_backend) =
+        coord.fan_out_search(&request, &Namespace::local()).await;
+    drop(guard);
+    let logs = captured.contents();
+
+    assert_eq!(per_backend.len(), 1);
+    assert!(per_backend[0].error.is_some());
+    assert!(
+        !logs.contains("sk_live_"),
+        "coordinator WARN leaked backend credential: {logs}"
+    );
+    assert!(
+        logs.contains("***MASKED***"),
+        "coordinator WARN omitted masked backend identity: {logs}"
+    );
+    assert!(logs.contains("backend search task timed out"));
 }
 
 /// Same as the entity-substrate test above, for the `search_notes` await at

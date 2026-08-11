@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::task::JoinError;
 use uuid::Uuid;
 
@@ -17,6 +18,37 @@ use khive_types::namespace::Namespace;
 
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
+
+/// Keep arbitrary configured backend identifiers safe and bounded before
+/// they reach persistent coordinator diagnostics.  The raw identifier stays
+/// on [`BackendSearchResult`] for internal routing; the MCP boundary applies
+/// the same canonical secret masker before exposing it on the wire.
+fn bounded_backend_id_for_log(backend_id: &str) -> String {
+    const MAX_INPUT_CHARS: usize = 4_096;
+    const MAX_OUTPUT_CHARS: usize = 256;
+
+    let backend_id_chars = backend_id.chars().count();
+    let bounded_input: String = backend_id.chars().take(MAX_INPUT_CHARS).collect();
+    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    let was_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
+    let sanitized = if masked.trim().is_empty() {
+        "masked-backend"
+    } else {
+        masked.as_ref()
+    };
+    if !was_masked && backend_id_chars <= MAX_OUTPUT_CHARS {
+        return sanitized.to_string();
+    }
+
+    // Fingerprint the original value so independently configured secrets or
+    // long identifiers do not collapse onto one diagnostic key after
+    // masking/truncation.  The digest reveals no credential material.
+    let fingerprint = format!("{:x}", Sha256::digest(backend_id.as_bytes()));
+    let suffix = format!("…#{fingerprint}");
+    let prefix_chars = MAX_OUTPUT_CHARS - suffix.chars().count();
+    let prefix: String = sanitized.chars().take(prefix_chars).collect();
+    format!("{prefix}{suffix}")
+}
 
 /// Result of a single backend's entity-search contribution to a fan-out.
 ///
@@ -616,7 +648,7 @@ impl SubstrateCoordinator {
                         )
                         .await;
                         tracing::warn!(
-                            backend = %backend_id,
+                            backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
                             "backend search task timed out"
                         );
@@ -678,7 +710,7 @@ impl SubstrateCoordinator {
                         )
                         .await;
                         tracing::warn!(
-                            backend = %backend_id,
+                            backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
                             "backend search task timed out"
                         );
@@ -900,7 +932,11 @@ impl SubstrateCoordinator {
                     let error = khive_runtime::RuntimeError::Internal(format!(
                         "backend search task join failed: {join_err}"
                     ));
-                    tracing::warn!(backend = %joined_backend_id, error = %error, "backend search task failed");
+                    tracing::warn!(
+                        backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
+                        error = %error,
+                        "backend search task failed"
+                    );
                     per_backend.push(BackendSearchResult {
                         backend_id: joined_backend_id,
                         hits: vec![],
@@ -910,7 +946,7 @@ impl SubstrateCoordinator {
                 }
                 Ok(Ok((_late_result, _completed_at))) => {
                     tracing::warn!(
-                        backend = %joined_backend_id,
+                        backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
                         timeout_ms,
                         "backend search task completed after the shared request deadline"
                     );
@@ -923,7 +959,7 @@ impl SubstrateCoordinator {
                 }
                 Err(_elapsed) => {
                     tracing::warn!(
-                        backend = %joined_backend_id,
+                        backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
                         timeout_ms,
                         "backend search task timed out"
                     );
