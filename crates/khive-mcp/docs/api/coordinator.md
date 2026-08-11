@@ -56,8 +56,10 @@ the bounded diagnostics even if the result itself must be omitted. If no hit
 survives filtering, `missing_backends` and `backend_errors` instead live inside
 the `search_incomplete` error. Complete searches omit both fields. At most 16
 causes and one per-operation wire budget are retained; truncation is explicit
-through `backend_errors_truncated` and `backend_errors_omitted`. Messages are
-credential-masked and capped at 1,024 Unicode scalar values before exposure.
+through `backend_errors_truncated` and `backend_errors_omitted`. Backend ids and
+messages are credential-masked before exposure; changed backend ids carry a
+stable hash suffix and `backend_id_masked: true`, ids are capped at 256 Unicode
+scalar values, and messages are capped at 1,024 Unicode scalar values.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 

@@ -445,7 +445,8 @@ The same validated request is used for single- and multi-backend execution.
 In multi-backend mode a backend failure with surviving hits yields those hits
 with `status: "partial"`, deprecated `partial: true`, `missing_backends`, and a
 `backend_errors` object mapping each retained failed backend to its bounded,
-credential-masked cause. These fields sit beside `result` and survive
+credential-masked backend id and cause. Masked backend ids use a stable hash
+suffix so distinct failed legs remain distinguishable. These fields sit beside `result` and survive
 presentation and response-frame compaction. If no hit survives filtering, the
 operation is `ok: false` with `error.kind="search_incomplete"`; the structured
 error carries the same diagnostics. `backend_errors_truncated` plus

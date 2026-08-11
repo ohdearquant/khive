@@ -480,10 +480,13 @@ it inside `error`. Complete searches omit it. Presentation and frame-budget
 omission preserve the diagnostics at the same location.
 
 Diagnostics are mandatory but bounded: retain at most 16 causes and no more
-than one fixed per-operation wire budget; cap backend ids at 256 Unicode scalar
-values using a stable hash suffix and cap cause messages at 1,024 scalar values
-plus an ellipsis. Before exposure or warning, scan at most 4,096 input scalar
-values with the canonical credential masker. Empty causes become
+than one fixed per-operation wire budget. Before exposure or warning, scan at
+most 4,096 input scalar values from both backend ids and causes with the
+canonical credential masker. Cap backend ids at 256 Unicode scalar values,
+using a stable hash suffix whenever masking or truncation changes the displayed
+id; a changed value carries `backend_id_masked=true` and a length-truncated
+value carries `backend_id_truncated=true`. Cap cause messages at 1,024 scalar
+values plus an ellipsis. Empty causes become
 `backend search failed without diagnostic detail`. If any failed legs are not
 retained, emit `backend_errors_truncated=true` and the exact
 `backend_errors_omitted` count. At least one cause MUST survive whenever a leg

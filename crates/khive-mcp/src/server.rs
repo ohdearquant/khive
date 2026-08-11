@@ -85,6 +85,7 @@ impl SearchStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BackendErrorDiagnostic {
     message: String,
+    backend_id_masked: bool,
     backend_id_truncated: bool,
     backend_id_chars: usize,
 }
@@ -123,12 +124,13 @@ impl SearchDegradation {
             .iter()
             .filter_map(|backend| backend.error.as_deref().map(|error| (backend, error)))
         {
-            let (key, backend_id_truncated, backend_id_chars) =
+            let (key, backend_id_masked, backend_id_truncated, backend_id_chars) =
                 bounded_backend_error_key(backend.backend_id.as_str());
             candidates.insert(
                 key,
                 BackendErrorDiagnostic {
                     message: bounded_backend_error_message(error),
+                    backend_id_masked,
                     backend_id_truncated,
                     backend_id_chars,
                 },
@@ -217,17 +219,33 @@ fn bounded_backend_error_message(message: &str) -> String {
     bounded
 }
 
-fn bounded_backend_error_key(backend_id: &str) -> (String, bool, usize) {
+fn bounded_backend_error_key(backend_id: &str) -> (String, bool, bool, usize) {
     let backend_id_chars = backend_id.chars().count();
-    if backend_id_chars <= MAX_BACKEND_ERROR_KEY_CHARS {
-        return (backend_id.to_string(), false, backend_id_chars);
+    let bounded_input: String = backend_id
+        .chars()
+        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
+        .collect();
+    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    let backend_id_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
+    let sanitized = if masked.trim().is_empty() {
+        "masked-backend"
+    } else {
+        masked.as_ref()
+    };
+    if !backend_id_masked && backend_id_chars <= MAX_BACKEND_ERROR_KEY_CHARS {
+        return (sanitized.to_string(), false, false, backend_id_chars);
     }
 
     let fingerprint = format!("{:x}", Sha256::digest(backend_id.as_bytes()));
     let suffix = format!("…#{fingerprint}");
     let prefix_chars = MAX_BACKEND_ERROR_KEY_CHARS - suffix.chars().count();
-    let prefix: String = backend_id.chars().take(prefix_chars).collect();
-    (format!("{prefix}{suffix}"), true, backend_id_chars)
+    let prefix: String = sanitized.chars().take(prefix_chars).collect();
+    (
+        format!("{prefix}{suffix}"),
+        backend_id_masked,
+        backend_id_chars > MAX_BACKEND_ERROR_KEY_CHARS,
+        backend_id_chars,
+    )
 }
 
 fn backend_errors_value(errors: &BTreeMap<String, BackendErrorDiagnostic>) -> Value {
@@ -239,6 +257,9 @@ fn backend_errors_value(errors: &BTreeMap<String, BackendErrorDiagnostic>) -> Va
                     "kind": "backend_error",
                     "message": diagnostic.message,
                 });
+                if diagnostic.backend_id_masked {
+                    value["backend_id_masked"] = Value::Bool(true);
+                }
                 if diagnostic.backend_id_truncated {
                     value["backend_id_truncated"] = Value::Bool(true);
                     value["backend_id_chars"] = json!(diagnostic.backend_id_chars);
@@ -3556,6 +3577,43 @@ mod tests {
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
 
+    #[derive(Clone, Default)]
+    struct SearchCapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SearchCapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured search log mutex poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SearchCapturedLog {
+        type Writer = SearchCapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl SearchCapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.0
+                    .lock()
+                    .expect("captured search log mutex poisoned")
+                    .clone(),
+            )
+            .expect("captured search logs are UTF-8")
+        }
+    }
+
     // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
     // connections close asynchronously; read-only admission rejects a writable
     // `-shm` as potentially live.
@@ -4385,6 +4443,16 @@ mod tests {
         assert!(masked.contains("***MASKED***"));
         assert!(!masked.contains("sk_live_"));
 
+        let backend_secret = format!("archive auth token sk_live_{}", "b".repeat(32));
+        let (key, key_masked, key_truncated, key_chars) =
+            bounded_backend_error_key(&backend_secret);
+        assert!(key_masked);
+        assert!(!key_truncated);
+        assert_eq!(key_chars, backend_secret.chars().count());
+        assert!(key.contains("***MASKED***"));
+        assert!(!key.contains("sk_live_"));
+        assert!(key.chars().count() <= MAX_BACKEND_ERROR_KEY_CHARS);
+
         let oversized = "x".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS + 100);
         let bounded = bounded_backend_error_message(&oversized);
         assert_eq!(bounded.chars().count(), MAX_BACKEND_ERROR_MESSAGE_CHARS + 1);
@@ -4473,6 +4541,50 @@ mod tests {
                 .map(Value::String)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn backend_id_credentials_are_absent_from_wire_and_warning() {
+        let secret = format!("archive auth token sk_live_{}", "c".repeat(32));
+        let result = CoordSearchResult {
+            entity_hits: Vec::new(),
+            note_hits: Vec::new(),
+            per_backend: vec![crate::coordinator::BackendSearchResult {
+                backend_id: khive_runtime::BackendId::new(secret.clone()),
+                entity_hits: Vec::new(),
+                note_hits: Vec::new(),
+                error: Some("storage unavailable".to_string()),
+            }],
+            partial: true,
+            entity_kinds: std::collections::HashMap::new(),
+            note_kinds: std::collections::HashMap::new(),
+            entity_created_at: std::collections::HashMap::new(),
+            note_created_at: std::collections::HashMap::new(),
+            note_names: std::collections::HashMap::new(),
+        };
+        let captured = SearchCapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let degradation = tracing::subscriber::with_default(subscriber, || {
+            SearchDegradation::from_result(&result)
+        });
+        let wire = search_diagnostic_value(&degradation).to_string();
+        let logs = captured.contents();
+
+        assert!(!wire.contains("sk_live_"), "wire leaked backend credential");
+        assert!(
+            !logs.contains("sk_live_"),
+            "warning leaked backend credential"
+        );
+        let backend = degradation
+            .missing_backends
+            .first()
+            .expect("failed backend diagnostic retained");
+        assert!(backend.contains("***MASKED***"));
+        assert!(degradation.backend_errors[backend].backend_id_masked);
     }
 
     #[test]
@@ -5448,6 +5560,7 @@ mod tests {
                     "archive".to_string(),
                     BackendErrorDiagnostic {
                         message: "storage unavailable".to_string(),
+                        backend_id_masked: false,
                         backend_id_truncated: false,
                         backend_id_chars: "archive".chars().count(),
                     },
