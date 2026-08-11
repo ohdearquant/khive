@@ -202,4 +202,37 @@ describe("repository showcase", () => {
     expect(container.querySelectorAll(".repo-view-panel tbody tr")).toHaveLength(200);
     expect(Array.from(container.querySelectorAll(".repo-view-panel .repo-bounded.truncated")).some((node) => node.textContent?.includes(bundle.capability.labels.truncated))).toBe(true);
   });
+
+  it("settles the structure graph without collapsing nodes onto a handful of shared coordinates", () => {
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const nodes = Array.from(container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]"));
+    expect(nodes.length).toBeGreaterThan(40);
+
+    const coordinateCounts = new Map<string, number>();
+    for (const node of nodes) {
+      const key = `${node.style.left}|${node.style.top}`;
+      coordinateCounts.set(key, (coordinateCounts.get(key) ?? 0) + 1);
+    }
+
+    const overcrowded = Array.from(coordinateCounts.entries()).filter(([, count]) => count > 2);
+    expect(overcrowded).toEqual([]);
+  });
+
+  it("keeps every structure-graph card footprint inside a 300px mobile stage", () => {
+    const stageWidth = 300;
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const nodes = Array.from(container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]"));
+    expect(nodes.length).toBeGreaterThan(40);
+
+    for (const node of nodes) {
+      const leftPercent = Number.parseFloat(node.style.left);
+      const widthPx = Number.parseFloat(node.style.width);
+      expect(Number.isNaN(leftPercent)).toBe(false);
+      expect(Number.isNaN(widthPx)).toBe(false);
+      const center = leftPercent / 100 * stageWidth;
+      const halfWidth = widthPx / 2;
+      expect(center - halfWidth).toBeGreaterThanOrEqual(0);
+      expect(center + halfWidth).toBeLessThanOrEqual(stageWidth);
+    }
+  });
 });

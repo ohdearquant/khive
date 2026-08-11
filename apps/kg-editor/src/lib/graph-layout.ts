@@ -15,12 +15,19 @@ export type SettledGraphNode<T extends GraphLayoutNode> =
   }>;
 
 // The narrowest supported graph stage is 300 px after mobile workspace
-// gutters. Mobile node cards can be 120 px wide, so their centers need a
-// 20% horizontal inset to keep the complete card inside the clipped stage.
-const HORIZONTAL_PADDING = 20;
+// gutters. The widest node card (a max-degree package/repository card in the
+// repo showcase) renders at ~138px on that stage, so settled centers need up
+// to a 23% horizontal inset to keep the complete card inside the clipped
+// stage.
+const HORIZONTAL_PADDING = 23;
 const VERTICAL_PADDING = 10;
 const CENTER = 50;
 const ITERATIONS = 160;
+// Minimum center-to-center separation (in the 0-100 layout space) below
+// which two settled nodes are considered overlapping and get pushed apart by
+// the deterministic cleanup pass that runs after the force settle.
+const MIN_SEPARATION = 7;
+const SEPARATION_ITERATIONS = 200;
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -62,13 +69,20 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
   const random = seededRandom(GRAPH_LAYOUT_SEED);
   const phase = random() * Math.PI * 2;
   const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+  // Scale the spiral radius per axis by the padded half-extent of the stage
+  // (not a flat pixel radius) so outer-ring nodes land inside bounds instead
+  // of needing an immediate clamp — a large node count otherwise lands many
+  // points on the same clamped corner before the force pass ever runs.
+  const maxRadiusX = CENTER - HORIZONTAL_PADDING;
+  const maxRadiusY = CENTER - VERTICAL_PADDING;
   const points = orderedNodes.map((node, index) => {
-    const radius = 16 + 25 * Math.sqrt((index + 0.5) / orderedNodes.length);
+    const ringFraction = Math.sqrt((index + 0.5) / orderedNodes.length);
+    const radiusScale = 0.15 + 0.8 * ringFraction;
     const angle = phase + index * goldenAngle + (random() - 0.5) * 0.08;
     return {
       node,
-      x: CENTER + Math.cos(angle) * radius,
-      y: CENTER + Math.sin(angle) * radius,
+      x: CENTER + Math.cos(angle) * radiusScale * maxRadiusX,
+      y: CENTER + Math.sin(angle) * radiusScale * maxRadiusY,
       velocityX: 0,
       velocityY: 0,
     };
@@ -140,6 +154,40 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
         ),
       );
     }
+  }
+
+  // The force pass alone can leave dense graphs (e.g. the 51-node repo
+  // showcase) with settled points stacked on top of each other, since the
+  // boundary clamp above stops motion at the edge instead of resolving the
+  // overlap. Run a deterministic, order-fixed cleanup: repeatedly push any
+  // pair closer than MIN_SEPARATION apart along their connecting vector (or
+  // a stable per-pair fallback direction when they coincide exactly), then
+  // re-clamp to the stage bounds.
+  for (let pass = 0; pass < SEPARATION_ITERATIONS; pass += 1) {
+    let movedAny = false;
+    for (let left = 0; left < points.length; left += 1) {
+      for (let right = left + 1; right < points.length; right += 1) {
+        const deltaX = points[right].x - points[left].x;
+        const deltaY = points[right].y - points[left].y;
+        const distance = Math.hypot(deltaX, deltaY);
+        if (distance >= MIN_SEPARATION) continue;
+        movedAny = true;
+        const fallbackAngle = (left * 928_371 + right * 574_639) % 360 /
+          360 * Math.PI * 2;
+        const unitX = distance > 1e-6 ? deltaX / distance : Math.cos(fallbackAngle);
+        const unitY = distance > 1e-6 ? deltaY / distance : Math.sin(fallbackAngle);
+        const push = (MIN_SEPARATION - distance) / 2;
+        points[left].x -= unitX * push;
+        points[left].y -= unitY * push;
+        points[right].x += unitX * push;
+        points[right].y += unitY * push;
+      }
+    }
+    for (const point of points) {
+      point.x = Math.min(100 - HORIZONTAL_PADDING, Math.max(HORIZONTAL_PADDING, point.x));
+      point.y = Math.min(100 - VERTICAL_PADDING, Math.max(VERTICAL_PADDING, point.y));
+    }
+    if (!movedAny) break;
   }
 
   return points.map(({ node, x, y }) => ({
