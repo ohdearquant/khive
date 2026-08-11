@@ -261,6 +261,18 @@ pub(crate) enum Site {
     /// `with_writer_unmanaged` fallback, taken while the write queue is
     /// enabled (ADR-136 D1 gate 3 amendment — the general vector write path).
     DirectRouteVecGeneralWrite,
+    /// `stores::entity::SqlEntityStore`'s pool-writer fallback.
+    DirectRouteEntity,
+    /// `stores::note::SqlNoteStore`'s pool-writer fallback.
+    DirectRouteNote,
+    /// `stores::graph::SqlGraphStore`'s standalone/pool-writer fallback.
+    DirectRouteGraphGeneralWrite,
+    /// `stores::event::SqlEventStore`'s standalone/pool-writer fallback.
+    DirectRouteEventGeneralWrite,
+    /// `stores::sparse::SqliteSparseStore`'s pool-writer fallback.
+    DirectRouteSparseGeneralWrite,
+    /// `stores::agents::SqlAgentStore`'s standalone/pool-writer fallback.
+    DirectRouteAgentGeneralWrite,
 }
 
 impl Site {
@@ -278,6 +290,12 @@ impl Site {
             Site::DirectRouteFtsRenameNamespace => "direct_route:fts_rename_namespace",
             Site::DirectRouteFtsGeneralWrite => "direct_route:fts_general_write",
             Site::DirectRouteVecGeneralWrite => "direct_route:vec_general_write",
+            Site::DirectRouteEntity => "direct_route:entity",
+            Site::DirectRouteNote => "direct_route:note",
+            Site::DirectRouteGraphGeneralWrite => "direct_route:graph_general_write",
+            Site::DirectRouteEventGeneralWrite => "direct_route:event_general_write",
+            Site::DirectRouteSparseGeneralWrite => "direct_route:sparse_general_write",
+            Site::DirectRouteAgentGeneralWrite => "direct_route:agent_general_write",
         }
     }
 }
@@ -1092,6 +1110,28 @@ pub(crate) fn maybe_emit_busy(db: &str, site: Site, err: &rusqlite::Error) {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn store_direct_route_sites_have_stable_names() {
+        assert_eq!(Site::DirectRouteEntity.as_str(), "direct_route:entity");
+        assert_eq!(Site::DirectRouteNote.as_str(), "direct_route:note");
+        assert_eq!(
+            Site::DirectRouteGraphGeneralWrite.as_str(),
+            "direct_route:graph_general_write"
+        );
+        assert_eq!(
+            Site::DirectRouteEventGeneralWrite.as_str(),
+            "direct_route:event_general_write"
+        );
+        assert_eq!(
+            Site::DirectRouteSparseGeneralWrite.as_str(),
+            "direct_route:sparse_general_write"
+        );
+        assert_eq!(
+            Site::DirectRouteAgentGeneralWrite.as_str(),
+            "direct_route:agent_general_write"
+        );
+    }
 
     #[test]
     fn resolve_log_dir_prefers_explicit_override() {

@@ -210,6 +210,9 @@ pub struct SqlAgentStore {
 
 impl SqlAgentStore {
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+        // Construction may happen before Tokio is entered. A missing handle
+        // is therefore only a cache hint; every write re-resolves it and
+        // applies strict/compatibility policy at the actual write seam.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Self {
             pool,
@@ -230,17 +233,27 @@ impl SqlAgentStore {
             .map_err(|e| map_sqlite_err(e, "open_agent_reader"))
     }
 
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        self.pool
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
+    }
+
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteAgentGeneralWrite);
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
             tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
@@ -283,6 +296,19 @@ impl SqlAgentStore {
 impl AgentStore for SqlAgentStore {
     async fn insert(&self, record: &AgentRecord) -> Result<(), StorageError> {
         let record = record.clone();
+
+        // The provider-session pre-check and INSERT must share one write
+        // transaction. The WriterTask already supplies that transaction, so
+        // submit only the DML body on the queue path; the compatibility path
+        // below retains its explicit BEGIN/COMMIT wrapper.
+        if let Some(writer_task) = self.current_writer_task("agent_insert")? {
+            return writer_task
+                .send_bounded(move |conn| {
+                    insert_agent_dml(conn, &record).map_err(|error| map_err(error, "agent_insert"))
+                })
+                .await;
+        }
+
         self.with_writer("agent_insert", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             if let Err(e) = insert_agent_dml(conn, &record) {

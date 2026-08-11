@@ -94,12 +94,21 @@ stores would open independent connections that contend with each other at
 `BEGIN IMMEDIATE`, defeating the purpose of a write queue. `ConnectionPool`
 lazily spawns a single `WriterTask` behind a `OnceLock`: the first caller to
 need it runs the init closure, every later caller (from any store, any
-namespace) receives a clone of the same handle. When `KHIVE_WRITE_QUEUE=1`,
-store methods route single-row DML through this shared `WriterTask` instead
-of taking the pool mutex directly; `orphan_sweep` and other closures that
-manage their own transaction bypass the queue via the "unmanaged" path
-instead, since a transaction-owning closure cannot be sent through a channel
-that already wraps every request in its own transaction.
+namespace) receives a clone of the same handle. Store methods resolve that
+handle again at write time, so construction before a Tokio runtime cannot
+permanently cache a queue bypass. Single-row, batch, and transaction-owning
+operations submit DML-only closures through the shared task; the task owns the
+outer transaction. A non-strict compatibility fallback may still use the
+legacy standalone/pool-mutex writer and records a store-specific
+`direct_route_violation`. Strict mode refuses that fallback before it opens a
+direct writer.
+
+Strict routing remains opt-in. Flipping its default is separately gated by
+ADR-135 F2 and ADR-136 D2 production A/B evidence plus the release gate; this
+write-time routing hardening does not claim that evidence. The unified helper
+covers the SQLite store layer; remaining runtime-orchestration direct-writer
+call sites stay in #1847's follow-up inventory rather than being silently
+classified as complete.
 
 See `crates/khive-db/docs/api/pool.md` and `crates/khive-db/docs/api/vectors.md`
 for the per-function routing rules and the tests that pin them down.

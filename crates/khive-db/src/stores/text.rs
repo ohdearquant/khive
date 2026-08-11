@@ -23,39 +23,6 @@ use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
-/// ADR-136 D1 gate 3: called immediately before a `with_writer_unmanaged`
-/// fallback so this store's one remaining direct-writer call site
-/// (`rename_namespace`) fails closed under strict routing instead of
-/// silently bypassing an enabled queue. Under non-strict routing this is a
-/// no-op except for a `direct_route_violation` sink row when the queue is
-/// enabled (ADR-136 D1 gate 6c) — observable, but not yet fatal. Mirrors
-/// `stores::vectors::refuse_direct_route_if_strict`; kept as a separate copy
-/// rather than a shared export to avoid coupling the two stores' internals.
-fn refuse_direct_route_if_strict(
-    pool: &ConnectionPool,
-    site: crate::timeout_sink::Site,
-    op: &'static str,
-) -> Result<(), StorageError> {
-    if pool.config().write_routing_strict {
-        return Err(StorageError::Pool {
-            operation: op.into(),
-            message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is available; \
-                      refusing to fall back to a direct connection"
-                .into(),
-        });
-    }
-    if pool.write_queue_active() {
-        // In-memory pools never spawn a writer task by documented design
-        // (explicit `Some(true)` degrades), so a violation row there would
-        // be noise, not signal.
-        crate::timeout_sink::emit_direct_route_violation(
-            &crate::timeout_sink::db_label(pool),
-            site,
-        );
-    }
-    Ok(())
-}
-
 /// The exact `DELETE` this store's `delete_document` issues, for a given
 /// FTS table (ADR-099 B3 r6 structural cut — see `entity.rs`'s sibling
 /// block). `table` must already be a trusted, sanitized table name (this
@@ -161,10 +128,10 @@ impl Fts5TextSearch {
     pub(crate) fn new(pool: Arc<ConnectionPool>, is_file_backed: bool, table_key: String) -> Self {
         let table_name = format!("fts_{}", table_key);
         // Enabled by default for file-backed pools; explicit off/degraded
-        // fallback remains possible (ADR-067 Component A, mirrors
-        // entity.rs policy): a missing writer task degrades to the legacy
-        // pool-mutex / standalone-connection path rather than failing
-        // construction.
+        // construction remains synchronous (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task is cached without failing
+        // construction. Every write re-resolves it and applies
+        // strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Self {
             pool,
@@ -193,18 +160,21 @@ impl Fts5TextSearch {
     /// `Err(WriterTaskNoRuntime)`, which construction collapses via
     /// `.ok().flatten()`) — every later write, even ones running inside a
     /// runtime, would otherwise silently keep bypassing an enabled queue.
-    /// `ConnectionPool::writer_task_handle()` is a cheap `OnceCell` read once
-    /// resolved, so re-checking here costs nothing on the hot path.
-    fn current_writer_task(&self) -> Option<WriterTaskHandle> {
-        self.writer_task
-            .clone()
-            .or_else(|| self.pool.writer_task_handle().ok().flatten())
+    /// The pool helper also enforces strict fail-closed routing and preserves
+    /// a typed `WriterTaskNoRuntime` error when no runtime is available.
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        self.pool
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
     }
 
     /// Route a single-row write through the pool-wide `WriterTask` when
-    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
-    /// to the legacy standalone-connection / pool-mutex path (ADR-067
-    /// Component A, Fork C slice 2). See `crates/khive-db/docs/api/text.md`
+    /// the write queue is enabled and a handle is available. Strict mode
+    /// refuses a missing handle; compatibility mode falls back to the legacy
+    /// standalone-connection / pool-mutex path (ADR-067 Component A, Fork C
+    /// slice 2). See `crates/khive-db/docs/api/text.md`
     /// for the per-caller routing rules (which methods bypass this via
     /// `with_writer_unmanaged` and why).
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
@@ -212,17 +182,14 @@ impl Fts5TextSearch {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
-        refuse_direct_route_if_strict(
-            &self.pool,
-            crate::timeout_sink::Site::DirectRouteFtsGeneralWrite,
-            op,
-        )?;
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteFtsGeneralWrite);
         self.with_writer_unmanaged(op, f).await
     }
 
@@ -802,13 +769,14 @@ impl TextSearch for Fts5TextSearch {
         // ADR-067 Component A: when the write queue is enabled, route
         // through the pool-wide WriterTask. DML-only closure — no BEGIN
         // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
-        // owns the transaction. `current_writer_task()` (ADR-136 D1 gate 3
+        // owns the transaction. `current_writer_task("fts_upsert")`
+        // (ADR-136 D1 gate 3
         // amendment) re-checks past a construction-time `None` cache so a
         // handle that only became available later is still used here rather
         // than falling to `with_writer`'s BEGIN-IMMEDIATE-wrapped closure
         // below (that closure is not safe to send through the queue, which
         // already wraps its own transaction).
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task("fts_upsert")? {
             let table2 = table.clone();
             return writer_task
                 .send_bounded(move |conn| {
@@ -850,10 +818,10 @@ impl TextSearch for Fts5TextSearch {
         // through the pool-wide WriterTask. DML-only closure (the per-row
         // `SAVEPOINT fts_upsert_doc` is preserved unchanged — only the OUTER
         // BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's run loop
-        // owns the enclosing transaction). `current_writer_task()` re-checks
+        // owns the enclosing transaction). `current_writer_task` re-checks
         // past a construction-time `None` cache — see `upsert_document`'s
         // matching note.
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task("fts_upsert_batch")? {
             let table2 = table.clone();
             return writer_task
                 .send_bounded(move |conn| {
@@ -1485,7 +1453,7 @@ impl Fts5TextSearch {
         // closing the TOCTOU window the pre-migration path had (its SELECT
         // ran before its own `BEGIN IMMEDIATE`, so a writer landing between
         // the two could resurrect a stale row or lose one mid-rename).
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("fts_rename_namespace")? {
             let table2 = table.clone();
             return writer_task
                 .send_bounded(move |conn| {
@@ -1495,11 +1463,8 @@ impl Fts5TextSearch {
                 .await;
         }
 
-        refuse_direct_route_if_strict(
-            &self.pool,
-            crate::timeout_sink::Site::DirectRouteFtsRenameNamespace,
-            "fts_rename_namespace",
-        )?;
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteFtsRenameNamespace);
 
         let origin = self.pool.origin();
         self.with_writer_unmanaged("fts_rename_namespace", move |conn| {
