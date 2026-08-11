@@ -237,7 +237,7 @@ svg line.ontology-edge[data-edge-origin="derived"] { stroke-dasharray: 2 2; }
 }
 
 .brand-mark span {
-  background: var(--khive-color-success-soft);
+  background: var(--khive-color-brand-glyph);
   border-radius: var(--khive-radius-pill);
   height: 4px;
   width: 4px;

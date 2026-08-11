@@ -61,7 +61,7 @@
 
 .repo-brand-mark::before,
 .repo-brand-mark::after {
-  background: var(--khive-color-accent-soft);
+  background: var(--khive-color-brand-glyph);
   content: "";
   height: 1px;
   left: 7px;
