@@ -367,7 +367,7 @@
   width: 100%;
 }
 
-.repo-view-nav button:hover { background: var(--khive-color-surface-raised); }
+.repo-view-nav button:hover { background: var(--khive-color-surface-overlay); }
 .repo-view-nav button.active { background: var(--green-pale); color: var(--green-dark); font-weight: 750; }
 .repo-view-nav button svg { flex: 0 0 auto; height: 14px; width: 14px; }
 .repo-view-nav button span { flex: 1; }

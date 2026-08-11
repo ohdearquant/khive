@@ -51,6 +51,10 @@
   --color-ontology-derived-soft: var(--khive-color-ontology-derived-soft);
   --font-sans: var(--khive-font-ui);
   --font-mono: var(--khive-font-mono);
+  --text-micro: var(--khive-type-micro);
+  --text-icon-small: var(--khive-type-icon-small);
+  --text-icon-scale: var(--khive-type-icon-scale);
+  --text-tiny: var(--khive-type-tiny);
   --text-2xs: var(--khive-type-2xs);
   --text-xs: var(--khive-type-xs);
   --text-sm: var(--khive-type-sm);
@@ -77,6 +81,7 @@
   --radius-ui-lg: var(--khive-radius-lg);
   --radius-ui-xl: var(--khive-radius-xl);
   --radius-ui-pill: var(--khive-radius-pill);
+  --shadow-none: var(--khive-shadow-none);
 }
 
 :root {

@@ -14,6 +14,28 @@ const tokenCss = await readFile(
   new URL("../src/app/tokens.css", import.meta.url),
   "utf8",
 );
+const showcaseCss = await readFile(
+  new URL("../src/app/showcase.css", import.meta.url),
+  "utf8",
+);
+
+function tokensForTheme(theme) {
+  const tokens = {};
+  for (const block of tokenCss.matchAll(/([^{}]+)\{([^{}]*)\}/gu)) {
+    const applies = theme === "dark"
+      ? block[1].includes(":root") || block[1].includes('[data-theme="dark"]')
+      : block[1].includes('[data-theme="light"]');
+    if (!applies) continue;
+    for (
+      const declaration of block[2].matchAll(
+        /(--khive-[\w-]+)\s*:\s*([^;]+);/gu,
+      )
+    ) {
+      tokens[declaration[1]] = declaration[2].trim();
+    }
+  }
+  return tokens;
+}
 
 test("literal-color lint rejects component CSS and Tailwind palette classes", () => {
   const violations = findLiteralColorViolations([
@@ -153,6 +175,98 @@ test("Tailwind color grammar rejects arbitrary values and extended prefixes", ()
   );
 });
 
+test("TypeScript AST scans Tailwind utilities in globally assigned strings", () => {
+  const violations = findLiteralColorViolations([
+    {
+      path: "src/components/card.tsx",
+      content: [
+        'const tone = active ? "bg-red-500" : "text-slate-400";',
+        'const badge = `fill-green-500 ${active ? "stroke-blue-500" : ""}`;',
+        "<div className={tone} data-badge={badge} />;",
+      ].join("\n"),
+    },
+  ]);
+
+  assert.deepEqual(
+    violations.map(({ literal }) => literal),
+    ["bg-red-500", "text-slate-400", "fill-green-500", "stroke-blue-500"],
+  );
+});
+
+test("Tailwind v4 color grammar covers modifiers, shadows, and arbitrary properties", () => {
+  const violations = findLiteralColorViolations([
+    {
+      path: "src/components/card.tsx",
+      content:
+        '<div className="bg-[#fff]/50 text-[red]! text-shadow-red-500 drop-shadow-blue-500 inset-shadow-green-500 inset-ring-purple-500 [border-color:#fff]" />',
+    },
+  ]);
+
+  assert.deepEqual(
+    violations.map(({ literal }) => literal),
+    [
+      "bg-[#fff]/50",
+      "text-[red]!",
+      "text-shadow-red-500",
+      "drop-shadow-blue-500",
+      "inset-shadow-green-500",
+      "inset-ring-purple-500",
+      "[border-color:#fff]",
+    ],
+  );
+});
+
+test("TypeScript AST scans conditional values in color-bearing style shorthands", () => {
+  const violations = findLiteralColorViolations([
+    {
+      path: "src/components/card.tsx",
+      content: `
+        <div style={{
+          ["border"]: active ? "1px solid red" : "1px solid blue",
+          "outline": "goldenrod solid 1px",
+          backgroundImage: "linear-gradient(red, blue)",
+          filter: "drop-shadow(0 0 #fff)",
+          animationName: "red",
+          gridArea: "blue",
+        }} />
+      `,
+    },
+  ]);
+
+  assert.deepEqual(
+    violations.map(({ literal }) => literal),
+    ["red", "blue", "goldenrod", "red", "blue", "#fff"],
+  );
+});
+
+test("TypeScript AST keeps regex, JSX, comparisons, comments, and prose distinct", () => {
+  const violations = findLiteralColorViolations([
+    {
+      path: "src/components/regex.tsx",
+      content: String
+        .raw`const matcher = /https?:\/\//; const view = <div className="bg-red-500" />;`,
+    },
+    {
+      path: "src/components/comparison.tsx",
+      content: 'if (count < max && color = "red" > 0) work();',
+    },
+    {
+      path: "src/components/prose.tsx",
+      content: `
+        // <svg fill="red" className="bg-red-500" />
+        /* "text-blue-500" */
+        const copy = 'color: "red"';
+        const prose = <p>fill="blue" text-red-500</p>;
+      `,
+    },
+  ]);
+
+  assert.deepEqual(
+    violations.map(({ path, literal }) => [path, literal]),
+    [["src/components/regex.tsx", "bg-red-500"]],
+  );
+});
+
 test("literal-color lint ignores selectors, comments, and string content", () => {
   assert.deepEqual(
     findLiteralColorViolations([
@@ -176,6 +290,21 @@ test("literal-color lint ignores named words in non-color CSS declarations", () 
       },
     ]),
     [],
+  );
+});
+
+test("CSS lint scans every color-bearing image, stroke, and emphasis property", () => {
+  const violations = findLiteralColorViolations([
+    {
+      path: "src/app/card.css",
+      content:
+        ".card { border-image-source: linear-gradient(red, blue); -webkit-text-stroke: 1px #fff; text-emphasis: red; }",
+    },
+  ]);
+
+  assert.deepEqual(
+    violations.map(({ literal }) => literal),
+    ["red", "blue", "#fff", "red"],
   );
 });
 
@@ -216,10 +345,12 @@ test("alpha-equivalent contrast requires opaque surface and primary tokens", () 
   );
 });
 
-test("Tailwind color mappings cover the public token taxonomy from source", () => {
+test("Tailwind theme mappings cover all 78 public tokens from source", () => {
   const publicTokens = new Set(
     Array.from(
-      tokenCss.matchAll(/(--khive-color-[a-z0-9-]+)\s*:/gu),
+      tokenCss.matchAll(
+        /(--khive-(?:color|font|type|space|radius|shadow)-[a-z0-9-]+)\s*:/gu,
+      ),
       (match) => match[1],
     ),
   );
@@ -227,32 +358,34 @@ test("Tailwind color mappings cover the public token taxonomy from source", () =
   const mappedTokens = new Set(
     Array.from(
       theme.matchAll(
-        /--color-[a-z0-9-]+\s*:\s*var\((--khive-color-[a-z0-9-]+)\)/gu,
+        /--[a-z0-9-]+\s*:\s*var\((--khive-[a-z0-9-]+)\)/gu,
       ),
       (match) => match[1],
     ),
   );
 
+  assert.equal(publicTokens.size, 78);
   assert.deepEqual([...mappedTokens].sort(), [...publicTokens].sort());
 });
 
-test("brand glyph has non-text contrast against its real surfaces in both themes", () => {
-  const blocks = Array.from(tokenCss.matchAll(/([^{}]+)\{([^{}]*)\}/gu));
+test("repository navigation hover uses a surface distinct from its panel", () => {
+  assert.match(
+    showcaseCss,
+    /\.repo-view-nav button:hover\s*\{\s*background:\s*var\(--khive-color-surface-overlay\);\s*\}/u,
+  );
   for (const theme of ["dark", "light"]) {
-    const tokens = {};
-    for (const block of blocks) {
-      const applies = theme === "dark"
-        ? block[1].includes(":root") || block[1].includes('[data-theme="dark"]')
-        : block[1].includes('[data-theme="light"]');
-      if (!applies) continue;
-      for (
-        const declaration of block[2].matchAll(
-          /(--khive-[\w-]+)\s*:\s*([^;]+);/gu,
-        )
-      ) {
-        tokens[declaration[1]] = declaration[2].trim();
-      }
-    }
+    const tokens = tokensForTheme(theme);
+    assert.notEqual(
+      tokens["--khive-color-surface-raised"],
+      tokens["--khive-color-surface-overlay"],
+      `${theme} navigation hover must change the rendered surface`,
+    );
+  }
+});
+
+test("brand glyph has non-text contrast against its real surfaces in both themes", () => {
+  for (const theme of ["dark", "light"]) {
+    const tokens = tokensForTheme(theme);
     const glyph = parseCssColor(tokens["--khive-color-brand-glyph"]);
     for (
       const backgroundName of [
