@@ -545,6 +545,25 @@ fn tx_age_thresholds_from_env(
     (warn_secs, max_age_secs)
 }
 
+#[cfg(unix)]
+const DEFAULT_WALPIN_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct CachedWalpinAttribution {
+    report: crate::walpin::WalpinReport,
+    census: Result<crate::walpin::CensusResult, String>,
+    captured_at: Instant,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum WalpinFullScanPlan {
+    Refresh,
+    Cached(CachedWalpinAttribution),
+    Suppressed,
+}
+
 /// Mutable escalation state carried across ticks by the caller (ADR-091 Plank 2).
 ///
 /// Kept separate from [`CheckpointConfig`] because it is *state*, not
@@ -568,6 +587,16 @@ pub struct TruncateState {
     /// the daemon's faster checkpoint cadence or a local environment override.
     #[cfg(unix)]
     legacy_walpin_fallback_interval: Duration,
+    /// Minimum spacing between full sidecar/OS-holder enumeration attempts.
+    /// The attempt timestamp advances before blocking work starts, so an I/O
+    /// failure or worker panic cannot turn sustained pressure into a hot retry
+    /// loop. A successful report is retained only for diagnostic reuse.
+    #[cfg(unix)]
+    walpin_full_scan_interval: Duration,
+    #[cfg(unix)]
+    walpin_full_scan_last_attempt: Option<Instant>,
+    #[cfg(unix)]
+    walpin_cached_attribution: Option<CachedWalpinAttribution>,
     /// Whether the no-progress attribution arm already attempted the one
     /// bounded sidecar enumeration allowed for this checkpoint tick.
     #[cfg(unix)]
@@ -581,6 +610,12 @@ impl Default for TruncateState {
             consecutive_failures: 0,
             #[cfg(unix)]
             legacy_walpin_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+            #[cfg(unix)]
+            walpin_full_scan_interval: DEFAULT_WALPIN_FULL_SCAN_INTERVAL,
+            #[cfg(unix)]
+            walpin_full_scan_last_attempt: None,
+            #[cfg(unix)]
+            walpin_cached_attribution: None,
             #[cfg(unix)]
             sidecar_attribution_attempted_this_tick: false,
         }
@@ -596,6 +631,14 @@ impl TruncateState {
         }
     }
 
+    #[cfg(all(test, unix))]
+    fn with_walpin_full_scan_cadence(interval: Duration) -> Self {
+        Self {
+            walpin_full_scan_interval: interval,
+            ..Self::default()
+        }
+    }
+
     #[cfg(unix)]
     fn begin_tick(&mut self) {
         self.sidecar_attribution_attempted_this_tick = false;
@@ -604,6 +647,48 @@ impl TruncateState {
     #[cfg(unix)]
     fn housekeeping_due(&self) -> bool {
         !self.sidecar_attribution_attempted_this_tick
+            && self.walpin_full_scan_due_at(Instant::now())
+    }
+
+    #[cfg(unix)]
+    fn walpin_full_scan_due_at(&self, now: Instant) -> bool {
+        self.walpin_full_scan_last_attempt.is_none_or(|last| {
+            now.saturating_duration_since(last) >= self.walpin_full_scan_interval
+        })
+    }
+
+    #[cfg(unix)]
+    fn claim_walpin_full_scan_at(&mut self, now: Instant) -> bool {
+        if !self.walpin_full_scan_due_at(now) {
+            return false;
+        }
+        self.walpin_full_scan_last_attempt = Some(now);
+        true
+    }
+
+    #[cfg(unix)]
+    fn plan_walpin_attribution_at(&mut self, now: Instant) -> WalpinFullScanPlan {
+        if self.claim_walpin_full_scan_at(now) {
+            WalpinFullScanPlan::Refresh
+        } else if let Some(cached) = self.walpin_cached_attribution.clone() {
+            WalpinFullScanPlan::Cached(cached)
+        } else {
+            WalpinFullScanPlan::Suppressed
+        }
+    }
+
+    #[cfg(unix)]
+    fn cache_walpin_attribution(
+        &mut self,
+        report: crate::walpin::WalpinReport,
+        census: Result<crate::walpin::CensusResult, String>,
+        captured_at: Instant,
+    ) {
+        self.walpin_cached_attribution = Some(CachedWalpinAttribution {
+            report,
+            census,
+            captured_at,
+        });
     }
 }
 
@@ -977,25 +1062,30 @@ impl WalpinSidecarState {
     /// and report memory are capped, and all blocking filesystem operations
     /// stay off the async runtime worker.
     #[cfg(unix)]
-    async fn reap_dead_entries_bounded(&self, legacy_fallback_interval: Duration) {
+    async fn reap_dead_entries_bounded(
+        &self,
+        legacy_fallback_interval: Duration,
+    ) -> Option<crate::walpin::WalpinReport> {
         let dir = self.dir.clone();
         let result = tokio::task::spawn_blocking(move || {
             crate::walpin::housekeep_live(&dir, legacy_fallback_interval)
         })
         .await;
         match result {
-            Ok(Ok(_)) => {}
+            Ok(Ok(report)) => Some(report),
             Ok(Err(e)) => {
                 tracing::warn!(
                     error = %e,
                     "ADR-091 Amendment 6: bounded walpin sidecar cleanup failed"
                 );
+                None
             }
             Err(join_err) => {
                 tracing::warn!(
                     error = %join_err,
                     "ADR-091 Amendment 6: walpin sidecar cleanup task panicked"
                 );
+                None
             }
         }
     }
@@ -1969,10 +2059,22 @@ pub async fn run_checkpoint_task(
             sidecar
                 .observe(oldest_tx.clone(), config.tx_warn_secs)
                 .await;
-            if truncate_state.housekeeping_due() {
-                sidecar
+            if truncate_state.housekeeping_due()
+                && truncate_state.claim_walpin_full_scan_at(Instant::now())
+            {
+                if let Some(report) = sidecar
                     .reap_dead_entries_bounded(legacy_walpin_fallback_interval)
-                    .await;
+                    .await
+                {
+                    truncate_state.cache_walpin_attribution(
+                        report,
+                        Err(
+                            "OS holder census is unavailable for a housekeeping-only scan"
+                                .to_string(),
+                        ),
+                        Instant::now(),
+                    );
+                }
             }
         }
 
@@ -2368,8 +2470,7 @@ fn maybe_truncate(
     }
 
     #[cfg(unix)]
-    let holder_attribution =
-        capture_walpin_attribution_request(pool, truncate_state.legacy_walpin_fallback_interval);
+    let holder_attribution = capture_walpin_attribution_request(pool, truncate_state);
     #[cfg(unix)]
     let mut sidecar_attribution = None;
     #[cfg(not(unix))]
@@ -2640,10 +2741,28 @@ fn note_truncate_outcome(
 /// `spawn_blocking` by [`complete_walpin_attribution`].
 #[cfg(unix)]
 #[derive(Debug)]
-struct WalpinAttributionRequest {
-    dir: PathBuf,
-    census: Result<crate::walpin::CensusResult, String>,
-    legacy_fallback_interval: Duration,
+enum WalpinAttributionRequest {
+    Fresh {
+        dir: PathBuf,
+        census: Result<crate::walpin::CensusResult, String>,
+        legacy_fallback_interval: Duration,
+    },
+    Cached(CachedWalpinAttribution),
+    Suppressed,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalpinReportFreshness {
+    Fresh,
+    Cached { age: Duration },
+}
+
+#[cfg(unix)]
+impl WalpinReportFreshness {
+    fn is_fresh(self) -> bool {
+        self == Self::Fresh
+    }
 }
 
 /// Non-Unix placeholder keeps the synchronous core's outcome shape stable;
@@ -2695,16 +2814,21 @@ impl std::fmt::Display for WalpinAttributionFailure {
 #[cfg(unix)]
 fn capture_walpin_attribution_request(
     pool: &ConnectionPool,
-    legacy_fallback_interval: Duration,
+    state: &mut TruncateState,
 ) -> Option<WalpinAttributionRequest> {
     let path = pool.canonical_path()?;
     if !crate::walpin::sidecar_enabled(true) {
         return None;
     }
-    Some(WalpinAttributionRequest {
-        dir: crate::walpin::sidecar_dir_for(path),
-        census: crate::walpin::census_holders(path).map_err(|error| error.to_string()),
-        legacy_fallback_interval,
+    let legacy_fallback_interval = state.legacy_walpin_fallback_interval;
+    Some(match state.plan_walpin_attribution_at(Instant::now()) {
+        WalpinFullScanPlan::Refresh => WalpinAttributionRequest::Fresh {
+            dir: crate::walpin::sidecar_dir_for(path),
+            census: crate::walpin::census_holders(path).map_err(|error| error.to_string()),
+            legacy_fallback_interval,
+        },
+        WalpinFullScanPlan::Cached(cached) => WalpinAttributionRequest::Cached(cached),
+        WalpinFullScanPlan::Suppressed => WalpinAttributionRequest::Suppressed,
     })
 }
 
@@ -2721,24 +2845,65 @@ async fn complete_walpin_attribution(
     let Some(request) = request else {
         return Ok(false);
     };
-    state.sidecar_attribution_attempted_this_tick = true;
+    match request {
+        WalpinAttributionRequest::Suppressed => Ok(false),
+        WalpinAttributionRequest::Cached(cached) => {
+            log_walpin_sidecar_report(
+                &cached.report,
+                cached.census,
+                WalpinReportFreshness::Cached {
+                    age: Instant::now().saturating_duration_since(cached.captured_at),
+                },
+            );
+            Ok(true)
+        }
+        WalpinAttributionRequest::Fresh {
+            dir,
+            census,
+            legacy_fallback_interval,
+        } => {
+            state.sidecar_attribution_attempted_this_tick = true;
+            if state.walpin_full_scan_last_attempt.is_none() {
+                state.walpin_full_scan_last_attempt = Some(Instant::now());
+            }
+            let fallback = state.walpin_cached_attribution.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                walpin_attribution_test_sync::before_enumeration(&dir);
+                crate::walpin::enumerate_live(&dir, legacy_fallback_interval)
+            })
+            .await
+            .map_err(|error| WalpinAttributionFailure::Worker(error.to_string()))
+            .and_then(|result| {
+                result.map_err(|error| WalpinAttributionFailure::Enumeration(error.to_string()))
+            });
 
-    let WalpinAttributionRequest {
-        dir,
-        census,
-        legacy_fallback_interval,
-    } = request;
-    let report = tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
-        walpin_attribution_test_sync::before_enumeration(&dir);
-        crate::walpin::enumerate_live(&dir, legacy_fallback_interval)
-    })
-    .await
-    .map_err(|error| WalpinAttributionFailure::Worker(error.to_string()))?
-    .map_err(|error| WalpinAttributionFailure::Enumeration(error.to_string()))?;
-
-    log_walpin_sidecar_report(&report, census);
-    Ok(true)
+            match result {
+                Ok(report) => {
+                    let captured_at = Instant::now();
+                    log_walpin_sidecar_report(
+                        &report,
+                        census.clone(),
+                        WalpinReportFreshness::Fresh,
+                    );
+                    state.cache_walpin_attribution(report, census, captured_at);
+                    Ok(true)
+                }
+                Err(error) => {
+                    if let Some(cached) = fallback {
+                        log_walpin_sidecar_report(
+                            &cached.report,
+                            cached.census,
+                            WalpinReportFreshness::Cached {
+                                age: Instant::now().saturating_duration_since(cached.captured_at),
+                            },
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        }
+    }
 }
 
 /// When a TRUNCATE attempt makes no progress, enumerate the walpin sidecar and
@@ -2759,6 +2924,7 @@ async fn complete_walpin_attribution(
 fn log_walpin_sidecar_report(
     report: &crate::walpin::WalpinReport,
     census: Result<crate::walpin::CensusResult, String>,
+    freshness: WalpinReportFreshness,
 ) {
     #[cfg(test)]
     walpin_attribution_test_sync::report_used();
@@ -2776,6 +2942,7 @@ fn log_walpin_sidecar_report(
             walpin_oldest_tx_label = hb.oldest_tx_label.as_deref().unwrap_or("<unlabeled>"),
             walpin_attribution_basis = hb.attribution_basis.as_deref().unwrap_or("<unspecified>"),
             walpin_attribution_evidence_backed = hb.attribution_is_evidence_backed(),
+            walpin_attribution_fresh = freshness.is_fresh(),
             walpin_health = "reporting",
             "ADR-091 Amendment 2 Plank B: live cross-process WAL-pin attribution report"
         );
@@ -2784,10 +2951,19 @@ fn log_walpin_sidecar_report(
         tracing::debug!(
             walpin_pid = pid,
             walpin_health = "registered_silent",
+            walpin_attribution_fresh = freshness.is_fresh(),
             "ADR-091 Amendment 2 Plank B: process affirmatively reports no over-threshold span"
         );
     }
     let mut unknown_pids: Vec<u32> = report.unknown_pids().collect();
+    if let WalpinReportFreshness::Cached { age } = freshness {
+        tracing::warn!(
+            walpin_cache_age_ms = age.as_millis() as u64,
+            "cached WAL-pin attribution is diagnostic-only; fully-attributed \
+             conclusion is not licensed"
+        );
+        unknown_pids.push(0);
+    }
 
     // The sidecar directory alone can only speak for PIDs that wrote
     // something there. Widen the universe to every PID the OS reports as
@@ -2853,6 +3029,8 @@ fn log_walpin_sidecar_report(
         }
     }
 
+    unknown_pids.sort_unstable();
+    unknown_pids.dedup();
     if !unknown_pids.is_empty() {
         tracing::warn!(
             ?unknown_pids,
@@ -3245,6 +3423,100 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn walpin_full_scan_cadence_refreshes_first_then_reuses_until_boundary() {
+        let cadence = Duration::from_secs(30);
+        let started_at = Instant::now();
+        let mut state = TruncateState::with_walpin_full_scan_cadence(cadence);
+
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at),
+            WalpinFullScanPlan::Refresh
+        ));
+        state.cache_walpin_attribution(
+            crate::walpin::WalpinReport::default(),
+            Ok(crate::walpin::CensusResult::default()),
+            started_at,
+        );
+
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at + cadence - Duration::from_nanos(1)),
+            WalpinFullScanPlan::Cached(_)
+        ));
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at + cadence),
+            WalpinFullScanPlan::Refresh
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn walpin_full_scan_failure_retries_only_after_cadence() {
+        let cadence = Duration::from_secs(30);
+        let started_at = Instant::now();
+        let mut state = TruncateState::with_walpin_full_scan_cadence(cadence);
+
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at),
+            WalpinFullScanPlan::Refresh
+        ));
+        // No cache update models either an enumeration error or a panicked
+        // blocking worker. The attempt itself still owns the cadence slot.
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at + cadence - Duration::from_nanos(1)),
+            WalpinFullScanPlan::Suppressed
+        ));
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at + cadence),
+            WalpinFullScanPlan::Refresh
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cached_walpin_report_is_diagnostic_only_even_when_fully_attributed() {
+        let report = crate::walpin::WalpinReport::default();
+        assert!(
+            report.fully_attributed(),
+            "the fixture must otherwise license the sharp conclusion"
+        );
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_walpin_sidecar_report(
+                &report,
+                Ok(crate::walpin::CensusResult::default()),
+                WalpinReportFreshness::Cached {
+                    age: Duration::from_secs(1),
+                },
+            );
+        });
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.message.as_deref()
+                    == Some(
+                        "cached WAL-pin attribution is diagnostic-only; fully-attributed \
+                         conclusion is not licensed",
+                    )
+            }),
+            "cached attribution must declare its fail-closed status: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.message.as_deref().is_some_and(|message| {
+                    message.starts_with("ADR-091 Amendment 2 Plank B: every live PID is reporting")
+                })
+            }),
+            "cached attribution must never authorize the fully-attributed conclusion: {events:?}"
+        );
+    }
+
     struct ReaderProcess {
         child: std::process::Child,
         _stdout: std::io::BufReader<std::process::ChildStdout>,
@@ -3460,7 +3732,7 @@ mod tests {
 
         let runtime_thread = std::thread::current().id();
         let mut state = TruncateState::default();
-        let request = Some(WalpinAttributionRequest {
+        let request = Some(WalpinAttributionRequest::Fresh {
             dir: sidecar_dir,
             census: Ok(crate::walpin::CensusResult::default()),
             legacy_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
@@ -3518,7 +3790,7 @@ mod tests {
         let _hook_guard = WalpinAttributionHookGuard;
 
         let mut state = TruncateState::default();
-        let request = Some(WalpinAttributionRequest {
+        let request = Some(WalpinAttributionRequest::Fresh {
             dir: sidecar_dir,
             census: Ok(crate::walpin::CensusResult::default()),
             legacy_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
