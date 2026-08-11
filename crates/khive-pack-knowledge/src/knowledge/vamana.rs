@@ -2662,6 +2662,9 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
     // Preserve the request-minted actor/visibility context (ADR-096). Reauthorizing
     // from the namespace here would silently replace it with runtime defaults.
     let token = token.clone();
+    // Deliberately detached cache maintenance: this warm attempt is shared
+    // across later requests and must not inherit one caller's cancellation or
+    // deadline. Request-owned ANN/search fan-out is scoped at its spawn sites.
     tokio::spawn(async move {
         run_warm_attempt(&rt, &token, &ann, &model, permit).await;
     });

@@ -494,16 +494,14 @@ impl KhiveRuntime {
         let build =
             khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
 
-        tokio::task::spawn_blocking(move || {
-            khive_db::diagnostics::collect_with_audit_append_failures(
-                &pool,
-                build,
-                interval,
-                crate::pack::audit_append_failure_count(),
-            )
-        })
+        khive_db::diagnostics::collect_with_audit_append_failures_interruptibly(
+            pool,
+            build,
+            interval,
+            crate::pack::audit_append_failure_count(),
+        )
         .await
-        .map_err(|e| RuntimeError::Internal(format!("db_diagnostics: spawn_blocking join: {e}")))
+        .map_err(RuntimeError::from)
     }
 
     // ---- Store accessors (token-scoped) ----

@@ -519,12 +519,6 @@ impl SqlGraphStore {
             .map_err(|e| map_sqlite_err(e, "open_graph_writer"))
     }
 
-    fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_reader()
-            .map_err(|e| map_sqlite_err(e, "open_graph_reader"))
-    }
-
     fn current_writer_task(
         &self,
         operation: &'static str,
@@ -584,18 +578,35 @@ impl SqlGraphStore {
         R: Send + 'static,
     {
         if self.is_file_backed {
-            let conn = self.open_standalone_reader()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
+            let pool = Arc::clone(&self.pool);
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Graph,
+                op,
+                move |scope| {
+                    scope.ensure_active()?;
+                    let conn = pool
+                        .open_standalone_reader()
+                        .map_err(|error| map_sqlite_err(error, op))?;
+                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
+                },
+            )
+            .await
         } else {
             let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.reader().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Graph,
+                op,
+                move |scope| {
+                    let mut guard = pool
+                        .reader_until(|| scope.should_stop())
+                        .map_err(|e| map_sqlite_err(e, op))?
+                        .ok_or_else(|| StorageError::Timeout {
+                            operation: op.into(),
+                        })?;
+                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
+                },
+            )
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
         }
     }
 }
@@ -1122,6 +1133,9 @@ fn run_bounded_traversal(
     conn.progress_handler(
         1_000,
         Some(move || {
+            if crate::read_cancellation::current_read_should_interrupt() {
+                return true;
+            }
             #[cfg(test)]
             if tests::traverse_progress_seam::hook(progress_seam_root) {
                 callback_timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
