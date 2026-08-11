@@ -3204,7 +3204,7 @@ pub fn json_type_name(v: &Value) -> &'static str {
 // require pub-exporting registry internals. Broad behavioral dispatch tests
 // live in tests/integration.rs.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ActorRef;
     use khive_types::Pack;
@@ -4529,6 +4529,8 @@ mod tests {
     struct CapturedEvent {
         message: Option<String>,
         audit_event: Option<String>,
+        into_id: Option<String>,
+        budget_rows: Option<u64>,
     }
 
     #[derive(Default)]
@@ -4557,7 +4559,14 @@ mod tests {
             match field.name() {
                 "message" => self.0.message = Some(cleaned),
                 "audit_event" => self.0.audit_event = Some(cleaned),
+                "into_id" => self.0.into_id = Some(cleaned),
                 _ => {}
+            }
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "budget_rows" {
+                self.0.budget_rows = Some(value);
             }
         }
     }
@@ -4596,7 +4605,23 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             let mut visitor = CapturedEventVisitor::default();
             event.record(&mut visitor);
-            self.events.lock().unwrap().push(visitor.0);
+            let captured = visitor.0;
+            // Tee the post-commit budget logs into their own append-only sink:
+            // `capture_dispatch_events` clears the main buffer, so a reader of
+            // budget events sharing that buffer would race the clear.
+            if let (Some(message), Some(into_id)) = (&captured.message, &captured.into_id) {
+                if message.ends_with("transaction materialization budget") {
+                    budget_events_sink()
+                        .lock()
+                        .unwrap()
+                        .push(CapturedBudgetLog {
+                            message: message.clone(),
+                            into_id: into_id.clone(),
+                            budget_rows: captured.budget_rows.unwrap_or(0),
+                        });
+                }
+            }
+            self.events.lock().unwrap().push(captured);
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
@@ -4613,6 +4638,32 @@ mod tests {
     /// runs at a time. The buffer is cleared at the start of each capture call.
     static GLOBAL_CAPTURE: OnceLock<Arc<StdMutex<Vec<CapturedEvent>>>> = OnceLock::new();
     static GLOBAL_INIT: Once = Once::new();
+
+    /// One captured post-commit budget log (curation merge tests).
+    #[derive(Clone)]
+    pub(crate) struct CapturedBudgetLog {
+        pub(crate) message: String,
+        pub(crate) into_id: String,
+        pub(crate) budget_rows: u64,
+    }
+
+    /// Append-only sink the subscriber tees budget logs into. Never cleared:
+    /// curation tests select their own rows by `into_id`, so stale rows from
+    /// other tests are inert rather than a pollution hazard.
+    static BUDGET_EVENTS: OnceLock<Arc<StdMutex<Vec<CapturedBudgetLog>>>> = OnceLock::new();
+
+    fn budget_events_sink() -> Arc<StdMutex<Vec<CapturedBudgetLog>>> {
+        Arc::clone(BUDGET_EVENTS.get_or_init(|| Arc::new(StdMutex::new(Vec::new()))))
+    }
+
+    /// Entry point for the curation merge tests: installs the process-global
+    /// capture subscriber (once for the whole test binary — a second
+    /// `set_global_default` elsewhere would starve one of the captures) and
+    /// returns the budget-log sink it tees into.
+    pub(crate) fn budget_log_events() -> Arc<StdMutex<Vec<CapturedBudgetLog>>> {
+        let _ = global_capture();
+        budget_events_sink()
+    }
 
     fn global_capture() -> Arc<StdMutex<Vec<CapturedEvent>>> {
         GLOBAL_INIT.call_once(|| {

@@ -26,6 +26,8 @@
   array.
 - V6/V7/V8 are frozen no-op slots; their `name` strings appear in the
   production `_schema_migrations` table and must not change.
+- V20 adds durable `blob_gc_claims` plus entity INSERT/UPDATE trigger fences
+  for ADR-091 Amendment 9's external-I/O-free transactional blob sweep.
 
 ### Pack Standard — Pack-Auxiliary Schema (ADR-017)
 
@@ -70,16 +72,16 @@
 - The tags/domain filter in `SqlEntityStore` normalizes values to lowercase
   before comparison so that domain filtering is case-insensitive.
 
-### Brain Pack + Knowledge Sections (ADR-048)
+### Historical pre-consolidation Brain Pack + Knowledge Sections (ADR-048)
 
-- V20 creates `brain_profile_snapshots` and `brain_event_log` tables for
+- Historical V20 creates `brain_profile_snapshots` and `brain_event_log` tables for
   the brain pack (Phase 1).
-- V21 creates `knowledge_sections` with a 10-value SectionType enum, FK to
+- Historical V21 creates `knowledge_sections` with a 10-value SectionType enum, FK to
   `knowledge_atoms`, and UNIQUE(atom_id, section_type) (Phase 2).
 
 ### Daemon & Warm Startup (ADR-049)
 
-- V22 extends `knowledge_atoms`, `knowledge_sections`, and `knowledge_domains`
+- Historical V22 extends `knowledge_atoms`, `knowledge_sections`, and `knowledge_domains`
   with a `status` column (NOT NULL DEFAULT 'draft'), plus `source_uri` and
   `source_type` provenance columns on atoms. Indexes accelerate
   status-filtered list/search paths. Existing finalized atoms are backfilled
@@ -113,6 +115,22 @@ classified as complete.
 See `crates/khive-db/docs/api/pool.md` and `crates/khive-db/docs/api/vectors.md`
 for the per-function routing rules and the tests that pin them down.
 
+### Write-transaction external-work invariant (ADR-091 Amendment 9)
+
+SQLite write transactions contain database statement execution and bounded
+in-memory preparation only. They never contain filesystem/process/network I/O,
+sleeps, blocking waits, embedding/model work, or another subsystem call. The
+enumerated owner/caller audit lives in ADR-091 and is a review invariant: adding
+or widening any `BEGIN IMMEDIATE`, `WriterGuard::transaction`, writer-task
+request, or `SqlAccess::atomic_unit` scope requires updating that table.
+
+Filesystem blob GC is the cross-resource reference design. A database-scoped
+process/advisory owner lock makes every pre-existing claim safely recoverable
+even after root relocation or database restore. Candidate recovery, claim,
+physical deletion, and cleanup proceed in batches of at most 128. Each claim
+and cleanup transaction is SQL-only and commits before filesystem deletion;
+entity triggers reject claimed references in every released-writer interval.
+
 ## Consistency Notes
 
 - **sqlite-vec KNN non-monotonicity** (`stores/vectors.rs`): The IN-subquery
@@ -123,4 +141,4 @@ for the per-function routing rules and the tests that pin them down.
   `embedding_coverage: 0.0` regardless of actual indexed vector count. This is
   a known lie in the stats implementation, not a data issue.
 
-Last reviewed: 2026-06-06
+Last reviewed: 2026-08-09
