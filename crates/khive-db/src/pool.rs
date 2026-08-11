@@ -1103,14 +1103,15 @@ impl ConnectionPool {
     /// of growing its WAL without bound.
     ///
     /// Read-only pools record the claim but have no writer-capable
-    /// connections to reconfigure.
+    /// connections to reconfigure. Writable pools publish the claim only after
+    /// the pooled writer is configured successfully; a failed attempt keeps
+    /// the bounded fallback active and remains retryable.
     pub fn claim_checkpoint_ownership(&self) -> Result<(), SqliteError> {
-        self.checkpoint_owner_claimed.store(true, Ordering::Release);
-        if self.config.read_only {
-            return Ok(());
+        if !self.config.read_only {
+            let writer = self.writer()?;
+            writer.conn().pragma_update(None, "wal_autocheckpoint", 0)?;
         }
-        let writer = self.writer()?;
-        writer.conn().pragma_update(None, "wal_autocheckpoint", 0)?;
+        self.checkpoint_owner_claimed.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -2550,6 +2551,50 @@ mod tests {
             FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
             "an unclaimed in-memory pool keeps the bounded fallback"
         );
+    }
+
+    #[test]
+    fn failed_checkpoint_ownership_claim_keeps_fallback_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_claim_retry.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            checkout_timeout: Duration::from_millis(1),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("pool open");
+
+        let legacy_conn = pool.legacy_conn();
+        let held_writer = legacy_conn.lock();
+        let error = pool
+            .claim_checkpoint_ownership()
+            .expect_err("the held pooled writer must make the claim time out");
+        assert!(matches!(
+            error,
+            SqliteError::WriterPoolCheckoutTimeout { .. }
+        ));
+        assert_eq!(
+            pool.effective_wal_autocheckpoint_pages(),
+            FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+            "a failed claim must leave later writer connections fallback-safe"
+        );
+
+        let fallback_writer = pool
+            .open_standalone_writer()
+            .expect("standalone writer after failed claim");
+        assert_eq!(
+            wal_autocheckpoint_pages(&fallback_writer),
+            FALLBACK_WAL_AUTOCHECKPOINT_PAGES
+        );
+        drop(fallback_writer);
+
+        drop(held_writer);
+        pool.claim_checkpoint_ownership()
+            .expect("the ownership claim remains retryable");
+        assert_eq!(pool.effective_wal_autocheckpoint_pages(), 0);
+        let writer = pool.writer().expect("pooled writer after successful retry");
+        assert_eq!(wal_autocheckpoint_pages(writer.conn()), 0);
     }
 
     #[test]
