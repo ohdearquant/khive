@@ -89,9 +89,9 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "=0.8.0"
-lattice-inference = { version = "=0.8.0", default-features = false }
-lattice-fann = "=0.7.1"
+lattice-embed = "=0.9.0"
+lattice-inference = { version = "=0.9.0", default-features = false }
+lattice-fann = "=0.9.0"
 parking_lot = "0.12"
 rand = "0.8"
 rand_distr = "0.4"
@@ -104,7 +104,7 @@ bytemuck = "1.16"
 unicode-segmentation = "1.11"
 rust-stemmers = "1.2"
 tempfile = "3"
-lru = "0.12"
+lru = "0.18"
 sha2 = "0.10"
 hex = "0.4"
 blake3 = { version = "1", default-features = false }
