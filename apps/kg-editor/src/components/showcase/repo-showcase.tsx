@@ -9,6 +9,7 @@ import {
   CircleDot,
   Clock3,
   Code2,
+  Database,
   GitBranch,
   GitCommitHorizontal,
   GitFork,
@@ -25,6 +26,8 @@ import {
 import { useMemo, useState } from "react";
 
 import { DataState } from "@/components/data-state";
+import { RepositoryTriage } from "@/components/showcase/repository-triage";
+import type { ShowcaseBundleSource } from "@/lib/adapters/preferred-showcase-source";
 import {
   DerivedEdgeMark,
   edgeDirectionMark,
@@ -979,7 +982,7 @@ function ActiveView({ id, bundle, moduleById, onExploreStructure }: ViewProps & 
   );
 }
 
-export function RepoShowcase({ bundle }: { bundle: RepoBundle }) {
+export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback" }: { bundle: RepoBundle; analysisSource?: ShowcaseBundleSource }) {
   const [activeView, setActiveView] = useState<ViewId>("structure_graph");
   const moduleById = useMemo(
     () => new Map(bundle.graph.modules.items.map((module) => [module.id, module])),
@@ -988,15 +991,16 @@ export function RepoShowcase({ bundle }: { bundle: RepoBundle }) {
   const { repository, snapshot, producer } = bundle.meta;
   const { capability } = bundle;
   return (
-    <article className="repo-overview" data-head-sha={snapshot.head_sha}>
+    <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
       <header className="repo-overview-heading">
         <div className="repo-identity"><span className="repo-avatar"><Package aria-hidden="true" /></span><div><span>{repository.host} · {availabilityText(repository.default_branch, capability.labels)}</span><strong>{repository.owner}/{repository.name}</strong></div></div>
-        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span></div>
+        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span></div>
       </header>
       <section className="repo-capability-strip" aria-label={capability.labels.product}>
         <div><ShieldCheck aria-hidden="true" /><div><strong>{capability.labels.product}</strong><span>{capability.mode}</span></div></div>
         <div className="repo-capability-flags">{Object.values(capability.languages).map((language) => <i key={language.label}>{language.label} · {language.module_join ? capability.views.history_structure_navigation.label : capability.labels.unavailable}</i>)}</div>
       </section>
+      <RepositoryTriage key={snapshot.head_sha} bundle={bundle} onOpenAnalysis={setActiveView} />
       <div className="repo-dashboard">
         <nav className="repo-view-nav" aria-label={capability.labels.product}>
           <span>{capability.labels.product}</span>

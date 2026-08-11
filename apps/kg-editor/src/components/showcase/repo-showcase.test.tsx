@@ -20,6 +20,49 @@ function exactish(value: string): RegExp {
 }
 
 describe("repository showcase", () => {
+  it("answers repository triage questions before exposing the raw analysis views", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+
+    render(<RepoShowcase bundle={bundle} />);
+
+    const triage = screen.getByRole("region", { name: "Repository triage" });
+    expect(within(triage).getByRole("heading", { name: "What deserves attention?" })).toBeVisible();
+    expect(within(triage).getByText(`${bundle.graph.modules.items.length} modules`)).toBeVisible();
+    expect(within(triage).getByText(`${bundle.graph.commits.items.length} commits`)).toBeVisible();
+    expect(within(triage).getByText("Observed", { selector: "span" })).toBeVisible();
+    expect(within(triage).getAllByText("Candidate", { selector: "span" }).length).toBeGreaterThan(0);
+
+    const firstStart = within(triage).getAllByRole("button", { name: /inspect .*\.rs/i })[0];
+    await user.click(firstStart);
+    const inspector = within(triage).getByRole("complementary", { name: "Module evidence" });
+    expect(within(inspector).getByText("Analysis window")).toBeVisible();
+    expect(within(inspector).getByRole("heading", { name: "Recent commits" })).toBeVisible();
+
+    await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "pool.rs");
+    const poolResult = within(triage).getByRole("button", { name: /inspect .*pool\.rs/i });
+    await user.click(poolResult);
+    expect(within(inspector).getByRole("heading", { level: 3 }).textContent).toContain("pool.rs");
+
+    await user.click(within(triage).getAllByRole("button", { name: /open full analysis/i })[0]);
+    expect(screen.getByRole("button", { name: bundle.capability.views.hotspot_quadrant.label })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("navigation", { name: bundle.capability.labels.product })).toBeVisible();
+  });
+
+  it("keeps module search bounded and gives an empty result one recovery action", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "definitely-not-a-module");
+
+    const empty = triage.querySelector<HTMLElement>('[data-state="empty"]')!;
+    expect(empty).toBeVisible();
+    expect(empty.querySelectorAll("button")).toHaveLength(1);
+    await user.click(within(empty).getByRole("button", { name: "Clear search" }));
+    expect(within(triage).getByRole("searchbox", { name: "Find a module or path" })).toHaveValue("");
+  });
+
   it("renders all ten capability-owned view labels", () => {
     const bundle = golden();
     render(<RepoShowcase bundle={bundle} />);
@@ -181,12 +224,7 @@ describe("repository showcase", () => {
 
     const { container } = render(<RepoShowcase bundle={bundle} />);
 
-    // Multiple `[data-state="truncated"]` disclosures can coexist: the browser-side
-    // local display slice (bound = shown, always ambient once a list exceeds the UI
-    // row cap) is a separate concern from the bundle's own page-bound disclosure.
-    // Target the modules page's own disclosure by its distinguishing reason text.
-    const state = Array.from(container.querySelectorAll<HTMLElement>('[data-state="truncated"]'))
-      .find((node) => node.textContent?.includes("fixture node budget"));
+    const state = container.querySelector<HTMLElement>(`.repo-view-panel [data-state="truncated"][data-bound="${bundle.graph.modules.bound.max_items}"]`);
     expect(state).toBeVisible();
     expect(state).toHaveAttribute("data-bound", String(bundle.graph.modules.bound.max_items));
     if (bundle.graph.modules.total_count.status === "available") {
@@ -285,7 +323,9 @@ describe("repository showcase", () => {
     await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
 
     expect(container.querySelectorAll(".repo-view-panel tbody tr")).toHaveLength(200);
-    expect(Array.from(container.querySelectorAll(".repo-view-panel .repo-bounded.truncated")).some((node) => node.textContent?.toLocaleLowerCase().includes(bundle.capability.labels.truncated.toLocaleLowerCase()))).toBe(true);
+    const localSlice = container.querySelector<HTMLElement>(`.repo-view-panel [data-state="truncated"][data-shown="200"][data-known-total="${bundle.aggregates.hotspot_quadrant.data.items.length}"]`);
+    expect(localSlice).toBeVisible();
+    expect(localSlice).toHaveTextContent(/truncated/i);
   });
 
   it("settles the structure graph without collapsing nodes onto a handful of shared coordinates", () => {
