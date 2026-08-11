@@ -173,6 +173,15 @@ not-committed result without changing the atomic path's existing process-exit
 semantics. Ordinary validation, transport, storage, and authorization-gate
 failures remain unclassified unless `--strict` supplies the aggregate reason.
 
+After `atomic.committed=true`, the write must not be replayed. If deferred
+reindexing or canonical result rendering then fails, the command exits
+successfully with `atomic.status="committed_degraded"`,
+`atomic.retryable=false`, and one or more typed `atomic.degradations` entries.
+Treat `post_commit_reindex` as an index-repair requirement and
+`result_rendering` as a result re-read requirement; neither means the mutation
+failed. A render-degraded result remains `ok=true` with `result=null` and its
+own non-retryable degradation marker.
+
 When an explicit `--db` conflicts with a selected multi-backend config,
 dispatch does not begin. The command emits
 `error.code = "database_override_conflict"` with

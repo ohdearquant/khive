@@ -107,6 +107,81 @@ impl std::fmt::Display for AtomicExecFailure {
 
 impl std::error::Error for AtomicExecFailure {}
 
+#[derive(Clone, Debug)]
+struct AtomicDegradation {
+    stage: &'static str,
+    op_index: Option<usize>,
+    tool: Option<String>,
+    error: String,
+}
+
+impl AtomicDegradation {
+    fn post_commit_reindex(error: anyhow::Error) -> Self {
+        Self {
+            stage: "post_commit_reindex",
+            op_index: None,
+            tool: None,
+            error: format!("post-commit reindex after atomic unit commit: {error:#}"),
+        }
+    }
+
+    fn result_rendering(op_index: usize, tool: &str, error: anyhow::Error) -> Self {
+        Self {
+            stage: "result_rendering",
+            op_index: Some(op_index),
+            tool: Some(tool.to_string()),
+            error: format!(
+                "op {op_index} (`{tool}`) committed but result rendering failed: {error:#}"
+            ),
+        }
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "stage": self.stage,
+            "op_index": self.op_index,
+            "tool": self.tool.as_deref(),
+            "error": self.error.as_str(),
+        })
+    }
+}
+
+fn committed_atomic_block(degradations: &[AtomicDegradation]) -> Value {
+    let mut atomic = json!({
+        "committed": true,
+        "rolled_back": false,
+        "failed_op_index": Value::Null,
+        "error": Value::Null,
+    });
+    if !degradations.is_empty() {
+        atomic["status"] = json!("committed_degraded");
+        atomic["retryable"] = json!(false);
+        atomic["degradations"] = Value::Array(
+            degradations
+                .iter()
+                .map(AtomicDegradation::as_json)
+                .collect(),
+        );
+    }
+    atomic
+}
+
+fn committed_degraded_result_entry(
+    op_index: usize,
+    tool: &str,
+    degradation: &AtomicDegradation,
+) -> Value {
+    json!({
+        "ok": true,
+        "tool": tool,
+        "op_index": op_index,
+        "result": Value::Null,
+        "status": "committed_degraded",
+        "retryable": false,
+        "degradation": degradation.as_json(),
+    })
+}
+
 fn atomic_failure_error(
     ops: &[OpsFileEntry],
     message: String,
@@ -226,8 +301,10 @@ fn add_post_commit_embedding_warning(
 /// (`{"results", "summary", "atomic"}`) on success or a rolled-back run; the
 /// `Err` cases are typed preflight/prepare failures, the op-count guard, an
 /// unsupported multi-backend config, or a genuine `atomic_unit` seam failure
-/// (`AtomicRunnerError`). Preflight and prepare failures happen before any
-/// target write and retain a per-operation envelope for the CLI boundary.
+/// (`AtomicRunnerError`). Post-commit reindex and result-rendering failures
+/// instead return a committed, non-retryable degraded envelope. Preflight and
+/// prepare failures happen before any target write and retain a per-operation
+/// envelope for the CLI boundary.
 pub(crate) async fn execute_atomic_ops_file(
     ops: Vec<OpsFileEntry>,
     cfg: RuntimeConfig,
@@ -377,14 +454,27 @@ pub(crate) async fn execute_atomic_ops_file(
             // never fails an already-committed atomic unit, but is visible.
             let gtd_audit_outcomes =
                 apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
+            let mut degradations = Vec::new();
             let embedding_outcomes =
-                khive_runtime::atomic_prepare::apply_post_commit_effects_with_report(
+                match khive_runtime::atomic_prepare::apply_post_commit_effects_with_report(
                     &runtime,
                     &token,
                     post_commit,
                 )
                 .await
-                .context("post-commit reindex after atomic unit commit")?;
+                {
+                    Ok(outcomes) => outcomes,
+                    Err(error) => {
+                        let degradation =
+                            AtomicDegradation::post_commit_reindex(anyhow::Error::new(error));
+                        tracing::warn!(
+                            error = %degradation.error,
+                            "atomic unit committed but post-commit reindex failed"
+                        );
+                        degradations.push(degradation);
+                        Vec::new()
+                    }
+                };
             // ADR-099 B3: render each committed op's
             // canonical-shaped `result` payload (ADR-099 D4 requires
             // `results[i].result`; the pre-fix envelope carried only
@@ -392,7 +482,7 @@ pub(crate) async fn execute_atomic_ops_file(
             // safe post-commit, same reasoning as the reindex pass above.
             let mut results: Vec<Value> = Vec::with_capacity(ops.len());
             for (idx, op) in ops.iter().enumerate() {
-                let mut result = build_op_result(
+                let rendered = build_op_result(
                     &runtime,
                     &token,
                     &op.tool,
@@ -401,34 +491,39 @@ pub(crate) async fn execute_atomic_ops_file(
                     &plans[idx],
                     &gtd_audit_outcomes,
                 )
-                .await
-                .with_context(|| {
-                    format!(
-                        "op {idx} (`{}`) committed but result rendering failed",
-                        op.tool
-                    )
-                })?;
-                let embedding_effect = match &plans[idx] {
-                    AtomicOpPlan::Update(plan) => Some(plan.post_commit()),
-                    _ => None,
-                };
-                add_post_commit_embedding_warning(
-                    &mut result,
-                    embedding_effect,
-                    &embedding_outcomes,
-                );
-                results
-                    .push(json!({"ok": true, "tool": op.tool, "op_index": idx, "result": result}));
+                .await;
+                match rendered {
+                    Ok(mut result) => {
+                        let embedding_effect = match &plans[idx] {
+                            AtomicOpPlan::Update(plan) => Some(plan.post_commit()),
+                            _ => None,
+                        };
+                        add_post_commit_embedding_warning(
+                            &mut result,
+                            embedding_effect,
+                            &embedding_outcomes,
+                        );
+                        results.push(
+                            json!({"ok": true, "tool": op.tool, "op_index": idx, "result": result}),
+                        );
+                    }
+                    Err(error) => {
+                        let degradation = AtomicDegradation::result_rendering(idx, &op.tool, error);
+                        tracing::warn!(
+                            error = %degradation.error,
+                            op_index = idx,
+                            tool = %op.tool,
+                            "atomic unit committed but operation result rendering failed"
+                        );
+                        results.push(committed_degraded_result_entry(idx, &op.tool, &degradation));
+                        degradations.push(degradation);
+                    }
+                }
             }
             json!({
                 "results": results,
                 "summary": {"total": total, "succeeded": total, "failed": 0},
-                "atomic": {
-                    "committed": true,
-                    "rolled_back": false,
-                    "failed_op_index": Value::Null,
-                    "error": Value::Null,
-                },
+                "atomic": committed_atomic_block(&degradations),
             })
         }
         AtomicRunOutcome::RolledBack {
@@ -1235,7 +1330,10 @@ async fn prepare_gtd_complete(
 /// `kkernel::exec::tests::atomic_update_unknown_field_is_rejected_and_does_not_mutate_row`.
 #[cfg(test)]
 mod validate_atomic_args_tests {
-    use super::{add_post_commit_embedding_warning, validate_atomic_args, PostCommitEffect, Uuid};
+    use super::{
+        add_post_commit_embedding_warning, committed_atomic_block, committed_degraded_result_entry,
+        validate_atomic_args, AtomicDegradation, PostCommitEffect, Uuid,
+    };
     use serde_json::json;
 
     #[test]
@@ -1292,6 +1390,40 @@ mod validate_atomic_args_tests {
         let expected = json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         assert_eq!(first_result["warnings"], expected);
         assert_eq!(second_result["warnings"], expected);
+    }
+
+    #[test]
+    fn committed_reindex_failure_is_typed_degraded_and_non_retryable() {
+        let degradation =
+            AtomicDegradation::post_commit_reindex(anyhow::anyhow!("fts maintenance unavailable"));
+        let atomic = committed_atomic_block(std::slice::from_ref(&degradation));
+
+        assert_eq!(atomic["committed"], true);
+        assert_eq!(atomic["rolled_back"], false);
+        assert_eq!(atomic["status"], "committed_degraded");
+        assert_eq!(atomic["retryable"], false);
+        assert_eq!(atomic["degradations"][0]["stage"], "post_commit_reindex");
+        assert!(atomic["degradations"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("fts maintenance unavailable")));
+    }
+
+    #[test]
+    fn committed_render_failure_keeps_operation_successful_and_non_retryable() {
+        let degradation = AtomicDegradation::result_rendering(
+            2,
+            "link",
+            anyhow::anyhow!("committed edge read failed"),
+        );
+        let result = committed_degraded_result_entry(2, "link", &degradation);
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["result"], serde_json::Value::Null);
+        assert_eq!(result["status"], "committed_degraded");
+        assert_eq!(result["retryable"], false);
+        assert_eq!(result["degradation"]["stage"], "result_rendering");
+        assert_eq!(result["degradation"]["op_index"], 2);
+        assert_eq!(result["degradation"]["tool"], "link");
     }
 
     #[test]

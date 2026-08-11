@@ -641,3 +641,44 @@ implementation was restructured to the seam this ADR mandates:
    (kind-vs-substrate NotFound shape on `update`; the `link`
    target-backend conflict arm) are obsolete: both paths now execute the same code, so
    the divergences no longer exist and no compensating documentation is required.
+
+---
+
+## Amendment 2 (2026-08-11) — committed post-processing degradation is non-retryable
+
+The successful commit is the irreversible retry-safety boundary. Once the commit pass returns
+`AtomicRunOutcome::Committed`, neither deferred index maintenance nor canonical result rendering
+may convert the invocation into an error that invites replay. The base DML is already durable at
+that point.
+
+A post-commit reindex or result-rendering failure therefore returns the ordinary successful
+`results` and `summary` envelope with the D4 atomic facts preserved:
+`committed=true`, `rolled_back=false`, `failed_op_index=null`, and `error=null`. The `atomic` object
+also carries these additive fields:
+
+```json
+{
+  "status": "committed_degraded",
+  "retryable": false,
+  "degradations": [
+    {
+      "stage": "post_commit_reindex",
+      "op_index": null,
+      "tool": null,
+      "error": "<diagnostic>"
+    }
+  ]
+}
+```
+
+The closed stage spellings in this amendment are `post_commit_reindex` and `result_rendering`.
+For a rendering failure, the affected result entry remains `ok=true` because its mutation
+committed; it carries `result=null`, `status="committed_degraded"`, `retryable=false`, and the same
+typed degradation object with its `op_index` and `tool`. `summary.succeeded` continues to count
+durable mutations, not successful presentation reads. Other committed results are still rendered,
+so one failed read does not erase the outcomes that remain available.
+
+The reindex stage remains best-effort as D3 already requires. Its failure means the derived search
+index may need repair; it does not mean the source row update failed. Full success, pre-commit
+failure, and rollback envelopes are unchanged. This is a CLI-only additive contract and does not
+change the MCP `request` wire surface.
