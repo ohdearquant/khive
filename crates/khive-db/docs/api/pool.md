@@ -47,6 +47,29 @@ writer task would let concurrent migrated stores over the same pool spawn
 independent writer connections that contend with each other at `BEGIN
 IMMEDIATE`, defeating the point of ADR-067 Component A.
 
+## `ConnectionPool::writer_task_for_write` — write-time store routing (#1847)
+
+Store construction is synchronous and can happen before a Tokio runtime is
+entered. A constructor may therefore cache no writer-task handle even though a
+later write runs inside a runtime where the pool can spawn (or retrieve) its
+single task. Every SQLite-backed store resolves through
+`writer_task_for_write` at the write seam, including transaction-owning and
+batch entry points, so a construction-time `None` is never a permanent routing
+decision.
+
+When `write_routing_strict` is enabled, a missing handle fails closed: a
+missing runtime preserves `StorageError::WriterTaskNoRuntime`, while an
+explicitly disabled or degraded queue returns a typed `StorageError::Pool`
+naming the operation. In compatibility mode, a caller may use its legacy
+standalone/pool-mutex writer only after this lookup returns `None`; that exact
+fallback emits a store-specific `direct_route_violation` when the file-backed
+queue is enabled.
+
+This routing hardening does **not** flip the strict-mode default. ADR-135 F2
+and ADR-136 D2 still require production A/B evidence and a release gate before
+`write_routing_strict` can become the default; until that evidence is accepted,
+`KHIVE_WRITE_ROUTING=strict` remains opt-in.
+
 ## Test coverage notes
 
 ### `writer_guard_transaction_registers_during_closure_only`

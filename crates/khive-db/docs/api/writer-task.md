@@ -64,12 +64,10 @@ successful response cannot race ahead of its telemetry sample.
 
 See `crates/khive-db/src/writer_task.rs` — private fn `run_writer_task`.
 
-A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from lock
-contention with an unmigrated writer path still holding the pool's writer
-mutex — reachable while any write path outside the routed-call
-classification table in `writer_task.rs`'s module docs still opens its own
-writer; strict routing per ADR-136 D1 has not landed) replies the request's
-error via `AnyWriteRequest::reply_error` without ever invoking the
+A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from an explicitly
+exempt writer or a non-strict compatibility fallback still holding another
+writer connection) replies the request's error via
+`AnyWriteRequest::reply_error` without ever invoking the
 request's operation closure via `AnyWriteRequest::execute_and_reply`.
 For transaction-wrapped requests, the scoped `writer_task_tx` registry span
 is dropped before the oneshot reply wakes the caller, both after a completed
@@ -78,6 +76,12 @@ therefore cannot still observe that request as an open SQL transaction.
 There is no watchdog/retry story for a failed `BEGIN` (ADR-067
 Component D remains future work); the connection simply tries
 `BEGIN IMMEDIATE` fresh on the next request.
+
+Request-path stores refresh a missing construction-time handle at write time.
+Strict routing therefore fails closed before any store fallback, and a
+non-strict fallback emits a store-specific `direct_route_violation`. The
+strict-default flip is intentionally outside this tranche: ADR-135 F2 and
+ADR-136 D2 still gate it on accepted production A/B and release evidence.
 
 Exits normally when every `WriterTaskHandle` clone is dropped and the channel
 closes (`rx.recv()` returns `None`). A panic while executing a request, a failed

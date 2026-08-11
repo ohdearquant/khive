@@ -49,6 +49,40 @@ async fn test_insert_and_get() {
     assert_eq!(fetched.owner_visible_namespaces, vec!["local".to_string()]);
 }
 
+/// #1847: the writer task owns the transaction around the agent ledger's
+/// provider-session pre-check plus insert. Sending the legacy BEGIN wrapper
+/// through the queue would deterministically fail as a nested transaction.
+#[tokio::test]
+async fn agent_insert_uses_writer_task_owned_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("agent-writer-task-transaction.db")),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(AGENTS_DDL).unwrap();
+    }
+    let before = pool.writer_acquisition_snapshot();
+    let store = SqlAgentStore::new(Arc::clone(&pool), true);
+
+    store
+        .insert(&make_record("agent-queued", "actor-a"))
+        .await
+        .expect("agent insert must use the writer task's existing transaction");
+
+    let after = pool.writer_acquisition_snapshot();
+    assert_eq!(
+        after.writer_task_acquisitions,
+        before.writer_task_acquisitions + 1,
+        "agent insert must acquire the shared writer task exactly once"
+    );
+}
+
 #[tokio::test]
 async fn test_get_missing_returns_none() {
     let store = setup_memory_store();
@@ -264,4 +298,39 @@ async fn test_terminate_all_non_terminal_boot_scan() {
     let c = store.get("agent-c").await.unwrap().unwrap();
     assert_eq!(c.terminal_reason, Some(TerminalReason::Completed));
     assert_eq!(c.state_changed_at, 1_000);
+}
+
+/// #1847: the agent-process ledger was added after the original strict-route
+/// census. It must fail closed like every other store when strict routing is
+/// requested without a writer-task handle.
+#[test]
+fn agent_write_strict_routing_fails_closed_without_writer_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("agent-strict-routing.db")),
+            write_queue_enabled: Some(false),
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(AGENTS_DDL).unwrap();
+    }
+    let store = SqlAgentStore::new(pool, true);
+
+    let error = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(store.insert(&make_record("agent-strict", "actor-a")))
+        .expect_err("strict routing must refuse the standalone writer fallback");
+    assert!(
+        matches!(
+            &error,
+            StorageError::Pool { operation, .. } if operation == "agent_insert"
+        ),
+        "strict routing must return the typed operation error, got: {error:?}"
+    );
+    assert!(error.to_string().contains("strict"), "got: {error}");
 }

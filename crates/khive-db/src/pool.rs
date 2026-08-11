@@ -79,10 +79,11 @@ pub struct PoolConfig {
     /// ADR-135 Amendment 1 and ADR-136 D1/D2 — the strict-routing default
     /// flip has NOT happened.
     ///
-    /// The set of routed write paths is the classification table in
-    /// `writer_task.rs` (module docs), not any single store; routing does
-    /// not yet claim ADR-067's single-writer guarantee — unmigrated write
-    /// paths still open their own writers until strict routing lands.
+    /// The store layer resolves all of its routed write paths at write time;
+    /// the classification table in `writer_task.rs` remains the authoritative
+    /// inventory. This tranche does not claim the repository-wide
+    /// single-writer guarantee: direct runtime-orchestration call sites remain
+    /// #1847 follow-up work, and the strict default is still evidence-gated.
     ///
     /// `None` means the caller expressed no preference: [`ConnectionPool::new`]
     /// resolves it once `path` is known, defaulting to `true` for file-backed
@@ -104,12 +105,13 @@ pub struct PoolConfig {
     /// Overridable via `KHIVE_WRITE_QUEUE_CAPACITY`. Default: 256 pending
     /// operations (ADR-067 Component A recommended default).
     pub write_queue_capacity: usize,
-    /// ADR-136 D1: when `true`, every write path that would otherwise
-    /// silently degrade to the legacy pool-mutex/standalone-connection path
-    /// on a missing or failed `WriterTask` handle instead returns an error.
-    /// Exercises the completed routing (ADR-135 F2's strict-routing
-    /// precondition) without changing behavior for callers that never set
-    /// the env var.
+    /// ADR-136 D1: when `true`, every covered store write path that would
+    /// otherwise silently degrade to the legacy pool-mutex/standalone-
+    /// connection path on a missing or failed `WriterTask` handle instead
+    /// returns an error.
+    /// Exercises the store-layer routing tranche toward ADR-135 F2's
+    /// strict-routing precondition without changing behavior for callers that
+    /// never set the env var.
     ///
     /// Overridable via `KHIVE_WRITE_ROUTING` (value `"strict"`,
     /// case-insensitive; anything else, or unset, leaves this `false`).
@@ -932,6 +934,52 @@ impl ConnectionPool {
                 }
             })
             .clone())
+    }
+
+    /// Resolve the writer task for a store write at the moment the write is
+    /// issued, rather than trusting only a handle cached by a synchronous
+    /// store constructor. Construction can legitimately run before Tokio is
+    /// entered, in which case `writer_task_handle()` returns
+    /// `WriterTaskNoRuntime` without caching a terminal `None`.
+    ///
+    /// Strict routing makes every missing handle fail closed here. The
+    /// caller remains responsible for recording a non-strict direct fallback
+    /// at the exact fallback seam with [`Self::record_direct_route`].
+    pub(crate) fn writer_task_for_write(
+        &self,
+        cached: Option<&WriterTaskHandle>,
+        operation: &'static str,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        let handle = match cached {
+            Some(handle) => Some(handle.clone()),
+            None => match self.writer_task_handle() {
+                Ok(handle) => handle,
+                Err(error) if self.config.write_routing_strict => return Err(error),
+                Err(_) => None,
+            },
+        };
+
+        if handle.is_none() && self.config.write_routing_strict {
+            return Err(StorageError::Pool {
+                operation: operation.into(),
+                message: "strict write routing requires a writer-task handle; no handle is \
+                          available, so the direct writer fallback was refused"
+                    .into(),
+            });
+        }
+        Ok(handle)
+    }
+
+    /// Record one actual compatibility fallback around the writer task. A
+    /// file-backed pool with the queue enabled should never reach this seam
+    /// in strict mode because [`Self::writer_task_for_write`] refuses first.
+    pub(crate) fn record_direct_route(&self, site: crate::timeout_sink::Site) {
+        if self.write_queue_active() {
+            crate::timeout_sink::emit_direct_route_violation(
+                &crate::timeout_sink::db_label(self),
+                site,
+            );
+        }
     }
 
     /// Test-only: how many times the writer-task init closure actually ran.
@@ -2969,6 +3017,28 @@ mod tests {
             0,
             "the guard must reject before ever attempting tokio::spawn"
         );
+    }
+
+    /// #1847: strict store routing must preserve the typed missing-runtime
+    /// failure instead of collapsing it into a direct-writer fallback.
+    #[test]
+    fn strict_writer_task_for_write_preserves_missing_runtime_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("strict_writer_task_no_runtime.db")),
+            write_queue_enabled: Some(true),
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+
+        let result = pool.writer_task_for_write(None, "strict_test_write");
+
+        assert!(
+            matches!(result, Err(StorageError::WriterTaskNoRuntime)),
+            "strict routing must preserve WriterTaskNoRuntime, got {result:?}"
+        );
+        assert_eq!(pool.writer_task_spawn_count(), 0);
     }
 
     /// Join-handle lifecycle: a spawn-configured pool stores exactly one

@@ -2527,7 +2527,7 @@ async fn test_search_rank_within_cap_counts_two_fts_passes() {
 /// `upsert_documents_routes_through_writer_task_when_flag_enabled` above (a
 /// `writer_task_spawn_count() == 1` assertion alone is a false positive:
 /// `upsert_document` setup calls already spawn/use the task). Red-proof:
-/// reverting the `if let Some(writer_task) = &self.writer_task` branch in
+/// reverting the `current_writer_task("fts_rename_namespace")` branch in
 /// `rename_namespace` (forcing every call through `with_writer_unmanaged`)
 /// makes `saw_enqueued` stay `false` and this test fail — see the impl
 /// report for the exact revert/run/restore transcript.
@@ -2663,7 +2663,7 @@ async fn rename_namespace_strict_routing_fails_closed_without_writer_task() {
 /// Deliberately `#[test]`, not `#[tokio::test]`: construction must happen
 /// with no ambient runtime, which a `#[tokio::test]` function body would
 /// not give it (the whole test body already runs on a Tokio worker thread).
-/// Red-proof: reverting `with_writer`'s `self.current_writer_task()` check
+/// Red-proof: reverting `with_writer`'s `self.current_writer_task(op)` check
 /// back to `&self.writer_task` makes `saw_enqueued` stay `false` and this
 /// test fail — the write takes the direct-connection path immediately
 /// instead of ever appearing in the writer task's channel.

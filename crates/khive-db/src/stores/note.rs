@@ -286,8 +286,8 @@ impl SqlNoteStore {
         // fallback remains possible (ADR-067 Component A, mirrors
         // entity.rs policy): a missing writer task — explicitly disabled,
         // spawn degraded, or no Tokio runtime available at this first
-        // access — degrades to the legacy pool-mutex path rather than
-        // failing construction.
+        // access — is cached without failing construction. Every write
+        // re-resolves it and applies strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
@@ -303,20 +303,28 @@ impl SqlNoteStore {
             .map_err(|error| map_sqlite_err(error, "open_note_reader"))
     }
 
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        self.pool
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
+    }
+
     /// Route a single-row write through the pool-wide `WriterTask` when
-    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
-    /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
+    /// the write queue is enabled and a handle is available. Strict mode
+    /// refuses a missing handle; compatibility mode falls back to the legacy
+    /// pool-mutex path (ADR-067 Component A, Fork C slice 2).
     ///
     /// This is the routing point for single-statement `with_writer` callers
     /// in this store (`update_note_properties`, `set_note_property`,
     /// `delete_note`). `f` must be DML-only — on the flag-on path it runs
     /// inside the WriterTask's own transaction, so a bare `BEGIN IMMEDIATE`
     /// would violate SQLite's nested-transaction rule. `upsert_notes` (the
-    /// batch method) does its own flag check and returns early on `Some`, so
-    /// its fallback call into this helper only ever executes on the flag-off
-    /// path
-    /// (`self.writer_task` is `None` by construction whenever that call is
-    /// reached) — no double-routing. Callers whose `f` issues more than one
+    /// batch method) performs the same write-time lookup first; a non-strict
+    /// `None` then falls through this helper, which records the actual
+    /// compatibility fallback. Strict mode returns before the direct-writer
+    /// seam. Callers whose `f` issues more than one
     /// DML statement that must land atomically together (`upsert_note`,
     /// `try_insert_note`, `patch_note_property_atomic`) use
     /// [`Self::with_writer_tx`] instead — see its doc comment (khive #827,
@@ -326,12 +334,14 @@ impl SqlNoteStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteNote);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
@@ -366,10 +376,12 @@ impl SqlNoteStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task.send_bounded(f).await;
         }
 
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteNote);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;

@@ -33,6 +33,13 @@
 //! | Recovery (`walpin` beacon/sidecar bookkeeping) | None — file-level bookkeeping (PID beacons, heartbeats) alongside the database, not a SQL connection against it | No | N/A — never acquires a database writer connection |
 //! | Top-level maintenance (`VACUUM` via `execute_script_top_level`/`WriterTaskHandle::send_top_level`) | `WriterTaskHandle`, skipping the per-request `BEGIN IMMEDIATE`/`COMMIT` wrap only | Yes | Routed through the SAME single writer owner as every other queued request — only the transaction wrap is skipped, never the queue |
 //!
+//! Store constructors may run outside Tokio and temporarily cache no handle;
+//! every store request-path write refreshes through
+//! `ConnectionPool::writer_task_for_write` at execution time. Strict routing
+//! refuses a missing handle, while the explicit compatibility fallback emits
+//! its store-specific violation at the actual direct-writer seam. The strict
+//! default itself remains gated by ADR-135 F2 / ADR-136 D2 evidence.
+//!
 //! A `direct_route_violation` sink row (`timeout_sink::emit_direct_route_violation`,
 //! ADR-136 D1 gate 6c) is emitted ONLY for the first row's degrade path — a
 //! `SqlAccess`-reachable write that bypassed an enabled queue. The other four
