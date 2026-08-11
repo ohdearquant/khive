@@ -194,9 +194,16 @@ async fn bridge_self_heals_across_in_place_reexec_without_losing_the_client_sess
         .arg(":memory:")
         .arg("--pack")
         .arg("kg")
+        // Keep both generations of the exec-preserved bridge on a hermetic
+        // config-discovery seat. An operator's cwd/HOME config (including a
+        // now-rejected legacy `[gate]` section) is unrelated to the protocol
+        // mismatch behavior and must not terminate generation one first.
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
         .env("KHIVE_SOCKET", &sock)
         .env("KHIVE_PID", &pid_file)
         .env("KHIVE_LOCK", &lock_file)
+        .env_remove("KHIVE_CONFIG")
         .env_remove("KHIVE_NO_DAEMON");
 
     let (child_transport, stderr) = TokioChildProcess::builder(command)

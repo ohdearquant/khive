@@ -110,7 +110,7 @@ pub fn checkpoint_probe(conn: &Connection) -> rusqlite::Result<CheckpointProbe> 
     })
 }
 
-/// The six ADR-091 checkpoint counters, read as one snapshot.
+/// ADR-091 checkpoint counters, read as one snapshot.
 ///
 /// The two `Option` fields carry the `u64::MAX` "never observed" sentinel as
 /// `None`, so a caller serializing this never sees `18446744073709551615`
@@ -123,9 +123,15 @@ pub struct CheckpointCounters {
     pub checkpoint_skipped_ticks: u64,
     pub checkpoint_consecutive_skips: u64,
     pub checkpoint_last_skip_wal_pages: Option<u64>,
+    pub checkpoint_pressure_elevated_ticks: u64,
+    pub checkpoint_pressure_episodes_started: u64,
+    pub checkpoint_pressure_episodes_recovered: u64,
+    pub checkpoint_lifecycle_append_attempts: u64,
+    pub checkpoint_lifecycle_append_failures: u64,
+    pub checkpoint_lifecycle_enqueue_drops: u64,
 }
 
-/// Snapshot the six process-global ADR-091 counters.
+/// Snapshot the process-global ADR-091 counters.
 pub fn checkpoint_counters() -> CheckpointCounters {
     CheckpointCounters {
         last_observed_wal_pages: checkpoint::last_observed_wal_pages(),
@@ -134,6 +140,13 @@ pub fn checkpoint_counters() -> CheckpointCounters {
         checkpoint_skipped_ticks: checkpoint::checkpoint_skipped_ticks(),
         checkpoint_consecutive_skips: checkpoint::checkpoint_consecutive_skips(),
         checkpoint_last_skip_wal_pages: checkpoint::checkpoint_last_skip_wal_pages(),
+        checkpoint_pressure_elevated_ticks: checkpoint::checkpoint_pressure_elevated_ticks(),
+        checkpoint_pressure_episodes_started: checkpoint::checkpoint_pressure_episodes_started(),
+        checkpoint_pressure_episodes_recovered: checkpoint::checkpoint_pressure_episodes_recovered(
+        ),
+        checkpoint_lifecycle_append_attempts: checkpoint::checkpoint_lifecycle_append_attempts(),
+        checkpoint_lifecycle_append_failures: checkpoint::checkpoint_lifecycle_append_failures(),
+        checkpoint_lifecycle_enqueue_drops: checkpoint::checkpoint_lifecycle_enqueue_drops(),
     }
 }
 
@@ -712,7 +725,7 @@ mod tests {
     }
 
     /// The verb must not perturb the state it reports: the probe touches none
-    /// of the six ADR-091 counters.
+    /// of the ADR-091 counters.
     #[test]
     #[serial(checkpoint_skip_metrics)]
     fn checkpoint_probe_does_not_perturb_the_adr091_counters() {
@@ -799,6 +812,12 @@ mod tests {
             "checkpoint_skipped_ticks",
             "checkpoint_consecutive_skips",
             "checkpoint_last_skip_wal_pages",
+            "checkpoint_pressure_elevated_ticks",
+            "checkpoint_pressure_episodes_started",
+            "checkpoint_pressure_episodes_recovered",
+            "checkpoint_lifecycle_append_attempts",
+            "checkpoint_lifecycle_append_failures",
+            "checkpoint_lifecycle_enqueue_drops",
         ] {
             assert!(counters.get(key).is_some(), "counter {key} must be present");
         }
@@ -927,6 +946,12 @@ mod tests {
             checkpoint_skipped_ticks: 0,
             checkpoint_consecutive_skips: 0,
             checkpoint_last_skip_wal_pages: None,
+            checkpoint_pressure_elevated_ticks: 0,
+            checkpoint_pressure_episodes_started: 0,
+            checkpoint_pressure_episodes_recovered: 0,
+            checkpoint_lifecycle_append_attempts: 0,
+            checkpoint_lifecycle_append_failures: 0,
+            checkpoint_lifecycle_enqueue_drops: 0,
         };
         let json = serde_json::to_value(counters).expect("serializes");
         assert!(json["last_observed_wal_pages"].is_null());

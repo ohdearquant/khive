@@ -1208,7 +1208,40 @@ invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
 run. A background checkpoint tick may independently perform its normal cleanup, but the
 diagnostic request itself never converts an unmeasured value into a clean-looking zero.
 
-### 2026-08-09 amendment (Amendment 7): routine logical WAL and writer-stage telemetry
+### 2026-08-09 amendment (Amendment 7): admitted cached-reader snapshots
+
+**Correction.** The original inventory predates the file-backed `SqlBridge` connection cache.
+`SqlAccess::reader()` and queue-backed `SqlWriter` reads now retain a read-only connection across
+calls; connection lifetime alone is not a snapshot lifetime, but an unfinalized statement or
+unadmitted transaction on that cache would reproduce the multi-hour WAL pin this ADR governs.
+Issue #1828 also showed that charging an idle cached connection against `max_readers` exhausts the
+process-local admission budget even when the connection is correctly in autocommit.
+
+**Decision.** An idle cached reader owns no reader permit and must be in autocommit. Each ordinary
+query acquires a permit for its blocking SQLite operation and releases it only after the statement
+is finalized and autocommit is verified. One explicit top-level deferred read transaction is
+allowed as one logical read operation: its successful `BEGIN` transfers the operation permit onto
+the handle; queries reuse it; `COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite
+reports autocommit. Immediate/exclusive starts and nested transaction controls remain rejected.
+Cancellation or handle drop destroys the connection before its retained transaction permit, so
+there is never an idle WAL snapshot outside admission. See ADR-005's 2026-08-09 amendment for the
+full raw-SQL capability contract.
+
+**Checkpoint acceptance.** The integration regression
+`multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress` retains eight idle
+cached reader handles against a two-reader budget after each handle completes its one-shot read,
+while repeated write cycles run with SQLite autocheckpoint disabled. The dedicated Amendment 5
+checkpoint connection copies every WAL frame on each PASSIVE cycle and the WAL file remains
+bounded. This is #1828's permit-lifetime acceptance: idle handles no longer retain reader
+admission, without depending on a zero-reader TRUNCATE window or reintroducing per-writer
+autocheckpoint (#1848).
+
+This regression does not reproduce or close #1460 or #1812. An idle autocommit connection does
+not pin WAL; those issues concern production stdio/multiprocess pinning and continuous
+concurrent-session WAL bounds, respectively, and remain open pending their own
+production-shaped regressions and fixes.
+
+### 2026-08-09 amendment (Amendment 8): routine logical WAL and writer-stage telemetry
 
 **Motivation.** Physical `-wal` bytes are an allocation high-water mark, not a logical backlog:
 SQLite can reset and reuse a large sidecar after every frame has been backfilled. Conversely, the
@@ -1239,11 +1272,84 @@ recovery time is not mislabeled as COMMIT and remains visible as total minus the
 This is observation only: no timing value changes admission, retry, rollback, checkpoint, or
 TRUNCATE behavior.
 
-### 2026-08-09 amendment (Amendment 9): write-transaction external-work audit
+### 2026-08-09 amendment (Amendment 9): checkpoint telemetry cannot amplify a pinned WAL
 
-The Amendment 9 allocation assumes #1844 lands as Amendment 7 and #1845 lands as Amendment 8.
-If that integration order changes, the integrating rebase must renumber this amendment and its
-cross-document references rather than publishing a duplicate or skipped allocation.
+**Motivation.** A production WAL pin exposed a feedback loop in the ADR-094 lifecycle sink.
+`run_checkpoint_task` appended `CheckpointOutcomeRecorded` to the primary store on every
+at/above-`warn_pages` observation. A pinned reader prevented those event writes from being
+reclaimed, so the 500 ms checkpoint loop became a high-rate writer to the WAL it was trying to
+drain. The event handoff was already lossy under sink contention; paying one primary-store write
+per attempt therefore provided neither complete history nor storage safety (#1838).
+
+**Decision.** Checkpoint pressure persistence is edge-triggered. One elevation row is enqueued
+when pressure first reaches `warn_pages`, sustained elevated observations aggregate in bounded
+task memory, and one recovery row is enqueued after pressure returns below `warn_pages`.
+`CheckpointOutcomeRecordedPayload` carries `episode_elevated_ticks` and
+`episode_peak_wal_pages`; the recovery row is the complete episode summary, while a delayed
+opening enqueue reports the aggregate observed so far. Both fields are absent on legacy rows
+written before this amendment; new transition rows use `payload_schema_version = 2`. A full
+bounded handoff leaves the accepted elevation state unchanged, so that transition may be retried
+without admitting one store append per checkpoint attempt. A recovery enqueue is likewise
+retried on later healthy ticks until accepted. If no elevation row ever reached the handoff, no
+orphan recovery row is invented.
+
+The invariant is now: with A checkpoint attempts inside one uninterrupted pressure episode,
+primary-store lifecycle appends are O(state transitions) (normally two), never O(A). The
+checkpoint loop's per-attempt evidence remains in the existing tracing/debug path and in honest
+process-global diagnostics:
+
+- `checkpoint_pressure_elevated_ticks`;
+- `checkpoint_pressure_episodes_started` / `checkpoint_pressure_episodes_recovered`;
+- `checkpoint_lifecycle_append_attempts` / `checkpoint_lifecycle_append_failures`;
+- `checkpoint_lifecycle_enqueue_drops`.
+
+These are lifetime aggregates across every checkpoint task in the process, matching the scope of
+the pre-existing ADR-091 counters. They are not reset by the operator surface. The actual
+pressure ladder remains `CheckpointSeverityState`'s in-memory consecutive-observation machine;
+it does not query persisted per-tick events. WAL-pin sidecars, no-progress attribution, PASSIVE /
+TRUNCATE policy, and the one-sidecar-pass-per-tick bound are unchanged.
+
+**Failure direction.** Lifecycle persistence remains best-effort. A queue drop or append failure
+can leave a gap in durable transitions, but it increments an explicit diagnostic counter and
+never creates a primary-store retry loop. The checkpoint task's essential operator evidence is
+the transition row, recovery summary when deliverable, process counters, edge-triggered logs,
+and WAL-pin attribution—not a self-amplifying per-attempt event stream.
+
+### 2026-08-09 amendment (Amendment 10): disable per-connection WAL autocheckpoint
+
+**Motivation.** Amendment 5 moved scheduled checkpoint work to one dedicated connection, but
+SQLite's automatic checkpoint threshold is connection-local. A non-zero threshold on any
+ordinary writer still runs an implicit PASSIVE checkpoint synchronously in the commit that
+crosses it. Disabling the threshold only on the dedicated connection therefore cannot keep
+checkpoint I/O off application commit paths.
+
+**Decision.** Checkpoint ownership is claimed, not assumed. The scheduled checkpoint task claims
+ownership of its pool at startup (`ConnectionPool::claim_checkpoint_ownership`, plus a
+propagation call that reaches a writer task spawned before the claim). On a claimed pool every
+writer-capable connection sets `PRAGMA wal_autocheckpoint = 0`: the already-open pooled writer
+is re-configured under the writer mutex, and the single standalone-writer constructor applies
+the claimed value to store and SQL-bridge writers as well as the writer task, diagnostics
+connection, and dedicated checkpoint connection, including every later open or checkpoint
+reconnect. On a pool no checkpoint task claims — embedded runtimes and one-shot CLI executions
+have writable pools but never start the scheduled task — writer-capable connections keep a
+bounded 4,000-page autocheckpoint, so SQLite's own reclamation still bounds WAL growth where no
+dedicated owner exists. The former `PoolConfig::wal_autocheckpoint_pages` field and
+`KHIVE_WAL_AUTOCHECKPOINT_PAGES` override are removed: routine checkpoint ownership is a safety
+invariant, not a tuning parameter, and neither posture is selectable by configuration.
+
+The scheduled task remains the only in-process source of routine PASSIVE checkpoint I/O on
+claimed pools. Amendment 5's dedicated-connection admission contract, TRUNCATE gates and busy
+bound, sidecar collection, counters, and severity ladder are otherwise unchanged. Regressions
+read the pragma on each connection class in both postures and grow a WAL past the 4,000-page
+threshold before observing it, so configuration-only coverage cannot mask a later-created
+connection reverting to the wrong posture — including the unclaimed-pool regression that the
+bounded fallback exists to prevent: unbounded WAL growth on a writable pool with no checkpoint
+owner.
+
+### 2026-08-09 amendment (Amendment 11): write-transaction external-work audit
+
+This amendment was allocated as Amendment 11 at integration; Amendments 9 and 10 record the
+checkpoint-telemetry and autocheckpoint changes merged ahead of it.
 
 **Motivation.** WAL mode admits one writer. Queue time therefore depends on both mean writer hold
 time and its variance; a filesystem call, network request, blocking wait, or expensive compute
