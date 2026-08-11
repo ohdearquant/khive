@@ -1790,19 +1790,24 @@ pub async fn run_checkpoint_task(
     // running checkpoint task never claim and keep SQLite's bounded WAL
     // reclamation. A failed claim leaves connections on the bounded fallback
     // — safe, just not the low-latency posture — so it warns and continues.
-    if let Err(e) = pool.claim_checkpoint_ownership() {
-        tracing::warn!(
-            error = %e,
-            "checkpoint task could not re-apply the ownership pragma on the pooled writer; \
-             writer connections keep the bounded autocheckpoint fallback until reopened"
-        );
-    }
-    if let Err(e) = pool.propagate_checkpoint_claim_to_writer_task().await {
-        tracing::warn!(
-            error = %e,
-            "checkpoint task could not reach the writer task's connection; it keeps the \
-             bounded autocheckpoint fallback"
-        );
+    match pool.claim_checkpoint_ownership() {
+        Ok(()) => {
+            if let Err(e) = pool.propagate_checkpoint_claim_to_writer_task().await {
+                tracing::warn!(
+                    error = %e,
+                    "checkpoint task could not reach the writer task's connection; it keeps the \
+                     bounded autocheckpoint fallback"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "checkpoint task could not re-apply the ownership pragma on the pooled writer; \
+                 writer connections keep the bounded autocheckpoint fallback unless ownership is \
+                 claimed later"
+            );
+        }
     }
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2958,6 +2963,7 @@ fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
+    use crate::writer_task::WriterTaskHandle;
     use rusqlite::hooks::{AuthAction, Authorization};
     use serial_test::serial;
     use tracing::field::{Field, Visit};
@@ -3198,6 +3204,19 @@ mod tests {
             ..PoolConfig::default()
         };
         Arc::new(ConnectionPool::new(cfg).expect("pool open"))
+    }
+
+    async fn writer_task_wal_autocheckpoint_pages(handle: &WriterTaskHandle) -> u32 {
+        handle
+            .send_top_level(|conn| {
+                conn.pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, u32>(0))
+                    .map_err(|error| khive_storage::error::StorageError::Pool {
+                        operation: "test_wal_autocheckpoint".into(),
+                        message: error.to_string(),
+                    })
+            })
+            .await
+            .expect("query writer-task connection pragma")
     }
 
     /// Test helper: open the same dedicated standalone connection
@@ -3726,6 +3745,62 @@ mod tests {
             .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
             .expect("read reopened autocheckpoint setting");
         assert_eq!(reopened, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(checkpoint_skip_metrics)]
+    async fn failed_checkpoint_claim_keeps_existing_writer_task_on_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed_claim_writer_task.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                checkout_timeout: Duration::from_millis(1),
+                write_queue_enabled: Some(true),
+                ..PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("writer-task resolution")
+            .expect("writer task enabled");
+        assert_eq!(
+            writer_task_wal_autocheckpoint_pages(&writer_task).await,
+            crate::pool::FALLBACK_WAL_AUTOCHECKPOINT_PAGES
+        );
+
+        let legacy_conn = pool.legacy_conn();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _held_writer = legacy_conn.lock();
+            held_tx.send(()).expect("signal held pooled writer");
+            release_rx.recv().expect("release held pooled writer");
+        });
+        held_rx.await.expect("pooled writer holder started");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        drop(shutdown_tx);
+        run_checkpoint_task(
+            Arc::clone(&pool),
+            CheckpointConfig {
+                interval: Duration::from_secs(60),
+                ..CheckpointConfig::default()
+            },
+            None,
+            shutdown_rx,
+            true,
+        )
+        .await;
+
+        assert_eq!(pool.writer_acquisition_snapshot().timeouts, 1);
+        assert_eq!(
+            writer_task_wal_autocheckpoint_pages(&writer_task).await,
+            crate::pool::FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+            "failed pooled-writer claim must not partially propagate ownership"
+        );
+        release_tx.send(()).expect("release pooled writer");
+        holder.await.expect("pooled writer holder joined");
     }
 
     #[tokio::test]
