@@ -75,9 +75,13 @@ For transaction-wrapped requests, the scoped `writer_task_tx` registry span
 is dropped before the oneshot reply wakes the caller, both after a completed
 transaction and after a failed `BEGIN`. A caller that has observed its reply
 therefore cannot still observe that request as an open SQL transaction.
-There is no watchdog/retry story for a failed `BEGIN` (ADR-067
-Component D remains future work); the connection simply tries
-`BEGIN IMMEDIATE` fresh on the next request.
+When the raw SQLite code is `SQLITE_BUSY` or `SQLITE_LOCKED`, the caller
+receives `StorageError::WriterTaskBusy` with the connection's configured busy
+timeout. This is retryable because the operation closure never ran; it does
+not mean queue admission failed. Any other `BEGIN` error retains the generic
+pool failure. The connection tries `BEGIN IMMEDIATE` fresh on the next request,
+so transient contention does not retire the writer task. Automatic internal
+retry remains outside this seam.
 
 Exits normally when every `WriterTaskHandle` clone is dropped and the channel
 closes (`rx.recv()` returns `None`). A panic while executing a request, a failed
