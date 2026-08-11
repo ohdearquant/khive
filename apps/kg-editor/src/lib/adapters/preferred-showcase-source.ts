@@ -6,6 +6,7 @@ import {
 import type { RepoBundle } from "@/lib/repo-bundle";
 import {
   isAllowedShowcaseAnalysis,
+  normalizeRepositoryUrl,
   type ShowcaseRegistryEntry,
 } from "@/lib/showcase-registry";
 
@@ -56,8 +57,26 @@ export async function loadPreferredShowcaseBundle(
     );
   }
 
+  const bundle = await parseBoundedShowcaseResponse(
+    response,
+    "Database snapshot",
+  );
+  const expectedRepository = normalizeRepositoryUrl(entry.canonicalUrl);
+  const actualRepository = normalizeRepositoryUrl(
+    bundle.meta.repository.canonical_url,
+  );
+  if (
+    !expectedRepository.ok ||
+    !actualRepository.ok ||
+    actualRepository.value !== expectedRepository.value
+  ) {
+    throw new Error(
+      "Database snapshot repository identity did not match the curated registry.",
+    );
+  }
+
   return {
-    bundle: await parseBoundedShowcaseResponse(response, "Database snapshot"),
+    bundle,
     source: "khive-db-snapshot",
   };
 }

@@ -126,6 +126,18 @@
   letter-spacing: -0.04em;
   margin: 5px 0 0;
 }
+.metrics dd strong {
+  font: inherit;
+}
+.metricCoverage {
+  color: var(--repo-muted);
+  display: block;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.35;
+  margin-top: 3px;
+}
 .metrics dd span {
   color: var(--repo-muted);
   font-size: 10px;
@@ -630,7 +642,7 @@
   .metrics > div:nth-child(2) {
     border-right: 0;
   }
-  .metrics > div:nth-child(-n + 2) {
+  .metrics > div:nth-child(-n+2) {
     border-bottom: 1px solid var(--repo-border);
   }
   .signalGrid {

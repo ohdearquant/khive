@@ -35,7 +35,7 @@ describe("preferred showcase source", () => {
       response(golden, 200, {
         "x-khive-analysis-id": "khive",
         "x-khive-analysis-source": "khive-db-snapshot",
-      }),
+      })
     );
 
     const result = await loadPreferredShowcaseBundle(
@@ -57,7 +57,7 @@ describe("preferred showcase source", () => {
     const fetchBundle = vi.fn(async (input: string) =>
       input.startsWith("/api/")
         ? response(new Uint8Array(), 404)
-        : response(golden, 200),
+        : response(golden, 200)
     );
 
     const result = await loadPreferredShowcaseBundle(
@@ -86,11 +86,28 @@ describe("preferred showcase source", () => {
       response(golden, 200, {
         "x-khive-analysis-id": "other",
         "x-khive-analysis-source": "khive-db-snapshot",
-      }),
+      })
     );
 
     await expect(
       loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
     ).rejects.toThrow(/provenance/i);
+  });
+
+  it("rejects a valid snapshot for a different repository", async () => {
+    const wrongRepository = JSON.parse(golden.toString("utf8"));
+    wrongRepository.meta.repository.canonical_url =
+      "https://github.com/example/not-khive";
+    const fetchBundle = vi.fn(async () =>
+      response(Buffer.from(JSON.stringify(wrongRepository)), 200, {
+        "x-khive-analysis-id": "khive",
+        "x-khive-analysis-source": "khive-db-snapshot",
+      })
+    );
+
+    await expect(
+      loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
+    ).rejects.toThrow(/repository identity/i);
+    expect(fetchBundle).toHaveBeenCalledOnce();
   });
 });

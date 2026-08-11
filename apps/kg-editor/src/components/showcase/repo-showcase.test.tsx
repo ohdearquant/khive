@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
@@ -24,20 +24,22 @@ describe("repository showcase", () => {
     const bundle = golden();
     const user = userEvent.setup();
 
-    render(<RepoShowcase bundle={bundle} />);
+    const { container } = render(<RepoShowcase bundle={bundle} />);
 
     const triage = screen.getByRole("region", { name: "Repository triage" });
     expect(within(triage).getByRole("heading", { name: "What deserves attention?" })).toBeVisible();
-    expect(within(triage).getByText(`${bundle.graph.modules.items.length} modules`)).toBeVisible();
-    expect(within(triage).getByText(`${bundle.graph.commits.items.length} commits`)).toBeVisible();
+    expect(container.querySelector('[data-repository-metric="modules"]')).toHaveTextContent(`${bundle.graph.modules.items.length}`);
+    expect(container.querySelector('[data-repository-metric="modules"]')).toHaveTextContent(/complete/i);
+    expect(container.querySelector('[data-repository-metric="commits"]')).toHaveTextContent(`${bundle.graph.commits.items.length}`);
     expect(within(triage).getByText("Observed", { selector: "span" })).toBeVisible();
     expect(within(triage).getAllByText("Candidate", { selector: "span" }).length).toBeGreaterThan(0);
+    expect(container.querySelector('[data-signal-kind="hidden_coupling"]')).toHaveTextContent(/truncated/i);
 
     const firstStart = within(triage).getAllByRole("button", { name: /inspect .*\.rs/i })[0];
     await user.click(firstStart);
     const inspector = within(triage).getByRole("complementary", { name: "Module evidence" });
     expect(within(inspector).getByText("Analysis window")).toBeVisible();
-    expect(within(inspector).getByRole("heading", { name: "Recent commits" })).toBeVisible();
+    expect(within(inspector).getByRole("heading", { name: bundle.capability.labels.metrics.commits })).toBeVisible();
 
     await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "pool.rs");
     const poolResult = within(triage).getByRole("button", { name: /inspect .*pool\.rs/i });
@@ -59,8 +61,26 @@ describe("repository showcase", () => {
     const empty = triage.querySelector<HTMLElement>('[data-state="empty"]')!;
     expect(empty).toBeVisible();
     expect(empty.querySelectorAll("button")).toHaveLength(1);
+    expect(within(triage).getAllByRole("button", { name: "Clear search" })).toHaveLength(1);
     await user.click(within(empty).getByRole("button", { name: "Clear search" }));
     expect(within(triage).getByRole("searchbox", { name: "Find a module or path" })).toHaveValue("");
+  });
+
+  it("moves focus and scroll position to the analysis selected from triage", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    await user.click(within(triage).getAllByRole("button", { name: /open full analysis/i })[0]);
+
+    const dashboard = container.querySelector<HTMLElement>("[data-repository-dashboard]")!;
+    await waitFor(() => expect(dashboard).toHaveFocus());
+    expect(scrollIntoView).toHaveBeenCalledOnce();
   });
 
   it("renders all ten capability-owned view labels", () => {
@@ -194,10 +214,24 @@ describe("repository showcase", () => {
     const bundle = structuredClone(golden());
     const user = userEvent.setup();
     bundle.capability.views.hotspot_quadrant.label = "Contract-owned risk field";
+    bundle.capability.views.dependency_topology.label = "Contract-owned topology";
+    bundle.capability.views.hidden_coupling.label = "Contract-owned coupling";
+    bundle.capability.views.api_surface.label = "Contract-owned API surface";
+    bundle.capability.labels.node_types.module = "Contract-owned component";
+    bundle.capability.labels.metrics.package_count = "Contract-owned package count";
+    bundle.capability.labels.metrics.module_count = "Contract-owned module count";
+    bundle.capability.labels.metrics.commits = "Contract-owned commits";
+    bundle.capability.labels.metrics.cycle_count = "Contract-owned cycles";
     bundle.capability.labels.metrics.fan_in = "Contract-owned inbound degree";
+    bundle.capability.labels.metrics.fan_out = "Contract-owned outbound degree";
+    bundle.capability.labels.metrics.bus_factor = "Contract-owned bus factor";
+    bundle.capability.labels.metrics.dependent_count = "Contract-owned dependent count";
+    bundle.capability.labels.metrics.cochange_count = "Contract-owned co-change count";
+    bundle.capability.labels.metrics.support = "Contract-owned support";
     bundle.capability.labels.metrics.change_frequency = "Contract-owned revisions";
-    const quadrant = bundle.aggregates.hotspot_quadrant.data.items[0].quadrant;
-    bundle.capability.labels.hotspot_quadrants[quadrant] = "Contract-owned quadrant";
+    for (const quadrant of Object.keys(bundle.capability.labels.hotspot_quadrants) as Array<keyof typeof bundle.capability.labels.hotspot_quadrants>) {
+      bundle.capability.labels.hotspot_quadrants[quadrant] = "Contract-owned quadrant";
+    }
     bundle.capability.labels.metrics.p50 = "Contract-owned median";
     bundle.aggregates.cadence_timeline.pull_request_lead_time_hours = {
       status: "available",
@@ -205,6 +239,24 @@ describe("repository showcase", () => {
     };
 
     const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+    for (const label of [
+      "Contract-owned package count",
+      "Contract-owned module count",
+      "Contract-owned commits",
+      "Contract-owned cycles",
+      "Contract-owned inbound degree",
+      "Contract-owned outbound degree",
+      "Contract-owned bus factor",
+      "Contract-owned topology",
+      "Contract-owned coupling",
+      "Contract-owned component evidence",
+    ]) {
+      expect(within(triage).getAllByText(label).length).toBeGreaterThan(0);
+    }
+    expect(triage).toHaveTextContent("Contract-owned API surface");
+    expect(triage).toHaveTextContent("Contract-owned dependent count");
+    expect(triage).toHaveTextContent("Contract-owned quadrant");
     await user.click(screen.getByRole("button", { name: "Contract-owned risk field" }));
 
     expect(screen.getByRole("heading", { name: "Contract-owned risk field" })).toBeVisible();

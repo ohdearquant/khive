@@ -29,9 +29,10 @@ describe("repository triage model", () => {
     );
     const brief = buildRepositoryBrief(bundle);
 
-    expect(brief.metrics.modules).toBe(bundle.graph.modules.items.length);
-    expect(brief.metrics.commits).toBe(bundle.graph.commits.items.length);
-    expect(brief.metrics.cycles).toBe(
+    expect(brief.metrics.modules.shown).toBe(bundle.graph.modules.items.length);
+    expect(brief.metrics.modules.status).toBe("complete");
+    expect(brief.metrics.commits.shown).toBe(bundle.graph.commits.items.length);
+    expect(brief.metrics.cycles.shown).toBe(
       bundle.aggregates.dependency_topology.cycles.items.length,
     );
     expect(
@@ -59,6 +60,69 @@ describe("repository triage model", () => {
     expect(bundle.aggregates.api_surface.data.items).toEqual(apiSurfaceBefore);
   });
 
+  it("preserves unavailable and truncated page semantics in summary metrics", () => {
+    const partial = structuredClone(bundle);
+    partial.graph.modules.items = partial.graph.modules.items.slice(0, 2);
+    partial.graph.modules.total_count = { status: "available", value: 37 };
+    partial.graph.modules.truncated = true;
+    partial.graph.modules.disclosure = {
+      status: "truncated",
+      reason: "module export was capped",
+    };
+    partial.graph.commits.items = [];
+    partial.graph.commits.total_count = {
+      status: "unavailable",
+      reason: "history count was not measured",
+    };
+    partial.graph.commits.disclosure = {
+      status: "unavailable",
+      reason: "history was not measured",
+    };
+
+    const brief = buildRepositoryBrief(partial);
+
+    expect(brief.metrics.modules).toMatchObject({
+      shown: 2,
+      total: 37,
+      status: "truncated",
+    });
+    expect(brief.metrics.modules.summary).toMatch(/2 captured of 37/i);
+    expect(brief.metrics.commits).toMatchObject({
+      shown: 0,
+      total: null,
+      status: "unavailable",
+    });
+    expect(brief.metrics.commits.summary).toMatch(/total unavailable/i);
+  });
+
+  it("does not fabricate recommendations from zero-evidence rows or cycle order", () => {
+    const quiet = structuredClone(bundle);
+    quiet.aggregates.hotspot_quadrant.data.items = quiet.aggregates
+      .hotspot_quadrant.data.items.map((row) => ({
+        ...row,
+        commit_count: 0,
+        fan_in: 0,
+        quadrant: "low_churn_low_fan_in" as const,
+      }));
+    quiet.aggregates.api_surface.data.items = quiet.aggregates.api_surface.data
+      .items.map((row) => ({
+        ...row,
+        dependent_count: 0,
+      }));
+
+    const brief = buildRepositoryBrief(quiet);
+    const cycle = brief.attentionSignals.find(
+      (signal) => signal.kind === "dependency_cycle",
+    );
+
+    expect(brief.startHere).toEqual([]);
+    expect(
+      brief.attentionSignals.some((signal) => signal.kind === "hotspot"),
+    ).toBe(false);
+    expect(cycle?.summary).toMatch(/SCC members:/i);
+    expect(cycle?.summary).not.toContain("→");
+  });
+
   it("builds one module inspector from topology, history, ownership, and coupling evidence", () => {
     const target = buildRepositoryBrief(bundle).startHere[0];
     const insight = buildModuleInsight(bundle, target.moduleId);
@@ -72,6 +136,13 @@ describe("repository triage model", () => {
     });
     expect(
       insight?.evidence.some((item) => item.label === "Analysis window"),
+    ).toBe(true);
+    expect(
+      insight?.evidence.some(
+        (item) =>
+          item.label ===
+            `${bundle.capability.views.hidden_coupling.label} coverage`,
+      ),
     ).toBe(true);
   });
 

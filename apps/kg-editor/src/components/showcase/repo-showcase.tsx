@@ -23,7 +23,7 @@ import {
   TrendingUp,
   Users,
 } from "@/icons";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import { DataState } from "@/components/data-state";
 import { RepositoryTriage } from "@/components/showcase/repository-triage";
@@ -984,12 +984,26 @@ function ActiveView({ id, bundle, moduleById, onExploreStructure }: ViewProps & 
 
 export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback" }: { bundle: RepoBundle; analysisSource?: ShowcaseBundleSource }) {
   const [activeView, setActiveView] = useState<ViewId>("structure_graph");
+  const dashboardRef = useRef<HTMLDivElement>(null);
   const moduleById = useMemo(
     () => new Map(bundle.graph.modules.items.map((module) => [module.id, module])),
     [bundle.graph.modules.items],
   );
   const { repository, snapshot, producer } = bundle.meta;
   const { capability } = bundle;
+  function openAnalysis(view: ViewId) {
+    setActiveView(view);
+    const dashboard = dashboardRef.current;
+    if (!dashboard) return;
+    dashboard.focus({ preventScroll: true });
+    const reduceMotion = window.matchMedia?.(
+      "(prefers-reduced-motion: reduce)",
+    ).matches ?? false;
+    dashboard.scrollIntoView?.({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  }
   return (
     <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
       <header className="repo-overview-heading">
@@ -1000,8 +1014,16 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         <div><ShieldCheck aria-hidden="true" /><div><strong>{capability.labels.product}</strong><span>{capability.mode}</span></div></div>
         <div className="repo-capability-flags">{Object.values(capability.languages).map((language) => <i key={language.label}>{language.label} · {language.module_join ? capability.views.history_structure_navigation.label : capability.labels.unavailable}</i>)}</div>
       </section>
-      <RepositoryTriage key={snapshot.head_sha} bundle={bundle} onOpenAnalysis={setActiveView} />
-      <div className="repo-dashboard">
+      <RepositoryTriage key={snapshot.head_sha} bundle={bundle} onOpenAnalysis={openAnalysis} />
+      <div
+        className="repo-dashboard"
+        data-repository-dashboard
+        id="repository-analysis-dashboard"
+        ref={dashboardRef}
+        role="region"
+        aria-label={`${capability.labels.product} analysis`}
+        tabIndex={-1}
+      >
         <nav className="repo-view-nav" aria-label={capability.labels.product}>
           <span>{capability.labels.product}</span>
           {viewOrder.map((id) => {

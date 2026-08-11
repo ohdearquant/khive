@@ -49,6 +49,14 @@ export interface RepositoryStartHereEntry {
   evidence: RepositoryEvidence[];
 }
 
+export interface RepositoryMetric {
+  shown: number;
+  total: number | null;
+  status: "complete" | "truncated" | "unavailable";
+  summary: string;
+  detail: string;
+}
+
 export interface RepositoryBrief {
   repository: {
     name: string;
@@ -58,10 +66,10 @@ export interface RepositoryBrief {
     ingestedAt: string;
   };
   metrics: {
-    packages: number;
-    modules: number;
-    commits: number;
-    cycles: number;
+    packages: RepositoryMetric;
+    modules: RepositoryMetric;
+    commits: RepositoryMetric;
+    cycles: RepositoryMetric;
   };
   startHere: RepositoryStartHereEntry[];
   attentionSignals: RepositoryAttentionSignal[];
@@ -147,12 +155,15 @@ function uniqueSortedModules(modules: RepoModule[]): RepoModule[] {
 function formatWindow(window: AnalysisWindow, snapshotTime: string): string {
   if (window.kind === "rolling_days") {
     const duration = window.days == null ? "Rolling" : `${window.days}-day`;
-    const range =
-      window.start && window.end ? ` (${window.start} to ${window.end})` : "";
+    const range = window.start && window.end
+      ? ` (${window.start} to ${window.end})`
+      : "";
     return `${duration} analysis window${range}`;
   }
   if (window.kind === "range") {
-    return `Bounded range ${window.start ?? "unspecified start"} to ${window.end ?? "unspecified end"}`;
+    return `Bounded range ${window.start ?? "unspecified start"} to ${
+      window.end ?? "unspecified end"
+    }`;
   }
   return `Declared all-history window; snapshot ingested at ${snapshotTime}`;
 }
@@ -172,18 +183,66 @@ function pageEvidence(
     };
   },
 ): RepositoryEvidence {
-  const total =
-    page.total_count.status === "available"
-      ? `${page.total_count.value} declared`
-      : "total unavailable";
-  const status =
-    page.disclosure.status === "complete"
-      ? "complete"
-      : `${page.disclosure.status}${page.disclosure.reason ? `: ${page.disclosure.reason}` : ""}`;
+  const total = page.total_count.status === "available"
+    ? `${page.total_count.value} declared`
+    : "total unavailable";
+  const status = page.disclosure.status === "complete"
+    ? "complete"
+    : `${page.disclosure.status}${
+      page.disclosure.reason ? `: ${page.disclosure.reason}` : ""
+    }`;
   return {
     label,
     value: `${page.items.length} present, ${total}; ${status}`,
-    detail: `Bound ${page.bound.kind} to ${page.bound.max_items}, ordered by ${page.bound.order}.`,
+    detail:
+      `Bound ${page.bound.kind} to ${page.bound.max_items}, ordered by ${page.bound.order}.`,
+  };
+}
+
+function pageMetric(page: {
+  items: unknown[];
+  total_count:
+    | { status: "available"; value: number }
+    | { status: "unavailable"; reason: string };
+  bound: { kind: "all" | "top_n"; max_items: number; order: string };
+  next_cursor?: string | null;
+  truncated: boolean;
+  disclosure: {
+    status: "complete" | "truncated" | "unavailable";
+    reason?: string | null;
+  };
+}): RepositoryMetric {
+  const shown = page.items.length;
+  const total = page.total_count.status === "available"
+    ? page.total_count.value
+    : null;
+  const status: RepositoryMetric["status"] =
+    page.total_count.status === "unavailable" ||
+      page.disclosure.status === "unavailable"
+      ? "unavailable"
+      : page.truncated ||
+          page.next_cursor != null ||
+          page.disclosure.status === "truncated" ||
+          (total != null && total > shown)
+      ? "truncated"
+      : "complete";
+  const reason = page.disclosure.reason ? `; ${page.disclosure.reason}` : "";
+  const summary = status === "complete"
+    ? total == null
+      ? `${shown} captured; total unavailable`
+      : `${shown} captured; complete`
+    : status === "truncated"
+    ? total == null
+      ? `${shown} captured; total unavailable; truncated${reason}`
+      : `${shown} captured of ${total}; truncated${reason}`
+    : `${shown} captured; total unavailable; unavailable${reason}`;
+  return {
+    shown,
+    total,
+    status,
+    summary,
+    detail:
+      `Bound ${page.bound.kind} to ${page.bound.max_items}, ordered by ${page.bound.order}.`,
   };
 }
 
@@ -213,7 +272,11 @@ function buildHotspotSignal(
   const analysis = bundle.aggregates.hotspot_quadrant;
   if (analysis.meta.status !== "available") return null;
   const hotspot = analysis.data.items
-    .filter((row) => moduleById.has(row.module_id))
+    .filter(
+      (row) =>
+        moduleById.has(row.module_id) &&
+        row.quadrant !== "low_churn_low_fan_in",
+    )
     .sort(hotspotComparator(moduleById))[0];
   if (!hotspot) return null;
 
@@ -222,8 +285,12 @@ function buildHotspotSignal(
     id: `hotspot:${moduleNode.id}`,
     kind: "hotspot",
     classification: "candidate",
-    title: `${moduleNode.source_path} is a change-attention candidate`,
-    summary: `${hotspot.commit_count} captured commits and fan-in ${hotspot.fan_in} place this module in the ${hotspot.quadrant.replaceAll("_", " ")} quadrant.`,
+    title:
+      `${moduleNode.source_path} is a ${bundle.capability.views.hotspot_quadrant.label} candidate`,
+    summary:
+      `${hotspot.commit_count} captured ${bundle.capability.labels.metrics.commits} and ${bundle.capability.labels.metrics.fan_in} ${hotspot.fan_in} place this module in ${
+        bundle.capability.labels.hotspot_quadrants[hotspot.quadrant]
+      }.`,
     whyItMatters:
       "Frequent change combined with incoming dependencies can increase review scope. These measurements identify where to inspect; they do not establish a defect.",
     moduleIds: [moduleNode.id],
@@ -236,8 +303,9 @@ function buildHotspotSignal(
         ),
       },
       {
-        label: "Observed metrics",
-        value: `${hotspot.commit_count} commits; fan-in ${hotspot.fan_in}`,
+        label: bundle.capability.views.hotspot_quadrant.label,
+        value:
+          `${hotspot.commit_count} ${bundle.capability.labels.metrics.commits}; ${bundle.capability.labels.metrics.fan_in} ${hotspot.fan_in}`,
       },
       pageEvidence("Coverage", analysis.data),
     ],
@@ -284,14 +352,15 @@ function buildCycleSignal(
   if (!cycle) return null;
 
   const paths = cycle.module_ids.map((moduleId) =>
-    modulePath(moduleById, moduleId),
+    modulePath(moduleById, moduleId)
   );
   return {
     id: `dependency-cycle:${cycle.id}`,
     kind: "dependency_cycle",
     classification: "observed",
-    title: `Observed dependency cycle across ${cycle.module_ids.length} modules`,
-    summary: paths.join(" → "),
+    title:
+      `Observed ${bundle.capability.views.dependency_topology.label} across ${cycle.module_ids.length} ${bundle.capability.labels.node_types.module.toLocaleLowerCase()} records`,
+    summary: `SCC members: ${paths.join(" · ")}`,
     whyItMatters:
       "The captured import graph contains a cycle, which can complicate change sequencing and boundary review. It does not by itself imply a runtime failure.",
     moduleIds: [...cycle.module_ids],
@@ -304,8 +373,9 @@ function buildCycleSignal(
         ),
       },
       {
-        label: "Observed topology",
-        value: `${cycle.id}; ${cycle.module_ids.length} modules`,
+        label: bundle.capability.views.dependency_topology.label,
+        value:
+          `${cycle.id}; ${cycle.module_ids.length} ${bundle.capability.labels.node_types.module.toLocaleLowerCase()} records`,
       },
       pageEvidence("Coverage", analysis.cycles),
     ],
@@ -348,8 +418,10 @@ function buildCouplingSignal(
     id: `hidden-coupling:${left.id}:${right.id}`,
     kind: "hidden_coupling",
     classification: "candidate",
-    title: `${left.name} and ${right.name} are a coupling candidate`,
-    summary: `${left.source_path} and ${right.source_path} changed together ${coupling.cochange_count} times in the captured window.`,
+    title:
+      `${left.name} and ${right.name} are a ${bundle.capability.views.hidden_coupling.label} candidate`,
+    summary:
+      `${left.source_path} and ${right.source_path} changed together ${coupling.cochange_count} times in the captured window.`,
     whyItMatters:
       "Repeated co-change can reveal coordination cost or an implicit boundary worth inspecting. Co-change alone does not prove a dependency or defect.",
     moduleIds: [left.id, right.id],
@@ -362,8 +434,11 @@ function buildCouplingSignal(
         ),
       },
       {
-        label: "Observed co-change",
-        value: `${coupling.cochange_count} commits; support ${(coupling.support * 100).toFixed(1)}%`,
+        label: bundle.capability.views.hidden_coupling.label,
+        value:
+          `${coupling.cochange_count} ${bundle.capability.labels.metrics.cochange_count}; ${bundle.capability.labels.metrics.support} ${
+            (coupling.support * 100).toFixed(1)
+          }%`,
       },
       pageEvidence("Coverage", analysis.data),
     ],
@@ -386,10 +461,9 @@ function buildOwnershipSignal(
         row.bus_factor.value <= 1,
     )
     .sort((left, right) => {
-      const leftConcentration =
-        left.author_concentration.status === "available"
-          ? left.author_concentration.value
-          : -1;
+      const leftConcentration = left.author_concentration.status === "available"
+        ? left.author_concentration.value
+        : -1;
       const rightConcentration =
         right.author_concentration.status === "available"
           ? right.author_concentration.value
@@ -408,16 +482,19 @@ function buildOwnershipSignal(
 
   if (ownership.bus_factor.status !== "available") return null;
   const moduleNode = moduleById.get(ownership.module_id)!;
-  const concentration =
-    ownership.author_concentration.status === "available"
-      ? `${(ownership.author_concentration.value * 100).toFixed(1)}% author concentration`
-      : "author concentration unavailable";
+  const concentration = ownership.author_concentration.status === "available"
+    ? `${
+      (ownership.author_concentration.value * 100).toFixed(1)
+    }% ${bundle.capability.labels.metrics.author_concentration}`
+    : `${bundle.capability.labels.metrics.author_concentration} unavailable`;
   return {
     id: `ownership:${moduleNode.id}`,
     kind: "ownership",
     classification: "candidate",
-    title: `${moduleNode.source_path} has concentrated captured ownership`,
-    summary: `${ownership.commit_count} captured commits, bus factor ${ownership.bus_factor.value}, and ${concentration}.`,
+    title:
+      `${moduleNode.source_path} has concentrated captured ${bundle.capability.views.ownership.label}`,
+    summary:
+      `${ownership.commit_count} captured ${bundle.capability.labels.metrics.commits}, ${bundle.capability.labels.metrics.bus_factor} ${ownership.bus_factor.value}, and ${concentration}.`,
     whyItMatters:
       "Concentrated contribution history can indicate a review or knowledge-transfer candidate. It does not establish current team ownership or availability.",
     moduleIds: [moduleNode.id],
@@ -431,7 +508,8 @@ function buildOwnershipSignal(
       },
       {
         label: "Sample threshold",
-        value: `${ownership.commit_count} commits (minimum ${OWNERSHIP_MINIMUM_COMMITS})`,
+        value:
+          `${ownership.commit_count} ${bundle.capability.labels.metrics.commits} (minimum ${OWNERSHIP_MINIMUM_COMMITS})`,
       },
       pageEvidence("Coverage", analysis.modules),
     ],
@@ -449,48 +527,50 @@ export function buildRepositoryBrief(bundle: RepoBundle): RepositoryBrief {
       row,
     ]),
   );
-  const startHere =
-    bundle.aggregates.api_surface.meta.status === "available"
-      ? [...bundle.aggregates.api_surface.data.items]
-          .filter((row) => moduleById.has(row.module_id))
-          .sort(
-            (left, right) =>
-              right.dependent_count - left.dependent_count ||
-              compareText(
-                modulePath(moduleById, left.module_id),
-                modulePath(moduleById, right.module_id),
-              ) ||
-              compareText(left.module_id, right.module_id),
-          )
-          .slice(0, 3)
-          .map((row): RepositoryStartHereEntry => {
-            const moduleNode = moduleById.get(row.module_id)!;
-            const hotspot = hotspotByModule.get(row.module_id);
-            return {
-              moduleId: moduleNode.id,
-              moduleName: moduleNode.name,
-              modulePath: moduleNode.module_path,
-              sourcePath: moduleNode.source_path,
-              dependentCount: row.dependent_count,
-              commitCount: hotspot?.commit_count ?? null,
-              reason:
-                "Many captured modules depend on this module; inspect its contract before broad changes.",
-              evidence: [
-                {
-                  label: "Observed API surface",
-                  value: `${row.dependent_count} dependents`,
-                },
-                {
-                  label: "Analysis window",
-                  value: formatWindow(
-                    bundle.aggregates.api_surface.meta.window,
-                    bundle.meta.snapshot.ingested_at,
-                  ),
-                },
-              ],
-            };
-          })
-      : [];
+  const startHere = bundle.aggregates.api_surface.meta.status === "available"
+    ? [...bundle.aggregates.api_surface.data.items]
+      .filter(
+        (row) => row.dependent_count > 0 && moduleById.has(row.module_id),
+      )
+      .sort(
+        (left, right) =>
+          right.dependent_count - left.dependent_count ||
+          compareText(
+            modulePath(moduleById, left.module_id),
+            modulePath(moduleById, right.module_id),
+          ) ||
+          compareText(left.module_id, right.module_id),
+      )
+      .slice(0, 3)
+      .map((row): RepositoryStartHereEntry => {
+        const moduleNode = moduleById.get(row.module_id)!;
+        const hotspot = hotspotByModule.get(row.module_id);
+        return {
+          moduleId: moduleNode.id,
+          moduleName: moduleNode.name,
+          modulePath: moduleNode.module_path,
+          sourcePath: moduleNode.source_path,
+          dependentCount: row.dependent_count,
+          commitCount: hotspot?.commit_count ?? null,
+          reason:
+            "Many captured modules depend on this module; inspect its contract before broad changes.",
+          evidence: [
+            {
+              label: bundle.capability.views.api_surface.label,
+              value:
+                `${row.dependent_count} ${bundle.capability.labels.metrics.dependent_count}`,
+            },
+            {
+              label: "Analysis window",
+              value: formatWindow(
+                bundle.aggregates.api_surface.meta.window,
+                bundle.meta.snapshot.ingested_at,
+              ),
+            },
+          ],
+        };
+      })
+    : [];
 
   const attentionSignals = [
     buildHotspotSignal(bundle, moduleById),
@@ -508,17 +588,18 @@ export function buildRepositoryBrief(bundle: RepoBundle): RepositoryBrief {
       ingestedAt: bundle.meta.snapshot.ingested_at,
     },
     metrics: {
-      packages: bundle.graph.packages.items.length,
-      modules: bundle.graph.modules.items.length,
-      commits: bundle.graph.commits.items.length,
-      cycles: bundle.aggregates.dependency_topology.cycles.items.length,
+      packages: pageMetric(bundle.graph.packages),
+      modules: pageMetric(bundle.graph.modules),
+      commits: pageMetric(bundle.graph.commits),
+      cycles: pageMetric(bundle.aggregates.dependency_topology.cycles),
     },
     startHere,
     attentionSignals,
     evidence: [
       {
         label: "Snapshot",
-        value: `${bundle.meta.snapshot.head_sha} ingested at ${bundle.meta.snapshot.ingested_at}`,
+        value:
+          `${bundle.meta.snapshot.head_sha} ingested at ${bundle.meta.snapshot.ingested_at}`,
       },
       pageEvidence("Module coverage", bundle.graph.modules),
       pageEvidence("Commit coverage", bundle.graph.commits),
@@ -591,8 +672,9 @@ export function buildModuleInsight(
   const apiSurfaceIndex = rankedApiSurface.findIndex(
     (row) => row.module_id === moduleId,
   );
-  const apiSurfaceRow =
-    apiSurfaceIndex === -1 ? undefined : rankedApiSurface[apiSurfaceIndex];
+  const apiSurfaceRow = apiSurfaceIndex === -1
+    ? undefined
+    : rankedApiSurface[apiSurfaceIndex];
 
   const commitById = new Map(
     bundle.graph.commits.items.map((commit) => [commit.id, commit]),
@@ -614,22 +696,21 @@ export function buildModuleInsight(
 
   const couplings = bundle.aggregates.hidden_coupling.data.items
     .flatMap((row): ModuleCoupling[] => {
-      const otherId =
-        row.left_module_id === moduleId
-          ? row.right_module_id
-          : row.right_module_id === moduleId
-            ? row.left_module_id
-            : null;
+      const otherId = row.left_module_id === moduleId
+        ? row.right_module_id
+        : row.right_module_id === moduleId
+        ? row.left_module_id
+        : null;
       if (!otherId) return [];
       const otherModule = moduleById.get(otherId);
       return otherModule
         ? [
-            {
-              module: otherModule,
-              cochangeCount: row.cochange_count,
-              support: row.support,
-            },
-          ]
+          {
+            module: otherModule,
+            cochangeCount: row.cochange_count,
+            support: row.support,
+          },
+        ]
         : [];
     })
     .sort(
@@ -642,9 +723,9 @@ export function buildModuleInsight(
   const historyCoverage = navigation
     ? pageEvidence("History navigation", navigation.commits)
     : {
-        label: "History navigation",
-        value: "No module history-navigation row was captured.",
-      };
+      label: "History navigation",
+      value: "No module history-navigation row was captured.",
+    };
 
   return {
     module: moduleNode,
@@ -656,30 +737,29 @@ export function buildModuleInsight(
     },
     hotspot: hotspotRow
       ? {
-          commitCount: hotspotRow.commit_count,
-          fanIn: hotspotRow.fan_in,
-          quadrant: hotspotRow.quadrant,
-        }
+        commitCount: hotspotRow.commit_count,
+        fanIn: hotspotRow.fan_in,
+        quadrant: hotspotRow.quadrant,
+      }
       : null,
     ownership: ownershipRow
       ? {
-          commitCount: ownershipRow.commit_count,
-          authorConcentration:
-            ownershipRow.author_concentration.status === "available"
-              ? ownershipRow.author_concentration.value
-              : null,
-          busFactor:
-            ownershipRow.bus_factor.status === "available"
-              ? ownershipRow.bus_factor.value
-              : null,
-          authors: [...ownershipRow.authors.items],
-        }
+        commitCount: ownershipRow.commit_count,
+        authorConcentration:
+          ownershipRow.author_concentration.status === "available"
+            ? ownershipRow.author_concentration.value
+            : null,
+        busFactor: ownershipRow.bus_factor.status === "available"
+          ? ownershipRow.bus_factor.value
+          : null,
+        authors: [...ownershipRow.authors.items],
+      }
       : null,
     apiSurface: apiSurfaceRow
       ? {
-          dependentCount: apiSurfaceRow.dependent_count,
-          rank: apiSurfaceIndex + 1,
-        }
+        dependentCount: apiSurfaceRow.dependent_count,
+        rank: apiSurfaceIndex + 1,
+      }
       : null,
     dependencies,
     dependents,
@@ -688,16 +768,31 @@ export function buildModuleInsight(
     evidence: [
       {
         label: "Analysis window",
-        value: `Hotspots: ${formatWindow(bundle.aggregates.hotspot_quadrant.meta.window, bundle.meta.snapshot.ingested_at)}; coupling: ${formatWindow(bundle.aggregates.hidden_coupling.meta.window, bundle.meta.snapshot.ingested_at)}.`,
+        value: `Hotspots: ${
+          formatWindow(
+            bundle.aggregates.hotspot_quadrant.meta.window,
+            bundle.meta.snapshot.ingested_at,
+          )
+        }; coupling: ${
+          formatWindow(
+            bundle.aggregates.hidden_coupling.meta.window,
+            bundle.meta.snapshot.ingested_at,
+          )
+        }.`,
         detail:
           "Topology and ownership use their separately declared bundle windows.",
       },
       {
         label: "Snapshot",
-        value: `${bundle.meta.snapshot.head_sha} at ${bundle.meta.snapshot.ingested_at}`,
+        value:
+          `${bundle.meta.snapshot.head_sha} at ${bundle.meta.snapshot.ingested_at}`,
       },
       pageEvidence("Structure-edge coverage", bundle.graph.structure_edges),
       historyCoverage,
+      pageEvidence(
+        `${bundle.capability.views.hidden_coupling.label} coverage`,
+        bundle.aggregates.hidden_coupling.data,
+      ),
     ],
   };
 }
@@ -717,25 +812,29 @@ export function findRepositoryModules(
     const name = module.name.toLowerCase();
     const pathParts = sourcePath.split("/");
     const basename = pathParts[pathParts.length - 1] ?? sourcePath;
-    if ([sourcePath, modulePath, name, basename].includes(normalizedQuery))
+    if ([sourcePath, modulePath, name, basename].includes(normalizedQuery)) {
       return 0;
+    }
     if (
       [sourcePath, modulePath, name, basename].some((value) =>
-        value.startsWith(normalizedQuery),
+        value.startsWith(normalizedQuery)
       )
-    )
+    ) {
       return 1;
+    }
     if (
       sourcePath.includes(`/${normalizedQuery}`) ||
       modulePath.includes(`::${normalizedQuery}`)
-    )
+    ) {
       return 2;
+    }
     if (
       [sourcePath, modulePath, name].some((value) =>
-        value.includes(normalizedQuery),
+        value.includes(normalizedQuery)
       )
-    )
+    ) {
       return 3;
+    }
     return null;
   };
 
