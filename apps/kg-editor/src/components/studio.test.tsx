@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import { Studio } from "@/components/studio";
 import { atlasReviewFixture } from "@/lib/fixtures/atlas-review";
-import { REVIEW_IMPORT_MAX_BYTES } from "@/lib/review-bundle";
+import { REVIEW_IMPORT_MAX_BYTES, type ReviewReport } from "@/lib/review-bundle";
 
 describe("KG Studio", () => {
   it("makes the no-write and unavailable capability boundary visible", () => {
@@ -17,14 +17,73 @@ describe("KG Studio", () => {
 
   it("navigates from semantic diff to the affected graph", async () => {
     const user = userEvent.setup();
-    render(<Studio initialBundle={atlasReviewFixture} />);
+    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
 
     await user.click(screen.getAllByRole("button", { name: /affected graph/i })[0]);
     expect(screen.getByRole("heading", { name: "Affected subgraph" })).toBeVisible();
     expect(screen.getByRole("button", { name: /Assertion-level provenance/i })).toBeVisible();
+    expect(screen.getByLabelText("Ontology legend")).toHaveTextContent(/Concept.*Document.*Unsupported kind/i);
+    expect(container.querySelector('[data-kind="domain"]')).toHaveAttribute("title", "Unsupported kind: domain");
+    expect(container.querySelector('line[data-edge-family="epistemic"]')).toBeInTheDocument();
+    expect(container.querySelector('line[data-edge-family="epistemic"]')).toHaveAttribute("marker-end", "url(#studio-ontology-arrow)");
+    expect(container.querySelector(".ontology-direction-glyph")).toHaveTextContent("›");
+    expect(container.querySelector(".ontology-direction-glyph")?.getAttribute("transform")).toMatch(/^rotate\(/);
     expect(
       screen.getByRole("region", { name: "Affected graph relationships" }),
     ).toHaveTextContent(/introduced_by · 1\.00/i);
+  });
+
+  it("dispatches retrieval note kinds through the note legend", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+
+    await user.click(screen.getAllByRole("button", { name: /Khive context/i })[0]);
+    expect(container.querySelector('[data-kind="observation"]')).toHaveTextContent("Observation");
+    expect(container.querySelector('[data-kind="observation"]')).not.toHaveTextContent("Unsupported kind");
+  });
+
+  it("uses explicit entity_kind in core review operation lists", async () => {
+    const user = userEvent.setup();
+    const operation = {
+      ...atlasReviewFixture.change_set.operations[0],
+      after: { kind: "entity", entity_kind: "concept", name: "Canonical concept" },
+    };
+    const report: ReviewReport = {
+      schema_version: "khive.review.v1",
+      review_kind: "changeset",
+      capability: {
+        source: "cli",
+        mutability: "read_only",
+        no_writes: true,
+        git_reads: false,
+        khive_reads: true,
+        github_writes: false,
+        wasm: false,
+        persistence: false,
+        unavailable_actions: ["apply", "commit", "push", "publish", "persist_review"],
+      },
+      change_set: { envelope: atlasReviewFixture.change_set.envelope, operations: [operation] },
+      tier_summary: {
+        ...atlasReviewFixture.tier_summary,
+        operations: 1,
+        tier_1: 1,
+        tier_2: 0,
+        highest_tier: "tier_1",
+        requires_independent_review: false,
+      },
+      validation: atlasReviewFixture.validation,
+      findings: [],
+      review_gate: atlasReviewFixture.review_gate,
+    };
+    const serialized = JSON.stringify(report);
+    const imported = new File([serialized], "core-review.json", { type: "application/json" });
+    Object.defineProperty(imported, "text", { value: () => Promise.resolve(serialized) });
+    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+
+    await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, imported);
+
+    expect(await screen.findByRole("heading", { name: "Attributed change-set review" })).toBeVisible();
+    expect(container.querySelector('.core-operation-list [data-kind="concept"]')).toHaveTextContent("Concept");
   });
 
   it("refuses same-family approval and records no approval state", async () => {

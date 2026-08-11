@@ -459,6 +459,12 @@
 .repo-graph-toolbar button { cursor: pointer; font-size: 14px; width: 30px; }
 .repo-graph-toolbar output { align-items: center; display: inline-flex; justify-content: center; min-width: 46px; padding: 0 5px; }
 
+.repo-ontology-legend {
+  border-bottom: 1px solid var(--repo-border);
+  color: var(--repo-muted);
+  padding: 7px 14px;
+}
+
 .repo-graph-stage {
   background:
     linear-gradient(rgba(20, 32, 51, 0.025) 1px, transparent 1px),
@@ -481,7 +487,7 @@
 
 .repo-graph-stage svg.repo-edges { height: 100%; inset: 0; position: absolute; width: 100%; }
 .repo-edges line { stroke: #b5c3bc; stroke-width: 1.2; }
-.repo-edges line.derived { stroke: var(--repo-violet); stroke-dasharray: 4 3; }
+.repo-edges .ontology-edge-glyph { stroke: var(--repo-paper); }
 .repo-graph-node {
   background: white;
   border: 1px solid #cfd8d3;
@@ -497,16 +503,23 @@
   z-index: 2;
 }
 .repo-graph-node:hover,
-.repo-graph-node.selected { border-color: var(--repo-green); box-shadow: 0 0 0 3px rgba(20, 125, 98, 0.12); }
+.repo-graph-node.selected { border-color: var(--ontology-kind-hue); box-shadow: 0 0 0 3px rgba(20, 125, 98, 0.12); }
 .repo-graph-node.history.selected { border-color: var(--repo-violet); box-shadow: 0 0 0 3px rgba(113, 88, 188, 0.12); }
 .repo-graph-node span,
 .repo-graph-node strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .repo-graph-node span { color: var(--repo-muted); font-size: 9px; text-transform: uppercase; }
 .repo-graph-node strong { font-size: 11px; margin-top: 2px; }
+.repo-graph-node > .repo-node-kind-icon {
+  color: var(--ontology-kind-hue);
+  display: inline-flex;
+  float: left;
+  font-size: 14px;
+  margin-right: 5px;
+}
 
 .repo-inspector { border-top: 1px solid var(--repo-border); padding: 13px 15px; }
 .repo-inspector-heading { gap: 8px; }
-.repo-inspector-heading svg { color: var(--repo-green); height: 15px; width: 15px; }
+.repo-inspector-heading svg { color: var(--ontology-kind-hue); height: 15px; width: 15px; }
 .repo-inspector-heading div { flex: 1; min-width: 0; }
 .repo-inspector-heading span,
 .repo-inspector-heading strong { display: block; }
@@ -535,6 +548,8 @@
 .repo-edge-list code { color: var(--repo-muted); font-size: 9px; overflow: hidden; text-overflow: ellipsis; }
 .repo-edge-list span { color: var(--repo-green); font-size: 10px; }
 .repo-edge-list em { color: var(--repo-violet); font-size: 9px; font-style: normal; }
+.repo-edge-list .ontology-relation-mark { color: var(--ontology-edge-hue); display: inline-flex; }
+.repo-edge-list .ontology-derived-mark { display: inline-flex; font-size: inherit; }
 
 .repo-list { max-height: 520px; overflow: auto; }
 .repo-list-row {

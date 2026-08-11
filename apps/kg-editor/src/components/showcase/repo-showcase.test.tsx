@@ -28,6 +28,15 @@ describe("repository showcase", () => {
     }
   });
 
+  it("uses the shared ontology legend and marks exporter-derived edges geometrically", () => {
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+
+    expect(screen.getByLabelText("Ontology legend")).toHaveTextContent(/Project.*Concept.*Contains.*Derived/i);
+    expect(container.querySelector('line[data-edge-origin="derived"]')).toHaveAttribute("marker-end", "url(#showcase-ontology-arrow)");
+    expect(container.querySelector(".ontology-direction-glyph")?.getAttribute("transform")).toMatch(/^rotate\(/);
+    expect(container.querySelector(".ontology-derived-glyph")).toHaveTextContent("◇");
+  });
+
   it("navigates from a module to its precomputed commits and back to modules", async () => {
     const bundle = golden();
     const user = userEvent.setup();

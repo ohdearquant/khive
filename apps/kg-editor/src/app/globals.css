@@ -20,6 +20,25 @@
   --amber-pale: #fff3d7;
   --red: #b24a4a;
   --red-pale: #fbe9e8;
+  --ontology-concept: #7256b1;
+  --ontology-document: #356d96;
+  --ontology-dataset: #087b77;
+  --ontology-project: #167357;
+  --ontology-person: #9a6914;
+  --ontology-org: #9b4d2f;
+  --ontology-artifact: #8a4d86;
+  --ontology-service: #2f7290;
+  --ontology-resource: #6f6547;
+  --ontology-observation: #4f6d7a;
+  --ontology-insight: #7a589d;
+  --ontology-question: #9b6514;
+  --ontology-decision: #3c7563;
+  --ontology-reference: #596fa3;
+  --ontology-edge-neutral: #697780;
+  --ontology-support: #147d62;
+  --ontology-refute: #b24a4a;
+  --ontology-derived: #7158bc;
+  --ontology-unknown: #7c8795;
   --shadow: 0 16px 45px rgba(26, 37, 47, 0.07);
   --shadow-small: 0 4px 18px rgba(28, 39, 49, 0.06);
   --radius: 12px;
@@ -82,6 +101,95 @@ kbd {
   white-space: nowrap;
   width: 1px;
 }
+
+.ontology-kind-mark,
+.ontology-relation-mark,
+.ontology-derived-mark,
+.ontology-legend {
+  align-items: center;
+  display: inline-flex;
+}
+
+.ontology-kind-mark {
+  color: var(--ontology-kind-hue);
+  gap: 4px;
+}
+
+.ontology-kind-mark svg {
+  flex: 0 0 auto;
+  height: 1em;
+  width: 1em;
+}
+
+.ontology-relation-mark {
+  color: var(--ontology-edge-hue);
+  gap: 4px;
+}
+
+.ontology-relation-mark b,
+.ontology-derived-mark b {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 1.15em;
+  line-height: 1;
+}
+
+.ontology-derived-mark {
+  color: var(--ontology-derived);
+  gap: 4px;
+}
+
+.ontology-legend {
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.ontology-legend > span {
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+svg line.ontology-edge {
+  stroke: var(--ontology-edge-hue);
+  stroke-linecap: round;
+  stroke-width: 1.3px;
+}
+
+svg line.ontology-edge[data-edge-treatment="quiet-solid"] { opacity: 0.72; }
+svg line.ontology-edge[data-edge-treatment="directional"] { stroke-dasharray: 7 2; }
+svg line.ontology-edge[data-edge-treatment="dotted"] { stroke-dasharray: 1 3; }
+svg line.ontology-edge[data-edge-treatment="assertive-solid"] { stroke-width: 1.8px; }
+svg line.ontology-edge[data-edge-treatment="undirected"] { stroke-dasharray: 6 2 1 2; }
+svg line.ontology-edge[data-edge-treatment="recessive-dashed"] { opacity: 0.62; stroke-dasharray: 3 4; }
+svg line.ontology-edge[data-edge-treatment="epistemic"] { stroke-dasharray: 8 2; stroke-width: 1.6px; }
+svg line.ontology-edge[data-edge-variant="secondary"] { stroke-dashoffset: 2; }
+svg line.ontology-edge[data-edge-variant="tertiary"] { stroke-dashoffset: 4; }
+svg line.ontology-edge[data-edge-variant="quaternary"] { stroke-dashoffset: 6; }
+svg line.ontology-edge[data-edge-origin="derived"] { stroke-dasharray: 2 2; }
+
+.ontology-edge-glyph {
+  dominant-baseline: central;
+  fill: var(--ontology-edge-hue);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 3px;
+  paint-order: stroke;
+  stroke: var(--surface-strong);
+  stroke-width: 0.7px;
+  text-anchor: middle;
+}
+
+.ontology-direction-glyph {
+  dominant-baseline: central;
+  fill: var(--ontology-edge-hue);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 5px;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: var(--surface-strong);
+  stroke-width: 0.8px;
+  text-anchor: middle;
+}
+
+.ontology-derived-glyph { fill: var(--ontology-derived); }
 
 .app-shell {
   min-height: 100vh;
@@ -1018,6 +1126,9 @@ i.context,
   color: var(--blue);
 }
 
+.substrate-chip.ontology-kind-mark { color: var(--ontology-kind-hue); }
+.substrate-chip.ontology-relation-mark { color: var(--ontology-edge-hue); }
+
 .tier-pill {
   padding: 4px 8px;
 }
@@ -1400,6 +1511,18 @@ i.context,
   gap: 10px;
 }
 
+.graph-legend-block {
+  display: grid;
+  gap: 7px;
+  justify-items: end;
+  max-width: min(62%, 620px);
+}
+
+.graph-ontology-legend {
+  color: var(--ink-faint);
+  justify-content: flex-end;
+}
+
 .graph-stage {
   background:
     linear-gradient(rgba(36, 56, 50, 0.03) 1px, transparent 1px),
@@ -1434,12 +1557,11 @@ i.context,
 }
 
 .graph-lines .added line {
-  stroke: #6cae98;
+  opacity: 1;
 }
 
 .graph-lines .modified line {
-  stroke: #c3a15c;
-  stroke-dasharray: 5 4;
+  opacity: 0.82;
 }
 
 .graph-node {
@@ -1464,7 +1586,7 @@ i.context,
 }
 
 .graph-node.selected {
-  border-color: var(--green);
+  border-color: var(--ontology-kind-hue);
 }
 
 .graph-node.added {
@@ -1480,9 +1602,10 @@ i.context,
 }
 
 .node-kind {
-  color: var(--ink-faint);
-  display: block;
+  color: var(--ontology-kind-hue);
+  display: flex;
   font-size: 8px;
+  gap: 4px;
   margin-bottom: 3px;
   text-transform: uppercase;
 }
@@ -1505,6 +1628,11 @@ i.context,
   position: absolute;
   transform: translate(-50%, -50%);
   z-index: 3;
+}
+
+.edge-label .ontology-relation-mark {
+  display: inline-flex;
+  font-size: inherit;
 }
 
 .edge-label.modified {
@@ -1560,6 +1688,14 @@ i.context,
   font-size: 10px;
   line-height: 1.45;
   margin: 5px 0 0;
+}
+
+.node-inspector-kind {
+  color: var(--ontology-kind-hue);
+  display: inline-flex;
+  float: left;
+  font-size: 15px;
+  margin: 0 6px 2px 0;
 }
 
 .node-inspector code {
