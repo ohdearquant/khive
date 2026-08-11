@@ -81,6 +81,26 @@ static CHECKPOINT_CONSECUTIVE_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// yet" sentinel, mirroring `LAST_WAL_PAGES`.
 static CHECKPOINT_LAST_SKIP_WAL_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Elevated checkpoint observations aggregated in memory instead of written
+/// as one primary-store lifecycle row per tick (#1838).
+static CHECKPOINT_PRESSURE_ELEVATED_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Below-to-above `warn_pages` transitions observed by checkpoint tasks.
+static CHECKPOINT_PRESSURE_EPISODES_STARTED: AtomicU64 = AtomicU64::new(0);
+
+/// Above-to-below `warn_pages` transitions observed by checkpoint tasks.
+static CHECKPOINT_PRESSURE_EPISODES_RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+/// Primary-store append calls actually made by checkpoint lifecycle workers.
+static CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Checkpoint lifecycle append calls that returned a storage error.
+static CHECKPOINT_LIFECYCLE_APPEND_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Lifecycle transitions rejected before append because the bounded handoff
+/// was full, closed, or could not serialize the payload.
+static CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// One backend-scoped observation produced by the periodic checkpoint task's
 /// own PASSIVE pass. Logical frame counts and the physical `-wal` allocation
 /// are intentionally separate: SQLite may retain/reuse the sidecar after the
@@ -199,6 +219,36 @@ pub fn checkpoint_last_skip_wal_pages() -> Option<u64> {
     }
 }
 
+/// Total at/above-`warn_pages` observations aggregated in memory.
+pub fn checkpoint_pressure_elevated_ticks() -> u64 {
+    CHECKPOINT_PRESSURE_ELEVATED_TICKS.load(Ordering::Relaxed)
+}
+
+/// Total pressure episodes observed to start in this process.
+pub fn checkpoint_pressure_episodes_started() -> u64 {
+    CHECKPOINT_PRESSURE_EPISODES_STARTED.load(Ordering::Relaxed)
+}
+
+/// Total pressure episodes observed to recover in this process.
+pub fn checkpoint_pressure_episodes_recovered() -> u64 {
+    CHECKPOINT_PRESSURE_EPISODES_RECOVERED.load(Ordering::Relaxed)
+}
+
+/// Total primary-store append calls made by checkpoint lifecycle workers.
+pub fn checkpoint_lifecycle_append_attempts() -> u64 {
+    CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS.load(Ordering::Relaxed)
+}
+
+/// Total checkpoint lifecycle append calls that returned a storage error.
+pub fn checkpoint_lifecycle_append_failures() -> u64 {
+    CHECKPOINT_LIFECYCLE_APPEND_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Total checkpoint lifecycle transitions rejected before append.
+pub fn checkpoint_lifecycle_enqueue_drops() -> u64 {
+    CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.load(Ordering::Relaxed)
+}
+
 /// A tick's dedicated checkpoint connection was unavailable: bump the
 /// lifetime and consecutive-skip counters and snapshot the last-known WAL
 /// pressure so an operator can see how bad the WAL was heading into the skip
@@ -219,6 +269,17 @@ fn note_checkpoint_observed(_wal_pages: u64) {
     CHECKPOINT_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
 }
 
+fn note_checkpoint_pressure_observation(above_warn: bool, was_above_warn: bool) {
+    if above_warn {
+        CHECKPOINT_PRESSURE_ELEVATED_TICKS.fetch_add(1, Ordering::Relaxed);
+        if !was_above_warn {
+            CHECKPOINT_PRESSURE_EPISODES_STARTED.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if was_above_warn {
+        CHECKPOINT_PRESSURE_EPISODES_RECOVERED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Reset the checkpoint-pressure atomics between tests. Process-wide gauges
 /// are otherwise shared across every test in this binary; tests that assert
 /// on them must reset first and run under a shared `#[serial(...)]` group.
@@ -227,6 +288,12 @@ pub(crate) fn reset_checkpoint_metrics_for_tests() {
     CHECKPOINT_SKIPPED_TICKS.store(0, Ordering::Relaxed);
     CHECKPOINT_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
     CHECKPOINT_LAST_SKIP_WAL_PAGES.store(u64::MAX, Ordering::Relaxed);
+    CHECKPOINT_PRESSURE_ELEVATED_TICKS.store(0, Ordering::Relaxed);
+    CHECKPOINT_PRESSURE_EPISODES_STARTED.store(0, Ordering::Relaxed);
+    CHECKPOINT_PRESSURE_EPISODES_RECOVERED.store(0, Ordering::Relaxed);
+    CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS.store(0, Ordering::Relaxed);
+    CHECKPOINT_LIFECYCLE_APPEND_FAILURES.store(0, Ordering::Relaxed);
+    CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.store(0, Ordering::Relaxed);
 }
 
 /// Outcome of a single checkpoint attempt.
@@ -1385,6 +1452,26 @@ impl CheckpointLifecycleOwner {
 /// without allowing sustained writer contention to grow memory without bound.
 const CHECKPOINT_LIFECYCLE_QUEUE_CAPACITY: usize = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointPressureEpisode {
+    elevated_ticks: u64,
+    peak_wal_pages: u64,
+}
+
+impl CheckpointPressureEpisode {
+    fn start(wal_pages: u64) -> Self {
+        Self {
+            elevated_ticks: 1,
+            peak_wal_pages: wal_pages,
+        }
+    }
+
+    fn observe(&mut self, wal_pages: u64) {
+        self.elevated_ticks = self.elevated_ticks.saturating_add(1);
+        self.peak_wal_pages = self.peak_wal_pages.max(wal_pages);
+    }
+}
+
 /// Zero-wait handoff from the checkpoint scheduler to its lifecycle sink.
 ///
 /// The worker serializes appends, preserving the order of every event that is
@@ -1417,7 +1504,9 @@ impl CheckpointLifecycleEmitter {
         let worker = tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
                 let kind = event.kind;
+                CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                 if let Err(err) = owner.event_store.append_event(event).await {
+                    CHECKPOINT_LIFECYCLE_APPEND_FAILURES.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         error = %err,
                         event_kind = %kind.name(),
@@ -1449,8 +1538,13 @@ impl CheckpointLifecycleEmitter {
                     event_kind = %kind.name(),
                     "failed to serialize checkpoint lifecycle event payload"
                 );
+                CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
+        };
+        let payload_schema_version = match kind {
+            khive_types::EventKind::CheckpointOutcomeRecorded => 2,
+            _ => 1,
         };
         let event = khive_storage::Event::new(
             namespace,
@@ -1459,7 +1553,8 @@ impl CheckpointLifecycleEmitter {
             khive_types::SubstrateKind::Event,
             "daemon:checkpoint_task",
         )
-        .with_payload(payload_value);
+        .with_payload(payload_value)
+        .with_payload_schema_version(payload_schema_version);
 
         match sender.try_send(event) {
             Ok(()) => {
@@ -1467,6 +1562,7 @@ impl CheckpointLifecycleEmitter {
                 true
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
                 if !self.busy_warning_emitted {
                     tracing::warn!(
                         event_kind = %event.kind.name(),
@@ -1478,6 +1574,7 @@ impl CheckpointLifecycleEmitter {
                 false
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
+                CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     event_kind = %event.kind.name(),
                     "checkpoint lifecycle event dropped because the append worker stopped"
@@ -1667,10 +1764,12 @@ impl CheckpointConnection {
 ///
 /// `lifecycle_owner` (ADR-094): exactly one task in a multi-backend fan-out
 /// should receive `Some`. That task appends a best-effort
-/// `CheckpointOutcomeRecorded` event on every at/above-`warn_pages` tick,
-/// plus one drain row when pressure falls back below `warn_pages`. `None`
-/// explicitly marks a non-owner. See `crates/khive-db/docs/api/checkpoint.md`
-/// for the full shutdown-mechanism and event-emission design history.
+/// `CheckpointOutcomeRecorded` event on the elevation transition and one
+/// recovery summary when pressure falls back below `warn_pages`. Sustained
+/// elevated ticks aggregate in memory and in `db_diagnostics`; they never
+/// write one primary-store row per checkpoint attempt. `None` explicitly
+/// marks a non-owner. See `crates/khive-db/docs/api/checkpoint.md` for the
+/// full shutdown-mechanism and event-emission design history.
 ///
 /// `is_main` (ADR-091 Amendment 3): whether `pool` is the deployment's main
 /// backend. A daemon owning several file-backed backends spawns one task per
@@ -1718,12 +1817,18 @@ pub async fn run_checkpoint_task(
     #[cfg(not(unix))]
     let mut truncate_state = TruncateState::default();
     let mut lifecycle_emitter = CheckpointLifecycleEmitter::new(lifecycle_owner);
-    // Independent of `severity_state` (which owns the WARN-episode ladder
-    // internally): this tracks whether an accepted elevated lifecycle row
-    // still needs its matching drain row. A full queue leaves it unchanged,
-    // so a dropped drain is retried on the next healthy tick rather than
-    // leaving consumers with a permanently open elevation episode.
+    // Independent of `severity_state` (which owns the WARN ladder): this
+    // tracks the lifecycle sink's accepted elevation state. A full queue
+    // leaves it unchanged, so an opening or recovery transition is retried
+    // without admitting more than one primary-store write for that edge.
     let mut event_elevation_open = false;
+    let mut pressure_episode: Option<CheckpointPressureEpisode> = None;
+    // A recovery row whose `try_emit` lost the race against a full queue.
+    // Retried on later ticks (before that tick's own transition handling)
+    // instead of leaving `pressure_episode` open for a stale episode to
+    // absorb the next, genuinely separate, pressure incident (#1857).
+    let mut pending_recovery: Option<khive_storage::CheckpointOutcomeRecordedPayload> = None;
+    let mut was_observed_above_warn = false;
     // ADR-091 Amendment 3: this task's own backend-scoped view of the
     // registry. `is_main` selects which `TxOriginFilter` variant applies —
     // the caller passes `true` for exactly the one checkpoint task covering
@@ -1876,6 +1981,8 @@ pub async fn run_checkpoint_task(
         let above_warn = wal_pages >= config.warn_pages;
         let above_high_water = wal_pages >= config.high_water_pages;
         let above_truncate_high_water = wal_pages >= config.truncate_high_water_pages;
+        note_checkpoint_pressure_observation(above_warn, was_observed_above_warn);
+        was_observed_above_warn = above_warn;
 
         // Per-tick debug for the oldest open entry always fires (cheap —
         // reuses this tick's already-computed `oldest_tx`); the two
@@ -1923,25 +2030,25 @@ pub async fn run_checkpoint_task(
             );
         }
 
-        // ADR-094: emit every elevated tick, plus exactly one drain row on
-        // the tick that observes the episode end — never on every ordinary
-        // below-warn tick.
-        if checkpoint_outcome_should_emit(above_warn, event_elevation_open) {
-            let payload = khive_storage::CheckpointOutcomeRecordedPayload {
-                wal_pages,
-                warn_pages: config.warn_pages,
-                high_water_pages: config.high_water_pages,
-                truncate_high_water_pages: config.truncate_high_water_pages,
-                above_warn,
-                above_high_water,
-                above_truncate_high_water,
-            };
-            if lifecycle_emitter
-                .try_emit(khive_types::EventKind::CheckpointOutcomeRecorded, payload)
-            {
-                event_elevation_open = above_warn;
-            }
-        }
+        // ADR-094/#1838, #1857: one elevation row and one recovery summary
+        // per genuinely continuous episode. Sustained elevated ticks update
+        // only the bounded in-memory aggregate and process diagnostics
+        // above; a dropped recovery handoff must not fold the next,
+        // separate, pressure incident into this episode's aggregate.
+        observe_checkpoint_pressure_tick(
+            above_warn,
+            wal_pages,
+            above_high_water,
+            above_truncate_high_water,
+            &config,
+            &mut event_elevation_open,
+            &mut pressure_episode,
+            &mut pending_recovery,
+            |payload| {
+                lifecycle_emitter
+                    .try_emit(khive_types::EventKind::CheckpointOutcomeRecorded, payload)
+            },
+        );
     }
 
     lifecycle_emitter.shutdown().await;
@@ -1952,13 +2059,124 @@ pub async fn run_checkpoint_task(
     }
 }
 
-/// Whether a `CheckpointOutcomeRecorded` event should be emitted for this
-/// tick: every elevated (`above_warn`) tick, plus exactly one drain row on
-/// the first tick that observes a return to below-warn after an elevated
-/// episode (`was_elevated`). An ordinary below-warn tick following another
-/// below-warn tick emits nothing.
+/// Whether a `CheckpointOutcomeRecorded` transition should be enqueued for
+/// this tick. Repeated observations in either state aggregate in memory;
+/// only elevation and recovery edges reach the primary store.
 fn checkpoint_outcome_should_emit(above_warn: bool, was_elevated: bool) -> bool {
-    above_warn || was_elevated
+    above_warn != was_elevated
+}
+
+/// Advance the pressure-episode/lifecycle-emission state machine for one
+/// observed tick. `try_emit` mirrors [`CheckpointLifecycleEmitter::try_emit`]
+/// — `true` means the row was handed off, `false` means the queue was full
+/// or closed.
+///
+/// #1857: on a dropped recovery handoff (`try_emit` returns `false` while
+/// `above_warn` is `false`), the closed episode's summary is stashed in
+/// `pending_recovery` for retry on later ticks — flushed here before this
+/// tick's own transition is evaluated — instead of leaving
+/// `event_elevation_open` and `pressure_episode` open for the next elevated
+/// tick to silently extend, which would report two separate pressure
+/// incidents as one merged episode.
+#[allow(clippy::too_many_arguments)]
+fn observe_checkpoint_pressure_tick(
+    above_warn: bool,
+    wal_pages: u64,
+    above_high_water: bool,
+    above_truncate_high_water: bool,
+    config: &CheckpointConfig,
+    event_elevation_open: &mut bool,
+    pressure_episode: &mut Option<CheckpointPressureEpisode>,
+    pending_recovery: &mut Option<khive_storage::CheckpointOutcomeRecordedPayload>,
+    mut try_emit: impl FnMut(khive_storage::CheckpointOutcomeRecordedPayload) -> bool,
+) {
+    // An undelivered recovery summary is a BARRIER, not merely a retry:
+    // lifecycle consumers assert on the ordered event history (ADR-094), so
+    // a later episode's opening must never be appended ahead of an earlier
+    // episode's recovery. If the retry fails, the in-memory aggregate still
+    // advances below, but no other emission is attempted this tick — a
+    // deferred opening or recovery re-derives from state on a later tick,
+    // after the pending summary has been delivered in order.
+    let pending_blocks_emission = if let Some(payload) = pending_recovery.clone() {
+        if try_emit(payload) {
+            *pending_recovery = None;
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+
+    if above_warn {
+        match pressure_episode.as_mut() {
+            Some(episode) => episode.observe(wal_pages),
+            None => *pressure_episode = Some(CheckpointPressureEpisode::start(wal_pages)),
+        }
+    } else if !*event_elevation_open {
+        // No elevation row reached the bounded handoff, so from any
+        // consumer's view this episode never opened; discarding it keeps
+        // the delivered history self-consistent. When the discard happens
+        // because the barrier suppressed the opening attempt entirely, the
+        // loss would otherwise be invisible even to the drop counters that
+        // record failed attempts, so it is counted and logged here.
+        if pending_blocks_emission && pressure_episode.is_some() {
+            CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                wal_pages,
+                "checkpoint pressure episode elapsed unreported behind an undelivered recovery summary"
+            );
+        }
+        *pressure_episode = None;
+    }
+
+    if pending_blocks_emission || !checkpoint_outcome_should_emit(above_warn, *event_elevation_open)
+    {
+        return;
+    }
+    let Some(episode) = *pressure_episode else {
+        tracing::warn!(
+            above_warn,
+            event_elevation_open = *event_elevation_open,
+            "checkpoint pressure transition has no episode aggregate"
+        );
+        return;
+    };
+    let payload = khive_storage::CheckpointOutcomeRecordedPayload {
+        wal_pages,
+        warn_pages: config.warn_pages,
+        high_water_pages: config.high_water_pages,
+        truncate_high_water_pages: config.truncate_high_water_pages,
+        above_warn,
+        above_high_water,
+        above_truncate_high_water,
+        episode_elevated_ticks: Some(episode.elevated_ticks),
+        episode_peak_wal_pages: Some(episode.peak_wal_pages),
+    };
+    if try_emit(payload.clone()) {
+        *event_elevation_open = above_warn;
+        if !above_warn {
+            *pressure_episode = None;
+        }
+    } else if !above_warn {
+        // The recovery handoff was dropped. Close this episode locally
+        // anyway — `event_elevation_open` MUST NOT stay true, or the next
+        // elevated tick would extend this (already finished) episode's
+        // aggregate instead of starting a fresh one for what is genuinely a
+        // new pressure incident. The dropped summary itself isn't thrown
+        // away: it is stashed in `pending_recovery` and delivered on a
+        // later tick, ahead of (and as a barrier to) every subsequent
+        // emission, so lifecycle ordering survives the retry. The slot is
+        // structurally empty here: a tick that entered with an undelivered
+        // summary returned at the barrier above and never reached this arm.
+        debug_assert!(
+            pending_recovery.is_none(),
+            "recovery emission attempted while an earlier summary was still pending"
+        );
+        *event_elevation_open = false;
+        *pressure_episode = None;
+        *pending_recovery = Some(payload);
+    }
 }
 
 /// ADR-091 Plank 0 (Amendment 3: takes the tick's already-computed,
@@ -3366,7 +3584,7 @@ mod tests {
         let task = section(
             source,
             "pub async fn run_checkpoint_task(",
-            "/// Whether a `CheckpointOutcomeRecorded` event should be emitted",
+            "/// Whether a `CheckpointOutcomeRecorded` transition should be enqueued",
         );
         let checkpoint = task
             .find("checkpoint_once_core(")
@@ -3378,11 +3596,25 @@ mod tests {
             .find("reap_dead_entries_bounded(legacy_walpin_fallback_interval)")
             .expect("fallback housekeeping");
         let outcome = task
-            .find("checkpoint_outcome_should_emit")
+            .find("observe_checkpoint_pressure_tick(")
             .expect("lifecycle outcome use");
         assert!(
             checkpoint < completion && completion < housekeeping && housekeeping < outcome,
             "tick ordering must be checkpoint -> awaited attribution -> housekeeping decision -> outcome"
+        );
+
+        // The outcome decision itself moved into the extracted per-tick
+        // helper; the emit gate must still be consulted there, so the
+        // ordering assertion above remains transitively about the same
+        // lifecycle decision it always pinned.
+        let pressure_tick = section(
+            source,
+            "fn observe_checkpoint_pressure_tick(",
+            "/// ADR-091 Plank 0",
+        );
+        assert!(
+            pressure_tick.contains("checkpoint_outcome_should_emit"),
+            "extracted pressure tick helper must gate on the lifecycle emit decision"
         );
     }
 
@@ -5084,9 +5316,8 @@ mod tests {
     }
 
     /// Pure decision-table coverage for every input combination
-    /// `checkpoint_outcome_should_emit` can see: a first elevated tick, a
-    /// sustained elevated tick, the single drain row, and the ordinary
-    /// healthy tick that must emit nothing.
+    /// `checkpoint_outcome_should_emit` can see: elevation, sustained
+    /// pressure, recovery, and repeated healthy observations.
     #[test]
     fn checkpoint_outcome_should_emit_covers_all_transitions() {
         assert!(
@@ -5094,8 +5325,8 @@ mod tests {
             "first elevated tick must emit"
         );
         assert!(
-            checkpoint_outcome_should_emit(true, true),
-            "sustained elevated tick must emit"
+            !checkpoint_outcome_should_emit(true, true),
+            "sustained elevated ticks must aggregate in memory instead of writing the WAL"
         );
         assert!(
             checkpoint_outcome_should_emit(false, true),
@@ -5107,9 +5338,281 @@ mod tests {
         );
     }
 
+    /// Regression #1838: under a persistent WAL pin, lifecycle persistence
+    /// must scale with pressure-state transitions, not checkpoint attempts.
+    #[test]
+    fn persistent_pressure_lifecycle_rows_are_o_state_transitions() {
+        let observations = [true; 128].into_iter().chain([false]).chain([false; 128]);
+        let mut was_elevated = false;
+        let writes = observations
+            .filter(|above_warn| {
+                let emit = checkpoint_outcome_should_emit(*above_warn, was_elevated);
+                if emit {
+                    was_elevated = *above_warn;
+                }
+                emit
+            })
+            .count();
+
+        assert_eq!(
+            writes, 2,
+            "one elevation row plus one recovery summary must cover any number of attempts"
+        );
+    }
+
+    #[test]
+    fn checkpoint_pressure_episode_retains_recovery_summary() {
+        let mut episode = CheckpointPressureEpisode::start(2_500);
+        episode.observe(2_300);
+        episode.observe(8_100);
+        episode.observe(4_000);
+
+        assert_eq!(episode.elevated_ticks, 4);
+        assert_eq!(episode.peak_wal_pages, 8_100);
+    }
+
+    /// Drives [`observe_checkpoint_pressure_tick`] through a fixed sequence
+    /// of `(above_warn, wal_pages)` ticks, faking `try_emit` per call index
+    /// (0-based across the whole sequence) via `fail_on`. Returns every
+    /// payload that was reported as successfully delivered, in delivery
+    /// order.
+    fn drive_pressure_ticks(
+        config: &CheckpointConfig,
+        ticks: &[(bool, u64)],
+        mut fail_on: impl FnMut(usize) -> bool,
+    ) -> Vec<khive_storage::CheckpointOutcomeRecordedPayload> {
+        let mut event_elevation_open = false;
+        let mut pressure_episode: Option<CheckpointPressureEpisode> = None;
+        let mut pending_recovery: Option<khive_storage::CheckpointOutcomeRecordedPayload> = None;
+        let mut delivered = Vec::new();
+        let mut call_index = 0usize;
+        for &(above_warn, wal_pages) in ticks {
+            observe_checkpoint_pressure_tick(
+                above_warn,
+                wal_pages,
+                false,
+                false,
+                config,
+                &mut event_elevation_open,
+                &mut pressure_episode,
+                &mut pending_recovery,
+                |payload| {
+                    let idx = call_index;
+                    call_index += 1;
+                    if fail_on(idx) {
+                        false
+                    } else {
+                        delivered.push(payload);
+                        true
+                    }
+                },
+            );
+        }
+        delivered
+    }
+
+    /// #1857 regression: a dropped recovery handoff must not fold the next,
+    /// separate, pressure incident into the closed episode's aggregate — and
+    /// the undelivered recovery is a BARRIER, so episode 2's opening must not
+    /// be delivered ahead of episode 1's recovery (ADR-094: consumers assert
+    /// on the ordered event history).
+    ///
+    /// Sequence: episode 1 opens and sustains for 3 ticks, then its recovery
+    /// row is dropped (call index 1) and two retries are also dropped (call
+    /// indices 2 and 3) — the second of them on the tick where episode 2
+    /// begins, so the barrier defers episode 2's opening. Once the worker
+    /// frees up, episode 1's delayed recovery delivers first, then episode
+    /// 2's opening (reflecting its state at emission time), then episode 2's
+    /// recovery.
+    #[test]
+    fn dropped_recovery_handoff_does_not_merge_pressure_episodes() {
+        let config = CheckpointConfig {
+            warn_pages: 1_000,
+            ..CheckpointConfig::default()
+        };
+        let ticks = [
+            (true, 1_500), // call 0: episode 1 opens — delivered
+            (true, 1_800), // sustained, no emit attempt
+            (true, 2_000), // sustained, no emit attempt
+            (false, 500),  // call 1: episode 1 recovery — DROPPED
+            (false, 400),  // call 2: retry episode 1 recovery — DROPPED
+            (true, 3_000), // call 3: retry — DROPPED; barrier defers episode 2's opening
+            (true, 3_500), // call 4: retry — delivered; call 5: episode 2 opens — delivered
+            (false, 300),  // call 6: episode 2 recovery — delivered
+        ];
+
+        let delivered = drive_pressure_ticks(&config, &ticks, |idx| matches!(idx, 1..=3));
+
+        assert_eq!(
+            delivered.len(),
+            4,
+            "expected episode-1 open, episode-1 delayed recovery, episode-2 open, \
+             episode-2 recovery: {delivered:?}"
+        );
+
+        let ep1_open = &delivered[0];
+        assert!(ep1_open.above_warn);
+        assert_eq!(ep1_open.episode_elevated_ticks, Some(1));
+        assert_eq!(ep1_open.episode_peak_wal_pages, Some(1_500));
+
+        let ep1_recovery = &delivered[1];
+        assert!(
+            !ep1_recovery.above_warn,
+            "episode 1's recovery must be delivered BEFORE episode 2's opening; \
+             an opening in this slot means the barrier failed: {delivered:?}"
+        );
+        assert_eq!(
+            ep1_recovery.episode_elevated_ticks,
+            Some(3),
+            "episode 1's delayed recovery must report only its own 3 elevated ticks, \
+             not ticks absorbed from episode 2"
+        );
+        assert_eq!(ep1_recovery.episode_peak_wal_pages, Some(2_000));
+
+        let ep2_open = &delivered[2];
+        assert!(ep2_open.above_warn);
+        assert_eq!(
+            ep2_open.episode_elevated_ticks,
+            Some(2),
+            "episode 2 opens fresh (never continuing episode 1's count), deferred one \
+             tick by the barrier, so its opening reports 2 elevated ticks"
+        );
+        assert_eq!(ep2_open.episode_peak_wal_pages, Some(3_500));
+
+        let ep2_recovery = &delivered[3];
+        assert!(!ep2_recovery.above_warn);
+        assert_eq!(
+            ep2_recovery.episode_elevated_ticks,
+            Some(2),
+            "episode 2's recovery must report only its own 2 elevated ticks"
+        );
+        assert_eq!(ep2_recovery.episode_peak_wal_pages, Some(3_500));
+    }
+
+    /// Degenerate barrier arm: an episode whose entire lifetime falls inside
+    /// the window where an earlier recovery is still undelivered is discarded
+    /// rather than reported out of order — from any consumer's view it never
+    /// opened, so no stale opening or recovery for it may surface after the
+    /// queue frees. The loss itself is counted and logged at the discard
+    /// site; this test pins the delivered-history shape.
+    #[test]
+    fn episode_elapsed_entirely_behind_barrier_is_discarded_not_reordered() {
+        let config = CheckpointConfig {
+            warn_pages: 1_000,
+            ..CheckpointConfig::default()
+        };
+        let ticks = [
+            (true, 1_500), // call 0: episode 1 opens — delivered
+            (false, 500),  // call 1: episode 1 recovery — DROPPED
+            (true, 9_000), // call 2: retry — DROPPED; barrier defers episode 2's opening
+            (false, 400),  // call 3: retry — DROPPED; episode 2 discarded behind barrier
+            (false, 300),  // call 4: retry — delivered
+            (true, 2_500), // call 5: episode 3 opens — delivered
+            (false, 200),  // call 6: episode 3 recovery — delivered
+        ];
+
+        let delivered = drive_pressure_ticks(&config, &ticks, |idx| matches!(idx, 1..=3));
+
+        let peaks: Vec<_> = delivered
+            .iter()
+            .map(|payload| (payload.above_warn, payload.episode_peak_wal_pages))
+            .collect();
+        assert_eq!(
+            peaks,
+            vec![
+                (true, Some(1_500)),  // episode 1 open
+                (false, Some(1_500)), // episode 1 delayed recovery
+                (true, Some(2_500)),  // episode 3 open — episode 2 (peak 9_000) never surfaces
+                (false, Some(2_500)), // episode 3 recovery
+            ],
+            "an episode elapsed entirely behind the barrier must not surface late or \
+             out of order: {delivered:?}"
+        );
+    }
+
+    /// ASCII-simple control for the regression above: the identical tick
+    /// sequence with no queue drops must report the same two episodes
+    /// separately (and promptly), confirming the merge in the drop case is
+    /// caused by the drop, not by the tick sequence itself.
+    #[test]
+    fn no_dropped_handoff_reports_two_separate_episodes() {
+        let config = CheckpointConfig {
+            warn_pages: 1_000,
+            ..CheckpointConfig::default()
+        };
+        let ticks = [
+            (true, 1_500),
+            (true, 1_800),
+            (true, 2_000),
+            (false, 500),
+            (false, 400),
+            (true, 3_000),
+            (true, 3_500),
+            (false, 300),
+        ];
+
+        let delivered = drive_pressure_ticks(&config, &ticks, |_idx| false);
+
+        assert_eq!(delivered.len(), 4, "{delivered:?}");
+        assert_eq!(
+            (
+                delivered[0].above_warn,
+                delivered[0].episode_elevated_ticks,
+                delivered[0].episode_peak_wal_pages
+            ),
+            (true, Some(1), Some(1_500)),
+            "episode 1 open"
+        );
+        assert_eq!(
+            (
+                delivered[1].above_warn,
+                delivered[1].episode_elevated_ticks,
+                delivered[1].episode_peak_wal_pages
+            ),
+            (false, Some(3), Some(2_000)),
+            "episode 1 recovery"
+        );
+        assert_eq!(
+            (
+                delivered[2].above_warn,
+                delivered[2].episode_elevated_ticks,
+                delivered[2].episode_peak_wal_pages
+            ),
+            (true, Some(1), Some(3_000)),
+            "episode 2 open"
+        );
+        assert_eq!(
+            (
+                delivered[3].above_warn,
+                delivered[3].episode_elevated_ticks,
+                delivered[3].episode_peak_wal_pages
+            ),
+            (false, Some(2), Some(3_500)),
+            "episode 2 recovery"
+        );
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn pressure_diagnostics_count_observations_and_transitions_separately() {
+        reset_checkpoint_metrics_for_tests();
+
+        note_checkpoint_pressure_observation(true, false);
+        note_checkpoint_pressure_observation(true, true);
+        note_checkpoint_pressure_observation(true, true);
+        note_checkpoint_pressure_observation(false, true);
+        note_checkpoint_pressure_observation(false, false);
+
+        assert_eq!(checkpoint_pressure_elevated_ticks(), 3);
+        assert_eq!(checkpoint_pressure_episodes_started(), 1);
+        assert_eq!(checkpoint_pressure_episodes_recovered(), 1);
+        assert_eq!(checkpoint_lifecycle_append_attempts(), 0);
+    }
+
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
-    async fn checkpoint_task_emits_outcome_events_while_elevated_and_stops_after_drain() {
+    async fn checkpoint_task_emits_one_opening_for_persistent_pressure() {
+        reset_checkpoint_metrics_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_emit.db");
         let pool = file_pool(&path);
@@ -5133,8 +5636,10 @@ mod tests {
             true,
         ));
 
-        // Poll for the first emitted event instead of a fixed sleep (same
-        // slowdown-flake class as the stale-sweep test above).
+        let progressed = wait_for(Duration::from_secs(10), || {
+            checkpoint_pressure_elevated_ticks() >= 10
+        })
+        .await;
         let emitted = wait_for(Duration::from_secs(10), || {
             !store.events.lock().unwrap().is_empty()
         })
@@ -5147,9 +5652,25 @@ mod tests {
 
         let events = store.events.lock().unwrap();
         assert!(
+            progressed,
+            "the simulated persistent-pressure episode must span at least ten checkpoint ticks"
+        );
+        assert!(
             emitted,
-            "an always-elevated config must append at least one CheckpointOutcomeRecorded event \
+            "an always-elevated config must append one CheckpointOutcomeRecorded event \
              within the poll deadline"
+        );
+        assert_eq!(
+            checkpoint_lifecycle_append_attempts(),
+            1,
+            "primary-store lifecycle writes must stay O(state transitions), not O(attempts)"
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload_schema_version, 2);
+        assert_eq!(events[0].payload["episode_elevated_ticks"], 1);
+        assert_eq!(
+            events[0].payload["episode_peak_wal_pages"],
+            events[0].payload["wal_pages"]
         );
         assert!(
             events
@@ -5163,15 +5684,13 @@ mod tests {
         );
     }
 
-    /// Regression #1434: the event sink's ordinary writer checkout can wait
-    /// five seconds, but a full lifecycle queue must drop telemetry while the
-    /// checkpoint scheduler continues through later elevated ticks. The
-    /// separate in-memory event backend makes that writer contention
-    /// deterministic without also preventing `checkpoint_once` from
-    /// observing the file-backed checkpoint pool.
+    /// Regression #1434/#1838: a lifecycle append may wait five seconds for
+    /// its sink writer, while checkpoint observations must continue without
+    /// enqueueing one new row per elevated tick.
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_cycles_and_task_shutdown_do_not_wait_for_a_contended_lifecycle_writer() {
+        reset_checkpoint_metrics_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_contended_sink.db");
         let checkpoint_pool = file_pool(&path);
@@ -5200,12 +5719,6 @@ mod tests {
             .try_writer()
             .expect("hold the event-store writer");
 
-        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber {
-            events: std::sync::Arc::clone(&buffer),
-        };
-        let _tracing_guard = tracing::subscriber::set_default(subscriber);
-
         let cfg = CheckpointConfig {
             interval: Duration::from_millis(10),
             warn_pages: 0,
@@ -5220,19 +5733,16 @@ mod tests {
             true,
         ));
 
-        let dropped = wait_for(Duration::from_secs(2), || {
-            buffer.lock().unwrap().iter().any(|event| {
-                event.message.as_deref()
-                    == Some("checkpoint lifecycle event dropped because the append worker is busy")
-            })
+        let progressed = wait_for(Duration::from_secs(2), || {
+            checkpoint_pressure_elevated_ticks() >= 10
         })
         .await;
         assert!(
-            dropped,
-            "later elevated ticks must reach the non-blocking enqueue while the first append is \
-             still waiting for the held event writer; got: {:?}",
-            buffer.lock().unwrap()
+            progressed,
+            "checkpoint observations must continue while the lifecycle append is contended"
         );
+        assert_eq!(checkpoint_lifecycle_append_attempts(), 1);
+        assert_eq!(checkpoint_lifecycle_enqueue_drops(), 0);
 
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
@@ -5250,11 +5760,12 @@ mod tests {
         drop(held_event_writer);
     }
 
-    /// A sink error is observable, and the worker remains alive to accept a
-    /// later checkpoint outcome instead of terminating the scheduler.
+    /// A sink error is observable without turning a sustained pressure
+    /// episode into a retrying primary-store write loop.
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_continues_after_lifecycle_append_failure() {
+        reset_checkpoint_metrics_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_failing_sink.db");
         let pool = file_pool(&path);
@@ -5281,11 +5792,8 @@ mod tests {
             true,
         ));
 
-        let retried = wait_for(Duration::from_secs(2), || {
-            store
-                .append_attempts
-                .load(std::sync::atomic::Ordering::Relaxed)
-                >= 2
+        let progressed = wait_for(Duration::from_secs(2), || {
+            checkpoint_pressure_elevated_ticks() >= 10
         })
         .await;
         shutdown_tx.send(()).expect("send shutdown signal");
@@ -5295,9 +5803,18 @@ mod tests {
             .expect("checkpoint task panicked");
 
         assert!(
-            retried,
-            "a failed append must not terminate the worker or checkpoint task"
+            progressed,
+            "a failed append must not terminate or stall the checkpoint task"
         );
+        assert_eq!(
+            store
+                .append_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a persistent pressure state must not retry one primary-store append per tick"
+        );
+        assert_eq!(checkpoint_lifecycle_append_attempts(), 1);
+        assert_eq!(checkpoint_lifecycle_append_failures(), 1);
         let captured = buffer.lock().unwrap().clone();
         assert!(
             captured.iter().any(|event| event.message.as_deref()

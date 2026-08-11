@@ -507,3 +507,74 @@ therefore cannot temporarily exceed the live connection budget. The writer
 task's fixed connection and store-internal operation-scoped connections are
 outside this raw-SQL handle budget and retain their ADR-067/ADR-135
 contracts.
+
+## Amendment: operation-scoped raw-SQL reader admission (2026-08-09)
+
+Issue #1828 supersedes the preceding amendment's reader-handle lifetime rule.
+The pool's effective reader count bounds concurrent file-backed raw-SQL reader
+opens and active read operations, not the number of retained `SqlReader`
+handles. `SqlAccess::reader()` may cache a read-only connection on its returned
+handle, but the permit used while opening that connection is released when the
+open finishes. Each ordinary `query_row`, `query_all`, and `query_page` call
+acquires a reader permit before moving the cached connection onto the blocking
+thread and releases it only after SQLite finishes the operation; the explicit
+read-transaction exception below treats its multi-call span as one operation.
+Saturation keeps the existing finite `checkout_timeout` and returns
+`StorageError::Timeout` with operation `sql_bridge.reader_open` or
+`sql_bridge.reader_operation`, respectively.
+
+The same rule applies to reads through a queue-backed `SqlWriter`: its lazily
+opened read-only connection remains cached without a reader permit, while each
+ordinary active query or explicit read-transaction span uses the shared
+permit. If an awaiting task is
+cancelled after SQLite work starts, the detached blocking closure retains the
+connection and permit together until that work actually finishes. Cancellation
+therefore cannot oversubscribe active reads, while idle retained handles no
+longer consume permanent admission capacity.
+
+Cached read-only connections may carry one explicitly admitted, top-level
+deferred read transaction across calls. A successful `BEGIN`, `BEGIN
+TRANSACTION`, or `BEGIN DEFERRED [TRANSACTION]` moves that call's reader permit
+onto the cached handle. Every query in the snapshot reuses the same permit;
+`COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite reports
+autocommit. `BEGIN IMMEDIATE`/`EXCLUSIVE`, `START`, nested `BEGIN`, savepoints,
+`RELEASE`, and `ROLLBACK ... TO` remain typed `StorageError::InvalidInput`
+because they either reserve write-side locks or require a nested lifecycle the
+single-level admission state does not represent. This exception is specific to
+single-statement reader calls: every `execute_batch` path continues to reject
+all transaction control before executing anything.
+
+Defense in depth distinguishes admitted and unadmitted non-autocommit state.
+An ordinary operation that leaves the cached connection outside autocommit is
+rolled back before its operation permit is released; if autocommit cannot be
+restored, the connection is discarded first. An admitted read transaction
+retains its permit across errors until a terminal control restores autocommit.
+On cancellation or handle drop, the connection is destroyed before its
+transaction permit, so SQLite closes the snapshot before admission returns.
+Thus an idle cached reader is autocommit and cannot pin WAL, while every live
+multi-call snapshot remains inside the `max_readers` active-read budget.
+
+The `multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress`
+regression is scoped to #1828: it retains eight cached reader handles against a
+two-reader budget after each handle completes its one-shot read, disables
+SQLite autocheckpoint, drives repeated write cycles, and observes the central
+ADR-091 PASSIVE checkpoint copying every WAL frame each cycle while the file
+size remains bounded. This proves idle handles no longer retain reader
+admission without depending on a zero-reader TRUNCATE window or undoing #1848's
+central checkpoint owner.
+
+The regression does not reproduce or close #1460 or #1812. An idle autocommit
+connection does not pin WAL; those issues concern production stdio/multiprocess
+pinning and continuous concurrent-session WAL bounds, respectively, and remain
+open pending their own production-shaped regressions and fixes.
+
+This amendment does not change the one-permit standalone writer budget. A
+read-write connection still retains its writer permit for its handle lifetime,
+including while one of its reader-supertrait methods runs; that read also
+acquires the ordinary active-read permit. The cached-reader admission state
+does not apply to this writer connection, so reader-supertrait calls within a
+legitimate manual `atomic_unit` do not terminate its transaction. Cached idle
+reader connections are enforced autocommit connections and do not retain a WAL
+snapshot (ADR-091), but their count is no longer a `max_readers` contract:
+callers that retain arbitrarily many handles remain responsible for their
+process's file-descriptor budget.

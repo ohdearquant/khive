@@ -805,7 +805,7 @@ impl ConnectionPool {
         &self.config
     }
 
-    /// Pool-wide permits for file-backed raw-SQL reader handles.
+    /// Pool-wide permits for file-backed raw-SQL reader opens and active reads.
     pub(crate) fn sql_bridge_reader_slots(&self) -> Arc<Semaphore> {
         Arc::clone(&self.sql_bridge_reader_slots)
     }
@@ -1089,7 +1089,7 @@ impl ConnectionPool {
     ///
     /// Called by the scheduled checkpoint task at startup — the one caller
     /// that actually replaces SQLite's per-commit autocheckpoint with
-    /// dedicated PASSIVE checkpointing (ADR-091 Amendment 8). The claim
+    /// dedicated PASSIVE checkpointing (ADR-091 Amendment 10). The claim
     /// makes every subsequently opened writer-capable connection set
     /// `PRAGMA wal_autocheckpoint = 0`, and re-applies that pragma on the
     /// already-open pooled writer under the writer mutex. A writer task

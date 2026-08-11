@@ -247,7 +247,7 @@ This decision is grounded in a static write-path code census (every cited path a
 
 Production checkpoint ownership now disables `wal_autocheckpoint` on every writer-capable
 connection of a pool the scheduled checkpoint task has claimed, as specified by ADR-091
-Amendment 8; pools without a running checkpoint task keep a bounded 4,000-page fallback so a
+Amendment 10; pools without a running checkpoint task keep a bounded 4,000-page fallback so a
 writable pool never loses WAL reclamation entirely. This supersedes the Context and Consequences
 statements that describe `wal_autocheckpoint=4000` as unconditional current behavior, and removes
 F7's current-versus-disabled comparison from the production topology matrix. An isolated benchmark
