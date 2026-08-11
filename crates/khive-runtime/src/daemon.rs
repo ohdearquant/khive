@@ -641,7 +641,10 @@ pub struct MetricsSnapshot {
 
 /// Read one length-prefixed frame (4-byte BE u32 length + JSON bytes).
 #[cfg(unix)]
-pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+pub async fn read_frame<R>(stream: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -658,7 +661,10 @@ pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
 
 /// Write one length-prefixed frame.
 #[cfg(unix)]
-pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
+pub async fn write_frame<W>(stream: &mut W, payload: &[u8]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     if payload.len() > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1020,7 +1026,30 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
 }
 
 #[cfg(unix)]
-async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
+async fn wait_for_peer_disconnect(read: &mut tokio::net::unix::OwnedReadHalf) {
+    let mut byte = [0u8; 1];
+    // One request is admitted per connection. EOF, a read error, or any
+    // subsequent byte all make this connection no longer a valid response
+    // peer, so the first completed read is the entire observation.
+    let _ = read.read(&mut byte).await;
+}
+
+#[cfg(all(unix, test))]
+async fn handle_conn<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
+    handle_conn_with_shutdown(stream, dispatcher, None).await;
+}
+
+#[cfg(unix)]
+async fn handle_conn_with_shutdown<D: DaemonDispatch>(
+    mut stream: UnixStream,
+    dispatcher: D,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown = shutdown.unwrap_or(local_shutdown_rx);
+    // Keeps the fallback receiver open in direct/test calls. Production owns
+    // a sender at the daemon-run scope and passes its receiver above.
+    let _local_shutdown_tx = local_shutdown_tx;
     let raw = match read_frame(&mut stream).await {
         Ok(r) => r,
         Err(e) => {
@@ -1035,6 +1064,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             return;
         }
     };
+    let (mut peer_read, mut peer_write) = stream.into_split();
 
     let served_config_id = Some(dispatcher.config_id().to_string());
     let resp = if frame.protocol_version != PROTOCOL_VERSION {
@@ -1133,18 +1163,34 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
-        match dispatcher
-            .dispatch(
-                frame.ops,
-                frame.presentation,
-                frame.presentation_per_op,
-                frame.format,
-                frame.format_per_op,
-                frame.from_wire,
-                Some(identity),
-            )
-            .await
-        {
+        let (read_cancel_tx, read_cancel_rx) = tokio::sync::watch::channel(false);
+        let dispatch = khive_storage::scope_request_read_cancellation(
+            shutdown,
+            khive_storage::scope_request_read_cancellation(
+                read_cancel_rx,
+                khive_storage::scope_request_read_deadline(
+                    khive_storage::request_read_timeout_from_env(),
+                    dispatcher.dispatch(
+                        frame.ops,
+                        frame.presentation,
+                        frame.presentation_per_op,
+                        frame.format,
+                        frame.format_per_op,
+                        frame.from_wire,
+                        Some(identity),
+                    ),
+                ),
+            ),
+        );
+        tokio::pin!(dispatch);
+        let dispatch_result = tokio::select! {
+            result = &mut dispatch => result,
+            _ = wait_for_peer_disconnect(&mut peer_read) => {
+                let _ = read_cancel_tx.send(true);
+                dispatch.await
+            }
+        };
+        match dispatch_result {
             Ok(result) => DaemonResponseFrame {
                 ok: true,
                 result: Some(result),
@@ -1203,11 +1249,11 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                     request_id: resp.request_id,
                 };
                 if let Ok(err_payload) = serde_json::to_vec(&err_resp) {
-                    if let Err(e) = write_frame(&mut stream, &err_payload).await {
+                    if let Err(e) = write_frame(&mut peer_write, &err_payload).await {
                         tracing::debug!(error = %e, "failed to write oversized-response error frame");
                     }
                 }
-            } else if let Err(e) = write_frame(&mut stream, &payload).await {
+            } else if let Err(e) = write_frame(&mut peer_write, &payload).await {
                 tracing::debug!(error = %e, "failed to write daemon response frame");
             }
         }
@@ -1684,6 +1730,10 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
     }
 
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connection_tasks = Arc::new(std::sync::Mutex::new(
+        Vec::<tokio::task::JoinHandle<()>>::new(),
+    ));
+    let (request_shutdown_tx, request_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let shutdown = async {
         // REASON: signal handler registration can only fail if the global Tokio runtime
@@ -1743,9 +1793,15 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
                             }
                         }
                         let d = dispatcher.clone();
-                        spawn_connection_task(Arc::clone(&active), async move {
-                            handle_conn(stream, d).await;
+                        let shutdown = request_shutdown_rx.clone();
+                        let handle = spawn_connection_task(Arc::clone(&active), async move {
+                            handle_conn_with_shutdown(stream, d, Some(shutdown)).await;
                         });
+                        let mut tasks = connection_tasks
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        tasks.retain(|task| !task.is_finished());
+                        tasks.push(handle);
                     }
                     Err(e) => tracing::error!(error = %e, "accept failed"),
                 }
@@ -1759,12 +1815,23 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
     // task outliving the drain window (or the process) unsignalled.
     let _ = checkpoint_shutdown_tx.send(());
 
+    // Per-run signal: read scopes stop promptly, admitted writes ignore it and
+    // retain the rest of the configured drain window to commit or roll back.
+    let _ = request_shutdown_tx.send(true);
+
     // Same ordering contract for ADR-119 daemon components: cancel before
     // drain, so each component's supervisor (itself a tracked task) can run
     // its bounded shutdown inside the drain wait.
     daemon_shutdown_token().cancel();
 
-    drain(&active).await;
+    let drained = drain(&active).await;
+    let tasks = {
+        let mut retained = connection_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *retained)
+    };
+    finish_connection_tasks(tasks, drained).await;
 
     // A concurrent client's `kill_and_respawn` may have already decided
     // this daemon looked stale, killed it, and spawned a replacement that
@@ -1962,13 +2029,21 @@ async fn pid_file_names_a_reachable_daemon(
 }
 
 #[cfg(unix)]
-async fn drain(active: &std::sync::atomic::AtomicUsize) {
+async fn drain(active: &std::sync::atomic::AtomicUsize) -> bool {
+    drain_with_timeout(active, drain_timeout()).await
+}
+
+#[cfg(unix)]
+async fn drain_with_timeout(
+    active: &std::sync::atomic::AtomicUsize,
+    timeout: std::time::Duration,
+) -> bool {
     use std::sync::atomic::Ordering;
     let remaining = || active.load(Ordering::Relaxed) + background_task_count();
     if remaining() == 0 {
-        return;
+        return true;
     }
-    let deadline = tokio::time::Instant::now() + drain_timeout();
+    let deadline = tokio::time::Instant::now() + timeout;
     while remaining() > 0 {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
@@ -1976,9 +2051,27 @@ async fn drain(active: &std::sync::atomic::AtomicUsize) {
                 remaining_background_tasks = background_task_count(),
                 "drain timeout reached; forcing shutdown"
             );
-            break;
+            return false;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+async fn finish_connection_tasks(tasks: Vec<tokio::task::JoinHandle<()>>, drained: bool) {
+    if !drained {
+        for task in &tasks {
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+    }
+    for task in tasks {
+        let _ = task.await;
     }
 }
 
@@ -2420,6 +2513,58 @@ mod tests {
             .expect("empty drain should return immediately");
     }
 
+    #[tokio::test(start_paused = true)]
+    #[serial(background_tasks)]
+    async fn graceful_drain_has_a_hard_upper_bound_with_stuck_work() {
+        use std::sync::atomic::Ordering;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = spawn_connection_task(Arc::clone(&active), async {
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        let started = tokio::time::Instant::now();
+
+        let drained = drain_with_timeout(&active, std::time::Duration::from_millis(250)).await;
+
+        assert!(!drained, "stuck work must exhaust the drain bound");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(250)
+                && started.elapsed() < std::time::Duration::from_millis(350),
+            "graceful shutdown exceeded its configured bound: {:?}",
+            started.elapsed()
+        );
+        finish_connection_tasks(vec![task], drained).await;
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            0,
+            "hard-bound escalation must abort, await, and release the handler"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(background_tasks)]
+    async fn admitted_work_finishes_inside_drain_window_without_abort() {
+        use std::sync::atomic::Ordering;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committed_in_task = Arc::clone(&committed);
+        let task = spawn_connection_task(Arc::clone(&active), async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            committed_in_task.store(true, Ordering::SeqCst);
+        });
+
+        let drained = drain_with_timeout(&active, std::time::Duration::from_millis(250)).await;
+        assert!(
+            drained,
+            "admitted work should finish inside the drain window"
+        );
+        finish_connection_tasks(vec![task], drained).await;
+        assert!(committed.load(Ordering::SeqCst));
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
     // `drain()` must wait for tracked background tasks (e.g. memory.recall's
     // serve-ledger append), not just in-flight connections, or a SIGTERM
     // lands mid-flight with no log and no row.
@@ -2592,6 +2737,42 @@ mod tests {
         dispatch_err: Option<String>,
     }
 
+    #[derive(Clone)]
+    struct CancellationAwareDispatch {
+        started: Arc<tokio::sync::Notify>,
+        cancellation_observed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl DaemonDispatch for CancellationAwareDispatch {
+        async fn dispatch(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
+            _identity: Option<RequestIdentity>,
+        ) -> Result<String, String> {
+            self.started.notify_one();
+            khive_storage::wait_for_request_read_cancellation().await;
+            self.cancellation_observed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("{}".to_string())
+        }
+
+        async fn warm_all(&self) {}
+
+        fn namespace(&self) -> &str {
+            "local"
+        }
+
+        fn config_id(&self) -> &str {
+            "disconnect-test"
+        }
+    }
+
     #[async_trait]
     impl DaemonDispatch for MockDispatch {
         async fn dispatch(
@@ -2661,6 +2842,34 @@ mod tests {
         let raw = read_frame(&mut client).await.expect("read response frame");
         handle.await.expect("handle_conn task panicked");
         serde_json::from_slice(&raw).expect("decode response frame")
+    }
+
+    #[tokio::test]
+    async fn daemon_peer_disconnect_signals_request_read_cancellation() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancellation_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatcher = CancellationAwareDispatch {
+            started: Arc::clone(&started),
+            cancellation_observed: Arc::clone(&cancellation_observed),
+        };
+        let (mut client, server) = UnixStream::pair().expect("unix stream pair");
+        let request = base_request_frame("disconnect-test");
+        let payload = serde_json::to_vec(&request).expect("encode request frame");
+        let handler = tokio::spawn(async move { handle_conn(server, dispatcher).await });
+        write_frame(&mut client, &payload)
+            .await
+            .expect("write request frame");
+        started.notified().await;
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_millis(500), handler)
+            .await
+            .expect("daemon handler ignored peer disconnect")
+            .expect("daemon handler panicked");
+        assert!(
+            cancellation_observed.load(std::sync::atomic::Ordering::SeqCst),
+            "peer loss did not reach the request-scoped read cancellation signal"
+        );
     }
 
     /// Protocol v4 makes `process_ref` part of dispatch semantics. A still-warm

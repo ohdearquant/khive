@@ -1131,27 +1131,41 @@ impl KhiveMcpServer {
     /// `--resumed-generation` marker means the normal `.serve()` handshake
     /// runs exactly as before this change.
     ///
-    /// Both branches wrap the raw stdio transport in
-    /// `crate::daemon::SelfHealOnFlushTransport` — the actual happens-after
-    /// edge that fires an armed self-heal re-exec (or drain-and-exit) only
-    /// once a message has genuinely finished flushing to the client, never
-    /// on a fixed timer that could race a slow or backpressured stdout.
+    /// Both branches keep `crate::daemon::SelfHealOnFlushTransport` directly
+    /// around the raw stdio transport — the actual happens-after edge that
+    /// fires an armed self-heal re-exec (or drain-and-exit) only once a message
+    /// has genuinely finished flushing to the client. The outer EOF adapter
+    /// shares rmcp's root cancellation token so disconnect cancels every
+    /// per-request child before rmcp starts its graceful drain.
     #[cfg(unix)]
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
-        let build_transport = || {
+        let root = tokio_util::sync::CancellationToken::new();
+        let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
-            crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(read, write))
+            crate::transport::CancelOnEofTransport::new(
+                crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
+                    read, write,
+                )),
+                root,
+            )
         };
 
         match stdio_serve_mode_for(crate::daemon::resumed_generation()) {
             StdioServeMode::Resumed => {
-                let service = rmcp::service::serve_directly(self, build_transport(), None);
+                let service = rmcp::service::serve_directly_with_ct(
+                    self,
+                    build_transport(root.clone()),
+                    None,
+                    root,
+                );
                 service.waiting().await?;
             }
             StdioServeMode::Handshake => {
-                let service = self.serve(build_transport()).await?;
+                let service = self
+                    .serve_with_ct(build_transport(root.clone()), root)
+                    .await?;
                 service.waiting().await?;
             }
         }
@@ -1164,13 +1178,20 @@ impl KhiveMcpServer {
     /// Unix-domain-socket daemon-forwarding protocol mismatch — there is
     /// nothing to self-heal from on this target (`--daemon` mode itself is
     /// Unix-only, see `serve.rs::serve_server`), so this path always runs the
-    /// normal MCP `initialize` handshake directly over the raw stdio
-    /// transport, with no resumed-generation skip and no flush-triggered hook.
+    /// normal MCP `initialize` handshake, with no resumed-generation skip and
+    /// no flush-triggered hook. It still shares rmcp's root token with the EOF
+    /// adapter so disconnect cancellation is platform-independent.
     #[cfg(not(unix))]
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
-        use rmcp::transport::stdio;
+        use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
-        let service = self.serve(stdio()).await?;
+        let root = tokio_util::sync::CancellationToken::new();
+        let (read, write) = stdio();
+        let transport = crate::transport::CancelOnEofTransport::new(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+        );
+        let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
         Ok(())
     }
@@ -1787,6 +1808,7 @@ async fn dispatch_via_coordinator_inner(
                         let coord_result = coord
                             .fan_out_search(&request, &namespace, &extra_visible)
                             .await;
+                        khive_storage::ensure_request_read_active("search")?;
                         let degradation = SearchDegradation::from_result(&coord_result);
 
                         // Preserve the coordinator search response's compatibility
@@ -2239,6 +2261,62 @@ fn apply_presentation_to_result(
 
 // ── single MCP tool ─────────────────────────────────────────────────────────
 
+fn request_read_timeout() -> std::time::Duration {
+    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let configured = std::env::var("KHIVE_REQUEST_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        let timeout = configured
+            .filter(|seconds| (1..=3_600).contains(seconds))
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| {
+                if let Some(invalid) = configured {
+                    tracing::warn!(
+                        invalid,
+                        default = khive_storage::DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+                        "KHIVE_REQUEST_READ_TIMEOUT_SECS must be in [1, 3600]"
+                    );
+                }
+                khive_storage::request_read_timeout_from_env()
+            });
+        khive_runtime::config_ledger::record_config_locked(
+            "KHIVE_REQUEST_READ_TIMEOUT_SECS",
+            timeout.as_secs().to_string(),
+        );
+        timeout
+    })
+}
+
+async fn scope_mcp_request_read_cancellation<F>(
+    cancellation: tokio_util::sync::CancellationToken,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    // Seed synchronously: a pre-cancelled rmcp context must be visible even
+    // when the wrapped request future is ready before the bridge task's first
+    // poll.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(cancellation.is_cancelled());
+    let _bridge = AbortOnDrop(tokio::spawn(async move {
+        cancellation.cancelled().await;
+        let _ = cancel_tx.send(true);
+    }));
+    khive_storage::scope_request_read_cancellation(
+        cancel_rx,
+        khive_storage::scope_request_read_deadline(request_read_timeout(), future),
+    )
+    .await
+}
+
 #[tool_router]
 impl KhiveMcpServer {
     #[tool(description = r#"Run one or more khive verbs in a single MCP call.
@@ -2299,7 +2377,17 @@ schemas live in each pack's docs and SKILL.md files.
 Tip: for one-shot calls, the single-op form is the densest. Use batch when
 several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
-    async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
+    async fn request(
+        &self,
+        Parameters(p): Parameters<RequestParams>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<String, McpError> {
+        scope_mcp_request_read_cancellation(cancellation, self.request_with_cancellation(p)).await
+    }
+}
+
+impl KhiveMcpServer {
+    async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
         // Parse before the daemon decision. The daemon protocol's historical
         // error channel is string-only, so forwarding malformed DSL would turn
         // `invalid_params` plus its structured `parse-error` reason into an
@@ -2327,7 +2415,15 @@ result (e.g. create then link with the new entity's id)."#)]
         #[cfg(unix)]
         if p.save_to.is_none() {
             let frame = self.wire_daemon_frame(&p);
-            if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
+            let forwarded = crate::daemon::forward_or_spawn(&frame);
+            tokio::pin!(forwarded);
+            let forwarded = tokio::select! {
+                result = &mut forwarded => result,
+                _ = khive_storage::wait_for_request_read_cancellation() => {
+                    return Err(McpError::internal_error("request cancelled", None));
+                }
+            };
+            if let Some(res) = forwarded {
                 return match res {
                     Ok(s) => Ok(s),
                     // #947/#898: a strict-mode pre-dispatch rejection is
@@ -2686,6 +2782,30 @@ impl KhiveMcpServer {
     }
 
     async fn dispatch_request_inner_with_strict_refusals(
+        &self,
+        p: RequestParams,
+        from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
+        origin: DispatchOrigin,
+        strict_refusals: bool,
+    ) -> Result<String, McpError> {
+        // `dispatch_request_inner_scoped` is the complete parse/dispatch/render
+        // pipeline. Keep that large generator behind one pointer before handing
+        // it to the generic task-local scope: otherwise the scope embeds the
+        // pipeline in every MCP, local-exec, and replay request future. LLVM
+        // coverage instrumentation amplifies the resulting poll stack enough to
+        // overflow Tokio's normal worker stack even for unrelated small verbs.
+        let dispatch = Box::pin(self.dispatch_request_inner_scoped(
+            p,
+            from_wire,
+            identity,
+            origin,
+            strict_refusals,
+        ));
+        khive_storage::scope_request_read_deadline(request_read_timeout(), dispatch).await
+    }
+
+    async fn dispatch_request_inner_scoped(
         &self,
         p: RequestParams,
         from_wire: bool,
@@ -3383,6 +3503,238 @@ mod tests {
                 .expect("test supplies a valid byte count");
             Ok(json!("x".repeat(bytes)))
         }
+    }
+
+    struct SlowSqlReadPack {
+        bridge: khive_db::SqlBridge,
+    }
+
+    impl khive_types::Pack for SlowSqlReadPack {
+        const NAME: &'static str = "slow-sql-read-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "slow_sql_read",
+                description: "runs SQLite work until the request read deadline interrupts it",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "pending_read_phase",
+                description: "waits until the request read deadline interrupts it",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for SlowSqlReadPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            use khive_storage::{SqlAccess, SqlStatement};
+
+            if verb == "pending_read_phase" {
+                khive_storage::await_request_read_phase(
+                    "outer-deadline-probe",
+                    std::future::pending::<()>(),
+                )
+                .await?;
+                return Ok(Value::Null);
+            }
+
+            let mut reader = self.bridge.reader().await?;
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: "WITH RECURSIVE numbers(value) AS (\
+                          SELECT 1 UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000\
+                          ) SELECT SUM(a.value * b.value * c.value) \
+                          FROM numbers AS a CROSS JOIN numbers AS b CROSS JOIN numbers AS c"
+                        .into(),
+                    params: vec![],
+                    label: Some("canonical-dispatch-deadline-probe".into()),
+                })
+                .await?;
+            Ok(json!({ "rows": rows.len() }))
+        }
+    }
+
+    fn slow_sql_read_test_server() -> KhiveMcpServer {
+        let pool = Arc::new(
+            khive_db::ConnectionPool::new(khive_db::PoolConfig::default())
+                .expect("in-memory SQLite pool"),
+        );
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SlowSqlReadPack {
+            bridge: khive_db::SqlBridge::new(pool, false),
+        });
+        KhiveMcpServer::from_registry(builder.build().expect("slow-SQL test registry"))
+    }
+
+    #[test]
+    fn canonical_request_deadline_wrapper_does_not_embed_dispatch_pipeline() {
+        // Construct the generators on an explicitly roomy stack so this
+        // regression reports their footprint instead of reproducing the LLVM
+        // coverage stack abort it is meant to prevent. Nothing is polled, so an
+        // empty registry is sufficient and the test performs no storage work.
+        let (pipeline_bytes, wrapper_bytes) = std::thread::Builder::new()
+            .name("request-dispatch-future-footprint".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let server = KhiveMcpServer::from_registry(
+                    VerbRegistryBuilder::new()
+                        .build()
+                        .expect("empty test registry"),
+                );
+                let pipeline_bytes = std::mem::size_of_val(&server.dispatch_request_inner_scoped(
+                    RequestParams {
+                        ops: "stats()".to_string(),
+                        ..Default::default()
+                    },
+                    false,
+                    None,
+                    DispatchOrigin::Local,
+                    false,
+                ));
+                let wrapper_bytes =
+                    std::mem::size_of_val(&server.dispatch_request_inner_with_strict_refusals(
+                        RequestParams {
+                            ops: "stats()".to_string(),
+                            ..Default::default()
+                        },
+                        false,
+                        None,
+                        DispatchOrigin::Local,
+                        false,
+                    ));
+                (pipeline_bytes, wrapper_bytes)
+            })
+            .expect("spawn request future footprint measurement")
+            .join()
+            .expect("request future footprint measurement panicked");
+
+        assert!(
+            wrapper_bytes.saturating_mul(2) < pipeline_bytes,
+            "the canonical deadline wrapper must keep the dispatch pipeline behind a pointer: \
+             wrapper={wrapper_bytes}B pipeline={pipeline_bytes}B"
+        );
+    }
+
+    fn assert_request_read_timed_out(response: &str) {
+        let envelope: Value = serde_json::from_str(response).expect("JSON response envelope");
+        assert_eq!(envelope["summary"]["failed"], 1, "{envelope}");
+        let error = envelope["results"][0]["error"].to_string().to_lowercase();
+        assert!(
+            error.contains("timeout") || error.contains("timed out"),
+            "request read must fail as a timeout: {envelope}"
+        );
+    }
+
+    // These dispatch-layer regressions compose with khive-db's
+    // `request_deadline_interrupts_statement_without_outer_timeout`, which
+    // separately proves that the same SQL bridge deadline sees SQLite VM
+    // progress and stops it before returning. Do not assert that paused Tokio
+    // time reaches the full default here: the SQLite wall-clock/progress
+    // backstop may win first under instrumentation. The typed timeout proves
+    // the canonical scope reached the database; the test below independently
+    // pins absolute Tokio-deadline ordering.
+    #[tokio::test(start_paused = true)]
+    async fn local_exec_dispatch_installs_the_default_request_read_deadline() {
+        let server = slow_sql_read_test_server();
+        let expected = request_read_timeout();
+        let response = tokio::time::timeout(
+            expected
+                .saturating_add(khive_db::sqlite_interrupt_grace_from_env())
+                .saturating_add(Duration::from_secs(1)),
+            server.dispatch_request_local_for_exec(
+                RequestParams {
+                    ops: "slow_sql_read()".to_string(),
+                    ..Default::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .expect("canonical local request-read deadline was never installed")
+        .expect("deadline is a per-op failure, not an RPC failure");
+
+        assert_request_read_timed_out(&response);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_dispatch_installs_the_default_request_read_deadline() {
+        let server = slow_sql_read_test_server();
+        let expected = request_read_timeout();
+        let response = tokio::time::timeout(
+            expected
+                .saturating_add(khive_db::sqlite_interrupt_grace_from_env())
+                .saturating_add(Duration::from_secs(1)),
+            server.dispatch_request_replay_as(
+                RequestParams {
+                    ops: "slow_sql_read()".to_string(),
+                    ..Default::default()
+                },
+                "local",
+                None,
+            ),
+        )
+        .await
+        .expect("canonical replay request-read deadline was never installed")
+        .expect("deadline is a per-op failure, not an RPC failure");
+
+        assert_request_read_timed_out(&response);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canonical_dispatch_preserves_an_earlier_outer_deadline() {
+        let server = slow_sql_read_test_server();
+        let outer = Duration::from_millis(50);
+        let default = request_read_timeout();
+        let started = tokio::time::Instant::now();
+        let response = khive_storage::scope_request_read_deadline(
+            outer,
+            server.dispatch_request_local(RequestParams {
+                ops: "pending_read_phase()".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("deadline is a per-op failure, not an RPC failure");
+        let elapsed = tokio::time::Instant::now().duration_since(started);
+
+        assert!(
+            elapsed >= outer,
+            "outer deadline fired too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < default,
+            "canonical dispatch renewed an earlier outer deadline: {elapsed:?}"
+        );
+        assert_request_read_timed_out(&response);
     }
 
     /// Receipt-only stand-in for the Git pack. Two operations can return
@@ -4965,6 +5317,20 @@ mod tests {
         std::env::remove_var("KHIVE_PROCESS_REF");
     }
 
+    fn stats_without_request_local_usage(raw: &str) -> Value {
+        let mut envelope: Value = serde_json::from_str(raw).expect("stats response JSON");
+        for entry in envelope["results"]
+            .as_array_mut()
+            .expect("stats results array")
+        {
+            entry
+                .as_object_mut()
+                .expect("stats result object")
+                .remove("usage");
+        }
+        envelope
+    }
+
     /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`
     /// onto the `DaemonRequestFrame` unchanged, and defaults to `None` when
     /// the caller supplied none.
@@ -5025,15 +5391,18 @@ mod tests {
 
         let server = make_daemon_save_to_test_server();
         server
-            .request(Parameters(RequestParams {
-                // Explicit `namespace="local"` so the write lands in the
-                // same namespace the server's audit `EventStore` handle is
-                // scoped to at construction (`Namespace::local()`), matching
-                // `find_audit_event_with_request_id`'s read scope.
-                ops: "stats(namespace=\"local\")".to_string(),
-                request_id: Some(9001),
-                ..Default::default()
-            }))
+            .request(
+                Parameters(RequestParams {
+                    // Explicit `namespace="local"` so the write lands in the
+                    // same namespace the server's audit `EventStore` handle is
+                    // scoped to at construction (`Namespace::local()`), matching
+                    // `find_audit_event_with_request_id`'s read scope.
+                    ops: "stats(namespace=\"local\")".to_string(),
+                    request_id: Some(9001),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("request() must succeed via local dispatch under KHIVE_NO_DAEMON");
 
@@ -5063,12 +5432,15 @@ mod tests {
         let server = make_daemon_save_to_test_server();
         let sink_path = dir.path().join("out.jsonl");
         server
-            .request(Parameters(RequestParams {
-                ops: "stats(namespace=\"local\")".to_string(),
-                save_to: Some(sink_path.to_string_lossy().to_string()),
-                request_id: Some(9002),
-                ..Default::default()
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats(namespace=\"local\")".to_string(),
+                    save_to: Some(sink_path.to_string_lossy().to_string()),
+                    request_id: Some(9002),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("request() with save_to must succeed");
 
@@ -5132,15 +5504,18 @@ mod tests {
 
         let sink_path = dir.path().join("out.jsonl");
         let resp = server
-            .request(Parameters(RequestParams {
-                ops: "stats()".to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: Some(sink_path.to_string_lossy().to_string()),
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats()".to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: Some(sink_path.to_string_lossy().to_string()),
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("request with save_to must succeed even with a warm daemon reachable");
 
@@ -5190,10 +5565,13 @@ mod tests {
         connect_when_daemon_ready(&sock).await;
 
         let error = server
-            .request(Parameters(RequestParams {
-                ops: "stats(".to_string(),
-                ..Default::default()
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats(".to_string(),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect_err("malformed DSL must be rejected before forwarding");
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -5205,10 +5583,13 @@ mod tests {
         // Prove this was the normal warm-daemon environment, not a no-daemon
         // fallback that happened to retain the local error shape.
         server
-            .request(Parameters(RequestParams {
-                ops: "stats()".to_string(),
-                ..Default::default()
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("valid follow-up must dispatch through the warm daemon");
 
@@ -5279,15 +5660,18 @@ mod tests {
             .expect("baseline stats() must succeed");
 
         let resp = server
-            .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await;
 
         match resp {
@@ -5318,8 +5702,10 @@ mod tests {
             })
             .await
             .expect("post-request stats() must succeed");
+
         assert_eq!(
-            after, baseline,
+            stats_without_request_local_usage(&after),
+            stats_without_request_local_usage(&baseline),
             "the comm.send op must NEVER have run locally after the ambiguous \
              forward outcome — a double-dispatch would mutate local state here"
         );
@@ -5402,15 +5788,18 @@ mod tests {
 
         // ── single op ──────────────────────────────────────────────────────
         let single_resp = server
-            .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
         let single: Value =
@@ -5427,17 +5816,20 @@ mod tests {
 
         // ── parallel batch ─────────────────────────────────────────────────
         let batch_resp = server
-            .request(Parameters(RequestParams {
-                ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
+            .request(
+                Parameters(RequestParams {
+                    ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
                        comm.send(to=\"bob\", content=\"strict-batch-2\")]"
-                    .to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+                        .to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
         let batch: Value =
@@ -5454,17 +5846,20 @@ mod tests {
 
         // ── chain (must abort remaining ops per the wire contract) ─────────
         let chain_resp = server
-            .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
+            .request(
+                Parameters(RequestParams {
+                    ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
                       comm.send(to=\"bob\", content=\"strict-chain-2\")"
-                    .to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+                        .to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
         let chain: Value =
@@ -5495,7 +5890,8 @@ mod tests {
             .await
             .expect("post-request stats() must succeed");
         assert_eq!(
-            after, baseline,
+            stats_without_request_local_usage(&after),
+            stats_without_request_local_usage(&baseline),
             "no comm.send op must ever have run locally under strict-mode fallback \
              rejection — a local dispatch would mutate local state here"
         );
@@ -5776,5 +6172,173 @@ mod tests {
             parsed["status"], "partial",
             "a chain with an aborted op must report status=partial; got {parsed}"
         );
+    }
+}
+#[cfg(test)]
+mod request_read_cancellation_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct EofProbeServer {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    impl rmcp::ServerHandler for EofProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let started = self.started.clone();
+            let cancelled = self.cancelled.clone();
+            async move {
+                started.notify_one();
+                scope_mcp_request_read_cancellation(context.ct, async {
+                    khive_storage::wait_for_request_read_cancellation().await;
+                })
+                .await;
+                cancelled.notify_one();
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_eof_cancels_root_and_request_read_before_rmcp_drain() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let probe = EofProbeServer {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::new(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        client_io
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("rmcp never admitted the request handler");
+
+        drop(client_io);
+
+        tokio::time::timeout(Duration::from_secs(2), cancelled.notified())
+            .await
+            .expect("stdio EOF did not cancel the request read scope promptly");
+        assert!(
+            root.is_cancelled(),
+            "EOF must cancel the exact root token passed into rmcp"
+        );
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("rmcp remained in its five-second EOF drain")
+            .expect("rmcp service task panicked");
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after EOF: {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rmcp_cancellation_token_reaches_request_read_scope() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_for_scope = token.clone();
+        let observed = tokio::spawn(async move {
+            scope_mcp_request_read_cancellation(token_for_scope, async {
+                khive_storage::wait_for_request_read_cancellation().await;
+                true
+            })
+            .await
+        });
+
+        token.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), observed)
+                .await
+                .expect("rmcp cancellation never reached the read scope")
+                .expect("scope task panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_rmcp_token_is_visible_without_yielding() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let observed = scope_mcp_request_read_cancellation(token, async {
+            khive_storage::request_read_is_cancelled()
+        })
+        .await;
+
+        assert!(
+            observed,
+            "a synchronously-ready request raced past a pre-cancelled rmcp context"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_tool_path_honors_an_already_cancelled_rmcp_token() {
+        std::env::set_var("KHIVE_NO_DAEMON", "1");
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: khive_runtime::Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+
+        let response = server
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                }),
+                cancellation,
+            )
+            .await;
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        match response {
+            Err(error) => {
+                let rendered = format!("{error:?}").to_ascii_lowercase();
+                assert!(
+                    rendered.contains("timeout") || rendered.contains("cancel"),
+                    "cancelled request returned an unrelated RPC error: {rendered}"
+                );
+            }
+            Ok(payload) => {
+                let parsed: Value = serde_json::from_str(&payload).expect("JSON response envelope");
+                assert!(
+                    parsed["summary"]["failed"].as_u64().unwrap_or(0) > 0,
+                    "the actual request tool path ignored its cancelled token: {parsed}"
+                );
+            }
+        }
     }
 }

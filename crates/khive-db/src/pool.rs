@@ -537,6 +537,7 @@ enum ReaderLease<'pool> {
 pub struct ReaderGuard<'pool> {
     lease: Option<ReaderLease<'pool>>,
     pool: &'pool ConnectionPool,
+    reusable: bool,
 }
 
 impl<'pool> ReaderGuard<'pool> {
@@ -550,6 +551,13 @@ impl<'pool> ReaderGuard<'pool> {
             ReaderLease::Pooled(conn) => conn,
             ReaderLease::Shared(guard) => guard,
         }
+    }
+
+    /// Fail closed when connection-global state could not be restored after
+    /// a read. A pooled reader is closed and replaced on drop; a degraded
+    /// shared-writer reader is quarantined for the lifetime of the pool.
+    pub(crate) fn discard(&mut self) {
+        self.reusable = false;
     }
 }
 
@@ -568,7 +576,18 @@ impl<'pool> Drop for ReaderGuard<'pool> {
         };
 
         match lease {
-            ReaderLease::Pooled(conn) => self.pool.return_reader(conn),
+            ReaderLease::Pooled(conn) if self.reusable => self.pool.return_reader(conn),
+            ReaderLease::Pooled(conn) => {
+                close_connection_quietly(conn);
+                if let Ok(conn) = self.pool.open_reader_connection() {
+                    if let Err(conn) = self.pool.readers.push(conn) {
+                        close_connection_quietly(conn);
+                    }
+                }
+            }
+            ReaderLease::Shared(guard) if !self.reusable => {
+                self.pool.retire_pooled_writer(&guard);
+            }
             ReaderLease::Shared(_guard) => {}
         }
     }
@@ -785,32 +804,72 @@ impl ConnectionPool {
     /// Tries to pop from the lock-free queue. If empty, spins briefly then
     /// waits with exponential backoff up to `checkout_timeout`.
     ///
-    /// # Deadlock Warning
-    ///
-    /// In degraded mode (WAL unavailable, `max_readers == 0`), this method locks
-    /// the writer mutex. If the calling thread already holds a [`WriterGuard`],
-    /// this will deadlock (parking_lot `Mutex` is not reentrant). Never call
-    /// `reader()` while holding a `WriterGuard` on the same pool.
+    /// In degraded mode (WAL unavailable, `max_readers == 0`), this method
+    /// checks the shared writer mutex in bounded slices and returns pool
+    /// exhaustion after `checkout_timeout`; it never blocks indefinitely on
+    /// the non-reentrant mutex.
     pub fn reader(&self) -> Result<ReaderGuard<'_>, SqliteError> {
+        self.reader_until(|| false)?.ok_or_else(|| {
+            SqliteError::InvalidData("uncancelled reader checkout stopped unexpectedly".into())
+        })
+    }
+
+    /// Check out a reader while cooperatively polling a request cancellation
+    /// predicate. The predicate is evaluated before connection acquisition and
+    /// between backoff slices, so an abandoned request does not sit through the
+    /// full pool checkout timeout or execute a statement when a reader later
+    /// becomes available.
+    pub(crate) fn reader_until<C>(
+        &self,
+        should_stop: C,
+    ) -> Result<Option<ReaderGuard<'_>>, SqliteError>
+    where
+        C: Fn() -> bool,
+    {
         if self.max_readers == 0 {
             self.ensure_pooled_writer_active()?;
-            let guard = self.writer.lock();
-            self.ensure_pooled_writer_active()?;
-            return Ok(ReaderGuard {
-                lease: Some(ReaderLease::Shared(guard)),
-                pool: self,
-            });
+            let started = Instant::now();
+            loop {
+                if should_stop() {
+                    return Ok(None);
+                }
+                let remaining = self
+                    .config
+                    .checkout_timeout
+                    .saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(pool_exhausted_error(
+                        self.config.checkout_timeout,
+                        self.max_readers,
+                    ));
+                }
+                if let Some(guard) = self
+                    .writer
+                    .try_lock_for(remaining.min(Duration::from_millis(2)))
+                {
+                    self.ensure_pooled_writer_active()?;
+                    return Ok(Some(ReaderGuard {
+                        lease: Some(ReaderLease::Shared(guard)),
+                        pool: self,
+                        reusable: true,
+                    }));
+                }
+            }
         }
 
         let started = Instant::now();
         let mut attempt = 0u32;
 
         loop {
+            if should_stop() {
+                return Ok(None);
+            }
             if let Some(conn) = self.readers.pop() {
-                return Ok(ReaderGuard {
+                return Ok(Some(ReaderGuard {
                     lease: Some(ReaderLease::Pooled(conn)),
                     pool: self,
-                });
+                    reusable: true,
+                }));
             }
 
             if started.elapsed() >= self.config.checkout_timeout {

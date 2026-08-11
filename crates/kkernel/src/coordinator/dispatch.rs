@@ -55,7 +55,10 @@ pub struct SubstrateCoordinator {
     /// Test-only: named backend's fan-out search task never resolves,
     /// simulating a hung backend (MAJ-2 timeout regression coverage).
     #[cfg(test)]
-    pub(super) hang_backend_id: Option<String>,
+    pub(super) hang_backend_ids: Vec<String>,
+    /// Test-only: delay a backend result past the shared absolute deadline.
+    #[cfg(test)]
+    pub(super) delay_backend: Option<(String, Duration)>,
     /// Test-only: when set, a backend's entity fan-out task returns this
     /// list verbatim instead of calling `hybrid_search`, so RRF-merge
     /// regression tests can pin exact ranks/UUIDs (MAJ-4).
@@ -77,7 +80,9 @@ impl SubstrateCoordinator {
             #[cfg(test)]
             panic_backend_id: None,
             #[cfg(test)]
-            hang_backend_id: None,
+            hang_backend_ids: Vec::new(),
+            #[cfg(test)]
+            delay_backend: None,
             #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
@@ -95,7 +100,9 @@ impl SubstrateCoordinator {
             #[cfg(test)]
             panic_backend_id: None,
             #[cfg(test)]
-            hang_backend_id: None,
+            hang_backend_ids: Vec::new(),
+            #[cfg(test)]
+            delay_backend: None,
             #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
@@ -115,7 +122,9 @@ impl SubstrateCoordinator {
             #[cfg(test)]
             panic_backend_id: None,
             #[cfg(test)]
-            hang_backend_id: None,
+            hang_backend_ids: Vec::new(),
+            #[cfg(test)]
+            delay_backend: None,
             #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
@@ -141,7 +150,25 @@ impl SubstrateCoordinator {
     /// (never resolves), simulating an unresponsive backend.
     #[cfg(test)]
     pub fn with_hanging_backend(mut self, backend_id: &str) -> Self {
-        self.hang_backend_id = Some(backend_id.to_string());
+        self.hang_backend_ids = vec![backend_id.to_string()];
+        self
+    }
+
+    /// Test-only: hang several concurrently-started backend tasks.
+    #[cfg(test)]
+    pub fn with_hanging_backends<I, S>(mut self, backend_ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.hang_backend_ids = backend_ids.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Test-only: delay one backend's result by `delay`.
+    #[cfg(test)]
+    pub fn with_delayed_backend(mut self, backend_id: &str, delay: Duration) -> Self {
+        self.delay_backend = Some((backend_id.to_string(), delay));
         self
     }
 
@@ -257,11 +284,11 @@ impl SubstrateCoordinator {
         for (backend_id, runtime) in entries {
             let ns = ns_clone.clone();
             let locator = Arc::clone(&locator);
-            let handle = tokio::spawn(async move {
+            let handle = tokio::spawn(khive_storage::inherit_request_read_context(async move {
                 let kind = Self::probe_endpoint_kind(&runtime, &ns, id).await?;
                 locator.insert(id, backend_id.clone());
                 Some(LocatedEndpoint { backend_id, kind })
-            });
+            }));
             handles.push(handle);
         }
 
@@ -503,6 +530,12 @@ impl SubstrateCoordinator {
             return (vec![], vec![], vec![]);
         }
 
+        let timeout_ms = backend_search_timeout_ms();
+        let timeout_dur = Duration::from_millis(timeout_ms);
+        let request_deadline = khive_storage::effective_request_read_deadline(
+            khive_storage::RequestReadDeadline::after(timeout_dur),
+        );
+
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
             let token = match runtime
@@ -528,15 +561,11 @@ impl SubstrateCoordinator {
             // unbounded even though the multi-backend path is bounded.
             #[cfg(test)]
             let should_hang = self
-                .hang_backend_id
-                .as_deref()
-                .map(|id| id == backend_id.as_str())
-                .unwrap_or(false);
+                .hang_backend_ids
+                .iter()
+                .any(|id| id == backend_id.as_str());
             #[cfg(not(test))]
             let should_hang = false;
-            let timeout_ms = backend_search_timeout_ms();
-            let timeout_dur = Duration::from_millis(timeout_ms);
-
             if search_notes {
                 let search_fut = async {
                     if should_hang {
@@ -556,7 +585,10 @@ impl SubstrateCoordinator {
                         )
                         .await
                 };
-                match tokio::time::timeout(timeout_dur, search_fut).await {
+                let search_fut =
+                    khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
+                tokio::pin!(search_fut);
+                match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
                     Ok(Ok(note_hits)) => {
                         let note_hits: Vec<NoteSearchHit> =
                             note_hits.into_iter().take(limit as usize).collect();
@@ -578,6 +610,11 @@ impl SubstrateCoordinator {
                         return (vec![], vec![], vec![backend_result]);
                     }
                     Err(_elapsed) => {
+                        let _ = tokio::time::timeout(
+                            khive_db::sqlite_interrupt_grace_from_env(),
+                            &mut search_fut,
+                        )
+                        .await;
                         tracing::warn!(
                             backend = %backend_id,
                             timeout_ms,
@@ -611,7 +648,10 @@ impl SubstrateCoordinator {
                         )
                         .await
                 };
-                match tokio::time::timeout(timeout_dur, search_fut).await {
+                let search_fut =
+                    khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
+                tokio::pin!(search_fut);
+                match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
                     Ok(Ok(hits)) => {
                         let hits: Vec<SearchHit> = hits.into_iter().take(limit as usize).collect();
                         let backend_result = BackendSearchResult {
@@ -632,6 +672,11 @@ impl SubstrateCoordinator {
                         return (vec![], vec![], vec![backend_result]);
                     }
                     Err(_elapsed) => {
+                        let _ = tokio::time::timeout(
+                            khive_db::sqlite_interrupt_grace_from_env(),
+                            &mut search_fut,
+                        )
+                        .await;
                         tracing::warn!(
                             backend = %backend_id,
                             timeout_ms,
@@ -662,9 +707,13 @@ impl SubstrateCoordinator {
         #[cfg(not(test))]
         let panic_id: Option<String> = None;
         #[cfg(test)]
-        let hang_id: Option<String> = self.hang_backend_id.clone();
+        let hang_ids: Vec<String> = self.hang_backend_ids.clone();
         #[cfg(not(test))]
-        let hang_id: Option<String> = None;
+        let hang_ids: Vec<String> = Vec::new();
+        #[cfg(test)]
+        let delay_backend = self.delay_backend.clone();
+        #[cfg(not(test))]
+        let delay_backend: Option<(String, Duration)> = None;
 
         let mut handles = Vec::with_capacity(entries.len());
         for (backend_id, runtime) in entries {
@@ -684,10 +733,10 @@ impl SubstrateCoordinator {
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
                 .unwrap_or(false);
-            let should_hang = hang_id
-                .as_deref()
-                .map(|id| id == backend_id.as_str())
-                .unwrap_or(false);
+            let should_hang = hang_ids.iter().any(|id| id == backend_id.as_str());
+            let delay = delay_backend
+                .as_ref()
+                .and_then(|(id, delay)| (id == backend_id.as_str()).then_some(*delay));
             #[cfg(test)]
             let entity_override: Option<Vec<SearchHit>> = self
                 .entity_hits_override
@@ -705,7 +754,7 @@ impl SubstrateCoordinator {
             #[cfg(not(test))]
             let note_override: Option<Vec<NoteSearchHit>> = None;
             let joined_backend_id = backend_id.clone();
-            let handle = tokio::spawn(async move {
+            let search = async move {
                 if should_panic {
                     panic!("injected backend search panic");
                 }
@@ -713,6 +762,9 @@ impl SubstrateCoordinator {
                     // Never resolves — exercises the fan-out timeout (MAJ-2).
                     std::future::pending::<()>().await;
                     unreachable!("a pending future never resolves");
+                }
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
                 }
                 if should_fail {
                     return (
@@ -779,20 +831,47 @@ impl SubstrateCoordinator {
                         Err(e) => (backend_id, Err(e), None),
                     }
                 }
-            });
+            };
+            let search = async move {
+                let result = search.await;
+                (result, tokio::time::Instant::now())
+            };
+            let handle = tokio::spawn(khive_storage::inherit_request_read_context(
+                khive_storage::scope_request_read_deadline_at(request_deadline, search),
+            ));
             handles.push((joined_backend_id, handle));
         }
 
         let mut per_backend: Vec<BackendSearchResult> = Vec::new();
         let mut entity_ranked_lists: Vec<Vec<SearchHit>> = Vec::new();
         let mut note_ranked_lists: Vec<Vec<NoteSearchHit>> = Vec::new();
-        let timeout_ms = backend_search_timeout_ms();
-        let timeout_dur = Duration::from_millis(timeout_ms);
-
-        for (joined_backend_id, handle) in handles {
-            let abort_handle = handle.abort_handle();
-            match tokio::time::timeout(timeout_dur, handle).await {
-                Ok(Ok((backend_id, Ok(hits), note_hits_opt))) => {
+        let interrupt_settlement_deadline =
+            request_deadline.async_at() + khive_db::sqlite_interrupt_grace_from_env();
+        for (joined_backend_id, mut handle) in handles {
+            let joined = if handle.is_finished() {
+                Ok((&mut handle).await)
+            } else {
+                match tokio::time::timeout_at(request_deadline.async_at(), &mut handle).await {
+                    Ok(result) => Ok(result),
+                    Err(elapsed) => {
+                        let settled =
+                            tokio::time::timeout_at(interrupt_settlement_deadline, &mut handle)
+                                .await;
+                        if settled.is_err() {
+                            handle.abort();
+                            let _ = (&mut handle).await;
+                        }
+                        // The grace window exists only to let SQLite tear down
+                        // an interrupted statement and return its permit.  It
+                        // must not extend the advertised request deadline.
+                        Err(elapsed)
+                    }
+                }
+            };
+            match joined {
+                Ok(Ok(((backend_id, Ok(hits), note_hits_opt), completed_at)))
+                    if completed_at <= request_deadline.async_at() =>
+                {
                     let note_hits = note_hits_opt.unwrap_or_default();
                     if !hits.is_empty() {
                         entity_ranked_lists.push(hits.clone());
@@ -807,7 +886,9 @@ impl SubstrateCoordinator {
                         error: None,
                     });
                 }
-                Ok(Ok((backend_id, Err(e), _))) => {
+                Ok(Ok(((backend_id, Err(e), _), completed_at)))
+                    if completed_at <= request_deadline.async_at() =>
+                {
                     per_backend.push(BackendSearchResult {
                         backend_id,
                         hits: vec![],
@@ -827,11 +908,20 @@ impl SubstrateCoordinator {
                         error: Some(error.to_string()),
                     });
                 }
+                Ok(Ok((_late_result, _completed_at))) => {
+                    tracing::warn!(
+                        backend = %joined_backend_id,
+                        timeout_ms,
+                        "backend search task completed after the shared request deadline"
+                    );
+                    per_backend.push(BackendSearchResult {
+                        backend_id: joined_backend_id,
+                        hits: vec![],
+                        note_hits: vec![],
+                        error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                    });
+                }
                 Err(_elapsed) => {
-                    // The task keeps running detached — `abort()` best-effort
-                    // cancels it so a hung backend doesn't burn resources
-                    // forever, but the response does not wait on that.
-                    abort_handle.abort();
                     tracing::warn!(
                         backend = %joined_backend_id,
                         timeout_ms,

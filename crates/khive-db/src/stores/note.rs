@@ -418,18 +418,35 @@ impl SqlNoteStore {
         R: Send + 'static,
     {
         if self.is_file_backed {
-            let conn = self.open_standalone_reader()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
+            let pool = Arc::clone(&self.pool);
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Notes,
+                op,
+                move |scope| {
+                    scope.ensure_active()?;
+                    let conn = pool
+                        .open_standalone_reader()
+                        .map_err(|error| map_sqlite_err(error, op))?;
+                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
+                },
+            )
+            .await
         } else {
             let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.reader().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Notes,
+                op,
+                move |scope| {
+                    let mut guard = pool
+                        .reader_until(|| scope.should_stop())
+                        .map_err(|e| map_sqlite_err(e, op))?
+                        .ok_or_else(|| StorageError::Timeout {
+                            operation: op.into(),
+                        })?;
+                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
+                },
+            )
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
         }
     }
 }

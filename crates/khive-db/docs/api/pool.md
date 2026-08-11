@@ -164,10 +164,32 @@ standalone writer. A live `writer()` handle therefore makes such an
 do not hold a boxed writer handle across an `atomic_unit()` call on the same
 pool — drop the handle first. With the write queue enabled, `atomic_unit`
 runs inside the writer task instead and never touches this budget.
-The cached-reader admission state does not apply to a standalone
-read-write writer: its handle-scoped writer permit remains held across the
-whole manual transaction, including reader-supertrait calls within that
-transaction, while each such read additionally uses an active-reader permit.
+The cached-reader admission state does not apply to a standalone read-write
+writer: its handle-scoped writer permit remains held across the whole manual
+transaction, including reader-supertrait calls within that transaction, while
+each such read additionally uses an active-reader permit.
+
+### Request cancellation (supersedes detached-natural-completion wording)
+
+Request-owned reads install an exact-connection interrupt handle plus the one
+connection-global progress callback. Cancellation and the absolute request
+deadline stop SQLite VM work; the connection and active permit remain owned
+until the worker stops (or remain inside the detached worker after the bounded
+interrupt-settlement window), so live SQLite state is never returned early.
+An interrupted explicit read transaction is rolled back before reuse; rollback
+or callback cleanup failure closes/replaces the connection. A subsequent
+borrower therefore sees neither the old handler nor its WAL snapshot.
+Reader-pool and cached-reader semaphore admission poll the same latched signal
+in bounded slices. Cancellation before checkout therefore returns promptly and
+the closure refuses to execute when a connection later becomes available; an
+already-admitted statement still follows the classification rules below.
+
+Prepared-statement classification is authoritative: only
+`Statement::readonly()` statements outside transaction control register.
+DML-with-RETURNING, transaction control, `execute_batch`, atomic units, and
+all admitted writes run without request-read interruption and return their real
+completion result. Recorded cancellation translates only a causal
+`SQLITE_INTERRUPT`; unrelated driver failures retain their original error.
 
 When the write queue is enabled, `writer()` is queue-first (ADR-136 D1
 gate 1): it opens no standalone connection and holds no writer permit, and

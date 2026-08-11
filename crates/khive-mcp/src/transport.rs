@@ -11,6 +11,59 @@ use async_trait::async_trait;
 
 use crate::server::KhiveMcpServer;
 
+/// Cancels rmcp's root service token before reporting transport EOF.
+///
+/// rmcp otherwise classifies EOF as a graceful close and drains in-flight
+/// handlers for five seconds without cancelling their per-request child
+/// tokens. The same token is passed to `serve_with_ct`/`serve_directly_with_ct`,
+/// so cancelling it here reaches every admitted handler before that drain
+/// begins. Send and close remain transparent, allowing this wrapper to sit
+/// outside the Unix post-flush self-heal transport without changing its flush
+/// ordering.
+pub(crate) struct CancelOnEofTransport<T> {
+    inner: T,
+    root: tokio_util::sync::CancellationToken,
+}
+
+impl<T> CancelOnEofTransport<T> {
+    pub(crate) fn new(inner: T, root: tokio_util::sync::CancellationToken) -> Self {
+        Self { inner, root }
+    }
+}
+
+impl<T> rmcp::transport::Transport<rmcp::RoleServer> for CancelOnEofTransport<T>
+where
+    T: rmcp::transport::Transport<rmcp::RoleServer>,
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    fn receive(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>>>
+           + Send {
+        let receive = self.inner.receive();
+        let root = self.root.clone();
+        async move {
+            let message = receive.await;
+            if message.is_none() {
+                root.cancel();
+            }
+            message
+        }
+    }
+
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
+}
+
 /// Options passed to a transport at serve time.
 #[derive(Debug, Default, Clone)]
 pub struct ServeOptions {
