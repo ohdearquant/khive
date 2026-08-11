@@ -3604,7 +3604,9 @@ mod tests {
         let db_path = real_dir.join("khive.db");
         fs::write(&db_path, b"").unwrap();
 
+        #[cfg(unix)]
         let dir_symlink = dir.path().join("dir_link");
+        #[cfg(unix)]
         let file_symlink = dir.path().join("file_link.db");
         #[cfg(unix)]
         {
@@ -3666,7 +3668,9 @@ mod tests {
         let db_path = real_dir.join("khive.db");
         fs::write(&db_path, b"").unwrap();
 
+        #[cfg(unix)]
         let dir_symlink = dir.path().join("dir_link");
+        #[cfg(unix)]
         let file_symlink = dir.path().join("file_link.db");
         #[cfg(unix)]
         {

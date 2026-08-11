@@ -905,16 +905,20 @@ mod tests {
             Duration::from_millis(40),
             Arc::clone(&bounded_wait_started),
             scope_request_read_cancellation(cancel_rx, async move {
-                run_interruptible_read(StorageCapability::Sql, "test_write_transition", |scope| {
-                    worker_waiting.store(true, Ordering::Release);
-                    while !worker_release.load(Ordering::Acquire) {
-                        std::thread::yield_now();
-                    }
-                    scope.mark_write_committed()?;
-                    std::thread::sleep(Duration::from_millis(120));
-                    worker_finished.store(true, Ordering::Release);
-                    Ok(73i64)
-                })
+                run_interruptible_read(
+                    StorageCapability::Sql,
+                    "test_write_transition",
+                    move |scope| {
+                        worker_waiting.store(true, Ordering::Release);
+                        while !worker_release.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        scope.mark_write_committed()?;
+                        std::thread::sleep(Duration::from_millis(120));
+                        worker_finished.store(true, Ordering::Release);
+                        Ok(73i64)
+                    },
+                )
                 .await
             }),
         );

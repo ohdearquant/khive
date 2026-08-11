@@ -3852,7 +3852,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(tx_registry)]
-    async fn cancelled_cached_reader_transaction_keeps_permit_until_connection_closes() {
+    async fn cancelled_cached_reader_transaction_releases_guards_after_connection_closes() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_reader_tx_drop_cancel.db")),
@@ -3877,51 +3877,29 @@ mod tests {
             })
             .await
             .expect("begin admitted transaction");
-        let (entered, release, completed) = blocking_progress_gate(
-            &reader
-                .handle
-                .as_ref()
-                .expect("reader retains connection after BEGIN")
-                .conn,
-        );
-        let query = tokio::spawn(async move { reader.query_all(progress_gate_statement()).await });
-        entered.notified().await;
-        query.abort();
-        assert!(matches!(query.await, Err(error) if error.is_cancelled()));
         assert!(
             khive_storage::tx_registry::oldest_for(&origin_view).is_some(),
-            "cancellation must retain registry evidence while detached SQLite work runs"
+            "the explicit transaction must be registered before cancellation"
         );
+        assert_eq!(pool.sql_bridge_reader_slots().available_permits(), 0);
 
-        let blocked = contender
-            .query_all(SqlStatement {
-                sql: "SELECT 1".into(),
-                params: vec![],
-                label: None,
-            })
-            .await;
-        assert!(
-            matches!(
-                &blocked,
-                Err(StorageError::Timeout { operation })
-                    if operation.as_ref() == "sql_bridge.reader_operation"
-            ),
-            "cancellation must not release the transaction permit while SQLite runs; got {blocked:?}"
-        );
-
-        tokio::task::spawn_blocking(move || release.wait())
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
-            .await
-            .expect("cancelled transaction connection did not close");
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let query = tokio::spawn(crate::scope_test_read_progress(
+            Arc::clone(&progress),
+            async move { reader.query_all(deliberately_slow_read_statement()).await },
+        ));
+        wait_for_progress(progress.as_ref()).await;
+        query.abort();
+        assert!(matches!(query.await, Err(error) if error.is_cancelled()));
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while khive_storage::tx_registry::oldest_for(&origin_view).is_some() {
+            while khive_storage::tx_registry::oldest_for(&origin_view).is_some()
+                || pool.sql_bridge_reader_slots().available_permits() != 1
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("connection cleanup after cancellation leaked the transaction span");
+        .expect("connection cleanup leaked transaction evidence or reader admission");
         contender
             .query_all(SqlStatement {
                 sql: "SELECT 1".into(),
@@ -3929,7 +3907,7 @@ mod tests {
                 label: None,
             })
             .await
-            .expect("admission must recover after the detached connection closes");
+            .expect("admission must recover after the cancelled connection closes");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
