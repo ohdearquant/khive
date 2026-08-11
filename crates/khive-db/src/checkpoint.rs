@@ -559,7 +559,9 @@ struct CachedWalpinAttribution {
 #[cfg(unix)]
 #[derive(Debug)]
 enum WalpinFullScanPlan {
-    Refresh,
+    Refresh {
+        previous_last_attempt: Option<Instant>,
+    },
     Cached(CachedWalpinAttribution),
     Suppressed,
 }
@@ -668,13 +670,21 @@ impl TruncateState {
 
     #[cfg(unix)]
     fn plan_walpin_attribution_at(&mut self, now: Instant) -> WalpinFullScanPlan {
-        if self.claim_walpin_full_scan_at(now) {
-            WalpinFullScanPlan::Refresh
+        if self.walpin_full_scan_due_at(now) {
+            let previous_last_attempt = self.walpin_full_scan_last_attempt.replace(now);
+            WalpinFullScanPlan::Refresh {
+                previous_last_attempt,
+            }
         } else if let Some(cached) = self.walpin_cached_attribution.clone() {
             WalpinFullScanPlan::Cached(cached)
         } else {
             WalpinFullScanPlan::Suppressed
         }
+    }
+
+    #[cfg(unix)]
+    fn restore_walpin_full_scan_reservation(&mut self, previous_last_attempt: Option<Instant>) {
+        self.walpin_full_scan_last_attempt = previous_last_attempt;
     }
 
     #[cfg(unix)]
@@ -1341,6 +1351,28 @@ impl WalpinSidecarState {
             self.wrote = false;
         }
     }
+}
+
+#[cfg(unix)]
+async fn run_walpin_housekeeping_if_due(
+    sidecar: &WalpinSidecarState,
+    state: &mut TruncateState,
+    legacy_fallback_interval: Duration,
+) -> bool {
+    if !state.housekeeping_due() || !state.claim_walpin_full_scan_at(Instant::now()) {
+        return false;
+    }
+    if let Some(report) = sidecar
+        .reap_dead_entries_bounded(legacy_fallback_interval)
+        .await
+    {
+        state.cache_walpin_attribution(
+            report,
+            Err("OS holder census is unavailable for a housekeeping-only scan".to_string()),
+            Instant::now(),
+        );
+    }
+    true
 }
 
 fn now_epoch_secs() -> i64 {
@@ -2059,23 +2091,12 @@ pub async fn run_checkpoint_task(
             sidecar
                 .observe(oldest_tx.clone(), config.tx_warn_secs)
                 .await;
-            if truncate_state.housekeeping_due()
-                && truncate_state.claim_walpin_full_scan_at(Instant::now())
-            {
-                if let Some(report) = sidecar
-                    .reap_dead_entries_bounded(legacy_walpin_fallback_interval)
-                    .await
-                {
-                    truncate_state.cache_walpin_attribution(
-                        report,
-                        Err(
-                            "OS holder census is unavailable for a housekeeping-only scan"
-                                .to_string(),
-                        ),
-                        Instant::now(),
-                    );
-                }
-            }
+            let _ = run_walpin_housekeeping_if_due(
+                sidecar,
+                &mut truncate_state,
+                legacy_walpin_fallback_interval,
+            )
+            .await;
         }
 
         // Skipped ticks leave crossing state unchanged — a busy tick must not
@@ -2470,7 +2491,7 @@ fn maybe_truncate(
     }
 
     #[cfg(unix)]
-    let holder_attribution = capture_walpin_attribution_request(pool, truncate_state);
+    let mut holder_attribution = capture_walpin_attribution_request(pool, truncate_state);
     #[cfg(unix)]
     let mut sidecar_attribution = None;
     #[cfg(not(unix))]
@@ -2522,7 +2543,7 @@ fn maybe_truncate(
                     // core is called directly from `run_checkpoint_task` on a
                     // Tokio worker. Hand the immutable request back to that
                     // async owner for an awaited `spawn_blocking` pass.
-                    sidecar_attribution = holder_attribution;
+                    sidecar_attribution = holder_attribution.take();
                 }
                 log_wal_pin_depth(conn);
             }
@@ -2534,6 +2555,14 @@ fn maybe_truncate(
             log_tx_registry_snapshot_warn(wal_pages_before);
             note_truncate_outcome(config, wal_pages_before, truncate_state);
         }
+    }
+    #[cfg(unix)]
+    if let Some(WalpinAttributionRequest::Fresh {
+        previous_last_attempt,
+        ..
+    }) = holder_attribution.as_ref()
+    {
+        truncate_state.restore_walpin_full_scan_reservation(*previous_last_attempt);
     }
     sidecar_attribution
 }
@@ -2746,6 +2775,7 @@ enum WalpinAttributionRequest {
         dir: PathBuf,
         census: Result<crate::walpin::CensusResult, String>,
         legacy_fallback_interval: Duration,
+        previous_last_attempt: Option<Instant>,
     },
     Cached(CachedWalpinAttribution),
     Suppressed,
@@ -2822,10 +2852,13 @@ fn capture_walpin_attribution_request(
     }
     let legacy_fallback_interval = state.legacy_walpin_fallback_interval;
     Some(match state.plan_walpin_attribution_at(Instant::now()) {
-        WalpinFullScanPlan::Refresh => WalpinAttributionRequest::Fresh {
+        WalpinFullScanPlan::Refresh {
+            previous_last_attempt,
+        } => WalpinAttributionRequest::Fresh {
             dir: crate::walpin::sidecar_dir_for(path),
             census: crate::walpin::census_holders(path).map_err(|error| error.to_string()),
             legacy_fallback_interval,
+            previous_last_attempt,
         },
         WalpinFullScanPlan::Cached(cached) => WalpinAttributionRequest::Cached(cached),
         WalpinFullScanPlan::Suppressed => WalpinAttributionRequest::Suppressed,
@@ -2861,6 +2894,7 @@ async fn complete_walpin_attribution(
             dir,
             census,
             legacy_fallback_interval,
+            previous_last_attempt: _,
         } => {
             state.sidecar_attribution_attempted_this_tick = true;
             if state.walpin_full_scan_last_attempt.is_none() {
@@ -3432,7 +3466,7 @@ mod tests {
 
         assert!(matches!(
             state.plan_walpin_attribution_at(started_at),
-            WalpinFullScanPlan::Refresh
+            WalpinFullScanPlan::Refresh { .. }
         ));
         state.cache_walpin_attribution(
             crate::walpin::WalpinReport::default(),
@@ -3446,7 +3480,7 @@ mod tests {
         ));
         assert!(matches!(
             state.plan_walpin_attribution_at(started_at + cadence),
-            WalpinFullScanPlan::Refresh
+            WalpinFullScanPlan::Refresh { .. }
         ));
     }
 
@@ -3459,7 +3493,7 @@ mod tests {
 
         assert!(matches!(
             state.plan_walpin_attribution_at(started_at),
-            WalpinFullScanPlan::Refresh
+            WalpinFullScanPlan::Refresh { .. }
         ));
         // No cache update models either an enumeration error or a panicked
         // blocking worker. The attempt itself still owns the cadence slot.
@@ -3469,7 +3503,7 @@ mod tests {
         ));
         assert!(matches!(
             state.plan_walpin_attribution_at(started_at + cadence),
-            WalpinFullScanPlan::Refresh
+            WalpinFullScanPlan::Refresh { .. }
         ));
     }
 
@@ -3515,6 +3549,105 @@ mod tests {
             }),
             "cached attribution must never authorize the fully-attributed conclusion: {events:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn progressing_truncate_releases_full_scan_reservation_to_housekeeping() {
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walpin-progress-reservation.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        let conn = checkpoint_conn(&pool);
+        let mut state = TruncateState::default();
+        let config = CheckpointConfig {
+            truncate_high_water_pages: 0,
+            truncate_min_interval: Duration::ZERO,
+            ..CheckpointConfig::default()
+        };
+
+        assert!(
+            maybe_truncate(&pool, &conn, &config, u64::MAX, &mut state).is_none(),
+            "a progressing TRUNCATE must not schedule no-progress attribution"
+        );
+        assert!(
+            state.housekeeping_due(),
+            "unused pre-TRUNCATE reservation must be restored before housekeeping"
+        );
+        let sidecar =
+            WalpinSidecarState::new(pool.canonical_path(), true, "daemon", config.interval)
+                .expect("file-backed test sidecar");
+        assert!(
+            run_walpin_housekeeping_if_due(&sidecar, &mut state, DEFAULT_SESSION_SWEEP_INTERVAL,)
+                .await,
+            "the production housekeeping arm must consume one full scan"
+        );
+        assert!(state.walpin_cached_attribution.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn erroring_truncate_releases_full_scan_reservation_to_housekeeping() {
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walpin-error-reservation.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        let conn = checkpoint_conn(&pool);
+        conn.authorizer(Some(
+            |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                AuthAction::Pragma { pragma_name, .. }
+                    if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
+                {
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            },
+        ))
+        .unwrap();
+        let mut state = TruncateState::default();
+        let config = CheckpointConfig {
+            truncate_high_water_pages: 0,
+            truncate_min_interval: Duration::ZERO,
+            ..CheckpointConfig::default()
+        };
+
+        assert!(
+            maybe_truncate(&pool, &conn, &config, u64::MAX, &mut state).is_none(),
+            "an erroring TRUNCATE must not schedule no-progress attribution"
+        );
+        conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        assert!(
+            state.housekeeping_due(),
+            "failed TRUNCATE must restore its unused full-scan reservation"
+        );
+        let sidecar =
+            WalpinSidecarState::new(pool.canonical_path(), true, "daemon", config.interval)
+                .expect("file-backed test sidecar");
+        assert!(
+            run_walpin_housekeeping_if_due(&sidecar, &mut state, DEFAULT_SESSION_SWEEP_INTERVAL,)
+                .await,
+            "the production housekeeping arm must consume one full scan"
+        );
+        assert!(state.walpin_cached_attribution.is_some());
     }
 
     struct ReaderProcess {
@@ -3736,6 +3869,7 @@ mod tests {
             dir: sidecar_dir,
             census: Ok(crate::walpin::CensusResult::default()),
             legacy_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+            previous_last_attempt: None,
         });
         let completion = tokio::spawn(async move {
             let result = complete_walpin_attribution(request, &mut state).await;
@@ -3794,6 +3928,7 @@ mod tests {
             dir: sidecar_dir,
             census: Ok(crate::walpin::CensusResult::default()),
             legacy_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+            previous_last_attempt: None,
         });
 
         let error = complete_walpin_attribution(request, &mut state)
@@ -3884,7 +4019,7 @@ mod tests {
             .find("complete_walpin_attribution(")
             .expect("awaited attribution completion");
         let housekeeping = task
-            .find("reap_dead_entries_bounded(legacy_walpin_fallback_interval)")
+            .find("run_walpin_housekeeping_if_due(")
             .expect("fallback housekeeping");
         let outcome = task
             .find("observe_checkpoint_pressure_tick(")
@@ -3892,6 +4027,15 @@ mod tests {
         assert!(
             checkpoint < completion && completion < housekeeping && housekeeping < outcome,
             "tick ordering must be checkpoint -> awaited attribution -> housekeeping decision -> outcome"
+        );
+        let housekeeping_helper = section(
+            source,
+            "async fn run_walpin_housekeeping_if_due(",
+            "fn now_epoch_secs()",
+        );
+        assert!(
+            housekeeping_helper.contains("reap_dead_entries_bounded(legacy_fallback_interval)"),
+            "the ordered housekeeping arm must retain the bounded full scan"
         );
 
         // The outcome decision itself moved into the extracted per-tick
