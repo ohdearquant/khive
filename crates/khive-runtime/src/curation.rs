@@ -9095,64 +9095,18 @@ mod tests {
         );
     }
 
-    /// Thread-local event capture for the post-commit budget log. Installed
-    /// via `tracing::subscriber::set_default`, so only events emitted on the
-    /// test's own thread are captured — which is the point: the budget log is
-    /// emitted by the async caller after the transaction, not from the writer
-    /// thread inside it.
-    struct BudgetLogCapture {
-        events: std::sync::Arc<std::sync::Mutex<Vec<(String, u64)>>>,
-    }
-
-    #[derive(Default)]
-    struct BudgetLogVisitor {
-        message: Option<String>,
-        budget_rows: Option<u64>,
-    }
-
-    impl tracing::field::Visit for BudgetLogVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.message = Some(format!("{value:?}").trim_matches('"').to_string());
-            }
-        }
-        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-            if field.name() == "budget_rows" {
-                self.budget_rows = Some(value);
-            }
-        }
-    }
-
-    impl tracing::Subscriber for BudgetLogCapture {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut visitor = BudgetLogVisitor::default();
-            event.record(&mut visitor);
-            if let Some(message) = visitor.message {
-                self.events
-                    .lock()
-                    .unwrap()
-                    .push((message, visitor.budget_rows.unwrap_or(0)));
-            }
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
+    // The post-commit budget logs are captured by the process-global tracing
+    // subscriber owned by `crate::pack::tests` — one test binary supports at
+    // most one `set_global_default`, and a thread-local `set_default` guard
+    // here proved lossy under parallel tests (the same event-loss class the
+    // pack tests' subscriber documents). Each test selects its own rows from
+    // the append-only sink by the merge's `into_id`.
+    use crate::pack::tests::budget_log_events;
 
     #[tokio::test]
     async fn merge_entity_reports_and_logs_tx_budget_after_commit() {
         use khive_storage::EdgeRelation;
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let _guard = tracing::subscriber::set_default(BudgetLogCapture {
-            events: std::sync::Arc::clone(&events),
-        });
+        let events = budget_log_events();
 
         let rt = rt();
         let tok = NamespaceToken::local();
@@ -9193,7 +9147,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|(message, _)| message != "merge_entity: transaction materialization budget"),
+                .all(|e| e.into_id != into.id.to_string()),
             "a dry-run preview must not emit the post-commit budget log"
         );
 
@@ -9212,22 +9166,22 @@ mod tests {
         assert!(summary.tx_budget.bytes_charged > 0);
 
         let captured = events.lock().unwrap();
-        let (_, logged_rows) = captured
+        let row = captured
             .iter()
-            .find(|(message, _)| message == "merge_entity: transaction materialization budget")
+            .find(|e| {
+                e.into_id == summary.kept_id.to_string()
+                    && e.message == "merge_entity: transaction materialization budget"
+            })
             .expect("committing entity merge must emit the post-commit budget log");
         assert_eq!(
-            *logged_rows as usize, summary.tx_budget.rows_charged,
+            row.budget_rows as usize, summary.tx_budget.rows_charged,
             "the log must carry the same observed row count the summary reports"
         );
     }
 
     #[tokio::test]
     async fn merge_note_reports_and_logs_tx_budget_after_commit() {
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let _guard = tracing::subscriber::set_default(BudgetLogCapture {
-            events: std::sync::Arc::clone(&events),
-        });
+        let events = budget_log_events();
 
         let rt = rt();
         let tok = NamespaceToken::local();
@@ -9255,12 +9209,15 @@ mod tests {
         assert!(summary.tx_budget.bytes_charged > 0);
 
         let captured = events.lock().unwrap();
-        let (_, logged_rows) = captured
+        let row = captured
             .iter()
-            .find(|(message, _)| message == "merge_note: transaction materialization budget")
+            .find(|e| {
+                e.into_id == summary.kept_id.to_string()
+                    && e.message == "merge_note: transaction materialization budget"
+            })
             .expect("committing note merge must emit the post-commit budget log");
         assert_eq!(
-            *logged_rows as usize, summary.tx_budget.rows_charged,
+            row.budget_rows as usize, summary.tx_budget.rows_charged,
             "the log must carry the same observed row count the summary reports"
         );
     }
