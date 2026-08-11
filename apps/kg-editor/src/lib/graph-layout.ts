@@ -7,12 +7,18 @@ type GraphLayoutEdge = Readonly<{
   target: string;
 }>;
 
-export type SettledGraphNode<T extends GraphLayoutNode> = T & Readonly<{
-  x: number;
-  y: number;
-}>;
+export type SettledGraphNode<T extends GraphLayoutNode> =
+  & T
+  & Readonly<{
+    x: number;
+    y: number;
+  }>;
 
-const PADDING = 10;
+// The narrowest supported graph stage is 300 px after mobile workspace
+// gutters. Mobile node cards can be 120 px wide, so their centers need a
+// 20% horizontal inset to keep the complete card inside the clipped stage.
+const HORIZONTAL_PADDING = 20;
+const VERTICAL_PADDING = 10;
 const CENTER = 50;
 const ITERATIONS = 160;
 
@@ -67,7 +73,9 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
       velocityY: 0,
     };
   });
-  const indexById = new Map(points.map((point, index) => [point.node.id, index]));
+  const indexById = new Map(
+    points.map((point, index) => [point.node.id, index]),
+  );
   const orderedEdges = [...edges].sort(compareEdges).flatMap((edge) => {
     const source = indexById.get(edge.source);
     const target = indexById.get(edge.target);
@@ -113,15 +121,23 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
     for (let index = 0; index < points.length; index += 1) {
       forceX[index] += (CENTER - points[index].x) * 0.006;
       forceY[index] += (CENTER - points[index].y) * 0.006;
-      points[index].velocityX = (points[index].velocityX + forceX[index]) * 0.68;
-      points[index].velocityY = (points[index].velocityY + forceY[index]) * 0.68;
+      points[index].velocityX = (points[index].velocityX + forceX[index]) *
+        0.68;
+      points[index].velocityY = (points[index].velocityY + forceY[index]) *
+        0.68;
       points[index].x = Math.min(
-        100 - PADDING,
-        Math.max(PADDING, points[index].x + points[index].velocityX * temperature),
+        100 - HORIZONTAL_PADDING,
+        Math.max(
+          HORIZONTAL_PADDING,
+          points[index].x + points[index].velocityX * temperature,
+        ),
       );
       points[index].y = Math.min(
-        100 - PADDING,
-        Math.max(PADDING, points[index].y + points[index].velocityY * temperature),
+        100 - VERTICAL_PADDING,
+        Math.max(
+          VERTICAL_PADDING,
+          points[index].y + points[index].velocityY * temperature,
+        ),
       );
     }
   }
