@@ -1071,6 +1071,17 @@ impl ConnectionPool {
         )?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+
+        let wal_enabled =
+            self.config.wal_mode && current_journal_mode(&conn)?.eq_ignore_ascii_case("wal");
+        if wal_enabled {
+            conn.pragma_update(
+                None,
+                "journal_size_limit",
+                self.config.journal_size_limit_bytes,
+            )?;
+        }
+
         Ok(conn)
     }
 
@@ -1758,6 +1769,11 @@ mod tests {
     fn wal_autocheckpoint_pages(conn: &Connection) -> u32 {
         conn.pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
             .expect("read PRAGMA wal_autocheckpoint")
+    }
+
+    fn journal_size_limit_bytes(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "journal_size_limit", |row| row.get(0))
+            .expect("read PRAGMA journal_size_limit")
     }
 
     #[test]
@@ -2488,6 +2504,56 @@ mod tests {
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         assert!(path.exists());
         assert!(pool.max_readers() > 0);
+    }
+
+    #[test]
+    fn standalone_wal_writer_uses_configured_journal_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standalone_wal_journal_limit.db");
+        let configured_limit = 12_345_678;
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            journal_size_limit_bytes: configured_limit,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("WAL pool open");
+
+        let standalone = pool
+            .open_standalone_writer_untracked()
+            .expect("standalone WAL writer open");
+        assert_eq!(current_journal_mode(&standalone).unwrap(), "wal");
+        assert_eq!(journal_size_limit_bytes(&standalone), configured_limit);
+    }
+
+    #[test]
+    fn standalone_rollback_writer_keeps_sqlite_journal_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standalone_rollback_journal_limit.db");
+        let sqlite_default = {
+            let conn = Connection::open(&path).expect("seed rollback-journal database");
+            assert_eq!(current_journal_mode(&conn).unwrap(), "delete");
+            journal_size_limit_bytes(&conn)
+        };
+        let configured_limit = if sqlite_default == 12_345_678 {
+            23_456_789
+        } else {
+            12_345_678
+        };
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            wal_mode: false,
+            journal_size_limit_bytes: configured_limit,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("rollback-journal pool open");
+
+        let standalone = pool
+            .open_standalone_writer_untracked()
+            .expect("standalone rollback-journal writer open");
+        assert_eq!(current_journal_mode(&standalone).unwrap(), "delete");
+        assert_eq!(journal_size_limit_bytes(&standalone), sqlite_default);
     }
 
     #[test]
