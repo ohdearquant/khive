@@ -757,12 +757,14 @@ async fn blob_gc_fence_probe_with_ids(
         Box::pin(async move {
             // Ownership guard: the cleanup below deletes these ids
             // unconditionally, so the probe may only proceed when it can
-            // prove every id is unclaimed. A hit means a collision with a
-            // real row (or a re-entered probe); deleting it would destroy
-            // data the probe does not own.
+            // prove every id is unclaimed in EVERY table cleanup touches.
+            // entities_seq is checked separately from entities because the
+            // ledger intentionally retains rows after entity hard deletion —
+            // a retained-only collision has no entities row to trip on.
             let preexisting = writer
                 .query_row(SqlStatement {
                     sql: "SELECT (SELECT COUNT(*) FROM entities WHERE id IN (?1, ?2)) \
+                              + (SELECT COUNT(*) FROM entities_seq WHERE entity_id IN (?1, ?2)) \
                               + (SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = ?3)"
                         .to_string(),
                     params: vec![
@@ -2407,6 +2409,70 @@ mod tests {
             .expect("the colliding entity must survive the refused probe untouched");
         assert_eq!(name, "unrelated data");
         assert_eq!(created_at, 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fence_probe_refuses_retained_seq_collision_and_preserves_the_ledger_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            crate::run_migrations(writer.conn_mut()).unwrap();
+            // entities_seq rows intentionally survive entity hard deletion, so
+            // an id can collide with the ledger alone — no entities row left
+            // for the guard to trip on.
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, name, tags, created_at, updated_at) \
+                     VALUES ('retained-id', 'local', 'document', 'gone entity', '[]', 7, 7)",
+                    [],
+                )
+                .unwrap();
+            writer
+                .conn_mut()
+                .execute("DELETE FROM entities WHERE id = 'retained-id'", [])
+                .unwrap();
+            let retained: i64 = writer
+                .conn_mut()
+                .query_row(
+                    "SELECT COUNT(*) FROM entities_seq WHERE entity_id = 'retained-id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, 1, "fixture requires a retained-only ledger row");
+        }
+
+        let sql = backend.sql();
+        let error = super::blob_gc_fence_probe_with_ids(
+            sql.as_ref(),
+            "retained-id".to_string(),
+            "retained-update-id".to_string(),
+            "retained-claim-key".to_string(),
+        )
+        .await
+        .expect_err("the probe must refuse when an id collides with a retained ledger row");
+        assert!(
+            matches!(error, StorageError::Unsupported { .. }),
+            "expected StorageError::Unsupported, got {error:?}"
+        );
+
+        let reader = backend.pool().reader().unwrap();
+        let survivors: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM entities_seq WHERE entity_id = 'retained-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            survivors, 1,
+            "the retained ledger row must survive the refused probe"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
