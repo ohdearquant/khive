@@ -16,6 +16,7 @@ use khive_storage::types::Direction;
 use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
 
+use super::dispatch::bounded_backend_cause_for_log;
 use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordinatorService};
 
 fn memory_runtime() -> Arc<KhiveRuntime> {
@@ -50,6 +51,32 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeCoordinatorLogCapture {
     fn make_writer(&'a self) -> Self::Writer {
         self.0.clone()
     }
+}
+
+#[derive(Debug)]
+struct DenyWithCauseGate {
+    cause: String,
+}
+
+impl khive_runtime::Gate for DenyWithCauseGate {
+    fn check(
+        &self,
+        _req: &khive_runtime::GateRequest,
+    ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+        Ok(khive_runtime::GateDecision::deny(self.cause.clone()))
+    }
+}
+
+fn memory_runtime_denied_with(cause: String) -> Arc<KhiveRuntime> {
+    Arc::new(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            gate: Arc::new(DenyWithCauseGate { cause }),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime with denying gate"),
+    )
 }
 
 fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
@@ -734,6 +761,66 @@ async fn fan_out_search_timeout_masks_backend_credentials_in_coordinator_warning
     assert!(logs.contains("backend search task timed out"));
 }
 
+#[test]
+fn coordinator_warning_cause_masker_is_bounded_and_fail_closed() {
+    let secret = format!("authorization token sk_live_{} denied", "q".repeat(32));
+    let masked = bounded_backend_cause_for_log(&secret);
+    assert!(masked.contains("***MASKED***"));
+    assert!(!masked.contains("sk_live_"));
+
+    let oversized = "x".repeat(5_000);
+    let bounded = bounded_backend_cause_for_log(&oversized);
+    assert_eq!(bounded.chars().count(), 1_025);
+    assert!(bounded.ends_with('…'));
+    assert_eq!(
+        bounded_backend_cause_for_log(" \t\n"),
+        "backend search failed without diagnostic detail"
+    );
+}
+
+#[tokio::test]
+async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() {
+    let secret = format!("authorization token sk_live_{} denied", "r".repeat(32));
+    let mut registry = BackendRegistry::new();
+    registry.register(
+        BackendId::new("archive"),
+        memory_runtime_denied_with(secret.clone()),
+    );
+    let coord = SubstrateCoordinator::new(registry);
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "credential-safe authorization",
+        "limit": 10,
+    }));
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    let (_hits, _note_hits, per_backend) =
+        coord.fan_out_search(&request, &Namespace::local()).await;
+    drop(guard);
+    let logs = captured.contents();
+
+    assert_eq!(per_backend.len(), 1);
+    assert!(
+        per_backend[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("sk_live_")),
+        "internal result should retain the raw cause until the MCP sanitizer"
+    );
+    assert!(
+        !logs.contains("sk_live_"),
+        "coordinator WARN leaked authorization credential: {logs}"
+    );
+    assert!(logs.contains("***MASKED***"));
+    assert!(logs.contains("authorization denied for namespace"));
+}
+
 /// Same as the entity-substrate test above, for the `search_notes` await at
 /// the other single-backend early-return call site.
 #[tokio::test(start_paused = true)]
@@ -1265,7 +1352,16 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
         "limit": 10,
     }));
 
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
     let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    drop(guard);
+    let logs = captured.contents();
     assert_eq!(per_backend.len(), 2, "every spawned backend is reported");
 
     let panicked = per_backend
@@ -1280,6 +1376,8 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
         error.contains("join failed") && error.contains("panic"),
         "join error should identify the task panic, got {error:?}"
     );
+    assert!(logs.contains("backend search task failed"));
+    assert!(logs.contains("join failed") && logs.contains("panic"));
 
     let healthy = per_backend
         .iter()
