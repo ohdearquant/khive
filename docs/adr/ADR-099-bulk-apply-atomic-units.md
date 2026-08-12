@@ -737,3 +737,58 @@ Non-atomic output and commit semantics remain unchanged: operations are independ
 are incremental, and the legacy no-save summary plus save-file manifest contracts retain their
 existing shapes. Atomic ops-files continue through the separate ADR-099 prepare/apply runner and
 are unaffected by this amendment.
+
+---
+
+## Amendment 4 (2026-08-12) — opt-in serial scheduling for constrained resources
+
+Real image-ingest smoke testing proved the Amendment 3 typed transport reaches the handler and
+loads one shared model as intended, but also exposed a distinct resource boundary: two independent
+image handlers in the same default parallel batch can concurrently contend for a constrained
+SQLite reader and fail at `sql_bridge.reader_open`. Spawning one process per image would discard
+the warm runtime/model advantage and is not an acceptable bulk-execution contract.
+
+**Decision:** add the explicit operator flag `kkernel exec --ops-file <path> --serial`. The
+ordinary default remains bounded parallel for backward compatibility. Serial mode keeps one
+in-process `KhiveMcpServer` and the same loaded model instances. It parses and submits each full
+logical typed batch through the same Amendment 3 server path while selecting a trusted scheduler
+cap of one, so a handler's complete response settles before the next handler starts. Maximum
+handler concurrency is therefore exactly one; no child process is spawned per operation.
+
+The source is still independent JSON operations, not a DSL chain: `$prev` remains forbidden.
+Before runtime construction or the first mutation, the entire byte-bounded stable snapshot
+receives both its existing JSONL validation and a bounded typed-parser pass, preserving
+operation-count, nesting, `$prev`, and reserved-envelope validation for later rows. Serial
+execution then retains the existing 100-op/32 MiB logical chunk boundaries, input order,
+incremental per-op commits, whole-batch write-key conflict preflight, progress cadence, strict
+refusal classification, save-file row ordering/publication, the single aggregate response budget,
+and success/aborted reconciliation. It changes scheduling only.
+
+The established request-read deadline remains one absolute deadline around the complete logical
+batch; serial mode does not renew or bypass it per operation. Trusted long-running local model
+batches must explicitly select the existing bounded `KHIVE_REQUEST_READ_TIMEOUT_SECS` operator
+configuration (1–3600 seconds) and record that setting in run evidence. Public request policy and
+wire limits remain unchanged.
+
+`--serial` requires `--ops-file` and conflicts with positional inline ops and `--atomic`. Atomic
+mode already defines a different whole-file prepared transaction contract; silently composing
+both flags would make the scheduling flag misleading. Dry-run may use `--serial`, but since
+dry-run stops after whole-file preflight it performs no dispatch.
+
+Mutation-sensitive tests pin the decision:
+
+- Clap and direct-library boundaries reject missing ops-file, inline, and `--atomic --serial`
+  combinations while defaulting the flag off;
+- a concurrency probe observes exactly one in-flight handler in serial mode and the existing
+  eight-handler server bound in the bounded-parallel default;
+- a constrained-reader probe fails overlapping parallel handlers but succeeds for every serial
+  operation on the same server;
+- serial and default scheduling share full-batch write-key conflict detection and canonical
+  aggregate response-budget errors; the budget never resets per operation;
+- ordered result/save rows, middle-operation failure, strict classification, and logical
+  progress/summary semantics survive serial scheduling; and
+- replacing the source after validation cannot change execution, while a later typed-invalid
+  `$prev` row is rejected before an earlier valid write lands.
+
+This operator-only CLI flag does not change the MCP/HTTP/raw DSL wire protocol, its 1 MiB limit,
+or the additive typed Rust host API stability statement in Amendment 3.

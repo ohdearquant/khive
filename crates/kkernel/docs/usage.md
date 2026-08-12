@@ -111,6 +111,36 @@ daemon, and inline `exec` strings retain their independent 1 MiB
 `MAX_OPS_INPUT_LEN` safety boundary. The ops-file limits are not a global limit
 increase.
 
+The default remains bounded-parallel handler execution. For a backend with a
+constrained reader/model resource, add `--serial`:
+
+```bash
+kkernel exec --ops-file batch.jsonl --serial --save-file results.jsonl
+```
+
+Serial mode still validates and freezes the complete source before runtime
+construction or the first write. It then keeps the same single in-process
+server, loaded models, 100-op/32 MiB logical chunk boundaries, ordered rows,
+save-file publication, strict handling, progress, and reconciliation semantics.
+Each complete logical chunk still receives one shared write-conflict preflight
+and aggregate response budget; only its trusted handler-concurrency cap changes
+from eight to one. `$prev` remains invalid because an ops-file contains
+independent JSON operations, not a DSL chain. `--serial` requires `--ops-file`
+and conflicts with positional inline ops and `--atomic`; the latter is a
+separate whole-file transaction contract.
+
+Serial scheduling does not renew Khive's established request-read deadline per
+operation: one logical chunk retains one deadline. A trusted long-running local
+model batch whose inference can exceed the 30-second default must opt into a
+bounded documented override (1–3600 seconds), for example:
+
+```bash
+KHIVE_REQUEST_READ_TIMEOUT_SECS=3600 \
+  kkernel exec --ops-file image-batch.jsonl --serial
+```
+
+Record this operator setting with run evidence; it is not a wire-limit bypass.
+
 ### Stable refusal reasons
 
 Refused invocations retain their existing human-readable error and exit-code

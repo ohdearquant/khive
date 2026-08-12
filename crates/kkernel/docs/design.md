@@ -102,6 +102,31 @@
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
   20 kg-substrate bare verbs. These are validated by the contract test.
 
+### Serial non-atomic ops-file dispatch (ADR-099 Amendment 4)
+
+`exec.rs` owns an opt-in `--ops-file --serial` scheduling policy for backends
+whose reader or model resources cannot safely serve multiple handlers at once.
+The complete source is first validated into the same byte-bounded stable
+snapshot, including a whole-snapshot typed-JSON structural preflight, before
+the runtime is built or any operation can write. Execution retains one local
+`KhiveMcpServer` and therefore one loaded model instance. Each existing
+100-op/32 MiB logical chunk is parsed and dispatched as one complete parallel
+batch through the same server path, but that batch's trusted scheduler cap is
+one. The next handler starts only after the current handler completes.
+
+This is scheduling, not chain or transaction semantics: `$prev` remains
+invalid, operations commit independently, and progress/save/strict/
+reconciliation, write-key conflict preflight, and aggregate response budget stay
+on the existing logical chunk boundary. The default path remains bounded
+parallel. `--serial` conflicts with `--atomic`, whose prepared whole-file
+transaction is owned by `atomic_apply.rs` below.
+
+The server's established request-read deadline remains scoped to the full
+logical batch and is not silently renewed per operation. Long-running trusted
+local model work must select the documented bounded
+`KHIVE_REQUEST_READ_TIMEOUT_SECS` override explicitly; serial scheduling itself
+does not weaken cancellation policy.
+
 ### Atomic `exec --ops-file --atomic` execution path (ADR-099 Slice B3)
 
 `atomic_apply.rs` is the CLI-boundary orchestrator for `kkernel exec --ops-file --atomic`.

@@ -174,8 +174,31 @@ pub(crate) enum DispatchOrigin {
 #[derive(Clone, Copy)]
 struct RunParsedContext<'a> {
     enforce_response_budget: bool,
+    max_batch_concurrency: usize,
     from_wire: bool,
     identity: Option<&'a khive_runtime::RequestIdentity>,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedDispatchPolicy {
+    strict_refusals: bool,
+    max_batch_concurrency: usize,
+}
+
+impl ParsedDispatchPolicy {
+    const fn bounded_parallel(strict_refusals: bool) -> Self {
+        Self {
+            strict_refusals,
+            max_batch_concurrency: MAX_BATCH_CONCURRENCY,
+        }
+    }
+
+    const fn serial(strict_refusals: bool) -> Self {
+        Self {
+            strict_refusals,
+            max_batch_concurrency: 1,
+        }
+    }
 }
 
 /// Typed failure crossing the dispatch/envelope seam.
@@ -1402,9 +1425,11 @@ impl KhiveMcpServer {
     ) -> Value {
         let RunParsedContext {
             enforce_response_budget,
+            max_batch_concurrency,
             from_wire,
             identity,
         } = context;
+        debug_assert!(max_batch_concurrency > 0);
         let response_budget = if mode == ExecutionMode::Parallel && enforce_response_budget {
             BATCH_RESPONSE_BUDGET_BYTES
         } else {
@@ -1605,7 +1630,8 @@ impl KhiveMcpServer {
                         },
                     }
                 });
-                let results = execute_bounded_batch(futures, response_budget).await;
+                let results =
+                    execute_bounded_batch(futures, response_budget, max_batch_concurrency).await;
                 parallel_batch_envelope(results)
             }
             ExecutionMode::Chain => {
@@ -2500,11 +2526,16 @@ fn batch_budget_error(tool: &str, response_budget: usize) -> Value {
     })
 }
 
-async fn execute_bounded_batch<I, F>(tasks: I, response_budget: usize) -> Vec<Value>
+async fn execute_bounded_batch<I, F>(
+    tasks: I,
+    response_budget: usize,
+    max_concurrency: usize,
+) -> Vec<Value>
 where
     I: IntoIterator<Item = BatchTask<F>>,
     F: Future<Output = Value>,
 {
+    assert!(max_concurrency > 0, "batch concurrency must be nonzero");
     let mut queued: std::collections::VecDeque<_> = tasks.into_iter().collect();
     let total = queued.len();
     let mut in_flight = FuturesUnordered::new();
@@ -2512,7 +2543,7 @@ where
         let entry = task.future.await;
         (task.index, task.tool, entry)
     };
-    for _ in 0..MAX_BATCH_CONCURRENCY {
+    for _ in 0..max_concurrency {
         if let Some(task) = queued.pop_front() {
             in_flight.push(start(task));
         }
@@ -2729,6 +2760,46 @@ impl KhiveMcpServer {
         format: Option<String>,
         strict_refusals: bool,
     ) -> Result<String, McpError> {
+        self.dispatch_typed_json_batch_local_for_exec_with_policy(
+            ops,
+            presentation,
+            format,
+            ParsedDispatchPolicy::bounded_parallel(strict_refusals),
+        )
+        .await
+    }
+
+    /// Dispatch one full typed ops-file chunk with exactly one handler in
+    /// flight while retaining ordinary parallel-batch semantics.
+    ///
+    /// Parsing, write-key conflict detection, aggregate response budgeting,
+    /// result ordering, presentation, audit, and strict-refusal handling remain
+    /// shared with [`Self::dispatch_typed_json_batch_local_for_exec`]. Only the
+    /// trusted local scheduler's concurrency cap changes.
+    pub async fn dispatch_typed_json_batch_serial_local_for_exec(
+        &self,
+        ops: Vec<TypedJsonOp>,
+        presentation: Option<String>,
+        format: Option<String>,
+        strict_refusals: bool,
+    ) -> Result<String, McpError> {
+        self.dispatch_typed_json_batch_local_for_exec_with_policy(
+            ops,
+            presentation,
+            format,
+            ParsedDispatchPolicy::serial(strict_refusals),
+        )
+        .await
+    }
+
+    async fn dispatch_typed_json_batch_local_for_exec_with_policy(
+        &self,
+        ops: Vec<TypedJsonOp>,
+        presentation: Option<String>,
+        format: Option<String>,
+        policy: ParsedDispatchPolicy,
+    ) -> Result<String, McpError> {
+        debug_assert!(policy.max_batch_concurrency > 0);
         let parsed = parse_typed_json_batch(ops).map_err(dsl_err_to_mcp)?;
         let p = RequestParams {
             ops: String::new(),
@@ -2745,7 +2816,7 @@ impl KhiveMcpServer {
             false,
             None,
             DispatchOrigin::Local,
-            strict_refusals,
+            policy,
         ));
         khive_storage::scope_request_read_deadline(request_read_timeout(), dispatch).await
     }
@@ -2858,7 +2929,7 @@ impl KhiveMcpServer {
             from_wire,
             identity,
             origin,
-            strict_refusals,
+            ParsedDispatchPolicy::bounded_parallel(strict_refusals),
         )
         .await
     }
@@ -2870,8 +2941,12 @@ impl KhiveMcpServer {
         from_wire: bool,
         identity: Option<khive_runtime::RequestIdentity>,
         origin: DispatchOrigin,
-        strict_refusals: bool,
+        policy: ParsedDispatchPolicy,
     ) -> Result<String, McpError> {
+        let ParsedDispatchPolicy {
+            strict_refusals,
+            max_batch_concurrency,
+        } = policy;
         let save_to = p.save_to.clone();
         let identity = identity.or_else(|| {
             p.request_id
@@ -2944,6 +3019,7 @@ impl KhiveMcpServer {
                 presentation_per_op.clone(),
                 RunParsedContext {
                     enforce_response_budget: save_to.is_none(),
+                    max_batch_concurrency,
                     from_wire,
                     identity: identity.as_ref(),
                 },
@@ -4017,6 +4093,134 @@ mod tests {
         KhiveMcpServer::from_registry(builder.build().expect("test registry"))
     }
 
+    fn typed_test_op(tool: &str, args: Value) -> TypedJsonOp {
+        let Value::Object(args) = args else {
+            panic!("typed test args must be an object")
+        };
+        TypedJsonOp {
+            tool: tool.to_string(),
+            args,
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_serial_dispatch_retains_full_batch_write_conflict_preflight() {
+        let ops = vec![
+            typed_test_op("update", json!({"id": "same-id", "name": "new"})),
+            typed_test_op("delete", json!({"id": "same-id"})),
+        ];
+        let server = large_result_test_server();
+        let parallel: Value = serde_json::from_str(
+            &server
+                .dispatch_typed_json_batch_local_for_exec(
+                    ops.clone(),
+                    Some("verbose".to_string()),
+                    Some("json".to_string()),
+                    false,
+                )
+                .await
+                .expect("parallel typed dispatch"),
+        )
+        .expect("parallel response JSON");
+        let serial: Value = serde_json::from_str(
+            &server
+                .dispatch_typed_json_batch_serial_local_for_exec(
+                    ops,
+                    Some("verbose".to_string()),
+                    Some("json".to_string()),
+                    false,
+                )
+                .await
+                .expect("serial typed dispatch"),
+        )
+        .expect("serial response JSON");
+
+        assert_eq!(serial["summary"], parallel["summary"]);
+        assert_eq!(serial["status"], parallel["status"]);
+        for (serial_row, parallel_row) in serial["results"]
+            .as_array()
+            .expect("serial rows")
+            .iter()
+            .zip(parallel["results"].as_array().expect("parallel rows"))
+        {
+            assert_eq!(serial_row["ok"], false);
+            assert_eq!(serial_row["tool"], parallel_row["tool"]);
+            assert_eq!(serial_row["error"], parallel_row["error"]);
+            assert!(serial_row["error"]
+                .as_str()
+                .expect("conflict error")
+                .contains("writes overlap"));
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_serial_dispatch_retains_one_aggregate_response_budget() {
+        let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
+        let ops: Vec<TypedJsonOp> = (0..12)
+            .map(|_| typed_test_op("large_result", json!({"bytes": result_bytes})))
+            .collect();
+        let server = large_result_test_server();
+        let parallel: Value = serde_json::from_str(
+            &server
+                .dispatch_typed_json_batch_local_for_exec(
+                    ops.clone(),
+                    Some("verbose".to_string()),
+                    Some("json".to_string()),
+                    false,
+                )
+                .await
+                .expect("parallel typed dispatch"),
+        )
+        .expect("parallel response JSON");
+        let serial: Value = serde_json::from_str(
+            &server
+                .dispatch_typed_json_batch_serial_local_for_exec(
+                    ops,
+                    Some("verbose".to_string()),
+                    Some("json".to_string()),
+                    false,
+                )
+                .await
+                .expect("serial typed dispatch"),
+        )
+        .expect("serial response JSON");
+
+        let serial_rows = serial["results"].as_array().expect("serial rows");
+        let first_serial_budget_error = serial_rows
+            .iter()
+            .position(|row| {
+                row["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("batch response budget"))
+            })
+            .expect("serial tail must contain canonical budget errors");
+        assert!(
+            first_serial_budget_error >= 3 && first_serial_budget_error < serial_rows.len(),
+            "serial dispatch must spend one aggregate budget, not reset it per op"
+        );
+        assert!(serial_rows[..first_serial_budget_error]
+            .iter()
+            .all(|row| row["ok"] == json!(true)));
+        assert!(serial_rows[first_serial_budget_error..].iter().all(|row| {
+            row["ok"] == json!(false)
+                && row["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(&BATCH_RESPONSE_BUDGET_BYTES.to_string()))
+        }));
+
+        let parallel_budget_error = parallel["results"]
+            .as_array()
+            .expect("parallel rows")
+            .iter()
+            .find_map(|row| row["error"].as_str())
+            .expect("parallel undispatched tail must use the same budget error");
+        assert_eq!(
+            serial_rows[first_serial_budget_error]["error"],
+            json!(parallel_budget_error),
+            "serial and default typed scheduling must single-source the budget/error contract"
+        );
+    }
+
     #[tokio::test]
     async fn bounded_batch_preserves_input_order() {
         let count = MAX_BATCH_CONCURRENCY + 3;
@@ -4035,7 +4239,7 @@ mod tests {
             )
         });
 
-        let results = execute_bounded_batch(futures, usize::MAX).await;
+        let results = execute_bounded_batch(futures, usize::MAX, MAX_BATCH_CONCURRENCY).await;
 
         let indices: Vec<u64> = results
             .iter()
@@ -4087,7 +4291,7 @@ mod tests {
 
         let results = tokio::time::timeout(
             Duration::from_secs(1),
-            execute_bounded_batch(futures, budget),
+            execute_bounded_batch(futures, budget, MAX_BATCH_CONCURRENCY),
         )
         .await
         .expect("started operations must settle promptly after a budget breach");
@@ -4458,7 +4662,9 @@ mod tests {
             )
         });
 
-        let response = parallel_batch_envelope(execute_bounded_batch(futures, usize::MAX).await);
+        let response = parallel_batch_envelope(
+            execute_bounded_batch(futures, usize::MAX, MAX_BATCH_CONCURRENCY).await,
+        );
 
         assert_eq!(
             response["summary"],
@@ -4487,7 +4693,7 @@ mod tests {
             )
         });
 
-        let results = execute_bounded_batch(futures, usize::MAX).await;
+        let results = execute_bounded_batch(futures, usize::MAX, MAX_BATCH_CONCURRENCY).await;
 
         assert_eq!(results.len(), count);
         assert_eq!(max_in_flight.load(Ordering::SeqCst), MAX_BATCH_CONCURRENCY);
@@ -5300,6 +5506,7 @@ mod tests {
                 None,
                 RunParsedContext {
                     enforce_response_budget: true,
+                    max_batch_concurrency: MAX_BATCH_CONCURRENCY,
                     from_wire: false,
                     identity: None,
                 },
@@ -5372,6 +5579,7 @@ mod tests {
                 None,
                 RunParsedContext {
                     enforce_response_budget: true,
+                    max_batch_concurrency: MAX_BATCH_CONCURRENCY,
                     from_wire: false,
                     identity: None,
                 },

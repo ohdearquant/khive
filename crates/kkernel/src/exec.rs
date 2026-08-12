@@ -30,6 +30,10 @@
 //! reconciliation manifest. An aborted manifest names confirmed committed
 //! chunks and any dispatched chunk whose response could not be verified.
 //! Without `--save-file`, validated row payloads are discarded after aggregation.
+//! `--serial` keeps the same logical chunks and one warm server/model instance,
+//! but runs each full chunk through the same batch path with handler concurrency
+//! capped at one. The default remains bounded parallel execution; `--serial`
+//! conflicts with `--atomic`.
 //! `--dry-run` validates every line and prints a per-verb summary without writes.
 
 use std::collections::BTreeMap;
@@ -354,6 +358,18 @@ const MAX_OPS_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_OPS_FILE_FAILURE_DETAILS: usize = 1_000;
 const MAX_OPS_FILE_FAILURE_ERROR_BYTES: usize = 4 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpsFileDispatchMode {
+    BoundedParallel,
+    Serial,
+}
+
+impl OpsFileDispatchMode {
+    const fn is_serial(self) -> bool {
+        matches!(self, Self::Serial)
+    }
+}
+
 /// Arguments for `kkernel exec` — execute a verb DSL expression against a chosen
 /// database and namespace, the same syntax accepted by the MCP `request` tool.
 #[derive(Parser, Debug)]
@@ -478,6 +494,9 @@ pub struct ExecArgs {
     /// prints its ordinary manifest. A later failure leaves database effects
     /// incremental, discards the incomplete temp file, and prints an aborted
     /// reconciliation manifest before returning non-zero.
+    /// Pass `--serial` to retain those logical chunks while awaiting every
+    /// handler before starting the next; this keeps one warm server/model and
+    /// limits handler concurrency to one.
     ///
     /// Mutually exclusive with the positional `ops` argument.
     #[arg(long, value_name = "PATH")]
@@ -487,6 +506,20 @@ pub struct ExecArgs {
     /// without writing anything.  Only valid with `--ops-file`.
     #[arg(long, requires = "ops_file")]
     pub dry_run: bool,
+
+    /// Await each JSON op to completion before dispatching the next one.
+    ///
+    /// This keeps one in-process server and its loaded models warm while
+    /// limiting handler concurrency to exactly one. It is intended for
+    /// resource-constrained backends where an ordinary parallel ops-file batch
+    /// can exhaust a reader or model resource. Only valid with `--ops-file` and
+    /// mutually exclusive with both positional inline ops and `--atomic`.
+    #[arg(
+        long,
+        requires = "ops_file",
+        conflicts_with_all = ["atomic", "ops"]
+    )]
+    pub serial: bool,
 
     /// Run the whole ops-file as ONE cross-op atomic unit (ADR-099): every op
     /// commits or the whole file rolls back, with zero partial state either
@@ -684,6 +717,94 @@ where
         line_num += 1;
     }
     Ok(ops)
+}
+
+/// Validate every decoded JSON op in the stable snapshot before the first
+/// handler can mutate state.
+///
+/// This is deliberately a bounded second pass: at most one ordinary logical
+/// chunk is materialized, and one over-target physical line may stand alone.
+/// It pins the typed parser's nesting, `$prev`, and reserved-envelope guards
+/// across the whole file rather than discovering a later invalid op after an
+/// earlier serial dispatch has committed.
+fn preflight_typed_validated_snapshot<R>(snapshot: &mut R, expected_total: usize) -> Result<()>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot for typed preflight")?;
+    let result: Result<()> = (|| {
+        let mut reader = std::io::BufReader::new(&mut *snapshot);
+        let mut processed = 0_usize;
+        let mut line_number = 1_usize;
+        let mut chunk_number = 0_usize;
+        let mut pending: Option<(OpsFileEntry, usize)> = None;
+        let mut eof = false;
+
+        while !eof {
+            let mut chunk = Vec::with_capacity(OPS_FILE_CHUNK_SIZE);
+            let mut chunk_bytes = 0_usize;
+            if let Some((op, bytes)) = pending.take() {
+                chunk_bytes = bytes;
+                chunk.push(op);
+            }
+            while chunk.len() < OPS_FILE_CHUNK_SIZE {
+                let Some(raw) = read_bounded_ops_line(&mut reader, line_number)? else {
+                    eof = true;
+                    break;
+                };
+                let physical_bytes = raw.len().saturating_add(1);
+                if let Some(op) = parse_ops_file_line(&raw, line_number)? {
+                    if should_defer_chunk_entry(chunk.len(), chunk_bytes, physical_bytes) {
+                        pending = Some((op, physical_bytes));
+                        line_number += 1;
+                        break;
+                    }
+                    chunk_bytes = chunk_bytes.saturating_add(physical_bytes);
+                    chunk.push(op);
+                }
+                line_number += 1;
+            }
+            if chunk.is_empty() {
+                break;
+            }
+
+            chunk_number += 1;
+            let chunk_len = chunk.len();
+            let typed_ops = chunk
+                .into_iter()
+                .map(|op| {
+                    let serde_json::Value::Object(args) = op.args else {
+                        unreachable!("validated ops-file args are always JSON objects")
+                    };
+                    khive_request::TypedJsonOp {
+                        tool: op.tool,
+                        args,
+                    }
+                })
+                .collect();
+            khive_request::parse_typed_json_batch(typed_ops).map_err(|error| {
+                refusal_error(
+                    RefusalReason::ParseError,
+                    format!("ops-file typed preflight chunk {chunk_number}: {error}"),
+                )
+            })?;
+            processed += chunk_len;
+        }
+
+        if processed != expected_total {
+            anyhow::bail!(
+                "validated ops-file snapshot changed during typed preflight: expected \
+                 {expected_total} ops, read {processed}"
+            );
+        }
+        Ok(())
+    })();
+    snapshot
+        .rewind()
+        .context("rewind typed-preflighted ops-file snapshot")?;
+    result
 }
 
 fn validated_tool_names<R>(snapshot: &mut R) -> Result<Vec<String>>
@@ -1075,6 +1196,7 @@ fn emit_aborted_ops_file_manifest(
 /// Apply a parsed ops-file against the given server, printing progress to
 /// stderr and either the final summary or a success/aborted save manifest.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn apply_ops_file_reader<R: std::io::BufRead>(
     server: &KhiveMcpServer,
     reader: R,
@@ -1084,7 +1206,7 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
     save_file: Option<String>,
     strict: bool,
 ) -> Result<serde_json::Value> {
-    apply_ops_file_reader_with_response_transform(
+    apply_ops_file_reader_with_dispatch_mode(
         server,
         reader,
         total,
@@ -1092,13 +1214,68 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
         _output_format,
         save_file,
         strict,
+        OpsFileDispatchMode::BoundedParallel,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_reader_with_dispatch_mode<R: std::io::BufRead>(
+    server: &KhiveMcpServer,
+    reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
+) -> Result<serde_json::Value> {
+    apply_ops_file_reader_with_response_transform_and_dispatch_mode(
+        server,
+        reader,
+        total,
+        presentation,
+        _output_format,
+        save_file,
+        strict,
+        dispatch_mode,
         |_, raw| raw,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn apply_ops_file_reader_with_response_transform<R, F>(
+    server: &KhiveMcpServer,
+    reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    response_transform: F,
+) -> Result<serde_json::Value>
+where
+    R: std::io::BufRead,
+    F: FnMut(usize, String) -> String,
+{
+    apply_ops_file_reader_with_response_transform_and_dispatch_mode(
+        server,
+        reader,
+        total,
+        presentation,
+        _output_format,
+        save_file,
+        strict,
+        OpsFileDispatchMode::BoundedParallel,
+        response_transform,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_reader_with_response_transform_and_dispatch_mode<R, F>(
     server: &KhiveMcpServer,
     mut reader: R,
     total: usize,
@@ -1106,6 +1283,7 @@ async fn apply_ops_file_reader_with_response_transform<R, F>(
     _output_format: Option<String>,
     save_file: Option<String>,
     strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
     mut response_transform: F,
 ) -> Result<serde_json::Value>
 where
@@ -1141,6 +1319,8 @@ where
 
     let execution_result: Result<()> = async {
         while !eof {
+            // `--serial` changes handler concurrency, not the established
+            // logical chunk/progress/reconciliation boundary.
             let mut chunk = Vec::with_capacity(OPS_FILE_CHUNK_SIZE);
             let mut chunk_bytes = 0_usize;
             if let Some((op, bytes)) = pending.take() {
@@ -1186,19 +1366,30 @@ where
 
             let chunk_number = chunk_idx + 1;
             dispatched_chunk = Some(chunk_number);
-            let raw = server
-                .dispatch_typed_json_batch_local_for_exec(
-                    typed_ops,
-                    presentation.clone(),
-                    // Inline --save-file writes raw results before format rendering.
-                    // Reproduce that lossless shape for the combined bulk save. The
-                    // no-save path deliberately preserves its pre-PR behavior, which
-                    // did not forward the CLI output-format override to each chunk.
-                    save_sink.is_some().then(|| "json".to_string()),
-                    strict,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("dispatch chunk {chunk_number}: {e}"))?;
+            let output_format = save_sink.is_some().then(|| "json".to_string());
+            let raw = if dispatch_mode.is_serial() {
+                server
+                    .dispatch_typed_json_batch_serial_local_for_exec(
+                        typed_ops,
+                        presentation.clone(),
+                        output_format,
+                        strict,
+                    )
+                    .await
+            } else {
+                server
+                    .dispatch_typed_json_batch_local_for_exec(
+                        typed_ops,
+                        presentation.clone(),
+                        // Inline --save-file writes raw results before format
+                        // rendering. Reproduce that lossless shape for combined
+                        // bulk save. No-save preserves its legacy behavior.
+                        output_format,
+                        strict,
+                    )
+                    .await
+            }
+            .map_err(|error| anyhow::anyhow!("dispatch chunk {chunk_number}: {error}"))?;
             let raw = response_transform(chunk_number, raw);
 
             let mut parsed: serde_json::Value =
@@ -1230,7 +1421,7 @@ where
                     &mut failures,
                     &mut failure_details_omitted,
                 ) {
-                    eprintln!("op {} ({}) failed: {reason}", op_index, tool,);
+                    eprintln!("op {} ({}) failed: {reason}", op_index, tool);
                 }
             }
 
@@ -1391,6 +1582,40 @@ async fn apply_ops_file(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_with_dispatch_mode(
+    server: &KhiveMcpServer,
+    ops: Vec<OpsFileEntry>,
+    presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
+) -> Result<serde_json::Value> {
+    let total = ops.len();
+    let mut encoded = Vec::new();
+    for op in ops {
+        serde_json::to_writer(
+            &mut encoded,
+            &serde_json::json!({"tool": op.tool, "args": op.args}),
+        )
+        .context("serialize test ops-file entry")?;
+        encoded.push(b'\n');
+    }
+    apply_ops_file_reader_with_dispatch_mode(
+        server,
+        std::io::Cursor::new(encoded),
+        total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+        dispatch_mode,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn apply_ops_file_with_response_transform<F>(
     server: &KhiveMcpServer,
     ops: Vec<OpsFileEntry>,
@@ -1444,6 +1669,14 @@ where
 /// skipped entirely, and all ops are dispatched through the in-process runtime
 /// in chunks (see module-level docs).
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
+    // Clap enforces these relations for normal CLI entry. Keep the same
+    // boundary for library callers that construct `ExecArgs` directly.
+    if args.serial && (args.ops_file.is_none() || args.ops.is_some() || args.atomic) {
+        anyhow::bail!(
+            "--serial requires --ops-file and conflicts with positional ops and --atomic"
+        );
+    }
+
     // ── pending-events drain ─────────────────────────────────────────────────
     if args.pending_events {
         let summary = pending_events::run_pending_events_with_config(
@@ -1473,7 +1706,6 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         (Some(ops), None) => ExecMode::Inline(ops.clone()),
         (None, Some(path)) => ExecMode::OpsFile(path.clone()),
     };
-
     // Parsing is the invocation boundary, before identity/configuration guards
     // choose a competing refusal. This makes malformed inline DSL and malformed
     // JSONL deterministically report `parse-error` regardless of whether strict
@@ -1572,6 +1804,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 args.save_file,
                 args.dry_run,
                 db_context,
+                args.serial,
                 args.atomic,
                 args.atomic_max_ops,
                 args.strict,
@@ -2203,10 +2436,15 @@ async fn run_exec_ops_file(
     save_file: Option<String>,
     dry_run: bool,
     db_context: ExecDbContext,
+    serial: bool,
     atomic: bool,
     atomic_max_ops: Option<usize>,
     strict: bool,
 ) -> Result<()> {
+    if serial && atomic {
+        anyhow::bail!("--serial conflicts with --atomic");
+    }
+
     // Validate the whole file and spool a stable bounded snapshot before any
     // runtime construction or writes. Non-atomic dispatch retains only one
     // request chunk plus ordered result envelopes in memory.
@@ -2225,6 +2463,20 @@ async fn run_exec_ops_file(
 
     if validated.total == 0 {
         anyhow::bail!("ops-file is empty (no non-blank lines): {}", path.display());
+    }
+
+    if serial {
+        if let Err(error) =
+            preflight_typed_validated_snapshot(&mut validated.snapshot, validated.total)
+        {
+            if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
+                return Err(report_unscoped_refusal(
+                    refusal.reason,
+                    refusal.message.as_str(),
+                ));
+            }
+            return Err(error);
+        }
     }
 
     if dry_run {
@@ -2326,7 +2578,7 @@ async fn run_exec_ops_file(
         .snapshot
         .rewind()
         .context("rewind validated ops-file snapshot for dispatch")?;
-    apply_ops_file_reader(
+    apply_ops_file_reader_with_dispatch_mode(
         &server,
         std::io::BufReader::new(validated.snapshot),
         validated.total,
@@ -2334,6 +2586,11 @@ async fn run_exec_ops_file(
         output_format,
         save_file,
         strict,
+        if serial {
+            OpsFileDispatchMode::Serial
+        } else {
+            OpsFileDispatchMode::BoundedParallel
+        },
     )
     .await
     .map(|_| ())
@@ -2980,6 +3237,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn serial_requires_ops_file_conflicts_with_inline_and_atomic_and_defaults_off() {
+        let serial =
+            ExecArgs::try_parse_from(["exec", "--ops-file", "/tmp/batch.jsonl", "--serial"])
+                .expect("--serial must be accepted for a non-atomic ops-file");
+        assert!(serial.serial);
+
+        let default_parallel = ExecArgs::parse_from(["exec", "--ops-file", "/tmp/batch.jsonl"]);
+        assert!(!default_parallel.serial);
+
+        assert!(
+            ExecArgs::try_parse_from(["exec", "stats()", "--serial"]).is_err(),
+            "--serial without --ops-file must fail during CLI parsing"
+        );
+        assert!(
+            ExecArgs::try_parse_from([
+                "exec",
+                "stats()",
+                "--ops-file",
+                "/tmp/batch.jsonl",
+                "--serial",
+            ])
+            .is_err(),
+            "--serial must not compose with inline positional ops"
+        );
+        assert!(
+            ExecArgs::try_parse_from([
+                "exec",
+                "--ops-file",
+                "/tmp/batch.jsonl",
+                "--atomic",
+                "--serial",
+            ])
+            .is_err(),
+            "--serial and --atomic are distinct execution contracts and must conflict"
+        );
+    }
+
     // ── isolated DB helpers ────────────────────────────────────────────────────
 
     /// Build an isolated in-process runtime using a temp-file SQLite database.
@@ -2998,6 +3293,117 @@ mod tests {
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
         KhiveMcpServer::new(rt).expect("server on temp db")
+    }
+
+    struct OpsFileConcurrencyProbePack {
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        reject_overlap: bool,
+    }
+
+    impl khive_types::Pack for OpsFileConcurrencyProbePack {
+        const NAME: &'static str = "ops-file-concurrency-probe";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+            name: "reader_probe",
+            description: "records test-only handler concurrency",
+            visibility: khive_runtime::Visibility::Verb,
+            category: khive_runtime::VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    struct ProbeInFlightGuard {
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for ProbeInFlightGuard {
+        fn drop(&mut self) {
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for OpsFileConcurrencyProbePack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            params: serde_json::Value,
+            _registry: &khive_runtime::VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> std::result::Result<serde_json::Value, khive_runtime::RuntimeError> {
+            let current = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let _guard = ProbeInFlightGuard {
+                in_flight: self.in_flight.clone(),
+            };
+            self.max_in_flight
+                .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            if params["fail"].as_bool().unwrap_or(false) {
+                return Err(khive_runtime::RuntimeError::Internal(
+                    "requested probe failure".to_string(),
+                ));
+            }
+            if self.reject_overlap && current > 1 {
+                return Err(khive_runtime::RuntimeError::Internal(
+                    "sql_bridge.reader_open constrained-reader overlap".to_string(),
+                ));
+            }
+            Ok(serde_json::json!({"sequence": params["sequence"]}))
+        }
+    }
+
+    fn concurrency_probe_server(
+        reject_overlap: bool,
+    ) -> (
+        KhiveMcpServer,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(OpsFileConcurrencyProbePack {
+            in_flight: in_flight.clone(),
+            max_in_flight: max_in_flight.clone(),
+            reject_overlap,
+        });
+        (
+            KhiveMcpServer::from_registry(builder.build().expect("probe registry")),
+            in_flight,
+            max_in_flight,
+        )
+    }
+
+    fn reader_probe_ops(count: usize) -> Vec<OpsFileEntry> {
+        (0..count)
+            .map(|sequence| OpsFileEntry {
+                tool: "reader_probe".to_string(),
+                args: serde_json::json!({"sequence": sequence}),
+            })
+            .collect()
     }
 
     // ── isolated_server ignores ambient KHIVE_PACKS (#1276) ───────────────────
@@ -4225,6 +4631,353 @@ id = "lambda:fallback"
     }
 
     #[tokio::test]
+    async fn serial_ops_file_max_in_flight_is_one_while_default_remains_parallel() {
+        let op_count = OPS_FILE_CHUNK_SIZE;
+        let (parallel_server, parallel_in_flight, parallel_max) = concurrency_probe_server(false);
+        let parallel_summary = apply_ops_file(
+            &parallel_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+        )
+        .await
+        .expect("the ordinary bounded-parallel batch must succeed");
+        assert_eq!(parallel_summary["succeeded"], op_count);
+        let observed_parallel_max = parallel_max.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed_parallel_max, 8,
+            "default dispatch must retain the server's bounded parallelism"
+        );
+        assert_eq!(
+            parallel_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let (serial_server, serial_in_flight, serial_max) = concurrency_probe_server(false);
+        let serial_summary = apply_ops_file_with_dispatch_mode(
+            &serial_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("serial dispatch must succeed");
+        assert_eq!(serial_summary["succeeded"], op_count);
+        assert_eq!(
+            serial_max.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "--serial must await every handler before starting the next"
+        );
+        assert_eq!(
+            serial_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_ops_file_succeeds_with_a_reader_that_refuses_overlap() {
+        let op_count = 4;
+        let (parallel_server, _, parallel_max) = concurrency_probe_server(true);
+        let parallel_summary = apply_ops_file(
+            &parallel_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+        )
+        .await
+        .expect("one parallel probe succeeds, so partial failure remains in-band");
+        assert_eq!(parallel_summary["succeeded"], 1);
+        assert_eq!(parallel_summary["failed"], op_count - 1);
+        assert_eq!(
+            parallel_max.load(std::sync::atomic::Ordering::SeqCst),
+            op_count
+        );
+        assert!(parallel_summary["failures"]
+            .as_array()
+            .expect("failure rows")
+            .iter()
+            .all(|failure| failure["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sql_bridge.reader_open")));
+
+        let (serial_server, _, serial_max) = concurrency_probe_server(true);
+        let serial_summary = apply_ops_file_with_dispatch_mode(
+            &serial_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("serial dispatch must avoid constrained-reader overlap");
+        assert_eq!(serial_summary["succeeded"], op_count);
+        assert_eq!(serial_summary["failed"], 0);
+        assert_eq!(serial_max.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn serial_ops_file_preserves_order_save_rows_and_strict_failure() {
+        let (server, _, max_in_flight) = concurrency_probe_server(false);
+        let mut ops = reader_probe_ops(3);
+        ops[1].args["fail"] = serde_json::json!(true);
+        let output_dir = tempfile::tempdir().expect("output dir");
+        let save_path = output_dir.path().join("serial-ordered.jsonl");
+
+        let error = apply_ops_file_with_dispatch_mode(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect_err("strict mode must report the middle handler failure");
+        assert!(error.to_string().contains("--strict"), "{error:#}");
+        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(save_path)
+            .expect("strict failure still publishes all confirmed ordered rows")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON result row"))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["tool"], "reader_probe");
+        assert_eq!(rows[0]["ok"], true);
+        assert_eq!(rows[0]["result"]["sequence"], 0);
+        assert_eq!(rows[1]["tool"], "reader_probe");
+        assert_eq!(rows[1]["ok"], false);
+        assert_eq!(rows[1]["reason"], "strict-op-failure");
+        assert_eq!(rows[2]["tool"], "reader_probe");
+        assert_eq!(rows[2]["ok"], true);
+        assert_eq!(rows[2]["result"]["sequence"], 2);
+    }
+
+    #[tokio::test]
+    async fn serial_dispatch_consumes_the_preflighted_stable_snapshot() {
+        use std::io::{Seek as _, Write as _};
+
+        let mut source = NamedTempFile::new().expect("ops source");
+        for sequence in 0..2 {
+            serde_json::to_writer(
+                source.as_file_mut(),
+                &serde_json::json!({
+                    "tool": "reader_probe",
+                    "args": {"sequence": sequence},
+                }),
+            )
+            .expect("write source op");
+            source.write_all(b"\n").expect("write newline");
+        }
+        let mut validated = validate_ops_file(source.path()).expect("preflight source");
+
+        source.as_file_mut().set_len(0).expect("truncate source");
+        source
+            .as_file_mut()
+            .rewind()
+            .expect("rewind replacement source");
+        source
+            .write_all(b"{malformed replacement\n")
+            .expect("replace source after preflight");
+        source.flush().expect("flush replacement");
+
+        let (server, _, max_in_flight) = concurrency_probe_server(false);
+        let summary = apply_ops_file_reader_with_dispatch_mode(
+            &server,
+            std::io::BufReader::new(&mut validated.snapshot),
+            validated.total,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("dispatch must consume the immutable validated snapshot");
+        assert_eq!(summary["total"], 2);
+        assert_eq!(summary["succeeded"], 2);
+        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn serial_typed_preflight_rejects_later_prev_before_first_write() {
+        use std::io::Write as _;
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let mut source = NamedTempFile::new().expect("ops source");
+        source
+            .write_all(
+                b"{\"tool\":\"create\",\"args\":{\"kind\":\"concept\",\"name\":\"must-not-land\"}}\n",
+            )
+            .expect("write valid first op");
+        source
+            .write_all(b"{\"tool\":\"stats\",\"args\":{\"probe\":\"$prev.id\"}}\n")
+            .expect("write typed-invalid later op");
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from(&db_path)),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            cfg,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(db_path.clone()),
+                anchor: Some(PathBuf::from(&db_path)),
+                config: Some(config_path),
+            },
+            true,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("later $prev must fail before the first serial handler starts");
+        assert!(error.to_string().contains("$prev"), "{error:#}");
+
+        let server = isolated_server(&db_path);
+        let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
+        assert_eq!(
+            response["results"][0]["result"],
+            serde_json::json!([]),
+            "whole-snapshot typed preflight must prevent the valid first write"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_whole_snapshot_preflight_does_not_change_default_chunk_commit_parity() {
+        use std::io::Write as _;
+
+        let mut source = NamedTempFile::new().expect("ops source");
+        for sequence in 0..OPS_FILE_CHUNK_SIZE {
+            serde_json::to_writer(
+                source.as_file_mut(),
+                &serde_json::json!({
+                    "tool": "create",
+                    "args": {
+                        "kind": "concept",
+                        "name": format!("default-first-chunk-{sequence}"),
+                    },
+                }),
+            )
+            .expect("write valid first-chunk op");
+            source.write_all(b"\n").expect("write newline");
+        }
+        source
+            .write_all(b"{\"tool\":\"stats\",\"args\":{\"probe\":\"$prev.id\"}}\n")
+            .expect("write typed-invalid second-chunk op");
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+
+        let default_db = NamedTempFile::new().expect("default db");
+        let default_db_path = default_db.path().to_str().expect("utf8").to_string();
+        let default_error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            RuntimeConfig {
+                db_path: Some(PathBuf::from(&default_db_path)),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            },
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(default_db_path.clone()),
+                anchor: Some(PathBuf::from(&default_db_path)),
+                config: Some(config_path.clone()),
+            },
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("default mode must reject the typed-invalid second chunk");
+        assert!(
+            default_error.to_string().contains("$prev"),
+            "{default_error:#}"
+        );
+        let default_server = isolated_server(&default_db_path);
+        let default_response =
+            dispatch_json(&default_server, r#"list(kind="concept", limit=200)"#).await;
+        assert_eq!(
+            default_response["results"][0]["result"]
+                .as_array()
+                .expect("default concept rows")
+                .len(),
+            OPS_FILE_CHUNK_SIZE,
+            "backward-compatible default mode must commit its first logical chunk"
+        );
+
+        let serial_db = NamedTempFile::new().expect("serial db");
+        let serial_db_path = serial_db.path().to_str().expect("utf8").to_string();
+        let serial_error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            RuntimeConfig {
+                db_path: Some(PathBuf::from(&serial_db_path)),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            },
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(serial_db_path.clone()),
+                anchor: Some(PathBuf::from(&serial_db_path)),
+                config: Some(config_path),
+            },
+            true,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("serial mode must reject the later invalid op before dispatch");
+        assert!(
+            serial_error.to_string().contains("$prev"),
+            "{serial_error:#}"
+        );
+        let serial_server = isolated_server(&serial_db_path);
+        let serial_response =
+            dispatch_json(&serial_server, r#"list(kind="concept", limit=200)"#).await;
+        assert_eq!(
+            serial_response["results"][0]["result"],
+            serde_json::json!([]),
+            "serial whole-snapshot preflight must reject before its first write"
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_single_ops_file_reaches_handler_validation() {
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_str().expect("utf8").to_string();
@@ -4962,6 +5715,7 @@ id = "lambda:fallback"
             None,
             true,
             ExecDbContext::default(),
+            false,
             false,
             None,
             false,
@@ -6915,6 +7669,7 @@ backend = "sessions"
             None,
             false,
             db_context(),
+            false,
             true,
             None,
             true,
@@ -6932,6 +7687,7 @@ backend = "sessions"
             Some(save_path.to_string_lossy().into_owned()),
             false,
             db_context(),
+            false,
             true,
             None,
             true,
@@ -7025,6 +7781,7 @@ backend = "sessions"
                 anchor: Some(PathBuf::from(&db_path)),
                 config: Some(config_path),
             },
+            false,
             true,
             None,
             true,
@@ -7074,6 +7831,7 @@ backend = "sessions"
                 anchor: Some(PathBuf::from(db_file.path())),
                 config: Some(config_path),
             },
+            false,
             true,
             Some(1),
             true,
