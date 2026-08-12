@@ -1,6 +1,6 @@
 //! Governed pairwise-preference feature, training, calibration, and FANN model contracts.
 //!
-//! `lattice-fann` 0.7.1's `BackpropTrainer` optimizes MSE.  This module therefore
+//! `lattice-fann` 0.9.0's `BackpropTrainer` optimizes MSE.  This module therefore
 //! fits the Bradley--Terry logistic objective directly in deterministic `f64`,
 //! then materializes the learned zero-intercept 10 -> 1 linear head as a FANN
 //! network.  FANN owns the persisted binary representation and every served
@@ -29,7 +29,7 @@ pub(crate) const RANDOMIZATION_REVISION: &str = "moodboard-side-v1";
 pub(crate) const PAIR_SPLIT_REVISION: &str = "moodboard-pair-split-v1";
 pub(crate) const TRAINING_REVISION: &str = "moodboard-logistic-bce-l2-v1";
 pub(crate) const MODEL_FAMILY: &str = "pairwise_zero_intercept_logistic";
-pub(crate) const FANN_CRATE_VERSION: &str = "0.7.1";
+pub(crate) const FANN_CRATE_VERSION: &str = "0.9.0";
 pub(crate) const FANN_FORMAT: &str = "FANN binary v1";
 
 pub(crate) const MIN_TRAIN_DECISIVE_GROUPS: usize = 64;
@@ -1675,7 +1675,12 @@ pub(crate) mod tests {
         let data = prepare_training_data(&sufficient_records(false), &scope).unwrap();
         let mut trained = train_model(&data, scope).unwrap();
         trained.bundle.fann.network_content_ref = "f".repeat(64);
+        assert_eq!(trained.bundle.fann.crate_version, "0.9.0");
         validate_loaded_bundle(&trained.bundle).unwrap();
+
+        let mut prior_fann_version = trained.bundle.clone();
+        prior_fann_version.fann.crate_version = "0.7.1".to_string();
+        assert!(validate_loaded_bundle(&prior_fann_version).is_err());
 
         let mut wrong_schema = trained.bundle.clone();
         wrong_schema.scope.feature_schema_id = "0".repeat(64);
