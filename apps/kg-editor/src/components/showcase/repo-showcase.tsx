@@ -33,6 +33,7 @@ import {
   OntologyLegend,
   RelationMark,
 } from "@/components/ontology-mark";
+import { settleGraphLayout } from "@/lib/graph-layout";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import type {
   RepoBundle,
@@ -218,31 +219,44 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
   const subtreePackages = subtreeId === graph.repository.id
     ? graph.packages.items
     : graph.packages.items.filter((item) => item.id === subtreeId);
-  const displayedPackages = subtreePackages.slice(0, 8);
+  // Sort by id before truncating so the displayed slice — and therefore the
+  // shared seeded layout fed by it — is independent of input array order
+  // (ADR-153 D4).
+  const displayedPackages = [...subtreePackages].sort((left, right) => left.id.localeCompare(right.id)).slice(0, 8);
   const selectablePackages = graph.packages.items.slice(0, UI_ROW_LIMIT);
   const displayedPackageIds = new Set(displayedPackages.map((item) => item.id));
   const subtreeModules = graph.modules.items.filter((item) => subtreeId === graph.repository.id || item.package_id === subtreeId);
-  const displayedModules = subtreeModules.filter((item) => displayedPackageIds.has(item.package_id)).slice(0, 42);
-  const packageIndex = new Map(displayedPackages.map((item, index) => [item.id, index]));
-  const positions = new Map<string, { x: number; y: number }>();
-  positions.set(graph.repository.id, { x: 50, y: 9 });
-  displayedPackages.forEach((item, index) => positions.set(item.id, {
-    x: ((index + 1) * 100) / (displayedPackages.length + 1),
-    y: 25,
-  }));
-  displayedModules.forEach((item) => {
-    const packagePosition = packageIndex.get(item.package_id) ?? 0;
-    const siblings = displayedModules.filter((candidate) => candidate.package_id === item.package_id);
-    const siblingIndex = siblings.findIndex((candidate) => candidate.id === item.id);
-    const baseX = ((packagePosition + 1) * 100) / (Math.max(displayedPackages.length, 1) + 1);
-    positions.set(item.id, {
-      x: Math.min(94, Math.max(6, baseX + ((siblingIndex % 3) - 1) * 7)),
-      y: Math.min(92, 46 + Math.floor(siblingIndex / 3) * 13),
-    });
-  });
-  const visibleIds = new Set(positions.keys());
+  const displayedModules = subtreeModules.filter((item) => displayedPackageIds.has(item.package_id))
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .slice(0, 42);
+  const visibleIds = new Set([
+    graph.repository.id,
+    ...displayedPackages.map((item) => item.id),
+    ...displayedModules.map((item) => item.id),
+  ]);
   const visibleEdges = graph.structure_edges.items.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
   const displayedEdges = visibleEdges.slice(0, UI_GRAPH_EDGE_LIMIT);
+  const layoutNodes = [
+    { id: graph.repository.id },
+    ...displayedPackages.map((item) => ({ id: item.id })),
+    ...displayedModules.map((item) => ({ id: item.id })),
+  ];
+  const layoutEdges = [
+    ...displayedPackages.map((item) => ({
+      id: `contains-${graph.repository.id}-${item.id}`,
+      source: graph.repository.id,
+      target: item.id,
+    })),
+    ...displayedModules.map((item) => ({
+      id: `contains-${item.package_id}-${item.id}`,
+      source: item.package_id,
+      target: item.id,
+    })),
+    ...displayedEdges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target })),
+  ];
+  const positions = new Map(
+    settleGraphLayout(layoutNodes, layoutEdges).map((node) => [node.id, { x: node.x, y: node.y }]),
+  );
   const degrees = new Map<string, number>();
   const fanIn = new Map<string, number>();
   const fanOut = new Map<string, number>();
@@ -355,7 +369,13 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
             </svg>
             <button
               className={`repo-graph-node ${selectedId === graph.repository.id ? "selected" : ""}`}
-              style={{ left: "50%", top: "9%", width: `${nodeWidth(graph.repository.id)}px`, ...kindHueStyle(entityLegendFor("project")) }}
+              data-node-id={graph.repository.id}
+              style={{
+                left: `${positions.get(graph.repository.id)!.x}%`,
+                top: `${positions.get(graph.repository.id)!.y}%`,
+                width: `${nodeWidth(graph.repository.id)}px`,
+                ...kindHueStyle(entityLegendFor("project")),
+              }}
               type="button"
               aria-pressed={selectedId === graph.repository.id}
               onClick={() => setSelectedId(graph.repository.id)}
@@ -366,7 +386,7 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
             {displayedPackages.map((item) => {
               const position = positions.get(item.id)!;
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
                   <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
                   <span>{labels.node_types.package}</span><strong>{item.name}</strong>
                 </button>
@@ -375,7 +395,7 @@ function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById
             {displayedModules.map((item) => {
               const position = positions.get(item.id)!;
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
                   <EntityKindMark className="repo-node-kind-icon" kind="concept" showLabel={false} />
                   <span>{labels.node_types.module}</span><strong>{item.module_path}</strong>
                 </button>

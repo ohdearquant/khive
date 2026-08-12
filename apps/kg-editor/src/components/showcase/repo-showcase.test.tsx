@@ -37,6 +37,39 @@ describe("repository showcase", () => {
     expect(container.querySelector("polygon.ontology-derived-glyph")).toBeInTheDocument();
   });
 
+  it("lays out the structure graph from the shared seeded layout, independent of input order", () => {
+    const bundle = golden();
+    const reversed = structuredClone(bundle);
+    reversed.graph.packages = {
+      ...reversed.graph.packages,
+      items: [...reversed.graph.packages.items].reverse(),
+    };
+    reversed.graph.modules = {
+      ...reversed.graph.modules,
+      items: [...reversed.graph.modules.items].reverse(),
+    };
+
+    function nodePositions(container: HTMLElement): Record<string, { left: string; top: string }> {
+      const positions: Record<string, { left: string; top: string }> = {};
+      for (const node of container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]")) {
+        const id = node.getAttribute("data-node-id")!;
+        positions[id] = { left: node.style.left, top: node.style.top };
+      }
+      return positions;
+    }
+
+    const forward = render(<RepoShowcase bundle={bundle} />);
+    const forwardPositions = nodePositions(forward.container);
+    expect(Object.keys(forwardPositions).length).toBeGreaterThan(0);
+    forward.unmount();
+
+    const backward = render(<RepoShowcase bundle={reversed} />);
+    const backwardPositions = nodePositions(backward.container);
+    backward.unmount();
+
+    expect(backwardPositions).toEqual(forwardPositions);
+  });
+
   it("navigates from a module to its precomputed commits and back to modules", async () => {
     const bundle = golden();
     const user = userEvent.setup();
@@ -168,5 +201,38 @@ describe("repository showcase", () => {
 
     expect(container.querySelectorAll(".repo-view-panel tbody tr")).toHaveLength(200);
     expect(Array.from(container.querySelectorAll(".repo-view-panel .repo-bounded.truncated")).some((node) => node.textContent?.includes(bundle.capability.labels.truncated))).toBe(true);
+  });
+
+  it("settles the structure graph without collapsing nodes onto a handful of shared coordinates", () => {
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const nodes = Array.from(container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]"));
+    expect(nodes).toHaveLength(51);
+
+    const coordinateCounts = new Map<string, number>();
+    for (const node of nodes) {
+      const key = `${node.style.left}|${node.style.top}`;
+      coordinateCounts.set(key, (coordinateCounts.get(key) ?? 0) + 1);
+    }
+
+    const overcrowded = Array.from(coordinateCounts.entries()).filter(([, count]) => count > 2);
+    expect(overcrowded).toEqual([]);
+  });
+
+  it("keeps every structure-graph card footprint inside a 300px mobile stage", () => {
+    const stageWidth = 300;
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const nodes = Array.from(container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]"));
+    expect(nodes).toHaveLength(51);
+
+    for (const node of nodes) {
+      const leftPercent = Number.parseFloat(node.style.left);
+      const widthPx = Number.parseFloat(node.style.width);
+      expect(Number.isNaN(leftPercent)).toBe(false);
+      expect(Number.isNaN(widthPx)).toBe(false);
+      const center = leftPercent / 100 * stageWidth;
+      const halfWidth = widthPx / 2;
+      expect(center - halfWidth).toBeGreaterThanOrEqual(0);
+      expect(center + halfWidth).toBeLessThanOrEqual(stageWidth);
+    }
   });
 });

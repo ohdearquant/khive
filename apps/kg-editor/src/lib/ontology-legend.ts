@@ -10,6 +10,8 @@ export const ENTITY_KINDS = [
   "resource",
 ] as const;
 
+export const GRAPH_LAYOUT_SEED = 0x4b48_4956;
+
 export const EDGE_RELATIONS = [
   "contains",
   "part_of",
