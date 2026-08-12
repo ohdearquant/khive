@@ -874,20 +874,20 @@ fn required_summary_count(parsed: &serde_json::Value, field: &str) -> Result<usi
 }
 
 fn classify_ordered_chunk(
-    chunk: &[OpsFileEntry],
+    expected_tools: &[String],
     results: &[serde_json::Value],
 ) -> Result<(usize, usize, usize)> {
-    if results.len() != chunk.len() {
+    if results.len() != expected_tools.len() {
         anyhow::bail!(
             "ordered chunk result count {} does not match input count {}",
             results.len(),
-            chunk.len()
+            expected_tools.len()
         );
     }
     let mut succeeded = 0_usize;
     let mut failed = 0_usize;
     let mut aborted = 0_usize;
-    for (index, (op, row)) in chunk.iter().zip(results).enumerate() {
+    for (index, (expected_tool, row)) in expected_tools.iter().zip(results).enumerate() {
         let object = row
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} is not a JSON object"))?;
@@ -895,10 +895,10 @@ fn classify_ordered_chunk(
             .get("tool")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} has no string tool"))?;
-        if returned_tool != op.tool {
+        if returned_tool != expected_tool {
             anyhow::bail!(
                 "dispatch result row {index} tool mismatch: expected {:?}, got {:?}",
-                op.tool,
+                expected_tool,
                 returned_tool
             );
         }
@@ -955,7 +955,7 @@ fn classify_ordered_chunk(
 }
 
 fn validate_ordered_chunk_envelope(
-    chunk: &[OpsFileEntry],
+    expected_tools: &[String],
     parsed: &serde_json::Value,
     chunk_number: usize,
 ) -> Result<(usize, usize, usize)> {
@@ -970,15 +970,15 @@ fn validate_ordered_chunk_envelope(
     let chunk_failed = required_summary_count(parsed, "failed")?;
     let chunk_aborted = required_summary_count(parsed, "aborted")?;
     let (derived_succeeded, derived_failed, derived_aborted) =
-        classify_ordered_chunk(chunk, results)?;
-    if chunk_total != chunk.len()
+        classify_ordered_chunk(expected_tools, results)?;
+    if chunk_total != expected_tools.len()
         || chunk_succeeded != derived_succeeded
         || chunk_failed != derived_failed
         || chunk_aborted != derived_aborted
     {
         anyhow::bail!(
             "dispatch chunk {chunk_number} summary disagrees with ordered rows: expected total {}, summary total {}, derived/summary succeeded {derived_succeeded}/{chunk_succeeded}, failed {derived_failed}/{chunk_failed}, aborted {derived_aborted}/{chunk_aborted}",
-            chunk.len(),
+            expected_tools.len(),
             chunk_total,
         );
     }
@@ -1169,32 +1169,34 @@ where
             }
             let applied_before = processed;
 
-            // Serialize the typed entries directly; avoid a second Value tree that
-            // would clone every base64 argument before producing the request text.
-            let batch_json = serde_json::to_string(&chunk).context("serialize chunk to JSON")?;
-
-            let params = RequestParams {
-                ops: batch_json,
-                presentation: presentation.clone(),
-                presentation_per_op: None,
-                save_to: None,
-                // Inline --save-file writes raw results before format rendering.
-                // Reproduce that lossless shape for the combined bulk save. The
-                // no-save path deliberately preserves its pre-PR behavior, which
-                // did not forward the CLI output-format override to each chunk.
-                format: if save_sink.is_some() {
-                    Some("json".to_string())
-                } else {
-                    None
-                },
-                format_per_op: None,
-                request_id: None,
-            };
+            let chunk_len = chunk.len();
+            let expected_tools: Vec<String> = chunk.iter().map(|op| op.tool.clone()).collect();
+            let typed_ops: Vec<khive_request::TypedJsonOp> = chunk
+                .into_iter()
+                .map(|op| {
+                    let serde_json::Value::Object(args) = op.args else {
+                        unreachable!("validated ops-file args are always JSON objects")
+                    };
+                    khive_request::TypedJsonOp {
+                        tool: op.tool,
+                        args,
+                    }
+                })
+                .collect();
 
             let chunk_number = chunk_idx + 1;
             dispatched_chunk = Some(chunk_number);
             let raw = server
-                .dispatch_request_local(params)
+                .dispatch_typed_json_batch_local_for_exec(
+                    typed_ops,
+                    presentation.clone(),
+                    // Inline --save-file writes raw results before format rendering.
+                    // Reproduce that lossless shape for the combined bulk save. The
+                    // no-save path deliberately preserves its pre-PR behavior, which
+                    // did not forward the CLI output-format override to each chunk.
+                    save_sink.is_some().then(|| "json".to_string()),
+                    strict,
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("dispatch chunk {chunk_number}: {e}"))?;
             let raw = response_transform(chunk_number, raw);
@@ -1203,7 +1205,7 @@ where
                 serde_json::from_str(&raw).context("parse dispatch result")?;
             annotate_and_emit_refusals(&mut parsed, strict);
             let (chunk_succeeded, chunk_failed, chunk_aborted) =
-                validate_ordered_chunk_envelope(&chunk, &parsed, chunk_number)?;
+                validate_ordered_chunk_envelope(&expected_tools, &parsed, chunk_number)?;
             let chunk_results = parsed["results"]
                 .as_array()
                 .expect("validated ordered results array");
@@ -1211,7 +1213,7 @@ where
             total_succeeded += chunk_succeeded;
             total_failed += chunk_failed;
             total_aborted += chunk_aborted;
-            confirmed_ops += chunk.len();
+            confirmed_ops += chunk_len;
             committed_chunks.push(chunk_number);
             dispatched_chunk = None;
 
@@ -1238,7 +1240,7 @@ where
                 }
             }
 
-            processed += chunk.len();
+            processed += chunk_len;
             let applied_now = processed;
             eprintln!(
                 "{}",
@@ -4076,19 +4078,10 @@ id = "lambda:fallback"
 
     #[test]
     fn ordered_chunk_contract_rejects_tool_or_summary_drift() {
-        let ops = vec![
-            OpsFileEntry {
-                tool: "first".to_string(),
-                args: serde_json::json!({}),
-            },
-            OpsFileEntry {
-                tool: "second".to_string(),
-                args: serde_json::json!({}),
-            },
-            OpsFileEntry {
-                tool: "third".to_string(),
-                args: serde_json::json!({}),
-            },
+        let tools = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
         ];
         let valid = serde_json::json!({
             "results": [
@@ -4100,18 +4093,18 @@ id = "lambda:fallback"
             "status":"partial"
         });
         assert_eq!(
-            validate_ordered_chunk_envelope(&ops, &valid, 1).unwrap(),
+            validate_ordered_chunk_envelope(&tools, &valid, 1).unwrap(),
             (1, 1, 1)
         );
 
         let mut wrong_tool = valid.clone();
         wrong_tool["results"][1]["tool"] = serde_json::json!("third");
-        assert!(validate_ordered_chunk_envelope(&ops, &wrong_tool, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &wrong_tool, 1).is_err());
 
         let mut lying_summary = valid;
         lying_summary["summary"]["succeeded"] = serde_json::json!(2);
         lying_summary["summary"]["failed"] = serde_json::json!(0);
-        assert!(validate_ordered_chunk_envelope(&ops, &lying_summary, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &lying_summary, 1).is_err());
 
         let mut missing_result = serde_json::json!({
             "results": [
@@ -4122,13 +4115,13 @@ id = "lambda:fallback"
             "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
             "status":"partial"
         });
-        assert!(validate_ordered_chunk_envelope(&ops, &missing_result, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &missing_result, 1).is_err());
         missing_result["results"][0]["result"] = serde_json::Value::Null;
         missing_result["results"][1]
             .as_object_mut()
             .unwrap()
             .remove("error");
-        assert!(validate_ordered_chunk_envelope(&ops, &missing_result, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &missing_result, 1).is_err());
 
         let mut contradictory = serde_json::json!({
             "results": [
@@ -4139,26 +4132,17 @@ id = "lambda:fallback"
             "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
             "status":"partial"
         });
-        assert!(validate_ordered_chunk_envelope(&ops, &contradictory, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &contradictory, 1).is_err());
         contradictory["results"][0]
             .as_object_mut()
             .unwrap()
             .remove("error");
-        assert!(validate_ordered_chunk_envelope(&ops, &contradictory, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &contradictory, 1).is_err());
     }
 
-    fn status_contract_fixture(status: &str) -> (Vec<OpsFileEntry>, serde_json::Value) {
+    fn status_contract_fixture(status: &str) -> (Vec<String>, serde_json::Value) {
         (
-            vec![
-                OpsFileEntry {
-                    tool: "first".to_string(),
-                    args: serde_json::json!({}),
-                },
-                OpsFileEntry {
-                    tool: "second".to_string(),
-                    args: serde_json::json!({}),
-                },
-            ],
+            vec!["first".to_string(), "second".to_string()],
             serde_json::json!({
                 "results": [
                     {"ok":true,"tool":"first","result":{}},
@@ -4237,6 +4221,136 @@ id = "lambda:fallback"
         assert_eq!(
             count, 3,
             "all 3 entities should be present after apply\nraw: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_single_ops_file_reaches_handler_validation() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let ops = vec![OpsFileEntry {
+            tool: "stats".to_string(),
+            args: serde_json::json!({
+                "payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1),
+            }),
+        }];
+        let mut observed_handler_error = false;
+
+        let error = apply_ops_file_with_response_transform(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            |_, raw| {
+                let response: serde_json::Value =
+                    serde_json::from_str(&raw).expect("handler response must be JSON");
+                assert_eq!(response["results"][0]["tool"], "stats");
+                assert_eq!(response["results"][0]["ok"], false);
+                assert!(
+                    response["results"][0]["error"]
+                        .to_string()
+                        .contains("payload"),
+                    "the oversized typed op must reach stats argument validation: {response}"
+                );
+                observed_handler_error = true;
+                raw
+            },
+        )
+        .await
+        .expect_err("the only op is intentionally invalid at the handler boundary");
+
+        assert!(
+            observed_handler_error,
+            "ops-file dispatch must not reapply the public 1 MiB raw-DSL limit"
+        );
+        assert!(error.to_string().contains("every op failed"));
+    }
+
+    #[tokio::test]
+    async fn oversized_multi_op_chunk_preserves_order_save_and_strict() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let payload = "x".repeat(600 * 1024);
+        let ops = vec![
+            OpsFileEntry {
+                tool: "create".to_string(),
+                args: serde_json::json!({
+                    "kind": "concept",
+                    "name": "oversized ordered success",
+                    "description": payload,
+                }),
+            },
+            OpsFileEntry {
+                tool: "stats".to_string(),
+                args: serde_json::json!({
+                    "payload": "y".repeat(600 * 1024),
+                }),
+            },
+        ];
+        let encoded_len = serde_json::to_vec(&ops).unwrap().len();
+        assert!(encoded_len > khive_request::MAX_OPS_INPUT_LEN);
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("oversized-ordered.jsonl");
+
+        let error = apply_ops_file(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .expect_err("strict mode must report the handler-level stats failure");
+
+        assert!(error.to_string().contains("--strict"), "{error:#}");
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&save_path)
+            .expect("strict failure still publishes the complete ordered result file")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["tool"], "create");
+        assert_eq!(rows[0]["ok"], true);
+        assert_eq!(rows[1]["tool"], "stats");
+        assert_eq!(rows[1]["ok"], false);
+        assert_eq!(rows[1]["reason"], "strict-op-failure");
+    }
+
+    #[tokio::test]
+    async fn public_dispatch_still_rejects_oversized_raw_ops() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let params = RequestParams {
+            ops: serde_json::json!({
+                "tool": "stats",
+                "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
+            })
+            .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+
+        let error = server
+            .dispatch_request_local(params)
+            .await
+            .expect_err("the raw request surface must retain its 1 MiB safety bound");
+        assert!(
+            error.to_string().contains("ops input is")
+                && error.to_string().contains(&format!(
+                    "max is {} bytes",
+                    khive_request::MAX_OPS_INPUT_LEN
+                )),
+            "unexpected public dispatch error: {error}"
         );
     }
 

@@ -692,3 +692,48 @@ The reindex stage remains best-effort as D3 already requires. Its failure means 
 index may need repair; it does not mean the source row update failed. Full success, pre-commit
 failure, and rollback envelopes are unchanged. This is a CLI-only additive contract and does not
 change the MCP `request` wire surface.
+
+---
+
+## Amendment 3 (2026-08-12) — endpoint-bounded typed dispatch for non-atomic ops-files
+
+The non-atomic ops-file path accepted endpoint-specific limits that were wider than the raw
+`request.ops` string boundary: 96 MiB per physical JSONL line, 512 MiB per file, 32 MiB per
+dispatch chunk, and 100 operations per chunk. After validating and decoding those JSONL rows, the
+implementation serialized each typed chunk back into a `RequestParams.ops` string and called
+`dispatch_request_local`. That redundant second parse incorrectly applied
+`MAX_OPS_INPUT_LEN` (1 MiB), so one valid large operation or multiple individually valid image
+operations could fail before any handler ran. The documented ops-file limits were therefore not
+an executable contract.
+
+**Decision:** a validated non-atomic ops-file chunk enters the existing MCP server dispatcher as
+an already-decoded typed JSON batch. The ops-file reader remains the only owner of the wider raw,
+line, file, chunk-byte, and operation-count limits. Before dispatch, the typed parser preserves
+the JSON batch's structural validation: non-empty and at most 100 operations, array/object nesting
+depth, no `$prev` anywhere in JSON values, and rejection of request-envelope fields inside verb
+arguments. The resulting `ParsedRequest` joins the same `run_parsed` path as string requests, so
+write-conflict handling, pack dispatch, identity and namespace attribution, gate/audit behavior,
+bounded concurrency, presentation, strict refusal annotation, output rendering, ordered rows,
+and save-file reconciliation do not fork.
+
+The raw serialized-body limit remains endpoint-class-specific. MCP, HTTP, daemon frames, inline
+`kkernel exec` strings, and every other untrusted string request continue to call
+`parse_request`, which rejects more than 1 MiB before expensive parsing. This amendment does not
+raise `MAX_OPS_INPUT_LEN`, add a larger public wire envelope, route bulk payloads through the
+daemon, or make the typed Rust API suitable for an unbounded caller. The additive
+`TypedJsonOp`/`parse_typed_json_batch` and local-exec server methods are narrow host APIs whose
+precondition is an independently byte-bounded trusted transport; they do not promise a stable
+remote protocol.
+
+Mutation-sensitive acceptance tests pin both sides of the boundary:
+
+- a single typed ops-file operation larger than 1 MiB reaches handler-level validation;
+- a multi-operation chunk larger than 1 MiB preserves ordered result rows, save publication, and
+  strict-failure classification;
+- the ordinary raw dispatch surface still rejects an operation string above 1 MiB; and
+- typed parsing preserves count, nesting, `$prev`, and reserved-envelope guards.
+
+Non-atomic output and commit semantics remain unchanged: operations are independent, chunk commits
+are incremental, and the legacy no-save summary plus save-file manifest contracts retain their
+existing shapes. Atomic ops-files continue through the separate ADR-099 prepare/apply runner and
+are unaffected by this amendment.

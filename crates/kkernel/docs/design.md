@@ -252,6 +252,17 @@ the wrong value would silently ignore an operator's in-memory isolation request.
 the canonical anchor captured alongside `cfg`, threaded through so fallback construction never
 re-reads a changed `HOME`.
 
+Non-atomic `--ops-file` chunks cross into that server through
+`dispatch_typed_json_batch_local_for_exec`. The JSONL reader has already enforced
+its 96 MiB line, 512 MiB file, 32 MiB chunk, and 100-op ceilings, so reserializing
+the decoded values and re-running the raw request parser would incorrectly apply
+the unrelated 1 MiB MCP/HTTP/daemon/inline-string cap a second time. The typed seam
+only replaces that redundant serialization/parse step: `parse_typed_json_batch`
+still enforces JSON-form nesting, `$prev`, reserved-envelope, and count rules, and
+the resulting `ParsedRequest` enters the same `run_parsed` identity, gate, audit,
+presentation, strict-refusal, rendering, and response-envelope pipeline. Public
+raw request paths continue to call `parse_request` and retain the 1 MiB limit.
+
 ### `exec` daemon-bypass second-writer contract (#548; ADR-067, ADR-099)
 
 **Decision:** keep `exec --save-file` and both `exec --ops-file` modes on the in-process path.

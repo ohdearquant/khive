@@ -30,7 +30,10 @@ use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
-use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, PrevFailure};
+use khive_request::{
+    parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, ParsedOp,
+    ParsedRequest, PrevFailure, TypedJsonOp,
+};
 use khive_runtime::{
     present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
     PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
@@ -2712,6 +2715,41 @@ impl KhiveMcpServer {
         .await
     }
 
+    /// Dispatch a bounded, already-decoded JSON batch for `kkernel exec --ops-file`.
+    ///
+    /// The ops-file reader owns its 96 MiB line, 512 MiB file, 32 MiB chunk,
+    /// and 100-op limits. This seam preserves JSON-form validation but avoids
+    /// serializing those typed values back into the public raw-DSL parser,
+    /// whose independent 1 MiB limit remains unchanged for MCP, HTTP, daemon,
+    /// inline exec, and every other string request surface.
+    pub async fn dispatch_typed_json_batch_local_for_exec(
+        &self,
+        ops: Vec<TypedJsonOp>,
+        presentation: Option<String>,
+        format: Option<String>,
+        strict_refusals: bool,
+    ) -> Result<String, McpError> {
+        let parsed = parse_typed_json_batch(ops).map_err(dsl_err_to_mcp)?;
+        let p = RequestParams {
+            ops: String::new(),
+            presentation,
+            presentation_per_op: None,
+            save_to: None,
+            format,
+            format_per_op: None,
+            request_id: None,
+        };
+        let dispatch = Box::pin(self.dispatch_parsed_request_inner_scoped(
+            p,
+            parsed,
+            false,
+            None,
+            DispatchOrigin::Local,
+            strict_refusals,
+        ));
+        khive_storage::scope_request_read_deadline(request_read_timeout(), dispatch).await
+    }
+
     /// Replay one stored public-surface request under a host-verified actor.
     ///
     /// An attributed actor must come from an out-of-band provenance check,
@@ -2813,6 +2851,27 @@ impl KhiveMcpServer {
         origin: DispatchOrigin,
         strict_refusals: bool,
     ) -> Result<String, McpError> {
+        let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        self.dispatch_parsed_request_inner_scoped(
+            p,
+            parsed,
+            from_wire,
+            identity,
+            origin,
+            strict_refusals,
+        )
+        .await
+    }
+
+    async fn dispatch_parsed_request_inner_scoped(
+        &self,
+        p: RequestParams,
+        parsed: ParsedRequest,
+        from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
+        origin: DispatchOrigin,
+        strict_refusals: bool,
+    ) -> Result<String, McpError> {
         let save_to = p.save_to.clone();
         let identity = identity.or_else(|| {
             p.request_id
@@ -2828,7 +2887,6 @@ impl KhiveMcpServer {
                     request_id: Some(request_id),
                 })
         });
-        let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
 
         // Parse presentation strings → PresentationMode.
         let presentation = parse_presentation_mode(p.presentation.as_deref())
@@ -3400,6 +3458,44 @@ mod tests {
         let parse_error = parse_request("stats(").expect_err("input must be malformed");
         let error = dsl_err_to_mcp(parse_error);
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["reason"].as_str()),
+            Some("parse-error")
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_dispatch_retains_raw_one_mib_input_limit() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let params = RequestParams {
+            ops: json!({
+                "tool": "stats",
+                "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
+            })
+            .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+
+        let error = server
+            .dispatch_request_wire(params)
+            .await
+            .expect_err("the public wire path must reject raw ops above 1 MiB");
+
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("ops input is"), "{error}");
         assert_eq!(
             error.data.as_ref().and_then(|data| data["reason"].as_str()),
             Some("parse-error")

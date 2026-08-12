@@ -5,8 +5,8 @@
 //! `src/conflict.rs` under `#[cfg(test)] mod tests`.
 
 use khive_request::{
-    parse_request, ArgValue, DslError, ExecutionMode, MAX_OPS, MAX_OPS_INPUT_LEN,
-    NESTING_DEPTH_LIMIT,
+    parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, TypedJsonOp, MAX_OPS,
+    MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT,
 };
 use serde_json::json;
 
@@ -1748,6 +1748,91 @@ fn oversized_ops_input_rejected_before_parsing() {
         ),
         "expected InputTooLarge, got {err:?}"
     );
+}
+
+#[test]
+fn typed_json_batch_uses_transport_bounds_instead_of_raw_dsl_cap() {
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "payload".to_string(),
+        json!("x".repeat(MAX_OPS_INPUT_LEN + 1)),
+    );
+
+    let parsed = parse_typed_json_batch(vec![TypedJsonOp {
+        tool: "blob.put".to_string(),
+        args,
+    }])
+    .expect("the bounded typed transport must not reapply the raw DSL byte cap");
+
+    assert_eq!(parsed.mode, ExecutionMode::Parallel);
+    assert_eq!(parsed.ops.len(), 1);
+    assert_eq!(parsed.ops[0].tool, "blob.put");
+    assert_eq!(
+        val(&parsed.ops[0].args["payload"]).as_str().unwrap().len(),
+        MAX_OPS_INPUT_LEN + 1
+    );
+}
+
+#[test]
+fn typed_json_batch_preserves_json_form_structural_guards() {
+    assert!(matches!(
+        parse_typed_json_batch(Vec::new()),
+        Err(DslError::EmptyBatch)
+    ));
+    let over_count = (0..=MAX_OPS)
+        .map(|index| TypedJsonOp {
+            tool: format!("probe_{index}"),
+            args: serde_json::Map::new(),
+        })
+        .collect();
+    assert!(matches!(
+        parse_typed_json_batch(over_count),
+        Err(DslError::TooManyOps { count, max }) if count == MAX_OPS + 1 && max == MAX_OPS
+    ));
+
+    let reserved = TypedJsonOp {
+        tool: "list".to_string(),
+        args: serde_json::Map::from_iter([
+            ("kind".to_string(), json!("concept")),
+            ("presentation".to_string(), json!("verbose")),
+        ]),
+    };
+    assert!(matches!(
+        parse_typed_json_batch(vec![reserved]),
+        Err(DslError::ReservedEnvelopeArg { arg_name, .. }) if arg_name == "presentation"
+    ));
+
+    let prev = TypedJsonOp {
+        tool: "get".to_string(),
+        args: serde_json::Map::from_iter([("id".to_string(), json!({"nested": "$prev.id"}))]),
+    };
+    assert!(matches!(
+        parse_typed_json_batch(vec![prev]),
+        Err(DslError::PrevRefInJsonForm { arg_name }) if arg_name == "id"
+    ));
+
+    let mut at_limit = json!(null);
+    for _ in 0..(NESTING_DEPTH_LIMIT - 3) {
+        at_limit = json!([at_limit]);
+    }
+    let at_limit = TypedJsonOp {
+        tool: "stats".to_string(),
+        args: serde_json::Map::from_iter([("payload".to_string(), at_limit)]),
+    };
+    assert!(parse_typed_json_batch(vec![at_limit]).is_ok());
+
+    let mut over_limit = json!(null);
+    for _ in 0..(NESTING_DEPTH_LIMIT - 2) {
+        over_limit = json!([over_limit]);
+    }
+    let over_limit = TypedJsonOp {
+        tool: "stats".to_string(),
+        args: serde_json::Map::from_iter([("payload".to_string(), over_limit)]),
+    };
+    assert!(matches!(
+        parse_typed_json_batch(vec![over_limit]),
+        Err(DslError::NestingTooDeep { max, .. }) if max == NESTING_DEPTH_LIMIT
+    ));
 }
 
 #[test]

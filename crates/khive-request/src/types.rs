@@ -386,6 +386,16 @@ pub struct ParsedRequest {
     pub mode: ExecutionMode,
 }
 
+/// One already-decoded JSON operation for a bounded trusted transport.
+///
+/// This type does not imply semantic validity. Pass it through
+/// [`crate::parse_typed_json_batch`] before dispatch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedJsonOp {
+    pub tool: String,
+    pub args: serde_json::Map<String, Value>,
+}
+
 /// Request syntax or preflight error surfaced as MCP `invalid_params`.
 ///
 /// No operation has executed when this error is returned. Resource, syntax,

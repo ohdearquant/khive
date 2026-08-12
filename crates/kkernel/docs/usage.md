@@ -94,6 +94,23 @@ response. Without `--strict`, a _partially_ failed request (`status: "partial"` 
 one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
 or aborted op into a nonzero process exit.
 
+### Bulk JSONL execution
+
+`kkernel exec --ops-file batch.jsonl` accepts one independent JSON operation per
+non-blank line: `{"tool":"verb","args":{...}}`. It validates the complete
+source before runtime construction, with a 96 MiB physical-line limit and a
+512 MiB file limit, then dispatches ordered chunks bounded to 100 operations and
+32 MiB. One operation larger than the chunk byte target runs alone, still under
+the physical-line and total-file ceilings.
+
+Validated chunks use the local typed JSON batch seam. They retain the same
+handler, identity, presentation, strict-refusal, audit, ordered-row, and output
+format pipeline as ordinary requests, without serializing the decoded values
+back through the raw request parser. This separation is intentional: MCP, HTTP,
+daemon, and inline `exec` strings retain their independent 1 MiB
+`MAX_OPS_INPUT_LEN` safety boundary. The ops-file limits are not a global limit
+increase.
+
 ### Stable refusal reasons
 
 Refused invocations retain their existing human-readable error and exit-code
