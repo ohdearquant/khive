@@ -6,7 +6,7 @@
 
 use khive_request::{
     parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, TypedJsonOp, MAX_OPS,
-    MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT,
+    MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, RESERVED_ENVELOPE_ARGS,
 };
 use serde_json::json;
 
@@ -1579,6 +1579,32 @@ fn non_reserved_presentation_like_arg_accepted() {
     assert_eq!(val(&r.ops[0].args["present"]), &json!("yes"));
 }
 
+#[test]
+fn preference_verbs_share_the_envelope_reserved_argument_contract() {
+    for verb in [
+        "moodboard.serve",
+        "moodboard.judge",
+        "moodboard.train_preference",
+        "moodboard.preference",
+    ] {
+        for argument in RESERVED_ENVELOPE_ARGS {
+            let error = parse_typed_json_batch(vec![TypedJsonOp {
+                tool: verb.to_string(),
+                args: serde_json::Map::from_iter([((*argument).to_string(), json!("verbose"))]),
+            }])
+            .expect_err("envelope-owned names must fail before every preference handler");
+            assert!(
+                matches!(
+                    error,
+                    DslError::ReservedEnvelopeArg { ref arg_name, verb: ref error_verb }
+                        if arg_name == argument && error_verb == verb
+                ),
+                "unexpected error for {verb}.{argument}: {error:?}"
+            );
+        }
+    }
+}
+
 /// RUNTIME-AUD-002 (#433): the JSON-form parser must preserve a present-but
 /// non-string `namespace` verbatim (as `ArgValue::Value`), never dropping or
 /// coercing it. This is the ingress link that carries the malformed value into
@@ -1801,6 +1827,20 @@ fn typed_json_batch_preserves_json_form_structural_guards() {
         parse_typed_json_batch(vec![reserved]),
         Err(DslError::ReservedEnvelopeArg { arg_name, .. }) if arg_name == "presentation"
     ));
+
+    let exposure = TypedJsonOp {
+        tool: "moodboard.serve".to_string(),
+        args: serde_json::Map::from_iter([(
+            "exposure".to_string(),
+            json!({"preference_probability_shown": false, "source_rank_shown": true}),
+        )]),
+    };
+    let parsed = parse_typed_json_batch(vec![exposure])
+        .expect("business exposure provenance must not collide with the request envelope");
+    assert_eq!(
+        val(&parsed.ops[0].args["exposure"])["source_rank_shown"],
+        true
+    );
 
     let prev = TypedJsonOp {
         tool: "get".to_string(),

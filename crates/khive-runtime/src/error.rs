@@ -313,6 +313,16 @@ pub enum RuntimeError {
         second_pack: String,
     },
 
+    /// A handler advertised a parameter that request parsing owns at the envelope level.
+    #[error(
+        "pack {pack:?} handler {verb:?} declares request-envelope parameter {param:?}; rename the verb argument"
+    )]
+    ReservedEnvelopeParam {
+        pack: String,
+        verb: String,
+        param: String,
+    },
+
     /// Gate denied this verb invocation.
     ///
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
@@ -466,6 +476,7 @@ impl RuntimeError {
             Self::CircularPackDependency(_) => "CircularPackDependency",
             Self::PackRedeclared { .. } => "PackRedeclared",
             Self::VerbCollision { .. } => "VerbCollision",
+            Self::ReservedEnvelopeParam { .. } => "ReservedEnvelopeParam",
             Self::PermissionDenied { .. } => "PermissionDenied",
             Self::Khive(_) => "Khive",
             Self::NamespaceMismatch { .. } => "NamespaceMismatch",
