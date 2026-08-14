@@ -161,6 +161,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-152](ADR-152-kg-editor-interaction-grammar.md)                     | kg-editor Interaction Grammar — Navigation, History, and Review Conversation                               |
 | [ADR-153](ADR-153-typed-graph-visual-encoding.md)                       | Typed Graph Visual Encoding                                                                                |
 | [ADR-154](ADR-154-sqlite-disk-reserve-admission.md)                     | SQLite Disk-Reserve Admission Before Logical Writes                                                        |
+| [ADR-155](ADR-155-pack-artifact-ingest-blobstore.md)                    | Pack Artifact Ingest over BlobStore                                                                        |
+| [ADR-156](ADR-156-named-vector-restart-durability.md)                   | Named-Vector Search Restart and Durability Semantics                                                       |
 
 <!-- END GENERATED ADR CATALOG -->
 
