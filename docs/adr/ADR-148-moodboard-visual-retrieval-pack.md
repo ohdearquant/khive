@@ -20,7 +20,7 @@ provider, while a visual descriptor must be derived from decoded raster bytes un
 explicit preprocessing contract. A separate application database would duplicate Khive's
 asset, provenance, namespace, and retrieval responsibilities.
 
-The Qwen3.5 pooled descriptor available in `lattice-embed` 0.8.0 is experimental retrieval
+The Qwen3.5 pooled descriptor available in `lattice-embed` 0.9.0 is experimental retrieval
 machinery. Its own contract says retrieval quality for the base instruct checkpoint is
 unvalidated. This pack must expose that machinery honestly, not market it as a state-of-the-art
 style model or collapse compatibility, cohesion, diversity, and uncertainty into one score.
@@ -65,7 +65,7 @@ Every response contains a nested `descriptor` object with this closed v1 shape:
   "model_name": "qwen3.5-vlm-pooled-visual",
   "model_revision": "<operator-pinned revision>",
   "checkpoint_sha256": "<64 lowercase hexadecimal characters>",
-  "inference": { "provider": "lattice-embed", "version": "0.8.0" },
+  "inference": { "provider": "lattice-embed", "version": "0.9.0" },
   "preprocessing": {
     "revision": "moodboard-qwen35-srgb-pad32-max448-v1",
     "max_side": 448,
@@ -109,8 +109,8 @@ paths, non-file entries, and more than 100000 files fail closed. This deliberate
 directory identity includes auxiliary files and layout as well as all configuration, tokenizer,
 manifest, and resolved weight bytes. A one-byte mutation cannot reuse the vector table identity.
 
-The published pack graph directly and exactly pins both `lattice-embed = "=0.8.0"` and its
-inference engine `lattice-inference = "=0.8.0"`, matching `inference.version`; a lock refresh cannot
+The published pack graph directly and exactly pins both `lattice-embed = "=0.9.0"` and its
+inference engine `lattice-inference = "=0.9.0"`, matching `inference.version`; a lock refresh cannot
 silently float the transitive math implementation under the same descriptor fingerprint.
 
 Each response also carries top-level `experimental: true`. Exact result shapes are:
@@ -332,26 +332,33 @@ and ignored real-checkpoint characterization tests. `KHIVE_MOODBOARD_MODEL_DIR` 
 expected attestation checked against the always-computed canonical digest.
 
 The load-free characterization successfully derived a 2048-dimensional descriptor from a local
-Qwen3.5-2B fixture. Inference did not start for that fixture because it contains a single
-`model.safetensors`, while `lattice-embed` 0.8.0 requires `model.safetensors.index.json` or
-`quantize_index.json` to locate `model.visual.*` tensors. This remains an explicit upstream
-checkpoint-layout friction ([lattice#1381](https://github.com/ohdearquant/lattice/issues/1381)).
+Qwen3.5-2B fixture. The historical 0.8.0 inference attempt did not start because that fixture
+contains a single `model.safetensors`, while that release required
+`model.safetensors.index.json` or `quantize_index.json` to locate `model.visual.*` tensors.
+`lattice-embed` 0.9.0 now supports the unindexed single-file layout; the upstream friction in
+[lattice#1381](https://github.com/ohdearquant/lattice/issues/1381) was resolved by the merged
+[lattice#1385](https://github.com/ohdearquant/lattice/pull/1385).
 
-The same ignored inference gate passed against the materialized indexed Qwen3.5-0.8B fixture with
-operator revision
-`hf-Qwen-Qwen3.5-0.8B-2fc06364715b967f1860aea9cf38778875588b17`. Published
-`lattice-embed` 0.8.0 produced a 1024-dimensional descriptor with checkpoint digest
+The same ignored inference gate historically passed with `lattice-embed` 0.8.0 against the
+materialized indexed Qwen3.5-0.8B fixture with operator revision
+`hf-Qwen-Qwen3.5-0.8B-2fc06364715b967f1860aea9cf38778875588b17`. That run produced a
+1024-dimensional descriptor with checkpoint digest
 `6dca0d0e661696b36985cbce8f89e1a91377822065de31eac94e90a0e45d43d3`, fingerprint
 `40be6f4ae97057e6a0b5c0d011db6e5a37f26c46b787df3e19ddf0fec1e3c9b9`, and model key
 `moodboard_40be6f4ae97057e6a0b5c0d011db6e5a37f26c46b787df3e19ddf0fec1e3c9b9_1024`.
+Under the current 0.9.0 contract, the unchanged checkpoint bytes map to fingerprint
+`bd91f5bf961eb429a6f57b6c16bafde9eeea249d799b1ff0d31e32cf05e5bc8f` and model key
+`moodboard_bd91f5bf961eb429a6f57b6c16bafde9eeea249d799b1ff0d31e32cf05e5bc8f_1024`; those values
+are descriptor-identity goldens, not evidence of a fresh real-checkpoint inference run.
 Before the private-snapshot hardening amendment, load-free descriptor discovery took 98,776 ms and
 cold load plus post-load verification took 297,380 ms; those timings are a historical direct-source
 baseline and do not include the new copy lifecycle. Three serialized inferences took 279,305 ms,
 294,164 ms, and 170,919 ms. The output L2 norm was
 `1.000000047`, repeat maximum coordinate delta `0`, and trailing-prompt maximum coordinate delta
-`0`. These timings characterize that contended local debug-build run, not a performance
-commitment. The result characterizes the pinned implementation and confirms the prompt-independent
-causal layout; it is not retrieval-quality evidence.
+`0`. These timings and numerical observations characterize that contended historical 0.8.0
+debug-build run, not the current 0.9.0 math or a performance commitment. They are not
+retrieval-quality evidence; the current inference identity requires a fresh characterization
+before equivalent numerical claims may be made for 0.9.0.
 
 ## References
 
