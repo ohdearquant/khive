@@ -442,11 +442,15 @@ fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
 
-In multi-backend mode a backend failure yields the successful hits from the
-remaining backends and adds `partial: true` plus `missing_backends` to that
-operation's request envelope. These fields sit beside `result` rather than
-inside the search result array, and remain present through presentation and
-response-frame compaction.
+In multi-backend mode a backend failure with surviving hits yields those hits
+with `status: "partial"`, deprecated `partial: true`, `missing_backends`, and a
+`backend_errors` object mapping each retained failed backend to its bounded,
+credential-masked backend id and cause. Masked backend ids use a stable hash
+suffix so distinct failed legs remain distinguishable. These fields sit beside `result` and survive
+presentation and response-frame compaction. If no hit survives filtering, the
+operation is `ok: false` with `error.kind="search_incomplete"`; the structured
+error carries the same diagnostics. `backend_errors_truncated` plus
+`backend_errors_omitted` explicitly report causes omitted by safety bounds.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
@@ -1795,17 +1799,25 @@ request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\
 
 ### `knowledge.import` — Commissive
 
-Ingest atlas markdown file(s) as atoms with parsed sections.
+Validate and ingest atlas markdown file(s) with stable root-relative identity.
 
-| Param            | Type   | Required | Notes                                                                         |
-| ---------------- | ------ | -------- | ----------------------------------------------------------------------------- |
-| `path`           | string | yes      | Filesystem path to a markdown file or directory.                              |
-| `format`         | string | no       | Only `atlas_md` supported (default).                                          |
-| `chunk_strategy` | string | no       | `section` (default, one section per atom) or `atom` (whole file as one atom). |
+| Param            | Type   | Required | Notes                                                                           |
+| ---------------- | ------ | -------- | ------------------------------------------------------------------------------- |
+| `path`           | string | yes      | Filesystem path to a `.md` file or bounded directory tree.                      |
+| `format`         | string | no       | Only `atlas_md` supported (default).                                            |
+| `chunk_strategy` | string | no       | `section` (atom plus section rows) or `atom` (whole markdown, no section rows). |
 
 ```
 request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
 ```
+
+Directory slugs use normalized root-relative components joined by `--`; source paths are
+retained in `properties.source_path`. Traversal and source validation complete before writes,
+normalization collisions fail closed, and symlinks are not followed. Root directory symlinks are
+rejected with or without a trailing separator. Entry, depth, and file-limit errors include the
+exact failing path plus current and configured traversal counts. Successful responses add
+`entries_visited`, `files_discovered`, `files_skipped`, `traversal_errors`, `sections_discovered`,
+and `sections_skipped` to the existing import counters.
 
 ### `knowledge.challenge` — Commissive
 
@@ -1965,8 +1977,10 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ## `git` pack — 4 verbs
 
-Git-history ingester plus a hardened write surface (ADR-088, ADR-088 Amendment 1,
-ADR-108). Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
+Git-history ingester plus a hardened write surface (ADR-088,
+[ADR-088 Amendment 1](../adr/ADR-088-amendment-1-git-digest.md),
+[ADR-088 Amendment 2](../adr/ADR-088-amendment-2-anchor-identity.md), ADR-108).
+Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
 `issue` / `pull_request` note kinds, used by `git.digest` below and by the `kkernel
 git-ingest` CLI (both drive the same underlying ingest core, so ingest enrichment —
 readable `name`s, `Closes #N` reference edges, parent→child commit `precedes` edges —
@@ -1981,12 +1995,12 @@ resolving or auto-creating the repo-anchor
 `project` entity. Bounded and cursor-resumable: call again with the same
 `source`/`project` while the response's `done` field is `false`.
 
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                         |
-| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
-| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                                                                                                            |
-| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                              |
-| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                 |
+| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                 |
+| ----------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected.         |
+| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolution is slug-first through `properties.repo_slug`, then exact and normalized `properties.repo_url` reconciliation; a new anchor is created only when no identity evidence matches. Names are never a match key. See `project_id` and `project_created`. |
+| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                                      |
+| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                         |
 
 ```
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")

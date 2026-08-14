@@ -16,7 +16,7 @@ compose/suggest, hooks, lint, export, and observability phases.
 | Section write-side embedding backfill                         | shipped  | `kkernel reindex` and `knowledge.edit` (inline atom-scoped re-embed) populate `knowledge_sections.embedding` via breadcrumb-enriched embed text (ADR-051 phase 1). Direct section-cosine scoring in `knowledge.search` and `knowledge.compose` is shipped (ADR-051 phase 2). Profile-weighted compose and the Vamana section ANN snapshot remain deferred. |
 | V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                                                                                                                                                             |
 | `knowledge.edit`                                              | shipped  | Upserts sections content-addressed by `content_hash`; identical content is idempotent, distinct content inserts a sibling row, and existing siblings (including verified ones) are left untouched.                                                                                                                                                         |
-| `knowledge.import`                                            | shipped  | Supports `atlas_md` files/directories with `chunk_strategy=section                                                                                                                                                                                                                                                                                         |
+| `knowledge.import`                                            | shipped  | Supports bounded, validate-first `atlas_md` file/directory import. Directory identities derive from root-relative paths; `section` creates section rows and `atom` preserves the whole markdown in one atom with no section rows.                                                                                                                          |
 | `knowledge.challenge` / `knowledge.adjudicate`                | shipped  | Challenge moves eligible sections to `disputed` and increments atom `dispute_count`; adjudicate requires disputed sections and resolves accept -> `verified`, reject -> `reviewed`.                                                                                                                                                                        |
 | Brain section posterior primitives                            | shipped  | Brain state, fold, feedback parsing, and `brain.create_profile(seed_priors.section_posteriors)` exist for section posteriors.                                                                                                                                                                                                                              |
 | `knowledge.suggest` / `knowledge.compose` profile weighting   | deferred | `suggest` is domain-oriented search with optional Vamana signal; `compose` uses explicit `domain_ids`/`atom_ids` and formats atom-body markdown. Neither resolves `brain` profiles or emits section-weighted manifests.                                                                                                                                    |
@@ -779,12 +779,14 @@ Two new verbs support corpus maintenance:
 knowledge.import(
   path="/path/to/atoms/",
   format="atlas_md",      # atlas markdown with ## section headers
-  chunk_strategy="section" # one section per chunk, or "atom" for whole-file
+  chunk_strategy="section" # atom plus section rows, or "atom" for byte-exact whole-file content
 )
 ```
 
-Parses markdown into section-typed atoms using the atlas header normalization map.
-Supports glob patterns for batch import.
+Parses markdown headings with the atlas section-type normalization map. The path is one `.md`
+file or a bounded directory tree; glob patterns are not part of the shipped wire contract.
+Directory atom identity derives from the root-relative file path as governed by the import
+integrity amendment below.
 
 **`knowledge.edit`** — agent-driven atom editing:
 
@@ -1354,6 +1356,56 @@ lattice-transport 0.2.5 to crates.io (currently only 0.2.1 published).
 | AND-composition of lint rules (Q7)        | Confirmed; auto-fix should NOT chain                                                     | No change           |
 | ESS cap as primary temporal strategy (Q1) | Confirmed but as approximation, not principled posterior; combine with BOCD in Phase 2-3 | Deferred            |
 | Binary feedback (Q9)                      | Under-specified; Dirichlet-tree recommended                                              | Deferred to Phase 3 |
+
+## Amendment: Import Integrity and Stable File Identity (2026-08-09)
+
+`knowledge.import` treats filesystem discovery and source parsing as a validate-first phase.
+Directory traversal is iterative and deterministic, does not follow symbolic links, and is
+bounded to 32 directory levels, 100,000 visited entries, and 10,000 markdown files. A symbolic
+link supplied as the root is rejected, including when the caller appends a trailing path
+separator; the root is rebuilt from lexical components before metadata inspection so the
+separator cannot cause the final directory symlink to be dereferenced. Descendant symbolic links,
+non-markdown files, and non-regular entries are skipped and reported. A directory-read,
+entry-inspection, depth, entry, file-count, source-read, identity, content-validation, or
+secret-scan failure aborts before the first atom write. Every depth, entry, or markdown-file limit
+failure names the exact path that crossed the bound and reports current and configured values for
+`depth`, `entries_visited`, and `files_discovered`; traversal failures are never silently
+flattened.
+
+For a directory import, an atom slug derives from the markdown file's path relative to the
+caller-supplied root. Each directory component and the filename stem use the existing lowercase
+ASCII slug normalization, and normalized components join with `--`; for example,
+`guides/retrieval/overview.md` becomes `guides--retrieval--overview`. A directly imported file
+retains its normalized filename-stem slug. The original root-relative path is stored as
+`properties.source_path` with `/` separators. `source_uri` remains `atlas:<id>` when an
+`atlas_id` is present and otherwise becomes `file:<source_path>`. If two source paths normalize
+to the same slug, the entire request is rejected before any write and the error names both paths.
+This deliberately replaces basename-only directory identity; previously collapsed nested files
+cannot be migrated automatically because their original path was not stored.
+
+The chunk strategies have distinct preservation contracts:
+
+- `section` creates one atom per file and eligible section rows. A section shorter than the
+  governed 80-character minimum is intentionally omitted and counted in `sections_skipped`.
+- `atom` stores the complete UTF-8 markdown document byte-for-byte as atom content, including
+  boundary whitespace, headings, and section bodies, and creates zero section rows. Parsed
+  headings count as discovered structure, not as skipped sections, because section-row creation
+  was not requested.
+
+Successful responses retain `imported_atoms`, `imported_sections`, and `files_processed` and add
+the following counters:
+
+| Counter               | Meaning                                                             |
+| --------------------- | ------------------------------------------------------------------- |
+| `entries_visited`     | Directory entries inspected, or 1 for a direct file                 |
+| `files_discovered`    | Regular `.md` files admitted to source preflight                    |
+| `files_skipped`       | Symbolic links, non-markdown files, and non-regular entries ignored |
+| `traversal_errors`    | Zero on success; any traversal error aborts the request             |
+| `sections_discovered` | Parsed `##` sections across admitted markdown files                 |
+| `sections_skipped`    | Sub-80-character sections omitted by the `section` strategy         |
+
+On a successful response, `files_processed` is the number of file-level atom upserts completed;
+it is no longer populated from discovery alone.
 
 ## References
 
