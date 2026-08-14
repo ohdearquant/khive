@@ -48,6 +48,10 @@ three schedule verbs remain available without `comm`.
 manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
 `findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
 path, not the MCP verb surface.
+That admin path is history-preserving: a deterministic entity, finding-note,
+or annotation-edge ID is skipped even when its row is soft-deleted, so neither
+real re-ingest nor `--dry-run` treats a tombstone as a new record or resurrects
+it.
 
 `blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
 `blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
@@ -154,6 +158,32 @@ its siblings (chain failures do abort the remainder of the chain):
 
 `aborted` counts ops skipped after an earlier failure in a `|` chain; it is always 0 for
 parallel batches, since parallel failures do not cascade.
+
+A successful entry can also carry a transport-owned `advisories` array beside `result`.
+These warnings describe execution context without changing the verb's canonical result or
+the batch summary. Presentation and output-format transforms apply only to `result`, and
+frame-budget degradation preserves advisories. For example, inspecting a read-only snapshot
+returns normal verb data while making the missing durable dispatch audit explicit:
+
+```json
+{
+  "ok": true,
+  "tool": "stats",
+  "result": { "entities": 42 },
+  "advisories": [
+    {
+      "code": "audit_persistence_skipped_read_only",
+      "severity": "warning",
+      "component": "audit_event_store",
+      "reason": "read_only_backend",
+      "message": "operation completed, but its dispatch audit event was not persisted because the audit backend is read-only"
+    }
+  ]
+}
+```
+
+That advisory appears on successful non-help operations only. Failed, aborted, and
+`help=true` entries do not claim that an audit write was skipped.
 
 ---
 
@@ -743,9 +773,9 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report writer-contention and WAL/checkpoint diagnostics for the main database: build identity,
-the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a
-WAL-pin holder census. Takes no parameters.
+Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
+database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
+sidecar file size, and a WAL-pin holder census. Takes no parameters.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
@@ -759,6 +789,12 @@ process-wide best-effort audit appends whose storage error was logged and swallo
 checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
 connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
 and reused across ticks) do not inflate the write-traffic acquisition total.
+
+`checkpoint_counters` reports checkpoint pressure without making its telemetry another source of
+WAL pressure. `checkpoint_pressure_elevated_ticks` and the episode start/recovery totals are
+in-memory observations; `checkpoint_lifecycle_append_attempts`, append failures, and handoff drops
+describe actual persistence work. The checkpoint task appends only episode elevation and recovery
+transitions, so sustained pressure does not produce one primary-store write per checkpoint tick.
 
 A finite-wait pooled checkout failure retains its compatibility display text in `message`, but
 the MCP error is a stable object rather than a string:
@@ -786,6 +822,16 @@ deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded
 `unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
 `unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
 holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are cleanup-enumeration
+measurements: this request deliberately does not run that mutating enumeration, so both fields are
+omitted rather than reporting fabricated `false`/`0` values.
+
+`graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
+`graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
+count is the legacy cross-namespace duplicate-ID state that can make a multi-namespace edge cursor
+walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
+intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
+live edge table. `graph_edge_integrity_error` explains a missing integrity section.
 Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
 explicit reasons rather than being silently omitted.
 
@@ -1511,11 +1557,11 @@ Time-triggered reminders and deferred verb dispatch. Optional; load with
 
 Create a time-triggered reminder.
 
-| Param     | Type   | Required | Notes                                                                                                                                            |
-| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `content` | string | yes      | Non-empty reminder message.                                                                                                                      |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                                                            |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, or a limited 5-field cron form using only `*` or one in-range integer per field (steps/ranges/lists not accepted). |
+| Param     | Type   | Required | Notes                                                                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
+| `content` | string | yes      | Non-empty reminder message.                                                                           |
+| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                 |
+| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`. Cron expressions are rejected because the executor cannot advance them. |
 
 ```
 request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
@@ -1527,7 +1573,7 @@ Schedule a future verb dispatch.
 
 | Param    | Type   | Required | Notes                                                               |
 | -------- | ------ | -------- | ------------------------------------------------------------------- |
-| `action` | string | yes      | Verb dispatch payload, e.g. `"schedule.remind(content=\"hello\")"`. |
+| `action` | string | yes      | One replayable verb call, e.g. `"gtd.assign(title=\"follow up\")"`. |
 | `at`     | string | yes      | RFC 3339 trigger time.                                              |
 | `repeat` | string | no       | Same recurrence grammar as `schedule.remind`.                       |
 
@@ -2068,10 +2114,10 @@ request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.p
 
 ## `code` pack — 1 verb
 
-Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Optional; load
-with `KHIVE_PACKS=kg,code`. Also registers the `finding` note kind used by the
-`kkernel code-ingest` admin CLI's `findings.json` batch ingest (not reachable via this
-MCP verb surface).
+Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Loaded by default;
+set `KHIVE_PACKS=kg,code` to select only the base and code packs. Also registers the
+`finding` note kind used by the `kkernel code-ingest` admin CLI's `findings.json` batch
+ingest (not reachable via this MCP verb surface).
 
 ### `code.ingest` — Commissive
 
@@ -2089,15 +2135,19 @@ becomes known.
 | ----------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `path`      | string          | yes      | Folder to ingest — a monorepo subtree (a single crate/package) is first-class, not a special case of whole-repo ingest.                                                                                                                      |
 | `db`        | string          | no       | Target map database path. Defaults to `<path>/.khive/code-map.db`. The shared production database — its default `$HOME/.khive/khive.db` location and the calling server's actual configured database — is always rejected, with no override. |
-| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Defaults to all three (auto-detected from manifests found under `path`).                                                                                                  |
+| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Omission accepts all three; the success report lists only languages observed under `path`.                                                                                |
+| `tiers`     | array\<string\> | no       | Select any of `l1` \| `l1.5` \| `l2`. Defaults to L1 and L1.5; L2 is opt-in and currently scans Rust sources only.                                                                                                                           |
 
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
 
-The success report includes `fts_indexed`, the number of entity documents written to the map's
-full-text index. Entity and FTS writes are a single success postcondition for this verb: an FTS
-failure makes the ingest fail rather than returning a structurally populated but unsearchable map.
+The argument object is closed: unknown names are rejected before filesystem or database access.
+The success report's sorted `languages` array describes languages observed by a selected tier,
+rather than echoing the caller's filter. It also includes `fts_indexed`, the number of entity
+documents written to the map's full-text index. Entity and FTS writes are a single success
+postcondition for this verb: an FTS failure makes the ingest fail rather than returning a
+structurally populated but unsearchable map.
 
 The map database uses the ordinary khive schema. To explore it with the generic KG read verbs,
 select it as a backend in a dedicated config:

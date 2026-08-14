@@ -41,6 +41,10 @@ use crate::validation::ValidationRule;
 /// [`VerbRegistry::pack_owned_note_kinds`].
 pub const GENERIC_CRUD_PACK: &str = "kg";
 
+/// Stable advisory code emitted when a successful inspection cannot persist
+/// its dispatch audit because the configured audit backend is read-only.
+pub const AUDIT_PERSISTENCE_SKIPPED_READ_ONLY: &str = "audit_persistence_skipped_read_only";
+
 const FULL_UUID_IDENTIFIER_HELP: &str = "A complete UUID spelling accepted by the consuming \
     parameter directly names one globally unique record; direct UUID lookup is not a namespace \
     search. Strict identifier responses use canonical lowercase dashed UUIDs.";
@@ -460,6 +464,9 @@ pub struct VerbRegistryBuilder {
     /// registry does not depend on the full `KhiveRuntime` surface — only the
     /// audit-persistence capability is needed here.
     event_store: Option<Arc<dyn EventStore>>,
+    /// The configured audit backend is intentionally read-only, so dispatch
+    /// omits the known-failing append and the transport surfaces an advisory.
+    audit_store_read_only: bool,
     /// Optional post-dispatch hook.
     ///
     /// When set, every successful pack dispatch calls `hook.on_dispatch(view)`
@@ -479,6 +486,7 @@ impl VerbRegistryBuilder {
             visible_namespaces: vec![],
             actor_id: None,
             event_store: None,
+            audit_store_read_only: false,
             dispatch_hook: None,
         }
     }
@@ -568,6 +576,18 @@ impl VerbRegistryBuilder {
     /// a durable receipt and therefore fails safely when no store is configured.
     pub fn with_event_store(&mut self, store: Arc<dyn EventStore>) -> &mut Self {
         self.event_store = Some(store);
+        self.audit_store_read_only = false;
+        self
+    }
+
+    /// Mark audit persistence unavailable because its backend is read-only.
+    ///
+    /// No `EventStore` is retained, so dispatch never attempts a write that is
+    /// known to fail. Successful request entries expose a machine-readable
+    /// advisory without changing their canonical verb result shape.
+    pub fn with_read_only_audit_store(&mut self) -> &mut Self {
+        self.event_store = None;
+        self.audit_store_read_only = true;
         self
     }
 
@@ -688,6 +708,7 @@ impl VerbRegistryBuilder {
             visible_namespaces: self.visible_namespaces,
             actor_id: self.actor_id,
             event_store: self.event_store,
+            audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
@@ -867,6 +888,9 @@ pub struct VerbRegistry {
     actor_id: Option<String>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
+    /// Distinguishes ordinary tracing-only construction from a sink omitted
+    /// deliberately because its configured backend is read-only.
+    audit_store_read_only: bool,
     /// Post-dispatch hook: `None` means no real-time observation.
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
     /// Names of all `Visibility::Verb` handlers across all packs, precomputed
@@ -1197,10 +1221,28 @@ impl VerbRegistry {
     /// `dispatch` (e.g. the email channel poll loop) append best-effort
     /// lifecycle events to the same sink gate-check audit rows use, without
     /// threading a second `Option<Arc<dyn EventStore>>` field through every
-    /// caller. `None` means tracing-only, matching the registry's own
-    /// audit-persistence default.
+    /// caller. `None` means either the historical tracing-only default or an
+    /// intentionally read-only audit backend; callers that need to distinguish
+    /// those cases use [`Self::audit_persistence_advisory`].
     pub fn event_store(&self) -> Option<Arc<dyn EventStore>> {
         self.event_store.clone()
+    }
+
+    /// Advisory for a dispatch whose configured audit sink is read-only.
+    ///
+    /// The MCP transport places this beside successful per-operation results;
+    /// `None` means audit persistence is configured normally or was never
+    /// configured at all.
+    pub fn audit_persistence_advisory(&self) -> Option<Value> {
+        self.audit_store_read_only.then(|| {
+            serde_json::json!({
+                "code": AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
+                "severity": "warning",
+                "component": "audit_event_store",
+                "reason": "read_only_backend",
+                "message": "operation completed, but its dispatch audit event was not persisted because the audit backend is read-only",
+            })
+        })
     }
 
     /// Return the help schema envelope for a verb.
@@ -1612,7 +1654,12 @@ impl VerbRegistry {
                 // dispatch happens to observe the queue non-empty first:
                 // an accepted provenance quirk, preferred over threading an
                 // `EventStore` handle into every synchronous
-                // `OnceLock::get_or_init` call site.
+                // `OnceLock::get_or_init` call site. The verb column is NOT
+                // inherited from that bystander dispatch: a config-lock row
+                // wearing an operation verb pollutes verb-filtered queries
+                // (e.g. per-verb receipt counts), so these rows carry their
+                // own `config.lock` pseudo-verb and remain discoverable by
+                // `EventKind::ConfigLocked`.
                 if let Some(store) = &self.event_store {
                     if crate::config_ledger::PENDING
                         .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -1621,13 +1668,14 @@ impl VerbRegistry {
                             let payload = serde_json::json!({ "key": key, "value": value });
                             let storage_event = Event::new(
                                 gate_req.namespace.as_str(),
-                                verb,
+                                "config.lock",
                                 EventKind::ConfigLocked,
                                 SubstrateKind::Event,
                                 format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                             )
                             .with_payload(payload);
-                            append_audit_event_best_effort(store, storage_event, verb).await;
+                            append_audit_event_best_effort(store, storage_event, "config.lock")
+                                .await;
                         }
                     }
                 }
@@ -2528,6 +2576,12 @@ impl VerbRegistry {
     /// rest from loading. Callers that need hard-failure semantics should call
     /// `all_schema_plans()` and apply each plan individually.
     pub fn apply_schema_plans(&self, backend: &khive_db::StorageBackend) {
+        if backend.is_read_only() {
+            tracing::info!(
+                "skipping pack schema plans because the backend is read-only; snapshot schema is used as-is"
+            );
+            return;
+        }
         for plan in self.all_schema_plans() {
             if plan.is_empty() {
                 continue;
@@ -2606,6 +2660,14 @@ impl VerbRegistry {
                         }
                     }
                 }
+            }
+
+            if backend.is_read_only() {
+                tracing::info!(
+                    pack = pack_name,
+                    "skipping pack schema plan because its assigned backend is read-only"
+                );
+                continue;
             }
 
             backend
@@ -3148,7 +3210,7 @@ pub fn json_type_name(v: &Value) -> &'static str {
 // require pub-exporting registry internals. Broad behavioral dispatch tests
 // live in tests/integration.rs.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ActorRef;
     use khive_types::Pack;
@@ -4473,6 +4535,8 @@ mod tests {
     struct CapturedEvent {
         message: Option<String>,
         audit_event: Option<String>,
+        into_id: Option<String>,
+        budget_rows: Option<u64>,
     }
 
     #[derive(Default)]
@@ -4501,7 +4565,14 @@ mod tests {
             match field.name() {
                 "message" => self.0.message = Some(cleaned),
                 "audit_event" => self.0.audit_event = Some(cleaned),
+                "into_id" => self.0.into_id = Some(cleaned),
                 _ => {}
+            }
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "budget_rows" {
+                self.0.budget_rows = Some(value);
             }
         }
     }
@@ -4540,7 +4611,23 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             let mut visitor = CapturedEventVisitor::default();
             event.record(&mut visitor);
-            self.events.lock().unwrap().push(visitor.0);
+            let captured = visitor.0;
+            // Tee the post-commit budget logs into their own append-only sink:
+            // `capture_dispatch_events` clears the main buffer, so a reader of
+            // budget events sharing that buffer would race the clear.
+            if let (Some(message), Some(into_id)) = (&captured.message, &captured.into_id) {
+                if message.ends_with("transaction materialization budget") {
+                    budget_events_sink()
+                        .lock()
+                        .unwrap()
+                        .push(CapturedBudgetLog {
+                            message: message.clone(),
+                            into_id: into_id.clone(),
+                            budget_rows: captured.budget_rows.unwrap_or(0),
+                        });
+                }
+            }
+            self.events.lock().unwrap().push(captured);
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
@@ -4557,6 +4644,32 @@ mod tests {
     /// runs at a time. The buffer is cleared at the start of each capture call.
     static GLOBAL_CAPTURE: OnceLock<Arc<StdMutex<Vec<CapturedEvent>>>> = OnceLock::new();
     static GLOBAL_INIT: Once = Once::new();
+
+    /// One captured post-commit budget log (curation merge tests).
+    #[derive(Clone)]
+    pub(crate) struct CapturedBudgetLog {
+        pub(crate) message: String,
+        pub(crate) into_id: String,
+        pub(crate) budget_rows: u64,
+    }
+
+    /// Append-only sink the subscriber tees budget logs into. Never cleared:
+    /// curation tests select their own rows by `into_id`, so stale rows from
+    /// other tests are inert rather than a pollution hazard.
+    static BUDGET_EVENTS: OnceLock<Arc<StdMutex<Vec<CapturedBudgetLog>>>> = OnceLock::new();
+
+    fn budget_events_sink() -> Arc<StdMutex<Vec<CapturedBudgetLog>>> {
+        Arc::clone(BUDGET_EVENTS.get_or_init(|| Arc::new(StdMutex::new(Vec::new()))))
+    }
+
+    /// Entry point for the curation merge tests: installs the process-global
+    /// capture subscriber (once for the whole test binary — a second
+    /// `set_global_default` elsewhere would starve one of the captures) and
+    /// returns the budget-log sink it tees into.
+    pub(crate) fn budget_log_events() -> Arc<StdMutex<Vec<CapturedBudgetLog>>> {
+        let _ = global_capture();
+        budget_events_sink()
+    }
 
     fn global_capture() -> Arc<StdMutex<Vec<CapturedEvent>>> {
         GLOBAL_INIT.call_once(|| {
@@ -5208,6 +5321,129 @@ mod tests {
             invoked.load(Ordering::SeqCst),
             0,
             "pack dispatch MUST NOT be invoked when gate denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_denial_precedes_id_existence_resolution() {
+        #[derive(Debug)]
+        struct AlwaysDenyUpdateGate {
+            checked: Arc<AtomicUsize>,
+        }
+        impl Gate for AlwaysDenyUpdateGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                self.checked.fetch_add(1, Ordering::SeqCst);
+                Ok(GateDecision::deny("caller has no update capability"))
+            }
+        }
+
+        #[derive(Debug)]
+        struct ExistenceOracleUpdatePack {
+            existing_id: String,
+            invoked: Arc<AtomicUsize>,
+        }
+
+        impl khive_types::Pack for ExistenceOracleUpdatePack {
+            const NAME: &'static str = "existence_oracle";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+                name: "update",
+                description: "distinguish a present id from an absent id",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Declaration,
+                params: &[],
+            }];
+        }
+
+        #[async_trait]
+        impl PackRuntime for ExistenceOracleUpdatePack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                self.invoked.fetch_add(1, Ordering::SeqCst);
+                match params.get("id").and_then(Value::as_str) {
+                    Some(id) if id == self.existing_id => Ok(serde_json::json!({"updated": id})),
+                    _ => Err(RuntimeError::NotFound("record".to_string())),
+                }
+            }
+        }
+
+        let existing_id = uuid::Uuid::new_v4().to_string();
+        let absent_id = uuid::Uuid::new_v4().to_string();
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let checked = Arc::new(AtomicUsize::new(0));
+
+        let pack = || ExistenceOracleUpdatePack {
+            existing_id: existing_id.clone(),
+            invoked: Arc::clone(&invoked),
+        };
+
+        let mut control_builder = VerbRegistryBuilder::new();
+        control_builder.register(pack());
+        let control = control_builder.build().expect("control registry builds");
+        control
+            .dispatch("update", serde_json::json!({"id": existing_id.clone()}))
+            .await
+            .expect("positive control resolves the present id");
+        assert!(matches!(
+            control
+                .dispatch("update", serde_json::json!({"id": absent_id.clone()}))
+                .await,
+            Err(RuntimeError::NotFound(_))
+        ));
+        assert_eq!(invoked.load(Ordering::SeqCst), 2);
+
+        let mut denied_builder = VerbRegistryBuilder::new();
+        denied_builder.register(pack());
+        denied_builder.with_gate(Arc::new(AlwaysDenyUpdateGate {
+            checked: Arc::clone(&checked),
+        }));
+        let denied = denied_builder.build().expect("denied registry builds");
+
+        let present_error = denied
+            .dispatch("update", serde_json::json!({"id": existing_id.clone()}))
+            .await
+            .expect_err("denied present-id update must not resolve the id");
+        let absent_error = denied
+            .dispatch("update", serde_json::json!({"id": absent_id.clone()}))
+            .await
+            .expect_err("denied absent-id update must not resolve the id");
+
+        let denial = |error: RuntimeError| match error {
+            RuntimeError::PermissionDenied { verb, reason } => (verb, reason),
+            other => panic!("expected gate refusal, got {other:?}"),
+        };
+        let present_denial = denial(present_error);
+        let absent_denial = denial(absent_error);
+        assert_eq!(present_denial.0, "update");
+        assert_eq!(present_denial.1, "caller has no update capability");
+        assert_eq!(present_denial, absent_denial);
+        assert_eq!(
+            checked.load(Ordering::SeqCst),
+            2,
+            "both denied requests must consult the configured gate"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            2,
+            "neither denied request may reach the existence oracle"
         );
     }
 
@@ -8305,6 +8541,70 @@ mod help_tests {
         assert!(
             msg.contains("collision_table"),
             "collision error must name the table; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_schema_plans_with_map_read_only_collision_is_an_error_without_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("read_only_schema_collision.db");
+        {
+            let writable = khive_db::StorageBackend::sqlite(&path).expect("writable backend");
+            writable.prepare_core_schema().expect("current schema");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+        let backend = khive_db::StorageBackend::sqlite_read_only(&path).expect("read-only backend");
+        let empty_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_alpha",
+            statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "pack_beta",
+            statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+        }));
+        let registry = builder.build().expect("registry builds");
+        let writes_before = backend.pool().writer_acquisition_snapshot();
+
+        let result = registry.apply_schema_plans_with_map(&empty_map, &backend);
+
+        let err = result.expect_err(
+            "read-only topology must reject the same cross-pack collision as writable topology",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pack_alpha"),
+            "collision error must name first pack; got: {msg}"
+        );
+        assert!(
+            msg.contains("pack_beta"),
+            "collision error must name second pack; got: {msg}"
+        );
+        assert!(
+            msg.contains("collision_table"),
+            "collision error must name the table; got: {msg}"
+        );
+        assert_eq!(
+            backend.pool().writer_acquisition_snapshot(),
+            writes_before,
+            "read-only collision validation must not acquire a writer"
         );
     }
 }

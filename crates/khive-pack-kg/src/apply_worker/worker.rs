@@ -42,6 +42,36 @@ pub(super) enum PendingCreatedRecord {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ReconciliationStage {
+    PostCommitReindex,
+    CreatedRecordResolution,
+}
+
+impl ReconciliationStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PostCommitReindex => "post_commit_reindex",
+            Self::CreatedRecordResolution => "created_record_resolution",
+        }
+    }
+}
+
+enum ApplyChangesetOutcome {
+    Applied {
+        created_records: Vec<Uuid>,
+        embedding_truncation: EmbeddingTruncationReport,
+    },
+    /// Base DML is durable, but the worker cannot safely publish success yet.
+    /// Keeping the proposal in `applying` makes repeated worker invocations a
+    /// no-op and leaves a stable operator-reconciliation state.
+    CommittedNeedsReconciliation {
+        stage: ReconciliationStage,
+        error: RuntimeError,
+        embedding_truncation: EmbeddingTruncationReport,
+    },
+}
+
 /// Worker that applies approved proposal changesets.
 pub struct ProposalApplyWorker {
     pub(crate) runtime: KhiveRuntime,
@@ -58,7 +88,9 @@ impl ProposalApplyWorker {
         }
     }
 
-    /// Check approval threshold; apply changeset if met. Errors emit `ProposalApplied { Failed }`.
+    /// Check approval threshold; apply changeset if met. Failures known to be
+    /// pre-commit emit `ProposalApplied { Failed }`; post-commit failures leave
+    /// the proposal in `applying` for reconciliation and are never replayed.
     pub async fn maybe_apply(
         &self,
         token: &NamespaceToken,
@@ -148,13 +180,32 @@ impl ProposalApplyWorker {
             .await;
 
         let embedding_truncation = match apply_result {
-            Ok((created_records, embedding_truncation)) => {
+            Ok(ApplyChangesetOutcome::Applied {
+                created_records,
+                embedding_truncation,
+            }) => {
                 let created_ids: Vec<Id128> = created_records
                     .iter()
                     .map(|id| Id128::from_u128(id.as_u128()))
                     .collect();
                 self.finalize_apply_success(token, proposal_id, created_ids)
                     .await;
+                embedding_truncation
+            }
+            Ok(ApplyChangesetOutcome::CommittedNeedsReconciliation {
+                stage,
+                error,
+                embedding_truncation,
+            }) => {
+                tracing::error!(
+                    proposal_id = %proposal_id,
+                    stage = stage.as_str(),
+                    error = %error,
+                    committed = true,
+                    retryable = false,
+                    "ProposalApplyWorker: proposal changeset committed but post-commit work \
+                     failed; leaving projection in 'applying' for operator reconciliation"
+                );
                 embedding_truncation
             }
             Err(e) => {
@@ -218,13 +269,17 @@ impl ProposalApplyWorker {
         Ok(payload.changeset)
     }
 
+    /// Apply one prepared changeset. `Err` is reserved for failures before a
+    /// durable atomic outcome is observed. Once the atomic runner reports
+    /// `Committed`, every later failure is returned as
+    /// `CommittedNeedsReconciliation` so the caller cannot emit Failed/revert.
     async fn apply_changeset(
         &self,
         token: &NamespaceToken,
         changeset: &ProposalChangeset,
         registry: &VerbRegistry,
         budget: &mut WriteBudget,
-    ) -> Result<(Vec<Uuid>, EmbeddingTruncationReport), RuntimeError> {
+    ) -> Result<ApplyChangesetOutcome, RuntimeError> {
         match self
             .prepare_changeset(token, changeset, registry, budget)
             .await?
@@ -238,19 +293,37 @@ impl ProposalApplyWorker {
                     .map_err(|error| RuntimeError::Storage(error.0))?;
                 match outcome {
                     AtomicRunOutcome::Committed { post_commit } => {
-                        let outcomes = apply_post_commit_effects_with_report(
+                        let outcomes = match apply_post_commit_effects_with_report(
                             &self.runtime,
                             token,
                             post_commit,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(outcomes) => outcomes,
+                            Err(error) => {
+                                return Ok(ApplyChangesetOutcome::CommittedNeedsReconciliation {
+                                    stage: ReconciliationStage::PostCommitReindex,
+                                    error,
+                                    embedding_truncation: EmbeddingTruncationReport::default(),
+                                });
+                            }
+                        };
                         let mut embedding_truncation = EmbeddingTruncationReport::default();
                         for outcome in outcomes {
                             embedding_truncation.merge(outcome.truncation);
                         }
-                        let created_records =
-                            self.resolve_created_records(token, created_records).await?;
-                        Ok((created_records, embedding_truncation))
+                        match self.resolve_created_records(token, created_records).await {
+                            Ok(created_records) => Ok(ApplyChangesetOutcome::Applied {
+                                created_records,
+                                embedding_truncation,
+                            }),
+                            Err(error) => Ok(ApplyChangesetOutcome::CommittedNeedsReconciliation {
+                                stage: ReconciliationStage::CreatedRecordResolution,
+                                error,
+                                embedding_truncation,
+                            }),
+                        }
                     }
                     AtomicRunOutcome::RolledBack {
                         failed_op_index,
@@ -272,7 +345,10 @@ impl ProposalApplyWorker {
                         false,
                     )
                     .await?;
-                Ok((vec![], summary.embedding_truncation))
+                Ok(ApplyChangesetOutcome::Applied {
+                    created_records: vec![],
+                    embedding_truncation: summary.embedding_truncation,
+                })
             }
         }
     }

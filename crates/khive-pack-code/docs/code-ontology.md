@@ -78,8 +78,12 @@ The pack depends on `kg`, registers the finding hook and vocabulary, and contrib
 database, with an opt-in L2 Rust symbol tier. Its optional `tiers` array accepts `l1`, `l1.5`, and
 `l2`. Omission or `null` preserves the L1+L1.5 default with L2 disabled; an empty array performs no
 map writes. When L2 is disabled, its five report counters are omitted so the existing default
-report shape is unchanged. `findings.json` ingestion is an admin CLI path through `kkernel
-code-ingest`, not an MCP operation. Unknown dispatch attempts fail
+report shape is unchanged. Arguments are deserialized through a closed typed schema (`path`, `db`,
+`languages`, and `tiers`), so unknown names fail before filesystem or database access. The report's
+sorted `languages` array names languages actually observed by a selected tier, not the caller's
+requested filter. `findings.json` ingestion is an admin CLI path through `kkernel
+code-ingest`, not an MCP operation. Its v2 finding identity is repository/project-scoped and carries
+a deterministic v1 UUID witness without rewriting legacy curated rows. Unknown dispatch attempts fail
 with `RuntimeError::InvalidInput` rather than silently succeeding.
 
 The dedicated map is an ordinary khive database, not a private code-pack format. Every

@@ -674,24 +674,32 @@ async fn embed_cosine_scores(
     runtime: &KhiveRuntime,
     query: &str,
     candidate_texts: &[String],
-) -> Option<Vec<f32>> {
+) -> Result<Option<Vec<f32>>, RuntimeError> {
     if runtime.default_embedder_name().is_empty() || candidate_texts.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut texts = Vec::with_capacity(candidate_texts.len() + 1);
     texts.push(query.to_string());
     texts.extend_from_slice(candidate_texts);
-    let embeddings = runtime.embed_batch(&texts).await.ok()?;
+    let embeddings = match khive_storage::await_request_read_phase(
+        "knowledge.embedding_rerank",
+        runtime.embed_batch(&texts),
+    )
+    .await?
+    {
+        Ok(embeddings) => embeddings,
+        Err(_) => return Ok(None),
+    };
     if embeddings.len() != texts.len() {
-        return None;
+        return Ok(None);
     }
     let query_emb = &embeddings[0];
-    Some(
+    Ok(Some(
         embeddings[1..]
             .iter()
             .map(|emb| cosine_similarity(query_emb, emb))
             .collect(),
-    )
+    ))
 }
 
 async fn rerank_with_embeddings(
@@ -707,7 +715,7 @@ async fn rerank_with_embeddings(
         .iter()
         .map(|h| format!("{} {}", h.name, h.content.as_deref().unwrap_or("")))
         .collect();
-    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await {
+    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await? {
         let max_tfidf = hits
             .iter()
             .map(|h| h.score)
@@ -954,12 +962,13 @@ async fn search_eligible_ann_with_refill(
     query_embedding: &[f32],
     target_eligible: usize,
     initial_k: usize,
-) -> EligibleAnnSearchState {
+) -> Result<EligibleAnnSearchState, RuntimeError> {
     let runtime = ctx.runtime;
     let target_eligible = target_eligible.max(1);
     let mut request_k = initial_k.max(target_eligible).max(1);
 
     loop {
+        khive_storage::ensure_request_read_active("knowledge.search")?;
         let AnnSearchState {
             hits: raw_hits,
             availability,
@@ -984,16 +993,17 @@ async fn search_eligible_ann_with_refill(
             .collect();
 
         let hydration_failures = hydrate_empty_hits(runtime, ctx.ns, &mut hits).await;
+        khive_storage::ensure_request_read_active("knowledge.search")?;
         filter_hits_by_status(&mut hits, ctx.statuses, ctx.exclude_statuses);
         filter_hits_by_type(&mut hits, ctx.type_filter);
 
         if hits.len() >= target_eligible || source_exhausted {
             hits.truncate(target_eligible);
-            return EligibleAnnSearchState {
+            return Ok(EligibleAnnSearchState {
                 hits,
                 availability,
                 hydration_failures,
-            };
+            });
         }
 
         // The live vector-store count is not a sound upper bound for a serving
@@ -1003,11 +1013,11 @@ async fn search_eligible_ann_with_refill(
         let next_k = request_k.saturating_mul(2);
         if next_k == request_k {
             hits.truncate(target_eligible);
-            return EligibleAnnSearchState {
+            return Ok(EligibleAnnSearchState {
                 hits,
                 availability,
                 hydration_failures,
-            };
+            });
         }
         request_k = next_k;
     }
@@ -1229,7 +1239,7 @@ async fn rerank_text_items(
         return Ok(());
     }
     let texts: Vec<String> = items.iter().map(|item| item.text.clone()).collect();
-    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await {
+    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await? {
         for (item, cos) in items.iter_mut().zip(cosines.iter()) {
             item.score = cos.max(0.0);
         }
@@ -1341,7 +1351,7 @@ async fn search_kg_entities(
         .iter()
         .map(|e| format!("{} {}", e.name, e.description.as_deref().unwrap_or("")))
         .collect();
-    let cosines = match embed_cosine_scores(runtime, query, &texts).await {
+    let cosines = match embed_cosine_scores(runtime, query, &texts).await? {
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
@@ -1487,6 +1497,7 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
+        khive_storage::ensure_request_read_active("knowledge.search")?;
         let p: SearchParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
         if raw_query.is_empty() {
@@ -1627,7 +1638,12 @@ impl KnowledgeHandlers {
 
         let mut ann_unavailable = false;
         let mut hydration_failures = 0usize;
-        if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
+        let query_embedding = khive_storage::await_request_read_phase(
+            "knowledge.search",
+            runtime.embed_query(&raw_query),
+        )
+        .await?;
+        if let Ok(query_emb) = query_embedding {
             let ann_k = fetch_limit.max(20);
             let model = runtime.default_embedder_name();
             let key = vamana::AnnKey::new(&ns, model);
@@ -1636,7 +1652,7 @@ impl KnowledgeHandlers {
                 availability,
                 hydration_failures: ann_hydration_failures,
             } = search_eligible_ann_with_refill(&ctx, token, ann, &key, &query_emb, ann_k, ann_k)
-                .await;
+                .await?;
             hydration_failures += ann_hydration_failures;
 
             if !ann_hits.is_empty() {
@@ -1690,6 +1706,7 @@ impl KnowledgeHandlers {
             out["ann_unavailable"] = json!(true);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
+        khive_storage::ensure_request_read_active("knowledge.search")?;
         Ok(out)
     }
 
@@ -1699,6 +1716,7 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
+        khive_storage::ensure_request_read_active("knowledge.suggest")?;
         let p: SuggestParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
         if raw_query.is_empty() {
@@ -1736,7 +1754,12 @@ impl KnowledgeHandlers {
         vamana::ensure_ann_background(runtime, token, ann);
         let mut ann_unavailable = false;
         let mut hydration_failures = 0usize;
-        if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
+        let query_embedding = khive_storage::await_request_read_phase(
+            "knowledge.suggest",
+            runtime.embed_query(&raw_query),
+        )
+        .await?;
+        if let Ok(query_emb) = query_embedding {
             // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
             // limit*3 would return mostly atoms that all get dropped after type filtering.
             // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
@@ -1757,7 +1780,7 @@ impl KnowledgeHandlers {
                 ctx.fetch_limit,
                 ann_k,
             )
-            .await;
+            .await?;
             hydration_failures += ann_hydration_failures;
 
             if !ann_hits.is_empty() {
@@ -1782,6 +1805,7 @@ impl KnowledgeHandlers {
 
         let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
         let member_token_sizes = load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?;
+        khive_storage::ensure_request_read_active("knowledge.suggest")?;
 
         // Price the member atom bodies that compose expands, not the much smaller
         // domain mirror description used for retrieval. The batched join keeps the
@@ -1840,6 +1864,7 @@ impl KnowledgeHandlers {
             });
         }
         attach_hydration_degradation(&mut out, hydration_failures);
+        khive_storage::ensure_request_read_active("knowledge.suggest")?;
         Ok(out)
     }
 
@@ -1922,29 +1947,32 @@ impl KnowledgeHandlers {
         // the request errors, is cancelled, or is abandoned mid-phase.
         use super::compose::Phase;
         let mut timing = super::compose::ComposeTiming::start(&raw_query, is_auto);
-        timing.begin(Phase::Suggest);
         macro_rules! try_or_finish {
             ($e:expr) => {
                 match $e {
                     Ok(v) => v,
                     Err(e) => {
                         timing.finish(0);
-                        return Err(e);
+                        return Err(e.into());
                     }
                 }
             };
         }
+        try_or_finish!(timing.begin(Phase::Suggest));
 
         if is_auto {
             let auto_limit = p.auto_limit.unwrap_or(5).clamp(1, 20);
-            let suggest_result = match Self::suggest(
+            let suggest_attempt = Self::suggest(
                 runtime,
                 token,
                 json!({ "query": &raw_query, "limit": auto_limit }),
                 ann,
             )
-            .await
-            {
+            .await;
+            try_or_finish!(khive_storage::ensure_request_read_active(
+                "knowledge.compose"
+            ));
+            let suggest_result = match suggest_attempt {
                 Ok(v) => {
                     suggest_ann_unavailable = v
                         .get("ann_unavailable")
@@ -1958,6 +1986,9 @@ impl KnowledgeHandlers {
                     v
                 }
                 Err(e) => {
+                    try_or_finish!(khive_storage::ensure_request_read_active(
+                        "knowledge.compose"
+                    ));
                     tracing::warn!(error = %e, "auto-compose: internal suggest failed, returning empty");
                     let response = json!({
                         "status": "ok",
@@ -1970,6 +2001,9 @@ impl KnowledgeHandlers {
                             "suggest_error": e.to_string(),
                         },
                     });
+                    try_or_finish!(khive_storage::ensure_request_read_active(
+                        "knowledge.compose"
+                    ));
                     timing.finish(0);
                     return Ok(response);
                 }
@@ -1994,11 +2028,14 @@ impl KnowledgeHandlers {
                 }
                 attach_hydration_degradation(&mut data, suggest_hydration_failures);
                 let response = json!({ "status": "ok", "data": data });
+                try_or_finish!(khive_storage::ensure_request_read_active(
+                    "knowledge.compose"
+                ));
                 timing.finish(0);
                 return Ok(response);
             }
         }
-        timing.begin(Phase::Fetch);
+        try_or_finish!(timing.begin(Phase::Fetch));
 
         let ns = token.namespace().as_str().to_owned();
 
@@ -2006,6 +2043,9 @@ impl KnowledgeHandlers {
         let mut member_slugs: Vec<String> = Vec::new();
 
         for id in &domain_ids {
+            try_or_finish!(khive_storage::ensure_request_read_active(
+                "knowledge.compose"
+            ));
             let domain = try_or_finish!(load_domain_by_id_or_slug(runtime, &ns, id).await);
             let members = try_or_finish!(parse_domain_members(&domain));
             member_slugs.extend(members);
@@ -2016,12 +2056,18 @@ impl KnowledgeHandlers {
         let mut ordered_atoms: Vec<Atom> = Vec::new();
 
         for slug in &member_slugs {
+            try_or_finish!(khive_storage::ensure_request_read_active(
+                "knowledge.compose"
+            ));
             let atom = try_or_finish!(load_atom_by_id_or_slug(runtime, &ns, slug).await);
             if seen_ids.insert(atom.id.to_string()) {
                 ordered_atoms.push(atom);
             }
         }
         for id in &atom_ids {
+            try_or_finish!(khive_storage::ensure_request_read_active(
+                "knowledge.compose"
+            ));
             let atom = try_or_finish!(load_atom_by_id_or_slug(runtime, &ns, id).await);
             if seen_ids.insert(atom.id.to_string()) {
                 ordered_atoms.push(atom);
@@ -2040,6 +2086,9 @@ impl KnowledgeHandlers {
         }
 
         if ordered_atoms.is_empty() {
+            try_or_finish!(khive_storage::ensure_request_read_active(
+                "knowledge.compose"
+            ));
             let mut data = json!({
                 "query": raw_query,
                 "markdown": "# Knowledge Briefing\n\nNo atoms found.",
@@ -2052,6 +2101,9 @@ impl KnowledgeHandlers {
             }
             attach_hydration_degradation(&mut data, suggest_hydration_failures);
             let response = json!({ "status": "ok", "data": data });
+            try_or_finish!(khive_storage::ensure_request_read_active(
+                "knowledge.compose"
+            ));
             timing.finish(0);
             return Ok(response);
         }
@@ -2067,7 +2119,7 @@ impl KnowledgeHandlers {
             })
             .collect();
 
-        timing.begin(Phase::Rerank);
+        try_or_finish!(timing.begin(Phase::Rerank));
         try_or_finish!(rerank_text_items(runtime, &raw_query, &mut items).await);
 
         let atom_ids: Vec<String> = ordered_atoms.iter().map(|a| a.id.to_string()).collect();
@@ -2076,12 +2128,12 @@ impl KnowledgeHandlers {
             .map(|item| (item.id.clone(), item.score))
             .collect();
 
-        timing.begin(Phase::Fetch);
+        try_or_finish!(timing.begin(Phase::Fetch));
         let section_map =
             try_or_finish!(super::compose::load_sections(runtime, &ns, &atom_ids).await);
 
         let has_sections = !section_map.is_empty();
-        timing.begin(Phase::Rerank);
+        try_or_finish!(timing.begin(Phase::Rerank));
 
         let mut section_results = if has_sections {
             let domain_member_ids: HashSet<String> = member_slugs
@@ -2107,10 +2159,20 @@ impl KnowledgeHandlers {
                 })
                 .collect();
 
-            let q_emb = runtime.embed_query(&raw_query).await.ok();
+            let q_emb = try_or_finish!(
+                khive_storage::await_request_read_phase(
+                    "knowledge.compose",
+                    runtime.embed_query(&raw_query),
+                )
+                .await
+            );
+            try_or_finish!(khive_storage::ensure_request_read_active(
+                "knowledge.compose"
+            ));
+            let q_emb = q_emb.ok();
 
             if let Some(qe) = q_emb {
-                super::compose::score_sections(
+                try_or_finish!(super::compose::score_sections(
                     &raw_query,
                     &qe,
                     &atom_cosine_scores,
@@ -2118,14 +2180,14 @@ impl KnowledgeHandlers {
                     &domain_scores,
                     &type_weights,
                     &super::compose::ComposeScoreWeights::default(),
-                )
+                ))
             } else {
                 Vec::new()
             }
         } else {
             Vec::new()
         };
-        timing.begin(Phase::Trim);
+        try_or_finish!(timing.begin(Phase::Trim));
 
         let max_tokens = p.max_tokens.unwrap_or(8000).clamp(500, 100_000);
         let char_budget = max_tokens * CHARS_PER_TOKEN;
@@ -2251,6 +2313,9 @@ impl KnowledgeHandlers {
                         }
                     }
                     Err(e) => {
+                        try_or_finish!(khive_storage::ensure_request_read_active(
+                            "knowledge.compose"
+                        ));
                         tracing::warn!(
                             error = %e,
                             "knowledge.compose: KG entity blend failed, continuing with atom-only response"
@@ -2259,6 +2324,10 @@ impl KnowledgeHandlers {
                 }
             }
         }
+
+        try_or_finish!(khive_storage::ensure_request_read_active(
+            "knowledge.compose"
+        ));
 
         let atom_json: Vec<Value> = items
             .iter()
@@ -2302,6 +2371,9 @@ impl KnowledgeHandlers {
             "status": "ok",
             "data": data,
         });
+        try_or_finish!(khive_storage::ensure_request_read_active(
+            "knowledge.compose"
+        ));
         timing.finish(count);
         Ok(response)
     }

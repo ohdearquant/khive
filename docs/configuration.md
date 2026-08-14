@@ -40,6 +40,20 @@ env pair (or built-in defaults), and storage falls back to the single-file
 A malformed file at whichever tier is found is always an error. A parse
 failure is never silently skipped in favor of a lower tier.
 
+### Authorization configuration is reserved
+
+The current runtime does not expose an operator `[gate]` configuration
+surface. Any present `[gate]` table, including an empty one, is rejected during
+startup. This is deliberate: accepting caller-enrollment keys that the runtime
+does not enforce would give operators a false authorization boundary.
+
+The accepted authorization direction remains ADR-129's fail-closed gate and
+ADR-143's store-held caller grants. ADR-143 supersedes a steady-state
+configuration roster; its one-time legacy import is not implemented in this
+build. Until that store-held model ships, do not add `[gate]` to `khive.toml`.
+Embedders can still install a `Gate` implementation programmatically through
+`RuntimeConfig::gate`.
+
 (Source: `KhiveConfig::load_with_home_fallback` and the inner
 `load_with_roots`, `crates/khive-runtime/src/engine_config.rs`, the `load`
 family starting around line 298.)

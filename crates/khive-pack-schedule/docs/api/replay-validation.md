@@ -13,19 +13,12 @@ callers can compare without re-parsing; the original string is preserved by call
 who want to store it as-is. Rejects unparseable strings and timestamps in the past
 relative to `Utc::now()`.
 
-## `validate_repeat` — cron-lite repeat spec
+## `validate_repeat` — executable repeat spec
 
-Accepts the literals `daily`, `weekly`, `monthly`, and a limited five-field form
-`MIN HOUR DOM MON DOW` where each field is `*` or one non-negative integer within:
-MIN 0–59, HOUR 0–23, DOM 1–31, MON 1–12, DOW 0–7.
-
-Standard cron operators (steps `*/15`, ranges `9-17`, lists `0,30`) are NOT accepted
-(issue #481): `kkernel`'s pending-events runner does not yet compute next-fire times
-for cron-form repeats (it fires them one-shot), so accepting full cron syntax would
-imply recurrence semantics that don't exist yet. Use `daily`/`weekly`/`monthly` for
-recurring runtime advancement until cron next-fire support lands. Malformed fields
-(non-numeric, out-of-range, or a cron operator) are rejected rather than silently
-accepted.
+Accepts only `daily`, `weekly`, and `monthly`, the recurrence forms the pending-events
+runner can advance. Every five-field cron expression is rejected at creation. This
+prevents an accepted recurrence from silently firing once and becoming terminal when
+the runner cannot calculate its next occurrence.
 
 ## `validate_action` — DSL parseability
 
@@ -53,7 +46,7 @@ provenance fails closed. For replay to succeed, the stored action must be:
 - Complete with respect to all required handler parameters.
 
 Rejecting anything else at write time prevents storing an action that is guaranteed
-to fail (and be silently marked "fired") when it comes due.
+to fail only when it comes due and then enter the failed-one-shot recovery lifecycle.
 
 It also rejects any handler whose schema declares `namespace` as a business param
 (issue #461/#462): `dispatch_action` in `pending_events.rs` unconditionally injects

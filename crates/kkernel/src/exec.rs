@@ -45,11 +45,11 @@ use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
     enforce_strict_actor_mode, install_resolved_blob_store,
     normalize_redundant_db_override_with_source, reject_conflicting_db_override_with_source,
-    RuntimeConfigInputs,
+    validate_declared_backend_access_modes, RuntimeConfigInputs,
 };
-#[cfg(unix)]
-use khive_mcp::server::compute_config_id;
 use khive_mcp::server::KhiveMcpServer;
+#[cfg(unix)]
+use khive_mcp::server::{compute_config_id, compute_config_id_with_storage_mode};
 use khive_mcp::tools::request::RequestParams;
 #[cfg(unix)]
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
@@ -1970,8 +1970,10 @@ async fn run_exec_inline_with_forward(
     // correctly rejects it. A matching concrete override is redundant, so its
     // fingerprint and captured construction anchor are normalized to the same
     // values used when no override is supplied.
-    if !khive_cfg.backends.is_empty() {
-        normalize_redundant_db_override_with_source(
+    let force_memory = if khive_cfg.backends.is_empty() {
+        false
+    } else {
+        let force_memory = normalize_redundant_db_override_with_source(
             &mut cfg,
             db_context.raw.as_deref(),
             &khive_cfg.backends,
@@ -1980,6 +1982,11 @@ async fn run_exec_inline_with_forward(
         if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
             db_context.anchor = cfg.db_path.clone();
         }
+        force_memory
+    };
+
+    if !force_memory {
+        validate_declared_backend_access_modes(&khive_cfg.backends)?;
     }
 
     disclose_resolved_database(&cfg, &khive_cfg);
@@ -2006,8 +2013,16 @@ async fn run_exec_inline_with_forward(
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
             // Fold the SAME backends topology the daemon folds (`Some(&khive_cfg)`)
-            // instead of `None` — see the `khive_cfg` load above.
-            config_id: compute_config_id(&cfg, Some(&khive_cfg)),
+            // instead of `None` — see the `khive_cfg` load above. A force-memory
+            // override also supplies the effective writable mode explicitly:
+            // the declaration can say `main.read_only = true`, but the runtime
+            // the child opens is writable memory and fingerprints that captured
+            // mode after construction.
+            config_id: if force_memory {
+                compute_config_id_with_storage_mode(&cfg, Some(&khive_cfg), false)
+            } else {
+                compute_config_id(&cfg, Some(&khive_cfg))
+            },
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
             metrics_only: false,
@@ -2138,6 +2153,45 @@ fn build_local_fallback_server(
     }
 }
 
+struct AtomicSavePublishFailure {
+    stdout: String,
+    error: anyhow::Error,
+}
+
+/// Render the authoritative atomic stdout value. A save sink is preflighted
+/// before execution, but its writes/flush/rename necessarily happen after the
+/// database outcome is known. If that publication fails after a commit, keep
+/// the process failure while returning a reconciliation envelope that makes
+/// the durable, non-retryable outcome explicit.
+fn render_atomic_output(
+    envelope: &mut serde_json::Value,
+    save_sink: Option<khive_mcp::save_sink::JsonlSaveSink>,
+) -> std::result::Result<String, AtomicSavePublishFailure> {
+    let Some(save_sink) = save_sink else {
+        return Ok(serde_json::to_string_pretty(envelope).expect("serialize atomic envelope"));
+    };
+
+    match save_sink.write_envelope(envelope) {
+        Ok(manifest) => {
+            Ok(serde_json::to_string(&manifest).expect("serialize atomic save manifest"))
+        }
+        Err(error) => {
+            let committed = crate::atomic_apply::record_save_file_publish_failure(envelope, &error);
+            let stdout = serde_json::to_string_pretty(envelope)
+                .expect("serialize atomic save failure reconciliation envelope");
+            let error = if committed {
+                error.context(
+                    "atomic database changes committed but --save-file publication failed; \
+                     do not replay the mutation (inspect stdout for reconciliation details)",
+                )
+            } else {
+                error.context("atomic --save-file publication failed")
+            };
+            Err(AtomicSavePublishFailure { stdout, error })
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
@@ -2245,11 +2299,15 @@ async fn run_exec_ops_file(
                 }
             };
         annotate_and_emit_refusals(&mut envelope, strict);
-        let output = if let Some(save_sink) = save_sink {
-            let manifest = save_sink.write_envelope(&envelope)?;
-            serde_json::to_string(&manifest).expect("serialize atomic save manifest")
-        } else {
-            serde_json::to_string_pretty(&envelope).expect("serialize atomic envelope")
+        let output = match render_atomic_output(&mut envelope, save_sink) {
+            Ok(output) => output,
+            Err(failure) => {
+                // stdout is the machine reconciliation channel. Emit it before
+                // returning the non-zero sink error so callers never infer that
+                // silence means the atomic database unit is safe to replay.
+                println!("{}", failure.stdout);
+                return Err(failure.error);
+            }
         };
         println!("{output}");
         return Ok(());
@@ -2285,6 +2343,7 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
     use tempfile::NamedTempFile;
+    use uuid::Uuid;
 
     // ── collect_op_failures: per-op error surfacing (#1228) ───────────────────
 
@@ -2975,6 +3034,33 @@ mod tests {
         let _server = isolated_server(&db_path);
     }
 
+    fn rerun_in_command_scoped_empty_home(child_marker: &str, test_name: &str) -> bool {
+        if std::env::var_os(child_marker).is_some() {
+            return false;
+        }
+
+        let calling_process_home = std::env::var_os("HOME");
+        let empty_home = tempfile::tempdir().expect("isolated child HOME");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg(test_name)
+                .arg("--exact")
+                .env("HOME", empty_home.path())
+                .env_remove("KHIVE_EMBEDDING_MODEL")
+                .env_remove("KHIVE_ADDITIONAL_EMBEDDING_MODELS")
+                .env_remove("KHIVE_ACTOR")
+                .env(child_marker, "1")
+                .status()
+                .expect("spawn isolated config-discovery test process");
+        assert_eq!(
+            std::env::var_os("HOME"),
+            calling_process_home,
+            "command-scoped HOME must not mutate the calling test process"
+        );
+        assert!(status.success(), "isolated child test failed: {status}");
+        true
+    }
+
     // ── exec-path / serve-path config_id parity (#581) ────────────────────────
     //
     // `run_exec`'s cfg construction (above) and `kkernel mcp`'s `build_server`
@@ -2992,9 +3078,12 @@ mod tests {
     #[test]
     #[serial]
     fn exec_config_id_matches_serve_config_id_for_project_toml_actor() {
-        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
-        std::env::remove_var("KHIVE_ACTOR");
+        const CHILD_MARKER: &str = "KKERNEL_EXEC_PROJECT_CONFIG_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::exec_config_id_matches_serve_config_id_for_project_toml_actor";
+        if rerun_in_command_scoped_empty_home(CHILD_MARKER, TEST_NAME) {
+            return;
+        }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -3101,9 +3190,12 @@ default = true
     #[test]
     #[serial]
     fn actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback() {
-        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
-        std::env::remove_var("KHIVE_ACTOR");
+        const CHILD_MARKER: &str = "KKERNEL_ACTOR_PIN_CONFIG_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback";
+        if rerun_in_command_scoped_empty_home(CHILD_MARKER, TEST_NAME) {
+            return;
+        }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -5318,6 +5410,308 @@ id = "lambda:fallback"
         );
     }
 
+    /// A declared read-only SQLite `main` backend becomes a writable memory
+    /// backend when `--db :memory:` forces the whole topology ephemeral. The
+    /// pre-open exec frame must fingerprint that effective runtime mode, not
+    /// the superseded declaration, or the freshly spawned daemon rejects its
+    /// very first request as a config mismatch.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn force_memory_exec_frame_matches_opened_read_only_topology_runtime() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().expect("force-memory config tempdir");
+        let config_path = fixture.path().join("read-only-topology.toml");
+        let declared_main = fixture.path().join("declared-main.db");
+        let declared_archive = fixture.path().join("declared-archive.db");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+read_only = true
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+"#,
+                declared_main.display(),
+                declared_archive.display(),
+            ),
+        )
+        .expect("write read-only topology config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&config_path),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve force-memory exec config");
+        assert_eq!(
+            cfg.db_path, None,
+            "the force-memory anchor must be in-memory"
+        );
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(result.is_ok(), "force-memory dispatch failed: {result:?}");
+
+        let frame_config_id = SPY_CAPTURED_CONFIG_ID
+            .with(|captured| captured.borrow_mut().take())
+            .expect("spy must capture the forwarded config id");
+        let khive_cfg = KhiveConfig::load_with_home_fallback(Some(&config_path), None)
+            .expect("load force-memory topology")
+            .expect("explicit config must exist");
+        let opened =
+            khive_mcp::serve::build_registry_for_multi_backend(cfg, &khive_cfg, Some(":memory:"))
+                .expect("force-memory runtime must build");
+        restore_home(prev_home);
+
+        assert!(
+            !opened.default_runtime.is_read_only(),
+            "force-memory replaces the declared read-only SQLite main with writable memory"
+        );
+        assert_eq!(
+            frame_config_id, opened.config_id,
+            "the pre-open exec frame and opened force-memory runtime must have identical config ids"
+        );
+        assert!(
+            !declared_main.exists() && !declared_archive.exists(),
+            "force-memory parity setup must not materialize either declared SQLite path"
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_writable_multi_backend_config(
+        config_path: &Path,
+        main_path: &Path,
+        secondary_path: &Path,
+    ) {
+        std::fs::write(
+            config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+"#,
+                main_path.display(),
+                secondary_path.display(),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn chmod_read_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(path, permissions).unwrap();
+
+        // A writable fixture's connections can close asynchronously and leave
+        // `-wal`/`-shm` sidecars behind; read-only admission rejects a writable
+        // `-shm` as potentially live. Freeze any lingering sidecars so the
+        // snapshot takes the documented frozen form.
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().unwrap().to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().unwrap().join(name);
+            if sidecar.exists() {
+                let mut sidecar_permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+                sidecar_permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, sidecar_permissions).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn runtime_config_for_explicit_multi_backend(
+        config_path: &Path,
+        db: Option<&str>,
+    ) -> RuntimeConfig {
+        resolve_runtime_config(RuntimeConfigInputs {
+            db,
+            config: Some(config_path),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .unwrap()
+    }
+
+    /// A client must not reuse a daemon that retained a write-capable handle
+    /// after the declared main file was chmod'd into snapshot mode. The
+    /// filesystem-mode refusal belongs before the forwarding seam.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_main_chmod_refuses_before_daemon_forward() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"main snapshot fixture").unwrap();
+        std::fs::write(&archive_path, b"archive fixture").unwrap();
+        chmod_read_only(&main_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, None),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        let error = result.expect_err("an undeclared main snapshot mode must fail closed");
+        assert!(error.to_string().contains("read_only = true"), "{error}");
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_none()),
+            "the retained writable daemon must never receive the frame"
+        );
+    }
+
+    /// The topology fingerprint includes secondary modes too; apply the same
+    /// pre-forward refusal to every declared SQLite backend, not only `main`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_secondary_chmod_refuses_before_daemon_forward() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"main fixture").unwrap();
+        std::fs::write(&archive_path, b"archive snapshot fixture").unwrap();
+        chmod_read_only(&archive_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, None),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        let error = result.expect_err("an undeclared secondary snapshot mode must fail closed");
+        assert!(error.to_string().contains("archive"), "{error}");
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_none()),
+            "the retained writable daemon must never receive the frame"
+        );
+    }
+
+    /// `--db :memory:` supersedes every declared file. Its pre-open/runtime
+    /// parity must therefore skip filesystem-mode checks on those unused paths.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn force_memory_skips_declared_chmod_preflight_and_forwards() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"unused main snapshot fixture").unwrap();
+        std::fs::write(&archive_path, b"unused archive snapshot fixture").unwrap();
+        chmod_read_only(&main_path);
+        chmod_read_only(&archive_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, Some(":memory:")),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "force-memory forwarding must remain valid: {result:?}"
+        );
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_some()),
+            "the force-memory frame must reach the forwarding seam"
+        );
+    }
+
     /// A CONCRETE override on a single-backend invocation (no `[[backends]]`
     /// declared) must reach the spawn seam: the spawned daemon has no
     /// config-declared database path and would otherwise bind
@@ -6023,6 +6417,20 @@ backend = "sessions"
         }
     }
 
+    async fn replace_fts_entities_with_incompatible_table(db_path: &str) {
+        let runtime = KhiveRuntime::new(atomic_cfg(db_path)).expect("runtime for FTS fault setup");
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.expect("writer for FTS fault setup");
+        writer
+            .execute_script(
+                "DROP TABLE fts_entities; \
+                 CREATE TABLE fts_entities (broken_column TEXT);"
+                    .to_string(),
+            )
+            .await
+            .expect("replace FTS table to inject post-commit reindex failure");
+    }
+
     #[tokio::test]
     async fn atomic_kg_only_config_keeps_gtd_hook_and_lifecycle_execution() {
         let db_file = NamedTempFile::new().expect("temp db");
@@ -6151,6 +6559,125 @@ backend = "sessions"
         let y_resp = dispatch_json(&server, &format!(r#"get(id="{y_id}")"#)).await;
         assert_eq!(x_resp["results"][0]["result"]["name"], "AtomicX-renamed");
         assert_eq!(y_resp["results"][0]["result"]["name"], "AtomicY-renamed");
+    }
+
+    #[tokio::test]
+    async fn atomic_post_commit_reindex_failure_returns_committed_non_retryable_envelope() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="PostCommitReindexBefore")"#,
+            )
+            .await;
+            response["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        // Migration state remains current, but an incompatible ordinary table
+        // occupies the post-commit FTS name. Store initialization cannot
+        // recreate the virtual table through IF NOT EXISTS; prepare and base
+        // DML do not touch it, so the failure occurs at the real reindex seam.
+        replace_fts_entities_with_incompatible_table(&db_path).await;
+
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![atomic_op(
+                "update",
+                serde_json::json!({"id": entity_id, "name": "PostCommitReindexAfter"}),
+            )],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("post-commit failure must return a reconciliation envelope");
+
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["atomic"]["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["degradations"][0]["stage"], "post_commit_reindex",
+            "{envelope}"
+        );
+        assert_eq!(envelope["summary"]["succeeded"], 1, "{envelope}");
+
+        let runtime =
+            KhiveRuntime::new(atomic_cfg(&db_path)).expect("runtime for committed-row check");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let entity = runtime
+            .get_entity(&token, Uuid::parse_str(&entity_id).unwrap())
+            .await
+            .expect("committed entity row");
+        assert_eq!(entity.name, "PostCommitReindexAfter");
+    }
+
+    #[tokio::test]
+    async fn atomic_result_read_failure_keeps_later_committed_delete_non_retryable() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="RenderThenDelete")"#,
+            )
+            .await;
+            response["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        // Both plans prepare against the same live row. The unit then updates
+        // and hard-deletes it atomically. Rendering op 0 performs its real
+        // post-commit read and cannot find the row removed by op 1.
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({"id": entity_id, "name": "NeverRendered"}),
+                ),
+                atomic_op("delete", serde_json::json!({"id": entity_id, "hard": true})),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("render failure after commit must be a reconciliation envelope");
+
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["atomic"]["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["degradations"][0]["stage"], "result_rendering",
+            "{envelope}"
+        );
+        assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+        assert_eq!(
+            envelope["results"][0]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["results"][0]["retryable"], false, "{envelope}");
+        assert_eq!(envelope["results"][1]["result"]["deleted"], true);
+
+        let runtime =
+            KhiveRuntime::new(atomic_cfg(&db_path)).expect("runtime for deleted-row check");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let deleted = runtime
+            .get_entity(&token, Uuid::parse_str(&entity_id).unwrap())
+            .await;
+        assert!(deleted.is_err(), "hard delete must remain committed");
     }
 
     /// Acceptance test 1b: a mid-unit failure rolls the WHOLE unit back —
@@ -6301,6 +6828,56 @@ backend = "sessions"
         assert_eq!(
             std::fs::read_to_string(save_path).unwrap().lines().count(),
             2
+        );
+    }
+
+    #[test]
+    fn atomic_save_persist_failure_returns_committed_reconciliation_stdout() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("publish-race.jsonl");
+        let sink = khive_mcp::save_sink::JsonlSaveSink::new(&save_path, false)
+            .expect("preflight save sink");
+        // Deterministic post-preflight publication failure: a directory wins
+        // the destination path after the sibling temp file has been created,
+        // so row writes and flush succeed but the final atomic rename fails.
+        std::fs::create_dir(&save_path).expect("occupy destination with a directory");
+        let mut envelope = serde_json::json!({
+            "results": [{
+                "ok": true,
+                "tool": "update",
+                "op_index": 0,
+                "result": {"id": Uuid::new_v4()}
+            }],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0},
+            "atomic": {
+                "committed": true,
+                "rolled_back": false,
+                "failed_op_index": null,
+                "error": null
+            }
+        });
+
+        let failure = render_atomic_output(&mut envelope, Some(sink))
+            .expect_err("persist failure must remain a non-zero CLI outcome");
+        let stdout: serde_json::Value =
+            serde_json::from_str(&failure.stdout).expect("structured stdout envelope");
+
+        assert_eq!(stdout["atomic"]["committed"], true, "{stdout}");
+        assert_eq!(stdout["atomic"]["status"], "committed_degraded", "{stdout}");
+        assert_eq!(stdout["atomic"]["retryable"], false, "{stdout}");
+        assert_eq!(
+            stdout["atomic"]["degradations"][0]["stage"], "save_file_publish",
+            "{stdout}"
+        );
+        assert!(
+            stdout["atomic"]["degradations"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("persist temp file")),
+            "{stdout}"
+        );
+        assert!(
+            format!("{:#}", failure.error).contains("do not replay the mutation"),
+            "terminal error must point automation at reconciliation"
         );
     }
 

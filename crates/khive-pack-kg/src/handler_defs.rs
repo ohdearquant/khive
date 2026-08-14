@@ -1023,13 +1023,15 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         category: VerbCategory::Assertive,
         params: &[],
     },
-    // Assertive: writer-contention and WAL/checkpoint diagnostics (ADR-091/ADR-135)
+    // Assertive: writer-contention, edge-integrity, and WAL diagnostics (ADR-091/ADR-135)
     HandlerDef {
         name: "db_diagnostics",
-        description: "Report writer-contention and WAL/checkpoint diagnostics for the main \
+        description: "Report writer-contention, graph-edge integrity, and WAL/checkpoint \
+                      diagnostics for the main \
                       database: aggregate and class-specific pooled/standalone/writer-task \
                       acquisitions, finite-wait pool timeouts, swallowed best-effort audit \
-                      append failures, build identity, ADR-091 checkpoint counters, a PASSIVE \
+                      append failures, build identity, duplicate edge-ID and list-ledger counts, \
+                      ADR-091 checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
                       WAL-pin holder census. The \
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \

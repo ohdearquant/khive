@@ -4520,6 +4520,12 @@ mod kg_blend {
     /// batches of 2+ texts (query + candidates).
     struct FailingBlendEmbedService;
 
+    const CANCEL_QUERY: &str = "zzzquantumfoo cancellation boundary kv cache paging decode \
+        attention retrieval augmented generation dense sparse benchmark corpus";
+
+    static CANCEL_ON_BLEND_FAILURE: std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>> =
+        std::sync::Mutex::new(None);
+
     #[async_trait]
     impl EmbeddingService for FailingBlendEmbedService {
         async fn embed(
@@ -4527,7 +4533,16 @@ mod kg_blend {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
-            if texts.len() == 1 && texts[0] == QUERY {
+            if texts.len() == 1 && (texts[0] == QUERY || texts[0] == CANCEL_QUERY) {
+                if texts[0] == CANCEL_QUERY {
+                    if let Some(cancel) = CANCEL_ON_BLEND_FAILURE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = cancel.send(true);
+                    }
+                }
                 return Err(EmbedError::Internal(
                     "simulated KG blend-path embed failure".into(),
                 ));
@@ -4628,6 +4643,35 @@ mod kg_blend {
         assert!(
             !md.contains("Knowledge graph"),
             "markdown must not contain a Knowledge graph section when the blend fails, got: {md}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_kg_blend_failure_never_degrades_to_success() {
+        let f = pack(rt_with_failing_blend_embedder());
+        let domain_id = seed_domain_and_atom(&f).await;
+        seed_kg_concept(&f).await;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        *CANCEL_ON_BLEND_FAILURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel_tx);
+
+        let result = khive_storage::scope_request_read_cancellation(
+            cancel_rx,
+            f.dispatch(
+                "knowledge.compose",
+                json!({ "domain_ids": [domain_id], "query": CANCEL_QUERY }),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(khive_runtime::RuntimeError::Storage(
+                    khive_storage::StorageError::Timeout { .. }
+                ))
+            ),
+            "request cancellation at the KG-blend catch must propagate, got {result:?}"
         );
     }
 }

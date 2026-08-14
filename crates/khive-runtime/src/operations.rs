@@ -24,6 +24,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
+use khive_storage::blob::ContentRef;
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
@@ -1274,7 +1275,7 @@ impl KhiveRuntime {
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
         Ok(self
-            .create_entity_with_embedding_report(
+            .create_entity_with_embedding_report_inner(
                 token,
                 kind,
                 entity_type,
@@ -1282,6 +1283,53 @@ impl KhiveRuntime {
                 description,
                 properties,
                 tags,
+                None,
+            )
+            .await?
+            .0)
+    }
+
+    /// Create an entity that references bytes already published to `BlobStore`.
+    ///
+    /// The typed [`ContentRef`] prevents malformed references from entering the
+    /// substrate through this consumer seam. The entity row, FTS document, and
+    /// configured text-vector rows use the same compensated create path as
+    /// [`Self::create_entity`]. The caller remains responsible for publishing the
+    /// blob before this call; a later failure deliberately leaves those bytes for
+    /// the blob store's grace-period orphan collection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_entity_with_content_ref(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<serde_json::Value>,
+        tags: Vec<String>,
+        content_ref: &ContentRef,
+    ) -> RuntimeResult<Entity> {
+        let blob_store = self.blob_store().ok_or_else(|| {
+            RuntimeError::Unconfigured(
+                "create_entity_with_content_ref requires an installed BlobStore".to_string(),
+            )
+        })?;
+        if !blob_store.exists(content_ref).await? {
+            return Err(RuntimeError::InvalidInput(format!(
+                "create_entity_with_content_ref requires a published blob; no object exists for {content_ref}"
+            )));
+        }
+        let validated_type = self.validate_entity_type_for_kind(kind, entity_type)?;
+        Ok(self
+            .create_entity_with_embedding_report_inner(
+                token,
+                kind,
+                validated_type.as_deref(),
+                name,
+                description,
+                properties,
+                tags,
+                Some(content_ref),
             )
             .await?
             .0)
@@ -1297,6 +1345,31 @@ impl KhiveRuntime {
         description: Option<&str>,
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        self.create_entity_with_embedding_report_inner(
+            token,
+            kind,
+            entity_type,
+            name,
+            description,
+            properties,
+            tags,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_entity_with_embedding_report_inner(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<serde_json::Value>,
+        tags: Vec<String>,
+        content_ref: Option<&ContentRef>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_entity_kind(kind)?;
         // Secret gate: scan name, description, structured properties, and tags.
@@ -1318,6 +1391,9 @@ impl KhiveRuntime {
         }
         if !tags.is_empty() {
             entity = entity.with_tags(tags);
+        }
+        if let Some(content_ref) = content_ref {
+            entity = entity.with_content_ref(content_ref.to_string());
         }
         self.entities(token)?.upsert_entity(entity.clone()).await?;
 

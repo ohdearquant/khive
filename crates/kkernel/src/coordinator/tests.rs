@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -537,6 +538,80 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
         "the healthy sibling's hit must still be present in the merged result \
          despite the hung backend"
     );
+}
+
+/// Every backend task starts together and therefore shares one absolute
+/// request deadline. Joining several hung handles sequentially must not renew
+/// the five-second budget for each handle (N hung backends must still cost one
+/// timeout window, not N windows).
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
+    let mut registry = BackendRegistry::new();
+    for backend in ["hung-a", "hung-b", "hung-c"] {
+        registry.register(BackendId::new(backend), memory_runtime());
+    }
+    let coord =
+        SubstrateCoordinator::new(registry).with_hanging_backends(["hung-a", "hung-b", "hung-c"]);
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "shared absolute timeout",
+        "limit": 10,
+    }));
+    let started = tokio::time::Instant::now();
+
+    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &Namespace::local()).await;
+
+    assert!(hits.is_empty());
+    assert!(note_hits.is_empty());
+    assert_eq!(per_backend.len(), 3);
+    assert!(per_backend.iter().all(|entry| entry
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("timed out"))));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
+        "three concurrently-started hung backends renewed the request budget; elapsed={elapsed:?}"
+    );
+}
+
+/// A sibling that finishes only while the coordinator is draining an earlier
+/// hung task has missed the shared request deadline. `JoinHandle::is_finished`
+/// must not relabel that late result as healthy merely because it is polled
+/// after the grace window.
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() {
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("a-hung"), memory_runtime());
+    registry.register(BackendId::new("b-late"), memory_runtime());
+    let coord = SubstrateCoordinator::new(registry)
+        .with_hanging_backend("a-hung")
+        .with_delayed_backend("b-late", Duration::from_millis(5_100));
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "late sibling",
+        "limit": 10,
+    }));
+
+    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &Namespace::local()).await;
+
+    assert!(hits.is_empty());
+    assert!(note_hits.is_empty());
+    assert_eq!(per_backend.len(), 2);
+    for backend in ["a-hung", "b-late"] {
+        let report = per_backend
+            .iter()
+            .find(|entry| entry.backend_id.as_str() == backend)
+            .expect("every backend is reported");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")),
+            "{backend} completed outside the absolute deadline but was accepted: {:?}",
+            report.error
+        );
+    }
 }
 
 /// Same guarantee as the spawned multi-backend hung-backend test above, but
@@ -2184,6 +2259,89 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
             entity_kind.and_then(|v| v.as_str()),
             Some("concept"),
             "T7a: entity_kind must be 'concept', got: {hit}"
+        );
+    }
+}
+
+/// #1676 acceptance: row-shape parity is a symmetric contract.
+///
+/// A one-way "coordinator contains the currently known fields" assertion does
+/// not catch a later field added only to the direct handler. Drive both server
+/// routes over the same primary runtime and require their complete key sets to
+/// be identical for both substrates.
+#[tokio::test]
+async fn multi_backend_and_direct_search_rows_have_exact_key_set_parity() {
+    async fn first_hit_keys(
+        server: &khive_mcp::server::KhiveMcpServer,
+        ops: &str,
+    ) -> BTreeSet<String> {
+        let raw = server
+            .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+                ops: ops.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("search dispatch must succeed");
+        let response: serde_json::Value =
+            serde_json::from_str(&raw).expect("search response must be valid JSON");
+        response["results"][0]["result"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("search must return an object row: {response}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    let primary = memory_runtime();
+    let empty_secondary = memory_runtime();
+    let namespace = RuntimeNamespace::local();
+    let token = primary.authorize(namespace).expect("authorize primary");
+    primary
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "ExactShapeEntityProbe",
+            Some("entity used to compare direct and coordinator row keys"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity shape probe");
+    primary
+        .create_note(
+            &token,
+            "observation",
+            Some("Exact shape note probe"),
+            "exactshapenoteprobe content used to compare search row keys",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note shape probe");
+
+    let direct = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+        packs_registry(Arc::clone(&primary), &["kg"]),
+        "local",
+        "test-direct-shape",
+    );
+    let coordinated = two_backend_server(Arc::clone(&primary), empty_secondary);
+
+    for ops in [
+        r#"search(kind="concept", query="ExactShapeEntityProbe")"#,
+        r#"search(kind="observation", query="exactshapenoteprobe")"#,
+    ] {
+        let direct_keys = first_hit_keys(&direct, ops).await;
+        let coordinated_keys = first_hit_keys(&coordinated, ops).await;
+        assert_eq!(
+            coordinated_keys, direct_keys,
+            "neither search route may add or omit a row field for {ops}"
         );
     }
 }

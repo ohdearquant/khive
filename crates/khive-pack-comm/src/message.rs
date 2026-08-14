@@ -813,6 +813,17 @@ mod tests {
         assert!(!annotated.to_string().contains("outbound_id="));
     }
 
+    #[test]
+    fn writer_begin_contention_is_retryable_without_delivery_probe() {
+        let error = RuntimeError::Storage(StorageError::WriterTaskBusy { timeout_ms: 175 });
+        let annotated = attach_outbound_id_to_ambiguous_write(Uuid::new_v4(), error);
+
+        assert!(matches!(
+            annotated,
+            RuntimeError::Storage(StorageError::WriterTaskBusy { timeout_ms: 175 })
+        ));
+    }
+
     #[tokio::test]
     async fn dual_write_versions_both_copies_and_stamps_optional_process_provenance() {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
