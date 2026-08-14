@@ -1654,7 +1654,12 @@ impl VerbRegistry {
                 // dispatch happens to observe the queue non-empty first:
                 // an accepted provenance quirk, preferred over threading an
                 // `EventStore` handle into every synchronous
-                // `OnceLock::get_or_init` call site.
+                // `OnceLock::get_or_init` call site. The verb column is NOT
+                // inherited from that bystander dispatch: a config-lock row
+                // wearing an operation verb pollutes verb-filtered queries
+                // (e.g. per-verb receipt counts), so these rows carry their
+                // own `config.lock` pseudo-verb and remain discoverable by
+                // `EventKind::ConfigLocked`.
                 if let Some(store) = &self.event_store {
                     if crate::config_ledger::PENDING
                         .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -1663,13 +1668,14 @@ impl VerbRegistry {
                             let payload = serde_json::json!({ "key": key, "value": value });
                             let storage_event = Event::new(
                                 gate_req.namespace.as_str(),
-                                verb,
+                                "config.lock",
                                 EventKind::ConfigLocked,
                                 SubstrateKind::Event,
                                 format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                             )
                             .with_payload(payload);
-                            append_audit_event_best_effort(store, storage_event, verb).await;
+                            append_audit_event_best_effort(store, storage_event, "config.lock")
+                                .await;
                         }
                     }
                 }
