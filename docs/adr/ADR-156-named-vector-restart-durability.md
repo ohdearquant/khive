@@ -21,9 +21,11 @@ questions that matter operationally: which parts survive a restart, which are re
 guarantees results are identical before and after, and what the read path does when a stored
 hit's backing artifact has since disappeared.
 
-These semantics were exercised end to end (a serving process was restarted between indexing
-and search, and between training and inference, with exact-equality checks on the results) but
-the contract lives only in test code. This record states it normatively.
+Restart semantics have been exercised end to end for the preference-model and blob lifecycle
+(a serving process restarted between training and inference, with exact-equality checks on the
+results). The named-vector reopen path — index, restart, search, exact hit and score equality —
+is not yet covered by such a test; for that path this record states the intended contract, and
+acceptance of this ADR gates on a persistent reopen test with exact hit and score assertions.
 
 ## Decision
 
@@ -41,18 +43,25 @@ table. Existing vectors are untouched and remain queryable under their original 
 Upgrades are therefore additive: old and new spaces coexist, and retiring an old space is an
 explicit curation act, not a side effect of reconfiguration.
 
-**D3 — Model state is process-local and reloads from configuration at boot.** Inference
-weights are not stored in the database. A restarted process reloads the checkpoint from its
-configured path, and the identity fields that participate in the fingerprint (revision,
+**D3 — Model state is process-local and reloads from configuration on first use after a
+restart.** Inference weights are not stored in the database. A restarted process reloads the
+checkpoint from its configured path lazily, when the first verb needing it runs; the first
+request after a restart therefore pays the load, and a load failure surfaces on that request
+rather than at boot. The identity fields that participate in the fingerprint (revision,
 checkpoint digest) guarantee that a _different_ checkpoint at the same path cannot silently
 write into the old space — it lands in a new one per D2.
 
 **D4 — Restart exactness for search.** For an unchanged store and an unchanged descriptor
-identity, a search issued after a restart returns the same hits with the same scores as before
-it. This follows from D1–D3 plus the retrieval design: exact brute-force cosine over the named
-table with deterministic score conversion, no approximate index whose in-memory build state
-could differ across processes. Consumers may rely on it; a violation is a defect, not drift to
-be tolerated.
+identity, a search issued after a restart returns the same scores as before it, and the same
+hits wherever the ordering is total. This follows from D1–D3 plus the retrieval design: exact
+brute-force cosine over the named table with deterministic score conversion, no approximate
+index whose in-memory build state could differ across processes. The known gap in totality:
+the store query orders by distance and truncates at the candidate limit without a tie-break,
+so equal-distance rows at the truncation boundary can produce different hit sets. Full
+same-hits exactness under ties requires a total order (distance, then subject id) applied in
+the store query before the limit; until that lands, consumers may rely on score exactness
+unconditionally and on hit-set exactness only in the absence of boundary ties. A violation
+outside that carve-out is a defect, not drift to be tolerated.
 
 **D5 — Read-path orphan policy: skip, do not error, never re-rank.** A hit whose backing
 artifact bytes are no longer resolvable (blob removed, entity soft-deleted) is dropped during

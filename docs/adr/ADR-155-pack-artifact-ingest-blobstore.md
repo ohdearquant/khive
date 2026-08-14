@@ -36,7 +36,11 @@ Derived representations (thumbnails, embeddings, normalized forms) never replace
 bytes' identity; they are separate records that reference it.
 
 **D2 — Deduplication is by ContentRef, before entity creation.** Ingest queries for an existing
-entity carrying the same `content_ref` and returns it instead of creating a duplicate. The
+entity carrying the same `content_ref` and returns it instead of creating a duplicate. This
+carries the ADR-148 idempotence boundary unchanged: the lookup-before-create critical section
+is process-wide, so the one-entity guarantee holds within a single Khive process; separate
+processes can still race and create duplicates because `entities.content_ref` is indexed but
+not unique. This record does not tighten that boundary. The
 store's own idempotent put (identical content, same ref, no re-write) handles the byte layer;
 this decision extends the same idempotence to the entity layer.
 
@@ -46,8 +50,13 @@ integrity error surfaced to the caller, never silently tolerated. Digest verific
 the read path by design: that is where the bytes are already in hand.
 
 **D4 — Source reads are bounded.** Reads of stored source bytes carry an explicit size bound
-chosen by the pack for its media class. A blob exceeding the bound is a typed refusal, not an
-unbounded allocation.
+chosen by the pack for its media class. Under the current `BlobStore` capability the bound is
+enforced by a size preflight before the read and a length check after it; the read itself
+returns a whole buffer, so a store whose object grows between preflight and read is detected
+only after the allocation. An over-bound object is a typed refusal in either case. A
+backend-enforced bounded or streaming read, which would close the preflight/read race and make
+the refusal precede allocation, is a `khive-storage` capability extension deferred to its own
+record.
 
 **D5 — Absent store fails closed with a typed refusal.** A pack verb that requires the
 BlobStore returns a typed unconfigured error naming the missing capability when no store is
@@ -60,8 +69,9 @@ bytes without fetching them (for visual assets: media type and pixel dimensions)
 
 ## Consequences
 
-- Ingest is idempotent end to end: repeated ingest of identical bytes converges on one blob and
-  one entity.
+- Ingest is idempotent end to end within one Khive process: repeated ingest of identical bytes
+  converges on one blob and one entity. Across processes the blob layer still converges (the
+  store's put is content-addressed), but entity creation can race per the ADR-148 boundary.
 - Corruption anywhere between write and read is detected at the read seam, the only place it
   can be detected cheaply.
 - A pack's artifact entities remain interpretable from the graph alone (D6), while the bytes
