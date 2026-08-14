@@ -8,15 +8,28 @@
 //! or total-byte limit; a per-clone size cap rejects an oversized
 //! clone/fetch before it enters the addressable cache slot. A per-`cache_key`
 //! advisory `slot_lock` (issue #805) serializes each slot's check-and-mutate
-//! span. See crates/khive-pack-git/docs/api/cache.md for the full design
-//! rationale (ownership-proof eviction, staging-then-move installation,
-//! per-clone cap enforcement, slot serialization).
+//! span.
+//!
+//! Fresh clones stage under a private namespace this cache owns outright
+//! (`<root>/.khive-git-staging/`), never directly in the (possibly shared,
+//! possibly `KHIVE_GIT_DIGEST_SCRATCH_ROOT`-overridden) cache root -- a
+//! staging entry's shape can never collide with unrelated operator data
+//! there. Each staging entry holds an exclusive advisory lock
+//! (`std::fs::File::try_lock`) on a file inside it for the whole span of the
+//! clone; opening the cache root reclaims a staging entry only once that
+//! lock is provably free (killed-clone residue no in-process handler could
+//! remove), never merely because it looks old -- a legitimate clone still
+//! running holds the lock regardless of how long it has been running. See
+//! crates/khive-pack-git/docs/api/cache.md for the full design rationale
+//! (ownership-proof eviction, staging-then-move installation, liveness-based
+//! crash-residue reaping, fd-verified owned-slot deletion, per-clone cap
+//! enforcement, slot serialization).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use uuid::Uuid;
 
@@ -27,6 +40,27 @@ pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_CLONE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 const MARKER_FILE: &str = ".khive-last-used";
+/// Private subdirectory of the cache root this crate owns outright: fresh
+/// clones stage here (never directly in `root`), and an owned cache slot's
+/// deletion is routed through here too (unix). Never treated as a cache
+/// slot itself -- its name is not `cache_key`-shaped.
+const STAGING_NAMESPACE: &str = ".khive-git-staging";
+/// Advisory-lock file inside one staging entry, held for the whole span of
+/// the clone that owns it. See the module doc.
+const STAGING_LOCK_FILE: &str = ".khive-staging.lock";
+/// Marker file recording when the namespace was last swept, so
+/// `prepare_cache_root` does a full scan+liveness pass at most once per
+/// `REAP_THROTTLE_INTERVAL` instead of on every cache mutation.
+const REAP_SWEEP_MARKER: &str = ".khive-last-swept";
+const REAP_THROTTLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Belt-and-suspenders fallback for a staging entry that crashed before it
+/// could write its own lock file (the brief mkdir-then-open-lock gap at the
+/// very start of `install_fresh_clone`) -- not the primary staleness
+/// signal, which is the lock itself. This cannot false-positive against a
+/// long-running live clone: a live clone writes its lock file within
+/// microseconds of creating its staging directory, well before `git clone`
+/// itself ever starts.
+const STALE_STAGING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug)]
 pub enum CacheError {
@@ -220,7 +254,7 @@ fn finish_mutation(root: &Path, outcome: &Result<PathBuf, CacheError>) {
 }
 
 fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
-    std::fs::create_dir_all(root)?;
+    prepare_cache_root(root)?;
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -263,6 +297,7 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
 }
 
 fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
+    prepare_cache_root(root)?;
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -308,7 +343,7 @@ pub(crate) fn reclone(canonical_url: &str) -> Result<PathBuf, CacheError> {
 }
 
 fn reclone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheError> {
-    std::fs::create_dir_all(root)?;
+    prepare_cache_root(root)?;
     let key = cache_key(canonical_url);
     let lock = slot_lock(&key);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -322,6 +357,21 @@ fn reclone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, CacheErro
     Ok(repo_dir)
 }
 
+fn staging_namespace_path(root: &Path) -> PathBuf {
+    root.join(STAGING_NAMESPACE)
+}
+
+/// Create (if needed) and return the private staging namespace: a
+/// subdirectory of `root` this cache owns outright, never shared with
+/// operator data even under a broad `KHIVE_GIT_DIGEST_SCRATCH_ROOT`
+/// override. Fresh clones stage here; an owned slot's deletion is routed
+/// through here too (unix).
+fn ensure_staging_namespace(root: &Path) -> std::io::Result<PathBuf> {
+    let path = staging_namespace_path(root);
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
 /// Shared staging-clone-then-move path for both a first-time `ensure_clone`
 /// and a `reclone` repair. See
 /// crates/khive-pack-git/docs/api/cache.md#install_fresh_clone.
@@ -331,30 +381,66 @@ fn install_fresh_clone(
     repo_dir: &Path,
     cap: u64,
 ) -> Result<(), CacheError> {
-    let staging_dir = root.join(format!(".staging-{}", Uuid::new_v4()));
+    let namespace_root = ensure_staging_namespace(root)
+        .map_err(|e| io_err("install_fresh_clone: staging namespace", root, e))?;
+    let wrapper = namespace_root.join(Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&wrapper)
+        .map_err(|e| io_err("install_fresh_clone: create staging wrapper", &wrapper, e))?;
+
+    let lock_path = wrapper.join(STAGING_LOCK_FILE);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&wrapper);
+            io_err("install_fresh_clone: open staging lock", &lock_path, e)
+        })?;
+    // Held for this whole span: while this handle (or any dup of its
+    // underlying fd) stays open, `reap_stale_staging`'s `try_lock` on this
+    // same path observes contention and treats this wrapper as live
+    // regardless of its age. A process kill (including SIGKILL) closes
+    // every fd the kernel holds for it and releases the lock automatically
+    // -- exactly the abandoned-staging signal the reaper needs, and never a
+    // false positive against a clone that is merely slow.
+    lock_file.try_lock().map_err(|e| {
+        let _ = std::fs::remove_dir_all(&wrapper);
+        io_err(
+            "install_fresh_clone: lock staging wrapper",
+            &lock_path,
+            std::io::Error::from(e),
+        )
+    })?;
+
+    let staging_dir = wrapper.join("repo");
     clone(canonical_url, &staging_dir).inspect_err(|_| {
         // `git clone` can create and partially populate the destination
-        // before failing (network drop, auth failure, bad ref) -- clean
-        // it up so a run of failures doesn't leave `.staging-*` litter
-        // under the scratch root. `evict_lru` deliberately never touches
-        // non-owned names (`is_owned_entry`), so nothing else would ever
-        // reclaim this on its own.
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        // before failing (network drop, auth failure, bad ref) -- clean up
+        // the whole wrapper so a run of failures doesn't leave staging
+        // litter under the private namespace.
+        let _ = std::fs::remove_dir_all(&wrapper);
     })?;
     let size = dir_size(&staging_dir).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        let _ = std::fs::remove_dir_all(&wrapper);
     })?;
     if size > cap {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        let _ = std::fs::remove_dir_all(&wrapper);
         return Err(CacheError::CloneTooLarge { bytes: size, cap });
     }
     touch(&staging_dir).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        let _ = std::fs::remove_dir_all(&wrapper);
     })?;
     std::fs::rename(&staging_dir, repo_dir).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        let _ = std::fs::remove_dir_all(&wrapper);
         CacheError::Io(e)
     })?;
+    // The wrapper now contains only the lock file; drop the lock after
+    // removal is queued so a concurrent reaper never observes a
+    // still-locked-but-empty wrapper as a decision point (it simply won't
+    // see it at all once removed).
+    let _ = std::fs::remove_dir_all(&wrapper);
+    drop(lock_file);
     Ok(())
 }
 
@@ -367,8 +453,224 @@ fn remove_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), CacheError> {
     if repo_dir.parent() != Some(root) || !is_owned_entry(repo_dir) {
         return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
     }
-    remove_dir_all_retrying(repo_dir).map_err(CacheError::Io)?;
-    Ok(())
+    delete_verified_owned_entry(root, repo_dir)
+}
+
+/// Race-resistant deletion of an owned cache slot living in the (possibly
+/// shared, possibly `KHIVE_GIT_DIGEST_SCRATCH_ROOT`-overridden) cache root.
+/// `remove_owned_entry` already checked ownership by pathname above; on
+/// unix this re-verifies it against an `openat(O_NOFOLLOW)`-opened handle
+/// bound to the inode at that name right now, then moves it into the
+/// private staging namespace with a single fd-relative `renameat` call
+/// before the (possibly slow, for a multi-GB clone) recursive delete runs.
+/// This shrinks the pathname-TOCTOU window an external writer racing the
+/// shared root could exploit from "however long the recursive delete
+/// takes" down to the handful of syscalls between the `openat` and the
+/// `renameat`; a final fd-vs-renamed-entry identity check (inode never
+/// changes across a same-filesystem rename) confirms the move carried
+/// exactly the directory that was validated. See
+/// crates/khive-pack-git/docs/api/cache.md#delete_verified_owned_entry.
+#[cfg(unix)]
+fn delete_verified_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), CacheError> {
+    let name = repo_dir
+        .file_name()
+        .ok_or_else(|| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
+    let root_fd = unix_fd::open_dir_nofollow(root)
+        .map_err(|e| io_err("delete_verified_owned_entry: open root", root, e))?;
+    let target_fd = unix_fd::openat_dir_nofollow(&root_fd, name)
+        .map_err(|_| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
+    if !is_owned_entry_via_fd(&target_fd) {
+        return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
+    }
+    let target_id = unix_fd::fstat(&target_fd)
+        .map_err(|e| io_err("delete_verified_owned_entry: fstat target", repo_dir, e))?;
+
+    let namespace_root = ensure_staging_namespace(root)
+        .map_err(|e| io_err("delete_verified_owned_entry: staging namespace", root, e))?;
+    let namespace_fd = unix_fd::open_dir_nofollow(&namespace_root).map_err(|e| {
+        io_err(
+            "delete_verified_owned_entry: open staging namespace",
+            &namespace_root,
+            e,
+        )
+    })?;
+    let trash_name = format!("trash-{}", Uuid::new_v4());
+    let trash_name_os = std::ffi::OsStr::new(&trash_name);
+    unix_fd::renameat(&root_fd, name, &namespace_fd, trash_name_os).map_err(|e| {
+        io_err(
+            "delete_verified_owned_entry: renameat to private namespace",
+            repo_dir,
+            e,
+        )
+    })?;
+
+    // `target_fd` still refers to the same inode after the rename (a file
+    // descriptor tracks the open file, not its name). Compare it against
+    // what `renameat` actually landed under `trash_name` to confirm the
+    // move carried exactly the directory validated above, not something
+    // that slipped into `name`'s place in the syscalls between the checks
+    // above and the `renameat` call.
+    let moved_path = namespace_root.join(&trash_name);
+    let moved_id = unix_fd::fstatat_nofollow(&namespace_fd, trash_name_os).map_err(|e| {
+        io_err(
+            "delete_verified_owned_entry: fstat moved entry",
+            &moved_path,
+            e,
+        )
+    })?;
+    if (moved_id.st_dev, moved_id.st_ino) != (target_id.st_dev, target_id.st_ino) {
+        return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
+    }
+
+    remove_dir_all_retrying(&moved_path).map_err(CacheError::Io)
+}
+
+#[cfg(not(unix))]
+fn delete_verified_owned_entry(_root: &Path, repo_dir: &Path) -> Result<(), CacheError> {
+    remove_dir_all_retrying(repo_dir).map_err(CacheError::Io)
+}
+
+/// fd-relative mirror of `is_owned_entry`: proves ownership against an
+/// already-opened, `O_NOFOLLOW`-bound handle instead of re-resolving
+/// `path.join(...)` by name. See crates/khive-pack-git/docs/api/cache.md#is_owned_entry.
+#[cfg(unix)]
+fn is_owned_entry_via_fd(target_fd: &std::fs::File) -> bool {
+    let git_is_directory = unix_fd::fstatat_nofollow(target_fd, std::ffi::OsStr::new(".git"))
+        .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFDIR);
+    let marker_is_regular_file =
+        unix_fd::fstatat_nofollow(target_fd, std::ffi::OsStr::new(MARKER_FILE))
+            .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG);
+    git_is_directory && marker_is_regular_file
+}
+
+/// `openat`/`fstatat`/`renameat` primitives bound to an already-opened
+/// directory descriptor rather than a pathname, mirroring the
+/// `O_NOFOLLOW`/`fstat` idiom used in `khive-db`'s WAL-pin sidecar and
+/// `khive-vamana`'s external-id sidecar: every operation after the initial
+/// `open`/`openat` is relative to a handle the kernel resolved once, immune
+/// to the original pathname being swapped out from under it afterward.
+#[cfg(unix)]
+mod unix_fd {
+    use std::ffi::{CString, OsStr};
+    use std::fs;
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::path::Path;
+
+    fn cstring(component: &OsStr) -> io::Result<CString> {
+        CString::new(component.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path component contains a NUL byte",
+            )
+        })
+    }
+
+    /// Open `path` as a directory, refusing to follow a symlink at the
+    /// final component. The returned handle is bound to that exact inode:
+    /// every later `*at()` call against it is immune to `path` being
+    /// replaced out from under it afterward.
+    pub(super) fn open_dir_nofollow(path: &Path) -> io::Result<fs::File> {
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        // SAFETY: `c_path` is NUL-terminated and lives for the duration of
+        // the call; `O_NOFOLLOW` refuses a symlink at the final component
+        // and `O_DIRECTORY` refuses a non-directory.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by a successful `open` and is
+        // owned here.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    /// `openat(dir, name, O_DIRECTORY | O_NOFOLLOW)` — open the single path
+    /// component `name` as a directory relative to `dir`'s own descriptor,
+    /// refusing a symlink at that component.
+    pub(super) fn openat_dir_nofollow(dir: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+        let c_name = cstring(name)?;
+        // SAFETY: `dir.as_raw_fd()` is a live directory descriptor;
+        // `c_name` is NUL-terminated for the duration of the call.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by a successful `openat`.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    /// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)` — the identity of `name`
+    /// as it stands right now, resolved relative to `dir`'s own descriptor
+    /// rather than a fresh pathname walk from the filesystem root.
+    pub(super) fn fstatat_nofollow(dir: &fs::File, name: &OsStr) -> io::Result<libc::stat> {
+        let c_name = cstring(name)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `dir.as_raw_fd()` is live; `c_name` is NUL-terminated;
+        // `st` is a valid out-param for the duration of the call.
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(st)
+    }
+
+    pub(super) fn fstat(file: &fs::File) -> io::Result<libc::stat> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `file.as_raw_fd()` is live; `st` is a valid out-param for
+        // the duration of the call.
+        let rc = unsafe { libc::fstat(file.as_raw_fd(), &mut st) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(st)
+    }
+
+    /// `renameat(from, name, to, to_name)` — move `name` out of `from` and
+    /// into `to` under `to_name`, both endpoints fd-relative so neither is
+    /// re-resolved by pathname at the moment of the move.
+    pub(super) fn renameat(
+        from: &fs::File,
+        name: &OsStr,
+        to: &fs::File,
+        to_name: &OsStr,
+    ) -> io::Result<()> {
+        let c_name = cstring(name)?;
+        let c_to_name = cstring(to_name)?;
+        // SAFETY: both fds are live directory descriptors; both C strings
+        // are NUL-terminated for the duration of the call.
+        let rc = unsafe {
+            libc::renameat(
+                from.as_raw_fd(),
+                c_name.as_ptr(),
+                to.as_raw_fd(),
+                c_to_name.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// Retries `remove_dir_all` a few times before giving up — see
@@ -515,6 +817,221 @@ fn io_err(op: &str, path: &Path, e: std::io::Error) -> CacheError {
         e.kind(),
         format!("{op} {}: {e}", path.display()),
     ))
+}
+
+/// Create/open the daemon-owned cache root and the private staging
+/// namespace inside it. Reclaims abandoned staging directories a killed
+/// clone could not clean up itself -- at most once per
+/// `REAP_THROTTLE_INTERVAL`, since every public cache mutation runs this
+/// before its own work and a full liveness pass over every staging entry on
+/// every single mutation is unbounded latency for no benefit once the
+/// namespace is already clean.
+fn prepare_cache_root(root: &Path) -> Result<(), CacheError> {
+    std::fs::create_dir_all(root)
+        .map_err(|e| io_err("prepare_cache_root: create_dir_all", root, e))?;
+    let namespace_root = ensure_staging_namespace(root)
+        .map_err(|e| io_err("prepare_cache_root: create staging namespace", root, e))?;
+    if !reap_due(&namespace_root)? {
+        return Ok(());
+    }
+    let removed = reap_stale_staging(root, SystemTime::now(), STALE_STAGING_AGE)?;
+    mark_reap_swept(&namespace_root);
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            root = %root.display(),
+            "reclaimed abandoned git-digest staging directories"
+        );
+    }
+    Ok(())
+}
+
+/// Whether enough time has passed since the last sweep to run another one.
+/// A missing marker (first call ever, or a namespace a previous sweep just
+/// emptied without leaving the marker readable) always sweeps.
+fn reap_due(namespace_root: &Path) -> Result<bool, CacheError> {
+    let marker = namespace_root.join(REAP_SWEEP_MARKER);
+    match std::fs::metadata(&marker).and_then(|m| m.modified()) {
+        Ok(last) => {
+            let elapsed = SystemTime::now()
+                .duration_since(last)
+                .unwrap_or(Duration::MAX);
+            Ok(elapsed >= REAP_THROTTLE_INTERVAL)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(io_err("prepare_cache_root: read sweep marker", &marker, e)),
+    }
+}
+
+/// Best-effort: a failure to record the sweep marker only costs an extra
+/// sweep next time, never correctness.
+fn mark_reap_swept(namespace_root: &Path) {
+    let marker = namespace_root.join(REAP_SWEEP_MARKER);
+    if let Err(e) = std::fs::write(&marker, b"") {
+        tracing::warn!(
+            error = %e,
+            "failed to record git-digest staging sweep marker"
+        );
+    }
+}
+
+/// Exact ownership proof for a staging wrapper: a canonical lowercase
+/// hyphenated UUID, a direct child of the private staging namespace.
+fn is_staging_wrapper_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    Uuid::parse_str(name).is_ok_and(|id| id.to_string() == name)
+}
+
+/// Deletion residue owned by this cache: `delete_verified_owned_entry`
+/// renames a doomed cache slot to `trash-<canonical UUID>` inside the
+/// private namespace before recursively deleting it. A kill in that window
+/// leaves the renamed directory behind, so the sweep must admit these names
+/// too or the deletion path reintroduces the unreclaimable-residue class
+/// this module exists to close. Trash entries never carry a staging lock
+/// file, so `staging_liveness` judges them by the conservative age fence
+/// alone; an entry whose recursive delete is still in flight is protected
+/// by that fence, and a concurrent double-delete resolves benignly because
+/// `remove_staging_wrapper` tolerates `NotFound`.
+fn is_trash_residue_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_prefix("trash-")
+        .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok_and(|id| id.to_string() == suffix))
+}
+
+/// Liveness verdict for one staging wrapper.
+enum StagingLiveness {
+    /// A live handle holds the wrapper's lock (or it has not existed long
+    /// enough yet for a missing lock file to mean anything) -- must survive
+    /// regardless of age.
+    Live,
+    /// No live handle holds the lock: either `try_lock` acquired it
+    /// (nothing else has it open), or the lock file was never written and
+    /// the wrapper is old enough that it cannot be a legitimate in-flight
+    /// clone.
+    Abandoned,
+}
+
+/// Liveness, not age, is the deletion criterion (see the module doc). A
+/// wrapper whose lock file exists is judged purely by whether `try_lock`
+/// can acquire it -- an active clone running past `max_age` still holds the
+/// lock and survives; a killed clone's lock is released by the kernel the
+/// instant the process dies and is reaped on the very next sweep,
+/// regardless of how fresh its mtime looks. A missing lock file (the
+/// narrow crash-before-lock-file window) falls back to the same
+/// conservative age fence the old age-only check used.
+fn staging_liveness(
+    wrapper: &Path,
+    now: SystemTime,
+    max_age: Duration,
+) -> Result<StagingLiveness, CacheError> {
+    let lock_path = wrapper.join(STAGING_LOCK_FILE);
+    match std::fs::OpenOptions::new().write(true).open(&lock_path) {
+        Ok(lock_file) => match lock_file.try_lock() {
+            Ok(()) => Ok(StagingLiveness::Abandoned),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(StagingLiveness::Live),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(io_err("reap_stale_staging: try_lock", &lock_path, e))
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let modified = std::fs::symlink_metadata(wrapper)
+                .and_then(|m| m.modified())
+                .map_err(|e| io_err("reap_stale_staging: wrapper mtime", wrapper, e))?;
+            match now.duration_since(modified) {
+                Ok(age) if age > max_age => Ok(StagingLiveness::Abandoned),
+                _ => Ok(StagingLiveness::Live),
+            }
+        }
+        Err(e) => Err(io_err(
+            "reap_stale_staging: open staging lock",
+            &lock_path,
+            e,
+        )),
+    }
+}
+
+/// Remove a staging wrapper found abandoned by `staging_liveness`. The
+/// wrapper lives inside the private namespace this cache owns outright, so
+/// unlike an owned cache slot in the shared root (`delete_verified_owned_entry`)
+/// there is no external-writer exposure to harden against here -- nothing
+/// but this cache ever creates entries under `STAGING_NAMESPACE`.
+fn remove_staging_wrapper(namespace_root: &Path, name: &std::ffi::OsStr) -> Result<(), CacheError> {
+    match remove_dir_all_retrying(&namespace_root.join(name)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(CacheError::Io(e)),
+    }
+}
+
+/// Reclaim abandoned staging wrappers and interrupted-deletion residue
+/// under the private namespace. A deletion candidate must be a real
+/// directory (never a symlink, file, or nested path) whose name is exactly
+/// a canonical lowercase hyphenated UUID (clone wrapper) or
+/// `trash-<canonical UUID>` (deletion residue), and must be judged
+/// `Abandoned` by `staging_liveness`. `now`/`max_age` are explicit so the
+/// fallback age boundary is deterministic in tests.
+fn reap_stale_staging(
+    root: &Path,
+    now: SystemTime,
+    max_age: Duration,
+) -> Result<usize, CacheError> {
+    let namespace_root = staging_namespace_path(root);
+    let read_dir = match std::fs::read_dir(&namespace_root) {
+        Ok(read_dir) => read_dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(io_err(
+                "reap_stale_staging: read_dir namespace",
+                &namespace_root,
+                e,
+            ));
+        }
+    };
+    let mut removed = 0usize;
+
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(io_err(
+                    "reap_stale_staging: read_dir entry",
+                    &namespace_root,
+                    e,
+                ));
+            }
+        };
+        let name = entry.file_name();
+        if !is_staging_wrapper_name(&name) && !is_trash_residue_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if path.parent() != Some(namespace_root.as_path()) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err("reap_stale_staging: stat", &path, e)),
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+
+        match staging_liveness(&path, now, max_age)? {
+            StagingLiveness::Live => continue,
+            StagingLiveness::Abandoned => {
+                remove_staging_wrapper(&namespace_root, &name)?;
+                removed += 1;
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 fn touch(repo_dir: &Path) -> Result<(), CacheError> {
@@ -721,6 +1238,31 @@ mod tests {
         p
     }
 
+    /// Build a staging wrapper directly (bypassing `install_fresh_clone`)
+    /// under the private namespace, optionally with a lock file held open
+    /// by the returned guard (drop the guard to simulate the owning
+    /// process dying / releasing the lock).
+    fn make_staging_wrapper(root: &Path, held: bool) -> (PathBuf, Uuid, Option<std::fs::File>) {
+        let namespace_root = ensure_staging_namespace(root).expect("staging namespace");
+        let id = Uuid::new_v4();
+        let wrapper = namespace_root.join(id.to_string());
+        std::fs::create_dir_all(wrapper.join("repo")).expect("create staging wrapper");
+        let held_file = if held {
+            let lock_path = wrapper.join(STAGING_LOCK_FILE);
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .expect("open lock file");
+            f.try_lock().expect("acquire lock");
+            Some(f)
+        } else {
+            None
+        };
+        (wrapper, id, held_file)
+    }
+
     fn slot_lock_registry_len() -> usize {
         SLOT_LOCKS
             .lock()
@@ -735,7 +1277,174 @@ mod tests {
             .capacity()
     }
 
-    /// A `git clone` failure must not leave a `.staging-<uuid>` dir behind.
+    #[test]
+    fn stale_staging_sweep_removes_an_abandoned_wrapper_lacking_a_lock_file_once_old() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (wrapper, _id, _held) = make_staging_wrapper(root.path(), false);
+        std::fs::create_dir_all(wrapper.join("repo/partial.git/objects")).expect("nested payload");
+        std::fs::write(wrapper.join("repo/partial.git/objects/pack"), b"partial")
+            .expect("write orphan payload");
+        let observed_mtime = std::fs::symlink_metadata(&wrapper)
+            .expect("wrapper metadata")
+            .modified()
+            .expect("wrapper mtime");
+
+        let removed = reap_stale_staging(
+            root.path(),
+            observed_mtime + std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("reap stale staging directory");
+
+        assert_eq!(removed, 1);
+        assert!(
+            !wrapper.exists(),
+            "abandoned staging payload must be reclaimed"
+        );
+    }
+
+    /// Blocking-finding acceptance test: a wrapper whose lock is still held
+    /// by a live handle must survive the sweep no matter how far past the
+    /// age fence it is -- age alone must never be the deletion criterion.
+    #[test]
+    fn stale_staging_sweep_preserves_a_wrapper_whose_lock_is_still_held_past_the_age_fence() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (wrapper, _id, held) = make_staging_wrapper(root.path(), true);
+        let _held = held.expect("lock guard");
+
+        let far_future = SystemTime::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60);
+        let removed =
+            reap_stale_staging(root.path(), far_future, std::time::Duration::from_secs(1))
+                .expect("sweep around a live wrapper");
+
+        assert_eq!(removed, 0);
+        assert!(
+            wrapper.exists(),
+            "a wrapper whose lock is still held by a live process must survive, \
+             even a full year past the age fence"
+        );
+    }
+
+    /// The flip side of the test above: liveness, not freshness, is what
+    /// matters. An abandoned wrapper (its lock file exists but nothing
+    /// holds the lock) is reclaimed even when it was created moments ago.
+    #[test]
+    fn stale_staging_sweep_removes_an_abandoned_wrapper_even_when_fresh() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (wrapper, _id, held) = make_staging_wrapper(root.path(), true);
+        // Simulate the owning process dying: release the lock (dropping the
+        // handle is exactly what the kernel does on process exit/kill).
+        drop(held);
+
+        let removed = reap_stale_staging(
+            root.path(),
+            SystemTime::now(),
+            std::time::Duration::from_secs(24 * 60 * 60),
+        )
+        .expect("sweep an abandoned-but-fresh wrapper");
+
+        assert_eq!(removed, 1);
+        assert!(
+            !wrapper.exists(),
+            "an abandoned wrapper must be reclaimed even when it is not old"
+        );
+    }
+
+    #[test]
+    fn staging_sweep_preserves_foreign_nested_and_nondirectory_entries_even_when_stale() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let namespace_root = ensure_staging_namespace(root.path()).expect("namespace");
+
+        let live_id = Uuid::new_v4();
+        let live_wrapper = namespace_root.join(live_id.to_string());
+        std::fs::create_dir_all(&live_wrapper).expect("create live wrapper");
+
+        let foreign = namespace_root.join("not-a-canonical-uuid");
+        std::fs::create_dir_all(&foreign).expect("create foreign-named dir");
+        let staging_file = namespace_root.join(Uuid::new_v4().to_string());
+        std::fs::write(&staging_file, b"operator file").expect("write uuid-shaped file");
+        let nested = namespace_root
+            .join("operator-owned")
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&nested).expect("create nested uuid-shaped dir");
+
+        // Every entry above is missing its lock file, so the fallback age
+        // check applies -- drive `now` far enough past `max_age` that every
+        // candidate would be reclaimed by age alone. Only the containment,
+        // name-shape, and type checks may save them (regression coverage
+        // for the bug where a future-dated fixture never reached those
+        // checks at all).
+        let far_future = SystemTime::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60);
+        let removed =
+            reap_stale_staging(root.path(), far_future, std::time::Duration::from_secs(1))
+                .expect("scan namespace entries");
+
+        assert_eq!(
+            removed, 1,
+            "only the canonical-UUID live wrapper is reclaimed"
+        );
+        assert!(!live_wrapper.exists());
+        assert!(foreign.is_dir(), "a non-UUID name is not staging-shaped");
+        assert!(staging_file.is_file(), "the sweep removes directories only");
+        assert!(
+            nested.is_dir(),
+            "the sweep never descends below the namespace root"
+        );
+    }
+
+    /// An interrupted `delete_verified_owned_entry` leaves its renamed
+    /// `trash-<uuid>` slot behind with no lock file. The sweep must reclaim
+    /// it once past the age fence (or the deletion path reintroduces the
+    /// unreclaimable-residue class this module closes), must preserve it
+    /// while fresh (an in-flight recursive delete), and must never touch a
+    /// trash-prefixed name whose suffix is not a canonical UUID.
+    #[test]
+    fn staging_sweep_reclaims_old_trash_residue_but_preserves_fresh_and_lookalikes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let namespace_root = ensure_staging_namespace(root.path()).expect("namespace");
+
+        let old_trash = namespace_root.join(format!("trash-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(old_trash.join("repo/.git/objects")).expect("old trash payload");
+        let lookalike = namespace_root.join("trash-not-a-canonical-uuid");
+        std::fs::create_dir_all(&lookalike).expect("create trash lookalike");
+        let observed_mtime = std::fs::symlink_metadata(&old_trash)
+            .expect("trash metadata")
+            .modified()
+            .expect("trash mtime");
+
+        let removed = reap_stale_staging(
+            root.path(),
+            observed_mtime + std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("reap trash residue");
+        assert_eq!(removed, 1, "only the canonical trash residue is reclaimed");
+        assert!(!old_trash.exists(), "aged trash residue must be reclaimed");
+        assert!(
+            lookalike.is_dir(),
+            "a non-canonical trash suffix is not cache-owned"
+        );
+
+        let fresh_trash = namespace_root.join(format!("trash-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(fresh_trash.join("repo/.git")).expect("fresh trash payload");
+        let fresh_mtime = std::fs::symlink_metadata(&fresh_trash)
+            .expect("fresh trash metadata")
+            .modified()
+            .expect("fresh trash mtime");
+        let removed = reap_stale_staging(
+            root.path(),
+            fresh_mtime + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("scan fresh trash residue");
+        assert_eq!(removed, 0, "an in-flight deletion must survive the sweep");
+        assert!(
+            fresh_trash.is_dir(),
+            "fresh trash residue is protected by the age fence"
+        );
+    }
+
+    /// A `git clone` failure must not leave a staging wrapper behind.
     #[test]
     fn ensure_clone_cleans_up_staging_dir_on_clone_failure() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -749,15 +1458,16 @@ mod tests {
             "cloning a nonexistent local path must fail: {result:?}"
         );
 
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read scratch root")
+        let namespace_root = staging_namespace_path(dir.path());
+        let leftovers: Vec<_> = std::fs::read_dir(&namespace_root)
+            .expect("read staging namespace")
             .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".staging-"))
+            .map(|e| e.file_name())
+            .filter(|name| is_staging_wrapper_name(name))
             .collect();
         assert!(
             leftovers.is_empty(),
-            "a failed clone must not leave .staging-* directories behind: {leftovers:?}"
+            "a failed clone must not leave staging wrappers behind: {leftovers:?}"
         );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
@@ -1560,6 +2270,48 @@ mod tests {
         );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Blocking-finding regression: an owned cache slot deleted through
+    /// `remove_owned_entry` (LRU eviction / repair over-cap cleanup) must
+    /// actually disappear, and a directory that is NOT a proven owned slot
+    /// -- even one an external writer swapped in at the exact cache-key
+    /// path after the caller last checked -- must never be deleted by the
+    /// fd-verified path either.
+    #[test]
+    fn remove_owned_entry_deletes_a_genuinely_owned_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let owned = make_owned_entry(root, "aaaaaaaaaaaaaaaa", true);
+        std::fs::write(owned.join("payload.txt"), b"clone contents").unwrap();
+
+        remove_owned_entry(root, &owned).expect("remove owned slot");
+        assert!(!owned.exists(), "an owned slot must be deleted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_owned_entry_refuses_a_symlink_planted_at_the_cache_key_path_after_the_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let target = tempfile::tempdir().expect("symlink target");
+        std::fs::write(target.path().join("victim.txt"), b"do not delete me").unwrap();
+
+        // `remove_owned_entry`'s own top-level `is_owned_entry` check cannot
+        // be satisfied by a bare symlink (it is filtered out before this
+        // function is ever reached in the real callers), so this test drives
+        // the fd-verified path directly to prove it independently refuses a
+        // symlink even if some future caller skipped that earlier gate.
+        let repo_dir = root.join("bbbbbbbbbbbbbbbb");
+        std::os::unix::fs::symlink(target.path(), &repo_dir).expect("plant symlink");
+
+        let err = delete_verified_owned_entry(root, &repo_dir)
+            .expect_err("a symlink at the cache-key path must be refused");
+        assert!(matches!(err, CacheError::UnsafeToReplace(_)));
+        assert!(
+            target.path().join("victim.txt").exists(),
+            "the symlink target's contents must survive a refused deletion"
+        );
     }
 
     // ── issue #805: same-key mutation serialization ────────────────────────
