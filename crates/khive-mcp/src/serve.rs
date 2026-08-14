@@ -10567,7 +10567,9 @@ backend = "kg-backend"
                 )
                 .await
                 .expect("list must succeed");
-            let notes = inbox.as_array().expect("list returns an array");
+            let notes = inbox["items"]
+                .as_array()
+                .expect("list returns an items envelope");
             assert_eq!(notes.len(), 1, "only the quarantine notification is stored");
             let quarantined = &notes[0];
             assert_eq!(
