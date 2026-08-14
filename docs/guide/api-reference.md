@@ -1973,8 +1973,10 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ## `git` pack — 4 verbs
 
-Git-history ingester plus a hardened write surface (ADR-088, ADR-088 Amendment 1,
-ADR-108). Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
+Git-history ingester plus a hardened write surface (ADR-088,
+[ADR-088 Amendment 1](../adr/ADR-088-amendment-1-git-digest.md),
+[ADR-088 Amendment 2](../adr/ADR-088-amendment-2-anchor-identity.md), ADR-108).
+Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
 `issue` / `pull_request` note kinds, used by `git.digest` below and by the `kkernel
 git-ingest` CLI (both drive the same underlying ingest core, so ingest enrichment —
 readable `name`s, `Closes #N` reference edges, parent→child commit `precedes` edges —
@@ -1989,12 +1991,12 @@ resolving or auto-creating the repo-anchor
 `project` entity. Bounded and cursor-resumable: call again with the same
 `source`/`project` while the response's `done` field is `false`.
 
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                         |
-| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
-| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                                                                                                            |
-| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                              |
-| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                 |
+| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                 |
+| ----------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected.         |
+| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolution is slug-first through `properties.repo_slug`, then exact and normalized `properties.repo_url` reconciliation; a new anchor is created only when no identity evidence matches. Names are never a match key. See `project_id` and `project_created`. |
+| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                                      |
+| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                         |
 
 ```
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
