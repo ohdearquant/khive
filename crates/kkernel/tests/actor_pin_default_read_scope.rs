@@ -61,6 +61,7 @@ fn base_args(db: &str, actor: Option<&str>, ops: &str, save_file: &str) -> ExecA
         save_file: Some(save_file.to_string()),
         ops_file: None,
         dry_run: false,
+        serial: false,
         atomic: false,
         atomic_max_ops: None,
         strict: true,
