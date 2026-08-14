@@ -450,6 +450,32 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
         .await
         .expect("first judgment");
     assert_eq!(first["created"], true);
+    let judgment_uuid = uuid::Uuid::parse_str(first["judgment_id"].as_str().expect("judgment id"))
+        .expect("judgment uuid");
+    let judgment_event = runtime
+        .events(&event_token)
+        .expect("events")
+        .get_event(judgment_uuid)
+        .await
+        .expect("judgment event read")
+        .expect("judgment event");
+    assert_eq!(judgment_event.verb, "moodboard.judgment_record");
+    assert_eq!(
+        judgment_event.payload["presentation"]["source_rank_shown"],
+        true
+    );
+    assert_eq!(
+        judgment_event.payload["presentation"]["preference_probability_shown"],
+        false
+    );
+    assert_eq!(
+        judgment_event.payload["presentation"]["served_preference_model_id"],
+        serde_json::Value::Null
+    );
+    assert!(
+        judgment_event.payload.get("exposure").is_none(),
+        "durable v1 judgment payload identity must retain its presentation member"
+    );
     let retry = registry
         .dispatch("moodboard.judge", judgment_payload)
         .await

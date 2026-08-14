@@ -1842,7 +1842,6 @@ fn typed_json_batch_preserves_json_form_structural_guards() {
         true
     );
 
-
     let prev = TypedJsonOp {
         tool: "get".to_string(),
         args: serde_json::Map::from_iter([("id".to_string(), json!({"nested": "$prev.id"}))]),
