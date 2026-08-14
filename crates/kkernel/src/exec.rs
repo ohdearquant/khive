@@ -3997,7 +3997,7 @@ id = "lambda:fallback"
                 .await
                 .expect("list must dispatch");
             let resp: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-            resp["results"][0]["result"]
+            resp["results"][0]["result"]["items"]
                 .as_array()
                 .map(|a| a.len())
                 .unwrap_or(0)
@@ -4618,9 +4618,7 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // Agent presentation: `{"results":[{"ok":true,"result":[...],"tool":"list"}],...}`.
-        // The `list` verb returns an array of entities directly under `result`.
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -5237,8 +5235,8 @@ id = "lambda:fallback"
         // if chunk 1's writes had been rolled back or never reached storage, because
         // the bookkeeping would simply agree with itself. Read it back through the
         // same server so the reconciliation record is checked against the database
-        // it describes. The requested limit stays under the entity list cap, so the
-        // handler returns a bare array rather than a clamp-wrapped object.
+        // it describes. The stable list contract wraps rows in `items` whether or
+        // not the requested limit reaches the entity cap.
         let params = RequestParams {
             ops: r#"list(kind="concept", limit=200)"#.to_string(),
             presentation: None,
@@ -5250,11 +5248,11 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let rows = response["results"][0]["result"]
+        let rows = response["results"][0]["result"]["items"]
             .as_array()
             .unwrap_or_else(|| {
                 panic!(
-                    "read-back must return a bare array under the entity list cap; got {}",
+                    "read-back list result must contain an items array; got {}",
                     response["results"][0]["result"]
                 )
             });
@@ -5336,7 +5334,10 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(response["results"][0]["result"], serde_json::json!([]));
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
@@ -5736,7 +5737,7 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -7232,7 +7233,7 @@ backend = "sessions"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -7794,7 +7795,10 @@ backend = "sessions"
 
         let server = isolated_server(&db_path);
         let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
-        assert_eq!(response["results"][0]["result"], serde_json::json!([]));
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
@@ -8252,7 +8256,13 @@ backend = "sessions"
             );
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
-            assert_eq!(resp["results"][0]["result"].as_array().unwrap().len(), 0);
+            assert_eq!(
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
         }
 
         // (b) read verb.
@@ -8353,7 +8363,10 @@ backend = "sessions"
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
             assert_eq!(
-                resp["results"][0]["result"].as_array().unwrap().len(),
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
                 0,
                 "no write must have landed for {verb:?}"
             );
@@ -8387,7 +8400,10 @@ backend = "sessions"
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
             assert_eq!(
-                resp["results"][0]["result"].as_array().unwrap().len(),
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
                 0,
                 "no write must have landed for merge"
             );

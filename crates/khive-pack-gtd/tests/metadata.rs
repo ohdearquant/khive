@@ -222,7 +222,9 @@ async fn list_task_exposes_gtd_status_not_row_visibility() {
         .dispatch("list", json!({"kind": "task"}))
         .await
         .expect("list must succeed");
-    let items = list_resp.as_array().expect("list must return array");
+    let items = list_resp["items"]
+        .as_array()
+        .expect("list must return an items envelope");
 
     let statuses: Vec<&str> = items.iter().filter_map(|n| n["status"].as_str()).collect();
 

@@ -100,9 +100,10 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 param_type: "string",
                 required: false,
                 description: "UUID or 8+ hex prefix of the repo-anchor project entity. When \
-                               absent, resolved by matching properties.repo_url or name, or \
-                               created if none is found (see the response's project_id and \
-                               project_created).",
+                               absent, resolved slug-first through properties.repo_slug with \
+                               exact then normalized properties.repo_url reconciliation, or \
+                               created if no identity evidence matches (see the response's \
+                               project_id and project_created). Names are never a match key.",
             },
             ParamDef {
                 name: "max_items",

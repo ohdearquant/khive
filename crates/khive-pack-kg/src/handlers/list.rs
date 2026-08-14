@@ -13,7 +13,8 @@ use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, event_filter_from_params,
     normalize_entity_timestamps, normalize_entity_timestamps_array,
     normalize_event_timestamps_array, parse_relation, reconcile_specific, remap_note_status,
-    resolve_kind_spec, resolve_uuid_async, to_json, validate_entity_type, KindSpec, ListParams,
+    resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json, validate_entity_type, KindSpec,
+    ListParams,
 };
 use crate::KgPack;
 
@@ -25,49 +26,19 @@ fn effective_list_limit(requested: u32, cap: u32) -> u32 {
     requested.min(cap)
 }
 
-fn render_list_response(items: Value, items_key: &str, requested: u32, effective: u32) -> Value {
-    if requested <= effective {
-        return items;
-    }
+fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
     serde_json::json!({
-        items_key: items,
+        "items": items,
         "requested_limit": requested,
         "effective_limit": effective,
-        "limit_clamped": true,
+        "limit_clamped": requested > effective,
     })
 }
 
 fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32) {
-    if requested <= effective {
-        return;
-    }
     response["requested_limit"] = serde_json::json!(requested);
     response["effective_limit"] = serde_json::json!(effective);
-    response["limit_clamped"] = serde_json::json!(true);
-}
-
-/// Wraps a bounded-scan list response with `scan_incomplete: true` when the
-/// scan hit its ceiling before exhausting all matching rows. `render_list_response`
-/// returns a bare array when the requested limit was not clamped, so this
-/// object-ifies the response (under `items_key`) whenever disclosure is needed.
-fn apply_scan_incomplete(
-    response: Value,
-    scan_incomplete: bool,
-    items_key: &str,
-    requested: u32,
-    effective: u32,
-) -> Value {
-    if !scan_incomplete {
-        return response;
-    }
-    let mut response = if response.is_object() {
-        response
-    } else {
-        serde_json::json!({ items_key: response })
-    };
-    response["scan_incomplete"] = Value::Bool(true);
-    add_list_limit_metadata(&mut response, requested, effective);
-    response
+    response["limit_clamped"] = serde_json::json!(requested > effective);
 }
 
 fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
@@ -200,8 +171,23 @@ async fn resolve_message_thread_filter(
     )))
 }
 
-fn note_matches_message_filters(note: &Note, params: &ListParams) -> bool {
+fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
     let properties = note.properties.as_ref();
+    if let Some(wanted) = params.tags.as_deref().filter(|tags| !tags.is_empty()) {
+        let stored = properties
+            .and_then(|value| value.get("tags"))
+            .and_then(Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !tags_match_any(&stored, wanted) {
+            return false;
+        }
+    }
     if let Some(wanted_thread) = params.thread_id.as_deref() {
         let Some(stored) = properties
             .and_then(|value| value.get("thread_id"))
@@ -400,12 +386,16 @@ impl KgPack {
                 };
                 Ok(render_list_response(
                     normalize_entity_timestamps_array(to_json(&entities)?),
-                    "items",
                     requested,
                     limit,
                 ))
             }
             KindSpec::Edge => {
+                if p.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+                    return Err(RuntimeError::InvalidInput(
+                        "tags filter is valid only for entity and note lists".into(),
+                    ));
+                }
                 let source_id = match p.source_id.as_deref() {
                     Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
                     None => None,
@@ -450,12 +440,7 @@ impl KgPack {
                         .runtime
                         .list_edges(token, filter, limit, offset)
                         .await?;
-                    Ok(render_list_response(
-                        to_json(&edges)?,
-                        "items",
-                        requested,
-                        limit,
-                    ))
+                    Ok(render_list_response(to_json(&edges)?, requested, limit))
                 }
             }
             KindSpec::Note { specific } => {
@@ -472,7 +457,8 @@ impl KgPack {
                 }
                 let requested = p.limit.unwrap_or(20);
                 let limit = effective_list_limit(requested, NOTE_LIST_CAP);
-                let has_msg_filter = p.thread_id.is_some()
+                let has_note_filter = p.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+                    || p.thread_id.is_some()
                     || p.direction.is_some()
                     || p.from.is_some()
                     || p.to.is_some()
@@ -483,7 +469,7 @@ impl KgPack {
 
                 if let Some(after_raw) = p.after.as_deref() {
                     let after = parse_after_cursor(after_raw)?;
-                    let (mut notes, next_after, scan_incomplete) = if has_msg_filter {
+                    let (mut notes, next_after, scan_incomplete) = if has_note_filter {
                         let mut collected = Vec::new();
                         let mut raw_after = after;
                         let mut scanned = 0u32;
@@ -510,7 +496,7 @@ impl KgPack {
                             for note in page {
                                 scanned = scanned.saturating_add(1);
                                 last_scanned = Some(note.id);
-                                if note_matches_message_filters(&note, &p) {
+                                if note_matches_list_filters(&note, &p) {
                                     collected.push(note);
                                     if collected.len() >= target {
                                         break;
@@ -575,7 +561,7 @@ impl KgPack {
 
                 let offset = p.offset.unwrap_or(0);
                 let mut scan_incomplete = false;
-                let notes: Vec<_> = if has_msg_filter {
+                let notes: Vec<_> = if has_note_filter {
                     let mut collected: Vec<_> = Vec::new();
                     let mut db_offset: u32 = 0;
                     let target_after_skip = offset as usize + limit as usize;
@@ -595,7 +581,7 @@ impl KgPack {
                             if note.deleted_at.is_some() {
                                 continue;
                             }
-                            if note_matches_message_filters(&note, &p) {
+                            if note_matches_list_filters(&note, &p) {
                                 collected.push(note);
                                 if collected.len() >= target_after_skip {
                                     break;
@@ -614,7 +600,7 @@ impl KgPack {
                         .await?
                 };
 
-                let remapped: Vec<Value> = if has_msg_filter {
+                let remapped: Vec<Value> = if has_note_filter {
                     notes
                         .into_iter()
                         .skip(offset as usize)
@@ -638,24 +624,26 @@ impl KgPack {
                         })
                         .collect()
                 };
-                let response = render_list_response(to_json(&remapped)?, "notes", requested, limit);
-                Ok(apply_scan_incomplete(
-                    response,
-                    scan_incomplete,
-                    "notes",
-                    requested,
-                    limit,
-                ))
+                let mut response = render_list_response(to_json(&remapped)?, requested, limit);
+                if scan_incomplete {
+                    response["scan_incomplete"] = Value::Bool(true);
+                }
+                Ok(response)
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
+                if p.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+                    return Err(RuntimeError::InvalidInput(
+                        "tags filter is valid only for entity and note lists".into(),
+                    ));
+                }
                 if p.after.is_some() {
                     return Err(RuntimeError::InvalidInput(
                         "after cursor pagination is supported only for entity, note, and edge lists"
                             .into(),
                     ));
                 }
-                let requested = p.limit.unwrap_or(100).max(1);
+                let requested = p.limit.unwrap_or(100);
                 let limit = effective_list_limit(requested, EVENT_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
                 let (filter, outcome) = event_filter_from_params(&p)?;
@@ -725,19 +713,15 @@ impl KgPack {
                         .await?;
                     page.items
                 };
-                let response = render_list_response(
+                let mut response = render_list_response(
                     normalize_event_timestamps_array(to_json(&items)?),
-                    "items",
                     requested,
                     limit,
                 );
-                Ok(apply_scan_incomplete(
-                    response,
-                    scan_incomplete,
-                    "items",
-                    requested,
-                    limit,
-                ))
+                if scan_incomplete {
+                    response["scan_incomplete"] = Value::Bool(true);
+                }
+                Ok(response)
             }
         }
     }

@@ -429,7 +429,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.import",
-        description: "Ingest atlas markdown file(s) as atoms with parsed sections",
+        description: "Validate and ingest atlas markdown file(s) with stable path identity",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -437,7 +437,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "path",
                 param_type: "string",
                 required: true,
-                description: "Filesystem path to a markdown file or directory",
+                description: "Filesystem path to a .md file or bounded directory tree",
             },
             ParamDef {
                 name: "format",
@@ -449,7 +449,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "chunk_strategy",
                 param_type: "string",
                 required: false,
-                description: "\"section\" (one section per atom, default) or \"atom\" (entire file as one atom)",
+                description: "\"section\" (atom plus parsed section rows, default) or \"atom\" (whole markdown in one atom, no section rows)",
             },
         ],
     },

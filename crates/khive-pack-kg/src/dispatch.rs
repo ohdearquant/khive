@@ -240,6 +240,12 @@ mod tests {
 
     use super::*;
 
+    fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
+        response["items"]
+            .as_array()
+            .expect("list response must contain an items array")
+    }
+
     /// By-ID get is namespace-agnostic; namespace on the record reflects the creator, not the caller. See `docs/api/namespace-dispatch.md`.
     #[tokio::test]
     async fn kg_create_entity_honors_caller_namespace() {
@@ -321,12 +327,7 @@ mod tests {
             .dispatch("list", json!({ "kind": "entity" }), &registry, &tenant_b)
             .await
             .expect("list must succeed");
-        // list returns a JSON array directly (Vec<Entity> serialized) — not an object with
-        // an "items" key. Panic on any other shape so the assertion is never vacuous.
-        let items: Vec<serde_json::Value> = match list {
-            serde_json::Value::Array(arr) => arr,
-            other => panic!("list must return a JSON array; got: {other:?}"),
-        };
+        let items = list_items(&list);
         assert!(
             items
                 .iter()
@@ -485,11 +486,7 @@ mod tests {
             .dispatch("list", json!({ "kind": "entity" }))
             .await
             .expect("list must succeed");
-        // list returns a JSON array directly (Vec<Entity> serialized).
-        let items: Vec<serde_json::Value> = match list_result {
-            serde_json::Value::Array(arr) => arr,
-            other => panic!("list must return a JSON array; got: {other:?}"),
-        };
+        let items = list_items(&list_result);
 
         let ids: Vec<&str> = items
             .iter()
@@ -557,10 +554,7 @@ mod tests {
             .dispatch("list", json!({ "kind": "entity" }))
             .await
             .expect("list must succeed");
-        let items: Vec<serde_json::Value> = match list_result {
-            serde_json::Value::Array(arr) => arr,
-            other => panic!("list must return a JSON array; got: {other:?}"),
-        };
+        let items = list_items(&list_result);
         let ids: Vec<&str> = items
             .iter()
             .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
@@ -621,10 +615,7 @@ mod tests {
             .dispatch("list", json!({ "kind": "entity" }))
             .await
             .expect("list must succeed");
-        let items: Vec<serde_json::Value> = match list_result {
-            serde_json::Value::Array(arr) => arr,
-            other => panic!("list must return a JSON array; got: {other:?}"),
-        };
+        let items = list_items(&list_result);
         let ids: Vec<&str> = items
             .iter()
             .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
@@ -687,10 +678,7 @@ mod tests {
             .dispatch("list", json!({ "kind": "entity", "namespace": "other-ns" }))
             .await
             .expect("list with explicit namespace must succeed");
-        let items: Vec<serde_json::Value> = match list_result {
-            serde_json::Value::Array(arr) => arr,
-            other => panic!("list must return a JSON array; got: {other:?}"),
-        };
+        let items = list_items(&list_result);
         let ids: Vec<&str> = items
             .iter()
             .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
@@ -749,13 +737,10 @@ mod tests {
             .dispatch("list", json!({ "kind": "entity" }))
             .await
             .expect("list must succeed through registry dispatch");
-        let ids_in_registry_list: Vec<&str> = match &list_result {
-            serde_json::Value::Array(arr) => arr
-                .iter()
-                .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
-                .collect(),
-            other => panic!("list must return a JSON array; got: {other:?}"),
-        };
+        let ids_in_registry_list: Vec<&str> = list_items(&list_result)
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect();
         assert!(
             ids_in_registry_list.contains(&entity_id),
             "entity created via non-local actor registry must be readable from 'local' list; \
@@ -777,13 +762,10 @@ mod tests {
             )
             .await
             .expect("direct pack list via actor-ns token must succeed");
-        let ids_in_actor_ns: Vec<&str> = match &actor_list_result {
-            serde_json::Value::Array(arr) => arr
-                .iter()
-                .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
-                .collect(),
-            other => panic!("list must return a JSON array; got: {other:?}"),
-        };
+        let ids_in_actor_ns: Vec<&str> = list_items(&actor_list_result)
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+            .collect();
         assert!(
             !ids_in_actor_ns.contains(&entity_id),
             "storage must not have been routed to 'lambda:leo'; \

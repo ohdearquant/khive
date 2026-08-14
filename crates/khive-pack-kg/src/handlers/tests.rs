@@ -1,6 +1,12 @@
 use super::{parse_relation, UpdateParams};
 use serde_json::json;
 
+fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
+    response["items"]
+        .as_array()
+        .expect("list response must contain an items array")
+}
+
 // F009 (CRIT): error text must be derived from EdgeRelation::ALL, not a hardcoded list.
 // Error text must include derived_from and precedes (all 15 relations must appear).
 #[test]
@@ -1097,7 +1103,7 @@ async fn list_thread_filter_distinguishes_full_uuid_and_rejects_ambiguous_prefix
         )
         .await
         .expect("full thread UUID filter");
-    let exact = exact.as_array().expect("list result array");
+    let exact = list_items(&exact);
     assert_eq!(exact.len(), 1, "full UUID must identify only one thread");
     assert_eq!(exact[0]["properties"]["thread_id"], first_thread);
 
@@ -1169,11 +1175,9 @@ async fn list_note_thread_filter_non_ascii_stored_no_panic() {
         "list with non-ASCII stored thread_id must not panic; got: {:?}",
         result.err()
     );
-    let arr = result.unwrap();
+    let response = result.unwrap();
     assert!(
-        arr.as_array()
-            .expect("list result must be a JSON array")
-            .is_empty(),
+        list_items(&response).is_empty(),
         "no note should match an unrelated legacy thread label"
     );
 }
@@ -1216,7 +1220,7 @@ async fn list_note_thread_filter_non_ascii_exact_match() {
         .await
         .expect("exact-match list must succeed");
 
-    let arr = result.as_array().expect("list result must be a JSON array");
+    let arr = list_items(&result);
     assert_eq!(
         arr.len(),
         1,
@@ -1946,7 +1950,7 @@ async fn create_entity_rejects_embedding_content() {
         .await
         .expect("list ok");
     assert_eq!(
-        list.as_array().expect("array").len(),
+        list_items(&list).len(),
         0,
         "rejected create must leave no entity behind"
     );

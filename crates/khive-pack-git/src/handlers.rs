@@ -20,8 +20,8 @@ use crate::ingest::{
     GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
 };
 use crate::source::{
-    parse_source, redact_repo_url, remote_url_to_slug, repo_basename, repo_identity, DigestSource,
-    REPO_SLUG_PROPERTY,
+    canonical_remote_identity, parse_source, redact_repo_url, remote_url_to_slug, repo_basename,
+    repo_identity, DigestSource, REPO_SLUG_PROPERTY,
 };
 use crate::GitPack;
 
@@ -205,7 +205,7 @@ impl GitPack {
 
         if !resolution.slug_duplicates.is_empty() {
             report.warnings.push(format!(
-                "multiple live project anchors match the same repo identity; selected oldest {}; duplicates: {}",
+                "multiple live project anchors resolve to the same repo identity; selected {} by canonical resolution order; duplicate or conflicting anchors: {}",
                 project_id,
                 resolution
                     .slug_duplicates
@@ -263,9 +263,10 @@ pub(crate) struct ProjectResolution {
     /// repo identity was found with a live corpus still annotating it
     /// (issue #1173) — surfaced via `IngestReport`, never silent.
     pub(crate) orphan: Option<OrphanSignal>,
-    /// Additional live anchors carrying the same `repo_slug` beyond the
-    /// deterministically selected one (ADR-088 Amendment 2 step-1
-    /// multi-match) — surfaced as a report warning, never silent.
+    /// Additional live anchors whose exact slug or normalized `repo_url`
+    /// resolves to the same identity as the deterministically selected one
+    /// (ADR-088 Amendment 2, #1708) — surfaced as a report warning, never
+    /// silent.
     pub(crate) slug_duplicates: Vec<Uuid>,
 }
 
@@ -276,10 +277,10 @@ pub(crate) struct OrphanSignal {
 
 /// Find an existing `project` entity whose `properties.repo_slug` matches
 /// the source's canonical repo identity (issue #1173), falling back to a
-/// legacy `properties.repo_url` match for pre-existing anchors that predate
-/// the slug property (backfilling it on match so future calls converge on
-/// the slug lookup without a migration); create the anchor when neither
-/// matches (ADR-088 Amendment 1 — auto-creation is reported via
+/// normalized `properties.repo_url` evidence for anchors whose slug is
+/// absent or non-canonical (backfilling the canonical slug on a selected
+/// match so future calls converge without a migration); create the anchor
+/// when neither matches (ADR-088 Amendment 1 — auto-creation is reported via
 /// `IngestReport.project_created`, never silent). The basename `name`
 /// fallback from the original v1 match is intentionally gone: it is both
 /// too weak (a differently-named legacy anchor is missed) and too broad (an
@@ -302,20 +303,24 @@ async fn resolve_or_create_project(
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
     if let Some((id, duplicates)) = slug_matches.split_first() {
+        let selected = *id;
         // issue #6 item 2: a step-1 slug match used to return immediately
-        // without consulting legacy pre-slug anchors, so an older
-        // alternate-spelling anchor for the same repository never
-        // surfaced in the duplicate-anchor warning. Selection is
-        // unchanged (the slug-tier match still wins); this only widens
-        // what gets reported alongside it.
+        // without consulting URL-equivalent anchors outside that slug tier.
+        // #1708 extends that diagnostic to a present but non-canonical slug.
+        // Selection is unchanged (the canonical slug tier still wins); this
+        // only widens what gets reported alongside it.
         let mut slug_duplicates = duplicates.to_vec();
-        slug_duplicates.extend(
-            find_normalized_legacy_matches(runtime, token, &identity)
+        append_unique_ids(
+            &mut slug_duplicates,
+            find_normalized_noncanonical_matches(runtime, token, &identity)
                 .await
-                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+                .into_iter()
+                .map(|(candidate, _)| candidate)
+                .filter(|candidate| *candidate != selected),
         );
         return Ok(ProjectResolution {
-            id: *id,
+            id: selected,
             created: false,
             orphan: None,
             slug_duplicates,
@@ -338,39 +343,37 @@ async fn resolve_or_create_project(
                     // lazy-upgrade path closes out any credential-bearing
                     // legacy URL it touches.
                     "properties": {
-                        REPO_SLUG_PROPERTY: identity,
+                        REPO_SLUG_PROPERTY: identity.clone(),
                         "repo_url": redact_repo_url(&repo_url),
                     },
             }),
         )
         .await?;
+        let mut slug_duplicates = duplicates.to_vec();
+        append_unique_ids(
+            &mut slug_duplicates,
+            find_normalized_noncanonical_matches(runtime, token, &identity)
+                .await
+                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+                .into_iter()
+                .map(|(candidate, _)| candidate)
+                .filter(|candidate| *candidate != id),
+        );
         return Ok(ProjectResolution {
             id,
             created: false,
             orphan: None,
-            slug_duplicates: duplicates.to_vec(),
+            slug_duplicates,
         });
     }
 
-    // ADR-088 Amendment 2 step 2: a legacy anchor that predates `repo_slug`
-    // entirely (so its stored `repo_url` is some other spelling of the same
-    // repository -- e.g. a bare local clone path from before this identity
-    // model existed) is reconciled by re-deriving each such anchor's own
-    // identity from its stored `repo_url` and comparing it to this source's
-    // resolved `identity`, not by a second exact-string match.
-    let legacy_candidates = find_legacy_projects_without_slug(runtime, token)
+    // ADR-088 Amendment 2 step 2 plus #1708: re-derive identity from every
+    // live anchor whose stored slug is absent or non-canonical. Normalized
+    // repo_url evidence can therefore repair and reuse a hand-written or
+    // stale slug instead of excluding the anchor and minting a duplicate.
+    let normalized_matches = find_normalized_noncanonical_matches(runtime, token, &identity)
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-    let mut normalized_matches: Vec<(Uuid, String)> = Vec::new();
-    for (id, candidate_repo_url) in legacy_candidates {
-        if normalize_legacy_repo_url(&candidate_repo_url)
-            .await
-            .as_deref()
-            == Some(identity.as_str())
-        {
-            normalized_matches.push((id, candidate_repo_url));
-        }
-    }
     if let Some(((selected, selected_repo_url), duplicates)) = normalized_matches.split_first() {
         let selected = *selected;
         crate::dispatch_from_token(
@@ -429,6 +432,14 @@ async fn resolve_or_create_project(
     })
 }
 
+fn append_unique_ids(target: &mut Vec<Uuid>, candidates: impl IntoIterator<Item = Uuid>) {
+    for candidate in candidates {
+        if !target.contains(&candidate) {
+            target.push(candidate);
+        }
+    }
+}
+
 // Multiple live anchors can carry one slug when two legacy anchors holding
 // different URL spellings of the same repository were each exact-matched and
 // backfilled on separate ingests. Selection must be deterministic (oldest
@@ -471,9 +482,10 @@ async fn find_projects_by_slug(
 /// ordered `created_at ASC, id ASC` so multi-match cases select the oldest
 /// deterministically and surface the remainder as a report warning -- the
 /// same contract as the step-1 slug lookup and the normalized step-2 route.
-/// Anchors that already carry `repo_slug` are excluded: they are found (if
-/// at all) via `find_projects_by_slug`, and an exact `repo_url` hit must
-/// never overwrite an already-derived identity.
+/// Anchors that already carry `repo_slug` are excluded from this raw-string
+/// route: canonical ones are found by step 1, while differing slugs require
+/// normalized URL evidence below. Raw equality alone never overwrites an
+/// already-derived identity.
 async fn find_projects_by_legacy_repo_url(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -507,14 +519,15 @@ async fn find_projects_by_legacy_repo_url(
         .collect())
 }
 
-/// Fetch every live `project` anchor in this namespace that has no
-/// `repo_slug` yet -- candidates for step-2 normalization reconciliation
-/// (ADR-088 Amendment 2). An anchor that already carries `repo_slug` was
-/// either created post-#1173 or already backfilled by the exact-match path
-/// above; it is found (if at all) via `find_projects_by_slug` instead.
-async fn find_legacy_projects_without_slug(
+/// Fetch every live `project` anchor whose slug is absent or differs from
+/// the source identity. These are candidates for step-2 normalized URL
+/// reconciliation; exact canonical-slug anchors remain exclusively in the
+/// higher-precedence step-1 lookup. SQL ordering makes candidate selection
+/// deterministic before the async normalization pass (#1708).
+async fn find_projects_without_canonical_slug(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    identity: &str,
 ) -> anyhow::Result<Vec<(Uuid, String)>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
@@ -523,12 +536,16 @@ async fn find_legacy_projects_without_slug(
             sql: "SELECT id, json_extract(properties,'$.repo_url') AS repo_url \
                   FROM entities WHERE kind='project' AND namespace=?1 \
                   AND deleted_at IS NULL \
-                  AND json_extract(properties,'$.repo_slug') IS NULL \
                   AND json_extract(properties,'$.repo_url') IS NOT NULL \
+                  AND (json_extract(properties,'$.repo_slug') IS NULL \
+                       OR json_extract(properties,'$.repo_slug')<>?2) \
                   ORDER BY created_at ASC, id ASC"
                 .into(),
-            params: vec![SqlValue::Text(token.namespace().as_str().to_string())],
-            label: Some("git_digest_find_legacy_projects_without_slug".into()),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(identity.to_string()),
+            ],
+            label: Some("git_digest_find_projects_without_canonical_slug".into()),
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -549,13 +566,15 @@ async fn find_legacy_projects_without_slug(
         .collect())
 }
 
-/// Same shape as `find_legacy_projects_without_slug`, scoped to soft-deleted
-/// rows (`deleted_at IS NOT NULL`) instead of live ones, and carrying each
-/// row's own `deleted_at` so callers can merge-sort tombstones by recency
-/// alongside an exact-match set (issue #6 item 1).
-async fn find_soft_deleted_legacy_projects_without_slug(
+/// Fetch every soft-deleted anchor outside the canonical slug tier and carry
+/// each row's own `deleted_at` so callers can normalize, deduplicate, and
+/// merge-sort tombstones by recency alongside an exact-match set. This is the
+/// tombstone counterpart of the live step-2 candidate scan: both absent and
+/// present-but-noncanonical slugs remain URL-reconciliation candidates.
+async fn find_soft_deleted_projects_without_canonical_slug(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    identity: &str,
 ) -> anyhow::Result<Vec<(Uuid, String, i64)>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
@@ -564,11 +583,15 @@ async fn find_soft_deleted_legacy_projects_without_slug(
             sql: "SELECT id, deleted_at, json_extract(properties,'$.repo_url') AS repo_url \
                   FROM entities WHERE kind='project' AND namespace=?1 \
                   AND deleted_at IS NOT NULL \
-                  AND json_extract(properties,'$.repo_slug') IS NULL \
-                  AND json_extract(properties,'$.repo_url') IS NOT NULL"
+                  AND json_extract(properties,'$.repo_url') IS NOT NULL \
+                  AND (json_extract(properties,'$.repo_slug') IS NULL \
+                       OR json_extract(properties,'$.repo_slug')<>?2)"
                 .into(),
-            params: vec![SqlValue::Text(token.namespace().as_str().to_string())],
-            label: Some("git_digest_find_soft_deleted_legacy_projects_without_slug".into()),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(identity.to_string()),
+            ],
+            label: Some("git_digest_find_soft_deleted_projects_without_canonical_slug".into()),
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -593,51 +616,56 @@ async fn find_soft_deleted_legacy_projects_without_slug(
         .collect())
 }
 
-/// Scan every live legacy (pre-slug) project anchor and return the ids whose
-/// stored `repo_url` normalizes to the same `identity` as the caller's
-/// resolved source -- the same normalize-and-compare step ADR-088 Amendment
-/// 2 step 2 already applies, reused here to surface a cross-tier duplicate
-/// when a *different* tier's exact match already won (issue #6 item 2).
-async fn find_normalized_legacy_matches(
+/// Return live anchors outside the canonical slug tier whose own stored
+/// `repo_url` normalizes to the caller's identity. This includes both legacy
+/// pre-slug rows and #1708's present-but-noncanonical slug rows. Candidate
+/// ordering is retained so normalized-only selection remains oldest-first.
+async fn find_normalized_noncanonical_matches(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     identity: &str,
-) -> anyhow::Result<Vec<Uuid>> {
-    let legacy_candidates = find_legacy_projects_without_slug(runtime, token).await?;
+) -> anyhow::Result<Vec<(Uuid, String)>> {
+    let candidates = find_projects_without_canonical_slug(runtime, token, identity).await?;
     let mut matches = Vec::new();
-    for (id, candidate_repo_url) in legacy_candidates {
-        if normalize_legacy_repo_url(&candidate_repo_url)
+    for (id, candidate_repo_url) in candidates {
+        if normalize_stored_repo_url(&candidate_repo_url)
             .await
             .as_deref()
             == Some(identity)
         {
-            matches.push(id);
+            matches.push((id, candidate_repo_url));
         }
     }
     Ok(matches)
 }
 
-/// Re-derive the repo-identity slug a legacy anchor's stored `repo_url`
-/// would resolve to today (ADR-088 Amendment 2 step 2). A URL-shaped value
-/// normalizes directly via `remote_url_to_slug`. A path-shaped value (an
-/// absolute local path, stored verbatim by the pre-#1173 local-source
-/// resolution path) is treated as a local clone and resolved the same way
-/// `repo_identity` resolves a `DigestSource::Local` -- via its current
-/// `origin` remote -- so a legacy local-path anchor reconciles with a
-/// later remote-URL digest of the same repository. Returns `None` when
-/// neither path yields a URL-shaped identity (e.g. the path no longer
-/// exists, or has no matching origin -- there is nothing to reconcile
-/// against).
-async fn normalize_legacy_repo_url(repo_url: &str) -> Option<String> {
+/// Re-derive the repo-identity slug an anchor's stored `repo_url` resolves to
+/// today (ADR-088 Amendment 2 step 2). A sluggable remote spelling normalizes
+/// directly via `remote_url_to_slug`; an accepted but unsluggable HTTPS source
+/// reproduces `repo_identity(Remote)`'s shared credential-redacted,
+/// slash/`.git`-normalized URL fallback. A
+/// path-shaped value (an absolute local path, stored verbatim by the pre-#1173
+/// local-source resolution path) is treated as a local clone and resolved the
+/// same way `repo_identity` resolves a `DigestSource::Local` -- via its current
+/// `origin` remote -- so a legacy local-path anchor reconciles with a later
+/// remote-URL digest of the same repository. A remote-less local path's
+/// `local:<canonical-path>` fallback is itself canonical evidence and is
+/// retained for equality comparison. Returns `None` when the stored value is
+/// neither a recognized remote spelling, an accepted HTTPS source, nor an
+/// absolute local path.
+async fn normalize_stored_repo_url(repo_url: &str) -> Option<String> {
     if let Some(slug) = remote_url_to_slug(repo_url) {
         return Some(slug);
     }
+    if repo_url.trim().starts_with("https://") {
+        let candidate = parse_source(repo_url).ok()?;
+        if let DigestSource::Remote { canonical, .. } = candidate {
+            return Some(canonical_remote_identity(&canonical));
+        }
+    }
     if repo_url.starts_with('/') {
         let candidate = DigestSource::Local(std::path::PathBuf::from(repo_url));
-        let slug = repo_identity(&candidate).await;
-        if !slug.starts_with("local:") {
-            return Some(slug);
-        }
+        return Some(repo_identity(&candidate).await);
     }
     None
 }
@@ -704,16 +732,17 @@ async fn find_orphaned_anchor(
     // same repository (one that would normalize to the same identity).
     // Extend the tombstone scan with the same normalize-and-compare step
     // the live step-2 path already uses, scoped to soft-deleted rows.
-    let legacy_tombstones = find_soft_deleted_legacy_projects_without_slug(runtime, token)
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
-    let already_matched: std::collections::HashSet<Uuid> =
+    let normalized_tombstones =
+        find_soft_deleted_projects_without_canonical_slug(runtime, token, identity)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+    let mut already_matched: std::collections::HashSet<Uuid> =
         dead_projects.iter().map(|(id, _)| *id).collect();
-    for (id, candidate_repo_url, deleted_at) in legacy_tombstones {
-        if already_matched.contains(&id) {
+    for (id, candidate_repo_url, deleted_at) in normalized_tombstones {
+        if !already_matched.insert(id) {
             continue;
         }
-        if normalize_legacy_repo_url(&candidate_repo_url)
+        if normalize_stored_repo_url(&candidate_repo_url)
             .await
             .as_deref()
             == Some(identity)
@@ -1219,12 +1248,18 @@ mod tests {
         }
     }
 
-    /// Same as [`init_bare_repo_with_origin`] but with `user.*` configured
-    /// and one commit -- `git log` (and thus `git.digest`) needs a real
-    /// commit to walk; a freshly-inited repo with zero commits fails at
-    /// the `git log` step before anchor resolution is even exercised.
-    fn init_repo_with_origin_and_one_commit(dir: &Path, origin: &str) {
-        init_bare_repo_with_origin(dir, origin);
+    /// Initialize a remote-less repository with `user.*` configured and one
+    /// commit. `git log` (and thus `git.digest`) needs a real commit to walk;
+    /// a freshly-initialized repo with zero commits fails before anchor
+    /// resolution is exercised.
+    fn init_repo_with_one_commit(dir: &Path) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git init failed");
         for args in [
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "Test User"],
@@ -1250,6 +1285,31 @@ mod tests {
                 .expect("spawn git");
             assert!(status.success(), "git {args:?} failed");
         }
+    }
+
+    fn init_repo_with_origin_and_one_commit(dir: &Path, origin: &str) {
+        init_repo_with_one_commit(dir);
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["remote", "add", "origin", origin])
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git remote add failed");
+    }
+
+    async fn dispatch_local_commit_digest(registry: &VerbRegistry, dir: &Path) -> Value {
+        registry
+            .dispatch(
+                "git.digest",
+                json!({
+                    "source": dir.to_string_lossy(),
+                    "include": ["commits"],
+                    "max_items": 1,
+                }),
+            )
+            .await
+            .expect("git.digest dispatch")
     }
 
     /// A legacy anchor created before `repo_slug` existed at all, from a
@@ -1364,14 +1424,22 @@ mod tests {
         assert_eq!(selected_id, ids[0].to_string(), "must select the oldest");
 
         let warnings = resp["warnings"].as_array().expect("warnings array");
-        assert!(
-            warnings.iter().any(|w| {
-                let w = w.as_str().unwrap_or("");
-                w.contains("duplicate")
-                    && w.contains(&selected_id)
-                    && w.contains(&ids[1].to_string())
-            }),
-            "duplicate warning must name the selected and duplicate ids: {warnings:?}"
+        let duplicate_id = ids[1].to_string();
+        let warning = warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|warning| {
+                warning.contains("duplicate")
+                    && warning.contains(&selected_id)
+                    && warning.contains(&duplicate_id)
+            })
+            .unwrap_or_else(|| {
+                panic!("duplicate warning must name selected and duplicate ids: {warnings:?}")
+            });
+        assert_eq!(
+            warning.matches(&duplicate_id).count(),
+            1,
+            "cross-route aggregation must not repeat an anchor id: {warning}"
         );
 
         // No-orphan defaults must be present on the wire shape.
@@ -1437,14 +1505,22 @@ mod tests {
         assert_eq!(selected_id, ids[0].to_string(), "must select the oldest");
 
         let warnings = resp["warnings"].as_array().expect("warnings array");
-        assert!(
-            warnings.iter().any(|w| {
-                let w = w.as_str().unwrap_or("");
-                w.contains("duplicate")
-                    && w.contains(&selected_id)
-                    && w.contains(&ids[1].to_string())
-            }),
-            "duplicate warning must name the selected and duplicate ids: {warnings:?}"
+        let duplicate_id = ids[1].to_string();
+        let warning = warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|warning| {
+                warning.contains("duplicate")
+                    && warning.contains(&selected_id)
+                    && warning.contains(&duplicate_id)
+            })
+            .unwrap_or_else(|| {
+                panic!("duplicate warning must name selected and duplicate ids: {warnings:?}")
+            });
+        assert_eq!(
+            warning.matches(&duplicate_id).count(),
+            1,
+            "exact and normalized evidence must not repeat an anchor id: {warning}"
         );
 
         // The selected anchor was backfilled with the origin-derived slug;
@@ -1517,6 +1593,59 @@ mod tests {
         assert_eq!(orphan.annotated_note_count, 1);
     }
 
+    /// #1708 public-surface tombstone regression: normalized orphan lookup
+    /// must include a soft-deleted anchor whose slug is present but differs
+    /// from the canonical identity. The wire report must identify its live
+    /// corpus rather than silently creating a replacement anchor beside it.
+    #[tokio::test]
+    async fn git_digest_reports_noncanonical_slug_tombstone_orphan() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_origin_and_one_commit(
+            dir.path(),
+            "https://github.com/org/noncanonical-tombstone-repo",
+        );
+
+        // Seed below the public secret gate: this row represents legacy data
+        // that predates URL-userinfo admission checks. The behavior under test
+        // is safe reconciliation of that already-persisted evidence, not
+        // permission for a caller to create it today.
+        let dead = khive_storage::Entity::new(
+            "local",
+            "project",
+            "noncanonical-tombstone-repo-old",
+        )
+        .with_properties(json!({
+            "repo_url": "  https://legacy:token@github.com/org/noncanonical-tombstone-repo.git?view=old  ",
+            "repo_slug": "org/noncanonical-tombstone-repo",
+        }));
+        let dead_id = dead.id;
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(dead)
+            .await
+            .expect("seed legacy noncanonical tombstone anchor");
+        create_note_annotating(&registry, "issue", "#1708 orphan", dead_id).await;
+        assert!(rt
+            .delete_entity(&token, dead_id, false)
+            .await
+            .expect("soft delete"));
+
+        let response = dispatch_local_commit_digest(&registry, dir.path()).await;
+        assert_eq!(response["project_created"], json!(true), "{response}");
+        assert_eq!(
+            response["orphaned_corpus_detected"],
+            json!(true),
+            "{response}"
+        );
+        assert_eq!(
+            response["orphaned_project_id"],
+            json!(dead_id.to_string()),
+            "{response}"
+        );
+        assert_eq!(response["orphaned_note_count"], json!(1), "{response}");
+    }
+
     /// Issue #6 item 2: when a step-1 slug match wins resolution, a live
     /// legacy (pre-slug) anchor for an alternate spelling of the same
     /// repository must still surface in `slug_duplicates` -- previously,
@@ -1575,5 +1704,383 @@ mod tests {
              as a cross-tier duplicate; got {:?}",
             resolution.slug_duplicates
         );
+    }
+
+    /// #1708: a present but non-canonical slug used to exclude an otherwise
+    /// matching anchor from every resolution tier. Normalized `repo_url`
+    /// evidence must repair and reuse that anchor, including same-patch
+    /// redaction of its stored display URL.
+    #[tokio::test]
+    async fn noncanonical_slug_anchor_is_repaired_reused_and_redacted() {
+        let (rt, token, registry) = fixture().await;
+        let source = DigestSource::Remote {
+            canonical: "https://github.com/org/noncanonical-repo".to_string(),
+            gh_slug: Some(("org".to_string(), "noncanonical-repo".to_string())),
+        };
+        let existing = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "noncanonical-repo",
+                    "properties": {
+                        "repo_url": "  legacy-token-user@github.com:org/noncanonical-repo.git?view=compact#top  ",
+                        "repo_slug": "org/noncanonical-repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create non-canonical anchor");
+        let existing_id = Uuid::parse_str(existing["id"].as_str().unwrap()).expect("uuid");
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve non-canonical anchor");
+        assert_eq!(resolution.id, existing_id);
+        assert!(
+            !resolution.created,
+            "matching URL evidence must prevent create"
+        );
+        assert!(resolution.slug_duplicates.is_empty());
+
+        let repaired = rt
+            .get_entity(&token, existing_id)
+            .await
+            .expect("repaired anchor remains readable");
+        let properties = repaired.properties.as_ref().expect("properties present");
+        assert_eq!(
+            properties.get("repo_slug").and_then(Value::as_str),
+            Some("github.com/org/noncanonical-repo")
+        );
+        assert_eq!(
+            properties.get("repo_url").and_then(Value::as_str),
+            Some("github.com:org/noncanonical-repo.git"),
+            "the full repair path must redact SCP-style userinfo"
+        );
+
+        let again = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve repaired anchor again");
+        assert_eq!(again.id, existing_id);
+        assert!(!again.created);
+        assert_eq!(
+            find_projects_by_slug(&rt, &token, "github.com/org/noncanonical-repo")
+                .await
+                .expect("canonical lookup"),
+            vec![existing_id]
+        );
+    }
+
+    /// #1708 public-surface regression: an older URL-equivalent anchor with
+    /// a conflicting slug must not displace the canonical slug winner, but it
+    /// must be named in the `git.digest` warning rather than silently hidden.
+    #[tokio::test]
+    async fn git_digest_warns_for_noncanonical_slug_conflict_with_canonical_winner() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_origin_and_one_commit(
+            dir.path(),
+            "https://github.com/org/conflicting-slug-repo",
+        );
+
+        let conflicting = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "conflicting-slug-repo-old",
+                    "properties": {
+                        "repo_url": "https://github.com/org/conflicting-slug-repo.git",
+                        "repo_slug": "org/conflicting-slug-repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create conflicting anchor");
+        let conflicting_id = Uuid::parse_str(conflicting["id"].as_str().unwrap()).expect("uuid");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let winner = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "conflicting-slug-repo",
+                    "properties": {
+                        "repo_url": "https://github.com/org/conflicting-slug-repo",
+                        "repo_slug": "github.com/org/conflicting-slug-repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create canonical winner");
+        let winner_id = Uuid::parse_str(winner["id"].as_str().unwrap()).expect("uuid");
+
+        let response = registry
+            .dispatch(
+                "git.digest",
+                json!({
+                    "source": dir.path().to_string_lossy(),
+                    "include": ["commits"],
+                    "max_items": 1,
+                }),
+            )
+            .await
+            .expect("git.digest dispatch");
+
+        assert_eq!(response["project_created"], json!(false), "{response}");
+        assert_eq!(
+            response["project_id"],
+            json!(winner_id.to_string()),
+            "canonical slug tier must win even when its anchor is newer"
+        );
+        let warning = response["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|warning| warning.contains(&conflicting_id.to_string()))
+            .expect("conflicting anchor must reach the public warning");
+        assert!(warning.contains(&winner_id.to_string()), "{warning}");
+        assert!(warning.contains("canonical resolution order"), "{warning}");
+        assert!(
+            warning.contains("duplicate or conflicting anchors"),
+            "{warning}"
+        );
+
+        assert_eq!(
+            find_projects_by_slug(&rt, &token, "github.com/org/conflicting-slug-repo")
+                .await
+                .expect("canonical lookup"),
+            vec![winner_id],
+            "warning must not rewrite or mint another canonical anchor"
+        );
+        let conflicting = rt
+            .get_entity(&token, conflicting_id)
+            .await
+            .expect("conflicting anchor remains readable");
+        assert_eq!(
+            conflicting
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("repo_slug"))
+                .and_then(Value::as_str),
+            Some("org/conflicting-slug-repo"),
+            "a canonical winner makes the conflict diagnostic-only"
+        );
+    }
+
+    /// #1708 remote-less-local regression: `local:<canonical-path>` is a real
+    /// canonical identity, not a failed normalization. A noncanonical slug on
+    /// the same stored path must be repaired and reused through `git.digest`.
+    #[tokio::test]
+    async fn git_digest_repairs_noncanonical_slug_for_remote_less_local_repo() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_one_commit(dir.path());
+        let path = dir.path().to_string_lossy().to_string();
+        let identity = repo_identity(&DigestSource::Local(dir.path().to_path_buf())).await;
+        assert!(identity.starts_with("local:"), "{identity}");
+
+        let existing = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "remote-less-local",
+                    "properties": {
+                        "repo_url": path,
+                        "repo_slug": "hand-written-local-slug",
+                    },
+                }),
+            )
+            .await
+            .expect("create noncanonical local anchor");
+        let existing_id = Uuid::parse_str(existing["id"].as_str().unwrap()).expect("uuid");
+
+        let response = dispatch_local_commit_digest(&registry, dir.path()).await;
+        assert_eq!(response["project_created"], json!(false), "{response}");
+        assert_eq!(response["project_id"], json!(existing_id.to_string()));
+        assert_eq!(
+            find_projects_by_slug(&rt, &token, &identity)
+                .await
+                .expect("canonical lookup"),
+            vec![existing_id],
+            "the repaired anchor must be the sole canonical winner"
+        );
+        let repaired = rt
+            .get_entity(&token, existing_id)
+            .await
+            .expect("repaired anchor remains readable");
+        assert_eq!(
+            repaired
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("repo_slug"))
+                .and_then(Value::as_str),
+            Some(identity.as_str())
+        );
+    }
+
+    /// #1708 remote-less-local conflict regression: an exact canonical slug
+    /// winner keeps precedence, while an older same-path anchor with a
+    /// conflicting slug reaches the public warning and remains unchanged.
+    #[tokio::test]
+    async fn git_digest_warns_for_remote_less_local_noncanonical_slug_conflict() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_one_commit(dir.path());
+        let path = dir.path().to_string_lossy().to_string();
+        let identity = repo_identity(&DigestSource::Local(dir.path().to_path_buf())).await;
+        assert!(identity.starts_with("local:"), "{identity}");
+
+        let conflicting = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "remote-less-local-old",
+                    "properties": {
+                        "repo_url": path.clone(),
+                        "repo_slug": "hand-written-local-slug",
+                    },
+                }),
+            )
+            .await
+            .expect("create conflicting local anchor");
+        let conflicting_id = Uuid::parse_str(conflicting["id"].as_str().unwrap()).expect("uuid");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let winner = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "remote-less-local",
+                    "properties": {
+                        "repo_url": path,
+                        "repo_slug": identity.clone(),
+                    },
+                }),
+            )
+            .await
+            .expect("create canonical local anchor");
+        let winner_id = Uuid::parse_str(winner["id"].as_str().unwrap()).expect("uuid");
+
+        let response = dispatch_local_commit_digest(&registry, dir.path()).await;
+        assert_eq!(response["project_created"], json!(false), "{response}");
+        assert_eq!(response["project_id"], json!(winner_id.to_string()));
+        let warning = response["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|warning| warning.contains(&conflicting_id.to_string()))
+            .expect("conflicting local anchor must reach the public warning");
+        assert!(warning.contains(&winner_id.to_string()), "{warning}");
+        assert!(warning.contains("canonical resolution order"), "{warning}");
+        assert_eq!(
+            find_projects_by_slug(&rt, &token, &identity)
+                .await
+                .expect("canonical lookup"),
+            vec![winner_id],
+            "warning must not rewrite the conflicting row"
+        );
+        let conflicting = rt
+            .get_entity(&token, conflicting_id)
+            .await
+            .expect("conflicting anchor remains readable");
+        assert_eq!(
+            conflicting
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("repo_slug"))
+                .and_then(Value::as_str),
+            Some("hand-written-local-slug")
+        );
+    }
+
+    /// #1708 accepted-unsluggable-remote regression: a single-segment HTTPS
+    /// path uses `repo_identity(Remote)`'s redacted-URL fallback. Stored URL
+    /// normalization must reproduce that identity and repair a present but
+    /// noncanonical slug rather than minting another anchor.
+    #[tokio::test]
+    async fn unsluggable_https_noncanonical_slug_anchor_is_repaired_and_reused() {
+        let (rt, token, registry) = fixture().await;
+        let source =
+            parse_source("https://source-user@example.com/repo?view=source#source-fragment")
+                .expect("accepted unsluggable HTTPS source");
+        let identity = repo_identity(&source).await;
+        assert_eq!(identity, "https://example.com/repo");
+
+        let existing = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "project",
+                    "name": "unsluggable-remote",
+                    "properties": {
+                        "repo_url": "  https://legacy-user@example.com/repo.git/?view=legacy#legacy-fragment  ",
+                        "repo_slug": "example.com/repo",
+                    },
+                }),
+            )
+            .await
+            .expect("create noncanonical unsluggable anchor");
+        let existing_id = Uuid::parse_str(existing["id"].as_str().unwrap()).expect("uuid");
+
+        let resolution = resolve_or_create_project(&rt, &registry, &token, &source)
+            .await
+            .expect("resolve accepted unsluggable source");
+        assert_eq!(resolution.id, existing_id);
+        assert!(!resolution.created, "matching fallback identity must reuse");
+        assert!(resolution.slug_duplicates.is_empty());
+
+        let repaired = rt
+            .get_entity(&token, existing_id)
+            .await
+            .expect("repaired anchor remains readable");
+        let properties = repaired.properties.as_ref().expect("properties present");
+        assert_eq!(
+            properties.get("repo_slug").and_then(Value::as_str),
+            Some(identity.as_str())
+        );
+        assert_eq!(
+            properties.get("repo_url").and_then(Value::as_str),
+            Some("https://example.com/repo.git/"),
+            "repair must redact the display URL without replacing it with the identity fallback"
+        );
+        assert_eq!(
+            find_projects_by_slug(&rt, &token, &identity)
+                .await
+                .expect("canonical lookup"),
+            vec![existing_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_unsluggable_https_equivalent_spellings_share_fallback_identity() {
+        for spelling in [
+            "https://legacy@example.com/repo.git?view=old",
+            "https://example.com/repo/?view=old#fragment",
+            "https://example.com/repo.git/?view=old",
+        ] {
+            assert_eq!(
+                normalize_stored_repo_url(spelling).await.as_deref(),
+                Some("https://example.com/repo"),
+                "stored equivalent spelling must reproduce the live fallback: {spelling:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_remote_fallback_rejects_non_source_shapes() {
+        for malformed in ["relative/repo", "user@example.com/repo", "https://"] {
+            assert_eq!(
+                normalize_stored_repo_url(malformed).await,
+                None,
+                "arbitrary malformed value must not become identity evidence: {malformed}"
+            );
+        }
     }
 }

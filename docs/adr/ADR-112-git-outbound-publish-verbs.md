@@ -3,7 +3,7 @@
 **Status**: Proposed\
 **Date**: 2026-07-13\
 **Authors**: khive maintainers\
-**Depends on**: ADR-088 (Git-Lifecycle Pack) and its Amendment 1 (`git.digest`), ADR-108
+**Depends on**: ADR-088 (Git-Lifecycle Pack) and its Amendments 1-2 (`git.digest`), ADR-108
 (Git Write Surface Through khive, Phase B), ADR-018 (Authorization Gate), ADR-017 (Pack
 Standard), ADR-016 (Request DSL), ADR-004 (Substrate Observables - `Event` store used for
 audit), ADR-013 (Note Kind Taxonomy)\
@@ -569,15 +569,17 @@ rather than the resolver selecting an arbitrary row. This enumeration and canoni
 applies only when a publish handler resolves its self-ingest target.
 
 **`git.digest` project-resolution behavior is unchanged by this ADR; the resolver specified
-here applies only to the `git.publish_*` verbs.** ADR-088 Amendment 1 remains the sole
-authority for `git.digest` project resolution: when `project` is omitted, `git.digest`
-matches either `properties.repo_url` or the name derived from the source basename and creates
-an anchor only when neither matches. This ADR adds no GitHub alias rewrite, duplicate-anchor
+here applies only to the `git.publish_*` verbs.** ADR-088 Amendment 1, as amended by
+ADR-088 Amendment 2, governs `git.digest` project resolution. When `project` is omitted,
+`git.digest` resolves the canonical `properties.repo_slug` first, then reconciles exact and
+normalized stored `properties.repo_url` evidence, including present-but-noncanonical slugs;
+it creates an anchor only when no identity evidence matches. Project name and source basename
+are never match keys. This ADR adds no publish-style GitHub alias rewrite, duplicate-anchor
 migration, same-identity validation for an explicit `project`, or other selection rule to
-`git.digest`. Existing digest project ids, cursors, and natural keys therefore remain under
-ADR-088 Amendment 1's accepted contract. A publish call can reuse a digest anchor when its
-stored `properties.repo_url` maps to the canonical GitHub identity; a name-only digest
-anchor is not silently reselected or rewritten by this publish-only resolver.
+`git.digest`. Existing digest project ids, cursors, and natural keys remain under that
+contract. A publish call can reuse a digest anchor when its stored `properties.repo_url` maps
+to the canonical GitHub identity; an unrelated same-basename anchor is not silently selected
+or rewritten by either resolver.
 
 Issue and PR self-ingest uses the same natural key as the current digest implementation:
 
@@ -1236,13 +1238,14 @@ and no handler or remote work occurs.
    `properties.repo_url` and prove the publish call canonicalizes it in place, pre-seed two
    URL aliases and prove publish resolution fails without choosing either, and prove an
    unrelated same-basename project is ignored by publish resolution. Separate compatibility
-   cases prove ADR-088 Amendment 1 remains unchanged: with `project` omitted, `git.digest`
-   still reuses a source-basename name match even when its `properties.repo_url` is absent or
-   does not map to the publish identity, and an explicit digest `project` still follows its
-   existing UUID/prefix resolution contract. The publish-only resolver must neither migrate
-   nor reject those digest selections. An initial release publish also asserts exactly one
-   reference note under its verb-qualified operation-identity upsert key and exactly one
-   `annotates` edge to the project selected by the publish resolver.
+   cases prove the ADR-088 Amendment 2 boundary remains unchanged: with `project` omitted,
+   `git.digest` reuses an exact canonical-slug anchor, reconciles a legacy or noncanonical-slug
+   anchor only when its stored URL resolves to the same identity, and ignores an unrelated
+   source-basename name match. An explicit digest `project` still follows its existing
+   UUID/prefix resolution contract. The publish-only resolver does not participate in those
+   digest calls and must not alter the digest selection contract. An initial release publish
+   also asserts exactly one reference note under its verb-qualified operation-identity upsert
+   key and exactly one `annotates` edge to the project selected by the publish resolver.
 5. **Recovery failure injection.** Inject a crash or store error after each boundary in
    the recovery table: operation insert, remote response, note upsert, edge ensure, audit
    append, and completion update. Resume with the same operation identity and assert that the
@@ -1500,9 +1503,9 @@ Four forks were presented for this design; each is resolved in place.
 
 - ADR-088 - Git-Lifecycle Pack; `commit`/`issue`/`pull_request` note kinds and `annotates`
   usage this ADR's dual write reuses unchanged.
-- ADR-088 Amendment 1 - `git.digest`; the unchanged authority for digest project resolution,
-  plus the note shapes and `gh` transport conventions this ADR reuses for the publish
-  direction. This ADR's strict GitHub resolver is publish-only.
+- ADR-088 Amendments 1 and 2 - `git.digest`; Amendment 2 governs current digest project
+  resolution, while Amendment 1 supplies the note shapes and `gh` transport conventions this
+  ADR reuses for the publish direction. This ADR's strict GitHub resolver is publish-only.
 - ADR-108 - Git Write Surface Through khive (Phase B); the repo-level write surface this
   ADR is scoped alongside, not duplicated with. The scan module described here is a
   candidate for future adoption by ADR-108 surfaces (for example, scanning a `git.commit`

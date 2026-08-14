@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::task::JoinError;
 use uuid::Uuid;
 
@@ -17,6 +18,61 @@ use khive_types::namespace::Namespace;
 
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
+
+/// Keep arbitrary configured backend identifiers safe and bounded before
+/// they reach persistent coordinator diagnostics.  The raw identifier stays
+/// on [`BackendSearchResult`] for internal routing; the MCP boundary applies
+/// the same canonical secret masker before exposing it on the wire.
+fn bounded_backend_id_for_log(backend_id: &str) -> String {
+    const MAX_INPUT_CHARS: usize = 4_096;
+    const MAX_OUTPUT_CHARS: usize = 256;
+
+    let backend_id_chars = backend_id.chars().count();
+    let bounded_input: String = backend_id.chars().take(MAX_INPUT_CHARS).collect();
+    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    let was_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
+    let sanitized = if masked.trim().is_empty() {
+        "masked-backend"
+    } else {
+        masked.as_ref()
+    };
+    if !was_masked && backend_id_chars <= MAX_OUTPUT_CHARS {
+        return sanitized.to_string();
+    }
+
+    // Fingerprint the original value so independently configured secrets or
+    // long identifiers do not collapse onto one diagnostic key after
+    // masking/truncation.  The digest reveals no credential material.
+    let fingerprint = format!("{:x}", Sha256::digest(backend_id.as_bytes()));
+    let suffix = format!("…#{fingerprint}");
+    let prefix_chars = MAX_OUTPUT_CHARS - suffix.chars().count();
+    let prefix: String = sanitized.chars().take(prefix_chars).collect();
+    format!("{prefix}{suffix}")
+}
+
+/// Bound and mask a backend failure cause before it reaches a warning.  This
+/// mirrors the MCP wire boundary so the earlier coordinator diagnostic cannot
+/// leak a credential that the response would later redact.
+pub(super) fn bounded_backend_cause_for_log(message: &str) -> String {
+    const MAX_INPUT_CHARS: usize = 4_096;
+    const MAX_OUTPUT_CHARS: usize = 1_024;
+    const MISSING_CAUSE: &str = "backend search failed without diagnostic detail";
+
+    let mut input_chars = message.chars();
+    let bounded_input: String = input_chars.by_ref().take(MAX_INPUT_CHARS).collect();
+    let input_truncated = input_chars.next().is_some();
+    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    if masked.trim().is_empty() {
+        return MISSING_CAUSE.to_string();
+    }
+
+    let mut masked_chars = masked.chars();
+    let mut bounded: String = masked_chars.by_ref().take(MAX_OUTPUT_CHARS).collect();
+    if masked_chars.next().is_some() || input_truncated {
+        bounded.push('…');
+    }
+    bounded
+}
 
 /// Result of a single backend's entity-search contribution to a fan-out.
 ///
@@ -543,7 +599,10 @@ impl SubstrateCoordinator {
             {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
+                    tracing::warn!(
+                        error = %bounded_backend_cause_for_log(&e.to_string()),
+                        "fan_out_search: authorization denied for namespace"
+                    );
                     let backend_result = BackendSearchResult {
                         backend_id: backend_id.clone(),
                         hits: vec![],
@@ -616,7 +675,7 @@ impl SubstrateCoordinator {
                         )
                         .await;
                         tracing::warn!(
-                            backend = %backend_id,
+                            backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
                             "backend search task timed out"
                         );
@@ -678,7 +737,7 @@ impl SubstrateCoordinator {
                         )
                         .await;
                         tracing::warn!(
-                            backend = %backend_id,
+                            backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
                             "backend search task timed out"
                         );
@@ -785,7 +844,10 @@ impl SubstrateCoordinator {
                 let token = match runtime.authorize_with_visibility(ns, extra_visible_task) {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
+                        tracing::warn!(
+                            error = %bounded_backend_cause_for_log(&e.to_string()),
+                            "fan_out_search: authorization denied for namespace"
+                        );
                         return (backend_id, Err(e), None);
                     }
                 };
@@ -900,7 +962,11 @@ impl SubstrateCoordinator {
                     let error = khive_runtime::RuntimeError::Internal(format!(
                         "backend search task join failed: {join_err}"
                     ));
-                    tracing::warn!(backend = %joined_backend_id, error = %error, "backend search task failed");
+                    tracing::warn!(
+                        backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
+                        error = %bounded_backend_cause_for_log(&error.to_string()),
+                        "backend search task failed"
+                    );
                     per_backend.push(BackendSearchResult {
                         backend_id: joined_backend_id,
                         hits: vec![],
@@ -910,7 +976,7 @@ impl SubstrateCoordinator {
                 }
                 Ok(Ok((_late_result, _completed_at))) => {
                     tracing::warn!(
-                        backend = %joined_backend_id,
+                        backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
                         timeout_ms,
                         "backend search task completed after the shared request deadline"
                     );
@@ -923,7 +989,7 @@ impl SubstrateCoordinator {
                 }
                 Err(_elapsed) => {
                     tracing::warn!(
-                        backend = %joined_backend_id,
+                        backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
                         timeout_ms,
                         "backend search task timed out"
                     );

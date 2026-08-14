@@ -420,7 +420,7 @@ verb; `exec` has no special-casing for any verb name; it forwards the DSL string
 pack owns it, exactly like the MCP `request` tool:
 
 ```bash
-kkernel exec 'knowledge.import(path="/path/to/corpus.jsonl", format="ndjson")' --db ~/.khive/khive.db
+kkernel exec 'knowledge.import(path="/path/to/atlas-markdown", format="atlas_md")' --db ~/.khive/khive.db
 kkernel exec 'stats()' --config /absolute/path/to/config.toml
 ```
 

@@ -162,7 +162,9 @@ each independently shippable:
   staging replica).
 - WAL disk-space guard: refuse new writes with a typed error before disk exhaustion,
   rather than escalating checkpoint modes under pressure (the direction production
-  systems converged on after their own incidents).
+  systems converged on after their own incidents). ADR-154 governs the exact volume
+  identity, execution-time admission, configuration, bypass, error, and bounded-guarantee
+  contract; this topology ADR does not independently redefine those semantics.
 
 ### Checkpoint policy under the new topology
 
@@ -221,7 +223,8 @@ which is the invariant, not a failure of it.
    class, and zero write loss — every acknowledged write subsequently readable,
    every unacknowledged write refused with a typed outcome, reconciled by
    end-to-end accounting across all clients.
-4. **Holder registry + disk guard** (component 4). Acceptance: a backup pass appears in
+4. **Holder registry + disk guard** (component 4; disk-guard mechanics are governed by
+   ADR-154). Acceptance: a backup pass appears in
    the census with identity and ETA while it runs; a synthetic disk-pressure run refuses
    writes with the typed error before the space floor, and the checkpointer log names
    the registered blocker instead of an anonymous pin.
@@ -254,5 +257,6 @@ wasted if a later stage is re-scoped.
 - rqlite, Bedrock, libSQL checkpoint/ownership choices: respective public sources
 - In-repo: #1828 (connection lifecycle / WAL pin), #1836 (replication holder), #1838
   (checkpoint self-amplification), #1654 (cross-process contention architecture),
-  ADR-091 (WAL snapshot lifetime), ADR-135 (diagnostics surface), and the 2026-08-09
+  ADR-091 (WAL snapshot lifetime), ADR-135 (diagnostics surface), ADR-154 (SQLite
+  disk-reserve admission), and the 2026-08-09
   hardening set (#1810 #1811 #1815 #1816 #1819 #1822 #1823 #1825 #1841)
