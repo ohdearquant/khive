@@ -535,11 +535,12 @@ fn delete_verified_owned_entry(_root: &Path, repo_dir: &Path) -> Result<(), Cach
 /// `path.join(...)` by name. See crates/khive-pack-git/docs/api/cache.md#is_owned_entry.
 #[cfg(unix)]
 fn is_owned_entry_via_fd(target_fd: &std::fs::File) -> bool {
-    let has_git = unix_fd::fstatat_nofollow(target_fd, std::ffi::OsStr::new(".git")).is_ok();
+    let git_is_directory = unix_fd::fstatat_nofollow(target_fd, std::ffi::OsStr::new(".git"))
+        .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFDIR);
     let marker_is_regular_file =
         unix_fd::fstatat_nofollow(target_fd, std::ffi::OsStr::new(MARKER_FILE))
             .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG);
-    has_git && marker_is_regular_file
+    git_is_directory && marker_is_regular_file
 }
 
 /// `openat`/`fstatat`/`renameat` primitives bound to an already-opened
@@ -883,6 +884,24 @@ fn is_staging_wrapper_name(name: &std::ffi::OsStr) -> bool {
     Uuid::parse_str(name).is_ok_and(|id| id.to_string() == name)
 }
 
+/// Deletion residue owned by this cache: `delete_verified_owned_entry`
+/// renames a doomed cache slot to `trash-<canonical UUID>` inside the
+/// private namespace before recursively deleting it. A kill in that window
+/// leaves the renamed directory behind, so the sweep must admit these names
+/// too or the deletion path reintroduces the unreclaimable-residue class
+/// this module exists to close. Trash entries never carry a staging lock
+/// file, so `staging_liveness` judges them by the conservative age fence
+/// alone; an entry whose recursive delete is still in flight is protected
+/// by that fence, and a concurrent double-delete resolves benignly because
+/// `remove_staging_wrapper` tolerates `NotFound`.
+fn is_trash_residue_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_prefix("trash-")
+        .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok_and(|id| id.to_string() == suffix))
+}
+
 /// Liveness verdict for one staging wrapper.
 enum StagingLiveness {
     /// A live handle holds the wrapper's lock (or it has not existed long
@@ -948,12 +967,13 @@ fn remove_staging_wrapper(namespace_root: &Path, name: &std::ffi::OsStr) -> Resu
     }
 }
 
-/// Reclaim abandoned staging wrappers under the private namespace. A
-/// deletion candidate must be a real directory (never a symlink, file, or
-/// nested path) whose name is exactly a canonical lowercase hyphenated
-/// UUID, and must be judged `Abandoned` by `staging_liveness`. `now`/
-/// `max_age` are explicit so the fallback age boundary is deterministic in
-/// tests.
+/// Reclaim abandoned staging wrappers and interrupted-deletion residue
+/// under the private namespace. A deletion candidate must be a real
+/// directory (never a symlink, file, or nested path) whose name is exactly
+/// a canonical lowercase hyphenated UUID (clone wrapper) or
+/// `trash-<canonical UUID>` (deletion residue), and must be judged
+/// `Abandoned` by `staging_liveness`. `now`/`max_age` are explicit so the
+/// fallback age boundary is deterministic in tests.
 fn reap_stale_staging(
     root: &Path,
     now: SystemTime,
@@ -986,7 +1006,7 @@ fn reap_stale_staging(
             }
         };
         let name = entry.file_name();
-        if !is_staging_wrapper_name(&name) {
+        if !is_staging_wrapper_name(&name) && !is_trash_residue_name(&name) {
             continue;
         }
         let path = entry.path();
@@ -1369,6 +1389,58 @@ mod tests {
         assert!(
             nested.is_dir(),
             "the sweep never descends below the namespace root"
+        );
+    }
+
+    /// An interrupted `delete_verified_owned_entry` leaves its renamed
+    /// `trash-<uuid>` slot behind with no lock file. The sweep must reclaim
+    /// it once past the age fence (or the deletion path reintroduces the
+    /// unreclaimable-residue class this module closes), must preserve it
+    /// while fresh (an in-flight recursive delete), and must never touch a
+    /// trash-prefixed name whose suffix is not a canonical UUID.
+    #[test]
+    fn staging_sweep_reclaims_old_trash_residue_but_preserves_fresh_and_lookalikes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let namespace_root = ensure_staging_namespace(root.path()).expect("namespace");
+
+        let old_trash = namespace_root.join(format!("trash-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(old_trash.join("repo/.git/objects")).expect("old trash payload");
+        let lookalike = namespace_root.join("trash-not-a-canonical-uuid");
+        std::fs::create_dir_all(&lookalike).expect("create trash lookalike");
+        let observed_mtime = std::fs::symlink_metadata(&old_trash)
+            .expect("trash metadata")
+            .modified()
+            .expect("trash mtime");
+
+        let removed = reap_stale_staging(
+            root.path(),
+            observed_mtime + std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("reap trash residue");
+        assert_eq!(removed, 1, "only the canonical trash residue is reclaimed");
+        assert!(!old_trash.exists(), "aged trash residue must be reclaimed");
+        assert!(
+            lookalike.is_dir(),
+            "a non-canonical trash suffix is not cache-owned"
+        );
+
+        let fresh_trash = namespace_root.join(format!("trash-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(fresh_trash.join("repo/.git")).expect("fresh trash payload");
+        let fresh_mtime = std::fs::symlink_metadata(&fresh_trash)
+            .expect("fresh trash metadata")
+            .modified()
+            .expect("fresh trash mtime");
+        let removed = reap_stale_staging(
+            root.path(),
+            fresh_mtime + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("scan fresh trash residue");
+        assert_eq!(removed, 0, "an in-flight deletion must survive the sweep");
+        assert!(
+            fresh_trash.is_dir(),
+            "fresh trash residue is protected by the age fence"
         );
     }
 

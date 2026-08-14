@@ -178,15 +178,28 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
 ### Accepted cache crash-residue rider (2026-08-09)
 
 The staging-then-rename design can clean every ordinary error return, but no
-in-process guard runs after `SIGKILL`, OOM termination, or host loss. Each
-cache-root open therefore reclaims a staging directory only when all of these
-hold: it is a direct child of the scratch root, its name is exactly
-`.staging-<canonical UUID>`, it is a real directory rather than a symlink, and
-its mtime is strictly more than 24 hours old. Files, nested paths, prefix
-lookalikes, future-dated entries, and fresh staging clones are retained. This
-recovery is distinct from LRU eviction because an interrupted staging clone
-has no addressable cache key or ownership marker and otherwise lies outside
-both configured cache caps forever.
+in-process guard runs after `SIGKILL`, OOM termination, or host loss. All
+staging state therefore lives in a private namespace directory
+(`<scratch root>/.khive-git-staging/`) that nothing but this cache creates
+entries under, and a throttled sweep of that namespace reclaims residue on
+cache-root open.
+
+A sweep candidate must be a real directory (never a symlink, file, or nested
+path) that is a direct child of the private namespace and whose name is
+either exactly a canonical lowercase hyphenated UUID (an in-flight clone
+wrapper) or `trash-<canonical UUID>` (an interrupted deletion moved out of
+the shared root). The deletion criterion is liveness, not age: every live
+clone holds an advisory lock on a file inside its wrapper, so a candidate
+whose lock is still held survives regardless of how old it is, while a
+killed process's lock is released by the kernel the instant it dies and the
+wrapper is reclaimed on the next sweep regardless of how fresh it looks. A
+candidate with no lock file — the narrow crash-before-lock-file window, and
+every `trash-` entry — falls back to a conservative mtime fence (strictly
+older than 24 hours) before it may be reclaimed. Prefix lookalikes,
+non-canonical names, future-dated entries, and fresh lock-less entries are
+retained. This recovery is distinct from LRU eviction because interrupted
+staging residue has no addressable cache key or ownership marker and
+otherwise lies outside both configured cache caps forever.
 
 ### Security posture
 

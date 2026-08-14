@@ -195,10 +195,14 @@ namespace, then runs `reap_stale_staging` at most once per
 `REAP_THROTTLE_INTERVAL` (see above). `reap_stale_staging` enumerates only
 the namespace's direct children. A deletion candidate must be a real
 directory (never a symlink, file, or nested path) whose name is exactly the
-lowercase canonical hyphenated spelling of a UUID; its liveness is then
-decided by `staging_liveness` — `try_lock`-acquirable (or missing its lock
-file _and_ older than the 24h age fallback) means abandoned, anything else
-means live and untouched regardless of age. Removal uses the same bounded
+lowercase canonical hyphenated spelling of a UUID (an in-flight clone
+wrapper) or `trash-` followed by one (an interrupted
+`delete_verified_owned_entry`, whose renamed slot would otherwise be
+unreclaimable residue); its liveness is then decided by `staging_liveness` —
+`try_lock`-acquirable (or missing its lock file _and_ older than the 24h age
+fallback) means abandoned, anything else means live and untouched regardless
+of age. Trash residue never carries a lock file, so the age fallback alone
+governs it: a fresh entry (a recursive delete still in flight) survives. Removal uses the same bounded
 retry helper as owned cache eviction and tolerates another process winning
 the same cleanup race; other I/O failures surface instead of silently
 leaving disk growth unobservable.
