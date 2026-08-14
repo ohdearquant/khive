@@ -12,6 +12,7 @@
 // dispatch and is intentionally co-located.
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     sync::{
         atomic::{AtomicI64, Ordering},
@@ -43,6 +44,26 @@ use khive_storage::{EdgeRelation, StorageCapability};
 use crate::coordinator::{CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
 
+const MAX_BACKEND_ERROR_ENTRIES: usize = 16;
+const MAX_BACKEND_ERROR_KEY_CHARS: usize = 256;
+const MAX_BACKEND_ERROR_MESSAGE_CHARS: usize = 1_024;
+const MAX_BACKEND_ERROR_INPUT_CHARS: usize = MAX_BACKEND_ERROR_MESSAGE_CHARS * 4;
+/// A legal request carries at most `MAX_OPS` operation envelopes. Reserving a
+/// quarter of the daemon frame for their mandatory diagnostic metadata leaves
+/// another quarter for JSON escaping and half for fixed envelope fields.
+const MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP: usize =
+    khive_runtime::daemon::MAX_FRAME_BYTES / khive_request::MAX_OPS / 4;
+// A JSON scalar needs at most six bytes (`\uXXXX`). The key occurs in both
+// `missing_backends` and `backend_errors`; 1 KiB covers the typed object,
+// integer metadata, punctuation, and the optional ellipsis.
+const MAX_SINGLE_BACKEND_SEARCH_DIAGNOSTIC_BYTES: usize =
+    MAX_BACKEND_ERROR_KEY_CHARS * 6 * 2 + MAX_BACKEND_ERROR_MESSAGE_CHARS * 6 + 1_024;
+const _: () = assert!(
+    MAX_SINGLE_BACKEND_SEARCH_DIAGNOSTIC_BYTES <= MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP,
+    "the search diagnostic budget must retain at least one backend cause"
+);
+const MISSING_BACKEND_ERROR_MESSAGE: &str = "backend search failed without diagnostic detail";
+
 /// Per-operation completeness discriminator for the `search` verb (ADR-130
 /// §1). `SearchDegradation::status == None` means "not a search op" — no
 /// `status` field is emitted on that operation's envelope.
@@ -61,10 +82,20 @@ impl SearchStatus {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BackendErrorDiagnostic {
+    message: String,
+    backend_id_masked: bool,
+    backend_id_truncated: bool,
+    backend_id_chars: usize,
+}
+
 #[derive(Debug, Default)]
 struct SearchDegradation {
     status: Option<SearchStatus>,
     missing_backends: Vec<String>,
+    backend_errors: BTreeMap<String, BackendErrorDiagnostic>,
+    backend_errors_omitted: usize,
 }
 
 impl SearchDegradation {
@@ -76,32 +107,188 @@ impl SearchDegradation {
         Self {
             status: Some(SearchStatus::Complete),
             missing_backends: Vec::new(),
+            backend_errors: BTreeMap::new(),
+            backend_errors_omitted: 0,
         }
     }
 
     fn from_result(result: &CoordSearchResult) -> Self {
-        let mut missing_backends: Vec<String> = result
+        let failed_backend_count = result
             .per_backend
             .iter()
             .filter(|backend| backend.error.is_some())
-            .map(|backend| backend.backend_id.as_str().to_string())
-            .collect();
-        missing_backends.sort();
-        missing_backends.dedup();
-        let status = if result.partial || !missing_backends.is_empty() {
+            .count();
+        let mut candidates = BTreeMap::new();
+        for (backend, error) in result
+            .per_backend
+            .iter()
+            .filter_map(|backend| backend.error.as_deref().map(|error| (backend, error)))
+        {
+            let (key, backend_id_masked, backend_id_truncated, backend_id_chars) =
+                bounded_backend_error_key(backend.backend_id.as_str());
+            candidates.insert(
+                key,
+                BackendErrorDiagnostic {
+                    message: bounded_backend_error_message(error),
+                    backend_id_masked,
+                    backend_id_truncated,
+                    backend_id_chars,
+                },
+            );
+            if candidates.len() > MAX_BACKEND_ERROR_ENTRIES {
+                let _ = candidates.pop_last();
+            }
+        }
+
+        let mut backend_errors = BTreeMap::new();
+        for (backend, diagnostic) in candidates {
+            let mut candidate = backend_errors.clone();
+            candidate.insert(backend, diagnostic);
+            let candidate_degradation = Self {
+                status: Some(SearchStatus::Partial),
+                missing_backends: candidate.keys().cloned().collect(),
+                backend_errors_omitted: failed_backend_count.saturating_sub(candidate.len()),
+                backend_errors: candidate.clone(),
+            };
+            if search_diagnostic_wire_len(&candidate_degradation)
+                <= MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP
+            {
+                backend_errors = candidate;
+            }
+        }
+
+        let missing_backends: Vec<String> = backend_errors.keys().cloned().collect();
+        let backend_errors_omitted = failed_backend_count.saturating_sub(backend_errors.len());
+        let is_partial = failed_backend_count > 0;
+        debug_assert!(!is_partial || !backend_errors.is_empty());
+        debug_assert_eq!(
+            missing_backends,
+            backend_errors.keys().cloned().collect::<Vec<_>>()
+        );
+        debug_assert_eq!(result.partial, is_partial);
+        let status = if is_partial {
             SearchStatus::Partial
         } else {
             SearchStatus::Complete
         };
+        for (backend, diagnostic) in &backend_errors {
+            tracing::warn!(
+                backend,
+                error = %diagnostic.message,
+                "fan-out search backend failed"
+            );
+        }
+        if backend_errors_omitted > 0 {
+            tracing::warn!(
+                failed_backend_count,
+                retained_backend_errors = backend_errors.len(),
+                backend_errors_omitted,
+                "additional fan-out search backend diagnostics omitted by bounds"
+            );
+        }
         Self {
             status: Some(status),
             missing_backends,
+            backend_errors,
+            backend_errors_omitted,
         }
     }
 
     fn is_partial(&self) -> bool {
         self.status == Some(SearchStatus::Partial)
     }
+}
+
+fn bounded_backend_error_message(message: &str) -> String {
+    let bounded_input: String = message
+        .chars()
+        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
+        .collect();
+    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    if masked.trim().is_empty() {
+        return MISSING_BACKEND_ERROR_MESSAGE.to_string();
+    }
+    let mut chars = masked.chars();
+    let mut bounded: String = chars
+        .by_ref()
+        .take(MAX_BACKEND_ERROR_MESSAGE_CHARS)
+        .collect();
+    if chars.next().is_some() || message.chars().nth(MAX_BACKEND_ERROR_INPUT_CHARS).is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn bounded_backend_error_key(backend_id: &str) -> (String, bool, bool, usize) {
+    let backend_id_chars = backend_id.chars().count();
+    let bounded_input: String = backend_id
+        .chars()
+        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
+        .collect();
+    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    let backend_id_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
+    let sanitized = if masked.trim().is_empty() {
+        "masked-backend"
+    } else {
+        masked.as_ref()
+    };
+    if !backend_id_masked && backend_id_chars <= MAX_BACKEND_ERROR_KEY_CHARS {
+        return (sanitized.to_string(), false, false, backend_id_chars);
+    }
+
+    let fingerprint = format!("{:x}", Sha256::digest(backend_id.as_bytes()));
+    let suffix = format!("…#{fingerprint}");
+    let prefix_chars = MAX_BACKEND_ERROR_KEY_CHARS - suffix.chars().count();
+    let prefix: String = sanitized.chars().take(prefix_chars).collect();
+    (
+        format!("{prefix}{suffix}"),
+        backend_id_masked,
+        backend_id_chars > MAX_BACKEND_ERROR_KEY_CHARS,
+        backend_id_chars,
+    )
+}
+
+fn backend_errors_value(errors: &BTreeMap<String, BackendErrorDiagnostic>) -> Value {
+    Value::Object(
+        errors
+            .iter()
+            .map(|(backend, diagnostic)| {
+                let mut value = json!({
+                    "kind": "backend_error",
+                    "message": diagnostic.message,
+                });
+                if diagnostic.backend_id_masked {
+                    value["backend_id_masked"] = Value::Bool(true);
+                }
+                if diagnostic.backend_id_truncated {
+                    value["backend_id_truncated"] = Value::Bool(true);
+                    value["backend_id_chars"] = json!(diagnostic.backend_id_chars);
+                }
+                (backend.clone(), value)
+            })
+            .collect(),
+    )
+}
+
+fn search_diagnostic_value(degradation: &SearchDegradation) -> Value {
+    let mut value = json!({
+        "kind": "search_incomplete",
+        "message": "no-match was not established because selected backends failed",
+        "retryable": false,
+        "missing_backends": degradation.missing_backends,
+        "backend_errors": backend_errors_value(&degradation.backend_errors),
+    });
+    if degradation.backend_errors_omitted > 0 {
+        value["backend_errors_truncated"] = Value::Bool(true);
+        value["backend_errors_omitted"] = json!(degradation.backend_errors_omitted);
+    }
+    value
+}
+
+fn search_diagnostic_wire_len(degradation: &SearchDegradation) -> usize {
+    serde_json::to_vec(&search_diagnostic_value(degradation))
+        .expect("search diagnostic metadata is always serializable")
+        .len()
 }
 
 struct OpSuccess {
@@ -141,13 +328,8 @@ fn op_success_from_registry_result(tool: &str, is_help: bool, result: Value) -> 
 /// keeps `ok=true` with an empty `result`; this is `ok=false` — a caller
 /// doing `if response.ok && response.result.is_empty()` sees the two cases
 /// differently, instead of concluding "no match" in both.
-fn search_incomplete_error(missing_backends: Vec<String>) -> Value {
-    json!({
-        "kind": "search_incomplete",
-        "message": "no-match was not established because selected backends failed",
-        "retryable": false,
-        "missing_backends": missing_backends,
-    })
+fn search_incomplete_error(degradation: SearchDegradation) -> Value {
+    search_diagnostic_value(&degradation)
 }
 
 /// Per-request parallelism stays bounded even when the parser accepts 100 ops; must be nonzero.
@@ -1370,9 +1552,10 @@ impl KhiveMcpServer {
     /// "partial", ADR-130 §1), which lives inside that op's `results` entry,
     /// never at this top level. A successful but incomplete coordinator
     /// search remains a success (`status="partial"` on that entry) and
-    /// carries a typed `missing_backends` advisory plus the deprecated
-    /// `partial` alias; a search where no hit survives a backend failure is
-    /// instead a failed op (`ok: false`, `error.kind: "search_incomplete"`).
+    /// carries bounded `missing_backends` and `backend_errors` diagnostics
+    /// plus the deprecated `partial` alias; a search where no hit survives a
+    /// backend failure is instead a failed op (`ok: false`,
+    /// `error.kind: "search_incomplete"`).
     ///
     /// Response envelope:
     /// ```json
@@ -1890,7 +2073,7 @@ async fn dispatch_via_coordinator_inner(
                     if outcome.metadata.is_partial() && is_empty {
                         Err(DispatchFailure::unclassified(
                             tool,
-                            search_incomplete_error(outcome.metadata.missing_backends),
+                            search_incomplete_error(outcome.metadata),
                         ))
                     } else {
                         Ok(OpSuccess {
@@ -2028,15 +2211,26 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         result,
         degradation,
     } = success;
-    let is_partial = degradation.is_partial();
-    let extra_fields = usize::from(degradation.status.is_some()) + if is_partial { 2 } else { 0 };
+    let SearchDegradation {
+        status,
+        missing_backends,
+        backend_errors,
+        backend_errors_omitted,
+    } = degradation;
+    let is_partial = status == Some(SearchStatus::Partial);
+    let extra_fields = usize::from(status.is_some())
+        + if is_partial {
+            3 + usize::from(backend_errors_omitted > 0) * 2
+        } else {
+            0
+        };
     let mut map = serde_json::Map::with_capacity(3 + extra_fields);
     map.insert("ok".to_string(), Value::Bool(true));
     map.insert("tool".to_string(), Value::String(tool));
     map.insert("result".to_string(), result);
     // ADR-130 §1: `status` is present on every successful search envelope
     // (complete or partial); absent for every other verb.
-    if let Some(status) = degradation.status {
+    if let Some(status) = status {
         map.insert(
             "status".to_string(),
             Value::String(status.as_str().to_string()),
@@ -2048,14 +2242,19 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         map.insert("partial".to_string(), Value::Bool(true));
         map.insert(
             "missing_backends".to_string(),
-            Value::Array(
-                degradation
-                    .missing_backends
-                    .into_iter()
-                    .map(Value::String)
-                    .collect(),
-            ),
+            Value::Array(missing_backends.into_iter().map(Value::String).collect()),
         );
+        map.insert(
+            "backend_errors".to_string(),
+            backend_errors_value(&backend_errors),
+        );
+        if backend_errors_omitted > 0 {
+            map.insert("backend_errors_truncated".to_string(), Value::Bool(true));
+            map.insert(
+                "backend_errors_omitted".to_string(),
+                json!(backend_errors_omitted),
+            );
+        }
     }
     Value::Object(map)
 }
@@ -2365,10 +2564,12 @@ entry's own `ok` field rather than assuming batch-level atomicity.
 `search` carries its own per-op `status` ("complete" | "partial") inside that
 op's `result` entry, separate from the top-level batch `status` above. A
 degraded-but-answered search stays ok:true with status="partial" plus a
-missing_backends list (and the deprecated partial:true alias). When a backend
-failure leaves no hit standing after filtering, the op instead fails outright
-with ok:false and error.kind="search_incomplete" — that case must not be read
-as "no results found."
+missing_backends list, bounded backend_errors causes, and the deprecated
+partial:true alias. Truncation is explicit through backend_errors_truncated and
+backend_errors_omitted. When a backend failure leaves no hit standing after
+filtering, the op instead fails outright with ok:false and
+error.kind="search_incomplete" while retaining the same diagnostics — that case
+must not be read as "no results found."
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -3230,6 +3431,9 @@ fn frame_budget_omission(entry: &Value) -> Value {
         "status",
         "partial",
         "missing_backends",
+        "backend_errors",
+        "backend_errors_truncated",
+        "backend_errors_omitted",
         "advisories",
     ] {
         if let Some(value) = entry.get(key) {
@@ -3372,6 +3576,43 @@ mod tests {
     use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+
+    #[derive(Clone, Default)]
+    struct SearchCapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SearchCapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured search log mutex poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SearchCapturedLog {
+        type Writer = SearchCapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl SearchCapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.0
+                    .lock()
+                    .expect("captured search log mutex poisoned")
+                    .clone(),
+            )
+            .expect("captured search logs are UTF-8")
+        }
+    }
 
     // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
     // connections close asynchronously; read-only admission rejects a writable
@@ -4175,14 +4416,175 @@ mod tests {
             "status": "partial",
             "partial": true,
             "missing_backends": ["archive"],
+            "backend_errors": {
+                "archive": {
+                    "kind": "backend_error",
+                    "message": "storage unavailable"
+                }
+            },
         }));
 
         assert_eq!(omitted["ok"], json!(true));
         assert_eq!(omitted["status"], json!("partial"));
         assert_eq!(omitted["partial"], json!(true));
         assert_eq!(omitted["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            omitted["backend_errors"]["archive"]["message"],
+            json!("storage unavailable")
+        );
         assert!(omitted.get("result").is_none());
         assert!(omitted.get("result_omitted").is_some());
+    }
+
+    #[test]
+    fn backend_error_evidence_is_masked_and_bounded_before_preservation() {
+        let secret = format!("storage auth token sk_live_{} failed", "a".repeat(32));
+        let masked = bounded_backend_error_message(&secret);
+        assert!(masked.contains("***MASKED***"));
+        assert!(!masked.contains("sk_live_"));
+
+        let backend_secret = format!("archive auth token sk_live_{}", "b".repeat(32));
+        let (key, key_masked, key_truncated, key_chars) =
+            bounded_backend_error_key(&backend_secret);
+        assert!(key_masked);
+        assert!(!key_truncated);
+        assert_eq!(key_chars, backend_secret.chars().count());
+        assert!(key.contains("***MASKED***"));
+        assert!(!key.contains("sk_live_"));
+        assert!(key.chars().count() <= MAX_BACKEND_ERROR_KEY_CHARS);
+
+        let oversized = "x".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS + 100);
+        let bounded = bounded_backend_error_message(&oversized);
+        assert_eq!(bounded.chars().count(), MAX_BACKEND_ERROR_MESSAGE_CHARS + 1);
+        assert!(bounded.ends_with('…'));
+        assert_eq!(
+            bounded_backend_error_message(" \t\n"),
+            MISSING_BACKEND_ERROR_MESSAGE
+        );
+    }
+
+    #[test]
+    fn backend_error_evidence_has_aggregate_budget_and_exact_key_parity() {
+        fn degraded_result(reverse: bool) -> CoordSearchResult {
+            let mut per_backend: Vec<crate::coordinator::BackendSearchResult> = (0
+                ..MAX_BACKEND_ERROR_ENTRIES + 9)
+                .map(|index| crate::coordinator::BackendSearchResult {
+                    backend_id: khive_runtime::BackendId::new(format!(
+                        "backend-{index:03}-{}",
+                        "x".repeat(MAX_BACKEND_ERROR_KEY_CHARS)
+                    )),
+                    entity_hits: Vec::new(),
+                    note_hits: Vec::new(),
+                    error: Some(format!(
+                        "backend failure {index}: {}",
+                        "\0\"\\".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS)
+                    )),
+                })
+                .collect();
+            if reverse {
+                per_backend.reverse();
+            }
+            CoordSearchResult {
+                entity_hits: Vec::new(),
+                note_hits: Vec::new(),
+                per_backend,
+                partial: true,
+                entity_kinds: std::collections::HashMap::new(),
+                note_kinds: std::collections::HashMap::new(),
+                entity_created_at: std::collections::HashMap::new(),
+                note_created_at: std::collections::HashMap::new(),
+                note_names: std::collections::HashMap::new(),
+            }
+        }
+
+        let forward = SearchDegradation::from_result(&degraded_result(false));
+        let reversed = SearchDegradation::from_result(&degraded_result(true));
+
+        assert!(!forward.backend_errors.is_empty());
+        assert!(forward.backend_errors.len() <= MAX_BACKEND_ERROR_ENTRIES);
+        assert!(forward.backend_errors.iter().all(|(backend, diagnostic)| {
+            backend.chars().count() <= MAX_BACKEND_ERROR_KEY_CHARS
+                && diagnostic.backend_id_truncated
+                && diagnostic.message.chars().count() <= MAX_BACKEND_ERROR_MESSAGE_CHARS + 1
+        }));
+        assert_eq!(
+            forward.missing_backends,
+            forward.backend_errors.keys().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            forward.backend_errors_omitted,
+            MAX_BACKEND_ERROR_ENTRIES + 9 - forward.backend_errors.len()
+        );
+        assert_eq!(forward.missing_backends, reversed.missing_backends);
+        assert_eq!(
+            backend_errors_value(&forward.backend_errors),
+            backend_errors_value(&reversed.backend_errors)
+        );
+        assert!(search_diagnostic_wire_len(&forward) <= MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP);
+
+        let envelope = ok_envelope(
+            "search".to_string(),
+            OpSuccess {
+                result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
+                degradation: forward,
+            },
+        );
+        assert_eq!(envelope["backend_errors_truncated"], true);
+        assert!(envelope["backend_errors_omitted"].as_u64().unwrap() > 0);
+        assert_eq!(
+            envelope["missing_backends"].as_array().unwrap(),
+            &envelope["backend_errors"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn backend_id_credentials_are_absent_from_wire_and_warning() {
+        let secret = format!("archive auth token sk_live_{}", "c".repeat(32));
+        let result = CoordSearchResult {
+            entity_hits: Vec::new(),
+            note_hits: Vec::new(),
+            per_backend: vec![crate::coordinator::BackendSearchResult {
+                backend_id: khive_runtime::BackendId::new(secret.clone()),
+                entity_hits: Vec::new(),
+                note_hits: Vec::new(),
+                error: Some("storage unavailable".to_string()),
+            }],
+            partial: true,
+            entity_kinds: std::collections::HashMap::new(),
+            note_kinds: std::collections::HashMap::new(),
+            entity_created_at: std::collections::HashMap::new(),
+            note_created_at: std::collections::HashMap::new(),
+            note_names: std::collections::HashMap::new(),
+        };
+        let captured = SearchCapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let degradation = tracing::subscriber::with_default(subscriber, || {
+            SearchDegradation::from_result(&result)
+        });
+        let wire = search_diagnostic_value(&degradation).to_string();
+        let logs = captured.contents();
+
+        assert!(!wire.contains("sk_live_"), "wire leaked backend credential");
+        assert!(
+            !logs.contains("sk_live_"),
+            "warning leaked backend credential"
+        );
+        let backend = degradation
+            .missing_backends
+            .first()
+            .expect("failed backend diagnostic retained");
+        assert!(backend.contains("***MASKED***"));
+        assert!(degradation.backend_errors[backend].backend_id_masked);
     }
 
     #[test]
@@ -4210,6 +4612,14 @@ mod tests {
             "message": "no-match was not established because selected backends failed",
             "retryable": false,
             "missing_backends": ["archive"],
+            "backend_errors": {
+                "archive": {
+                    "kind": "backend_error",
+                    "message": "storage unavailable"
+                }
+            },
+            "backend_errors_truncated": true,
+            "backend_errors_omitted": 2,
         });
         let omitted = frame_budget_omission(&json!({
             "ok": false,
@@ -5146,6 +5556,16 @@ mod tests {
             degradation: SearchDegradation {
                 status: Some(SearchStatus::Partial),
                 missing_backends: vec!["archive".to_string()],
+                backend_errors: BTreeMap::from([(
+                    "archive".to_string(),
+                    BackendErrorDiagnostic {
+                        message: "storage unavailable".to_string(),
+                        backend_id_masked: false,
+                        backend_id_truncated: false,
+                        backend_id_chars: "archive".chars().count(),
+                    },
+                )]),
+                backend_errors_omitted: 0,
             },
         };
         let envelope = present_ok_envelope_or_depth_error(
@@ -5159,6 +5579,10 @@ mod tests {
         assert_eq!(envelope["status"], json!("partial"));
         assert_eq!(envelope["partial"], json!(true));
         assert_eq!(envelope["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            envelope["backend_errors"]["archive"]["message"],
+            json!("storage unavailable")
+        );
         assert!(envelope.get("result").is_some());
     }
 

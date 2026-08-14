@@ -442,11 +442,15 @@ fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
 
-In multi-backend mode a backend failure yields the successful hits from the
-remaining backends and adds `partial: true` plus `missing_backends` to that
-operation's request envelope. These fields sit beside `result` rather than
-inside the search result array, and remain present through presentation and
-response-frame compaction.
+In multi-backend mode a backend failure with surviving hits yields those hits
+with `status: "partial"`, deprecated `partial: true`, `missing_backends`, and a
+`backend_errors` object mapping each retained failed backend to its bounded,
+credential-masked backend id and cause. Masked backend ids use a stable hash
+suffix so distinct failed legs remain distinguishable. These fields sit beside `result` and survive
+presentation and response-frame compaction. If no hit survives filtering, the
+operation is `ok: false` with `error.kind="search_incomplete"`; the structured
+error carries the same diagnostics. `backend_errors_truncated` plus
+`backend_errors_omitted` explicitly report causes omitted by safety bounds.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
