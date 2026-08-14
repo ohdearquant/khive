@@ -4858,7 +4858,7 @@ id = "lambda:fallback"
         let server = isolated_server(&db_path);
         let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
         assert_eq!(
-            response["results"][0]["result"],
+            response["results"][0]["result"]["items"],
             serde_json::json!([]),
             "whole-snapshot typed preflight must prevent the valid first write"
         );
@@ -4926,7 +4926,7 @@ id = "lambda:fallback"
         let default_response =
             dispatch_json(&default_server, r#"list(kind="concept", limit=200)"#).await;
         assert_eq!(
-            default_response["results"][0]["result"]
+            default_response["results"][0]["result"]["items"]
                 .as_array()
                 .expect("default concept rows")
                 .len(),
@@ -4969,7 +4969,7 @@ id = "lambda:fallback"
         let serial_response =
             dispatch_json(&serial_server, r#"list(kind="concept", limit=200)"#).await;
         assert_eq!(
-            serial_response["results"][0]["result"],
+            serial_response["results"][0]["result"]["items"],
             serde_json::json!([]),
             "serial whole-snapshot preflight must reject before its first write"
         );
