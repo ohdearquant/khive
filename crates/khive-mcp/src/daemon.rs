@@ -4255,10 +4255,9 @@ mod tests {
                 first["ok"], true,
                 "list op must succeed inside daemon result: {first}"
             );
-            let rows = first["result"]
+            let rows = first["result"]["items"]
                 .as_array()
-                .or_else(|| first["result"]["items"].as_array())
-                .expect("list result must be an array or object with items");
+                .expect("list result must contain the stable items array");
             rows.iter()
                 .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
                 .collect()

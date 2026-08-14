@@ -76,6 +76,13 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
     }
 }
 
+fn list_items(response: &Value) -> &[Value] {
+    response
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("list response must contain an items array")
+}
+
 // ---- PackRuntime trait: verbs() and unknown-verb dispatch ----
 
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
@@ -534,7 +541,7 @@ async fn create_entity_then_list_by_kind_finds_it() {
         .await
         .expect("list must succeed");
 
-    let items = list.as_array().expect("list response must be an array");
+    let items = list_items(&list);
     let names: Vec<&str> = items
         .iter()
         .filter_map(|v| v.get("name").and_then(Value::as_str))
@@ -569,7 +576,7 @@ async fn list_entity_kind_filter_restricts_results() {
         .await
         .expect("list by project kind must succeed");
 
-    let items = list.as_array().expect("list must be array");
+    let items = list_items(&list);
     for item in items {
         assert_eq!(
             item.get("kind").and_then(Value::as_str),
@@ -616,15 +623,11 @@ async fn list_entities_offset_returns_disjoint_pages() {
         .await
         .expect("list page 2 must succeed");
 
-    let ids1: Vec<&str> = page1
-        .as_array()
-        .unwrap()
+    let ids1: Vec<&str> = list_items(&page1)
         .iter()
         .filter_map(|v| v.get("id").and_then(Value::as_str))
         .collect();
-    let ids2: Vec<&str> = page2
-        .as_array()
-        .unwrap()
+    let ids2: Vec<&str> = list_items(&page2)
         .iter()
         .filter_map(|v| v.get("id").and_then(Value::as_str))
         .collect();
@@ -671,15 +674,11 @@ async fn list_notes_offset_returns_disjoint_pages() {
         .await
         .expect("list page 2 must succeed");
 
-    let ids1: Vec<&str> = page1
-        .as_array()
-        .unwrap()
+    let ids1: Vec<&str> = list_items(&page1)
         .iter()
         .filter_map(|v| v.get("id").and_then(Value::as_str))
         .collect();
-    let ids2: Vec<&str> = page2
-        .as_array()
-        .unwrap()
+    let ids2: Vec<&str> = list_items(&page2)
         .iter()
         .filter_map(|v| v.get("id").and_then(Value::as_str))
         .collect();
@@ -2562,7 +2561,7 @@ async fn link_by_name_exact_match_wins_over_many_prefix_matching_decoys() {
 }
 
 #[tokio::test]
-async fn list_event_kind_returns_array() {
+async fn list_event_kind_returns_items_envelope() {
     let pack = pack_with_events();
     // Create an entity first so there are audit events to find.
     pack.dispatch("create", json!({"kind": "concept", "name": "AuditTarget"}))
@@ -2577,7 +2576,7 @@ async fn list_event_kind_returns_array() {
         .await
         .expect("list(kind=event) must succeed");
 
-    let arr = result.as_array().expect("list must return a JSON array");
+    let arr = list_items(&result);
     assert!(
         !arr.is_empty(),
         "at least one create audit event must be present"
@@ -2612,7 +2611,7 @@ async fn get_event_uuid_returns_event_wrapper() {
         )
         .await
         .expect("list must succeed");
-    let events = list_result.as_array().expect("list must be array");
+    let events = list_items(&list_result);
     assert!(!events.is_empty(), "must have at least one create event");
     let event_id = events[0]
         .get("id")
@@ -2674,7 +2673,7 @@ async fn get_event_uuid_cross_namespace_succeeds() {
         )
         .await
         .expect("list must succeed");
-    let events = list_result.as_array().expect("list must be array");
+    let events = list_items(&list_result);
     assert!(!events.is_empty(), "must have at least one create event");
     let event_id = events[0]
         .get("id")
@@ -2731,7 +2730,7 @@ async fn list_event_created_at_is_iso8601_string() {
         .await
         .expect("list(kind=event) must succeed");
 
-    let arr = result.as_array().expect("list must return a JSON array");
+    let arr = list_items(&result);
     assert!(!arr.is_empty(), "must have at least one event");
 
     for event in arr {
@@ -2768,7 +2767,7 @@ async fn get_event_created_at_is_iso8601_string() {
         .dispatch("list", json!({"kind": "event", "limit": 1}))
         .await
         .expect("list must succeed");
-    let events = list_result.as_array().expect("list must be array");
+    let events = list_items(&list_result);
     assert!(!events.is_empty(), "must have at least one event");
     let event_id = events[0]
         .get("id")
@@ -2818,7 +2817,7 @@ async fn update_event_uuid_returns_immutable_error() {
         )
         .await
         .expect("list must succeed");
-    let events = list_result.as_array().expect("list must be array");
+    let events = list_items(&list_result);
     let event_id = events[0]
         .get("id")
         .and_then(Value::as_str)
@@ -2859,7 +2858,7 @@ async fn delete_event_uuid_returns_immutable_error_and_event_persists() {
         )
         .await
         .expect("list must succeed");
-    let events = list_result.as_array().expect("list must be array");
+    let events = list_items(&list_result);
     let event_id = events[0]
         .get("id")
         .and_then(Value::as_str)
@@ -2908,7 +2907,7 @@ async fn list_events_pagination_returns_distinct_pages() {
         )
         .await
         .expect("page 1 must succeed");
-    let arr1 = page1.as_array().expect("must be array");
+    let arr1 = list_items(&page1);
     assert_eq!(arr1.len(), 2, "page 1 must contain exactly 2 events");
 
     let page2 = pack
@@ -2918,7 +2917,7 @@ async fn list_events_pagination_returns_distinct_pages() {
         )
         .await
         .expect("page 2 must succeed");
-    let arr2 = page2.as_array().expect("must be array");
+    let arr2 = list_items(&page2);
     assert!(
         !arr2.is_empty(),
         "page 2 must contain at least 1 event (3 creates total)"
@@ -2948,7 +2947,7 @@ async fn list_events_pagination_four_items_full_disjointness() {
         )
         .await
         .expect("page 1 must succeed");
-    let arr1 = page1.as_array().expect("must be array");
+    let arr1 = list_items(&page1);
     assert_eq!(arr1.len(), 2, "page 1 must have exactly 2 events");
 
     let page2 = pack
@@ -2958,7 +2957,7 @@ async fn list_events_pagination_four_items_full_disjointness() {
         )
         .await
         .expect("page 2 must succeed");
-    let arr2 = page2.as_array().expect("must be array");
+    let arr2 = list_items(&page2);
     assert_eq!(
         arr2.len(),
         2,
@@ -2995,7 +2994,7 @@ async fn list_events_pagination_offset_beyond_end_returns_empty() {
         )
         .await
         .expect("large offset must not error");
-    let arr = result.as_array().expect("must be array");
+    let arr = list_items(&result);
     assert!(
         arr.is_empty(),
         "offset beyond total event count must return empty page"
@@ -3501,7 +3500,7 @@ async fn curation_update_entity_event_payload_has_adr014_fields() {
         )
         .await
         .expect("list entity_updated events must succeed");
-    let arr = events.as_array().expect("list must return array");
+    let arr = list_items(&events);
     assert!(
         !arr.is_empty(),
         "at least one entity_updated event must be present after update"
@@ -3581,7 +3580,7 @@ async fn curation_merge_entity_event_payload_has_adr014_fields() {
         )
         .await
         .expect("list entity_merged events must succeed");
-    let arr = events.as_array().expect("list must return array");
+    let arr = list_items(&events);
     assert!(
         !arr.is_empty(),
         "at least one entity_merged event must be present"
@@ -3717,7 +3716,7 @@ async fn curation_delete_entity_hard_event_payload_has_adr014_fields() {
         )
         .await
         .expect("list entity_deleted events must succeed");
-    let arr = events.as_array().expect("list must return array");
+    let arr = list_items(&events);
     assert!(
         !arr.is_empty(),
         "at least one entity_deleted event must be present"
@@ -3773,8 +3772,8 @@ async fn list_event_observed_filter_is_wired_through_to_storage() {
         .await
         .expect("list(kind=event, observed=[...]) must not return an error");
     assert!(
-        result.as_array().is_some(),
-        "list with observed filter must return an array; got {result}"
+        result.get("items").and_then(Value::as_array).is_some(),
+        "list with observed filter must return an items envelope; got {result}"
     );
 }
 
@@ -3805,8 +3804,8 @@ async fn list_event_selected_filter_is_wired_through_to_storage() {
         .await
         .expect("list(kind=event, selected=[...]) must not return an error");
     assert!(
-        result.as_array().is_some(),
-        "list with selected filter must return an array; got {result}"
+        result.get("items").and_then(Value::as_array).is_some(),
+        "list with selected filter must return an items envelope; got {result}"
     );
 }
 
@@ -3884,7 +3883,7 @@ async fn list_observation_notes_status_is_row_visibility_unchanged() {
         .dispatch("list", json!({"kind": "observation"}))
         .await
         .expect("list must succeed");
-    let items = list_resp.as_array().expect("list must return array");
+    let items = list_items(&list_resp);
     assert!(!items.is_empty(), "expected at least one observation");
 
     for item in items {
@@ -4512,7 +4511,7 @@ async fn get_edge_includes_annotating_notes() {
         )
         .await
         .expect("list annotates edges for note must succeed");
-    let note_edges = note_edges.as_array().expect("edge list must return array");
+    let note_edges = list_items(&note_edges);
     assert_eq!(
         note_edges.len(),
         1,
@@ -5694,7 +5693,7 @@ async fn parallel_link_same_triple_returns_identical_ids() {
         )
         .await
         .expect("list edges must succeed");
-    let edges = list_result.as_array().expect("list must return array");
+    let edges = list_items(&list_result);
     assert_eq!(
         edges.len(),
         1,
@@ -5802,7 +5801,7 @@ async fn singleton_link_updates_weight_and_metadata_on_existing_triple() {
         )
         .await
         .expect("list edges must succeed");
-    let edges = list_result.as_array().expect("list must return array");
+    let edges = list_items(&list_result);
     assert_eq!(
         edges.len(),
         1,
@@ -6175,7 +6174,7 @@ async fn merge_rewire_symmetric_relation_canonicalization() {
         )
         .await
         .expect("list edge in canonical order must succeed");
-    let edges = edge_list.as_array().expect("list must return array");
+    let edges = list_items(&edge_list);
     assert_eq!(
         edges.len(),
         1,
@@ -6268,7 +6267,7 @@ async fn update_edge_to_symmetric_relation_canonicalizes_endpoints() {
         )
         .await
         .expect("list canonical edge must succeed");
-    let listed: &Vec<Value> = edge_list.as_array().expect("list must return array");
+    let listed = list_items(&edge_list);
     assert_eq!(
         listed.len(),
         1,
@@ -6358,7 +6357,7 @@ async fn update_edge_to_symmetric_relation_no_duplicate_when_canonical_exists() 
         )
         .await
         .expect("list canonical competes_with after update must succeed");
-    let listed: &Vec<Value> = edge_list.as_array().expect("list must return array");
+    let listed = list_items(&edge_list);
     assert_eq!(
         listed.len(),
         1,
@@ -6665,7 +6664,7 @@ async fn proposal_created_event_expiry_is_iso8601_string() {
         )
         .await
         .expect("list proposal_created events must succeed");
-    let arr = events.as_array().expect("list must return array");
+    let arr = list_items(&events);
     assert!(
         !arr.is_empty(),
         "at least one proposal_created event must exist"
@@ -6762,7 +6761,7 @@ async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
         )
         .await
         .expect("list proposal_applied must succeed");
-    let arr = events.as_array().expect("must be array");
+    let arr = list_items(&events);
     assert!(
         !arr.is_empty(),
         "must have at least one proposal_applied event"
@@ -6811,7 +6810,7 @@ async fn event_list_created_at_normalized_via_live_dispatch() {
         .dispatch("list", json!({"kind": "event", "limit": 10}))
         .await
         .expect("list must succeed");
-    let arr = events.as_array().expect("must be array");
+    let arr = list_items(&events);
     assert!(!arr.is_empty(), "must have at least one event");
 
     // All created_at values must be ISO strings (the array walker normalizes each
@@ -6865,7 +6864,7 @@ async fn proposal_created_event_expiry_normalized_via_live_dispatch() {
         )
         .await
         .expect("list proposal_created must succeed");
-    let arr = events.as_array().expect("must be array");
+    let arr = list_items(&events);
     assert!(
         !arr.is_empty(),
         "must have at least one proposal_created event"
@@ -6923,7 +6922,7 @@ async fn proposal_applied_event_applied_at_is_iso8601_string() {
         )
         .await
         .expect("list proposal_applied events must succeed");
-    let arr = events.as_array().expect("list must return array");
+    let arr = list_items(&events);
     assert!(
         !arr.is_empty(),
         "at least one proposal_applied event must exist after approval"
@@ -7019,7 +7018,7 @@ async fn note_expires_at_is_normalized_to_iso8601() {
         .dispatch("list", json!({"kind": "note", "limit": 100}))
         .await
         .expect("list must succeed");
-    let items = list_result.as_array().expect("list must return an array");
+    let items = list_items(&list_result);
     let found = items
         .iter()
         .find(|v| v.get("id").and_then(Value::as_str) == Some(&note_id.to_string()))
@@ -7079,14 +7078,12 @@ async fn list_proposal_last_decision_is_bare_string_not_json_encoded() {
         .await
         .expect("review must succeed");
 
-    // list(kind=proposal) returns a JSON array directly (not wrapped in {"items":[...]}).
+    // Proposal lists use the same stable items envelope as other offset-mode lists.
     let list = f
         .dispatch("list", json!({"kind": "proposal"}))
         .await
         .expect("list proposals must succeed");
-    let items = list
-        .as_array()
-        .expect("list(kind=proposal) must return a JSON array");
+    let items = list_items(&list);
     let proposal = items
         .iter()
         .find(|v| {
@@ -7647,7 +7644,7 @@ async fn propose_review_approve_lifecycle() {
         .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
         .await
         .expect("list proposals must succeed");
-    let items = list.as_array().expect("list must return an array");
+    let items = list_items(&list);
     let found = items
         .iter()
         .any(|v| v["id"].as_str().is_some_and(|id| id == pid));
@@ -7664,7 +7661,7 @@ async fn propose_review_approve_lifecycle() {
         )
         .await
         .expect("list proposal_applied events must succeed");
-    let evts = events.as_array().expect("event list must be array");
+    let evts = list_items(&events);
     assert!(
         !evts.is_empty(),
         "#393 approve: no proposal_applied event emitted after approval"
@@ -7714,7 +7711,7 @@ async fn propose_review_reject_lifecycle() {
         .dispatch("list", json!({ "kind": "proposal", "status": "rejected" }))
         .await
         .expect("list proposals must succeed");
-    let items = list.as_array().expect("list must return an array");
+    let items = list_items(&list);
     let found = items
         .iter()
         .any(|v| v["id"].as_str().is_some_and(|id| id == pid));
@@ -7776,7 +7773,7 @@ async fn propose_withdraw_lifecycle() {
         .dispatch("list", json!({ "kind": "proposal", "status": "withdrawn" }))
         .await
         .expect("list proposals must succeed");
-    let items = list.as_array().expect("list must return an array");
+    let items = list_items(&list);
     let found = items
         .iter()
         .any(|v| v["id"].as_str().is_some_and(|id| id == pid));
@@ -7840,7 +7837,7 @@ async fn list_proposals_status_filter() {
         .dispatch("list", json!({ "kind": "proposal", "status": "open" }))
         .await
         .expect("list(status=open) must succeed");
-    let open_items = list_open.as_array().expect("list must return an array");
+    let open_items = list_items(&list_open);
 
     let has_open = open_items
         .iter()
@@ -7974,7 +7971,7 @@ async fn withdraw_cas_divergence_after_approval() {
         .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
         .await
         .expect("list must succeed");
-    let items = list.as_array().expect("must be array");
+    let items = list_items(&list);
     let found = items
         .iter()
         .any(|v| v["id"].as_str().is_some_and(|id| id == pid));
@@ -10139,7 +10136,7 @@ async fn proposal_add_entity_changeset_entity_exists_in_kg_after_apply() {
         .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
         .await
         .expect("list(kind=proposal, status=applied) must succeed");
-    let items = list.as_array().expect("list must return an array");
+    let items = list_items(&list);
     assert!(
         items
             .iter()
@@ -10224,7 +10221,7 @@ async fn proposal_add_note_changeset_note_exists_in_kg_after_apply() {
         .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
         .await
         .expect("list(kind=proposal, status=applied) must succeed");
-    let items = list.as_array().expect("list must return an array");
+    let items = list_items(&list);
     assert!(
         items
             .iter()
@@ -10322,7 +10319,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
         .await
         .expect("list(delivered=false) must succeed");
 
-    let items = result.as_array().expect("list returns array");
+    let items = list_items(&result);
     assert_eq!(
         items.len(),
         1,
@@ -10351,7 +10348,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
         )
         .await
         .expect("list(delivered=true) must succeed");
-    let delivered_items = delivered_result.as_array().expect("array");
+    let delivered_items = list_items(&delivered_result);
     assert_eq!(
         delivered_items.len(),
         200,
@@ -10382,7 +10379,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
         )
         .await
         .expect("list(no delivered filter) must succeed");
-    let all_items = all_result.as_array().expect("array");
+    let all_items = list_items(&all_result);
     assert_eq!(
         all_items.len(),
         200,
@@ -12016,7 +12013,7 @@ async fn create_concept(f: &Fixture, name: &str) -> String {
 
 /// #701 regression, exercised through the `list` verb: `offset` must page
 /// through the full edge set instead of returning the identical first page
-/// every time, and an out-of-range offset must return an empty array.
+/// every time, and an out-of-range offset must return an empty items page.
 #[tokio::test]
 async fn list_kind_edge_offset_pages_through_full_set() {
     let f = pack();
@@ -12032,15 +12029,14 @@ async fn list_kind_edge_offset_pages_through_full_set() {
     }
 
     async fn list_page(f: &Fixture, a: &str, offset: u64) -> Vec<Value> {
-        f.dispatch(
+        let response = f
+            .dispatch(
             "list",
             json!({"kind": "edge", "source_id": a, "relations": ["extends"], "limit": 2, "offset": offset}),
         )
         .await
-        .expect("list(kind=edge) must succeed")
-        .as_array()
-        .expect("bare array response")
-        .clone()
+        .expect("list(kind=edge) must succeed");
+        list_items(&response).to_vec()
     }
 
     let page0 = list_page(&f, &a, 0).await;
@@ -12093,9 +12089,8 @@ async fn list_kind_edge_after_cursor_tiles_full_set() {
     for _ in 0..20 {
         let args = json!({"kind": "edge", "source_id": a, "relations": ["extends"], "limit": 2, "after": after});
         let result = f.dispatch("list", args).await.expect("list must succeed");
-        // Cursor-mode responses are an object, not a bare array (#702.2) —
-        // distinguishable at the JSON-shape level so plain offset callers
-        // are unaffected.
+        // Cursor mode uses a substrate-specific envelope, while offset mode
+        // uses the common `items` envelope.
         let obj = result
             .as_object()
             .expect("cursor-mode response is an object");
@@ -12358,8 +12353,58 @@ fn pack_and_runtime() -> (Fixture, KhiveRuntime, NamespaceToken) {
     (Fixture { registry }, rt, tok)
 }
 
-/// `list(kind="entity")`: a `limit` at or under the cap (500) keeps the
-/// existing bare-array response shape.
+#[tokio::test]
+async fn list_note_tags_filter_is_case_insensitive_and_applied_before_limit() {
+    let (pack, rt, tok) = pack_and_runtime();
+    let mut target = Note::new("local", "observation", "tagged target")
+        .with_properties(json!({"tags": ["source-integrity"]}));
+    target.created_at = 1;
+    target.updated_at = 1;
+    let target_id = target.id;
+
+    let mut notes = vec![target];
+    for index in 0..201i64 {
+        let mut note = Note::new("local", "observation", format!("tag decoy {index}"))
+            .with_properties(json!({"tags": ["other"]}));
+        note.created_at = index + 2;
+        note.updated_at = index + 2;
+        notes.push(note);
+    }
+    let summary = rt.notes(&tok).unwrap().upsert_notes(notes).await.unwrap();
+    assert_eq!(summary.failed, 0);
+
+    let response = pack
+        .dispatch(
+            "list",
+            json!({"kind": "note", "tags": ["SOURCE-INTEGRITY"], "limit": 1}),
+        )
+        .await
+        .expect("tag-filtered note list must succeed");
+    let items = list_items(&response);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], target_id.to_string());
+    assert_eq!(response["requested_limit"], 1);
+    assert_eq!(response["effective_limit"], 1);
+    assert_eq!(response["limit_clamped"], false);
+}
+
+#[tokio::test]
+async fn list_tags_filter_rejects_substrates_without_tags() {
+    let pack = pack();
+    for kind in ["edge", "event", "proposal"] {
+        let error = pack
+            .dispatch("list", json!({"kind": kind, "tags": ["source-integrity"]}))
+            .await
+            .unwrap_err();
+        assert!(
+            is_invalid_input(&error),
+            "kind={kind} must reject an inapplicable tags filter: {error}"
+        );
+    }
+}
+
+/// `list(kind="entity")`: a `limit` at or under the cap (500) uses the same
+/// stable envelope as an over-cap request.
 #[tokio::test]
 async fn list_entity_limit_under_cap_honored_exactly() {
     let (pack, rt, tok) = pack_and_runtime();
@@ -12382,12 +12427,15 @@ async fn list_entity_limit_under_cap_honored_exactly() {
         .await
         .expect("#894: list under cap must succeed");
 
-    let items = resp.as_array().expect("list must return an array");
+    let items = list_items(&resp);
     assert_eq!(
         items.len(),
         3,
         "limit=3 under the entity cap (500) must return exactly 3 rows"
     );
+    assert_eq!(resp["requested_limit"], 3);
+    assert_eq!(resp["effective_limit"], 3);
+    assert_eq!(resp["limit_clamped"], false);
 }
 
 /// An over-cap request reports the effective limit even when the result set
@@ -12519,12 +12567,15 @@ async fn list_note_limit_under_cap_honored_exactly() {
         .dispatch("list", json!({"kind": "note", "limit": 2}))
         .await
         .expect("#894: list notes under cap must succeed");
-    let items = resp.as_array().expect("list must return an array");
+    let items = list_items(&resp);
     assert_eq!(
         items.len(),
         2,
         "limit=2 under the note cap (200) must return exactly 2 rows"
     );
+    assert_eq!(resp["requested_limit"], 2);
+    assert_eq!(resp["effective_limit"], 2);
+    assert_eq!(resp["limit_clamped"], false);
 }
 
 /// Same truncation metadata as the entity path, at the note cap (200).
@@ -12549,9 +12600,9 @@ async fn list_note_limit_over_cap_truncates_with_metadata() {
         .dispatch("list", json!({"kind": "note", "limit": 300}))
         .await
         .expect("#894: list notes must succeed even when the cap binds");
-    let items = resp["notes"]
+    let items = resp["items"]
         .as_array()
-        .expect("clamped note envelope must contain notes");
+        .expect("clamped note envelope must contain items");
     assert_eq!(
         items.len(),
         200,
@@ -12593,8 +12644,8 @@ async fn list_note_limit_over_cap_truncates_with_metadata() {
     assert_eq!(unique_ids.len(), 201, "cursor pages must tile all notes");
 }
 
-/// `list(kind="edge")` offset mode keeps the existing bare-array shape when
-/// the request does not exceed the cap.
+/// `list(kind="edge")` offset mode keeps one envelope shape on both sides of
+/// the cap.
 #[tokio::test]
 async fn list_edge_offset_mode_limit_under_cap_honored_exactly() {
     use khive_storage::EdgeRelation;
@@ -12633,12 +12684,58 @@ async fn list_edge_offset_mode_limit_under_cap_honored_exactly() {
         .dispatch("list", json!({"kind": "edge", "limit": 3}))
         .await
         .expect("#894: list edges under cap must succeed");
-    let items = resp.as_array().expect("list must return an array");
+    let items = list_items(&resp);
     assert_eq!(
         items.len(),
         3,
         "limit=3 under the edge cap must return exactly 3 rows"
     );
+    assert_eq!(resp["requested_limit"], 3);
+    assert_eq!(resp["effective_limit"], 3);
+    assert_eq!(resp["limit_clamped"], false);
+}
+
+#[tokio::test]
+async fn list_edge_zero_limit_matches_its_metadata_and_returns_no_rows() {
+    use khive_storage::EdgeRelation;
+
+    let (pack, rt, tok) = pack_and_runtime();
+    let source = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "zero-edge-source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source");
+    let target = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "zero-edge-target",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+    rt.link(&tok, source.id, target.id, EdgeRelation::Extends, 1.0, None)
+        .await
+        .expect("create edge");
+
+    let response = pack
+        .dispatch("list", json!({"kind": "edge", "limit": 0}))
+        .await
+        .expect("zero-limit offset edge list must succeed");
+    assert!(list_items(&response).is_empty());
+    assert_eq!(response["requested_limit"], 0);
+    assert_eq!(response["effective_limit"], 0);
+    assert_eq!(response["limit_clamped"], false);
 }
 
 /// `list(kind="edge", limit=<over EDGE_LIST_MAX_LIMIT>)`: the cap genuinely
@@ -12735,7 +12832,7 @@ async fn list_edge_limit_over_cap_truncates_with_metadata_in_both_modes() {
     assert_eq!(cursor_resp["limit_clamped"], true);
 }
 
-/// `list(kind="event")` also keeps the bare-array response below its cap.
+/// `list(kind="event")` uses the common items envelope below its cap too.
 #[tokio::test]
 async fn list_event_limit_under_cap_honored_exactly() {
     let f = pack_with_events();
@@ -12752,12 +12849,35 @@ async fn list_event_limit_under_cap_honored_exactly() {
         .dispatch("list", json!({"kind": "event", "limit": 2}))
         .await
         .expect("#894: list events under cap must succeed");
-    let items = resp.as_array().expect("list must return an array");
+    let items = list_items(&resp);
     assert!(
         items.len() <= 2,
         "limit=2 must never return more than 2 rows; got {}",
         items.len()
     );
+    assert_eq!(resp["requested_limit"], 2);
+    assert_eq!(resp["effective_limit"], 2);
+    assert_eq!(resp["limit_clamped"], false);
+}
+
+#[tokio::test]
+async fn list_event_zero_limit_preserves_requested_value_and_returns_no_rows() {
+    let f = pack_with_events();
+    f.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "zero-limit-event"}),
+    )
+    .await
+    .expect("create must produce at least one event");
+
+    let response = f
+        .dispatch("list", json!({"kind": "event", "limit": 0}))
+        .await
+        .expect("zero-limit offset event list must succeed like other substrates");
+    assert!(list_items(&response).is_empty());
+    assert_eq!(response["requested_limit"], 0);
+    assert_eq!(response["effective_limit"], 0);
+    assert_eq!(response["limit_clamped"], false);
 }
 
 #[tokio::test]
@@ -12874,7 +12994,9 @@ async fn list_proposals_offset_sweep_covers_all_exactly_once() {
             )
             .await
             .expect("list proposals page");
-        let items = page.as_array().expect("proposal list is a JSON array");
+        let items = page["items"]
+            .as_array()
+            .expect("proposal offset envelope must contain items");
         if items.is_empty() {
             break;
         }
@@ -13304,9 +13426,7 @@ async fn envelope_usage_equals_audit_row_resource_units() {
         )
         .await
         .expect("list(kind=event) must succeed");
-    let rows: Vec<&Value> = events
-        .as_array()
-        .expect("list must return an array")
+    let rows: Vec<&Value> = list_items(&events)
         .iter()
         .filter(|e| e.pointer("/payload/resource/units").is_some())
         .collect();
