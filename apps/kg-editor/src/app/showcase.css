@@ -244,12 +244,15 @@
 
 .repo-state-card > svg { color: var(--repo-green); flex: 0 0 auto; height: 24px; width: 24px; }
 .repo-state-card.loading > svg { animation: repo-spin 1s linear infinite; }
-.repo-state-card.warning > svg { color: var(--amber); }
-.repo-state-card.miss > svg { color: var(--repo-violet); }
+.repo-state-card.unavailable > svg { color: var(--amber); }
+.repo-state-card.truncated > svg { color: var(--amber); }
+.repo-state-card.error > svg { color: var(--red); }
+.repo-state-card.empty > svg { color: var(--repo-violet); }
 .repo-state-card strong,
 .repo-state-card span { display: block; }
 .repo-state-card strong { font-size: var(--khive-type-lg); }
 .repo-state-card span { color: var(--repo-muted); font-size: var(--khive-type-md); line-height: 1.5; margin-top: 4px; overflow-wrap: anywhere; }
+.repo-state-card .data-state-action { margin-left: auto; }
 
 @keyframes repo-spin { to { transform: rotate(360deg); } }
 
@@ -578,7 +581,9 @@ button.repo-list-row:hover,
 .repo-table td { border-top: 1px solid var(--repo-border); padding: 10px 11px; vertical-align: middle; }
 .repo-table td code { color: var(--repo-muted); font-size: var(--khive-type-sm); }
 .repo-table td strong { font-size: var(--khive-type-md); }
-.repo-inline-state { color: var(--amber); display: block; font-size: var(--khive-type-xs); font-style: normal; margin-top: 4px; }
+.repo-inline-state { align-items: flex-start; color: var(--amber); display: inline-flex; font-size: var(--khive-type-xs); gap: 4px; margin-top: 4px; }
+.repo-inline-state > svg { flex: 0 0 auto; height: 10px; margin-top: 1px; width: 10px; }
+.repo-inline-state .data-state-copy { gap: 1px; }
 
 .repo-bar {
   background: var(--khive-color-border);
@@ -664,6 +669,7 @@ button.repo-list-row:hover,
 .repo-bounded.complete { background: var(--khive-color-accent-soft); border-color: var(--khive-color-border); color: var(--khive-color-text-secondary); }
 .repo-bounded svg { flex: 0 0 auto; height: 12px; width: 12px; }
 .repo-bounded span { flex: 1; }
+.repo-bounded .data-state-copy { gap: 2px; }
 
 .repo-empty {
   color: var(--repo-muted);
@@ -678,6 +684,8 @@ button.repo-list-row:hover,
 .repo-empty strong { color: var(--repo-navy); font-size: var(--khive-type-base); }
 .repo-empty span { font-size: var(--khive-type-md); line-height: 1.5; max-width: 430px; }
 .repo-empty code { background: var(--khive-color-surface-raised); border-radius: var(--khive-radius-sm); font-size: var(--khive-type-sm); padding: 5px 7px; }
+.repo-empty .data-state-copy { align-items: center; }
+.repo-empty .data-state-action { margin-top: 4px; }
 .repo-empty.compact { min-height: 128px; padding: 22px; }
 
 .repo-cadence-series {

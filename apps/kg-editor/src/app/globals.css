@@ -57,6 +57,30 @@ kbd {
   width: 1px;
 }
 
+.data-state {
+  align-items: center;
+  display: flex;
+}
+
+.data-state-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.data-state.inline {
+  display: inline-flex;
+}
+
+.data-state-bound {
+  font-variant-numeric: tabular-nums;
+}
+
+.data-state-action {
+  flex: 0 0 auto;
+}
+
 .ontology-kind-mark,
 .ontology-relation-mark,
 .ontology-derived-mark,

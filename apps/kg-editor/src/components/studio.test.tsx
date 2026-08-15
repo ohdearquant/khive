@@ -4,7 +4,38 @@ import { describe, expect, it } from "vitest";
 
 import { Studio } from "@/components/studio";
 import { atlasReviewFixture } from "@/lib/fixtures/atlas-review";
-import { REVIEW_IMPORT_MAX_BYTES, type ReviewReport } from "@/lib/review-bundle";
+import { REVIEW_IMPORT_MAX_BYTES, type ReviewBundle, type ReviewReport } from "@/lib/review-bundle";
+
+const zeroPageCases = [
+  {
+    name: "affected graph",
+    view: /affected graph/i,
+    empty: (bundle: ReviewBundle) => {
+      bundle.graph.nodes.items = [];
+      bundle.graph.edges.items = [];
+    },
+  },
+  {
+    name: "checks",
+    view: /^checks/i,
+    empty: (bundle: ReviewBundle) => { bundle.checks.items = []; },
+  },
+  {
+    name: "evidence",
+    view: /provenance/i,
+    empty: (bundle: ReviewBundle) => { bundle.evidence.items = []; },
+  },
+  {
+    name: "retrieval",
+    view: /khive context/i,
+    empty: (bundle: ReviewBundle) => { bundle.retrieval.search.items = []; },
+  },
+  {
+    name: "activity",
+    view: /^activity/i,
+    empty: (bundle: ReviewBundle) => { bundle.activity.items = []; },
+  },
+] as const;
 
 describe("KG Studio", () => {
   it("makes the no-write and unavailable capability boundary visible", () => {
@@ -13,6 +44,82 @@ describe("KG Studio", () => {
     expect(screen.getByText("Demo data · no writes")).toBeVisible();
     expect(screen.getByText("WASM unavailable")).toBeVisible();
     expect(screen.getByText(/not persisted/i)).toBeVisible();
+  });
+
+  it("renders an actionable shared empty state for filtered graph changes", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+
+    await user.type(screen.getByPlaceholderText("Filter entities, edges, tiers…"), "nothing-matches-this");
+
+    const empty = container.querySelector<HTMLElement>('[data-state="empty"]');
+    expect(empty).toBeVisible();
+    expect(empty?.querySelectorAll("button")).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Clear filter" }));
+    expect(container.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+  });
+
+  it.each(zeroPageCases)("renders $name zero pages through one actionable empty state", async ({ view, empty }) => {
+    const bundle = structuredClone(atlasReviewFixture);
+    empty(bundle);
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    await user.click(screen.getAllByRole("button", { name: view })[0]);
+
+    const state = container.querySelector<HTMLElement>('[data-state="empty"]');
+    expect(state).toBeVisible();
+    expect(state?.querySelectorAll("button")).toHaveLength(1);
+    expect(within(state!).getByRole("button", { name: "Import another review bundle" })).toBeVisible();
+  });
+
+  it("renders Studio page bounds as the shared truncated state", () => {
+    const bundle = structuredClone(atlasReviewFixture);
+    bundle.changes.truncated = true;
+    bundle.changes.next_cursor = "next-page";
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    const state = container.querySelector<HTMLElement>('[data-state="truncated"]');
+    expect(state).toHaveAttribute("data-shown", String(bundle.changes.items.length));
+    expect(state).not.toHaveAttribute("data-bound");
+    expect(state).toHaveTextContent(/graph changes.*bound unavailable/i);
+  });
+
+  it.each([
+    ["truncated", { truncated: true, next_cursor: null }],
+    ["next cursor", { truncated: false, next_cursor: "next-page" }],
+  ] as const)("does not mislabel a zero-item %s page as known-empty", (_name, incomplete) => {
+    const bundle = structuredClone(atlasReviewFixture);
+    bundle.changes.items = [];
+    bundle.changes.truncated = incomplete.truncated;
+    bundle.changes.next_cursor = incomplete.next_cursor;
+
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    expect(container.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+    const state = container.querySelector<HTMLElement>('[data-state="truncated"]');
+    expect(state).toBeVisible();
+    expect(state).toHaveAttribute("data-shown", "0");
+    expect(state).not.toHaveAttribute("data-bound");
+  });
+
+  it.each([
+    ["truncated", { truncated: true, next_cursor: null }],
+    ["next cursor", { truncated: false, next_cursor: "next-page" }],
+  ] as const)("does not render the checks success hero for a zero-item %s page", async (_name, incomplete) => {
+    const bundle = structuredClone(atlasReviewFixture);
+    bundle.checks.items = [];
+    bundle.checks.truncated = incomplete.truncated;
+    bundle.checks.next_cursor = incomplete.next_cursor;
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    await user.click(screen.getAllByRole("button", { name: /^checks/i })[0]);
+
+    const surface = container.querySelector<HTMLElement>(".review-surface")!;
+    expect(within(surface).queryByText("No error-level findings")).not.toBeInTheDocument();
+    expect(surface.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+    expect(surface.querySelector('[data-state="truncated"]')).toBeVisible();
   });
 
   it("navigates from semantic diff to the affected graph", async () => {

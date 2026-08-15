@@ -24,6 +24,7 @@ import {
 } from "@/icons";
 import { useMemo, useState } from "react";
 
+import { DataState } from "@/components/data-state";
 import {
   DerivedEdgeMark,
   edgeDirectionMark,
@@ -46,6 +47,11 @@ type Labels = RepoBundle["capability"]["labels"];
 type ViewCapability = RepoBundle["capability"]["views"][ViewId];
 type Icon = typeof Network;
 type ModuleMap = Map<string, RepoModule>;
+type ViewProps = Readonly<{
+  bundle: RepoBundle;
+  moduleById: ModuleMap;
+  onExploreStructure: () => void;
+}>;
 
 const viewOrder: readonly ViewId[] = [
   "structure_graph",
@@ -113,23 +119,82 @@ function availabilityText<T>(
   return value.status === "available" ? render(value.value) : `${labels.unavailable} · ${value.reason}`;
 }
 
+function isIncompleteRepoPage<T>(page: RepoPage<T>): boolean {
+  return page.disclosure.status !== "unavailable"
+    && (page.truncated || page.next_cursor != null || page.disclosure.status === "truncated");
+}
+
+function isKnownEmptyRepoPage<T>(page: RepoPage<T>): boolean {
+  return page.items.length === 0
+    && page.disclosure.status === "complete"
+    && !page.truncated
+    && page.next_cursor == null;
+}
+
 function BoundDisclosure<T>({ page, labels }: { page: RepoPage<T>; labels: Labels }) {
   const total = page.total_count.status === "available" ? formatNumber(page.total_count.value) : labels.unavailable;
   const reason = page.disclosure.reason ?? (page.truncated ? labels.truncated : undefined);
+  if (page.disclosure.status === "unavailable") {
+    return (
+      <DataState
+        className="repo-bounded"
+        presentation="inline"
+        state="unavailable"
+        title={labels.unavailable}
+        message={reason ?? "This bundle does not claim a complete collection."}
+        context={[`${formatNumber(page.items.length)} / ${total}`]}
+      />
+    );
+  }
+  if (isIncompleteRepoPage(page)) {
+    return (
+      <DataState
+        className="repo-bounded"
+        presentation="inline"
+        state="truncated"
+        title={labels.truncated}
+        shown={page.items.length}
+        bound={page.bound.max_items}
+        knownTotal={page.total_count.status === "available" ? page.total_count.value : undefined}
+        reason={reason ?? "The exported collection reached its declared bound."}
+      />
+    );
+  }
   return (
-    <div className={`repo-bounded ${page.disclosure.status}`} role="status">
-      {page.truncated ? <AlertTriangle aria-hidden="true" /> : <Info aria-hidden="true" />}
-      <span>
-        {page.truncated ? `${labels.truncated} · ` : page.disclosure.status === "unavailable" ? `${labels.unavailable} · ` : ""}
-        {reason ? `${reason} · ` : ""}{formatNumber(page.items.length)} / {total}
-      </span>
-    </div>
+    <span className="repo-bounded complete">
+      <Info aria-hidden="true" />
+      <span>{formatNumber(page.items.length)} / {total}</span>
+    </span>
   );
 }
 
 function InlinePageState<T>({ page, labels }: { page: RepoPage<T>; labels: Labels }) {
-  if (!page.truncated && page.disclosure.status !== "unavailable") return null;
-  return <em className="repo-inline-state">{page.truncated ? labels.truncated : labels.unavailable}{page.disclosure.reason ? ` · ${page.disclosure.reason}` : ""}</em>;
+  if (page.disclosure.status === "unavailable") {
+    return (
+      <DataState
+        className="repo-inline-state"
+        presentation="inline"
+        state="unavailable"
+        title={labels.unavailable}
+        message={page.disclosure.reason ?? "This bundle does not claim a complete collection."}
+      />
+    );
+  }
+  if (isIncompleteRepoPage(page)) {
+    return (
+      <DataState
+        className="repo-inline-state"
+        presentation="inline"
+        state="truncated"
+        title={labels.truncated}
+        shown={page.items.length}
+        bound={page.bound.max_items}
+        knownTotal={page.total_count.status === "available" ? page.total_count.value : undefined}
+        reason={page.disclosure.reason ?? "The exported collection reached its declared bound."}
+      />
+    );
+  }
+  return null;
 }
 
 function LocalSliceDisclosure({
@@ -145,10 +210,16 @@ function LocalSliceDisclosure({
 }) {
   if (shown >= total) return null;
   return (
-    <div className="repo-bounded truncated" role="status">
-      <AlertTriangle aria-hidden="true" />
-      <span>{labels.truncated} · {formatNumber(shown)} / {formatNumber(total)} {label}</span>
-    </div>
+    <DataState
+      className="repo-bounded"
+      presentation="inline"
+      state="truncated"
+      title={`${label} ${labels.truncated.toLocaleLowerCase()}`}
+      shown={shown}
+      bound={shown}
+      knownTotal={total}
+      reason="The browser display bound hides the remaining captured rows."
+    />
   );
 }
 
@@ -162,7 +233,18 @@ function InlineLocalSlice({
   labels: Labels;
 }) {
   if (shown >= total) return null;
-  return <em className="repo-inline-state">{labels.truncated} · {formatNumber(shown)} / {formatNumber(total)}</em>;
+  return (
+    <DataState
+      className="repo-inline-state"
+      presentation="inline"
+      state="truncated"
+      title={labels.truncated}
+      shown={shown}
+      bound={shown}
+      knownTotal={total}
+      reason="The browser display bound hides the remaining captured rows."
+    />
+  );
 }
 
 function ViewHeader({ capability }: { capability: ViewCapability }) {
@@ -182,12 +264,13 @@ function ViewHeader({ capability }: { capability: ViewCapability }) {
 
 function UnavailableView({ capability, labels }: { capability: ViewCapability; labels: Labels }) {
   return (
-    <div className="repo-empty" role="status">
-      <AlertTriangle aria-hidden="true" />
-      <strong>{labels.unavailable}</strong>
-      <span>{capability.unavailable_reason}</span>
-      <code>{capability.granularity} · {capability.join}</code>
-    </div>
+    <DataState
+      className="repo-empty"
+      state="unavailable"
+      title={`${capability.label} ${labels.unavailable.toLocaleLowerCase()}`}
+      message={capability.unavailable_reason ?? "This bundle does not claim data for the view."}
+      context={[`${capability.granularity} · ${capability.join}`]}
+    />
   );
 }
 
@@ -463,6 +546,7 @@ function HistoryFacet({
   parentPage,
   resolveItem,
   labels,
+  onExploreStructure,
 }: {
   label: string;
   icon: Icon;
@@ -470,6 +554,7 @@ function HistoryFacet({
   parentPage: RepoBundle["graph"]["history_navigation"]["by_module"];
   resolveItem: (id: string) => { title: string; number: number } | undefined;
   labels: Labels;
+  onExploreStructure: () => void;
 }) {
   const page = value?.status === "available" ? value.value : null;
   const rows = page?.items.slice(0, UI_ROW_LIMIT) ?? [];
@@ -483,24 +568,24 @@ function HistoryFacet({
     <section className="repo-card">
       <div className="repo-card-heading"><h3>{label}</h3></div>
       {unavailableReason ? (
-        <div className="repo-empty"><Info aria-hidden="true" /><strong>{labels.unavailable}</strong><span>{unavailableReason}</span></div>
-      ) : rows.length === 0 ? (
-        <div className="repo-empty"><Icon aria-hidden="true" /><strong>0</strong><span>{label}</span></div>
-      ) : (
+        <DataState className="repo-empty" state="unavailable" title={`${label} ${labels.unavailable.toLocaleLowerCase()}`} message={unavailableReason} />
+      ) : page && isKnownEmptyRepoPage(page) ? (
+        <DataState className="repo-empty" state="empty" title={`No ${label}`} message={`${label} captured for the selected module belong here.`} action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+      ) : rows.length > 0 ? (
         <div className="repo-list">
           {rows.map((id) => {
             const item = resolveItem(id);
             return <div className="repo-list-row" key={id}><Icon aria-hidden="true" /><div><strong>{item?.title ?? id}</strong>{item && <span>#{item.number}</span>}</div></div>;
           })}
         </div>
-      )}
+      ) : null}
       {page && <LocalSliceDisclosure shown={rows.length} total={page.items.length} label={label} labels={labels} />}
       {page && <BoundDisclosure page={page} labels={labels} />}
     </section>
   );
 }
 
-function HistoryStructure({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function HistoryStructure({ bundle, moduleById, onExploreStructure }: ViewProps) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
   const view = capability.views.history_structure_navigation;
@@ -545,13 +630,16 @@ function HistoryStructure({ bundle, moduleById }: { bundle: RepoBundle; moduleBy
                 <GitCommitHorizontal aria-hidden="true" /><div><strong>{commit.subject}</strong><span>{commit.author} · {formatDate(commit.committed_at)}</span></div><code>{commit.short_sha}</code>
               </button>
             ))}
-            {commits.length === 0 && linkedCommitIds.size > 0 ? (
-              <div className="repo-empty"><AlertTriangle aria-hidden="true" /><strong>{labels.truncated}</strong><span>{graph.commits.disclosure.reason}</span></div>
-            ) : commits.length === 0 && (
+            {commits.length === 0 && (
               selectedModuleNavigation?.commits.disclosure.status === "unavailable" ||
-              graph.history_navigation.by_module.disclosure.status === "unavailable"
-                ? <div className="repo-empty"><GitCommitHorizontal aria-hidden="true" /><strong>{labels.unavailable}</strong><span>{selectedModuleNavigation?.commits.disclosure.reason ?? graph.history_navigation.by_module.disclosure.reason}</span></div>
-                : <div className="repo-empty"><GitCommitHorizontal aria-hidden="true" /><strong>0</strong><span>{labels.node_types.commit}</span></div>
+              graph.history_navigation.by_module.disclosure.status === "unavailable" ||
+              graph.commits.disclosure.status === "unavailable"
+                ? <DataState className="repo-empty" state="unavailable" title={`${labels.node_types.commit} ${labels.unavailable.toLocaleLowerCase()}`} message={selectedModuleNavigation?.commits.disclosure.reason ?? graph.history_navigation.by_module.disclosure.reason ?? "This bundle does not claim commit navigation."} />
+                : linkedCommitIds.size > 0
+                  ? <DataState className="repo-empty" state="truncated" title={`${labels.node_types.commit} ${labels.truncated.toLocaleLowerCase()}`} shown={commits.length} bound={graph.commits.bound.max_items} knownTotal={linkedCommitIds.size} reason={graph.commits.disclosure.reason ?? "Referenced commits fall outside the captured graph bound."} />
+                  : selectedModuleNavigation && isKnownEmptyRepoPage(selectedModuleNavigation.commits)
+                    ? <DataState className="repo-empty" state="empty" title={`No ${labels.node_types.commit}`} message="Commits captured for the selected module belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+                    : null
             )}
           </div>
           <LocalSliceDisclosure shown={commits.length} total={linkedCommitIds.size} label={labels.node_types.commit} labels={labels} />
@@ -567,6 +655,7 @@ function HistoryStructure({ bundle, moduleById }: { bundle: RepoBundle; moduleBy
           parentPage={graph.history_navigation.by_module}
           resolveItem={(id) => graph.pull_requests.items.find((candidate) => candidate.id === id)}
           labels={labels}
+          onExploreStructure={onExploreStructure}
         />
         <HistoryFacet
           label={labels.node_types.issue}
@@ -575,6 +664,7 @@ function HistoryStructure({ bundle, moduleById }: { bundle: RepoBundle; moduleBy
           parentPage={graph.history_navigation.by_module}
           resolveItem={(id) => graph.issues.items.find((candidate) => candidate.id === id)}
           labels={labels}
+          onExploreStructure={onExploreStructure}
         />
       </div>
       <div className="repo-grid two">
@@ -603,7 +693,7 @@ function HistoryStructure({ bundle, moduleById }: { bundle: RepoBundle; moduleBy
             ))}
             {graph.join_resolution.repositories.status === "available" && <LocalSliceDisclosure shown={resolutions.length} total={graph.join_resolution.repositories.value.length} label={labels.metrics.resolution} labels={labels} />}
             {graph.join_resolution.historical.status === "available" && <LocalSliceDisclosure shown={historicalResolutions.length} total={graph.join_resolution.historical.value.length} label={labels.metrics.change_frequency} labels={labels} />}
-            {graph.join_resolution.repositories.status === "unavailable" && <div className="repo-empty"><Info aria-hidden="true" /><strong>{labels.unavailable}</strong><span>{graph.join_resolution.repositories.reason}</span></div>}
+            {graph.join_resolution.repositories.status === "unavailable" && <DataState className="repo-empty" state="unavailable" title={`${labels.metrics.resolution} ${labels.unavailable.toLocaleLowerCase()}`} message={graph.join_resolution.repositories.reason} />}
             {graph.join_resolution.historical.status === "unavailable" && <div className="repo-stat-line"><span>{labels.metrics.change_frequency}</span><strong>{labels.unavailable}</strong></div>}
           </div>
         </section>
@@ -627,7 +717,7 @@ function HistoryStructure({ bundle, moduleById }: { bundle: RepoBundle; moduleBy
   );
 }
 
-function DependencyTopology({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function DependencyTopology({ bundle, moduleById, onExploreStructure }: ViewProps) {
   const analysis = bundle.aggregates.dependency_topology;
   const labels = bundle.capability.labels;
   const moduleRows = analysis.modules.items.slice(0, UI_ROW_LIMIT);
@@ -645,7 +735,7 @@ function DependencyTopology({ bundle, moduleById }: { bundle: RepoBundle; module
       <section className="repo-card">
         <div className="repo-card-heading"><h3>{labels.metrics.cycle_count}</h3><p>{formatNumber(analysis.cycles.items.length)}</p></div>
         <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>{cycle.module_ids.map((id) => moduleName(moduleById, id)).join(" → ")}</span></div></div>)}</div>
-        {analysis.cycles.items.length === 0 && <div className="repo-empty"><ShieldCheck aria-hidden="true" /><strong>0</strong><span>{labels.metrics.cycle_count}</span></div>}
+        {isKnownEmptyRepoPage(analysis.cycles) && <DataState className="repo-empty" state="empty" title="No dependency cycles in this bundle" message="Dependency cycles found by the captured topology analysis belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={cycleRows.length} total={analysis.cycles.items.length} label={labels.metrics.cycle_count} labels={labels} />
         <BoundDisclosure page={analysis.cycles} labels={labels} />
       </section>
@@ -684,7 +774,7 @@ function HotspotQuadrantView({ bundle, moduleById }: { bundle: RepoBundle; modul
   );
 }
 
-function HiddenCouplingView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function HiddenCouplingView({ bundle, moduleById, onExploreStructure }: ViewProps) {
   const analysis = bundle.aggregates.hidden_coupling;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
@@ -692,7 +782,7 @@ function HiddenCouplingView({ bundle, moduleById }: { bundle: RepoBundle; module
     <div className="repo-view-body">
       <section className="repo-card repo-table-wrap">
         <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.node_types.module}</th><th>{labels.metrics.cochange_count}</th><th>{labels.metrics.support}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.left_module_id}-${row.right_module_id}`}><td><strong>{moduleName(moduleById, row.left_module_id)}</strong></td><td><strong>{moduleName(moduleById, row.right_module_id)}</strong></td><td>{formatNumber(row.cochange_count)}</td><td><div className="repo-bar violet" aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}><span style={{ width: `${Math.min(100, row.support * 100)}%` }} /></div></td></tr>)}</tbody></table>
-        {analysis.data.items.length === 0 && <div className="repo-empty"><Braces aria-hidden="true" /><strong>0</strong><span>{bundle.capability.views.hidden_coupling.label}</span></div>}
+        {isKnownEmptyRepoPage(analysis.data) && <DataState className="repo-empty" state="empty" title={`No ${bundle.capability.views.hidden_coupling.label.toLocaleLowerCase()} in this bundle`} message="Module pairs with captured co-change signals belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.hidden_coupling.label} labels={labels} />
         <BoundDisclosure page={analysis.data} labels={labels} />
       </section>
@@ -724,15 +814,15 @@ function TreemapView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: M
 type CadencePage = RepoBundle["aggregates"]["cadence_timeline"]["commits"];
 type CadenceSeriesId = "commits" | "issues_opened" | "issues_closed" | "pull_requests_opened" | "pull_requests_merged";
 
-function CadenceSeries({ id, page, label, labels }: { id: CadenceSeriesId; page: CadencePage; label: string; labels: Labels }) {
+function CadenceSeries({ id, page, label, labels, onExploreStructure }: { id: CadenceSeriesId; page: CadencePage; label: string; labels: Labels; onExploreStructure: () => void }) {
   const rows = page.items.slice(0, UI_ROW_LIMIT);
   return (
     <section className="repo-card repo-table-wrap" data-cadence-series={id} data-series-status={page.disclosure.status}>
       <div className="repo-card-heading"><h3>{label}</h3><p>{page.total_count.status === "available" ? formatNumber(page.total_count.value) : labels.unavailable}</p></div>
       {page.disclosure.status === "unavailable" ? (
-        <div className="repo-empty compact"><Info aria-hidden="true" /><strong>{labels.unavailable}</strong><span>{page.disclosure.reason}</span></div>
-      ) : rows.length === 0 ? (
-        <div className="repo-empty compact"><ShieldCheck aria-hidden="true" /><strong>0</strong><span>{label}</span></div>
+        <DataState className="repo-empty compact" state="unavailable" title={`${label} ${labels.unavailable.toLocaleLowerCase()}`} message={page.disclosure.reason ?? "This bundle does not claim cadence data."} />
+      ) : isKnownEmptyRepoPage(page) ? (
+        <DataState className="repo-empty compact" state="empty" title={`No ${label.toLocaleLowerCase()} cadence points`} message={`Captured weekly ${label.toLocaleLowerCase()} counts belong here.`} action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
       ) : (
         <table className="repo-table"><thead><tr><th>{labels.metrics.week}</th><th>{label}</th></tr></thead><tbody>{rows.map((point) => <tr key={point.week_start}><td>{point.week_start}</td><td>{formatNumber(point.count)}</td></tr>)}</tbody></table>
       )}
@@ -742,7 +832,7 @@ function CadenceSeries({ id, page, label, labels }: { id: CadenceSeriesId; page:
   );
 }
 
-function CadenceView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function CadenceView({ bundle, moduleById, onExploreStructure }: ViewProps) {
   const analysis = bundle.aggregates.cadence_timeline;
   const labels = bundle.capability.labels;
   const commitRows = analysis.commits.items.slice(0, UI_ROW_LIMIT);
@@ -765,11 +855,11 @@ function CadenceView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: M
         <LocalSliceDisclosure shown={commitRows.length} total={analysis.commits.items.length} label={labels.metrics.commits} labels={labels} />
       </div>
       <div className="repo-cadence-series">
-        <CadenceSeries id="commits" page={analysis.commits} label={labels.metrics.commits} labels={labels} />
-        <CadenceSeries id="issues_opened" page={analysis.issues_opened} label={labels.metrics.issues_opened} labels={labels} />
-        <CadenceSeries id="issues_closed" page={analysis.issues_closed} label={labels.metrics.issues_closed} labels={labels} />
-        <CadenceSeries id="pull_requests_opened" page={analysis.pull_requests_opened} label={labels.metrics.pull_requests_opened} labels={labels} />
-        <CadenceSeries id="pull_requests_merged" page={analysis.pull_requests_merged} label={labels.metrics.pull_requests_merged} labels={labels} />
+        <CadenceSeries id="commits" page={analysis.commits} label={labels.metrics.commits} labels={labels} onExploreStructure={onExploreStructure} />
+        <CadenceSeries id="issues_opened" page={analysis.issues_opened} label={labels.metrics.issues_opened} labels={labels} onExploreStructure={onExploreStructure} />
+        <CadenceSeries id="issues_closed" page={analysis.issues_closed} label={labels.metrics.issues_closed} labels={labels} onExploreStructure={onExploreStructure} />
+        <CadenceSeries id="pull_requests_opened" page={analysis.pull_requests_opened} label={labels.metrics.pull_requests_opened} labels={labels} onExploreStructure={onExploreStructure} />
+        <CadenceSeries id="pull_requests_merged" page={analysis.pull_requests_merged} label={labels.metrics.pull_requests_merged} labels={labels} onExploreStructure={onExploreStructure} />
       </div>
       <div className="repo-grid two">
         <section className="repo-card" style={{ padding: 14 }}><span className="repo-eyebrow">{labels.metrics.lead_time}</span><strong>{availabilityText(analysis.pull_request_lead_time_hours, labels, (value) => `${labels.metrics.p50} ${value.p50.toFixed(1)} · ${labels.metrics.p90} ${value.p90.toFixed(1)} · ${labels.metrics.p95} ${value.p95.toFixed(1)}`)}</strong></section>
@@ -804,7 +894,7 @@ function OwnershipView({ bundle, moduleById }: { bundle: RepoBundle; moduleById:
         </section>
       </div>
       <section className="repo-card repo-table-wrap">
-        {analysis.modules.disclosure.status === "unavailable" ? <div className="repo-empty"><Info aria-hidden="true" /><strong>{labels.unavailable}</strong><span>{analysis.modules.disclosure.reason}</span></div> : <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.commits}</th><th>{labels.metrics.author_concentration}</th><th>{labels.metrics.bus_factor}</th></tr></thead><tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong><div>{row.authors.items.slice(0, 8).map((author) => `${author.author} ${formatPercent(author.share)}`).join(" · ")}</div><InlineLocalSlice shown={Math.min(8, row.authors.items.length)} total={row.authors.items.length} labels={labels} /><InlinePageState page={row.authors} labels={labels} /></td><td>{row.commit_count}</td><td>{row.author_concentration.status === "available" ? <div className="repo-bar" aria-label={`${labels.metrics.author_concentration} ${formatPercent(row.author_concentration.value)}`}><span style={{ width: `${Math.min(100, row.author_concentration.value * 100)}%` }} /></div> : availabilityText(row.author_concentration, labels)}</td><td>{availabilityText(row.bus_factor, labels, formatNumber)}</td></tr>)}</tbody></table>}
+        {analysis.modules.disclosure.status === "unavailable" ? <DataState className="repo-empty" state="unavailable" title={`${labels.node_types.module} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.modules.disclosure.reason ?? "This bundle does not claim ownership modules."} /> : <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.commits}</th><th>{labels.metrics.author_concentration}</th><th>{labels.metrics.bus_factor}</th></tr></thead><tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong><div>{row.authors.items.slice(0, 8).map((author) => `${author.author} ${formatPercent(author.share)}`).join(" · ")}</div><InlineLocalSlice shown={Math.min(8, row.authors.items.length)} total={row.authors.items.length} labels={labels} /><InlinePageState page={row.authors} labels={labels} /></td><td>{row.commit_count}</td><td>{row.author_concentration.status === "available" ? <div className="repo-bar" aria-label={`${labels.metrics.author_concentration} ${formatPercent(row.author_concentration.value)}`}><span style={{ width: `${Math.min(100, row.author_concentration.value * 100)}%` }} /></div> : availabilityText(row.author_concentration, labels)}</td><td>{availabilityText(row.bus_factor, labels, formatNumber)}</td></tr>)}</tbody></table>}
         <LocalSliceDisclosure shown={moduleRows.length} total={analysis.modules.items.length} label={labels.node_types.module} labels={labels} />
         <BoundDisclosure page={analysis.modules} labels={labels} />
       </section>
@@ -865,7 +955,7 @@ function ScorecardView({ bundle, moduleById }: { bundle: RepoBundle; moduleById:
   );
 }
 
-const viewComponents: Record<ViewId, React.ComponentType<{ bundle: RepoBundle; moduleById: ModuleMap }>> = {
+const viewComponents: Record<ViewId, React.ComponentType<ViewProps>> = {
   structure_graph: StructureGraph,
   history_structure_navigation: HistoryStructure,
   dependency_topology: DependencyTopology,
@@ -878,13 +968,13 @@ const viewComponents: Record<ViewId, React.ComponentType<{ bundle: RepoBundle; m
   scorecard: ScorecardView,
 };
 
-function ActiveView({ id, bundle, moduleById }: { id: ViewId; bundle: RepoBundle; moduleById: ModuleMap }) {
+function ActiveView({ id, bundle, moduleById, onExploreStructure }: ViewProps & { id: ViewId }) {
   const capability = bundle.capability.views[id];
   const labels = bundle.capability.labels;
   const ViewComponent = viewComponents[id];
   return (
     <ViewFrame capability={capability} labels={labels} allowPartial={id === "ownership"}>
-      <ViewComponent bundle={bundle} moduleById={moduleById} />
+      <ViewComponent bundle={bundle} moduleById={moduleById} onExploreStructure={onExploreStructure} />
     </ViewFrame>
   );
 }
@@ -917,7 +1007,7 @@ export function RepoShowcase({ bundle }: { bundle: RepoBundle }) {
           })}
         </nav>
         <section className="repo-view-panel" aria-label={capability.views[activeView].label}>
-          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} />
+          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} onExploreStructure={() => setActiveView("structure_graph")} />
         </section>
       </div>
     </article>
