@@ -1,8 +1,15 @@
 import type { ShowcaseBundleSource } from "@/lib/adapters/preferred-showcase-source";
+import {
+  buildCouplingComparison,
+  couplingAnalysisWindowLabel,
+  couplingComparisonResultStatus,
+  type CouplingComparisonResult,
+  type CouplingEvidenceBoundary,
+  type CouplingEvidenceState,
+} from "@/lib/coupling-comparison";
 import { buildModuleInsight } from "@/lib/repository-brief";
 import type { RepoBundle, ViewId } from "@/lib/repo-bundle";
 import type { StructureGraphLocation } from "@/lib/repository-location";
-import { structureCouplingPairKey } from "@/lib/structure-coupling-lens";
 
 export const INVESTIGATION_BRIEF_MAX_CHARS = 48 * 1_024;
 export const INVESTIGATION_BRIEF_VERIFY_INSTRUCTION =
@@ -157,22 +164,6 @@ function unavailableCoverage(label: string, reason: string): string {
   return `- ${label}: **unavailable**; ${code(reason)}.`;
 }
 
-function formatWindow(
-  window: RepoBundle["aggregates"]["hidden_coupling"]["meta"]["window"],
-): string {
-  if (window.kind === "rolling_days") {
-    const duration = window.days == null ? "Rolling" : `${window.days}-day`;
-    const range = window.start && window.end
-      ? ` (${boundedInline(window.start)} to ${boundedInline(window.end)})`
-      : "";
-    return `${duration} analysis window${range}`;
-  }
-  if (window.kind === "range") {
-    return `Bounded analysis range ${boundedInline(window.start ?? "unspecified start")} to ${boundedInline(window.end ?? "unspecified end")}`;
-  }
-  return "Declared all-history analysis window";
-}
-
 function percentage(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
 }
@@ -181,6 +172,105 @@ function sourceDescription(source: ShowcaseBundleSource): string {
   return source === "khive-db-snapshot"
     ? "Materialized khive DB snapshot"
     : "Curated static fallback bundle";
+}
+
+function couplingBoundarySummary(boundary: CouplingEvidenceBoundary): string {
+  const declared = boundary.declared == null
+    ? "an unknown declared total"
+    : `${boundary.declared} declared`;
+  return `${boundary.shown} shown of ${declared}; fixed bound ${boundary.bound}${
+    boundary.reason ? `; ${code(boundary.reason)}` : ""
+  }`;
+}
+
+function couplingEvidenceLine(
+  label: string,
+  state: CouplingEvidenceState,
+  boundary: CouplingEvidenceBoundary,
+): string {
+  return `- ${label}: **${state}**; ${couplingBoundarySummary(boundary)}.`;
+}
+
+function appendCouplingWorkbench(
+  lines: string[],
+  result: CouplingComparisonResult,
+): void {
+  lines.push(
+    "",
+    "## Boundary evidence workbench",
+    "",
+    `- Boundary evidence status: ${code(couplingComparisonResultStatus(result), PATH_VALUE_LIMIT)}.`,
+    `- Status: **${result.status}**.`,
+  );
+  if (result.status === "unavailable") {
+    lines.push(
+      `- Code: ${code(result.code)}.`,
+      `- Reason: ${code(result.reason, PATH_VALUE_LIMIT)}.`,
+      `- Direct dependency: **unknown**; ${code(result.reason, PATH_VALUE_LIMIT)}.`,
+      "- Verify next:",
+      `  - Inspect the recorded endpoint sources because boundary evidence is unavailable: ${code(result.reason, PATH_VALUE_LIMIT)}.`,
+    );
+    return;
+  }
+  const comparison = result.value;
+  lines.push(
+    `- ${comparison.caveat}`,
+    couplingEvidenceLine(
+      "Shared commits",
+      comparison.sharedCommits.state,
+      comparison.sharedCommits.boundary,
+    ),
+    couplingEvidenceLine(
+      "Common structural neighbors",
+      comparison.commonNeighbors.state,
+      comparison.commonNeighbors.boundary,
+    ),
+    couplingEvidenceLine(
+      "Direct dependency",
+      comparison.directDependency.state,
+      comparison.directDependency.boundary,
+    ),
+  );
+  for (const endpoint of comparison.endpoints) {
+    lines.push(
+      `- Endpoint: ${code(endpoint.module.source_path, PATH_VALUE_LIMIT)}.`,
+      `  - Topology: **${endpoint.topology.state}**; fan-in ${endpoint.topology.fanIn ?? "unavailable"}; fan-out ${endpoint.topology.fanOut ?? "unavailable"}; ${couplingBoundarySummary(endpoint.topology.boundary)}.`,
+      `  - SCC membership: **${endpoint.scc.state}**; ${couplingBoundarySummary(endpoint.scc.boundary)}.`,
+      `  - Endpoint history: ${couplingBoundarySummary(endpoint.history.boundary)}.`,
+      endpoint.hotspot.state === "present"
+        ? `  - Captured hotspot row: ${endpoint.hotspot.commitCount} commits; fan-in ${endpoint.hotspot.fanIn}; quadrant ${code(endpoint.hotspot.quadrant ?? "unavailable")}; window ${code(couplingAnalysisWindowLabel(endpoint.hotspot.window), PATH_VALUE_LIMIT)}; ${couplingBoundarySummary(endpoint.hotspot.boundary)}.`
+        : `  - Hotspot evidence: **${endpoint.hotspot.state}**; window ${code(couplingAnalysisWindowLabel(endpoint.hotspot.window), PATH_VALUE_LIMIT)}; ${couplingBoundarySummary(endpoint.hotspot.boundary)}.`,
+      endpoint.ownership.state === "present"
+        ? `  - Captured ownership rows: ${endpoint.ownership.commitCount} commits; author concentration ${endpoint.ownership.authorConcentration == null ? "unavailable" : percentage(endpoint.ownership.authorConcentration)}; bus factor ${endpoint.ownership.busFactor ?? "unavailable"}; window ${code(couplingAnalysisWindowLabel(endpoint.ownership.window), PATH_VALUE_LIMIT)}; ${couplingBoundarySummary(endpoint.ownership.boundary)}.`
+        : `  - Ownership evidence: **${endpoint.ownership.state}**; window ${code(couplingAnalysisWindowLabel(endpoint.ownership.window), PATH_VALUE_LIMIT)}; ${couplingBoundarySummary(endpoint.ownership.boundary)}.`,
+      `  - ${endpoint.ownership.caveat}`,
+    );
+    for (const cycle of endpoint.scc.items) {
+      lines.push(
+        `  - SCC ${code(cycle.id)}: ${cycle.modules.map((moduleNode) => code(moduleNode.source_path, PATH_VALUE_LIMIT)).join(", ")}; SCC members: ${couplingBoundarySummary(cycle.memberBoundary)}.`,
+      );
+    }
+  }
+  if (comparison.sharedCommits.items.length > 0) {
+    lines.push("- Bounded shared-commit sample:");
+    for (const item of comparison.sharedCommits.items) {
+      lines.push(
+        `  - ${code(item.commit.sha)} at ${code(item.commit.committed_at)}: ${code(item.commit.subject)}.`,
+      );
+    }
+  }
+  if (comparison.commonNeighbors.items.length > 0) {
+    lines.push("- Bounded common-neighbor sample:");
+    for (const item of comparison.commonNeighbors.items) {
+      lines.push(
+        `  - ${code(item.module.source_path, PATH_VALUE_LIMIT)}: left ${code(item.leftDirection)} ${code(item.leftRelation)}; right ${code(item.rightDirection)} ${code(item.rightRelation)}.`,
+      );
+    }
+  }
+  lines.push("- Verify next:");
+  for (const prompt of comparison.verifyPrompts) {
+    lines.push(`  - ${code(prompt, PATH_VALUE_LIMIT)}.`);
+  }
 }
 
 function appendOptionalBlocks(
@@ -258,10 +348,6 @@ export function buildInvestigationBrief({
     const matches = moduleBySourcePath.get(path) ?? [];
     return matches.length === 1 ? matches[0] : null;
   }) ?? [];
-  const focusedPairKey = focusedModules.length === 2 &&
-      focusedModules[0] && focusedModules[1]
-    ? structureCouplingPairKey(focusedModules[0].id, focusedModules[1].id)
-    : null;
   if (
     focusedModules.some((moduleNode) =>
       moduleNode != null &&
@@ -282,18 +368,19 @@ export function buildInvestigationBrief({
       `Captured module revision does not match the recorded snapshot SHA (${mismatchedModule.source_path}).`,
     );
   }
-  const focusedPair = focusedPairKey
-    ? bundle.aggregates.hidden_coupling.data.items.find((pair) =>
-      structureCouplingPairKey(pair.left_module_id, pair.right_module_id) ===
-        focusedPairKey
-    )
-    : undefined;
-  const capturedDirectEdge = focusedPairKey
-    ? bundle.graph.structure_edges.items.some((edge) =>
-      edge.relation === "depends_on" &&
-      structureCouplingPairKey(edge.source, edge.target) === focusedPairKey
-    )
-    : false;
+  const focusedComparison = focusedPaths
+    ? buildCouplingComparison({ bundle, sourcePaths: focusedPaths })
+    : null;
+  if (
+    focusedComparison?.status === "unavailable" &&
+    (focusedComparison.code === "source_revision_mismatch" ||
+      focusedComparison.code === "evidence_revision_mismatch")
+  ) {
+    throw new InvestigationBriefError(
+      "referenced_module_revision_mismatch",
+      focusedComparison.reason,
+    );
+  }
 
   const sccSummary = insight.topology.cycles.length > 0
     ? `**Observed** SCC membership: ${insight.topology.cycles.length} captured SCC${insight.topology.cycles.length === 1 ? "" : "s"}.`
@@ -348,25 +435,34 @@ export function buildInvestigationBrief({
   ];
 
   if (focusedPaths && focusedPaths.length === 2) {
+    const comparison = focusedComparison?.status === "available"
+      ? focusedComparison.value
+      : null;
+    const unavailableComparisonReason =
+      focusedComparison?.status === "unavailable"
+        ? focusedComparison.reason
+        : "The focused paths do not resolve to one captured pair.";
     lines.push(
-      "- Classification: **Candidate hidden coupling**, not a dependency or defect claim.",
+      comparison
+        ? "- Classification: **Candidate hidden coupling**, not a dependency or defect claim."
+        : `- Classification: **Focused endpoint hypothesis**; producer classification is unavailable; ${code(unavailableComparisonReason, PATH_VALUE_LIMIT)}. This is not a dependency or defect claim.`,
       `- Endpoints: ${code(focusedPaths[0], PATH_VALUE_LIMIT)} and ${code(focusedPaths[1], PATH_VALUE_LIMIT)}.`,
       focusedModules.length === 2 && focusedModules[0] && focusedModules[1]
         ? `- Endpoint source revisions: ${code(focusedModules[0].source_revision)} and ${code(focusedModules[1].source_revision)}; both match the recorded snapshot full SHA.`
         : "- Endpoint source revision binding is unavailable because the focused paths do not resolve to two unique captured modules.",
-      focusedPair
-        ? `- Observed co-change evidence: ${focusedPair.cochange_count} co-changes; ${percentage(focusedPair.support)} support. ${formatWindow(bundle.aggregates.hidden_coupling.meta.window)}.`
-        : "- Co-change/support evidence is unavailable because the focused paths do not resolve to one captured pair.",
+      comparison
+        ? `- Observed co-change evidence: ${comparison.cochange.count} co-changes; ${percentage(comparison.cochange.support)} support. ${couplingAnalysisWindowLabel(bundle.aggregates.hidden_coupling.meta.window)}.`
+        : `- Co-change/support evidence is unavailable; ${code(unavailableComparisonReason)}.`,
     );
-    if (!focusedPairKey) {
+    if (!comparison) {
       lines.push(
-        "- Direct-edge evidence is unknown because the focused paths do not resolve to two unique captured modules.",
+        `- Direct-edge evidence is unknown; ${code(unavailableComparisonReason, PATH_VALUE_LIMIT)}.`,
       );
-    } else if (capturedDirectEdge) {
+    } else if (comparison.directDependency.state === "present") {
       lines.push(
         "- Observed direct-edge evidence: a captured direct dependency edge is present between the endpoints.",
       );
-    } else if (pageIsComplete(bundle.graph.structure_edges)) {
+    } else if (comparison.directDependency.state === "absent") {
       lines.push(
         "- Observed direct-edge evidence: No captured direct dependency edge exists between the endpoints in the complete structure-edge page.",
       );
@@ -375,6 +471,7 @@ export function buildInvestigationBrief({
         "- Direct-edge evidence is unknown because structure-edge coverage is incomplete; absence is not inferred.",
       );
     }
+    if (focusedComparison) appendCouplingWorkbench(lines, focusedComparison);
   } else {
     lines.push(
       "- No focused hidden-coupling pair is encoded in the current structure location.",
@@ -385,10 +482,10 @@ export function buildInvestigationBrief({
     "",
     "## Coverage and interpretation caveats",
     "",
-    `- Dependency topology window: ${formatWindow(bundle.aggregates.dependency_topology.meta.window)}.`,
-    `- Hotspot window: ${formatWindow(bundle.aggregates.hotspot_quadrant.meta.window)}.`,
-    `- Ownership window: ${formatWindow(bundle.aggregates.ownership.meta.window)}.`,
-    `- Hidden-coupling window: ${formatWindow(bundle.aggregates.hidden_coupling.meta.window)}.`,
+    `- Dependency topology window: ${couplingAnalysisWindowLabel(bundle.aggregates.dependency_topology.meta.window)}.`,
+    `- Hotspot window: ${couplingAnalysisWindowLabel(bundle.aggregates.hotspot_quadrant.meta.window)}.`,
+    `- Ownership window: ${couplingAnalysisWindowLabel(bundle.aggregates.ownership.meta.window)}.`,
+    `- Hidden-coupling window: ${couplingAnalysisWindowLabel(bundle.aggregates.hidden_coupling.meta.window)}.`,
     pageCoverage("Module-page coverage", bundle.graph.modules),
     pageCoverage(
       "Topology-module coverage",

@@ -20,9 +20,12 @@ const goldenPath = resolve(
   process.cwd(),
   "../../docs/schemas/examples/khive-repo-v1-khive.json",
 );
+const goldenBundle = parseRepoBundle(
+  JSON.parse(readFileSync(goldenPath, "utf8")),
+);
 
 function golden(): RepoBundle {
-  return parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
+  return structuredClone(goldenBundle);
 }
 
 describe("repository showcase hidden-coupling lens", () => {
@@ -181,6 +184,100 @@ describe("repository showcase hidden-coupling lens", () => {
     const retainedOnlyPath = focusedPair.find((path) => path !== sourcePath)!;
     expect(offViewCopy).not.toContain("Candidate hidden coupling");
     expect(offViewCopy).not.toContain(retainedOnlyPath);
+  });
+
+  it("opens the focused Boundary workbench and updates the inspector without stealing focus or dropping the pair", async () => {
+    const bundle = golden();
+    const databasePackage = bundle.graph.packages.items.find((item) =>
+      item.name === "khive-db"
+    )!;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.selectOptions(
+      screen.getByRole("combobox", {
+        name:
+          `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+      }),
+      databasePackage.id,
+    );
+    await user.click(screen.getByRole("radio", {
+      name: bundle.capability.views.hidden_coupling.label,
+    }));
+    await user.click(screen.getAllByRole("button", {
+      name: /Focus coupling candidate between/,
+    })[0]);
+
+    const focusedPair = new URL(window.location.href).searchParams.getAll(
+      "pair",
+    );
+    const workbench = screen.getByRole("region", {
+      name: "Boundary evidence workbench",
+    });
+    expect(workbench).toHaveTextContent(
+      /Shared commits: 5 shown of 24 declared.*truncated/i,
+    );
+    expect(workbench).toHaveTextContent("crates/khive-db/src/pool.rs");
+    const endpointControl = within(workbench).getByRole("button", {
+      name: "Show crates/khive-db/src/stores/graph_tests.rs in module inspector",
+    });
+
+    endpointControl.focus();
+    await user.click(endpointControl);
+
+    await waitFor(() => expect(endpointControl).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    ));
+    expect(endpointControl).toHaveFocus();
+    expect(new URL(window.location.href).searchParams.get("module"))
+      .toBe("crates/khive-db/src/stores/graph_tests.rs");
+    expect(new URL(window.location.href).searchParams.getAll("pair"))
+      .toEqual(focusedPair);
+    expect(container.querySelector<HTMLElement>("[data-module-inspector]"))
+      .toHaveTextContent("crates/khive-db/src/stores/graph_tests.rs");
+  });
+
+  it("lets pair presence drive an unavailable workbench when the focused producer row is absent", () => {
+    const bundle = golden();
+    const left = "crates/khive-db/src/stores/graph.rs";
+    const right = "crates/khive-db/src/stores/graph_tests.rs";
+    const endpointIds = new Set(bundle.graph.modules.items
+      .filter((moduleNode) => [left, right].includes(moduleNode.source_path))
+      .map((moduleNode) => moduleNode.id));
+    bundle.aggregates.hidden_coupling.data.items =
+      bundle.aggregates.hidden_coupling.data.items.filter((row) =>
+        !(endpointIds.has(row.left_module_id) &&
+          endpointIds.has(row.right_module_id))
+      );
+    window.history.replaceState(
+      null,
+      "",
+      repositoryLocationUrl(new URL(window.location.href), {
+        repository: bundle.meta.repository.canonical_url,
+        snapshotSha: bundle.meta.snapshot.head_sha,
+        modulePath: left,
+        view: "structure_graph",
+        structureGraph: {
+          packageName: "khive-db",
+          lens: "hidden_coupling",
+          couplingPair: [left, right],
+        },
+      }),
+    );
+
+    render(<RepoShowcase bundle={bundle} />);
+
+    const workbench = screen.getByRole("region", {
+      name: "Boundary evidence workbench",
+    });
+    expect(within(workbench).getByRole("status", {
+      name: "Boundary evidence status",
+    })).toHaveTextContent(
+      /pair_evidence_unavailable.*focused paths do not resolve to one captured coupling row/i,
+    );
+    expect(new URL(window.location.href).searchParams.getAll("pair"))
+      .toEqual([left, right]);
   });
 
   it("pushes and restores the package, lens, and focused pair without relayout", async () => {

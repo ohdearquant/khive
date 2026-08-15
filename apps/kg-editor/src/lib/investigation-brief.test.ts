@@ -9,6 +9,10 @@ import {
   INVESTIGATION_BRIEF_VERIFY_INSTRUCTION,
   markdownCodeSpan,
 } from "@/lib/investigation-brief";
+import {
+  buildCouplingComparison,
+  couplingComparisonResultStatus,
+} from "@/lib/coupling-comparison";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
 import { canonicalCouplingPair } from "@/lib/repository-location";
 
@@ -16,9 +20,12 @@ const goldenPath = resolve(
   process.cwd(),
   "../../docs/schemas/examples/khive-repo-v1-khive.json",
 );
+const goldenBundle = parseRepoBundle(
+  JSON.parse(readFileSync(goldenPath, "utf8")),
+);
 
 function golden(): RepoBundle {
-  return parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
+  return structuredClone(goldenBundle);
 }
 
 const graphImplementation = "crates/khive-db/src/stores/graph.rs";
@@ -93,6 +100,21 @@ describe("bounded investigation brief", () => {
     expect(first).toMatch(/Observed co-change evidence: 24 co-changes; 2\.6% support/i);
     expect(first).toMatch(/365-day analysis window/i);
     expect(first).toMatch(/No captured direct dependency edge/i);
+    expect(first).toContain("## Boundary evidence workbench");
+    expect(first).toMatch(/Shared commits: \*\*present\*\*; 5 shown of 24 declared; fixed bound 5/i);
+    expect(first).toMatch(/Common structural neighbors: \*\*present\*\*; 1 shown of 1 declared; fixed bound 6/i);
+    expect(first).toContain(markdownCodeSpan("crates/khive-db/src/pool.rs"));
+    expect(first).toMatch(/Endpoint history: 38 shown of 38 declared/i);
+    expect(first).toMatch(/Endpoint history: 25 shown of 25 declared/i);
+    expect(first).toMatch(/Captured hotspot row: 38 commits; fan-in 2; quadrant/i);
+    expect(first).toMatch(/Captured hotspot row: 25 commits; fan-in 0; quadrant/i);
+    expect(first).toMatch(
+      /Captured hotspot row: 38 commits;[^\n]*window ` 365-day analysis window \(2025-08-07T18:00:00\+00:00 to 2026-08-07T18:00:00\+00:00\) `/i,
+    );
+    expect(first).toMatch(
+      /Captured ownership rows: 38 commits;[^\n]*window ` Declared all-history analysis window `/i,
+    );
+    expect(first).toMatch(/Verify next/i);
     expect(first).toContain("Module-page coverage");
     expect(first).toContain("Topology-module coverage");
     expect(first).toContain("SCC-page coverage");
@@ -140,6 +162,118 @@ describe("bounded investigation brief", () => {
     );
     expect(brief).not.toMatch(/No captured direct dependency edge/i);
     expect(brief).toContain("structure export reached its bound");
+  });
+
+  it("exports the same tri-state and fixed bounds as the focused comparison model", () => {
+    const bundle = golden();
+    const left = moduleId(bundle, graphImplementation);
+    const leftHistory = bundle.graph.history_navigation.by_module.items.find(
+      (row) => row.module_id === left,
+    )!;
+    leftHistory.commits.items = ["not-shared-in-captured-page"];
+    leftHistory.commits.truncated = true;
+    leftHistory.commits.next_cursor = "next-history-page";
+    leftHistory.commits.disclosure = {
+      status: "truncated",
+      reason: "history page reached its bound",
+    };
+    const model = buildCouplingComparison({
+      bundle,
+      sourcePaths: canonicalCouplingPair(graphImplementation, graphTests),
+    });
+    expect(model.status).toBe("available");
+    if (model.status !== "available") return;
+    expect(model.value.sharedCommits.state).toBe("unknown");
+
+    const brief = focusedBrief(bundle);
+
+    expect(brief).toMatch(
+      /Shared commits: \*\*unknown\*\*; 0 shown of an unknown declared total; fixed bound 5/i,
+    );
+    expect(brief).toContain("history page reached its bound");
+    expect(brief).not.toMatch(/Shared commits: \*\*absent\*\*/i);
+  });
+
+  it("keeps unavailable UI and Markdown status, code, reason, and next step on one result", () => {
+    const bundle = golden();
+    bundle.aggregates.hidden_coupling.meta.status = "unavailable";
+    bundle.aggregates.hidden_coupling.meta.unavailable_reason =
+      "The pair producer withheld this bounded window.";
+    const result = buildCouplingComparison({
+      bundle,
+      sourcePaths: canonicalCouplingPair(graphImplementation, graphTests),
+    });
+    expect(result.status).toBe("unavailable");
+    if (result.status !== "unavailable") return;
+
+    const brief = focusedBrief(bundle);
+
+    expect(brief).toContain("## Boundary evidence workbench");
+    expect(brief).toContain("Status: **unavailable**");
+    expect(brief).toContain(markdownCodeSpan(result.code));
+    expect(brief).toContain(markdownCodeSpan(result.reason));
+    expect(brief).toContain(couplingComparisonResultStatus(result));
+    expect(brief).toMatch(
+      /Direct dependency: \*\*unknown\*\*.*pair producer withheld this bounded window/i,
+    );
+    expect(brief).toMatch(
+      /Verify next[\s\S]*pair producer withheld this bounded window/i,
+    );
+    expect(brief).not.toMatch(/paths do not resolve to two unique captured modules/i);
+  });
+
+  it("does not promote an addressable endpoint pair without a producer row to a hidden-coupling candidate", () => {
+    const bundle = golden();
+    const endpointIds = new Set([
+      moduleId(bundle, graphImplementation),
+      moduleId(bundle, graphTests),
+    ]);
+    bundle.aggregates.hidden_coupling.data.items =
+      bundle.aggregates.hidden_coupling.data.items.filter((row) =>
+        !(endpointIds.has(row.left_module_id) &&
+          endpointIds.has(row.right_module_id))
+      );
+
+    const brief = focusedBrief(bundle);
+
+    expect(brief).toContain(
+      "Classification: **Focused endpoint hypothesis**",
+    );
+    expect(brief).toMatch(/producer classification is unavailable/i);
+    expect(brief).toMatch(/focused paths do not resolve to one captured coupling row/i);
+    expect(brief).not.toContain("Candidate hidden coupling");
+  });
+
+  it("exports the same per-SCC member bound as the focused workbench model", () => {
+    const bundle = golden();
+    const endpointId = moduleId(bundle, graphImplementation);
+    const members = [
+      endpointId,
+      ...bundle.graph.modules.items
+        .filter((moduleNode) =>
+          ![endpointId, moduleId(bundle, graphTests)].includes(moduleNode.id)
+        )
+        .slice(0, 11)
+        .map((moduleNode) => moduleNode.id),
+    ];
+    bundle.aggregates.dependency_topology.modules.items.find((row) =>
+      row.module_id === endpointId
+    )!.cycle_ids = ["large-brief-cycle"];
+    bundle.aggregates.dependency_topology.cycles.items.push({
+      id: "large-brief-cycle",
+      module_ids: members,
+    });
+    const omitted = bundle.graph.modules.items.find((moduleNode) =>
+      moduleNode.id === members[6]
+    )!;
+
+    const brief = focusedBrief(bundle);
+
+    expect(brief).toMatch(/SCC members.*6 shown of 12 declared; fixed bound 6/i);
+    expect(brief).toMatch(
+      /6 additional captured SCC members.*fixed display bound/i,
+    );
+    expect(brief).not.toContain(markdownCodeSpan(omitted.source_path));
   });
 
   it("rejects a selected module whose source revision is not the recorded HEAD", () => {
@@ -264,6 +398,56 @@ describe("bounded investigation brief", () => {
     expect(brief).toContain("Optional detail coverage");
     expect(brief?.trimEnd().endsWith(INVESTIGATION_BRIEF_VERIFY_INSTRUCTION))
       .toBe(true);
+  });
+
+  it("code-escapes unavailable comparison status, reason, and verification copy", () => {
+    const bundle = golden();
+    const hostileReason =
+      "withheld `tick` [link](https://attacker.invalid) *bold* _emphasis_";
+    bundle.aggregates.hidden_coupling.meta.status = "unavailable";
+    bundle.aggregates.hidden_coupling.meta.unavailable_reason = hostileReason;
+    const result = buildCouplingComparison({
+      bundle,
+      sourcePaths: canonicalCouplingPair(graphImplementation, graphTests),
+    });
+    expect(result.status).toBe("unavailable");
+    if (result.status !== "unavailable") return;
+
+    const brief = focusedBrief(bundle);
+
+    expect(brief).toContain(
+      `- Boundary evidence status: ${markdownCodeSpan(couplingComparisonResultStatus(result))}.`,
+    );
+    expect(brief).toContain(`- Reason: ${markdownCodeSpan(result.reason)}.`);
+    expect(brief).toContain(
+      `- Direct dependency: **unknown**; ${markdownCodeSpan(result.reason)}.`,
+    );
+    expect(brief).toContain(
+      `  - Inspect the recorded endpoint sources because boundary evidence is unavailable: ${markdownCodeSpan(result.reason)}.`,
+    );
+  });
+
+  it("code-escapes hostile captured paths inside verification prompts", () => {
+    const bundle = golden();
+    const hostilePath =
+      "crates/`pool`/[link](https://attacker.invalid)/*bold*.rs";
+    bundle.graph.modules.items.find((moduleNode) =>
+      moduleNode.source_path === "crates/khive-db/src/pool.rs"
+    )!.source_path = hostilePath;
+    const result = buildCouplingComparison({
+      bundle,
+      sourcePaths: canonicalCouplingPair(graphImplementation, graphTests),
+    });
+    expect(result.status).toBe("available");
+    if (result.status !== "available") return;
+    const prompt = result.value.verifyPrompts.find((candidate) =>
+      candidate.includes(hostilePath)
+    );
+    expect(prompt).toBeDefined();
+
+    const brief = focusedBrief(bundle);
+
+    expect(brief).toContain(`  - ${markdownCodeSpan(prompt!)}.`);
   });
 
   it("bounds final escaped Markdown and reserves an exact omission disclosure", () => {

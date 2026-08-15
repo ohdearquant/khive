@@ -719,6 +719,160 @@
 .repo-coupling-endpoints { align-items: center; display: flex; flex-wrap: wrap; gap: 2px; margin-top: 5px; }
 .repo-coupling-endpoints > span { color: var(--repo-muted); font-size: var(--khive-type-xs); }
 
+.repo-boundary-workbench {
+  background: var(--khive-color-surface-overlay);
+  border: 1px solid var(--repo-border);
+  border-radius: var(--khive-radius-lg);
+  margin-top: 12px;
+  min-width: 0;
+  padding: 13px;
+}
+.repo-boundary-workbench > header {
+  align-items: flex-start;
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+}
+.repo-boundary-workbench > header span {
+  color: var(--repo-muted);
+  display: block;
+  font-size: var(--khive-type-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.repo-boundary-workbench h3,
+.repo-boundary-workbench h4 { margin: 0; }
+.repo-boundary-workbench h3 { font-size: var(--khive-type-base); margin-top: 3px; }
+.repo-boundary-workbench h4 { font-size: var(--khive-type-sm); }
+.repo-boundary-workbench > header p {
+  color: var(--repo-muted);
+  font-size: var(--khive-type-sm);
+  line-height: 1.45;
+  margin: 0;
+  max-width: 52ch;
+}
+.repo-boundary-status {
+  background: var(--khive-color-accent-soft);
+  border: 1px solid var(--khive-color-border-strong);
+  border-radius: var(--khive-radius-md);
+  font-size: var(--khive-type-sm);
+  line-height: 1.45;
+  margin: 11px 0;
+  padding: 8px 9px;
+}
+.repo-boundary-endpoints,
+.repo-boundary-shared {
+  display: grid;
+  gap: 9px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.repo-boundary-endpoint,
+.repo-boundary-shared > section,
+.repo-boundary-direct,
+.repo-boundary-prompts {
+  border: 1px solid var(--repo-border);
+  border-radius: var(--khive-radius-md);
+  min-width: 0;
+  padding: 10px;
+}
+.repo-boundary-endpoint > header {
+  align-items: flex-start;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+.repo-boundary-endpoint > header div { min-width: 0; }
+.repo-boundary-endpoint > header span,
+.repo-boundary-endpoint > header strong,
+.repo-boundary-endpoint > header code { display: block; }
+.repo-boundary-endpoint > header span { color: var(--repo-muted); font-size: var(--khive-type-xs); }
+.repo-boundary-endpoint > header strong { font-size: var(--khive-type-sm); margin-top: 2px; }
+.repo-boundary-endpoint > header code {
+  color: var(--repo-muted);
+  font-size: var(--khive-type-xs);
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.repo-boundary-endpoint > header button {
+  background: var(--khive-color-surface-raised);
+  border: 1px solid var(--khive-color-border-strong);
+  border-radius: var(--khive-radius-sm);
+  color: inherit;
+  cursor: pointer;
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: var(--khive-type-xs);
+  padding: 5px 6px;
+}
+.repo-boundary-endpoint > header button[aria-expanded="true"] { background: var(--khive-color-accent-soft); }
+.repo-boundary-endpoint > header button:focus-visible { outline: 2px solid var(--khive-color-accent); outline-offset: 2px; }
+.repo-boundary-endpoint dl { margin: 9px 0 0; }
+.repo-boundary-endpoint dl > div { border-top: 1px solid var(--repo-border); padding: 7px 0; }
+.repo-boundary-endpoint dt {
+  align-items: center;
+  display: flex;
+  font-size: var(--khive-type-xs);
+  font-weight: 650;
+  gap: 5px;
+  justify-content: space-between;
+}
+.repo-boundary-endpoint dd {
+  color: var(--repo-muted);
+  font-size: var(--khive-type-xs);
+  line-height: 1.45;
+  margin: 4px 0 0;
+  min-width: 0;
+}
+.repo-boundary-endpoint dd > span,
+.repo-boundary-endpoint dd > p { display: block; }
+.repo-boundary-endpoint dd > .repo-boundary-window {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+.repo-boundary-endpoint dd > p { margin: 5px 0 0; }
+.repo-boundary-endpoint ul,
+.repo-boundary-shared ol,
+.repo-boundary-shared ul,
+.repo-boundary-prompts ol { margin: 6px 0 0; padding-left: 18px; }
+.repo-boundary-endpoint li,
+.repo-boundary-shared li,
+.repo-boundary-prompts li { margin: 4px 0; overflow-wrap: anywhere; }
+.repo-boundary-evidence-state {
+  border: 1px solid var(--khive-color-border-strong);
+  border-radius: var(--khive-radius-pill);
+  color: var(--repo-muted);
+  font-size: var(--khive-type-xs);
+  font-weight: 500;
+  padding: 1px 5px;
+}
+.repo-boundary-evidence-state.present { color: var(--khive-color-success); }
+.repo-boundary-evidence-state.absent { color: var(--khive-color-text-secondary); }
+.repo-boundary-evidence-state.unknown { color: var(--khive-color-warning); }
+.repo-boundary-evidence-coverage {
+  color: var(--repo-muted);
+  display: block;
+  font-size: var(--khive-type-xs);
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+.repo-boundary-evidence-coverage > span,
+.repo-boundary-evidence-coverage > em { display: block; }
+.repo-boundary-evidence-coverage > em { color: var(--khive-color-warning); font-style: normal; margin-top: 2px; }
+.repo-boundary-shared { margin-top: 9px; }
+.repo-boundary-shared h4,
+.repo-boundary-direct h4 { align-items: center; display: flex; gap: 6px; justify-content: space-between; }
+.repo-boundary-shared li code,
+.repo-boundary-shared li span { display: block; }
+.repo-boundary-shared li code { font-size: var(--khive-type-xs); }
+.repo-boundary-shared li span { color: var(--repo-muted); font-size: var(--khive-type-xs); margin-top: 2px; }
+.repo-boundary-direct,
+.repo-boundary-prompts { margin-top: 9px; }
+.repo-boundary-direct > p,
+.repo-boundary-prompts li { color: var(--repo-muted); font-size: var(--khive-type-xs); line-height: 1.45; }
+.repo-boundary-direct > p { margin: 6px 0 0; }
+.repo-boundary-workbench.unavailable > p { color: var(--repo-muted); font-size: var(--khive-type-sm); }
+
 .repo-inspector { border-top: 1px solid var(--repo-border); padding: 13px 15px; }
 .repo-inspector-heading { gap: 8px; }
 .repo-inspector-heading svg { color: var(--ontology-kind-hue); height: 15px; width: 15px; }
@@ -979,6 +1133,11 @@ button.repo-list-row:hover,
   .repo-coupling-lens > header { flex-direction: column; }
   .repo-coupling-lens > header p { text-align: left; }
   .repo-coupling-evidence { grid-template-columns: 1fr; }
+  .repo-boundary-workbench > header,
+  .repo-boundary-endpoint > header { flex-direction: column; }
+  .repo-boundary-endpoints,
+  .repo-boundary-shared { grid-template-columns: 1fr; }
+  .repo-boundary-endpoint > header button { width: 100%; }
   .repo-inspector-heading {
     align-items: start;
     display: grid;
