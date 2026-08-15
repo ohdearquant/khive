@@ -148,6 +148,7 @@ describe("repository showcase", () => {
     const user = userEvent.setup();
     const writeText = vi.spyOn(navigator.clipboard, "writeText")
       .mockResolvedValue(undefined);
+    writeText.mockClear();
     render(<RepoShowcase bundle={golden()} />);
 
     await waitFor(() =>
@@ -874,6 +875,67 @@ describe("repository showcase", () => {
     const localSlice = container.querySelector<HTMLElement>(`.repo-view-panel [data-state="truncated"][data-shown="200"][data-known-total="${bundle.aggregates.hotspot_quadrant.data.items.length}"]`);
     expect(localSlice).toBeVisible();
     expect(localSlice).toHaveTextContent(/truncated/i);
+  });
+
+  it("routes palette module, view, and copy commands through the shared location controller", async () => {
+    const bundle = golden();
+    const writer = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/writer_task.rs")
+    )!;
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    writeText.mockClear();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await waitFor(() =>
+      expect(new URL(window.location.href).searchParams.get("view"))
+        .toBe("structure_graph")
+    );
+    const pushState = vi.spyOn(window.history, "pushState");
+    pushState.mockClear();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(
+      screen.getByRole("combobox", { name: "Search repository commands" }),
+      writer.source_path,
+    );
+    await user.keyboard("{Enter}");
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 }))
+        .toHaveTextContent(writer.source_path)
+    );
+    expect(inspector).toHaveFocus();
+    expect(new URL(window.location.href).searchParams.get("module"))
+      .toBe(writer.source_path);
+    expect(pushState).toHaveBeenCalledTimes(1);
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(
+      screen.getByRole("combobox", { name: "Search repository commands" }),
+      bundle.capability.views.hidden_coupling.label,
+    );
+    await user.keyboard("{Enter}");
+    const dashboard = container.querySelector<HTMLElement>(
+      "[data-repository-dashboard]",
+    )!;
+    await waitFor(() => expect(dashboard).toHaveFocus());
+    expect(new URL(window.location.href).searchParams.get("module"))
+      .toBe(writer.source_path);
+    expect(new URL(window.location.href).searchParams.get("view"))
+      .toBe("hidden_coupling");
+    expect(pushState).toHaveBeenCalledTimes(2);
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(
+      screen.getByRole("combobox", { name: "Search repository commands" }),
+      "copy link",
+    );
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(window.location.href));
+    expect(pushState).toHaveBeenCalledTimes(2);
   });
 
   it("settles the structure graph without collapsing nodes onto a handful of shared coordinates", () => {
