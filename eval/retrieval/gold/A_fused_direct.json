@@ -1,0 +1,28 @@
+{
+  "by_class": {
+    "exact_specific": {
+      "MRR@10": 1.0,
+      "Recall@100": 1.0,
+      "TargetRecall@100": 1.0,
+      "nDCG@10": 0.607255296346126
+    },
+    "fresh_directive": {
+      "MRR@10": 1.0,
+      "Recall@100": 1.0,
+      "TargetRecall@100": 1.0,
+      "nDCG@10": 0.6540072697389476
+    },
+    "paraphrase_specific": {
+      "MRR@10": 1.0,
+      "Recall@100": 1.0,
+      "TargetRecall@100": 1.0,
+      "nDCG@10": 0.6435522841380823
+    }
+  },
+  "overall": {
+    "MRR@10": 1.0,
+    "Recall@100": 1.0,
+    "TargetRecall@100": 1.0,
+    "nDCG@10": 0.6321699847015594
+  }
+}

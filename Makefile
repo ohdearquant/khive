@@ -8,7 +8,7 @@ CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
 LOCAL_VERIFY_STAMP := $(LOCAL_BUILD_RECEIPT).verified
 
-.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check
 
 check:
 	cd crates && cargo check --workspace
@@ -78,6 +78,10 @@ bench-1m-ci:
 	@echo "==> Running Vamana CI smoke bench (2-point: 10K/50K, <60 s)..."
 	@echo "    Set SIFT_DIR to the sift_base.fvecs / sift_query.fvecs directory."
 	bash scripts/bench_1m.sh --ci
+
+eval-retrieval-gold-check:
+	@echo "==> Retrieval eval harness: re-running A_fused_direct against committed gold..."
+	cd eval/retrieval && uv run python evaluate.py --check-gold
 
 hold-time-gate:
 	@echo "==> ADR-135 F4 release gate: per-shape writer hold-time regression coverage..."
