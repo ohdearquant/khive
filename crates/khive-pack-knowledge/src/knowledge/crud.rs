@@ -162,8 +162,11 @@ impl KnowledgeHandlers {
                     .execute(SqlStatement {
                         // Promote draft -> reviewed when this upsert finalizes the atom.
                         // Never demote an already reviewed row, and leave status
-                        // untouched when not finalizing.
-                        sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=?5, source_type=?6, finalized=?7, status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
+                        // untouched when not finalizing. finalized=COALESCE(?7, finalized)
+                        // preserves the existing flag when the caller omits it; SQLite's
+                        // `NULL = 1` evaluates to NULL (falsy), so an omitted field also
+                        // leaves the status CASE on its ELSE branch.
+                        sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=?5, source_type=?6, finalized=COALESCE(?7, finalized), status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
                         params: vec![
                             SqlValue::Text(atom_in.name.clone()),
                             SqlValue::Text(content.clone()),
@@ -171,7 +174,7 @@ impl KnowledgeHandlers {
                             props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
                             source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
                             source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            SqlValue::Integer(atom_in.finalized.unwrap_or(false) as i64),
+                            atom_in.finalized.map_or(SqlValue::Null, |f| SqlValue::Integer(f as i64)),
                             SqlValue::Integer(now),
                             SqlValue::Text(id),
                             SqlValue::Text(ns.clone()),
