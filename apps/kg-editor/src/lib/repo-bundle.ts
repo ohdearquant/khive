@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+import {
+  addressableModulePathIssue,
+  publicRepositoryUrlIssue,
+} from "@/lib/repository-location";
+
 // Generic strings intentionally have no local minLength: the normative JSON
 // Schema does not add one. Shape closure and field-specific formats stay strict.
 const wireString = z.string();
@@ -484,6 +489,16 @@ export const repoBundleSchema = z.strictObject({
   }),
   capability: capabilitySchema,
 }).superRefine((bundle, context) => {
+  const repositoryIssue = publicRepositoryUrlIssue(
+    bundle.meta.repository.canonical_url,
+  );
+  if (repositoryIssue) {
+    context.addIssue({
+      code: "custom",
+      path: ["meta", "repository", "canonical_url"],
+      message: repositoryIssue,
+    });
+  }
   if (bundle.meta.ingest.code_ingest.status === "available" &&
       bundle.meta.snapshot.head_sha !== bundle.meta.ingest.code_ingest.value.source_revision) {
     context.addIssue({ code: "custom", path: ["meta", "ingest", "code_ingest", "source_revision"], message: "code map revision must equal the bundle HEAD" });
@@ -492,6 +507,25 @@ export const repoBundleSchema = z.strictObject({
     if (bundle.graph[key].items.length !== 0) {
       context.addIssue({ code: "custom", path: ["graph", key, "items"], message: "symbol-tier collections are typed but empty in khive.repo.v1" });
     }
+  }
+  const sourcePaths = new Set<string>();
+  for (const [index, moduleNode] of bundle.graph.modules.items.entries()) {
+    const pathIssue = addressableModulePathIssue(moduleNode.source_path);
+    if (pathIssue) {
+      context.addIssue({
+        code: "custom",
+        path: ["graph", "modules", "items", index, "source_path"],
+        message: pathIssue,
+      });
+    }
+    if (sourcePaths.has(moduleNode.source_path)) {
+      context.addIssue({
+        code: "custom",
+        path: ["graph", "modules", "items", index, "source_path"],
+        message: "module source paths must be unique within a repository snapshot",
+      });
+    }
+    sourcePaths.add(moduleNode.source_path);
   }
   for (const key of [
     "dependency_topology",

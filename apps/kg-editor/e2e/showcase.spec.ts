@@ -74,6 +74,43 @@ test("dogfoods every repository analysis from the curated static bundle", async 
   ]);
 });
 
+test("restores a shared investigation and follows browser back and forward", async ({ page }) => {
+  const snapshot = "c2979d2443738a075e55a170c772d1dc86cf0f91";
+  const pool = "crates/khive-db/src/pool.rs";
+  const writer = "crates/khive-db/src/writer_task.rs";
+  const query = new URLSearchParams({
+    repo: "https://github.com/ohdearquant/khive",
+    at: snapshot,
+    module: pool,
+    view: "dependency_topology",
+  });
+  await page.goto(`/?${query.toString()}`);
+
+  const inspector = page.locator("[data-module-inspector]");
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(pool);
+  await expect(page.locator('[data-view-id="dependency_topology"]')).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+
+  await page.getByRole("searchbox", { name: "Find a module or path" }).fill(writer);
+  await page.getByRole("button", { name: `Inspect ${writer}` }).click();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
+  await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(writer)}`));
+
+  await page.locator('[data-view-id="hidden_coupling"]').click();
+  await expect(page).toHaveURL(/view=hidden_coupling/);
+
+  await page.goBack();
+  await expect(page).toHaveURL(/view=dependency_topology/);
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
+
+  await page.goBack();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(pool);
+  await page.goForward();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
+});
+
 test("a valid repository miss stays local and renders an honest state", async ({ page }) => {
   const requestedAfterSubmit: string[] = [];
   let observing = false;

@@ -18,6 +18,7 @@ import {
   SHOWCASE_REGISTRY,
   type ShowcaseRegistryEntry,
 } from "@/lib/showcase-registry";
+import { parseRepositoryLocation } from "@/lib/repository-location";
 
 type LoadState =
   | Readonly<{ status: "loading"; entry: ShowcaseRegistryEntry }>
@@ -61,10 +62,18 @@ function sourceLabel(source: ShowcaseBundleSource): string {
   return source === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback";
 }
 
-function replaceRepositoryQuery(repository?: string) {
+function replaceRepositoryQuery(
+  repository?: string,
+  clearInvestigation = true,
+) {
   const query = new URL(window.location.href);
   if (repository) query.searchParams.set("repo", repository);
   else query.searchParams.delete("repo");
+  if (clearInvestigation) {
+    query.searchParams.delete("at");
+    query.searchParams.delete("module");
+    query.searchParams.delete("view");
+  }
   const search = query.searchParams.size ? `?${query.searchParams.toString()}` : "";
   window.history.replaceState(null, "", `${query.pathname}${search}${query.hash}`);
 }
@@ -77,22 +86,56 @@ export function Showcase() {
   const loadSequence = useRef(0);
 
   useEffect(() => {
-    const sequence = ++loadSequence.current;
-    void loadEntry(defaultEntry)
-      .then((loaded) => {
-        setLabels(loaded.bundle.capability.labels);
-        if (loadSequence.current === sequence) {
-          setState({ status: "ready", entry: defaultEntry, loaded });
-        }
-      })
-      .catch((error: unknown) => {
-        if (loadSequence.current === sequence) {
-          setState({
-            status: "error",
-            reason: error instanceof Error ? error.message : "The showcase bundle could not be loaded.",
-          });
-        }
-      });
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      const parsed = parseRepositoryLocation(new URL(window.location.href));
+      const repositoryIssue = parsed.issues.find((issue) =>
+        issue.parameter === "repo"
+      );
+      if (repositoryIssue) {
+        setState({ status: "invalid", reason: repositoryIssue.message });
+        return;
+      }
+
+      const requestedRepository = parsed.location.repository ??
+        defaultEntry.canonicalUrl;
+      const lookup = resolveShowcaseRepository(requestedRepository);
+      setInput(requestedRepository);
+      if (lookup.status === "invalid") {
+        setState(lookup);
+        return;
+      }
+      if (lookup.status === "miss") {
+        setState(lookup);
+        return;
+      }
+
+      const sequence = ++loadSequence.current;
+      setInput(lookup.normalizedUrl);
+      setState({ status: "loading", entry: lookup.entry });
+      if (parsed.location.repository !== lookup.normalizedUrl) {
+        replaceRepositoryQuery(lookup.normalizedUrl, false);
+      }
+      void loadEntry(lookup.entry)
+        .then((loaded) => {
+          if (loadSequence.current === sequence) {
+            setLabels(loaded.bundle.capability.labels);
+            setState({ status: "ready", entry: lookup.entry, loaded });
+          }
+        })
+        .catch((error: unknown) => {
+          if (loadSequence.current === sequence) {
+            setState({
+              status: "error",
+              reason: error instanceof Error ? error.message : "The showcase bundle could not be loaded.",
+            });
+          }
+        });
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [defaultEntry]);
 
   function submit(event: FormEvent<HTMLFormElement>) {
