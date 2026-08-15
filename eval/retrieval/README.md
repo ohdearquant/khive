@@ -47,9 +47,14 @@ baseline.
   `kkernel` binary.
 - **Binary identity**: every run records `kkernel --version` and prints it;
   `gold/A_fused_direct.json` embeds the `kkernel_version` it was derived
-  with, and `--check-gold` reports a version mismatch as its own labeled
-  failure line (separate from metric mismatches) so a drifted binary is
-  named rather than misdiagnosed as a ranking regression.
+  with. A revision differing from gold's recorded one is reported as
+  context — a warning when the metrics match, and a `context:` line ahead
+  of any metric mismatches — never as a failure by itself, because every
+  commit after the gold-derivation commit (including the one that ships
+  the gold file) changes the revision hash without touching retrieval
+  behavior. The gate's verdict rides on the metrics; the version line
+  keeps a real binary drift from being misdiagnosed as a ranking
+  regression.
 
 ## Running it
 

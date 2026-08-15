@@ -443,19 +443,30 @@ def kkernel_revision(version_str: str) -> str:
     return m.group(1) if m else version_str
 
 
-def compare_gold(agg: dict, gold: dict, tol: float, kkernel_version: str) -> list[str]:
-    mismatches = []
+def version_drift_note(gold: dict, kkernel_version: str) -> str | None:
+    """Context, not a verdict: the gate's question is whether the metrics are
+    preserved, so a revision that differs from gold's recorded one must not
+    fail the check by itself — every commit after the gold-derivation commit
+    (including the commit that ships the gold file) produces a different
+    revision hash while leaving retrieval behavior untouched. The note exists
+    to keep a metric mismatch from being misdiagnosed when the binary really
+    did drift."""
     gold_version = gold.get("kkernel_version")
     if gold_version is not None and kkernel_revision(gold_version) != kkernel_revision(
         kkernel_version
     ):
-        mismatches.append(
+        return (
             f"kkernel_version: got {kkernel_version!r} vs gold {gold_version!r} — "
             "the kkernel binary this run used does not match the one gold was "
             "derived against (build/version drift, not necessarily a metric "
-            "regression; verify the binary before treating other mismatches "
-            "below as real)"
+            "regression; verify the binary before treating any metric "
+            "mismatches as real)"
         )
+    return None
+
+
+def compare_gold(agg: dict, gold: dict, tol: float) -> list[str]:
+    mismatches = []
     for m, v in agg["overall"].items():
         gv = gold["overall"][m]
         if abs(v - gv) > tol:
@@ -650,14 +661,19 @@ def main() -> int:
             print(f"\ngold file not found: {args.gold}", file=sys.stderr)
             return 2
         gold = json.loads(args.gold.read_text())
-        mismatches = compare_gold(agg, gold, args.gold_tolerance, kkernel_version)
+        drift = version_drift_note(gold, kkernel_version)
+        mismatches = compare_gold(agg, gold, args.gold_tolerance)
         if mismatches:
             print(
                 f"\nGOLD CHECK FAILED ({len(mismatches)} mismatches):", file=sys.stderr
             )
+            if drift:
+                print(f"  context: {drift}", file=sys.stderr)
             for m in mismatches:
                 print(f"  {m}", file=sys.stderr)
             return 1
+        if drift:
+            print(f"\nWARNING: {drift}", file=sys.stderr)
         print(
             "\nGOLD CHECK PASSED — matches gold/A_fused_direct.json within tolerance "
             f"{args.gold_tolerance}"
