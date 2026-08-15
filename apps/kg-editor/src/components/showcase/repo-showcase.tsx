@@ -27,6 +27,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { DataState } from "@/components/data-state";
+import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
 import { RepositoryTriage } from "@/components/showcase/repository-triage";
 import type { ShowcaseBundleSource } from "@/lib/adapters/preferred-showcase-source";
 import {
@@ -1035,6 +1036,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
   }> | null>(null);
   const [navigationStatus, setNavigationStatus] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
+  const overviewRef = useRef<HTMLElement>(null);
   const dashboardRef = useRef<HTMLDivElement>(null);
   const copyLinkRef = useRef<HTMLButtonElement>(null);
 
@@ -1237,11 +1239,27 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       block: "start",
     });
   }
+
+  function openModuleFromPalette(moduleId: string) {
+    selectModule(moduleId);
+    const inspector = overviewRef.current?.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    );
+    if (!inspector) return;
+    inspector.focus({ preventScroll: true });
+    const reduceMotion = window.matchMedia?.(
+      "(prefers-reduced-motion: reduce)",
+    ).matches ?? false;
+    inspector.scrollIntoView?.({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  }
   return (
-    <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
+    <article ref={overviewRef} className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
       <header className="repo-overview-heading">
         <div className="repo-identity"><span className="repo-avatar"><Package aria-hidden="true" /></span><div><span>{repository.host} · {availabilityText(repository.default_branch, capability.labels)}</span><strong>{repository.owner}/{repository.name}</strong></div></div>
-        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span><button ref={copyLinkRef} type="button" className="repo-copy-link" onClick={copyInvestigationLink}><Copy aria-hidden="true" /> Copy investigation link</button>{copyStatus && <span role="status" className="repo-copy-status">{copyStatus}</span>}</div>
+        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span><RepositoryCommandPalette bundle={bundle} activeView={activeView} selectedModuleId={selectedModuleId} onSelectModule={openModuleFromPalette} onSelectView={openAnalysis} onCopyLink={copyInvestigationLink} /><button ref={copyLinkRef} type="button" className="repo-copy-link" onClick={copyInvestigationLink}><Copy aria-hidden="true" /> Copy investigation link</button>{copyStatus && <span role="status" className="repo-copy-status">{copyStatus}</span>}</div>
       </header>
       <section className="repo-capability-strip" aria-label={capability.labels.product}>
         <div><ShieldCheck aria-hidden="true" /><div><strong>{capability.labels.product}</strong><span>{capability.mode}</span></div></div>
