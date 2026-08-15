@@ -285,3 +285,85 @@ the producer's Rust module-path rules differ from the earlier illustrative table
   bundle-contract discipline this ADR reuses
 - ADR-146: Forge-native KG review (proposed, in flight) — sibling lane
   sharing rendering components
+
+## Amendment 1 — Operator-configured DB snapshot delivery (2026-08-11)
+
+The static golden remains the portable contract fixture and the public, zero-service
+fallback. A local operator may additionally serve a completed repository analysis from
+a server-private materialization when the purpose is to inspect a repository already
+registered on that machine.
+
+This mode does not turn slice 1 into on-demand ingest:
+
+1. The operator runs `khive repo build` out of band. Each successful run owns a fresh,
+   dedicated history database, code-map database, pinned checkout, and canonical
+   `khive.repo.v1` report. A failed or incomplete run is never promoted.
+2. The Next.js server accepts only a closed, configured analysis ID. Browser input never
+   supplies a repository URL, filesystem path, database path, executable, or argument.
+   Looking up an unknown ID performs no filesystem or process work.
+3. Request handling performs no clone, ingest, export, SQLite open, or child-process
+   execution. It reads the completed server-private report, enforces the browser byte
+   ceiling, validates the closed wire model, and returns the exact bounded report.
+4. Analysis roots and their parents are operator-owned, server-private, and not writable
+   by untrusted local principals. A promoted analysis directory is immutable. The reader
+   refuses symlink components, verifies canonical containment both before and after open,
+   and compares the opened handle's file identity with the final path before reading.
+   Run directories, database paths, validation failures, and SQLite details remain
+   server-private. Responses use stable sanitized errors and are marked
+   `private, no-store`.
+5. A UI that selects this source calls it a **DB-backed snapshot** and names its pinned
+   SHA and generation time. It must not call it live: the two stores were reconciled at
+   build time and are immutable for that analysis ID until the operator promotes another
+   successful run.
+
+Here, SQLite is the analysis source of truth and JSON is the bounded read model between
+the Rust exporter and renderer. This defines how a later UI adapter can remove a
+checked-in browser asset from its active path without duplicating the cross-store join
+in TypeScript. The server boundary can land independently while the static adapter
+remains the default. This amendment does not authorize request-time `repo export`,
+arbitrary-URL ingestion, or direct browser/Next.js access to SQLite. Those remain slice
+2 and require the queueing, sandboxing, resource-limit, and abuse-control design in D4.
+
+## Amendment 2 — Operator-configured analysis catalog (2026-08-14)
+
+Amendment 1 allowed an operator to name completed materialized reports by opaque ID, but
+an ID-only allowlist left two missing contracts: a browser could not discover the
+configured set without an out-of-band static registry, and the report route did not bind
+an ID to the repository identity inside the loaded bundle. This amendment closes both
+gaps without adding discovery of server-private storage.
+
+The operator configuration is `KHIVE_SHOWCASE_ANALYSES`, a JSON array of strict
+`{analysis_id, canonical_url}` objects. It contains one to 64 entries. Analysis IDs use
+the Amendment 1 closed ID grammar. Repository URLs pass the same normalization used by
+the showcase lookup: HTTP and HTTPS inputs canonicalize to HTTPS, host names are
+case-normalized, the GitHub `www` alias and a terminal `.git` suffix are removed, and
+query, fragment, and trailing-slash variations do not create new identities. Both
+analysis ID and normalized URL are unique across the array. Malformed JSON, a non-array,
+an empty or oversized array, unknown object fields, an invalid ID or URL, or either kind
+of duplicate makes the whole configuration unavailable. The former
+`KHIVE_SHOWCASE_ANALYSIS_IDS` setting is not a compatibility surface.
+
+`GET /api/showcase/analyses` returns this exact deterministic envelope, ordered by
+`analysis_id`:
+
+```json
+{
+  "schema_version": "khive.showcase.catalog.v1",
+  "entries": [{ "analysis_id": "khive", "canonical_url": "https://github.com/ohdearquant/khive" }]
+}
+```
+
+Each entry contains exactly `analysis_id` and `canonical_url`. No server path, report
+metadata, database state, build state, or operator-only field is present. Catalog
+handling parses the bounded explicit configuration only: it does not enumerate the
+analysis root, read a report, open SQLite, or execute a process. The response is JSON
+with `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`. Missing or
+invalid configuration returns Amendment 1's sanitized `NOT_CONFIGURED` 404 envelope.
+
+The existing `GET /api/showcase/analyses/[id]` route additionally resolves the configured
+entry before any filesystem access. After its existing bounded, symlink-resistant read
+and closed `khive.repo.v1` validation, it normalizes
+`meta.repository.canonical_url` and requires equality with that entry's configured URL.
+A mismatch is `ANALYSIS_INVALID`; neither URL nor a private path is reflected in the
+error. Request-time clone, export, SQLite access, process execution, directory scanning,
+and arbitrary URL ingest remain forbidden.

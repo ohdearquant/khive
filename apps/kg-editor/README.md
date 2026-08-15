@@ -91,6 +91,43 @@ npm run build
 The production build is a statically rendered App Router page. There is intentionally no hosting
 or deployment configuration in this open-source slice.
 
+## Optional DB-backed snapshot delivery
+
+For a local analysis prepared with `kkernel repo build`, the Node server can expose a
+server-private materialized report without placing it under `public/`:
+
+```bash
+KHIVE_SHOWCASE_ANALYSIS_ROOT=/absolute/path/to/analyses \
+KHIVE_SHOWCASE_ANALYSES='[{"analysis_id":"khive","canonical_url":"https://github.com/ohdearquant/khive"}]' \
+npm run dev
+```
+
+The report must be located at
+`$KHIVE_SHOWCASE_ANALYSIS_ROOT/khive/khive.repo.v1.json`. Discover configured entries at
+`/api/showcase/analyses`, then fetch this report at
+`/api/showcase/analyses/khive`. `KHIVE_SHOWCASE_ANALYSES` is a strict JSON array of one
+to 64 `{analysis_id, canonical_url}` objects. IDs and normalized repository URLs must
+both be unique; one invalid entry makes the entire catalog unavailable. The catalog is
+sorted by analysis ID and exposes only those two public fields. It does not scan the
+analysis root or read a report.
+
+The report route rejects symlinks, reports above 8 MiB, malformed bundles, unknown IDs,
+and bundles whose normalized `meta.repository.canonical_url` does not match the URL
+configured for that ID. It never opens SQLite or starts a repository process. Responses
+deliberately omit server paths and carry
+`X-Khive-Analysis-Source: khive-db-snapshot` plus the analysis ID and a canonical byte
+ETag. Both API routes use `private, no-store` and `nosniff` responses; an absent or
+invalid operator catalog returns a sanitized 404.
+
+The analysis root and its parent must be owned by the operator and unavailable for
+untrusted local writes. Promoted analysis directories are immutable: build into a fresh
+run directory, then publish only the completed report. The reader verifies path
+containment and file identity after opening and reads at most 8 MiB plus one sentinel
+byte.
+
+This is a pinned DB-backed snapshot, not a live mutable query and not arbitrary URL
+ingest. See ADR-147 Amendments 1–2 and the repository-showcase CLI guide.
+
 ## Adapter boundary
 
 `RepoBundle` in `src/lib/repo-bundle.ts` and `ReviewInput` in
