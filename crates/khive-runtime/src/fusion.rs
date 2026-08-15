@@ -17,25 +17,43 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 pub use khive_fusion::FusionStrategy;
 
+/// Name -> custom fusion implementation table keyed by the entity/note ID
+/// type used throughout hybrid search. Built by a caller (e.g. a pack at
+/// construction time) and passed to [`fuse_with_strategy`] /
+/// [`KhiveRuntime::hybrid_search_with_strategy`] alongside a
+/// [`FusionStrategy::Custom`] selection to resolve it -- the seam a
+/// learned-sparse (SPLADE) retrieval leg plugs into.
+pub type FusionRegistry = khive_fusion::FusionRegistry<Uuid>;
+
 const CANDIDATE_MULTIPLIER: u32 = 4;
 
 /// Fuse text and vector hits using the given strategy, returning at most `limit` results.
 /// Positional weighted strategies use `[vector, keyword]` order.
+///
+/// `registry` resolves `FusionStrategy::Custom { name, .. }` by name. When
+/// `None`, or when `name` has no registration, Custom fails closed with
+/// [`khive_fusion::FuseError`] rather than silently falling back to RRF.
 pub fn fuse_with_strategy(
     text_hits: Vec<TextSearchHit>,
     vector_hits: Vec<VectorSearchHit>,
     strategy: &FusionStrategy,
     limit: usize,
+    registry: Option<&FusionRegistry>,
 ) -> RuntimeResult<Vec<SearchHit>> {
     match strategy {
-        FusionStrategy::VectorOnly => fuse_sources(Vec::new(), vector_hits, strategy, limit),
-        FusionStrategy::KeywordOnly => fuse_sources(text_hits, Vec::new(), strategy, limit),
+        FusionStrategy::VectorOnly => {
+            fuse_sources(Vec::new(), vector_hits, strategy, limit, registry)
+        }
+        FusionStrategy::KeywordOnly => {
+            fuse_sources(text_hits, Vec::new(), strategy, limit, registry)
+        }
         FusionStrategy::Rrf { .. } | FusionStrategy::Weighted { .. } | FusionStrategy::Union => {
-            fuse_sources(text_hits, vector_hits, strategy, limit)
+            fuse_sources(text_hits, vector_hits, strategy, limit, registry)
         }
-        FusionStrategy::Custom { ref name, .. } => {
-            Err(khive_fusion::FuseError::CustomRequiresRuntime(name.clone()).into())
-        }
+        FusionStrategy::Custom { ref name, .. } => match registry {
+            Some(registry) => fuse_sources(text_hits, vector_hits, strategy, limit, Some(registry)),
+            None => Err(khive_fusion::FuseError::CustomRequiresRuntime(name.clone()).into()),
+        },
     }
 }
 
@@ -46,7 +64,13 @@ pub(crate) fn rrf_fuse_k(
     k: usize,
     limit: usize,
 ) -> RuntimeResult<Vec<SearchHit>> {
-    fuse_with_strategy(text_hits, vector_hits, &FusionStrategy::Rrf { k }, limit)
+    fuse_with_strategy(
+        text_hits,
+        vector_hits,
+        &FusionStrategy::Rrf { k },
+        limit,
+        None,
+    )
 }
 
 fn fuse_sources(
@@ -54,6 +78,7 @@ fn fuse_sources(
     vector_hits: Vec<VectorSearchHit>,
     strategy: &FusionStrategy,
     limit: usize,
+    registry: Option<&FusionRegistry>,
 ) -> RuntimeResult<Vec<SearchHit>> {
     let mut metadata: HashMap<Uuid, SearchHit> =
         HashMap::with_capacity(text_hits.len() + vector_hits.len());
@@ -96,7 +121,12 @@ fn fuse_sources(
     // place: removing one would shift the surviving arm onto the wrong weight.
     let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![vector_source, text_source];
 
-    Ok(khive_fusion::fuse(sources, strategy, limit)?
+    let fused = match registry {
+        Some(registry) => khive_fusion::fuse_with_registry(sources, strategy, limit, registry)?,
+        None => khive_fusion::fuse(sources, strategy, limit)?,
+    };
+
+    Ok(fused
         .into_iter()
         .filter_map(|(id, score)| {
             let mut hit = metadata.remove(&id)?;
@@ -169,6 +199,10 @@ impl KhiveRuntime {
     }
 
     /// Hybrid search with a caller-supplied fusion strategy.
+    ///
+    /// `registry` resolves `FusionStrategy::Custom` by name (see
+    /// [`fuse_with_strategy`]); pass `None` when the strategy is never
+    /// `Custom`.
     pub async fn hybrid_search_with_strategy(
         &self,
         token: &NamespaceToken,
@@ -176,6 +210,7 @@ impl KhiveRuntime {
         query_vector: Option<Vec<f32>>,
         strategy: FusionStrategy,
         limit: u32,
+        registry: Option<&FusionRegistry>,
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
@@ -221,7 +256,7 @@ impl KhiveRuntime {
         // ranking and the alive check; truncating it first lets stale hits hide
         // live candidates from the other arm.
         let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
-        let fused = fuse_with_strategy(text_hits, vector_hits, &strategy, fusion_limit)?;
+        let fused = fuse_with_strategy(text_hits, vector_hits, &strategy, fusion_limit, registry)?;
         self.retain_alive_search_hits(token, fused, limit as usize)
             .await
     }
@@ -393,10 +428,16 @@ mod tests {
         // so assert on raw score magnitude (smaller k widens the rank-1-vs-rank-2 gap)
         // rather than ordering.
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
-        let hits_k1 =
-            fuse_with_strategy(text.clone(), vec![], &FusionStrategy::Rrf { k: 1 }, 10).unwrap();
+        let hits_k1 = fuse_with_strategy(
+            text.clone(),
+            vec![],
+            &FusionStrategy::Rrf { k: 1 },
+            10,
+            None,
+        )
+        .unwrap();
         let hits_k60 =
-            fuse_with_strategy(text, vec![], &FusionStrategy::Rrf { k: 60 }, 10).unwrap();
+            fuse_with_strategy(text, vec![], &FusionStrategy::Rrf { k: 60 }, 10, None).unwrap();
         // Both should have a first (rank 1 always wins in single-source)
         assert_eq!(hits_k1[0].entity_id, a);
         assert_eq!(hits_k60[0].entity_id, a);
@@ -420,6 +461,7 @@ mod tests {
                 weights: vec![0.7, 0.3],
             },
             10,
+            None,
         )
         .unwrap();
         let heavy_keyword = fuse_with_strategy(
@@ -429,6 +471,7 @@ mod tests {
                 weights: vec![0.3, 0.7],
             },
             10,
+            None,
         )
         .unwrap();
 
@@ -451,6 +494,7 @@ mod tests {
                 weights: vec![0.7, 0.3],
             },
             10,
+            None,
         )
         .unwrap();
         let w2 = fuse_with_strategy(
@@ -460,6 +504,7 @@ mod tests {
                 weights: vec![7.0, 3.0],
             },
             10,
+            None,
         )
         .unwrap();
 
@@ -485,6 +530,7 @@ mod tests {
                 weights: vec![0.0, 0.0],
             },
             10,
+            None,
         )
         .unwrap();
         assert_eq!(hits[0].entity_id, a);
@@ -503,6 +549,7 @@ mod tests {
                 weights: vec![-0.5, 1.0],
             },
             10,
+            None,
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
@@ -520,6 +567,7 @@ mod tests {
                 weights: vec![1.0, 0.0],
             },
             10,
+            None,
         )
         .unwrap();
         assert!(
@@ -535,7 +583,7 @@ mod tests {
         let text = vec![text_hit(a, 0.3, "a")];
         let vec_hits = vec![vector_hit(a, 0.9)];
 
-        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::Union, 10).unwrap();
+        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::Union, 10, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert!((hits[0].score.to_f64() - 0.9).abs() < 1e-6);
         assert_eq!(hits[0].source, SearchSource::Both);
@@ -549,7 +597,8 @@ mod tests {
         let text = vec![text_hit(b, 0.9, "b")];
         let vec_hits = vec![vector_hit(a, 0.8)];
 
-        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::VectorOnly, 10).unwrap();
+        let hits =
+            fuse_with_strategy(text, vec_hits, &FusionStrategy::VectorOnly, 10, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, a);
         assert_eq!(hits[0].source, SearchSource::Vector);
@@ -565,11 +614,102 @@ mod tests {
             vec![vector_hit(vector_id, 0.9)],
             &FusionStrategy::KeywordOnly,
             10,
+            None,
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, text_id);
         assert_eq!(hits[0].source, SearchSource::Text);
+    }
+
+    // 7b. Custom strategy dispatches through a registered `FusionRegistry`
+    // and yields a different ranking than RRF on the same fixture.
+    #[test]
+    fn custom_strategy_dispatches_through_registry_and_differs_from_rrf() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.5, "b")];
+
+        let mut registry = FusionRegistry::new();
+        registry.register(
+            "reverse",
+            |sources: Vec<Vec<(Uuid, DeterministicScore)>>, _: &serde_json::Value| {
+                let mut flat: Vec<_> = sources.into_iter().flatten().collect();
+                flat.reverse();
+                flat
+            },
+        );
+        let strategy =
+            FusionStrategy::try_custom("reverse".to_string(), serde_json::Value::Null).unwrap();
+
+        let custom =
+            fuse_with_strategy(text.clone(), vec![], &strategy, 10, Some(&registry)).unwrap();
+        let rrf = fuse_with_strategy(text, vec![], &FusionStrategy::rrf(), 10, None).unwrap();
+
+        let custom_ids: Vec<_> = custom.iter().map(|h| h.entity_id).collect();
+        let rrf_ids: Vec<_> = rrf.iter().map(|h| h.entity_id).collect();
+        assert_ne!(
+            custom_ids, rrf_ids,
+            "custom and RRF must yield different orderings on this fixture"
+        );
+    }
+
+    // 7c. An unregistered Custom name fails closed rather than falling back to RRF.
+    #[test]
+    fn custom_strategy_unknown_name_fails_closed() {
+        let a = Uuid::new_v4();
+        let text = vec![text_hit(a, 0.9, "a")];
+        let registry = FusionRegistry::new();
+        let strategy =
+            FusionStrategy::try_custom("nonexistent".to_string(), serde_json::Value::Null).unwrap();
+
+        let result = fuse_with_strategy(text, vec![], &strategy, 10, Some(&registry));
+        assert!(result.is_err());
+    }
+
+    // 7d. Custom without a registry (None) fails closed exactly as before this slice.
+    #[test]
+    fn custom_strategy_without_registry_fails_closed() {
+        let a = Uuid::new_v4();
+        let text = vec![text_hit(a, 0.9, "a")];
+        let strategy =
+            FusionStrategy::try_custom("reverse".to_string(), serde_json::Value::Null).unwrap();
+
+        let result = fuse_with_strategy(text, vec![], &strategy, 10, None);
+        assert!(result.is_err());
+    }
+
+    // 7e. Registering a custom strategy never perturbs the default (non-Custom) path.
+    #[test]
+    fn registered_custom_strategy_leaves_default_path_unaffected() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.5, "b")];
+
+        let mut registry = FusionRegistry::new();
+        registry.register(
+            "reverse",
+            |sources: Vec<Vec<(Uuid, DeterministicScore)>>, _: &serde_json::Value| {
+                let mut flat: Vec<_> = sources.into_iter().flatten().collect();
+                flat.reverse();
+                flat
+            },
+        );
+
+        let via_registry = fuse_with_strategy(
+            text.clone(),
+            vec![],
+            &FusionStrategy::rrf(),
+            10,
+            Some(&registry),
+        )
+        .unwrap();
+        let via_default =
+            fuse_with_strategy(text, vec![], &FusionStrategy::rrf(), 10, None).unwrap();
+
+        let ids_registry: Vec<_> = via_registry.iter().map(|h| h.entity_id).collect();
+        let ids_default: Vec<_> = via_default.iter().map(|h| h.entity_id).collect();
+        assert_eq!(ids_registry, ids_default);
     }
 
     // 8. Default strategy is Rrf{k:60}
@@ -587,6 +727,7 @@ mod tests {
             vector_hits,
             &FusionStrategy::Union,
             CANDIDATE_MULTIPLIER as usize,
+            None,
         )
         .unwrap();
         assert!(truncated.iter().all(|hit| !live.contains(&hit.entity_id)));
@@ -598,6 +739,7 @@ mod tests {
                 Some(query_vector),
                 FusionStrategy::Union,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -616,12 +758,13 @@ mod tests {
             vector_hits,
             &strategy,
             CANDIDATE_MULTIPLIER as usize,
+            None,
         )
         .unwrap();
         assert!(truncated.iter().all(|hit| !live.contains(&hit.entity_id)));
 
         let hits = rt
-            .hybrid_search_with_strategy(&tok, query_text, Some(query_vector), strategy, 1)
+            .hybrid_search_with_strategy(&tok, query_text, Some(query_vector), strategy, 1, None)
             .await
             .unwrap();
 
@@ -693,7 +836,14 @@ mod tests {
         .unwrap();
 
         let result = rt
-            .hybrid_search_with_strategy(&tok, "$prev.id", None, FusionStrategy::default(), 10)
+            .hybrid_search_with_strategy(
+                &tok,
+                "$prev.id",
+                None,
+                FusionStrategy::default(),
+                10,
+                None,
+            )
             .await;
 
         assert!(
@@ -725,7 +875,7 @@ mod tests {
         .unwrap();
 
         let result = rt
-            .hybrid_search_with_strategy(&tok, "foo@bar", None, FusionStrategy::default(), 10)
+            .hybrid_search_with_strategy(&tok, "foo@bar", None, FusionStrategy::default(), 10, None)
             .await;
 
         let hits = result.unwrap_or_else(|e| {
