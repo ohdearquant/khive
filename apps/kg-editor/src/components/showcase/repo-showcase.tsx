@@ -24,7 +24,7 @@ import {
   TrendingUp,
   Users,
 } from "@/icons";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { DataState } from "@/components/data-state";
 import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
@@ -42,6 +42,7 @@ import {
 import { settleGraphLayout } from "@/lib/graph-layout";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import { buildRepositoryBrief } from "@/lib/repository-brief";
+import { buildStructureCouplingLens } from "@/lib/structure-coupling-lens";
 import type {
   RepoBundle,
   RepoModule,
@@ -58,6 +59,8 @@ type Labels = RepoBundle["capability"]["labels"];
 type ViewCapability = RepoBundle["capability"]["views"][ViewId];
 type Icon = typeof Network;
 type ModuleMap = Map<string, RepoModule>;
+type AnalysisWindow =
+  RepoBundle["aggregates"]["hidden_coupling"]["meta"]["window"];
 type ViewProps = Readonly<{
   bundle: RepoBundle;
   moduleById: ModuleMap;
@@ -85,6 +88,7 @@ const UI_ROW_LIMIT = 200;
 const UI_TREEMAP_LIMIT = 180;
 const UI_RESIDUAL_LIMIT = 80;
 const UI_GRAPH_EDGE_LIMIT = 50;
+const UI_COUPLING_EDGE_LIMIT = 20;
 
 function derivedDiamondPoints(x: number, y: number): string {
   const r = 1.1;
@@ -95,8 +99,31 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat("en", { notation: value >= 10_000 ? "compact" : "standard" }).format(value);
 }
 
+function formatExactNumber(value: number): string {
+  return new Intl.NumberFormat("en").format(value);
+}
+
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric" }).format(new Date(value));
+}
+
+function formatAnalysisWindow(
+  window: AnalysisWindow,
+  snapshotTime: string,
+): string {
+  if (window.kind === "rolling_days") {
+    const duration = window.days == null ? "Rolling" : `${window.days}-day`;
+    const range = window.start && window.end
+      ? ` · ${formatDate(window.start)} to ${formatDate(window.end)}`
+      : "";
+    return `${duration} analysis window${range}`;
+  }
+  if (window.kind === "range") {
+    return `Bounded analysis window · ${
+      window.start ? formatDate(window.start) : "unspecified start"
+    } to ${window.end ? formatDate(window.end) : "unspecified end"}`;
+  }
+  return `All-history analysis window · snapshot ${formatDate(snapshotTime)}`;
 }
 
 function formatPercent(value: number): string {
@@ -342,12 +369,22 @@ function ViewFrame({
   );
 }
 
-function StructureGraph({ bundle }: { bundle: RepoBundle }) {
+function StructureGraph({
+  bundle,
+  moduleById,
+  selectedModuleId,
+  onInspectModule,
+}: ViewProps) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
   const [subtreeId, setSubtreeId] = useState(graph.repository.id);
   const [zoom, setZoom] = useState(1);
   const [selectedId, setSelectedId] = useState(graph.repository.id);
+  const [lens, setLens] = useState<"structure" | "hidden_coupling">(
+    "structure",
+  );
+  const [focusedPairKey, setFocusedPairKey] = useState<string | null>(null);
+  const lensGroupName = useId();
   const {
     displayedEdges,
     displayedModules,
@@ -449,6 +486,43 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
     ...displayedPackages.map((item) => [item.id, item.name] as const),
     ...displayedModules.map((item) => [item.id, item.module_path] as const),
   ]);
+  const couplingLens = useMemo(() =>
+    buildStructureCouplingLens({
+      pairPage: bundle.aggregates.hidden_coupling.data,
+      structureEdgePage: graph.structure_edges,
+      visibleModuleIds: visibleIds,
+      limit: UI_COUPLING_EDGE_LIMIT,
+    }), [
+    bundle.aggregates.hidden_coupling.data,
+    graph.structure_edges,
+    visibleIds,
+  ]);
+  const focusedPair = couplingLens.pairs.find((pair) =>
+    pair.key === focusedPairKey
+  ) ?? null;
+  const focusedModuleIds = focusedPair
+    ? new Set([focusedPair.leftModuleId, focusedPair.rightModuleId])
+    : null;
+  const couplingNodeCounts = new Map<string, number>();
+  for (const pair of couplingLens.pairs) {
+    couplingNodeCounts.set(
+      pair.leftModuleId,
+      Math.max(couplingNodeCounts.get(pair.leftModuleId) ?? 0, pair.cochangeCount),
+    );
+    couplingNodeCounts.set(
+      pair.rightModuleId,
+      Math.max(couplingNodeCounts.get(pair.rightModuleId) ?? 0, pair.cochangeCount),
+    );
+  }
+  const isContextDimmed = (id: string) =>
+    lens === "hidden_coupling" && focusedModuleIds !== null &&
+    !focusedModuleIds.has(id);
+  const isCouplingFocused = (id: string) =>
+    lens === "hidden_coupling" && focusedModuleIds?.has(id) === true;
+  const inspectCouplingEndpoint = (moduleId: string) => {
+    setSelectedId(moduleId);
+    onInspectModule(moduleId);
+  };
 
   return (
     <div className="repo-view-body">
@@ -462,12 +536,39 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
               onChange={(event) => {
                 setSubtreeId(event.target.value);
                 setSelectedId(event.target.value);
+                setFocusedPairKey(null);
               }}
             >
               <option value={graph.repository.id}>{labels.node_types.repository}</option>
               {selectablePackages.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
             </select>
           </label>
+          <fieldset className="repo-graph-lens-picker">
+            <legend>Graph lens</legend>
+            <label>
+              <input
+                type="radio"
+                name={lensGroupName}
+                value="structure"
+                checked={lens === "structure"}
+                onChange={() => {
+                  setLens("structure");
+                  setFocusedPairKey(null);
+                }}
+              />
+              <span>{capability.views.structure_graph.label}</span>
+            </label>
+            <label>
+              <input
+                type="radio"
+                name={lensGroupName}
+                value="hidden_coupling"
+                checked={lens === "hidden_coupling"}
+                onChange={() => setLens("hidden_coupling")}
+              />
+              <span>{capability.views.hidden_coupling.label}</span>
+            </label>
+          </fieldset>
           <div>
             <button type="button" aria-label={`${capability.views.structure_graph.label} −`} onClick={() => setZoom((value) => Math.max(0.75, value - 0.25))}>−</button>
             <output aria-live="polite">{Math.round(zoom * 100)}%</output>
@@ -480,6 +581,13 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
           presentRelations={displayedEdges.map((edge) => edge.relation)}
         />
         <div className="repo-graph-stage" aria-label={capability.views.structure_graph.label}>
+          {lens === "hidden_coupling" && (
+            <div className="repo-graph-active-overlay">
+              <Braces aria-hidden="true" />
+              <span>Active analytical overlay</span>
+              <strong>{capability.views.hidden_coupling.label}</strong>
+            </div>
+          )}
           <div className="repo-graph-viewport" style={{ transform: `scale(${zoom})` }}>
             <svg className="repo-edges" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
               <defs>
@@ -493,8 +601,11 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
                 if (!source || !target) return null;
                 const legend = edgeLegendFor(edge.relation);
                 const direction = edgeDirectionMark(legend, source, target);
+                const dimmed = focusedModuleIds !== null &&
+                  !(focusedModuleIds.has(edge.source) &&
+                    focusedModuleIds.has(edge.target));
                 return (
-                  <g key={edge.id}>
+                  <g className={dimmed ? "context-dimmed" : undefined} key={edge.id}>
                     <line
                       className="ontology-edge"
                       data-edge-family={legend.family}
@@ -539,9 +650,39 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
                   </g>
                 );
               })}
+              {lens === "hidden_coupling" && couplingLens.pairs.map((pair) => {
+                const source = positions.get(pair.leftModuleId);
+                const target = positions.get(pair.rightModuleId);
+                if (!source || !target) return null;
+                const selected = focusedPairKey === pair.key;
+                const dimmed = focusedPair !== null && !selected;
+                return (
+                  <g
+                    className={`${selected ? "selected" : ""} ${dimmed ? "context-dimmed" : ""}`.trim()}
+                    data-coupling-overlay={pair.key}
+                    key={`coupling-${pair.key}`}
+                  >
+                    <line
+                      className="repo-coupling-edge"
+                      x1={source.x}
+                      y1={source.y}
+                      x2={target.x}
+                      y2={target.y}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                    <circle
+                      className="repo-coupling-mark"
+                      cx={(source.x + target.x) / 2}
+                      cy={(source.y + target.y) / 2}
+                      r="1.45"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  </g>
+                );
+              })}
             </svg>
             <button
-              className={`repo-graph-node ${selectedId === graph.repository.id ? "selected" : ""}`}
+              className={`repo-graph-node ${selectedId === graph.repository.id ? "selected" : ""} ${isContextDimmed(graph.repository.id) ? "context-dimmed" : ""}`}
               data-node-id={graph.repository.id}
               style={{
                 left: `${positions.get(graph.repository.id)!.x}%`,
@@ -551,7 +692,10 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
               }}
               type="button"
               aria-pressed={selectedId === graph.repository.id}
-              onClick={() => setSelectedId(graph.repository.id)}
+              onClick={() => {
+                setSelectedId(graph.repository.id);
+                setFocusedPairKey(null);
+              }}
             >
               <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
               <span>{labels.node_types.repository}</span><strong>{graph.repository.label}</strong>
@@ -559,7 +703,10 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
             {displayedPackages.map((item) => {
               const position = positions.get(item.id)!;
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
+                  setSelectedId(item.id);
+                  setFocusedPairKey(null);
+                }}>
                   <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
                   <span>{labels.node_types.package}</span><strong>{item.name}</strong>
                 </button>
@@ -567,15 +714,130 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
             })}
             {displayedModules.map((item) => {
               const position = positions.get(item.id)!;
+              const couplingCount = couplingNodeCounts.get(item.id);
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""} ${isCouplingFocused(item.id) ? "coupling-focused" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
+                  setSelectedId(item.id);
+                  setFocusedPairKey(null);
+                }}>
                   <EntityKindMark className="repo-node-kind-icon" kind="concept" showLabel={false} />
                   <span>{labels.node_types.module}</span><strong>{item.module_path}</strong>
+                  {lens === "hidden_coupling" && couplingCount !== undefined && (
+                    <span
+                      className="repo-graph-overlay-badge"
+                      aria-label={`${capability.views.hidden_coupling.label}: ${labels.metrics.cochange_count} ${formatNumber(couplingCount)}`}
+                    >
+                      <Braces aria-hidden="true" />
+                      <b>{formatNumber(couplingCount)}</b>
+                    </span>
+                  )}
                 </button>
               );
             })}
           </div>
         </div>
+        {lens === "hidden_coupling" && (
+          <section
+            className="repo-coupling-lens"
+            role="region"
+            aria-label={`${capability.views.hidden_coupling.label} lens`}
+          >
+            <header>
+              <div>
+                <span>Candidate evidence · not a dependency claim</span>
+                <strong>{formatNumber(couplingLens.pairs.length)} of {formatNumber(couplingLens.capturedVisiblePairCount)} captured visible pairs shown</strong>
+              </div>
+              <p>
+                <span>{formatAnalysisWindow(bundle.aggregates.hidden_coupling.meta.window, bundle.meta.snapshot.ingested_at)}</span>
+                <span>{formatExactNumber(couplingLens.capturedPairCount)} captured of {couplingLens.declaredPairCount === null ? labels.unavailable : formatExactNumber(couplingLens.declaredPairCount)} declared</span>
+              </p>
+            </header>
+            {couplingLens.coverage === "unavailable"
+              ? (
+                <DataState
+                  className="repo-inline-state"
+                  presentation="inline"
+                  state="unavailable"
+                  title={labels.unavailable}
+                  message={couplingLens.coverageReason ?? "The hidden-coupling aggregate is unavailable."}
+                />
+              )
+              : couplingLens.coverage === "truncated" && (
+              <DataState
+                className="repo-inline-state"
+                presentation="inline"
+                state="truncated"
+                title={labels.truncated}
+                shown={couplingLens.capturedPairCount}
+                bound={bundle.aggregates.hidden_coupling.data.bound.max_items}
+                knownTotal={couplingLens.declaredPairCount ?? undefined}
+                reason={couplingLens.coverageReason ?? "The hidden-coupling aggregate is incomplete."}
+              />
+            )}
+            <p className="repo-coupling-caveat">
+              Co-change is an implicit-boundary candidate, not proof of runtime dependency. Captured rows can include production, test, example, and generated modules.
+            </p>
+            {couplingLens.pairs.length === 0
+              ? couplingLens.coverage === "unavailable"
+              ? (
+                <DataState
+                  className="repo-empty compact"
+                  state="unavailable"
+                  title={`${capability.views.hidden_coupling.label} ${labels.unavailable.toLocaleLowerCase()}`}
+                  message={couplingLens.coverageReason ?? "The bundle does not claim hidden-coupling evidence."}
+                />
+              )
+              : (
+                <DataState
+                  className="repo-empty compact"
+                  state="empty"
+                  title="No captured coupling pair in this visible graph"
+                  message="Choose another package or return to the structure lens."
+                  action={{
+                    label: "Return to structure lens",
+                    onClick: () => {
+                      setLens("structure");
+                      setFocusedPairKey(null);
+                    },
+                  }}
+                />
+              )
+              : (
+                <ol className="repo-coupling-evidence">
+                  {couplingLens.pairs.map((pair) => {
+                    const left = moduleById.get(pair.leftModuleId);
+                    const right = moduleById.get(pair.rightModuleId);
+                    const leftLabel = left?.source_path ?? pair.leftModuleId;
+                    const rightLabel = right?.source_path ?? pair.rightModuleId;
+                    const dependencyMessage = pair.dependencyEvidence === "absent"
+                      ? "No captured direct dependency edge"
+                      : pair.dependencyEvidence === "present"
+                      ? "Captured direct dependency edge"
+                      : `Direct dependency evidence unknown · ${couplingLens.dependencyCoverageReason ?? "structure edge coverage is incomplete"}`;
+                    return (
+                      <li className={focusedPairKey === pair.key ? "selected" : ""} key={pair.key}>
+                        <button
+                          type="button"
+                          className="repo-coupling-focus"
+                          aria-pressed={focusedPairKey === pair.key}
+                          aria-label={`Focus coupling candidate between ${leftLabel} and ${rightLabel}`}
+                          onClick={() => setFocusedPairKey(pair.key)}
+                        >
+                          <Braces aria-hidden="true" />
+                          <span><strong>{labels.metrics.cochange_count}: {formatNumber(pair.cochangeCount)} · {labels.metrics.support}: {formatPercent(pair.support)}</strong>{dependencyMessage}</span>
+                        </button>
+                        <div className="repo-coupling-endpoints">
+                          <ModuleInspectionControl moduleId={pair.leftModuleId} moduleById={moduleById} modulePage={graph.modules} selectedModuleId={selectedModuleId} onInspectModule={inspectCouplingEndpoint} className="compact" />
+                          <span>paired with</span>
+                          <ModuleInspectionControl moduleId={pair.rightModuleId} moduleById={moduleById} modulePage={graph.modules} selectedModuleId={selectedModuleId} onInspectModule={inspectCouplingEndpoint} className="compact" />
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+          </section>
+        )}
         <div className="repo-inspector">
           <div className="repo-inspector-heading">
             <EntityKindMark kind={selectedEntityKind} showLabel={false} />

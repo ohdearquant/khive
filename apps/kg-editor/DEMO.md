@@ -2,7 +2,7 @@
 
 This walkthrough demonstrates the repository showcase as an investigation tool,
 not a generic dashboard. The example values below come from the khive snapshot
-at `288b9eee1f471d505e7f5de33e121c58773a10af`. When using a newer snapshot,
+at `c2979d2443738a075e55a170c772d1dc86cf0f91`. When using a newer snapshot,
 narrate the values and coverage displayed by the UI.
 
 ## Prepare the materialized snapshot
@@ -14,7 +14,7 @@ the allowlisted server route:
 
 ```bash
 KHIVE_SHOWCASE_ANALYSIS_ROOT=/absolute/path/to/analyses \
-KHIVE_SHOWCASE_ANALYSIS_IDS=khive \
+KHIVE_SHOWCASE_ANALYSES='[{"analysis_id":"khive","canonical_url":"https://github.com/ohdearquant/khive"}]' \
 npm run dev
 ```
 
@@ -34,8 +34,8 @@ the curated static fallback.
    field, and select **Open repository**.
 2. Point to the DB-snapshot badge, pinned SHA, ingestion time, and exporter
    identity.
-3. Point to the overview: this snapshot contains 45 packages, 683 modules, 990
-   commits, and seven captured dependency SCCs.
+3. Point to the overview: this snapshot contains 43 packages, 658 modules, 938
+   commits, and five captured dependency SCCs.
 
 Say:
 
@@ -52,10 +52,10 @@ distinguish production, test, example, and generated modules.
 ### 2. Start at the writer/storage seam
 
 1. Search for `crates/khive-db/src/pool.rs` and inspect it.
-2. Show fan-in 20, fan-out 2, 26 captured commits, and bus factor 1.
+2. Show fan-in 20, fan-out 2, 19 captured commits, and bus factor 1.
 3. In **Dependency topology**, follow the SCC member link to
    `crates/khive-db/src/writer_task.rs`.
-4. Show its fan-in 9, fan-out 2, 21 captured commits, and the same two-member
+4. Show its fan-in 8, fan-out 2, 14 captured commits, and the same two-member
    SCC.
 
 Say:
@@ -71,7 +71,7 @@ test modules, so 20 is not a production-only fan-in.
 
 ### 3. Show an architectural insight that argues against consolidation
 
-Search for `crates/khive-db/src/checkpoint.rs`. It has 38 captured commits and
+Search for `crates/khive-db/src/checkpoint.rs`. It has 31 captured commits and
 co-change evidence across DB, runtime, and MCP. Source and ADR inspection
 explains why this control plane must remain physically independent of the writer
 queue: a dedicated checkpoint connection prevents checkpoint I/O from consuming
@@ -81,9 +81,9 @@ control/metrics facade, not SQLite connection ownership.
 ### 4. Move to the runtime coordination knot
 
 1. Search for `crates/khive-runtime/src/operations.rs`.
-2. Show 90 captured commits, fan-in 4, fan-out 7, and its SCC with `pack.rs` and
+2. Show 89 captured commits, fan-in 4, fan-out 7, and its SCC with `pack.rs` and
    `curation.rs`.
-3. Point to the history disclosure: the total is 90 while the inspector shows a
+3. Point to the history disclosure: the total is 89 while the inspector shows a
    recent sample from the captured page.
 4. Open **Dependency topology** and show SCC membership without implying an edge
    order.
@@ -95,11 +95,21 @@ Say:
 > dependency-lower contract, followed by the split plans already documented in
 > these source files.
 
-### 5. Use a false positive to demonstrate trustworthiness
+### 5. Verify a hidden boundary instead of trusting a rank
 
-Open the top **Hidden coupling** candidate. In this snapshot it is
-`khive-pack-comm/tests/integration.rs` with `src/handlers.rs`, at 40 co-changes.
-The global analysis contains only the top 1,000 of 104,798 candidate pairs.
+1. Return to **Structure graph**, select the `khive-db` package, and switch the
+   graph lens from **Structure graph** to **Hidden coupling**.
+2. Point out that the graph can verify only 70 captured visible pairs in this
+   package, renders the top 20, and discloses that the global aggregate contains
+   1,000 of 104,263 declared candidates.
+3. Focus `stores/graph_tests.rs` paired with `stores/graph.rs`: they changed
+   together 24 times in the 365-day window, but the complete captured structure
+   edge page has no direct dependency edge between them.
+4. Open either endpoint. The shared inspector, endpoint module, URL, and active
+   Structure view stay synchronized in the current session. A shared URL restores
+   the repository, snapshot, endpoint module, and Structure view; package
+   selection, lens choice, and pair focus are not yet URL-addressed, so reselect
+   them after opening the link. Track full lens replay as follow-up work in #1887.
 
 Say:
 
@@ -108,9 +118,11 @@ Say:
 > source-role caveat let us falsify the scary interpretation instead of turning
 > a rank into a defect.
 
-If time permits, repeat the exercise with the MCP `coordinator.rs`/`server.rs`
-SCC. Its reverse edge comes from a `cfg(test)` import, while the production
-coordinator seam is one-way.
+If time permits, open the full **Hidden coupling** ranking: its top captured
+pair is `khive-pack-comm/tests/integration.rs` with `src/handlers.rs`, at 39
+co-changes. Then repeat with the MCP `coordinator.rs`/`server.rs` SCC. Its
+reverse edge comes from a `cfg(test)` import, while the production coordinator
+seam is one-way.
 
 ### 6. Close with one confirmed contract drift
 
@@ -143,7 +155,7 @@ Say:
 
 ## Closing line
 
-> The UI does not tell me that code is bad. It turns 683 modules into a
+> The UI does not tell me that code is bad. It turns 658 modules into a
 > reproducible investigation: provenance, rank, topology, history, bounds, and
 > the exact paths needed to test an architecture hypothesis. Dogfooding also
 > exposed where the analysis itself must improve—especially production/test
