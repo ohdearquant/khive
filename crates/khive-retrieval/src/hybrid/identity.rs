@@ -51,8 +51,7 @@ mod tests {
             (3u32, DeterministicScore::from_f64(0.5)),
         ];
         let out = reranker.rerank("q", results.clone(), 3).await.unwrap();
-        let ids: Vec<_> = out.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec![1u32, 2u32, 3u32]);
+        assert_eq!(out, results);
     }
 
     #[tokio::test]
@@ -63,10 +62,8 @@ mod tests {
             (2u32, DeterministicScore::from_f64(0.9)),
             (3u32, DeterministicScore::from_f64(0.5)),
         ];
-        let out = reranker.rerank("q", results, 2).await.unwrap();
-        assert_eq!(out.len(), 2);
-        let ids: Vec<_> = out.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec![1u32, 2u32]);
+        let out = reranker.rerank("q", results.clone(), 2).await.unwrap();
+        assert_eq!(out, results[..2]);
     }
 
     #[tokio::test]

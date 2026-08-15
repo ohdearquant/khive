@@ -56,7 +56,6 @@ async fn identity_reranker_reexport_compiles_and_runs() {
         (1u32, DeterministicScore::from_f64(0.5)),
         (2u32, DeterministicScore::from_f64(0.9)),
     ];
-    let out = reranker.rerank("q", results, 1).await.unwrap();
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].0, 1u32);
+    let out = reranker.rerank("q", results.clone(), 1).await.unwrap();
+    assert_eq!(out, results[..1]);
 }
