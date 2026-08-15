@@ -83,8 +83,8 @@ eval-retrieval-gold-check:
 	@echo "==> Retrieval eval harness: re-running A_fused_direct against committed gold..."
 	@echo "    (tolerance 0.002 absorbs a pre-existing rank-10-boundary tie-break jitter"
 	@echo "    in memory.recall unrelated to this harness's temporal-weight hermeticity fix"
-	@echo "    -- see eval/retrieval/README.md Determinism section)"
-	cd eval/retrieval && uv run python evaluate.py --check-gold --gold-tolerance 0.002
+	@echo "    -- see benches/retrieval/README.md Determinism section)"
+	cd benches/retrieval && uv run python evaluate.py --check-gold --gold-tolerance 0.002
 
 hold-time-gate:
 	@echo "==> ADR-135 F4 release gate: per-shape writer hold-time regression coverage..."
