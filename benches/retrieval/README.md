@@ -172,6 +172,50 @@ drift. Root-causing that tie-break is out of scope for this eval-only PR
 gate meaningful for real regressions without chasing a single flipped rank
 at an exact score tie.
 
+## Experimental: offline SPLADE sparse-retrieval fusion
+
+`splade_offline.py` is a separate, clearly-experimental sidecar script — not a
+`CONDITIONS` entry, and it never touches `gold/A_fused_direct.json` or any
+existing condition. It adds a SPLADE-family sparse-retrieval leg computed
+entirely offline (Python, `transformers`+`torch`, no new Rust dependency, no
+serving code), RRF-fuses it against the committed `A_fused_direct`
+condition's own ranking using the same rule the runtime applies
+(`DEFAULT_RRF_K = 60`, `crates/khive-fusion/src/strategy.rs:7`), and scores
+the fused ranking with this harness's own metrics.
+
+Two modes:
+
+```bash
+# One-time: encode the 400-note corpus + 40 queries into sparse vectors.
+# Requires transformers+torch as ephemeral --with deps (nothing added to
+# pyproject); writes fixtures/splade_vectors_offline.json locally (~1MB —
+# not committed, this repo's pre-commit large-file guard caps at 512KB;
+# regenerate with this command, ~17s on a warm model cache).
+uv run --with transformers --with torch python splade_offline.py --encode
+
+# Fuse + evaluate — only needs kkernel and the local fixture above, no torch.
+uv run python splade_offline.py --out results/B_splade_offline.jsonl
+
+# Paired comparison against baseline, same tool as any other condition:
+uv run python bootstrap.py results/A_fused_direct.jsonl results/B_splade_offline.jsonl
+```
+
+**Methodology honesty:** this is a two-stage offline approximation of a
+native three-leg fusion. `A_fused_direct` is itself already an RRF fusion of
+the runtime's dense and lexical legs; this script RRF-fuses that
+already-fused ranking against a third, independently-computed SPLADE leg,
+rather than fusing all three legs in one pass. This is a conservative
+approximation, not a neutral one — see the bias-direction discussion in
+`.khive/EXPERIMENT_REPORT_splade_gate.md` (not committed; regenerate by
+re-running the commands above) or the module docstring in
+`splade_offline.py`. Separately: this harness's synthetic corpus has
+target-note content derived directly from its own query text
+(`generate_corpus.py`), so its baseline `fresh_directive` nDCG@10 (0.65) is
+far higher than any figure from a real production corpus — this benchmark
+can measure whether an offline SPLADE leg is additive and safe, but it
+cannot validate a real-corpus low-recall claim, which needs its own labeled
+benchmark.
+
 ## Relationship to the #939 measurement
 
 The July 2026 measurement (issue #939, `.khive/REPORT.md`) established this

@@ -93,6 +93,11 @@ implementation_notes.md
 # Real-data recall benchmark corpus (extracted from khive-graph.db, never commit)
 crates/khive-pack-memory/tests/fixtures/
 
+# Locally-regenerated SPLADE sparse-vector fixture (~1MB, over the 512KB
+# pre-commit large-file cap) — regenerate with
+# `benches/retrieval/splade_offline.py --encode`
+benches/retrieval/fixtures/
+
 uv.lock
 pyproject.toml
 # Exception: the khive-contract integration suite is a committed uv project
