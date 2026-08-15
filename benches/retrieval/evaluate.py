@@ -89,13 +89,23 @@ def refuse_unsafe_db_env() -> None:
         )
 
 
+_KNOWN_PRIVATE_FIRMLINK_PREFIXES = ("tmp", "var", "etc")
+
+
 def _ambient_symlink(p: Path) -> bool:
-    """macOS publishes /tmp, /var, and /etc as symlinks into /private as an
-    OS convention. Those are OS-owned, not planted, and a scratch root under
-    them must not be misreported as an attack."""
+    """macOS publishes /tmp, /var, and /etc — and only those three — as
+    symlinks into /private as an OS convention. Those are OS-owned, not
+    planted, and a scratch root under them must not be misreported as an
+    attack. Restricted to the exact known prefixes (not "any absolute path
+    whose realpath happens to equal /private/<itself>"): without this
+    restriction, a planted symlink for an arbitrary prefix (e.g.
+    /opt/attacker/tmp -> /private/opt/attacker/tmp) that happens to resolve
+    would also be waved through."""
     try:
         rel = p.relative_to("/")
     except ValueError:
+        return False
+    if not rel.parts or rel.parts[0] not in _KNOWN_PRIVATE_FIRMLINK_PREFIXES:
         return False
     return os.path.realpath(str(p)) == str(Path("/private") / rel)
 
@@ -183,24 +193,17 @@ def _open_dir_component_nofollow(parent_fd: int, name: str, full_path: Path) -> 
         ) from e
 
 
-def open_scratch_root_fd(root: Path) -> int:
-    """Open a persistent, race-resistant directory fd for `root`.
-
-    `_validate_scratch_root` checks components with `lstat` and then
-    `make_scratch` creates the directory — a concurrent process can swap a
-    component for a symlink in the gap between that check and this open.
-    Walking every component from the filesystem root via `openat`
-    (`dir_fd=`) with `O_NOFOLLOW` closes that gap: each hop is resolved
-    relative to the fd already opened for its parent, so a symlink planted
-    after validation is refused here instead of silently followed. All
-    subsequent scratch file access in this run goes through the returned fd,
-    never through `root` as a bare path.
-    """
-    root = root.absolute()
-    fd = os.open(root.anchor, os.O_DIRECTORY | os.O_CLOEXEC)
-    cur = Path(root.anchor)
+def _open_path_nofollow(path: Path) -> int:
+    """Walk every component of `path` from the filesystem root via `openat`
+    (`dir_fd=`) with `O_NOFOLLOW`, so a symlink planted anywhere along the
+    chain — including after some earlier validation pass — is refused
+    instead of silently followed. Returns an fd for `path` itself; the
+    caller owns it and must close it."""
+    path = path.absolute()
+    fd = os.open(path.anchor, os.O_DIRECTORY | os.O_CLOEXEC)
+    cur = Path(path.anchor)
     try:
-        for part in root.relative_to(root.anchor).parts:
+        for part in path.relative_to(path.anchor).parts:
             cur = cur / part
             next_fd = _open_dir_component_nofollow(fd, part, cur)
             os.close(fd)
@@ -211,6 +214,48 @@ def open_scratch_root_fd(root: Path) -> int:
         raise
 
 
+def open_scratch_root_fd(root: Path) -> int:
+    """Open a persistent, race-resistant directory fd for `root`.
+
+    `_validate_scratch_root` checks components with `lstat` and then
+    `make_scratch` creates the directory — a concurrent process can swap a
+    component for a symlink in the gap between that check and this open.
+    `_open_path_nofollow` closes that gap: each hop is resolved relative to
+    the fd already opened for its parent, so a symlink planted after
+    validation is refused here instead of silently followed. All subsequent
+    scratch file access in this run goes through the returned fd, never
+    through `root` as a bare path.
+    """
+    return _open_path_nofollow(root)
+
+
+def init_scratch_dirs(root_fd: int) -> dict[str, tuple[int, int]]:
+    """Create the scratch tree's HOME and TMPDIR subdirectories through the
+    pinned root fd (`dir_fd=root_fd`) rather than by pathname, and record
+    each one's (device, inode) at creation time.
+
+    The recorded identity lets `cleanup_scratch` refuse to recurse into a
+    same-name substitution later — including one on the *same* filesystem as
+    the scratch root, which a bare device check alone would not catch (see
+    `_rmtree_contents_via_fd`).
+    """
+    known: dict[str, tuple[int, int]] = {}
+    for name in ("home", "tmp"):
+        try:
+            os.mkdir(name, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        fd = os.open(
+            name, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd
+        )
+        try:
+            st = os.fstat(fd)
+            known[name] = (st.st_dev, st.st_ino)
+        finally:
+            os.close(fd)
+    return known
+
+
 def _claim_scratch_file(root_fd: int, name: str) -> None:
     """Atomically claim `name` under the scratch root as a fresh, real file.
 
@@ -218,9 +263,12 @@ def _claim_scratch_file(root_fd: int, name: str) -> None:
     exists at `name`; `O_NOFOLLOW` additionally refuses to follow a symlink
     raced into place on the create call itself. Immediately closed: kkernel
     (subprocess) and sqlite3 need a path string, not an fd (see
-    `verified_scratch_path`), so the claim's only job is to make the
-    eventual path-based open resolve to a file this run created, not one a
-    concurrent process substituted.
+    `verified_scratch_path`), so the claim's job is to make the *next*
+    path-based open (`verified_scratch_path`, called immediately before
+    each consumer) resolve to a file this run created at claim time — it
+    does not, by itself, protect a path handed to a consumer some time
+    later; see `verified_scratch_path`'s docstring for that residual
+    window.
     """
     fd = os.open(
         name,
@@ -231,7 +279,63 @@ def _claim_scratch_file(root_fd: int, name: str) -> None:
     os.close(fd)
 
 
-def verified_scratch_path(root: Path, root_fd: int, name: str) -> str:
+class VerifiedScratchPath:
+    """An absolute path string this run has verified names the same file
+    (device + inode) as an fd opened through the TOCTOU-guarded scratch-root
+    fd, plus the still-open leaf fd needed to detect — after the fact — a
+    substitution that happens *during* a consumer's own path-based open.
+
+    This is a detection aid, not a closed race: sqlite3.connect and the
+    kkernel subprocess both take a path string, not a descriptor (neither
+    accepts an fd, and macOS has no /proc/self/fd to convert one), so a swap
+    landing between this verification and the moment the consumer itself
+    opens the path cannot be prevented from here. See
+    `verified_scratch_path`'s docstring for the accepted residual window.
+    """
+
+    __slots__ = ("path", "_leaf_fd")
+
+    def __init__(self, path: str, leaf_fd: int) -> None:
+        self.path = path
+        self._leaf_fd = leaf_fd
+
+    def recheck(self) -> None:
+        """Call after the consumer (sqlite3/subprocess) that was handed
+        `.path` has returned. Closes the held leaf fd and compares its
+        identity, captured before the consumer ran, against a fresh
+        path-based stat taken now. An unlink+recreate substitution during
+        the consumer's use is still visible here: the held fd keeps
+        resolving to the original inode regardless of what happens to the
+        name, so if the two disagree, the consumer plausibly read or wrote
+        through substituted content and this run fails loudly instead of
+        silently trusting that output. A same-inode, in-place content
+        replacement (no unlink — e.g. a bind mount) is NOT detected by this
+        check, since device/inode are unchanged; that narrower case is
+        outside what a path-based API can ever let a caller observe.
+        """
+        try:
+            fd_stat = os.fstat(self._leaf_fd)
+            path_stat = os.stat(self.path, follow_symlinks=False)
+        finally:
+            os.close(self._leaf_fd)
+        if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+            raise SystemExit(
+                f"refusing to trust output produced through {self.path}: it no "
+                "longer matches the file this run verified before handing the "
+                "path to a consumer (TOCTOU guard) — device/inode changed "
+                "during use"
+            )
+
+    def discard(self) -> None:
+        """Close the held leaf fd without comparing identity — for a path
+        handed to a consumer that is *expected* to legitimately replace it
+        (e.g. a write-then-rename output file), where a changed inode after
+        the call is the intended durability mechanism, not a signal worth
+        checking."""
+        os.close(self._leaf_fd)
+
+
+def verified_scratch_path(root: Path, root_fd: int, name: str) -> VerifiedScratchPath:
     """Resolve `name` under the scratch root to an absolute path string,
     re-verified immediately before a subprocess/sqlite3 call that can only
     take a path (neither accepts an fd, and macOS has no /proc/self/fd to
@@ -243,6 +347,17 @@ def verified_scratch_path(root: Path, root_fd: int, name: str) -> str:
     same file (device + inode), something was swapped between the fd-based
     claim and this call, and the harness refuses to hand the path to a
     subprocess rather than risk it writing through a symlink.
+
+    IMPORTANT — this closes the window up to the moment this function
+    returns; it does NOT make the returned path race-resistant afterward.
+    A concurrent process can still replace the name between this return and
+    the instant sqlite3.connect()/the kkernel subprocess actually opens the
+    path string — path-only APIs give this harness no way to hand over an
+    already-open handle instead. The returned `VerifiedScratchPath` keeps
+    the leaf fd open specifically so callers can call `.recheck()` after the
+    consumer returns and detect (not prevent) that residual race; treat any
+    single call to this function as verified-at-call-time, not
+    race-resistant-for-the-life-of-the-path.
     """
     try:
         leaf_fd = os.open(
@@ -253,27 +368,41 @@ def verified_scratch_path(root: Path, root_fd: int, name: str) -> str:
             f"refusing to use {root / name}: could not open {name!r} through the "
             f"validated scratch-root fd without following a symlink (TOCTOU guard): {e}"
         ) from e
-    try:
-        fd_stat = os.fstat(leaf_fd)
-    finally:
-        os.close(leaf_fd)
+    fd_stat = os.fstat(leaf_fd)
     resolved = os.path.realpath(str(root / name))
     path_stat = os.stat(resolved, follow_symlinks=False)
     if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+        os.close(leaf_fd)
         raise SystemExit(
             f"refusing to use {resolved}: it no longer matches the file opened "
             "through the validated scratch-root fd (TOCTOU guard) — device/inode "
             "changed between claim and use"
         )
-    return resolved
+    return VerifiedScratchPath(resolved, leaf_fd)
 
 
-def _rmtree_contents_via_fd(dir_fd: int) -> None:
+def _rmtree_contents_via_fd(
+    dir_fd: int,
+    root_identity: tuple[int, int],
+    known_children: dict[str, tuple[int, int]] | None = None,
+) -> None:
     """Recursively delete everything inside the directory named by `dir_fd`,
     never resolving a path string and never following a symlink: entries are
     listed with `os.scandir(dir_fd)`, a symlink entry is `unlink`ed as a leaf
     (removing the link itself, not its target), and only entries confirmed
-    as real directories via `O_NOFOLLOW` are opened and recursed into."""
+    as real directories via `O_NOFOLLOW` are opened and recursed into.
+
+    `O_NOFOLLOW` alone stops a symlink substitution but not a *real*
+    directory substitution — a concurrent process renaming an external,
+    non-empty directory onto an entry name this run owns. Before recursing
+    into any directory, its opened fd's device must match `root_identity`'s
+    device (a foreign filesystem is refused outright) and, for entries this
+    run recorded an identity for at creation time (`known_children` — today
+    just the top-level `home`/`tmp` dirs, threaded in only at the top-level
+    call), the fd's (device, inode) must still match what was recorded.
+    Either mismatch fails the run loudly rather than recursing into and
+    deleting content this run does not own.
+    """
     with os.scandir(dir_fd) as it:
         entries = list(it)
     for entry in entries:
@@ -284,7 +413,31 @@ def _rmtree_contents_via_fd(dir_fd: int) -> None:
                 entry.name, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
             )
             try:
-                _rmtree_contents_via_fd(child_fd)
+                child_stat = os.fstat(child_fd)
+                if child_stat.st_dev != root_identity[0]:
+                    raise SystemExit(
+                        f"refusing to recurse into {entry.name!r}: its device "
+                        f"({child_stat.st_dev}) does not match the scratch "
+                        f"root's device ({root_identity[0]}) — this looks like "
+                        "a foreign directory substituted into the scratch tree "
+                        "(TOCTOU guard); leaving it for operator cleanup"
+                    )
+                expected = (known_children or {}).get(entry.name)
+                if (
+                    expected is not None
+                    and (
+                        child_stat.st_dev,
+                        child_stat.st_ino,
+                    )
+                    != expected
+                ):
+                    raise SystemExit(
+                        f"refusing to recurse into {entry.name!r}: its identity "
+                        "no longer matches what this run recorded when it "
+                        "created that directory (TOCTOU guard); leaving it for "
+                        "operator cleanup"
+                    )
+                _rmtree_contents_via_fd(child_fd, root_identity)
             finally:
                 os.close(child_fd)
             os.rmdir(entry.name, dir_fd=dir_fd)
@@ -317,16 +470,49 @@ def read_scratch_jsonl(root_fd: int, name: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def cleanup_scratch(root: Path, root_fd: int) -> None:
+def cleanup_scratch(
+    root: Path, root_fd: int, known_children: dict[str, tuple[int, int]]
+) -> None:
     """Delete the scratch tree through the held, TOCTOU-guarded `root_fd`
     rather than a fresh path-based walk, then remove the now-empty root
-    directory itself. The final `rmdir` uses `root`'s path rather than a
-    parent fd (this script never opens the scratch root's parent), but
-    `rmdir` only ever removes an empty directory — a symlink or a
-    repopulated directory raced into that name fails closed instead of
-    deleting through it."""
-    _rmtree_contents_via_fd(root_fd)
-    os.rmdir(root)
+    directory itself through a freshly `O_NOFOLLOW`-walked parent fd
+    (never a bare `os.rmdir(root)` pathname call).
+
+    `root_identity`, captured from `root_fd` before the walk, is re-checked
+    against both `root_fd` itself (an invariant given fd semantics, but
+    recorded and asserted explicitly for auditability against a future
+    refactor that might reopen or reuse the fd) and against a fresh,
+    path-based stat of the root's name under its parent immediately before
+    the final `rmdir`. If a concurrent process replaced the directory at
+    that name (e.g. with an empty directory it controls) after this run's
+    content was deleted via the fd, the path-based stat disagrees with the
+    fd-based one and the run refuses to remove the replacement, leaving it
+    for operator cleanup instead of silently deleting whatever is now
+    there.
+    """
+    root = root.absolute()
+    root_stat = os.fstat(root_fd)
+    root_identity = (root_stat.st_dev, root_stat.st_ino)
+    _rmtree_contents_via_fd(root_fd, root_identity, known_children)
+    parent_fd = _open_path_nofollow(root.parent)
+    try:
+        cur_stat = os.fstat(root_fd)
+        if (cur_stat.st_dev, cur_stat.st_ino) != root_identity:
+            raise SystemExit(
+                f"refusing to remove {root}: the held scratch-root fd no "
+                "longer matches its recorded identity (TOCTOU guard); "
+                "leaving contents for operator cleanup"
+            )
+        entry_stat = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (entry_stat.st_dev, entry_stat.st_ino) != root_identity:
+            raise SystemExit(
+                f"refusing to rmdir {root}: the name no longer resolves to "
+                "the directory this run created (TOCTOU guard); leaving "
+                "contents for operator cleanup"
+            )
+        os.rmdir(root.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def make_scratch(scratch_dir: str | None) -> Path:
@@ -336,22 +522,31 @@ def make_scratch(scratch_dir: str | None) -> Path:
         root.mkdir(parents=True, exist_ok=True)
     else:
         root = Path(tempfile.mkdtemp(prefix=SCRATCH_MARKER))
-    (root / "home").mkdir(exist_ok=True)
     return root
 
 
-def scratch_env(root: Path, db_path: Path) -> dict:
+def scratch_env(home_path: str, tmp_path: str, db_path: Path) -> dict:
     """Minimal allowlisted child environment: PATH (so the `kkernel` binary
-    name resolves), HOME/TMPDIR redirected into the scratch root, and the
-    harness's own explicit KHIVE_DB/KHIVE_EMBEDDING_MODEL. Nothing else from
-    the caller's environment is copied through, so no inherited KHIVE_* or
-    other retrieval-affecting variable can change what gets scored."""
-    tmp_dir = root / "tmp"
-    tmp_dir.mkdir(exist_ok=True)
+    name resolves), HOME/TMPDIR redirected into the scratch root's `home`/
+    `tmp` subdirectories (created through the pinned root fd by
+    `init_scratch_dirs`, not by pathname — `home_path`/`tmp_path` come from
+    `verified_scratch_path`), and the harness's own explicit KHIVE_DB/
+    KHIVE_EMBEDDING_MODEL. Nothing else from the caller's environment is
+    copied through, so no inherited KHIVE_* or other retrieval-affecting
+    variable can change what gets scored.
+
+    HOME/TMPDIR are still exported as bare path strings, though: the
+    kkernel subprocess (and anything it execs) reads $HOME/$TMPDIR by
+    pathname, not by descriptor, so — like KHIVE_DB via
+    `verified_scratch_path` — a swap of `home` or `tmp` between this call
+    and whenever the child actually reads those variables is the same
+    residual, undocumented-away race as `verified_scratch_path`'s TOCTOU
+    window, not something this function can close.
+    """
     return {
         "PATH": os.environ.get("PATH", ""),
-        "HOME": str(root / "home"),
-        "TMPDIR": str(tmp_dir),
+        "HOME": home_path,
+        "TMPDIR": tmp_path,
         "KHIVE_DB": str(db_path),
         "KHIVE_EMBEDDING_MODEL": PINNED_EMBEDDING_MODEL,
     }
@@ -399,19 +594,31 @@ def seed_corpus(
     write_scratch_jsonl(root_fd, "seed_ops.jsonl", ops)
     _claim_scratch_file(root_fd, "seed_save.jsonl")
 
+    ops_vp = verified_scratch_path(root, root_fd, "seed_ops.jsonl")
+    save_vp = verified_scratch_path(root, root_fd, "seed_save.jsonl")
+    db_vp = verified_scratch_path(root, root_fd, "eval.db")
     run_kkernel(
         kkernel,
         [
             "exec",
             "--ops-file",
-            verified_scratch_path(root, root_fd, "seed_ops.jsonl"),
+            ops_vp.path,
             "--save-file",
-            verified_scratch_path(root, root_fd, "seed_save.jsonl"),
+            save_vp.path,
             "--db",
-            verified_scratch_path(root, root_fd, "eval.db"),
+            db_vp.path,
         ],
         env,
     )
+    ops_vp.recheck()
+    # save_vp is not rechecked: `kkernel exec --save-file` publishes its
+    # output via tempfile-write-then-rename (crates/kkernel/src/exec.rs,
+    # atomic_apply::record_save_file_publish_failure), so the path
+    # legitimately names a different inode after a successful run than the
+    # one `_claim_scratch_file`/`verified_scratch_path` observed before the
+    # call — that is the intended durability mechanism, not a substitution.
+    save_vp.discard()
+    db_vp.recheck()
 
     rows = read_scratch_jsonl(root_fd, "seed_save.jsonl")
     failed = [r for r in rows if not r.get("ok")]
@@ -424,7 +631,8 @@ def seed_corpus(
 
 
 def key_id_map(root: Path, root_fd: int) -> dict[str, str]:
-    conn = sqlite3.connect(verified_scratch_path(root, root_fd, "eval.db"))
+    db_vp = verified_scratch_path(root, root_fd, "eval.db")
+    conn = sqlite3.connect(db_vp.path)
     try:
         cur = conn.execute(
             "SELECT id, properties FROM notes WHERE properties IS NOT NULL"
@@ -435,15 +643,17 @@ def key_id_map(root: Path, root_fd: int) -> dict[str, str]:
             for tag in props.get("tags", []):
                 if tag.startswith("k:"):
                     mapping[tag[2:]] = note_id
-        return mapping
     finally:
         conn.close()
+    db_vp.recheck()
+    return mapping
 
 
 def set_ages(
     root: Path, root_fd: int, notes: list[dict], key_to_id: dict[str, str]
 ) -> None:
-    conn = sqlite3.connect(verified_scratch_path(root, root_fd, "eval.db"))
+    db_vp = verified_scratch_path(root, root_fd, "eval.db")
+    conn = sqlite3.connect(db_vp.path)
     try:
         for n in notes:
             note_id = key_to_id[n["key"]]
@@ -456,6 +666,7 @@ def set_ages(
         conn.commit()
     finally:
         conn.close()
+    db_vp.recheck()
 
 
 def run_condition(
@@ -486,19 +697,27 @@ def run_condition(
     write_scratch_jsonl(root_fd, ops_name, ops)
     _claim_scratch_file(root_fd, save_name)
 
+    ops_vp = verified_scratch_path(root, root_fd, ops_name)
+    save_vp = verified_scratch_path(root, root_fd, save_name)
+    db_vp = verified_scratch_path(root, root_fd, "eval.db")
     run_kkernel(
         kkernel,
         [
             "exec",
             "--ops-file",
-            verified_scratch_path(root, root_fd, ops_name),
+            ops_vp.path,
             "--save-file",
-            verified_scratch_path(root, root_fd, save_name),
+            save_vp.path,
             "--db",
-            verified_scratch_path(root, root_fd, "eval.db"),
+            db_vp.path,
         ],
         env,
     )
+    ops_vp.recheck()
+    # See seed_corpus: kkernel publishes --save-file via write-then-rename,
+    # so a changed inode here is the intended durability mechanism.
+    save_vp.discard()
+    db_vp.recheck()
 
     rows = read_scratch_jsonl(root_fd, save_name)
     if len(rows) != len(queries):
@@ -554,6 +773,27 @@ def _validate_recall_row(query: dict, row: dict, corpus_size: int) -> list:
                 f"query_id={query['query_id']!r}; unexpected against this "
                 "harness's fixed top_k on its fixed corpus"
             )
+        # The verbose multi-model envelope (recall.rs handle_recall, the
+        # is_verbose && vector_hits_per_model.len() > 1 branch) carries a
+        # non-empty `results` array alongside top-level `budget_capped`/
+        # `truncated_for_budget` instead of the bare `truncated` flag above
+        # — a truthy budget_capped or nonzero truncated_for_budget here
+        # means the ranked pool was cut down before this response was built,
+        # same failure as the bare-array 'truncated' check below but not
+        # caught by it since this envelope never sets per-hit "truncated".
+        if result.get("budget_capped"):
+            raise RuntimeError(
+                f"memory.recall verbose envelope for query_id={query['query_id']!r} "
+                "reports budget_capped=true; the ranked pool was cut by the "
+                "response token budget before this harness could score it"
+            )
+        if result.get("truncated_for_budget"):
+            raise RuntimeError(
+                f"memory.recall verbose envelope for query_id={query['query_id']!r} "
+                f"reports truncated_for_budget={result.get('truncated_for_budget')!r}; "
+                "the ranked pool was cut by the response token budget before this "
+                "harness could score it"
+            )
         hits = result.get("results")
         if not isinstance(hits, list):
             raise RuntimeError(
@@ -582,6 +822,17 @@ def _validate_recall_row(query: dict, row: dict, corpus_size: int) -> list:
             f"memory.recall pool for query_id={query['query_id']!r} carries per-hit "
             f"'truncated' markers at depth {len(hits)}; the harness requires a fully "
             "untruncated top-100 pool for a valid Recall@100 label"
+        )
+    # A non-empty ANN-degraded response keeps the bare-array/results shape
+    # (recall.rs handle_recall stamps each hit with "degraded":
+    # "ann_unavailable" rather than changing the envelope — only the
+    # zero-hit case changes shape, caught by the top-level `degraded` check
+    # above) so a degraded ranking must be caught here, per hit.
+    if any(h.get("degraded") for h in hits):
+        raise RuntimeError(
+            f"memory.recall pool for query_id={query['query_id']!r} carries per-hit "
+            f"'degraded' markers at depth {len(hits)}; the harness requires a fully "
+            "warm, non-degraded ranking for a valid Recall@100 label"
         )
     return hits
 
@@ -790,12 +1041,15 @@ def run_self_tests() -> int:
         ok, msg = _expect_systemexit(make_scratch, str(root))
         _record(failures, "nonempty-scratch-root-refused", ok, msg)
 
-    # 5. a fresh / nonexistent --scratch-dir root is accepted and initialized.
+    # 5. a fresh / nonexistent --scratch-dir root is accepted and initialized;
+    # `home`/`tmp` are created separately by `init_scratch_dirs` once
+    # `root_fd` exists (see the home/tmp-substitution self-test arms below),
+    # not by `make_scratch` itself.
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / "fresh"
         try:
             made = make_scratch(str(root))
-            ok = made.exists() and (made / "home").is_dir()
+            ok = made.exists() and made.is_dir()
             msg = "ok" if ok else "scratch dir not initialized correctly"
         except SystemExit as e:
             ok, msg = False, f"unexpected refusal: {e}"
@@ -868,9 +1122,7 @@ def run_self_tests() -> int:
             ok, msg = _expect_systemexit(
                 verified_scratch_path, root, root_fd, "claimed.txt"
             )
-            _record(
-                failures, "post-claim-symlink-swap-refused-at-use", ok, msg
-            )
+            _record(failures, "post-claim-symlink-swap-refused-at-use", ok, msg)
             if victim.read_text() != "do not touch":
                 failures.append(
                     "post-claim-symlink-swap-refused-at-use: victim file was modified"
@@ -902,12 +1154,162 @@ def run_self_tests() -> int:
         finally:
             os.close(root_fd)
 
+    def _expect_runtimeerror(fn, *a, **kw) -> tuple[bool, str]:
+        try:
+            fn(*a, **kw)
+        except RuntimeError as e:
+            return True, str(e)
+        return False, "did not raise RuntimeError"
+
+    # 12. a non-empty bare-array memory.recall response carrying per-hit
+    # "degraded" markers (the ann_unavailable stamp recall.rs adds to every
+    # hit in a non-empty degraded response, recall.rs:800-809) is rejected
+    # even though the top-level shape is a plain array and the depth check
+    # passes.
+    hits = [{"id": f"n{i}", "degraded": "ann_unavailable"} for i in range(100)]
+    row = {"ok": True, "result": hits}
+    ok, msg = _expect_runtimeerror(
+        _validate_recall_row, {"query_id": "q-degraded-bare"}, row, 100
+    )
+    _record(failures, "degraded-bare-array-rejected", ok, msg)
+
+    # 13. the verbose multi-model envelope (recall.rs:916-929) carries a
+    # non-empty "results" array with per-hit "degraded" markers but no
+    # top-level "degraded" flag — the plain `result.get("degraded")` check
+    # above never sees it, so the per-hit check must catch it here too.
+    hits = [{"id": f"n{i}", "degraded": "ann_unavailable"} for i in range(100)]
+    row = {
+        "ok": True,
+        "result": {
+            "results": hits,
+            "candidates": {"vector_candidates_per_model": []},
+            "budget_capped": False,
+            "truncated_for_budget": 0,
+        },
+    }
+    ok, msg = _expect_runtimeerror(
+        _validate_recall_row, {"query_id": "q-degraded-verbose"}, row, 100
+    )
+    _record(failures, "verbose-envelope-degraded-rejected", ok, msg)
+
+    # 14. the verbose envelope's own budget_capped/truncated_for_budget
+    # fields (absent from the plain-array/simple-truncated checks above)
+    # are rejected too, not just the per-hit degraded stamp.
+    hits = [{"id": f"n{i}"} for i in range(100)]
+    row = {
+        "ok": True,
+        "result": {
+            "results": hits,
+            "candidates": {"vector_candidates_per_model": []},
+            "budget_capped": True,
+            "truncated_for_budget": 3,
+        },
+    }
+    ok, msg = _expect_runtimeerror(
+        _validate_recall_row, {"query_id": "q-budget-capped-verbose"}, row, 100
+    )
+    _record(failures, "verbose-envelope-budget-capped-rejected", ok, msg)
+
+    # 15. residual TOCTOU window (verified_scratch_path/VerifiedScratchPath):
+    # neither sqlite3.connect nor the kkernel subprocess accepts a
+    # descriptor, so a swap landing between verification and the consumer's
+    # own path-based open cannot be prevented from here — this arm
+    # demonstrates both accepted halves: (a) a path-only "consumer" opening
+    # the verified path after the swap observes the substituted content
+    # (the residual window itself), and (b) `.recheck()`, called after that
+    # consumption, still detects the swap and fails the run rather than
+    # silently trusting output produced against substituted content.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        root_fd = open_scratch_root_fd(root)
+        try:
+            _claim_scratch_file(root_fd, "claimed.txt")
+            vp = verified_scratch_path(root, root_fd, "claimed.txt")
+            victim = Path(td) / "victim.txt"
+            victim.write_text("swapped-after-verify")
+            claimed_path = root / "claimed.txt"
+            claimed_path.unlink()
+            claimed_path.symlink_to(victim)
+            consumed = claimed_path.read_text()
+            window_exists = consumed == "swapped-after-verify"
+            ok, msg = _expect_systemexit(vp.recheck)
+            if not window_exists:
+                ok, msg = False, "consumer did not observe the swapped content"
+            _record(failures, "post-verify-swap-window-detected-by-recheck", ok, msg)
+        finally:
+            os.close(root_fd)
+
+    # 16. a real (non-symlink) foreign directory renamed onto the tracked
+    # "home" name after `init_scratch_dirs` recorded its identity is refused
+    # at cleanup rather than recursed into — same filesystem as the scratch
+    # root, so a bare st_dev check alone would not catch this; the recorded
+    # (device, inode) manifest is what catches it.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        root_fd = open_scratch_root_fd(root)
+        try:
+            known = init_scratch_dirs(root_fd)
+            foreign = Path(td) / "foreign"
+            foreign.mkdir()
+            (foreign / "victim.txt").write_text("do not touch")
+            os.rmdir("home", dir_fd=root_fd)
+            os.rename(str(foreign), str(root / "home"))
+            ok, msg = _expect_systemexit(cleanup_scratch, root, root_fd, known)
+            _record(failures, "home-dir-substitution-not-recursed", ok, msg)
+            if not (root / "home" / "victim.txt").exists():
+                failures.append(
+                    "home-dir-substitution-not-recursed: victim content was deleted"
+                )
+        finally:
+            os.close(root_fd)
+
+    # 17. the scratch root itself is renamed aside and replaced with a fresh
+    # empty directory at the same path just before the final rmdir; cleanup
+    # must refuse to rmdir the replacement (parent-fd-relative rmdir with an
+    # identity recheck, not a bare `os.rmdir(root)` pathname call).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        root_fd = open_scratch_root_fd(root)
+        try:
+            known = init_scratch_dirs(root_fd)
+            os.rmdir("home", dir_fd=root_fd)
+            os.rmdir("tmp", dir_fd=root_fd)
+            root.rename(Path(td) / "root-moved-aside")
+            replacement = root
+            replacement.mkdir()
+            ok, msg = _expect_systemexit(cleanup_scratch, root, root_fd, known)
+            _record(failures, "root-replacement-not-rmdir", ok, msg)
+            if not replacement.is_dir():
+                failures.append(
+                    "root-replacement-not-rmdir: replacement directory was deleted"
+                )
+        finally:
+            os.close(root_fd)
+
+    # 18. `_ambient_symlink` only tolerates the exact known macOS firmlink
+    # prefixes (/tmp, /var, /etc); an arbitrary prefix is rejected outright,
+    # before it would ever reach the realpath comparison — the reviewer's
+    # probe used a matching /opt/attacker/tmp -> /private/opt/attacker/tmp
+    # realpath mapping, which this harness cannot reproducibly fake without
+    # root, but the prefix gate rejects the path regardless of what
+    # realpath would return, which is exactly what closes that probe.
+    ok = _ambient_symlink(Path("/opt/attacker/tmp")) is False
+    _record(
+        failures,
+        "ambient-symlink-arbitrary-prefix-rejected",
+        ok,
+        "arbitrary /opt prefix was accepted as an ambient /private mapping",
+    )
+
     if failures:
         print(f"\nSELF-TEST FAILED ({len(failures)}):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("\nSELF-TEST PASSED (11 checks)")
+    print("\nSELF-TEST PASSED (18 checks)")
     return 0
 
 
@@ -955,14 +1357,21 @@ def main() -> int:
         db_path = root / "eval.db"
         _reject_existing_scratch_db(db_path)
         _claim_scratch_file(root_fd, "eval.db")
-        env = scratch_env(root, db_path)
+        known_children = init_scratch_dirs(root_fd)
+        home_vp = verified_scratch_path(root, root_fd, "home")
+        tmp_vp = verified_scratch_path(root, root_fd, "tmp")
+        env = scratch_env(home_vp.path, tmp_vp.path, db_path)
+        home_vp.recheck()
+        tmp_vp.recheck()
 
         try:
+            migrate_vp = verified_scratch_path(root, root_fd, "eval.db")
             run_kkernel(
                 args.kkernel,
-                ["db", "migrate", "--db", verified_scratch_path(root, root_fd, "eval.db")],
+                ["db", "migrate", "--db", migrate_vp.path],
                 env,
             )
+            migrate_vp.recheck()
             queries = generate_corpus.parse_queries(args.queries)
             notes = seed_corpus(args.kkernel, env, root, root_fd, args.seed, args.epoch)
             key_to_id = key_id_map(root, root_fd)
@@ -983,7 +1392,7 @@ def main() -> int:
             ]
         finally:
             if not args.keep_scratch:
-                cleanup_scratch(root, root_fd)
+                cleanup_scratch(root, root_fd, known_children)
     finally:
         os.close(root_fd)
 
