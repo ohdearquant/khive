@@ -45,7 +45,7 @@
 
 .backdrop {
   align-items: flex-start;
-  background: color-mix(in srgb, var(--repo-navy) 42%, transparent);
+  background: color-mix(in srgb, var(--repo-navy) 42%, var(--khive-color-transparent));
   display: flex;
   inset: 0;
   justify-content: center;
@@ -94,7 +94,7 @@
 
 .close {
   align-items: center;
-  background: transparent;
+  background: var(--khive-color-transparent);
   border: 0;
   border-radius: 7px;
   color: var(--repo-muted);
@@ -133,7 +133,7 @@
 }
 
 .search input {
-  background: transparent;
+  background: var(--khive-color-transparent);
   border: 0;
   color: var(--repo-navy);
   flex: 1 1 auto;
@@ -167,8 +167,8 @@
 
 .result {
   align-items: center;
-  background: transparent;
-  border: 1px solid transparent;
+  background: var(--khive-color-transparent);
+  border: 1px solid var(--khive-color-transparent);
   border-radius: 9px;
   color: inherit;
   cursor: pointer;
