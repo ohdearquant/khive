@@ -25,10 +25,31 @@ for (const source of [
     context,
     page,
   }) => {
+    const consoleErrors: string[] = [];
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text());
+    });
     await context.grantPermissions(
       ["clipboard-read", "clipboard-write"],
       { origin: "http://127.0.0.1:3017" },
     );
+    await page.route(/\/api\/showcase\/analyses\/?$/, async (route) => {
+      if (source.id === "curated-static-fallback") {
+        await route.fulfill({ status: 404 });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          schema_version: "khive.showcase.catalog.v1",
+          entries: [{
+            analysis_id: "khive",
+            canonical_url: "https://github.com/ohdearquant/khive",
+          }],
+        }),
+      });
+    });
     await page.route("**/api/showcase/analyses/khive", async (route) => {
       if (source.id === "curated-static-fallback") {
         await route.fulfill({ status: 404 });
@@ -64,6 +85,9 @@ for (const source of [
     expect(copied).toContain(
       "Verify at the recorded full SHA: inspect the named source paths",
     );
+    expect(consoleErrors).toEqual(source.id === "khive-db-snapshot"
+      ? []
+      : [expect.stringMatching(/failed to load resource.*404/i)]);
   });
 }
 
@@ -71,6 +95,9 @@ test("dogfoods every repository analysis from the curated static bundle", async 
   const consoleErrors: string[] = [];
   page.on("console", (message) => {
     if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  await page.route(/\/api\/showcase\/analyses\/?$/, async (route) => {
+    await route.fulfill({ status: 404 });
   });
   await page.route("**/api/showcase/analyses/khive", async (route) => {
     await route.fulfill({ status: 404 });
