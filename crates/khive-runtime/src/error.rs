@@ -278,6 +278,12 @@ pub enum RuntimeError {
     #[error("fusion: {0}")]
     Fusion(#[from] khive_fusion::FuseError),
 
+    /// `FusionStrategy::Custom { name, .. }` named a strategy no pack has
+    /// registered via `KhiveRuntime::register_fusion_strategy` (ADR-012).
+    /// Fails closed — never falls back to RRF or any other default.
+    #[error("unknown fusion strategy: {0}")]
+    UnknownFusionStrategy(String),
+
     #[error("internal: {0}")]
     Internal(String),
 
@@ -469,6 +475,7 @@ impl RuntimeError {
             Self::Embedding(_) => "Embedding",
             Self::Ambiguous(_) => "Ambiguous",
             Self::Fusion(_) => "Fusion",
+            Self::UnknownFusionStrategy(_) => "UnknownFusionStrategy",
             Self::Internal(_) => "Internal",
             Self::GuardedWriteFailed(_) => "GuardedWriteFailed",
             Self::MissingPackDependency(_) => "MissingPackDependency",

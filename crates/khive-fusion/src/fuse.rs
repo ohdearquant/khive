@@ -3,7 +3,6 @@
 use khive_score::DeterministicScore;
 use std::hash::Hash;
 
-use super::registry::{FusionRegistry, UnknownFusionStrategy};
 use super::rrf::reciprocal_rank_fusion;
 use super::strategy::FusionStrategy;
 use super::union::union_fusion;
@@ -12,7 +11,10 @@ use super::weighted::weighted_fusion;
 /// Fuse ranked sources and retain at most `top_k` results.
 ///
 /// RRF, weighted, and union results sort by score then ID; pass-through modes preserve source
-/// order. Custom strategies return [`FuseError::CustomRequiresRuntime`]. See
+/// order. `Custom` strategies are the openness mechanism ADR-012 (§`FusionStrategy`) reserves for
+/// runtime-registered executors: this crate has no runtime context to dispatch them, so `fuse`
+/// returns [`FuseError::CustomRequiresRuntime`] and the caller (`khive-runtime`'s
+/// `KhiveRuntime::register_fusion_strategy`/dispatch boundary) resolves the name instead. See
 /// `crates/khive-fusion/docs/api/fusion-functions.md`.
 pub fn fuse<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
@@ -37,35 +39,6 @@ pub fn fuse<Id: Eq + Hash + Clone + Ord>(
     Ok(fused.into_iter().take(top_k).collect())
 }
 
-/// Like [`fuse`], but dispatches `FusionStrategy::Custom` through `registry`
-/// by name instead of returning [`FuseError::CustomRequiresRuntime`]. Every
-/// other strategy behaves identically to [`fuse`] -- registering a custom
-/// strategy never changes the default (non-Custom) dispatch path.
-///
-/// An unregistered `name` fails closed with
-/// [`FuseError::UnknownCustomStrategy`] rather than silently falling back to
-/// RRF or any other default.
-pub fn fuse_with_registry<Id: Eq + Hash + Clone + Ord>(
-    sources: Vec<Vec<(Id, DeterministicScore)>>,
-    strategy: &FusionStrategy,
-    top_k: usize,
-    registry: &FusionRegistry<Id>,
-) -> Result<Vec<(Id, DeterministicScore)>, FuseError> {
-    if sources.is_empty() || top_k == 0 {
-        return Ok(Vec::new());
-    }
-
-    let FusionStrategy::Custom { name, params } = strategy else {
-        return fuse(sources, strategy, top_k);
-    };
-
-    let fused = registry
-        .dispatch(name, sources, params)
-        .map_err(|UnknownFusionStrategy(name)| FuseError::UnknownCustomStrategy(name))?;
-
-    Ok(fused.into_iter().take(top_k).collect())
-}
-
 /// Select a single source by index, treating a lone source as authoritative
 /// regardless of the requested index (e.g. vector-only search with no keyword source).
 fn passthrough_source<Id>(
@@ -82,11 +55,9 @@ fn passthrough_source<Id>(
 /// Error from the [`fuse`] entry point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FuseError {
-    /// Custom strategies must be dispatched through the runtime registry.
+    /// `Custom` strategies must be dispatched through a runtime's registered
+    /// `FusionExecutor` (ADR-012) -- this crate has no runtime context.
     CustomRequiresRuntime(String),
-    /// [`fuse_with_registry`] was called with a `Custom` name that has no
-    /// registration in the supplied [`FusionRegistry`].
-    UnknownCustomStrategy(String),
 }
 
 impl std::fmt::Display for FuseError {
@@ -95,12 +66,9 @@ impl std::fmt::Display for FuseError {
             Self::CustomRequiresRuntime(name) => {
                 write!(
                     f,
-                    "custom strategy '{}' requires runtime FusionRegistry dispatch",
+                    "custom strategy '{}' requires runtime FusionExecutor dispatch",
                     name
                 )
-            }
-            Self::UnknownCustomStrategy(name) => {
-                write!(f, "no fusion strategy registered under name '{}'", name)
             }
         }
     }
@@ -240,62 +208,5 @@ mod tests {
             result.unwrap_err(),
             FuseError::CustomRequiresRuntime("decay_weighted".to_string())
         );
-    }
-
-    fn reverse_order_fusion(
-        sources: Vec<Vec<(&'static str, DeterministicScore)>>,
-        _params: &serde_json::Value,
-    ) -> Vec<(&'static str, DeterministicScore)> {
-        let mut flat: Vec<_> = sources.into_iter().flatten().collect();
-        flat.reverse();
-        flat
-    }
-
-    #[test]
-    fn fuse_with_registry_dispatches_custom_and_differs_from_rrf() {
-        let source = make_results(vec![("doc_a", 0.9), ("doc_b", 0.5), ("doc_c", 0.1)]);
-        let mut registry: FusionRegistry<&'static str> = FusionRegistry::new();
-        registry.register("reverse", reverse_order_fusion);
-        let strategy =
-            FusionStrategy::try_custom("reverse".to_string(), serde_json::Value::Null).unwrap();
-
-        let custom = fuse_with_registry(vec![source.clone()], &strategy, 10, &registry).unwrap();
-        let rrf = fuse(vec![source], &FusionStrategy::rrf(), 10).unwrap();
-
-        let custom_ids: Vec<_> = custom.iter().map(|(id, _)| *id).collect();
-        let rrf_ids: Vec<_> = rrf.iter().map(|(id, _)| *id).collect();
-        assert_eq!(custom_ids, vec!["doc_c", "doc_b", "doc_a"]);
-        assert_eq!(rrf_ids, vec!["doc_a", "doc_b", "doc_c"]);
-        assert_ne!(
-            custom_ids, rrf_ids,
-            "custom and RRF must yield different orderings on this fixture"
-        );
-    }
-
-    #[test]
-    fn fuse_with_registry_unknown_name_fails_closed() {
-        let source = make_results(vec![("doc_a", 0.9)]);
-        let registry: FusionRegistry<&'static str> = FusionRegistry::new();
-        let strategy =
-            FusionStrategy::try_custom("nonexistent".to_string(), serde_json::Value::Null).unwrap();
-
-        let result = fuse_with_registry(vec![source], &strategy, 10, &registry);
-        assert_eq!(
-            result.unwrap_err(),
-            FuseError::UnknownCustomStrategy("nonexistent".to_string())
-        );
-    }
-
-    #[test]
-    fn fuse_with_registry_default_path_unaffected_by_registered_custom() {
-        let source = make_results(vec![("doc_a", 0.9), ("doc_b", 0.5)]);
-        let mut registry: FusionRegistry<&'static str> = FusionRegistry::new();
-        registry.register("reverse", reverse_order_fusion);
-
-        let via_registry =
-            fuse_with_registry(vec![source.clone()], &FusionStrategy::rrf(), 10, &registry)
-                .unwrap();
-        let via_default = fuse(vec![source], &FusionStrategy::rrf(), 10).unwrap();
-        assert_eq!(via_registry, via_default);
     }
 }

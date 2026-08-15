@@ -41,8 +41,10 @@ for (id, score) in &fused {
 `fuse` dispatches on `strategy`: `Rrf` and `Union`/`VectorOnly`/`KeywordOnly` are
 computed inline via `reciprocal_rank_fusion`/`union_fusion`; `Weighted` goes
 through `weighted_fusion`. `Custom` strategies return
-`FuseError::CustomRequiresRuntime` — they are dispatched by a runtime's fusion
-registry, which this crate does not implement.
+`FuseError::CustomRequiresRuntime` — per [ADR-012](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-012-retrieval-composition.md),
+they are registered and dispatched through `khive-runtime`'s
+`KhiveRuntime::register_fusion_strategy`/`FusionExecutor` trait, which this
+crate has no runtime context to implement.
 
 RRF's score is rank-based and ignores the input scores entirely:
 `score(d) = sum(1 / (k + rank_i(d)))` across every source that ranks `d`, with

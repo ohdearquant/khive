@@ -3962,7 +3962,7 @@ impl KhiveRuntime {
         // `candidates` here would drop a high-salience note ranked just outside
         // the raw RRF cutoff before salience ever applied.
         let fuse_k = text_hits.len() + vector_hits.len();
-        let fused = crate::fusion::rrf_fuse_k(text_hits, vector_hits, RRF_K, fuse_k)?;
+        let fused = crate::fusion::rrf_fuse_k(self, text_hits, vector_hits, RRF_K, fuse_k).await?;
 
         let candidate_ids: Vec<Uuid> = fused.iter().map(|hit| hit.entity_id).collect();
         if candidate_ids.is_empty() {
