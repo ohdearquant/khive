@@ -11,7 +11,10 @@ use super::weighted::weighted_fusion;
 /// Fuse ranked sources and retain at most `top_k` results.
 ///
 /// RRF, weighted, and union results sort by score then ID; pass-through modes preserve source
-/// order. Custom strategies return [`FuseError::CustomRequiresRuntime`]. See
+/// order. `Custom` strategies are the openness mechanism ADR-012 (§`FusionStrategy`) reserves for
+/// runtime-registered executors: this crate has no runtime context to dispatch them, so `fuse`
+/// returns [`FuseError::CustomRequiresRuntime`] and the caller (`khive-runtime`'s
+/// `KhiveRuntime::register_fusion_strategy`/dispatch boundary) resolves the name instead. See
 /// `crates/khive-fusion/docs/api/fusion-functions.md`.
 pub fn fuse<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
@@ -52,7 +55,8 @@ fn passthrough_source<Id>(
 /// Error from the [`fuse`] entry point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FuseError {
-    /// Custom strategies must be dispatched through the runtime registry.
+    /// `Custom` strategies must be dispatched through a runtime's registered
+    /// `FusionExecutor` (ADR-012) -- this crate has no runtime context.
     CustomRequiresRuntime(String),
 }
 
@@ -62,7 +66,7 @@ impl std::fmt::Display for FuseError {
             Self::CustomRequiresRuntime(name) => {
                 write!(
                     f,
-                    "custom strategy '{}' requires runtime FusionRegistry dispatch",
+                    "custom strategy '{}' requires runtime FusionExecutor dispatch",
                     name
                 )
             }

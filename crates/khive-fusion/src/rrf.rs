@@ -1,9 +1,10 @@
 //! Reciprocal Rank Fusion (RRF) algorithm.
 
 use khive_score::{rrf_score, DeterministicScore};
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+
+use crate::ordering::cmp_desc_then_id;
 
 /// Fuse score-descending sources by `sum 1/(max(k, 1) + one_based_rank)`.
 ///
@@ -43,12 +44,7 @@ pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
 
     let mut fused: Vec<(Id, DeterministicScore)> = combined.into_iter().collect();
 
-    fused.sort_by(
-        |(id_a, score_a), (id_b, score_b)| match score_b.cmp(score_a) {
-            Ordering::Equal => id_a.cmp(id_b),
-            other => other,
-        },
-    );
+    fused.sort_by(cmp_desc_then_id);
 
     fused
 }
