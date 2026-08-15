@@ -165,8 +165,10 @@ impl KnowledgeHandlers {
                         // untouched when not finalizing. finalized=COALESCE(?7, finalized)
                         // preserves the existing flag when the caller omits it; SQLite's
                         // `NULL = 1` evaluates to NULL (falsy), so an omitted field also
-                        // leaves the status CASE on its ELSE branch.
-                        sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=?5, source_type=?6, finalized=COALESCE(?7, finalized), status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
+                        // leaves the status CASE on its ELSE branch. source_uri/source_type
+                        // use the same COALESCE shape so an omitted field preserves the
+                        // existing attribution instead of clobbering it with NULL.
+                        sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=COALESCE(?5, source_uri), source_type=COALESCE(?6, source_type), finalized=COALESCE(?7, finalized), status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
                         params: vec![
                             SqlValue::Text(atom_in.name.clone()),
                             SqlValue::Text(content.clone()),
