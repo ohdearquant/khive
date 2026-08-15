@@ -86,7 +86,7 @@
   width: 16px;
 }
 .searchControl input {
-  background: transparent;
+  background: var(--khive-color-transparent);
   border: 0;
   min-width: 0;
   outline: 0;
@@ -217,7 +217,7 @@
 
 .moduleButton {
   align-items: center;
-  background: transparent;
+  background: var(--khive-color-transparent);
   border: 0;
   cursor: pointer;
   display: flex;
@@ -230,7 +230,7 @@
 
 .moduleButton:hover,
 .moduleButton[aria-pressed="true"] {
-  background: color-mix(in srgb, var(--repo-green) 8%, transparent);
+  background: color-mix(in srgb, var(--repo-green) 8%, var(--khive-color-transparent));
 }
 .moduleButton > svg {
   color: var(--repo-muted);
@@ -281,7 +281,7 @@
 }
 .resultHeading {
   align-items: center;
-  background: color-mix(in srgb, var(--repo-green) 5%, transparent);
+  background: color-mix(in srgb, var(--repo-green) 5%, var(--khive-color-transparent));
   border-bottom: 1px solid var(--repo-border);
   display: flex;
   font-size: 10px;
@@ -289,7 +289,7 @@
   padding: 8px 14px;
 }
 .resultHeading button {
-  background: transparent;
+  background: var(--khive-color-transparent);
   border: 0;
   color: var(--repo-green);
   cursor: pointer;
@@ -406,7 +406,7 @@
 }
 .signalActions button {
   align-items: center;
-  background: transparent;
+  background: var(--khive-color-transparent);
   border: 1px solid var(--repo-border);
   border-radius: 6px;
   color: var(--repo-muted);
@@ -549,7 +549,7 @@
 .relationships button,
 .inspectorSection li > button,
 .memberLinks button {
-  background: transparent;
+  background: var(--khive-color-transparent);
   border: 0;
   color: var(--repo-muted);
   cursor: pointer;
