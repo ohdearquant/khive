@@ -879,10 +879,10 @@ class MakefileGateContractTests(unittest.TestCase):
         expanded: list[str] = []
         for cmd in commands:
             cmd = cmd.lstrip("@")
-            # Variable values may themselves reference variables
-            # (LOCAL_VERIFY_STAMP is built from LOCAL_BUILD_RECEIPT), so expand
-            # to a fixpoint. A single pass leaves a stray `$(NAME)` that the
-            # shell then reads as command substitution.
+            # Variable values may themselves reference other plain `:=`
+            # variables, so expand to a fixpoint. A single pass leaves a
+            # stray `$(NAME)` that the shell then reads as command
+            # substitution.
             for _ in range(10):
                 before = cmd
                 for name, value in variables.items():
@@ -1176,7 +1176,9 @@ class MakefileGateContractTests(unittest.TestCase):
 
         local_recipe = self.makefile[self.makefile.index("local: verify-local-artifact") :]
         self.assertNotIn("cargo build", local_recipe)
-        stamp_check = local_recipe.index('--inspect-stamp "$$LOCAL_VERIFY_STAMP_VALUE"')
+        stamp_check = local_recipe.index(
+            '--inspect-stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified"'
+        )
         assignments = local_recipe.index('eval "$$VERIFIED_ASSIGNMENTS"')
         hash_check = local_recipe.index(
             'if [ "$$VERIFIED_SHA256" != "$$SRC_SHA256" ]'
@@ -1215,15 +1217,18 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertNotIn("pkill", fleet_check)
 
     def test_recipes_never_splice_caller_controlled_vars_as_make_refs(self) -> None:
-        """FULL_PACKS, LOCAL_VERB_FLOOR, LOCAL_BUILD_RECEIPT, LOCAL_VERIFY_STAMP,
-        and CARGO must reach recipe shell text only via the `$$<VAR>_VALUE`
-        environment path, never as a raw `$(VAR)` splice — that splice is the
-        shell-injection surface this contract guards against regressing."""
+        """FULL_PACKS, LOCAL_VERB_FLOOR, LOCAL_BUILD_RECEIPT, and CARGO must
+        reach recipe shell text only via the `$$<VAR>_VALUE` environment
+        path, never as a raw `$(VAR)` splice — that splice is the
+        shell-injection surface this contract guards against regressing.
+        The verification stamp path must never be its own Make-level `:=`
+        variable at all (that eager derivation is exactly the defect this
+        test suite closed): it is computed in the shell from
+        `$${LOCAL_BUILD_RECEIPT_VALUE}` at recipe-execution time."""
         forbidden = (
             "$(FULL_PACKS)",
             "$(LOCAL_VERB_FLOOR)",
             "$(LOCAL_BUILD_RECEIPT)",
-            "$(LOCAL_VERIFY_STAMP)",
             "$(CARGO)",
         )
         recipe_lines = [
@@ -1239,6 +1244,36 @@ class MakefileGateContractTests(unittest.TestCase):
                 f"{token} was spliced directly into recipe shell text; it must "
                 "be passed through the environment as $$<VAR>_VALUE instead",
             )
+
+        self.assertNotRegex(
+            self.makefile,
+            r"(?m)^\s*LOCAL_VERIFY_STAMP\s*(:=|\?=)",
+            "LOCAL_VERIFY_STAMP must not exist as a Make-level variable — its "
+            "`:=` RHS is expanded at parse time, before the literal-capture "
+            "block runs, so a receipt path containing a literal `$` gets "
+            "macro-expanded and a `$(shell ...)` receipt value executes "
+            "during parsing (even under `make -n`)",
+        )
+
+        # The exact sweep the fix must pass: no caller-controlled Makefile
+        # variable is eagerly `:=`/`?=`-derived via a raw `$(VAR)` splice.
+        # The only lines with this shape are the literal-capture
+        # `override *_VALUE := $(value VAR)` lines, whose `$(value ...)`
+        # form performs no expansion and is therefore excluded by the
+        # pattern (it requires `$(` immediately followed by the bare
+        # variable name, not `$(value `).
+        sweep = re.findall(
+            r"^.*(?::=|\?=).*\$\((?:LOCAL_BUILD_RECEIPT|LOCAL_VERB_FLOOR"
+            r"|FULL_PACKS|FLEET_ARTIFACT|CARGO)\).*$",
+            self.makefile,
+            re.M,
+        )
+        self.assertEqual(
+            sweep,
+            [],
+            "found eager Make-level expansion of a caller-controlled "
+            f"variable: {sweep!r}",
+        )
 
         fleet_build = subprocess.run(
             ["make", "--no-print-directory", "-n", "fleet-build"],
@@ -1378,6 +1413,110 @@ class MakefileGateContractTests(unittest.TestCase):
                 "FLEET_ARTIFACT was expanded as a GNU Make function",
             )
 
+    def test_verify_stamp_path_is_derived_from_the_literal_receipt_value(
+        self,
+    ) -> None:
+        """The verification stamp path must equal `<receipt-as-given>.verified`
+        even when the receipt path contains a literal `$` byte. Before the
+        fix, `LOCAL_VERIFY_STAMP := $(LOCAL_BUILD_RECEIPT).verified` was a
+        Make-level `:=` derivation, so a `$` in the receipt path was
+        macro-expanded (e.g. as a one-letter Make variable reference) rather
+        than treated as literal text, and the derived stamp no longer
+        matched the receipt the build actually wrote. Deriving the stamp in
+        the shell from the already-captured `LOCAL_BUILD_RECEIPT_VALUE` env
+        value makes a literal `$` inert data on this path."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "build_local_artifact.py").write_text(
+                "raise SystemExit(0)\n", encoding="utf-8"
+            )
+            record = root / "verify-argv.json"
+            (root / "scripts" / "verify_local_artifact.py").write_text(
+                textwrap.dedent(
+                    f"""\
+                    import json
+                    import sys
+                    with open({str(record)!r}, "w", encoding="utf-8") as fh:
+                        json.dump(sys.argv[1:], fh)
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            # A receipt path containing a literal `$X` sequence — under the
+            # pre-fix Make-level `:=` derivation, `$X` is a one-letter Make
+            # variable reference (expanding to empty, since `X` is unset),
+            # silently corrupting the derived stamp path.
+            receipt = str(root / "state" / "bui$Xld.json")
+
+            completed = subprocess.run(
+                [
+                    "make",
+                    "--no-print-directory",
+                    "-f",
+                    str(MAKEFILE),
+                    "verify-local-artifact",
+                    f"LOCAL_BUILD_RECEIPT={receipt}",
+                    f"FULL_PACKS={TEST_PACKS}",
+                    "LOCAL_VERB_FLOOR=3",
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertTrue(
+                record.is_file(),
+                f"verify_local_artifact.py stub never ran\n"
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            argv = json.loads(record.read_text(encoding="utf-8"))
+            stamp_index = argv.index("--stamp")
+            self.assertEqual(
+                argv[stamp_index + 1],
+                f"{receipt}.verified",
+                "the derived stamp path must equal the literal receipt path "
+                "plus '.verified', with no Make-level expansion of `$` bytes "
+                f"in the receipt path; full argv: {argv!r}",
+            )
+
+    def test_receipt_path_shell_payload_never_executes_at_make_parse_time(
+        self,
+    ) -> None:
+        """A hostile `LOCAL_BUILD_RECEIPT='$(shell ...)'` value must never
+        execute, even under `make -n` (which runs no recipes at all). Before
+        the fix, `LOCAL_VERIFY_STAMP := $(LOCAL_BUILD_RECEIPT).verified` was
+        a Make-level `:=` assignment, whose RHS Make expands immediately at
+        PARSE time — before any recipe (real or dry-run) is considered — so
+        a `$(shell ...)` payload in the receipt path ran as soon as Make
+        parsed the Makefile with that override on the command line."""
+        pwned = Path(tempfile.gettempdir()) / "pr1809_r4_pwned"
+        pwned.unlink(missing_ok=True)
+        self.addCleanup(lambda: pwned.unlink(missing_ok=True))
+
+        completed = subprocess.run(
+            [
+                "make",
+                "--no-print-directory",
+                "-n",
+                "fleet-check",
+                f"LOCAL_BUILD_RECEIPT=$(shell touch {pwned})",
+                f"FULL_PACKS={TEST_PACKS}",
+                "LOCAL_VERB_FLOOR=3",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertFalse(
+            pwned.exists(),
+            "a $(shell ...) payload in LOCAL_BUILD_RECEIPT executed during "
+            "Makefile parsing (even under `make -n`, which runs no "
+            f"recipes)\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+
     def test_broken_pack_registration_fails_fleet_build_before_install_or_daemon_stop(
         self,
     ) -> None:
@@ -1424,7 +1563,6 @@ class MakefileGateContractTests(unittest.TestCase):
                     "fleet-build",
                     f"CARGO={fake_cargo}",
                     f"LOCAL_BUILD_RECEIPT={receipt}",
-                    f"LOCAL_VERIFY_STAMP={receipt}.verified",
                     f"FULL_PACKS={TEST_PACKS}",
                     "LOCAL_VERB_FLOOR=3",
                 ],
@@ -1553,7 +1691,9 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertIn("scripts/verify_local_artifact.py", self.makefile)
         self.assertIn('--build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE"', self.makefile)
         self.assertIn('--min-verbs "$$LOCAL_VERB_FLOOR_VALUE"', self.makefile)
-        self.assertIn('--stamp "$$LOCAL_VERIFY_STAMP_VALUE"', self.makefile)
+        self.assertIn(
+            '--stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified"', self.makefile
+        )
         self.assertNotIn("LOCAL_ARTIFACT", self.makefile)
         self.assertNotIn("/release/kkernel", self.makefile)
         self.assertIn(

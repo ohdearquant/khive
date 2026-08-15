@@ -6,7 +6,6 @@ FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,b
 LOCAL_VERB_FLOOR := 90
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
-LOCAL_VERIFY_STAMP := $(LOCAL_BUILD_RECEIPT).verified
 FLEET_ARTIFACT ?=
 # Every variable below can be overridden on the command line (`make VAR=...`)
 # and plain `:=`/`?=` loses to command-line assignments. Make performs no
@@ -17,10 +16,13 @@ FLEET_ARTIFACT ?=
 # the environment instead of shell source — recipes read `$$<VAR>_VALUE`,
 # never `$(VAR)`. `FULL_PACKS` and `LOCAL_VERB_FLOOR` are additionally gated
 # by `validate-make-inputs` so a hostile value is rejected before it reaches
-# a shell at all; the path/tool variables (LOCAL_BUILD_RECEIPT,
-# LOCAL_VERIFY_STAMP, CARGO) need no character allowlist — the env-value pass
-# alone removes the shell-parse surface — but must never be re-spliced as
-# `$(VAR)` into recipe shell text.
+# a shell at all; the path/tool variables (LOCAL_BUILD_RECEIPT, CARGO) need no
+# character allowlist — the env-value pass alone removes the shell-parse
+# surface — but must never be re-spliced as `$(VAR)` into recipe shell text.
+# The verification stamp path is likewise never a `:=` derivation — it is
+# `"$${LOCAL_BUILD_RECEIPT_VALUE}.verified"`, computed by the shell at recipe
+# time from the already-captured env value, so a literal `$` in the receipt
+# path is inert data and no `$(shell ...)` payload can run during parsing.
 override FLEET_ARTIFACT_VALUE := $(value FLEET_ARTIFACT)
 unexport FLEET_ARTIFACT
 export FLEET_ARTIFACT_VALUE
@@ -33,13 +35,6 @@ export LOCAL_VERB_FLOOR_VALUE
 override LOCAL_BUILD_RECEIPT_VALUE := $(value LOCAL_BUILD_RECEIPT)
 unexport LOCAL_BUILD_RECEIPT
 export LOCAL_BUILD_RECEIPT_VALUE
-# LOCAL_VERIFY_STAMP is derived from LOCAL_BUILD_RECEIPT above; by the time
-# this line runs, `$(LOCAL_BUILD_RECEIPT)` already reflects a command-line
-# override (command-line assignments win over the plain `:=` above), so the
-# derivation still tracks a caller-supplied receipt path.
-override LOCAL_VERIFY_STAMP_VALUE := $(value LOCAL_VERIFY_STAMP)
-unexport LOCAL_VERIFY_STAMP
-export LOCAL_VERIFY_STAMP_VALUE
 override CARGO_VALUE := $(value CARGO)
 unexport CARGO
 export CARGO_VALUE
@@ -99,7 +94,7 @@ verify-local-artifact: validate-make-inputs build-local
 		--build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE" \
 		--packs "$$FULL_PACKS_VALUE" \
 		--min-verbs "$$LOCAL_VERB_FLOOR_VALUE" \
-		--stamp "$$LOCAL_VERIFY_STAMP_VALUE"
+		--stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified"
 
 # Build and verify the release artifact without installing it or interrupting
 # the serving daemon. This compatibility name makes the build-only safety gate
@@ -167,7 +162,7 @@ hold-time-gate:
 local: verify-local-artifact
 	@if ! VERIFIED_ASSIGNMENTS=$$(python3 scripts/verify_local_artifact.py \
 	  --build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE" \
-	  --inspect-stamp "$$LOCAL_VERIFY_STAMP_VALUE" \
+	  --inspect-stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified" \
 	  --min-verbs "$$LOCAL_VERB_FLOOR_VALUE"); then \
 	  exit 1; \
 	fi; \
