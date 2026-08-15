@@ -2,10 +2,11 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
+import { repositoryLocationUrl } from "@/lib/repository-location";
 
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
 const showcaseSourcePath = resolve(process.cwd(), "src/components/showcase/repo-showcase.tsx");
@@ -20,6 +21,257 @@ function exactish(value: string): RegExp {
 }
 
 describe("repository showcase", () => {
+  beforeEach(() => {
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("restores and traverses a shareable module and analysis location", async () => {
+    const bundle = golden();
+    const pool = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/pool.rs")
+    )!;
+    const writer = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/writer_task.rs")
+    )!;
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: pool.source_path,
+      view: "dependency_topology",
+    });
+    window.history.replaceState(null, "", direct);
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    const inspector = within(
+      container.querySelector<HTMLElement>("[data-repository-triage]")!,
+    ).getByRole("complementary", { name: "Module evidence" });
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(
+        pool.source_path,
+      )
+    );
+    expect(
+      screen.getByRole("button", {
+        name: bundle.capability.views.dependency_topology.label,
+      }),
+    ).toHaveAttribute("aria-current", "page");
+    const breadcrumb = within(inspector).getByRole("navigation", {
+      name: "Investigation location",
+    });
+    expect(breadcrumb).toHaveTextContent(`${bundle.meta.repository.owner}/${bundle.meta.repository.name}`);
+    expect(breadcrumb).toHaveTextContent(pool.source_path);
+
+    const pushState = vi.spyOn(window.history, "pushState");
+    const search = screen.getByRole("searchbox", { name: "Find a module or path" });
+    await user.type(search, writer.source_path);
+    await user.click(screen.getByRole("button", { name: `Inspect ${writer.source_path}` }));
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(
+        writer.source_path,
+      )
+    );
+    expect(new URL(window.location.href).searchParams.get("module")).toBe(
+      writer.source_path,
+    );
+    expect(pushState).toHaveBeenCalledTimes(1);
+
+    const hiddenCoupling = screen.getByRole("button", {
+      name: bundle.capability.views.hidden_coupling.label,
+    });
+    await user.click(hiddenCoupling);
+    expect(new URL(window.location.href).searchParams.get("view")).toBe(
+      "hidden_coupling",
+    );
+    expect(pushState).toHaveBeenCalledTimes(2);
+    await user.click(hiddenCoupling);
+    expect(pushState).toHaveBeenCalledTimes(2);
+
+    window.history.replaceState(null, "", direct);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(
+        pool.source_path,
+      )
+    );
+    expect(
+      screen.getByRole("button", {
+        name: bundle.capability.views.dependency_topology.label,
+      }),
+    ).toHaveAttribute("aria-current", "page");
+    expect(
+      screen.getByRole("status", { name: "Investigation navigation" }),
+    ).toHaveTextContent(
+      `Restored ${bundle.capability.views.dependency_topology.label} for ${pool.source_path}.`,
+    );
+    expect(pushState).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps stale and missing deep-link evidence explicit and recoverable", async () => {
+    const bundle = golden();
+    const missingPath = "crates/not-captured/src/missing.rs";
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: "0000000000000000000000000000000000000000",
+      modulePath: missingPath,
+      view: "scorecard",
+    });
+    window.history.replaceState(null, "", direct);
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    expect(await screen.findByRole("status", { name: /investigation link/i }))
+      .toHaveTextContent(/requested snapshot.*is not loaded/i);
+    const inspector = container.querySelector<HTMLElement>("[data-module-inspector]")!;
+    expect(within(inspector).getByText(new RegExp(missingPath))).toBeVisible();
+    const recovery = within(inspector).getByRole("button", {
+      name: /open recommended module/i,
+    });
+    await user.click(recovery);
+
+    await waitFor(() =>
+      expect(new URL(window.location.href).searchParams.get("at")).toBe(
+        bundle.meta.snapshot.head_sha,
+      )
+    );
+    await waitFor(() => expect(inspector).toHaveFocus());
+    expect(new URL(window.location.href).searchParams.get("module")).not.toBe(
+      missingPath,
+    );
+  });
+
+  it("copies the normalized investigation link with visible feedback", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    render(<RepoShowcase bundle={golden()} />);
+
+    await waitFor(() =>
+      expect(new URL(window.location.href).searchParams.get("at")).not.toBeNull()
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Copy investigation link" }),
+    );
+
+    expect(writeText).toHaveBeenCalledWith(window.location.href);
+    expect(screen.getByText("Investigation link copied.")).toHaveAttribute(
+      "role",
+      "status",
+    );
+  });
+
+  it("preserves stale-link evidence when clipboard access fails", async () => {
+    const bundle = golden();
+    const staleSha = "0000000000000000000000000000000000000000";
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: staleSha,
+      modulePath: bundle.graph.modules.items[0].source_path,
+      view: "scorecard",
+    });
+    window.history.replaceState(null, "", direct);
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockRejectedValue(new Error("permission denied"));
+    writeText.mockClear();
+    const user = userEvent.setup();
+    render(<RepoShowcase bundle={bundle} />);
+
+    const notice = await screen.findByRole("status", {
+      name: "Investigation link status",
+    });
+    await user.click(
+      screen.getByRole("button", { name: "Copy investigation link" }),
+    );
+
+    expect(writeText).toHaveBeenCalledOnce();
+    expect(new URL(window.location.href).searchParams.get("at")).toBe(staleSha);
+    expect(notice).toBeVisible();
+    expect(screen.getByText("Investigation link could not be copied."))
+      .toHaveAttribute("role", "status");
+    await user.click(within(notice).getByRole("button", {
+      name: "Use current snapshot",
+    }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Copy investigation link" }))
+        .toHaveFocus()
+    );
+  });
+
+  it("does not roll navigation back when clipboard completion is delayed", async () => {
+    const bundle = golden();
+    let finishCopy: (() => void) | undefined;
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockImplementation(() => new Promise<void>((resolve) => {
+        finishCopy = resolve;
+      }));
+    writeText.mockClear();
+    const user = userEvent.setup();
+    render(<RepoShowcase bundle={bundle} />);
+    await waitFor(() =>
+      expect(new URL(window.location.href).searchParams.get("view"))
+        .toBe("structure_graph")
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Copy investigation link" }),
+    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.hidden_coupling.label,
+    }));
+    expect(new URL(window.location.href).searchParams.get("view"))
+      .toBe("hidden_coupling");
+
+    finishCopy?.();
+    expect(await screen.findByText("Investigation link copied."))
+      .toBeVisible();
+    expect(new URL(window.location.href).searchParams.get("view"))
+      .toBe("hidden_coupling");
+  });
+
+  it("labels generic repaired locations separately from stale snapshots", async () => {
+    const bundle = golden();
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent(bundle.meta.repository.canonical_url)}&at=${bundle.meta.snapshot.head_sha}&view=not-a-view`,
+    );
+    const user = userEvent.setup();
+    render(<RepoShowcase bundle={bundle} />);
+
+    const notice = await screen.findByRole("status", {
+      name: "Investigation link status",
+    });
+    expect(notice).toHaveTextContent("Investigation link was repaired");
+    expect(within(notice).queryByRole("button", { name: "Use current snapshot" }))
+      .not.toBeInTheDocument();
+    await user.click(within(notice).getByRole("button", { name: "Dismiss" }));
+    expect(notice).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Copy investigation link" }))
+        .toHaveFocus()
+    );
+  });
+
+  it("does not offer a no-op module recovery for a snapshot with no modules", async () => {
+    const bundle = structuredClone(golden());
+    bundle.graph.modules.items = [];
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent(bundle.meta.repository.canonical_url)}&at=${bundle.meta.snapshot.head_sha}&module=crates%2Fmissing.rs&view=scorecard`,
+    );
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+    const unavailable = await within(inspector).findByRole("status");
+    expect(unavailable).toHaveAttribute("data-state", "unavailable");
+    expect(unavailable).toHaveTextContent(/no captured modules/i);
+    expect(unavailable.querySelector("button")).toBeNull();
+  });
+
   it("answers repository triage questions before exposing the raw analysis views", async () => {
     const bundle = golden();
     const user = userEvent.setup();
@@ -294,7 +546,6 @@ describe("repository showcase", () => {
 
   it("keeps known-empty history distinct from unavailable and preserves available false", async () => {
     const bundle = structuredClone(golden());
-    const user = userEvent.setup();
     const first = bundle.graph.history_navigation.by_module.items[0];
     first.commits = {
       ...first.commits,
@@ -308,9 +559,25 @@ describe("repository showcase", () => {
       status: "available",
       value: false,
     };
+    const moduleNode = bundle.graph.modules.items.find((module) =>
+      module.id === first.module_id
+    )!;
+    window.history.replaceState(
+      null,
+      "",
+      repositoryLocationUrl(new URL(window.location.href), {
+        repository: bundle.meta.repository.canonical_url,
+        snapshotSha: bundle.meta.snapshot.head_sha,
+        modulePath: moduleNode.source_path,
+        view: "history_structure_navigation",
+      }),
+    );
 
     const { container } = render(<RepoShowcase bundle={bundle} />);
-    await user.click(container.querySelector('[data-view-id="history_structure_navigation"]')!);
+    await waitFor(() =>
+      expect(container.querySelector('[data-view-id="history_structure_navigation"]'))
+        .toHaveAttribute("aria-current", "page")
+    );
 
     const commits = container.querySelector<HTMLElement>("[data-history-commits]")!;
     expect(within(commits).getAllByText("0").length).toBeGreaterThan(0);

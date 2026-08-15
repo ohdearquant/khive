@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -20,7 +20,26 @@ const mockedLoad = vi.mocked(loadPreferredShowcaseBundle);
 describe("materialized repository lookup", () => {
   beforeEach(() => {
     window.history.replaceState(null, "", "/");
+    mockedLoad.mockClear();
     mockedLoad.mockResolvedValue({ bundle, source: "khive-db-snapshot" });
+  });
+
+  it("resolves the repository in a direct URL before loading the default", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent("https://github.com/example/not-curated")}&at=${bundle.meta.snapshot.head_sha}&module=crates%2Fexample%2Fsrc%2Flib.rs&view=scorecard`,
+    );
+
+    render(<Showcase />);
+
+    expect(
+      await screen.findByText("No curated showcase bundle matches this repository"),
+    ).toBeVisible();
+    expect(mockedLoad).not.toHaveBeenCalled();
+    expect(new URL(window.location.href).searchParams.get("repo")).toBe(
+      "https://github.com/example/not-curated",
+    );
   });
 
   it("normalizes a curated alias and performs no bundle load for a later miss", async () => {
@@ -50,6 +69,11 @@ describe("materialized repository lookup", () => {
     );
     expect(mockedLoad).toHaveBeenCalledTimes(1);
 
+    window.history.replaceState(
+      null,
+      "",
+      `${window.location.pathname}${window.location.search}&at=${bundle.meta.snapshot.head_sha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
+    );
     await user.clear(input);
     await user.type(input, "https://github.com/example/not-curated");
     await user.click(screen.getByRole("button", { name: bundle.capability.labels.lookup_action }));
@@ -60,10 +84,43 @@ describe("materialized repository lookup", () => {
     expect(empty).toBeVisible();
     expect(empty?.querySelectorAll("button")).toHaveLength(1);
     expect(window.location.search).toBe("");
+    expect(new URL(window.location.href).searchParams.get("at")).toBeNull();
+    expect(new URL(window.location.href).searchParams.get("module")).toBeNull();
+    expect(new URL(window.location.href).searchParams.get("view")).toBeNull();
     expect(mockedLoad).toHaveBeenCalledTimes(1);
 
     await user.click(screen.getByRole("button", { name: "Use the curated khive example" }));
     await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
     expect(mockedLoad).toHaveBeenCalledTimes(1);
   }, 15_000);
+
+  it("preserves a direct investigation while canonicalizing a curated alias", async () => {
+    const pool = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/pool.rs")
+    )!;
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent("http://github.com/ohdearquant/khive.git")}&at=${bundle.meta.snapshot.head_sha}&module=${encodeURIComponent(pool.source_path)}&view=dependency_topology`,
+    );
+
+    const { container } = render(<Showcase />);
+
+    const inspector = await screen.findByRole("complementary", {
+      name: "Module evidence",
+    });
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(
+        pool.source_path,
+      )
+    );
+    expect(container.querySelector('[data-view-id="dependency_topology"]'))
+      .toHaveAttribute("aria-current", "page");
+    expect(new URL(window.location.href).searchParams.get("repo")).toBe(
+      bundle.meta.repository.canonical_url,
+    );
+    expect(new URL(window.location.href).searchParams.get("module")).toBe(
+      pool.source_path,
+    );
+  });
 });

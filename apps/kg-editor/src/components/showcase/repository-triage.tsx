@@ -35,6 +35,11 @@ import styles from "./repository-triage.module.css";
 export type RepositoryTriageProps = Readonly<{
   bundle: RepoBundle;
   onOpenAnalysis: (view: ViewId) => void;
+  selectedModuleId: string | null;
+  onSelectModule: (moduleId: string) => void;
+  unresolvedModule: Readonly<{ path: string; reason: string }> | null;
+  onRecoverModule: () => void;
+  canRecoverModule: boolean;
 }>;
 
 function formatNumber(value: number): string {
@@ -157,6 +162,11 @@ function ModuleButton({
 export function RepositoryTriage({
   bundle,
   onOpenAnalysis,
+  selectedModuleId,
+  onSelectModule,
+  unresolvedModule,
+  onRecoverModule,
+  canRecoverModule,
 }: RepositoryTriageProps) {
   const brief = useMemo(() => buildRepositoryBrief(bundle), [bundle]);
   const labels = bundle.capability.labels;
@@ -167,10 +177,10 @@ export function RepositoryTriage({
       new Map(bundle.graph.modules.items.map((module) => [module.id, module])),
     [bundle.graph.modules.items],
   );
-  const initialModuleId = brief.startHere[0]?.moduleId ??
-    bundle.graph.modules.items[0]?.id ?? null;
-  const [selectedModuleId, setSelectedModuleId] = useState<string | null>(
-    initialModuleId,
+  const packageById = useMemo(
+    () =>
+      new Map(bundle.graph.packages.items.map((item) => [item.id, item])),
+    [bundle.graph.packages.items],
   );
   const inspectorRef = useRef<HTMLElement>(null);
   const [query, setQuery] = useState("");
@@ -184,8 +194,7 @@ export function RepositoryTriage({
     [bundle, query],
   );
 
-  function selectModule(moduleId: string) {
-    setSelectedModuleId(moduleId);
+  function focusInspector() {
     const inspector = inspectorRef.current;
     if (!inspector) return;
     inspector.focus({ preventScroll: true });
@@ -196,6 +205,11 @@ export function RepositoryTriage({
       behavior: reduceMotion ? "auto" : "smooth",
       block: "start",
     });
+  }
+
+  function selectModule(moduleId: string) {
+    onSelectModule(moduleId);
+    focusInspector();
   }
 
   function selectSignal(signal: RepositorySignal) {
@@ -500,6 +514,24 @@ export function RepositoryTriage({
                   <span>
                     <FileText aria-hidden="true" /> {moduleLabel} evidence
                   </span>
+                  <nav
+                    className={styles.breadcrumb}
+                    aria-label="Investigation location"
+                  >
+                    <span>
+                      {bundle.meta.repository.owner}/{bundle.meta.repository.name}
+                    </span>
+                    {packageById.get(selectedInsight.module.package_id) && (
+                      <>
+                        <ArrowRight aria-hidden="true" />
+                        <span>
+                          {packageById.get(selectedInsight.module.package_id)?.name}
+                        </span>
+                      </>
+                    )}
+                    <ArrowRight aria-hidden="true" />
+                    <strong>{selectedInsight.module.source_path}</strong>
+                  </nav>
                   <h3>{selectedInsight.module.source_path}</h3>
                   <p>
                     {selectedInsight.module.language} ·{" "}
@@ -774,6 +806,31 @@ export function RepositoryTriage({
                   </dl>
                 </section>
               </>
+            )
+            : unresolvedModule && canRecoverModule
+            ? (
+              <DataState
+                className={styles.empty}
+                state="empty"
+                title={`${unresolvedModule.path} is not captured in this snapshot`}
+                message={unresolvedModule.reason}
+                action={{
+                  label: "Open recommended module",
+                  onClick: () => {
+                    onRecoverModule();
+                    focusInspector();
+                  },
+                }}
+              />
+            )
+            : unresolvedModule
+            ? (
+              <DataState
+                className={styles.empty}
+                state="unavailable"
+                title={`${unresolvedModule.path} is not captured in this snapshot`}
+                message={`${unresolvedModule.reason} This snapshot contains no captured modules to open.`}
+              />
             )
             : (
               <DataState
