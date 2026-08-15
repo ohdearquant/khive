@@ -23,7 +23,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -51,9 +50,21 @@ PINNED_EMBEDDING_MODEL = "all-minilm-l6-v2"
 # term is zeroed so gold is clock-hermetic (see README "Determinism"
 # section). relevance/salience keep the product defaults (0.7/0.2) so the
 # weight sum stays positive and stable.
+#
+# default_token_budget is pinned to the server-side DoS cap (MAX_TOKEN_BUDGET,
+# crates/khive-pack-memory/src/scoring.rs) rather than the product default
+# (4000): the response token budget is applied after top_k ranking
+# (crates/khive-pack-memory/src/handlers/recall.rs handle_recall, the
+# `budget_cutoff` loop) and can truncate a 100-hit pool below what a
+# Recall@100 label requires. Pinning to the fixed server-side maximum keeps
+# the corpus untruncated (worst case ~31k chars for the 100 longest notes in
+# this harness's corpus vs. a 16000*4=64000-char budget at this setting)
+# without deriving the number from actual corpus content, which would make
+# gold non-hermetic.
 HERMETIC_RECALL_CONFIG = {
     "scoring": {
         "weights": {"relevance": 0.7, "salience": 0.2, "temporal": 0.0},
+        "default_token_budget": 16000,
     }
 }
 
@@ -146,6 +157,178 @@ def _reject_existing_scratch_db(db_path: Path) -> None:
             )
 
 
+def _open_dir_component_nofollow(parent_fd: int, name: str, full_path: Path) -> int:
+    """openat-style: open `name` as a directory relative to `parent_fd`,
+    refusing to follow a symlink at this single hop (O_NOFOLLOW) — except
+    the macOS /tmp,/var,/etc -> /private ambient mapping, which is OS-owned
+    rather than attacker-plantable (see `_ambient_symlink`). Returns a new
+    directory fd; the caller owns it and must close it.
+
+    O_NOFOLLOW's failure errno for "this is a symlink" is platform-dependent
+    (ELOOP on Linux, ENOTDIR on macOS when combined with O_DIRECTORY), so the
+    ambient-mapping exception is decided by `lstat`-checking the component
+    itself (`_ambient_symlink`, same check `_validate_scratch_root` uses)
+    rather than by matching a specific errno.
+    """
+    try:
+        return os.open(
+            name, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
+        )
+    except OSError as e:
+        if full_path.is_symlink() and _ambient_symlink(full_path):
+            return os.open(name, os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=parent_fd)
+        raise SystemExit(
+            f"refusing --scratch-dir: symlink or non-directory encountered at "
+            f"{full_path} while opening the scratch root (TOCTOU guard): {e}"
+        ) from e
+
+
+def open_scratch_root_fd(root: Path) -> int:
+    """Open a persistent, race-resistant directory fd for `root`.
+
+    `_validate_scratch_root` checks components with `lstat` and then
+    `make_scratch` creates the directory — a concurrent process can swap a
+    component for a symlink in the gap between that check and this open.
+    Walking every component from the filesystem root via `openat`
+    (`dir_fd=`) with `O_NOFOLLOW` closes that gap: each hop is resolved
+    relative to the fd already opened for its parent, so a symlink planted
+    after validation is refused here instead of silently followed. All
+    subsequent scratch file access in this run goes through the returned fd,
+    never through `root` as a bare path.
+    """
+    root = root.absolute()
+    fd = os.open(root.anchor, os.O_DIRECTORY | os.O_CLOEXEC)
+    cur = Path(root.anchor)
+    try:
+        for part in root.relative_to(root.anchor).parts:
+            cur = cur / part
+            next_fd = _open_dir_component_nofollow(fd, part, cur)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _claim_scratch_file(root_fd: int, name: str) -> None:
+    """Atomically claim `name` under the scratch root as a fresh, real file.
+
+    `O_CREAT | O_EXCL` refuses if anything — including a symlink — already
+    exists at `name`; `O_NOFOLLOW` additionally refuses to follow a symlink
+    raced into place on the create call itself. Immediately closed: kkernel
+    (subprocess) and sqlite3 need a path string, not an fd (see
+    `verified_scratch_path`), so the claim's only job is to make the
+    eventual path-based open resolve to a file this run created, not one a
+    concurrent process substituted.
+    """
+    fd = os.open(
+        name,
+        os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY | os.O_CLOEXEC,
+        0o600,
+        dir_fd=root_fd,
+    )
+    os.close(fd)
+
+
+def verified_scratch_path(root: Path, root_fd: int, name: str) -> str:
+    """Resolve `name` under the scratch root to an absolute path string,
+    re-verified immediately before a subprocess/sqlite3 call that can only
+    take a path (neither accepts an fd, and macOS has no /proc/self/fd to
+    convert one).
+
+    Opens `name` through the TOCTOU-guarded `root_fd` with `O_NOFOLLOW`
+    (refusing a symlink) and `fstat`s that fd; separately `stat`s the
+    realpath a subprocess would actually open. If the two do not name the
+    same file (device + inode), something was swapped between the fd-based
+    claim and this call, and the harness refuses to hand the path to a
+    subprocess rather than risk it writing through a symlink.
+    """
+    try:
+        leaf_fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd
+        )
+    except OSError as e:
+        raise SystemExit(
+            f"refusing to use {root / name}: could not open {name!r} through the "
+            f"validated scratch-root fd without following a symlink (TOCTOU guard): {e}"
+        ) from e
+    try:
+        fd_stat = os.fstat(leaf_fd)
+    finally:
+        os.close(leaf_fd)
+    resolved = os.path.realpath(str(root / name))
+    path_stat = os.stat(resolved, follow_symlinks=False)
+    if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+        raise SystemExit(
+            f"refusing to use {resolved}: it no longer matches the file opened "
+            "through the validated scratch-root fd (TOCTOU guard) — device/inode "
+            "changed between claim and use"
+        )
+    return resolved
+
+
+def _rmtree_contents_via_fd(dir_fd: int) -> None:
+    """Recursively delete everything inside the directory named by `dir_fd`,
+    never resolving a path string and never following a symlink: entries are
+    listed with `os.scandir(dir_fd)`, a symlink entry is `unlink`ed as a leaf
+    (removing the link itself, not its target), and only entries confirmed
+    as real directories via `O_NOFOLLOW` are opened and recursed into."""
+    with os.scandir(dir_fd) as it:
+        entries = list(it)
+    for entry in entries:
+        if entry.is_symlink():
+            os.unlink(entry.name, dir_fd=dir_fd)
+        elif entry.is_dir(follow_symlinks=False):
+            child_fd = os.open(
+                entry.name, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
+            )
+            try:
+                _rmtree_contents_via_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(entry.name, dir_fd=dir_fd)
+        else:
+            os.unlink(entry.name, dir_fd=dir_fd)
+
+
+def write_scratch_jsonl(root_fd: int, name: str, rows: list[dict]) -> None:
+    """Create-and-write `name` under the scratch root through `root_fd`.
+    `O_CREAT | O_EXCL` refuses anything already at that name (including a
+    symlink); `O_NOFOLLOW` additionally refuses a symlink raced into place
+    on the create call itself."""
+    fd = os.open(
+        name,
+        os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY | os.O_CLOEXEC,
+        0o600,
+        dir_fd=root_fd,
+    )
+    with os.fdopen(fd, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def read_scratch_jsonl(root_fd: int, name: str) -> list[dict]:
+    """Read `name` under the scratch root through `root_fd` with
+    `O_NOFOLLOW`, so this harness's own read never follows a symlink raced
+    into place while a subprocess was writing that name."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+    with os.fdopen(fd) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def cleanup_scratch(root: Path, root_fd: int) -> None:
+    """Delete the scratch tree through the held, TOCTOU-guarded `root_fd`
+    rather than a fresh path-based walk, then remove the now-empty root
+    directory itself. The final `rmdir` uses `root`'s path rather than a
+    parent fd (this script never opens the scratch root's parent), but
+    `rmdir` only ever removes an empty directory — a symlink or a
+    repopulated directory raced into that name fails closed instead of
+    deleting through it."""
+    _rmtree_contents_via_fd(root_fd)
+    os.rmdir(root)
+
+
 def make_scratch(scratch_dir: str | None) -> Path:
     if scratch_dir:
         root = Path(scratch_dir)
@@ -190,43 +373,47 @@ def run_kkernel(
 
 
 def seed_corpus(
-    kkernel: str, env: dict, db_path: Path, root: Path, seed: int, epoch: str
+    kkernel: str,
+    env: dict,
+    root: Path,
+    root_fd: int,
+    seed: int,
+    epoch: str,
 ) -> list[dict]:
     notes = generate_corpus.build_corpus(DEFAULT_QUERIES, seed, epoch)
     if len(notes) != 400:
         raise SystemExit(f"expected 400 notes, generator produced {len(notes)}")
-    ops_path = root / "seed_ops.jsonl"
-    save_path = root / "seed_save.jsonl"
-    with ops_path.open("w") as f:
-        for n in notes:
-            op = {
-                "tool": "memory.remember",
-                "args": {
-                    "content": n["content"],
-                    "salience": n["salience"],
-                    "decay_factor": n["decay_factor"],
-                    "memory_type": n["memory_type"],
-                    "tags": [f"k:{n['key']}"],
-                },
-            }
-            f.write(json.dumps(op) + "\n")
+    ops = [
+        {
+            "tool": "memory.remember",
+            "args": {
+                "content": n["content"],
+                "salience": n["salience"],
+                "decay_factor": n["decay_factor"],
+                "memory_type": n["memory_type"],
+                "tags": [f"k:{n['key']}"],
+            },
+        }
+        for n in notes
+    ]
+    write_scratch_jsonl(root_fd, "seed_ops.jsonl", ops)
+    _claim_scratch_file(root_fd, "seed_save.jsonl")
 
     run_kkernel(
         kkernel,
         [
             "exec",
             "--ops-file",
-            str(ops_path),
+            verified_scratch_path(root, root_fd, "seed_ops.jsonl"),
             "--save-file",
-            str(save_path),
+            verified_scratch_path(root, root_fd, "seed_save.jsonl"),
             "--db",
-            str(db_path),
+            verified_scratch_path(root, root_fd, "eval.db"),
         ],
         env,
     )
 
-    with save_path.open() as f:
-        rows = [json.loads(line) for line in f if line.strip()]
+    rows = read_scratch_jsonl(root_fd, "seed_save.jsonl")
     failed = [r for r in rows if not r.get("ok")]
     if failed:
         raise RuntimeError(f"{len(failed)} seed ops failed, e.g. {failed[0]}")
@@ -236,8 +423,8 @@ def seed_corpus(
     return notes
 
 
-def key_id_map(db_path: Path) -> dict[str, str]:
-    conn = sqlite3.connect(str(db_path))
+def key_id_map(root: Path, root_fd: int) -> dict[str, str]:
+    conn = sqlite3.connect(verified_scratch_path(root, root_fd, "eval.db"))
     try:
         cur = conn.execute(
             "SELECT id, properties FROM notes WHERE properties IS NOT NULL"
@@ -253,8 +440,10 @@ def key_id_map(db_path: Path) -> dict[str, str]:
         conn.close()
 
 
-def set_ages(db_path: Path, notes: list[dict], key_to_id: dict[str, str]) -> None:
-    conn = sqlite3.connect(str(db_path))
+def set_ages(
+    root: Path, root_fd: int, notes: list[dict], key_to_id: dict[str, str]
+) -> None:
+    conn = sqlite3.connect(verified_scratch_path(root, root_fd, "eval.db"))
     try:
         for n in notes:
             note_id = key_to_id[n["key"]]
@@ -272,49 +461,54 @@ def set_ages(db_path: Path, notes: list[dict], key_to_id: dict[str, str]) -> Non
 def run_condition(
     kkernel: str,
     env: dict,
-    db_path: Path,
     root: Path,
+    root_fd: int,
     condition: str,
     queries: list[dict],
+    corpus_size: int,
 ) -> list[dict]:
     extra_args = CONDITIONS[condition]
-    ops_path = root / f"query_ops_{condition}.jsonl"
-    save_path = root / f"query_save_{condition}.jsonl"
-    with ops_path.open("w") as f:
-        for q in queries:
-            args = {
+    ops_name = f"query_ops_{condition}.jsonl"
+    save_name = f"query_save_{condition}.jsonl"
+    ops = [
+        {
+            "tool": "memory.recall",
+            "args": {
                 "query": q["query"],
                 "top_k": CANDIDATE_POOL,
                 "include_breakdown": True,
                 "config": HERMETIC_RECALL_CONFIG,
                 **extra_args,
-            }
-            f.write(json.dumps({"tool": "memory.recall", "args": args}) + "\n")
+            },
+        }
+        for q in queries
+    ]
+    write_scratch_jsonl(root_fd, ops_name, ops)
+    _claim_scratch_file(root_fd, save_name)
 
     run_kkernel(
         kkernel,
         [
             "exec",
             "--ops-file",
-            str(ops_path),
+            verified_scratch_path(root, root_fd, ops_name),
             "--save-file",
-            str(save_path),
+            verified_scratch_path(root, root_fd, save_name),
             "--db",
-            str(db_path),
+            verified_scratch_path(root, root_fd, "eval.db"),
         ],
         env,
     )
 
-    with save_path.open() as f:
-        rows = [json.loads(line) for line in f if line.strip()]
+    rows = read_scratch_jsonl(root_fd, save_name)
     if len(rows) != len(queries):
         raise RuntimeError(f"expected {len(queries)} query rows, got {len(rows)}")
     for q, row in zip(queries, rows):
-        row["_hits"] = _validate_recall_row(q, row)
+        row["_hits"] = _validate_recall_row(q, row, corpus_size)
     return rows
 
 
-def _validate_recall_row(query: dict, row: dict) -> list:
+def _validate_recall_row(query: dict, row: dict, corpus_size: int) -> list:
     """Validate a memory.recall response row and return its hit list.
 
     The normal (non-degraded, non-budget-capped) response is a bare JSON
@@ -329,6 +523,15 @@ def _validate_recall_row(query: dict, row: dict) -> list:
     so none of those edge cases are expected; hitting one here means the
     run is not representative (e.g. a cold/unready ANN index) and must fail
     loudly rather than silently score a degraded ranking into gold.
+
+    A bare array is accepted at any length by the response shape itself —
+    the response token budget (crates/khive-pack-memory/src/handlers/
+    recall.rs `handle_recall`, the `budget_cutoff` loop after ranking) can
+    still truncate a non-empty hit list below the requested top_k, stamping
+    each surviving hit with `"truncated": true` rather than changing the
+    envelope shape. Silently scoring that shorter pool would mislabel
+    Recall@100 / TargetRecall@100 as if the full pool had been evaluated, so
+    both the pool depth and the per-hit marker are checked explicitly below.
     """
     if not row.get("ok"):
         raise RuntimeError(
@@ -337,8 +540,8 @@ def _validate_recall_row(query: dict, row: dict) -> list:
         )
     result = row.get("result")
     if isinstance(result, list):
-        return result
-    if isinstance(result, dict):
+        hits = result
+    elif isinstance(result, dict):
         if result.get("degraded"):
             raise RuntimeError(
                 f"memory.recall degraded for query_id={query['query_id']!r}: "
@@ -352,13 +555,35 @@ def _validate_recall_row(query: dict, row: dict) -> list:
                 "harness's fixed top_k on its fixed corpus"
             )
         hits = result.get("results")
-        if isinstance(hits, list):
-            return hits
-    raise RuntimeError(
-        f"memory.recall returned an unexpected response shape for "
-        f"query_id={query['query_id']!r} (got {type(result).__name__}); "
-        "expected a bare hit array or a known degraded/truncated envelope"
-    )
+        if not isinstance(hits, list):
+            raise RuntimeError(
+                f"memory.recall returned an unexpected response shape for "
+                f"query_id={query['query_id']!r} (got {type(result).__name__}); "
+                "expected a bare hit array or a known degraded/truncated envelope"
+            )
+    else:
+        raise RuntimeError(
+            f"memory.recall returned an unexpected response shape for "
+            f"query_id={query['query_id']!r} (got {type(result).__name__}); "
+            "expected a bare hit array or a known degraded/truncated envelope"
+        )
+
+    expected_pool = min(CANDIDATE_POOL, corpus_size)
+    if len(hits) < expected_pool:
+        raise RuntimeError(
+            f"memory.recall pool for query_id={query['query_id']!r} is truncated: "
+            f"got {len(hits)} hits, expected {expected_pool} (top_k={CANDIDATE_POOL} "
+            f"against a {corpus_size}-note corpus) — scoring this pool would silently "
+            "mislabel Recall@100/TargetRecall@100; raise the recall token budget "
+            "(HERMETIC_RECALL_CONFIG) or investigate the cause before re-running"
+        )
+    if any(h.get("truncated") for h in hits):
+        raise RuntimeError(
+            f"memory.recall pool for query_id={query['query_id']!r} carries per-hit "
+            f"'truncated' markers at depth {len(hits)}; the harness requires a fully "
+            "untruncated top-100 pool for a valid Recall@100 label"
+        )
+    return hits
 
 
 def dcg_at_k(grades: list[int], k: int) -> float:
@@ -624,12 +849,65 @@ def run_self_tests() -> int:
         f"expected a missing-provenance note, got {note!r}",
     )
 
+    # 10. a file swapped for a symlink to an external victim AFTER it was
+    # claimed through the validated root fd is refused at use time
+    # (`verified_scratch_path`), and the victim is left untouched — this is
+    # the TOCTOU window between validation and use, closed by O_NOFOLLOW on
+    # the fd-relative leaf open.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        root_fd = open_scratch_root_fd(root)
+        try:
+            _claim_scratch_file(root_fd, "claimed.txt")
+            victim = Path(td) / "victim.txt"
+            victim.write_text("do not touch")
+            claimed_path = root / "claimed.txt"
+            claimed_path.unlink()
+            claimed_path.symlink_to(victim)
+            ok, msg = _expect_systemexit(
+                verified_scratch_path, root, root_fd, "claimed.txt"
+            )
+            _record(
+                failures, "post-claim-symlink-swap-refused-at-use", ok, msg
+            )
+            if victim.read_text() != "do not touch":
+                failures.append(
+                    "post-claim-symlink-swap-refused-at-use: victim file was modified"
+                )
+        finally:
+            os.close(root_fd)
+
+    # 11. the device+inode re-check arm: the scratch root directory itself is
+    # swapped out from under a held `root_fd` (renamed aside, then recreated
+    # fresh at the same path) between the fd-based claim and use — a regular
+    # file, not a symlink, so O_NOFOLLOW alone would not catch it. The fd-
+    # resolved and path-resolved views of the same name now disagree on
+    # device+inode, and `verified_scratch_path` must refuse rather than hand
+    # the swapped path to a subprocess.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        root_fd = open_scratch_root_fd(root)
+        try:
+            _claim_scratch_file(root_fd, "claimed.txt")
+            moved_aside = Path(td) / "root-moved-aside"
+            root.rename(moved_aside)
+            root.mkdir()
+            (root / "claimed.txt").write_text("swapped root")
+            ok, msg = _expect_systemexit(
+                verified_scratch_path, root, root_fd, "claimed.txt"
+            )
+            _record(failures, "device-inode-mismatch-refused", ok, msg)
+        finally:
+            os.close(root_fd)
+
     if failures:
         print(f"\nSELF-TEST FAILED ({len(failures)}):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("\nSELF-TEST PASSED (9 checks)")
+    print("\nSELF-TEST PASSED (11 checks)")
     return 0
 
 
@@ -669,32 +947,45 @@ def main() -> int:
 
     refuse_unsafe_db_env()
     root = make_scratch(args.scratch_dir)
-    db_path = root / "eval.db"
-    _reject_existing_scratch_db(db_path)
-    env = scratch_env(root, db_path)
-
+    # Opened immediately after creation so every subsequent scratch access in
+    # this run goes through a TOCTOU-guarded fd rather than re-resolving
+    # `root` as a bare path (see `open_scratch_root_fd`).
+    root_fd = open_scratch_root_fd(root)
     try:
-        run_kkernel(args.kkernel, ["db", "migrate", "--db", str(db_path)], env)
-        queries = generate_corpus.parse_queries(args.queries)
-        notes = seed_corpus(args.kkernel, env, db_path, root, args.seed, args.epoch)
-        key_to_id = key_id_map(db_path)
-        missing = [n["key"] for n in notes if n["key"] not in key_to_id]
-        if missing:
-            raise RuntimeError(
-                f"{len(missing)} seeded notes missing tag-based id, e.g. {missing[:5]}"
-            )
-        set_ages(db_path, notes, key_to_id)
-        id_to_key = {v: k for k, v in key_to_id.items()}
+        db_path = root / "eval.db"
+        _reject_existing_scratch_db(db_path)
+        _claim_scratch_file(root_fd, "eval.db")
+        env = scratch_env(root, db_path)
 
-        result_rows = run_condition(
-            args.kkernel, env, db_path, root, args.condition, queries
-        )
-        per_query = [
-            compute_metrics(q, id_to_key, row) for q, row in zip(queries, result_rows)
-        ]
+        try:
+            run_kkernel(
+                args.kkernel,
+                ["db", "migrate", "--db", verified_scratch_path(root, root_fd, "eval.db")],
+                env,
+            )
+            queries = generate_corpus.parse_queries(args.queries)
+            notes = seed_corpus(args.kkernel, env, root, root_fd, args.seed, args.epoch)
+            key_to_id = key_id_map(root, root_fd)
+            missing = [n["key"] for n in notes if n["key"] not in key_to_id]
+            if missing:
+                raise RuntimeError(
+                    f"{len(missing)} seeded notes missing tag-based id, e.g. {missing[:5]}"
+                )
+            set_ages(root, root_fd, notes, key_to_id)
+            id_to_key = {v: k for k, v in key_to_id.items()}
+
+            result_rows = run_condition(
+                args.kkernel, env, root, root_fd, args.condition, queries, len(notes)
+            )
+            per_query = [
+                compute_metrics(q, id_to_key, row)
+                for q, row in zip(queries, result_rows)
+            ]
+        finally:
+            if not args.keep_scratch:
+                cleanup_scratch(root, root_fd)
     finally:
-        if not args.keep_scratch:
-            shutil.rmtree(root, ignore_errors=True)
+        os.close(root_fd)
 
     agg = aggregate(per_query)
     print_table(args.condition, agg)
