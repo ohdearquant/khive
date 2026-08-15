@@ -41,6 +41,10 @@ Double-modified records use these field policies:
 
 `SnapshotMergeStrategy::Ours` and `Theirs` are the explicit resolutions for property or identity conflicts and retain the selected branch's complete record.
 
+### Cross-key identity collisions
+
+Per-key reconciliation above decides each semantic edge's UUID independently, so a branch-chosen identity (an added edge, or a one-sided/double modification that changes `edge_id`) can coincide with a durable UUID already used by a *different* semantic edge in the merged set. `merge_edges` reserves every UUID inherited unchanged from base first, then resolves branch-chosen UUIDs against that reserved set in deterministic key order: an edge whose own identity did not change always keeps it; a colliding branch-chosen identity falls back to that key's own base UUID and reports `EdgeIdentityCollision`. Independently added edges with no base UUID to fall back to still report the collision, keeping the attempted identity, since there is no established identity to restore.
+
 ## `validate_dangling_edges`
 
 Dangling validation must run after entity merge, using the final entity-ID set. Each edge with a missing source or target yields `MergeConflict::DanglingEdge` with the missing endpoint. If both endpoints are missing, the source is reported first because validation uses an `if`/`else if` check.

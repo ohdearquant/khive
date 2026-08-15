@@ -79,6 +79,16 @@ pub enum MergeConflict {
         ours: Uuid,
         theirs: Uuid,
     },
+    /// An edge's identity change collided with another edge's durable UUID
+    /// already claimed in the merged set; the edge keeps its unmodified base
+    /// identity instead of duplicating the other edge's UUID.
+    EdgeIdentityCollision {
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: String,
+        attempted_edge_id: Uuid,
+        retained_edge_id: Uuid,
+    },
     /// Both branches changed the same edge-property key differently.
     EdgePropertyMismatch {
         source_id: Uuid,

@@ -44,7 +44,7 @@ going through the `MergeEngine` trait object.
 `MergeConflict` enumerates what `Auto` can detect: `NameConflict`, `KindConflict`,
 `PropertyMismatch`, `ModifyDelete` (one branch edited, the other deleted),
 `DuplicateAddition` (both branches added the same UUID with different content),
-`EdgeModifyDelete`, `EdgeIdentityMismatch`, `EdgePropertyMismatch`, and `DanglingEdge`
+`EdgeModifyDelete`, `EdgeIdentityMismatch`, `EdgeIdentityCollision`, `EdgePropertyMismatch`, and `DanglingEdge`
 (a merged edge references an entity not in the merged set). `BranchSide::{Ours, Theirs}`
 identifies which branch a `ModifyDelete` / `EdgeModifyDelete` change came from.
 

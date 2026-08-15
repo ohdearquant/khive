@@ -45,7 +45,6 @@ pub fn merge_edges(
             .then(a.relation.cmp(&b.relation))
     });
 
-    let mut merged: Vec<ExportedEdge> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
 
     // Preserve the common-base record for unchanged output.
@@ -55,40 +54,42 @@ pub fn merge_edges(
         .map(|e| (EdgeKey::from_edge(e), e))
         .collect();
 
-    for key in &all_keys_sorted {
-        let ours_change = ours_diff.get(key);
-        let theirs_change = theirs_diff.get(key);
+    // First pass: decide each key's provisional edge per-key, same as before,
+    // and note whether its durable identity is exactly base's (untouched) or
+    // was chosen by branch content (added, or a modification that changed
+    // `edge_id`). This classification drives collision resolution below,
+    // independent of key iteration order.
+    let mut candidates: Vec<(EdgeKey, Option<(ExportedEdge, bool)>)> =
+        Vec::with_capacity(all_keys_sorted.len());
 
-        match (ours_change, theirs_change) {
+    for key in all_keys_sorted {
+        let ours_change = ours_diff.get(&key);
+        let theirs_change = theirs_diff.get(&key);
+
+        let candidate = match (ours_change, theirs_change) {
             (Some(EdgeChange::Unchanged), Some(EdgeChange::Unchanged)) => {
-                if let Some(&e) = base_edge_map.get(key) {
-                    merged.push(e.clone());
-                }
+                base_edge_map.get(&key).map(|&e| (e.clone(), true))
             }
 
             (Some(EdgeChange::Added(e)), None)
-            | (Some(EdgeChange::Added(e)), Some(EdgeChange::Unchanged)) => {
-                merged.push(e.clone());
-            }
+            | (Some(EdgeChange::Added(e)), Some(EdgeChange::Unchanged)) => Some((e.clone(), false)),
 
             (None, Some(EdgeChange::Added(e)))
-            | (Some(EdgeChange::Unchanged), Some(EdgeChange::Added(e))) => {
-                merged.push(e.clone());
-            }
+            | (Some(EdgeChange::Unchanged), Some(EdgeChange::Added(e))) => Some((e.clone(), false)),
 
             (Some(EdgeChange::Added(e_ours)), Some(EdgeChange::Added(e_theirs))) => {
-                let (edge, edge_conflicts) = merge_added_edges(key, e_ours, e_theirs);
-                merged.push(edge);
+                let (edge, edge_conflicts) = merge_added_edges(&key, e_ours, e_theirs);
                 conflicts.extend(edge_conflicts);
+                Some((edge, false))
             }
 
-            (Some(EdgeChange::Deleted), Some(EdgeChange::Deleted)) => {}
+            (Some(EdgeChange::Deleted), Some(EdgeChange::Deleted)) => None,
 
             (Some(EdgeChange::Deleted), Some(EdgeChange::Unchanged))
-            | (Some(EdgeChange::Deleted), None) => {}
+            | (Some(EdgeChange::Deleted), None) => None,
 
             (Some(EdgeChange::Unchanged), Some(EdgeChange::Deleted))
-            | (None, Some(EdgeChange::Deleted)) => {}
+            | (None, Some(EdgeChange::Deleted)) => None,
 
             (
                 Some(EdgeChange::Modified {
@@ -102,7 +103,10 @@ pub fn merge_edges(
                 }),
                 None,
             ) => {
-                merged.push(edge_ours.clone());
+                let identity_is_base = base_edge_map
+                    .get(&key)
+                    .is_some_and(|&b| b.edge_id == edge_ours.edge_id);
+                Some((edge_ours.clone(), identity_is_base))
             }
 
             (
@@ -119,7 +123,10 @@ pub fn merge_edges(
                     ..
                 }),
             ) => {
-                merged.push(edge_theirs.clone());
+                let identity_is_base = base_edge_map
+                    .get(&key)
+                    .is_some_and(|&b| b.edge_id == edge_theirs.edge_id);
+                Some((edge_theirs.clone(), identity_is_base))
             }
 
             (
@@ -133,9 +140,10 @@ pub fn merge_edges(
                 }),
             ) => {
                 let (edge, edge_conflicts) =
-                    merge_modified_edges(key, base, edge_ours, edge_theirs);
-                merged.push(edge);
+                    merge_modified_edges(&key, base, edge_ours, edge_theirs);
                 conflicts.extend(edge_conflicts);
+                let identity_is_base = edge.edge_id == base.edge_id;
+                Some((edge, identity_is_base))
             }
 
             (Some(EdgeChange::Deleted), Some(EdgeChange::Modified { .. })) => {
@@ -146,6 +154,7 @@ pub fn merge_edges(
                     modified_in: BranchSide::Theirs,
                     deleted_in: BranchSide::Ours,
                 });
+                None
             }
 
             (Some(EdgeChange::Modified { .. }), Some(EdgeChange::Deleted)) => {
@@ -156,10 +165,53 @@ pub fn merge_edges(
                     modified_in: BranchSide::Ours,
                     deleted_in: BranchSide::Theirs,
                 });
+                None
             }
 
-            _ => {}
+            _ => None,
+        };
+
+        candidates.push((key, candidate));
+    }
+
+    // Second pass: reserve every durable identity inherited unchanged from
+    // base before resolving branch-chosen identities, so a one-sided or
+    // double edge modification can never displace an edge that kept its
+    // pre-existing UUID — regardless of which key sorts first. Base edges are
+    // validated duplicate-free on ingest, so these reservations never collide
+    // with each other.
+    let mut used_edge_ids: HashSet<Uuid> = HashSet::new();
+    for (_, candidate) in &candidates {
+        if let Some((edge, true)) = candidate {
+            used_edge_ids.insert(edge.edge_id);
         }
+    }
+
+    // Third pass: resolve branch-chosen identities against the reserved set,
+    // in the original sorted order, and emit the final deterministic output.
+    let mut merged: Vec<ExportedEdge> = Vec::with_capacity(candidates.len());
+    for (key, candidate) in candidates {
+        let Some((mut edge, identity_is_base)) = candidate else {
+            continue;
+        };
+
+        if !identity_is_base && !used_edge_ids.insert(edge.edge_id) {
+            let attempted_edge_id = edge.edge_id;
+            if let Some(&base_edge) = base_edge_map.get(&key) {
+                edge.edge_id = base_edge.edge_id;
+                used_edge_ids.insert(edge.edge_id);
+            }
+
+            conflicts.push(MergeConflict::EdgeIdentityCollision {
+                source_id: key.source,
+                target_id: key.target,
+                relation: key.relation.clone(),
+                attempted_edge_id,
+                retained_edge_id: edge.edge_id,
+            });
+        }
+
+        merged.push(edge);
     }
 
     Ok((merged, conflicts))
@@ -672,6 +724,41 @@ mod tests {
                 && *ours == ours_edge.edge_id
                 && *theirs == theirs_edge.edge_id
         ));
+    }
+
+    #[test]
+    fn one_sided_identity_change_colliding_with_other_edge_is_rejected() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+
+        let edge1_base = edge(a, b, 1.0);
+        let edge2 = edge(c, d, 1.0);
+
+        let mut edge1_ours = edge1_base.clone();
+        edge1_ours.edge_id = edge2.edge_id;
+
+        let base = archive(vec![edge1_base.clone(), edge2.clone()]);
+        let ours = archive(vec![edge1_ours, edge2.clone()]);
+        let theirs = archive(vec![edge1_base, edge2.clone()]);
+
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+
+        let mut seen_ids = HashSet::new();
+        for merged_edge in &merged {
+            assert!(
+                seen_ids.insert(merged_edge.edge_id),
+                "merge output must not contain duplicate durable edge_id {:?}: {merged:?}",
+                merged_edge.edge_id
+            );
+        }
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| matches!(c, MergeConflict::EdgeIdentityCollision { .. })),
+            "expected an EdgeIdentityCollision conflict, got: {conflicts:?}"
+        );
     }
 
     #[test]
