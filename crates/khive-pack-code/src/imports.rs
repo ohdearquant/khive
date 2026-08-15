@@ -1,9 +1,12 @@
 //! Regex-based import scan for `code.ingest` L1.5 (ADR-085 Amendment 2 B3).
 //!
 //! Syntax-only, per B2: no type-checking, no compilation. Coverage-floor
-//! extraction — good enough to produce `depends_on` edges and module paths,
-//! not a full parser. Pure functions; no filesystem or storage access beyond
-//! the caller-supplied file path (used only for path arithmetic).
+//! extraction — good enough to produce static-coupling `depends_on` edges and
+//! module paths, not a full parser. The regexes are deliberately scope-blind:
+//! guarded, type-check-only, and function-local imports are included, so these
+//! edges do not assert a module-initialization or runtime dependency. Pure
+//! functions; no filesystem or storage access beyond the caller-supplied file
+//! path (used only for path arithmetic).
 
 use std::path::{Component, Path};
 
@@ -71,7 +74,11 @@ fn python_imported_names(names: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Extract raw, unclassified import specifiers from `content`.
+/// Extract raw, scope-unclassified import specifiers from `content`.
+///
+/// Leading whitespace is accepted intentionally, so imports nested in a
+/// function or guard (including Python `if TYPE_CHECKING:` blocks) are part of
+/// this static-coupling signal. See ADR-085 Amendment 2 B3.
 pub(crate) fn extract_raw_imports(language: &str, content: &str) -> Vec<String> {
     let mut out = Vec::new();
     match language {

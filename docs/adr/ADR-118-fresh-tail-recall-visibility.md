@@ -7,7 +7,8 @@
 delta-log/watermark classifier), [ADR-107](ADR-107-memory-ann-lifecycle.md) (Memory ANN
 lifecycle — eventual consistency contract)
 **References**: issue #1143 (write-to-visibility regression), issue #752 (process-local
-generation counter), issue #942 (fresh-query scoring quality — related, out of scope)
+generation counter), issue #942 (fresh-query scoring quality — related, out of scope), issue
+#1802 (process-global fresh-tail toggle race)
 
 ## Context
 
@@ -55,10 +56,10 @@ inside §1's checkpoint mismatch window, which re-resolution closes for both cro
 checkpoints and same-process queries that captured candidates before the bridge swap. While no
 index is serving (Cold rebuild in flight, or Empty), a
 committed write is visible to the vector legs iff its log row is still retained and fewer
-than threshold-many retained writes committed after it in scope (§3 states the precise
-condition); ADR-107 governs everything else until the rebuild lands. The
-per-query cost is proportional to the tail length, which the checkpoint lifecycle already
-bounds.
+than `ceil(KHIVE_ANN_REBUILD_THRESHOLD × live_vector_count)` retained writes committed after
+it in scope (§3 states the precise condition); ADR-107 governs everything else until the
+rebuild lands. The per-query cost is proportional to the full tail length when an index is
+serving and to the corpus-relative suffix when one is not (§3).
 
 ### 1. Tail enumeration
 
@@ -160,32 +161,45 @@ near ties. This is bounded and accepted; if it shows up in practice, the remedy 
 full-precision re-scoring of the ANN candidates within the merge window — explicitly a
 scoring refinement inside the leg, never a fusion change.
 
-### 3. Cost bound and the no-index case
+### 3. Cost shape and the no-index case
 
-The exact leg is O(|tail| × dims) per model per query. The tail is small by construction:
+The exact leg is O(|tail| × dims) per model per query. The serving-index tail is normally small:
 
 - The checkpoint lifecycle (ADR-079 §"checkpoint") drains the tail on a cadence; the
   steady-state tail is the writes since the last checkpoint.
-- The rebuild threshold (`KHIVE_ANN_REBUILD_THRESHOLD`, default 0.20) caps how long a tail
-  can grow relative to the live corpus before a full rebuild is already in flight. A tail at
+- The rebuild threshold (`KHIVE_ANN_REBUILD_THRESHOLD`, default 0.20) determines when the
+  classifier starts a full rebuild instead of replaying the tail. A tail at
   the threshold on a 68k-row corpus is ~13.6k exact comparisons. The similarity arithmetic at
   that ceiling is sub-millisecond, but the dominant cost there is the ~13.6k embedding-row
   point-reads per model, which is not — the honest bound at the pathological ceiling is the
-  point-read I/O, and it applies only while a full rebuild is already in flight. The
-  steady-state tail (writes since the last checkpoint) is small enough that both terms are
-  negligible, and the steady state is the case the leg exists for.
+  point-read I/O. The threshold is a rebuild trigger, not a hard query cap: while a serving
+  index exists, the exact leg continues to scan the complete retained suffix above its
+  watermark so read-your-writes is not traded away if a rebuild is delayed and later writes
+  push the suffix past the trigger. The steady-state tail (writes since the last checkpoint)
+  is small enough that both terms are negligible, and the steady state is the case the leg
+  exists for.
 
 When no ANN index is serving at all (Cold rebuild in flight, or Empty classification), the
 watermark is 0 and the tail is the entire scope. The exact leg does **not** absorb that case:
-it caps its scan at the threshold-sized tail, taking the highest-seq suffix of the log (the
-newest raw writes, before final-state coalescing) so the freshest writes stay visible while FTS
-covers the rest, and otherwise
+it counts the live, join-filtered vector corpus and caps its scan at
+`ceil(KHIVE_ANN_REBUILD_THRESHOLD × live_vector_count)`, taking the highest-seq suffix of the
+log (the newest raw writes, before final-state coalescing) so the freshest writes stay visible
+while FTS covers the rest, and otherwise
 defers to the existing Cold-path behavior (FTS-only serving while the rebuild runs). The leg
-restores freshness on a serving index; it is not a general exact-search fallback. This is
-the second tier of the §"Decision" guarantee stated precisely: with no serving index, a
+restores freshness on a serving index; it is not a general exact-search fallback. The no-index
+path has an intentionally asymmetric cost boundary. An empty-tail existence probe returns before
+any corpus count. Once that probe finds retained rows, however, each Cold/Empty query pays an
+O(live-vector-corpus) `COUNT` over the vector-to-note join, followed by at most
+`ceil(KHIVE_ANN_REBUILD_THRESHOLD × live_vector_count)` newest raw-log point reads and exact
+scores. Only the suffix and scoring work are threshold-bounded; the live-corpus count/join is
+not. This remaining no-index cost is accepted to keep the bound corpus-relative without adding
+a separately maintained count. This is the second tier of the §"Decision" guarantee stated
+precisely: with no serving index, a
 committed write is visible to the vector legs **iff its `ann_write_log` row is still
-retained — compaction has not passed it — and fewer than threshold-many retained writes
-committed after it in scope**. Both conjuncts are load-bearing. Under concurrent load,
+retained — compaction has not passed it — and fewer than
+`ceil(KHIVE_ANN_REBUILD_THRESHOLD × live_vector_count)` retained raw log rows committed after
+it in scope**. Both conjuncts are load-bearing. The live count and selected log suffix come
+from one SQL statement, so the ceiling and rows describe the same snapshot. Under concurrent load,
 later commits can push an earlier write outside the newest suffix, so recency of the
 caller's own write is not guaranteed by construction. And a write already compacted out of
 the log — possible only after every registered consumer durably checkpointed past it —
@@ -199,7 +213,9 @@ contradicted by it.
 
 No new tuning knob is introduced. One escape hatch is added for operational isolation:
 `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Values other than `0`
-are ignored.
+are ignored. The environment is sampled once during `KhiveRuntime` construction;
+memory and knowledge serving read that immutable per-runtime policy and never re-read or
+mutate process-global environment state on a request path.
 
 ### 4. Scope: both delta-log consumers
 
@@ -261,9 +277,12 @@ deletes that write no log rows — see ADR-079's rule 5 qualification).
   the overwhelmingly common state — matching the pre-Vamana behavior and the synchronous
   write path's implicit promise; the Cold/Empty window keeps the newest-suffix guarantee
   only (§3).
-- Recall pays a small per-query cost (log-tail scan + registry-minimum coverage check +
-  exact scoring) that is near zero when the tail is empty and bounded by the rebuild
-  threshold when it is not.
+- Recall's serving-index path pays a small per-query cost (log-tail scan + registry-minimum
+  coverage check + exact scoring) that is near zero when the tail is empty. A non-empty
+  Cold/Empty fallback additionally pays an O(live-vector-corpus) count/join; only its newest
+  raw-log suffix reads and scoring are bounded by the corpus-relative rebuild threshold. The
+  serving-index path scans the full suffix to preserve read-your-writes and has no separate hard
+  row cap.
 - The tail query adds read traffic on `ann_write_log`; its index must serve
   `(embedding_model, seq)`-shaped scans efficiently (the existing namespace-first index
   shape is a known follow-up).

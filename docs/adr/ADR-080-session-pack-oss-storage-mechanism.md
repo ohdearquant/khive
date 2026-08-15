@@ -205,7 +205,10 @@ the M2 milestone of the session pack build (issue #350, PR #368) with the Claude
 source, gained the Codex CLI source in PR #375, and gains the ChatGPT export source with
 the 2026-07-02 amendment. The 2026-08-01 amendment adds claude.ai data exports as a
 separate fourth source. The mirror is disabled by default and never writes to, moves, or
-deletes the files it reads.
+deletes the files it reads. Here "read-only" describes the transcript sources,
+not the khive sink: the mirror writes auxiliary rows and cursor state. ADR-028
+Amendment A2 therefore suppresses this warm hook when the session pack's own
+assigned backend is a read-only snapshot.
 
 #### Mirror sources — closed set
 

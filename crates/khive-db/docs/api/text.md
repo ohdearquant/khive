@@ -10,25 +10,25 @@ of MATCH-expression syntax errors and false-negative matches.
 
 See `crates/khive-db/src/stores/text.rs` — private method `with_writer`.
 
-Routes a single-row write through the pool-wide `WriterTask` when
-`KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise falls back to the
-legacy standalone-connection / pool-mutex path.
+Resolves the pool-wide `WriterTask` at write time and routes through it when
+available; a handle missed by construction outside Tokio is refreshed here.
+Strict routing fails closed when no handle is available. Compatibility mode
+falls back to the legacy standalone-connection / pool-mutex path and emits a
+store-specific direct-route violation when the file-backed queue is enabled.
 
 This is the routing point for `with_writer` callers whose closure is
 DML-only (`delete_document`/`fts_delete`, `rebuild`/`fts_rebuild`): on the
 flag-on path the closure runs inside the WriterTask's own transaction, so a
 bare `BEGIN IMMEDIATE` would violate SQLite's nested-transaction rule.
-`upsert_document`/`upsert_documents` (the single-doc and batch write
-methods) do their own flag check and return early on `Some`, so their
-fallback calls into this helper only ever execute on the flag-off path
-(`self.writer_task` is `None` by construction whenever those calls are
-reached) — no double-routing.
+`upsert_document`/`upsert_documents` (the single-doc and batch write methods)
+perform the same write-time lookup before falling through this helper. A
+non-strict `None` records only at the actual fallback seam; strict mode never
+reaches it.
 
-`rename_namespace` (`#[allow(dead_code)]`, no production caller — see
-ADR-067's `BEGIN IMMEDIATE` site inventory, EXEMPT) manages its own manual
-transaction and calls `with_writer_unmanaged` instead of this helper —
-routing its closure through the WriterTask would nest a bare `BEGIN
-IMMEDIATE` inside the WriterTask's own transaction.
+`rename_namespace` submits its DML-only read/delete/reinsert body through the
+WriterTask when available, with the task owning the enclosing transaction. Its
+compatibility fallback alone calls `with_writer_unmanaged` and supplies the
+legacy explicit transaction; strict routing refuses before that fallback.
 
 ## FTS5 query sanitization pipeline
 

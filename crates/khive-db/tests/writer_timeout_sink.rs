@@ -92,6 +92,120 @@ fn wait_for_ndjson_line(predicate: impl Fn(&str) -> bool, timeout: Duration) -> 
     }
 }
 
+/// Read-only inspection must neither start the process-global writer-timeout
+/// sink nor consume its one-time claim. Run the assertion in a freshly
+/// spawned copy of this integration-test binary because other tests in the
+/// parent process intentionally initialize that global sink.
+#[test]
+fn read_only_pool_does_not_claim_sink_and_later_writable_pool_can() {
+    const CHILD_MARKER: &str = "KHIVE_READ_ONLY_SINK_FRESH_PROCESS";
+
+    if std::env::var(CHILD_MARKER).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "read_only_pool_does_not_claim_sink_and_later_writable_pool_can",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env_remove("KHIVE_WRITER_TIMEOUT_SINK_DIR")
+            .output()
+            .expect("fresh integration-test process must start");
+        assert!(
+            output.status.success(),
+            "fresh-process read-only sink regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let read_only_path = dir.path().join("inspection.db");
+    {
+        let conn = rusqlite::Connection::open(&read_only_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE inspected(id INTEGER PRIMARY KEY);\
+             INSERT INTO inspected DEFAULT VALUES;",
+        )
+        .unwrap();
+    }
+    let main_before = std::fs::read(&read_only_path).unwrap();
+    let mut entries_before = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries_before.sort();
+
+    let read_only_pool = ConnectionPool::new(PoolConfig {
+        path: Some(read_only_path.clone()),
+        read_only: true,
+        write_queue_enabled: Some(false),
+        ..PoolConfig::default()
+    })
+    .expect("read-only inspection pool must open");
+    let count: i64 = read_only_pool
+        .reader()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM inspected", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // The sink thread performs its first directory creation asynchronously.
+    // Wait beyond its one-second drain cadence before proving absence so this
+    // cannot pass merely because a wrongly-started writer has not run yet.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let mut entries_after = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries_after.sort();
+    assert_eq!(std::fs::read(&read_only_path).unwrap(), main_before);
+    assert_eq!(entries_after, entries_before);
+    assert!(
+        !dir.path().join(".khive-logs").exists(),
+        "a read-only pool must not initialize filesystem-writing diagnostics"
+    );
+
+    // A later writable pool in this same fresh process must still be able to
+    // claim the global sink, proving the read-only constructor skipped init
+    // rather than claiming a permanently inert handle.
+    let writable_path = dir.path().join("writable.db");
+    let _writable_pool = ConnectionPool::new(PoolConfig {
+        path: Some(writable_path.clone()),
+        write_queue_enabled: Some(false),
+        ..PoolConfig::default()
+    })
+    .expect("later writable pool must open");
+    let sink_path = dir
+        .path()
+        .join(".khive-logs")
+        .join(format!("writer_timeouts.{}.ndjson", std::process::id()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let sink_contents = loop {
+        if let Ok(contents) = std::fs::read_to_string(&sink_path) {
+            if contents.contains("\"kind\":\"startup\"") {
+                break contents;
+            }
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "later writable pool did not claim the sink at {sink_path:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let writable_marker = writable_path
+        .canonicalize()
+        .unwrap_or(writable_path)
+        .display()
+        .to_string();
+    assert!(
+        sink_contents.contains(&writable_marker),
+        "startup row must name the later writable pool: {sink_contents}"
+    );
+}
+
 /// A genuine `ConnectionPool::writer()` admission timeout (a held writer +
 /// a tiny `checkout_timeout`) must produce a `"kind":"timeout"` /
 /// `"site":"pool_admission"` row naming this pool's own database path.
@@ -396,6 +510,11 @@ async fn text_busy_standalone_writer_emits_ndjson_row() {
         Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
         None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
     }
+    assert_eq!(
+        backend.pool().config().write_queue_enabled,
+        Some(false),
+        "writable StorageBackend::sqlite must preserve an explicit queue-off override"
+    );
 
     let store = backend.text("wts_busy_test").expect("text search");
 

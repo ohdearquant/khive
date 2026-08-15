@@ -34,9 +34,21 @@ import {
   Upload,
   X,
   XCircle,
-} from "lucide-react";
+} from "@/icons";
 import { useMemo, useRef, useState } from "react";
 
+import {
+  edgeDirectionMark,
+  edgeHueStyle,
+  EntityKindMark,
+  kindHueStyle,
+  NoteKindMark,
+  OntologyKindMark,
+  OntologyLegend,
+  RelationMark,
+} from "@/components/ontology-mark";
+import { settleGraphLayout } from "@/lib/graph-layout";
+import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import {
   isReviewReport,
   parseReviewInput,
@@ -345,6 +357,26 @@ function FieldDiff({ field }: { field: ReviewChange["fields"][number] }) {
   );
 }
 
+function ChangeOntologyMark({ change }: { change: ReviewChange }) {
+  const valueAt = (path: string) => {
+    const field = change.fields.find((candidate) => candidate.path === path);
+    return field?.after ?? field?.before;
+  };
+  if (change.substrate === "entity") {
+    const value = valueAt("entity_kind") ?? valueAt("kind");
+    const kind = typeof value === "string" ? value : "entity";
+    return <EntityKindMark className="substrate-chip" kind={kind} />;
+  }
+  if (change.substrate === "note") {
+    const value = valueAt("note_kind") ?? valueAt("kind");
+    const kind = typeof value === "string" ? value : "note";
+    return <NoteKindMark className="substrate-chip" kind={kind} />;
+  }
+  const value = valueAt("relation");
+  const relation = typeof value === "string" ? value : "edge";
+  return <RelationMark className="substrate-chip edge" relation={relation} />;
+}
+
 function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; selected: boolean; onSelect: () => void }) {
   return (
     <article className={`change-card ${change.change} ${selected ? "selected" : ""}`}>
@@ -356,7 +388,7 @@ function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; sele
           <strong>{change.title}</strong>
           <span>{change.subtitle}</span>
         </div>
-        <span className={`substrate-chip ${change.substrate}`}>{change.substrate}</span>
+        <ChangeOntologyMark change={change} />
         <TierPill tier={change.tier} />
         <ChevronDown className={selected ? "rotated" : ""} aria-hidden="true" />
       </button>
@@ -416,11 +448,34 @@ function ChangesView({ bundle, query, onQuery }: { bundle: ReviewBundle; query: 
   );
 }
 
-function GraphView({ bundle }: { bundle: ReviewBundle }) {
-  const [selectedId, setSelectedId] = useState(bundle.graph.nodes.items[0]?.id ?? "");
-  const selected = bundle.graph.nodes.items.find((node) => node.id === selectedId) ?? bundle.graph.nodes.items[0];
+type GraphSelection = { type: "node" | "edge"; id: string };
 
-  const nodeById = useMemo(() => new Map(bundle.graph.nodes.items.map((node) => [node.id, node])), [bundle.graph.nodes.items]);
+function GraphView({ bundle }: { bundle: ReviewBundle }) {
+  const [selection, setSelection] = useState<GraphSelection>({
+    type: "node",
+    id: bundle.graph.nodes.items[0]?.id ?? "",
+  });
+
+  const settledNodes = useMemo(
+    () => settleGraphLayout(bundle.graph.nodes.items, bundle.graph.edges.items),
+    [bundle.graph.edges.items, bundle.graph.nodes.items],
+  );
+
+  const nodeById = useMemo(
+    () => new Map(settledNodes.map((node) => [node.id, node])),
+    [settledNodes],
+  );
+  const edgeById = useMemo(() => new Map(bundle.graph.edges.items.map((edge) => [edge.id, edge])), [bundle.graph.edges.items]);
+
+  const selectNode = (id: string) => setSelection({ type: "node", id });
+  const selectEdge = (id: string) => setSelection({ type: "edge", id });
+
+  const selected = selection.type === "node"
+    ? settledNodes.find((node) => node.id === selection.id) ?? settledNodes[0]
+    : undefined;
+  const selectedEdge = selection.type === "edge" ? edgeById.get(selection.id) : undefined;
+  const selectedEdgeSource = selectedEdge ? nodeById.get(selectedEdge.source) : undefined;
+  const selectedEdgeTarget = selectedEdge ? nodeById.get(selectedEdge.target) : undefined;
 
   return (
     <div className="view-stack">
@@ -429,35 +484,79 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
           <span className="eyebrow">Bounded 2-hop context</span>
           <h2>Affected subgraph</h2>
         </div>
-        <div className="graph-legend">
-          <span><i className="added" /> Added</span>
-          <span><i className="modified" /> Changed</span>
-          <span><i className="context" /> Context</span>
+        <div className="graph-legend-block">
+          <div className="graph-legend">
+            <span><i className="added" /> Added</span>
+            <span><i className="modified" /> Changed</span>
+            <span><i className="context" /> Context</span>
+          </div>
+          <OntologyLegend
+            className="graph-ontology-legend"
+            presentEntityKinds={bundle.graph.nodes.items.map((node) => node.kind)}
+            presentRelations={bundle.graph.edges.items.map((edge) => edge.relation)}
+          />
         </div>
       </div>
       <div className="graph-stage">
         <svg className="graph-lines" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <marker id="studio-ontology-arrow" markerHeight="6" markerWidth="6" orient="auto" refX="5" refY="3" viewBox="0 0 6 6">
+              <path d="M 0 0 L 6 3 L 0 6 z" fill="context-stroke" />
+            </marker>
+          </defs>
           {bundle.graph.edges.items.map((edge) => {
             const source = nodeById.get(edge.source);
             const target = nodeById.get(edge.target);
             if (!source || !target) return null;
+            const legend = edgeLegendFor(edge.relation);
+            const direction = edgeDirectionMark(legend, source, target);
             return (
               <g key={edge.id} className={edge.state}>
-                <line x1={source.x} y1={source.y} x2={target.x} y2={target.y} vectorEffect="non-scaling-stroke" />
-                <circle cx={(source.x + target.x) / 2} cy={(source.y + target.y) / 2} r="1.2" vectorEffect="non-scaling-stroke" />
+                <line
+                  className="ontology-edge"
+                  data-edge-family={legend.family}
+                  data-edge-treatment={legend.treatment}
+                  data-edge-variant={legend.variant}
+                  data-edge-origin="ingested"
+                  markerEnd={legend.directed ? "url(#studio-ontology-arrow)" : undefined}
+                  style={edgeHueStyle(legend)}
+                  x1={source.x}
+                  y1={source.y}
+                  x2={target.x}
+                  y2={target.y}
+                  vectorEffect="non-scaling-stroke"
+                />
+                <text
+                  className="ontology-edge-glyph"
+                  data-edge-directed={legend.directed}
+                  style={edgeHueStyle(legend)}
+                  x={(source.x + target.x) / 2}
+                  y={(source.y + target.y) / 2}
+                >
+                  {legend.glyph}
+                </text>
+                {direction && (
+                  <text
+                    className="ontology-direction-glyph"
+                    style={edgeHueStyle(legend)}
+                    transform={direction.transform}
+                    x={direction.x}
+                    y={direction.y}
+                  >›</text>
+                )}
               </g>
             );
           })}
         </svg>
-        {bundle.graph.nodes.items.map((node) => (
+        {settledNodes.map((node) => (
           <button
             type="button"
-            className={`graph-node ${node.state} ${node.id === selectedId ? "selected" : ""}`}
-            style={{ left: `${node.x}%`, top: `${node.y}%` }}
+            className={`graph-node ${node.state} ${selection.type === "node" && node.id === selection.id ? "selected" : ""}`}
+            style={{ left: `${node.x}%`, top: `${node.y}%`, ...kindHueStyle(entityLegendFor(node.kind)) }}
             key={node.id}
-            onClick={() => setSelectedId(node.id)}
+            onClick={() => selectNode(node.id)}
           >
-            <span className="node-kind">{node.kind}</span>
+            <EntityKindMark className="node-kind" kind={node.kind} />
             <strong>{node.label}</strong>
           </button>
         ))}
@@ -466,13 +565,16 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
           const target = nodeById.get(edge.target);
           if (!source || !target) return null;
           return (
-            <span
+            <button
+              type="button"
               key={`${edge.id}-label`}
-              className={`edge-label ${edge.state}`}
+              className={`edge-label ${edge.state} ${selection.type === "edge" && edge.id === selection.id ? "selected" : ""}`}
               style={{ left: `${(source.x + target.x) / 2}%`, top: `${(source.y + target.y) / 2}%` }}
+              aria-pressed={selection.type === "edge" && edge.id === selection.id}
+              onClick={() => selectEdge(edge.id)}
             >
-              {edge.relation} · {edge.weight.toFixed(2)}
-            </span>
+              <RelationMark relation={edge.relation} /> · {edge.weight.toFixed(2)}
+            </button>
           );
         })}
       </div>
@@ -485,24 +587,44 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
             if (!source || !target) return null;
             return (
               <li key={`${edge.id}-summary`}>
-                <strong>{source.label}</strong>
-                <span>{edge.relation} · {edge.weight.toFixed(2)}</span>
-                <strong>{target.label}</strong>
-                <em>{edge.state}</em>
+                <button
+                  type="button"
+                  className={selection.type === "edge" && edge.id === selection.id ? "selected" : ""}
+                  aria-pressed={selection.type === "edge" && edge.id === selection.id}
+                  onClick={() => selectEdge(edge.id)}
+                >
+                  <strong>{source.label}</strong>
+                  <span><RelationMark relation={edge.relation} /><span className="visually-hidden">{edge.relation}</span> · {edge.weight.toFixed(2)}</span>
+                  <strong>{target.label}</strong>
+                  <em>{edge.state}</em>
+                </button>
               </li>
             );
           })}
         </ul>
       </section>
       {selected && (
-        <div className="node-inspector">
+        <div className="node-inspector" style={kindHueStyle(entityLegendFor(selected.kind))}>
           <div className={`node-state-dot ${selected.state}`} />
           <div>
-            <span>{selected.kind} · {selected.state}</span>
+            <EntityKindMark className="node-inspector-kind" kind={selected.kind} showLabel={false} />
+            <span>{entityLegendFor(selected.kind).label} · {selected.state}</span>
             <strong>{selected.label}</strong>
             <p>{selected.description}</p>
           </div>
           <code>{shortHash(selected.id)}</code>
+        </div>
+      )}
+      {selectedEdge && selectedEdgeSource && selectedEdgeTarget && (
+        <div className="node-inspector edge-inspector" style={edgeHueStyle(edgeLegendFor(selectedEdge.relation))}>
+          <div className={`node-state-dot ${selectedEdge.state}`} />
+          <div>
+            <RelationMark className="node-inspector-kind" relation={selectedEdge.relation} showLabel={false} />
+            <span>{edgeLegendFor(selectedEdge.relation).label} · {selectedEdge.state}</span>
+            <strong>{selectedEdgeSource.label} → {selectedEdgeTarget.label}</strong>
+            <p>Weight {selectedEdge.weight.toFixed(2)}</p>
+          </div>
+          <code>{shortHash(selectedEdge.id)}</code>
         </div>
       )}
       <PageNotice page={bundle.graph.nodes} label="Graph nodes" />
@@ -603,7 +725,7 @@ function RetrievalView({ bundle }: { bundle: ReviewBundle }) {
       {mode === "search" && (
         <div className="retrieval-results">
           {bundle.retrieval.search.items.map((result, index) => (
-            <article key={result.id}><span className="result-rank">{index + 1}</span><div><strong>{result.title}</strong><span>{result.kind} · score {result.score}</span><p>{result.snippet}</p></div><code>{result.id}</code></article>
+            <article key={result.id}><span className="result-rank">{index + 1}</span><div><strong>{result.title}</strong><span><OntologyKindMark kind={result.kind} /> · score {result.score}</span><p>{result.snippet}</p></div><code>{result.id}</code></article>
           ))}
         </div>
       )}
@@ -619,8 +741,8 @@ function RetrievalView({ bundle }: { bundle: ReviewBundle }) {
           {bundle.retrieval.traversal.items.map((node, index) => (
             <div className={`traversal-row depth-${node.depth}`} key={`${node.id}-${index}`}>
               <span className="traversal-line" aria-hidden="true" />
-              <span className="traversal-node"><Circle /></span>
-              <div><strong>{node.name}</strong><span>{node.kind}{node.via ? ` · ${node.via}` : " · root"}</span></div>
+              <span className="traversal-node"><EntityKindMark kind={node.kind} showLabel={false} /></span>
+              <div><strong>{node.name}</strong><span><EntityKindMark kind={node.kind} />{node.via ? <> · <RelationMark relation={node.via} /></> : " · root"}</span></div>
               <code>{node.id}</code>
             </div>
           ))}
@@ -763,6 +885,28 @@ function ViewSurface({ activeView, bundle, query, onQuery }: { activeView: View;
   return <ChangesView bundle={bundle} query={query} onQuery={onQuery} />;
 }
 
+function OperationOntologyMark({
+  operation,
+}: {
+  operation: ReviewReport["change_set"]["operations"][number];
+}) {
+  const record = operation.after ?? operation.before;
+  const stringField = (...names: string[]) => {
+    for (const name of names) {
+      const value = record?.[name];
+      if (typeof value === "string") return value;
+    }
+    return undefined;
+  };
+  if (operation.target === "entity") {
+    return <EntityKindMark className="substrate-chip" kind={stringField("entity_kind", "kind") ?? "entity"} />;
+  }
+  if (operation.target === "note") {
+    return <NoteKindMark className="substrate-chip" kind={stringField("note_kind", "kind") ?? "note"} />;
+  }
+  return <RelationMark className="substrate-chip edge" relation={stringField("relation") ?? "edge"} />;
+}
+
 function CoreReviewStudio({
   report,
   onImport,
@@ -825,7 +969,7 @@ function CoreReviewStudio({
                     <div className="change-summary core-operation-summary">
                       <span className="change-sign">{operation.index + 1}</span>
                       <div className="change-title"><strong>{operation.summary}</strong><span>{operation.reason}</span></div>
-                      <span className={`substrate-chip ${operation.target}`}>{operation.target}</span>
+                      <OperationOntologyMark operation={operation} />
                       <TierPill tier={operation.tier} />
                     </div>
                     <div className="change-detail core-operation-detail">

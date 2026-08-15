@@ -250,12 +250,12 @@ def test_merge_entity_rewires_edges_unions_tags_drops_self_loops(
 
     # No edges referencing the removed entity
     gone_out = khive_session.verb("list", {"kind": "edge", "source_id": gone["id"],
-                                            "namespace": temp_namespace})
+                                            "namespace": temp_namespace})["items"]
     assert gone_out == [], (
         f"No edges with source_id=gone should remain: {gone_out}"
     )
     gone_in = khive_session.verb("list", {"kind": "edge", "target_id": gone["id"],
-                                           "namespace": temp_namespace})
+                                           "namespace": temp_namespace})["items"]
     assert gone_in == [], (
         f"No edges with target_id=gone should remain: {gone_in}"
     )

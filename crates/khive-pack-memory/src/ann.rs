@@ -672,7 +672,11 @@ pub(crate) async fn ensure_ann_background(
     ann: &SharedAnn,
     model: &str,
 ) -> bool {
-    if model.is_empty() {
+    // Request-time recall and mutation hooks share this entry point with
+    // daemon warm. A snapshot may use an already-loaded bridge or the exact
+    // sqlite-vec fallback, but it must never enqueue registration,
+    // checkpoint, or compaction work against its read-only backend.
+    if rt.is_read_only() || model.is_empty() {
         return false;
     }
     let key = AnnKey::from_token(model);
@@ -1599,67 +1603,104 @@ async fn tail_exists(rt: &KhiveRuntime, model: &str, s: u64) -> Result<bool, Str
 }
 
 /// Fetch the scope's tail (rows above `s`, all namespaces, ordered), coalesce
-/// to the final op per subject, and point-read embeddings for final upserts.
+/// to the final op per subject, and hydrate embeddings for final upserts.
 /// Two distinct outcomes for a final upsert (ADR-079 Amendment 1,
 /// join-filtered corpora): a vec row that is absent or out of scope
 /// contradicts the committed log (same-transaction writes) → `Err` → Cold;
 /// a row that is present but whose note fails the join predicate
 /// (soft-deleted, or gone) replays as a delete — its final corpus state is
-/// absence. Returns the ops and the new watermark.
+/// absence. The suffix, vectors, and note liveness are read by one statement,
+/// which is the snapshot boundary even for pool-backed readers. Returns the
+/// ops and the new watermark.
 pub(crate) async fn fetch_final_tail(
     rt: &KhiveRuntime,
     model: &str,
     s: u64,
-    limit: Option<u64>,
+    live_threshold: Option<f64>,
 ) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
-    fetch_final_tail_on(reader.as_mut(), model, s, limit).await
+    fetch_final_tail_on(reader.as_mut(), model, s, live_threshold).await
 }
 
-/// Same as [`fetch_final_tail`] but runs every read through a caller-supplied
-/// reader instead of acquiring its own connection — used by the ADR-118 §1
-/// "Compaction linearization" fix to keep the registry-minimum guard and this
-/// scan inside one read snapshot (see [`fresh_tail_serving`]).
+/// Same as [`fetch_final_tail`] but runs its single snapshot statement through
+/// a caller-supplied reader instead of acquiring its own handle. Serving paths
+/// also use this seam while coordinating the ADR-118 §1 registry guard.
 async fn fetch_final_tail_on(
     reader: &mut dyn khive_storage::SqlReader,
     model: &str,
     s: u64,
-    limit: Option<u64>,
+    live_threshold: Option<f64>,
 ) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
-    // `limit` (ADR-118 §3, Cold/Empty tier): cap the scan to the newest
-    // `limit` log rows instead of the entire scope, taking the highest-seq
-    // suffix so the freshest writes stay visible. The DESC+LIMIT rows are
-    // reversed back to ascending order below so final-op-per-subject
-    // coalescing (insert-overwrite = last write wins) is unaffected.
-    let order_limit = match limit {
-        Some(n) => format!("ORDER BY seq DESC LIMIT {n}"),
-        None => "ORDER BY seq".to_string(),
+    // `live_threshold` (ADR-118 §3, Cold/Empty tier): cap the scan to
+    // ceil(threshold × live corpus) newest log rows. The live count and log
+    // suffix, vectors, and note liveness share one statement snapshot. The
+    // outer ORDER BY restores ascending sequence order after newest-suffix
+    // selection so final-op-per-subject coalescing remains last-write-wins.
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let (live_cte, order_limit) = match live_threshold {
+        Some(_) => (
+            format!(
+                "live AS (\
+                   SELECT COUNT(*) AS live_count FROM {table_name} v \
+                   JOIN notes n ON n.id = v.subject_id \
+                   WHERE v.embedding_model = ?1 \
+                     AND v.kind = 'note' AND v.field = 'note.content' \
+                     AND n.deleted_at IS NULL\
+                 ), "
+            ),
+            "ORDER BY seq DESC \
+             LIMIT (SELECT CAST(live_count * ?3 AS INTEGER) + \
+                       CASE WHEN CAST(live_count * ?3 AS INTEGER) < live_count * ?3 \
+                            THEN 1 ELSE 0 END FROM live)"
+                .to_string(),
+        ),
+        None => (String::new(), "ORDER BY seq".to_string()),
     };
+    let mut params = vec![
+        SqlValue::Text(model.to_owned()),
+        SqlValue::Integer(s as i64),
+    ];
+    if let Some(threshold) = live_threshold {
+        params.push(SqlValue::Float(threshold));
+    }
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT seq, subject_id, op FROM ann_write_log \
-                  WHERE embedding_model = ?1 \
-                    AND kind = 'note' AND field = 'note.content' AND seq > ?2 \
-                  {order_limit}"
+                "WITH {live_cte}selected AS (\
+                   SELECT seq, subject_id, op FROM ann_write_log \
+                   WHERE embedding_model = ?1 \
+                     AND kind = 'note' AND field = 'note.content' AND seq > ?2 \
+                   {order_limit}\
+                 ) \
+                 SELECT selected.seq, selected.subject_id, selected.op, \
+                        vectors.embedding_model AS vector_model, \
+                        vectors.kind AS vector_kind, \
+                        vectors.field AS vector_field, vectors.embedding, \
+                        live_note.id AS live_note_id \
+                 FROM selected \
+                 LEFT JOIN {table_name} AS vectors \
+                   ON vectors.subject_id = selected.subject_id \
+                 LEFT JOIN notes AS live_note \
+                   ON live_note.id = selected.subject_id \
+                  AND live_note.deleted_at IS NULL \
+                 ORDER BY selected.seq"
             ),
-            params: vec![
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Integer(s as i64),
-            ],
-            label: Some("memory_ann_fetch_tail".into()),
+            params,
+            label: Some("memory_ann_fresh_tail_snapshot".into()),
         })
         .await
         .map_err(|e| e.to_string())?;
-    let mut rows = rows;
-    if limit.is_some() {
-        rows.reverse();
-    }
 
     let mut new_s = s;
+    type RawVector = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    );
     // Ordered iteration + insert-overwrite = final op per subject wins.
-    let mut finals: Vec<(Uuid, bool)> = Vec::new();
+    let mut finals: Vec<(Uuid, bool, RawVector, bool)> = Vec::new();
     let mut index_of: HashMap<Uuid, usize> = HashMap::new();
     for row in &rows {
         let seq = match row.get("seq") {
@@ -1677,121 +1718,84 @@ async fn fetch_final_tail_on(
             Some(SqlValue::Text(t)) => t == "delete",
             _ => return Err("ann_write_log.op: unexpected value".into()),
         };
+        let raw_vector = (
+            match row.get("vector_model") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("vector_kind") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("vector_field") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("embedding") {
+                Some(SqlValue::Blob(value)) => Some(value.clone()),
+                _ => None,
+            },
+        );
+        let is_live = matches!(
+            row.get("live_note_id"),
+            Some(SqlValue::Text(id)) if Uuid::parse_str(id).ok() == Some(uuid)
+        );
         match index_of.get(&uuid) {
-            Some(&i) => finals[i].1 = is_delete,
+            Some(&i) => finals[i] = (uuid, is_delete, raw_vector, is_live),
             None => {
                 index_of.insert(uuid, finals.len());
-                finals.push((uuid, is_delete));
-            }
-        }
-    }
-
-    let upsert_ids: Vec<Uuid> = finals
-        .iter()
-        .filter(|(_, is_delete)| !is_delete)
-        .map(|(u, _)| *u)
-        .collect();
-
-    // Per-subject point reads: the vec0 vtable plans a point lookup only for a
-    // single PRIMARY KEY equality constraint — an `IN (...)` batch or any extra
-    // predicate degrades to a full scan. Scope is therefore checked in Rust.
-    // A vec row that is absent, or present but out of this consumer's scope,
-    // contradicts the log's committed final upsert (vec writes and log appends
-    // are same-transaction) → Err, which the caller treats as Cold.
-    let table_name = format!("vec_{}", sanitize_model_key(model));
-    let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::with_capacity(upsert_ids.len());
-    for subject in &upsert_ids {
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: format!(
-                    "SELECT embedding_model, kind, field, embedding \
-                     FROM {table_name} WHERE subject_id = ?1"
-                ),
-                params: vec![SqlValue::Text(subject.to_string())],
-                label: Some("memory_ann_tail_point_read".into()),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        let Some(row) = rows.first() else {
-            return Err(format!(
-                "tail upsert {subject}: vector row absent (log/corpus contradiction)"
-            ));
-        };
-        let in_scope = matches!(row.get("embedding_model"), Some(SqlValue::Text(m)) if m == model)
-            && matches!(row.get("kind"), Some(SqlValue::Text(k)) if k == "note")
-            && matches!(row.get("field"), Some(SqlValue::Text(f)) if f == "note.content");
-        if !in_scope {
-            return Err(format!(
-                "tail upsert {subject}: vector row out of consumer scope (log/corpus contradiction)"
-            ));
-        }
-        let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
-            return Err(format!("tail upsert {subject}: embedding is not a blob"));
-        };
-        let vec: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        embeddings.insert(*subject, vec);
-    }
-
-    // Join-predicate check on the regular notes table (batched IN is fine
-    // there). A subject whose vec row exists but whose note fails the
-    // join-filtered corpus predicate (soft-deleted, or gone) is not a
-    // contradiction: its final corpus state is absence → replay as delete
-    // (ADR-079 Amendment 1, join-filtered corpora).
-    let mut live_notes: HashSet<Uuid> = HashSet::with_capacity(upsert_ids.len());
-    for chunk in upsert_ids.chunks(500) {
-        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
-        let params: Vec<SqlValue> = chunk
-            .iter()
-            .map(|u| SqlValue::Text(u.to_string()))
-            .collect();
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: format!(
-                    "SELECT id FROM notes WHERE deleted_at IS NULL AND id IN ({})",
-                    placeholders.join(", ")
-                ),
-                params,
-                label: Some("memory_ann_tail_live_notes".into()),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        for row in &rows {
-            if let Some(SqlValue::Text(id_str)) = row.get("id") {
-                if let Ok(uuid) = Uuid::parse_str(id_str) {
-                    live_notes.insert(uuid);
-                }
+                finals.push((uuid, is_delete, raw_vector, is_live));
             }
         }
     }
 
     let mut ops: Vec<(Uuid, Option<Vec<f32>>)> = Vec::with_capacity(finals.len());
-    for (uuid, is_delete) in finals {
+    for (subject, is_delete, (vector_model, vector_kind, vector_field, embedding), is_live) in
+        finals
+    {
         if is_delete {
-            ops.push((uuid, None));
-        } else if live_notes.contains(&uuid) {
-            let embedding = embeddings
-                .remove(&uuid)
-                .ok_or_else(|| format!("tail upsert {uuid}: embedding vanished mid-replay"))?;
-            ops.push((uuid, Some(embedding)));
+            ops.push((subject, None));
+            continue;
+        }
+        // A vec row that is absent or outside this consumer's scope
+        // contradicts the committed upsert. The LEFT JOIN keeps that absence
+        // visible to this check instead of silently dropping the log row.
+        if vector_model.is_none()
+            && vector_kind.is_none()
+            && vector_field.is_none()
+            && embedding.is_none()
+        {
+            return Err(format!(
+                "tail upsert {subject}: vector row absent (log/corpus contradiction)"
+            ));
+        }
+        let in_scope = vector_model.as_deref() == Some(model)
+            && vector_kind.as_deref() == Some("note")
+            && vector_field.as_deref() == Some("note.content");
+        if !in_scope {
+            return Err(format!(
+                "tail upsert {subject}: vector row out of consumer scope (log/corpus contradiction)"
+            ));
+        }
+        let Some(bytes) = embedding else {
+            return Err(format!("tail upsert {subject}: embedding is not a blob"));
+        };
+        let vector: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        if is_live {
+            ops.push((subject, Some(vector)));
         } else {
-            ops.push((uuid, None));
+            // A vector whose note is soft-deleted or gone is a valid
+            // join-filtered absence, represented as a delete in the replay.
+            ops.push((subject, None));
         }
     }
     Ok((ops, new_s))
 }
 
 // ── ADR-118: fresh-tail exact leg (read-your-writes recall visibility) ─────────
-
-/// `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Any
-/// other value, including unset, leaves it enabled.
-fn fresh_tail_enabled() -> bool {
-    std::env::var("KHIVE_ANN_FRESH_TAIL")
-        .map(|v| v != "0")
-        .unwrap_or(true)
-}
 
 /// Read the currently-installed bridge's fresh-tail watermark for `key`: the
 /// `ann_write_log` seq its corpus state reflects, or `None` if no bridge is
@@ -1834,12 +1838,12 @@ async fn registry_min_watermark_on(
     }))
 }
 
-/// Open an explicit read transaction so every subsequent query through
-/// `reader` observes one consistent snapshot (ADR-118 §1 "Compaction
-/// linearization") instead of each `query_all` call taking its own implicit
-/// per-statement snapshot (the default for a connection with no open
-/// transaction). `BEGIN DEFERRED` is valid on a read-only connection: it
-/// starts a read transaction, not a write.
+/// Open an explicit read transaction for reader implementations that retain
+/// one connection across calls (ADR-118 §1 "Compaction linearization"). A
+/// pool-backed reader may reacquire a connection per method call, so
+/// load-bearing corpus hydration must still use one statement; see
+/// [`fetch_final_tail_on`]. `BEGIN DEFERRED` is valid on a read-only
+/// connection: it starts a read transaction, not a write.
 async fn begin_read_snapshot(reader: &mut dyn khive_storage::SqlReader) -> Result<(), String> {
     reader
         .query_all(SqlStatement {
@@ -1973,9 +1977,9 @@ pub(crate) enum FreshTailOutcome {
 /// (and primary) tier: a serving bridge exists, and every committed write
 /// above its watermark is merged in, giving read-your-writes visibility.
 /// `s = None` is the second tier (§3): no serving index is available at all,
-/// so the leg caps its scan at a fixed-ceiling newest suffix of the log
-/// instead of the entire scope, guaranteeing visibility of only the
-/// caller's most recent writes until a serving index exists again.
+/// so the leg caps its scan at a corpus-relative newest suffix of the log
+/// instead of the entire scope, guaranteeing visibility of only the caller's
+/// most recent writes until a serving index exists again.
 /// `query`/`k` are the recall vector and fetch limit — needed only by the
 /// serving tier's mismatch re-resolution path, which must run a fresh ANN
 /// search against a newly loaded segment.
@@ -2043,8 +2047,10 @@ pub(crate) async fn fresh_tail_leg(
         }
     }
 
-    if !fresh_tail_enabled() {
-        return FreshTailOutcome::Skipped("fresh-tail leg disabled via KHIVE_ANN_FRESH_TAIL");
+    if !rt.ann_fresh_tail_enabled() {
+        return FreshTailOutcome::Skipped(
+            "fresh-tail leg disabled by runtime policy (KHIVE_ANN_FRESH_TAIL is sampled at construction)",
+        );
     }
 
     match s {
@@ -2053,10 +2059,11 @@ pub(crate) async fn fresh_tail_leg(
     }
 }
 
-/// Tier 1: a serving bridge exists at watermark `s`. The registry-minimum
-/// guard, the tail scan, and the tail's embedding point-reads run inside ONE
-/// read transaction (ADR-118 §1 "Compaction linearization") so compaction
-/// cannot strike between the guard and the fetch it is meant to justify.
+/// Tier 1: a serving bridge exists at watermark `s`. Standalone readers keep
+/// the registry-minimum guard and tail statement inside one read transaction
+/// (ADR-118 §1 "Compaction linearization"). Independently, the tail suffix,
+/// current embeddings, and note liveness always share one statement snapshot,
+/// including on pool-backed readers.
 async fn fresh_tail_serving(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -2375,19 +2382,20 @@ async fn fresh_tail_reresolve(
     unreachable!("the loop always returns on or before its terminal round")
 }
 
-/// Fixed ceiling for the Cold/Empty-tier capped scan (ADR-118 §3). Deriving
-/// a corpus-proportional cap (`ann_rebuild_threshold() * live`) needs an
-/// O(corpus) live-count join — appropriate for the background restart
-/// classifier, not for this per-query path. The ceiling is
-/// a fixed, conservative match to the ADR's own worked example (a 0.20
-/// threshold on a 68k-row corpus is ~13.6k comparisons).
-const FRESH_TAIL_CAPPED_MAX_ROWS: u64 = 20_000;
-
 /// Tier 2 (§3): no serving index at all. A cheap, log-only existence probe
 /// (no corpus join) fast-paths the common empty-tail case; a non-empty tail
-/// is capped at a fixed ceiling rather than a live-corpus-proportional one,
-/// so this bounded fallback never itself pays an O(corpus) cost.
+/// is capped at ceil(`ann_rebuild_threshold() * live corpus`) rows. After the
+/// probe, one statement/snapshot computes that live count, selects the newest
+/// suffix, and hydrates its current vectors and note liveness.
 async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
+    fresh_tail_capped_at_threshold(rt, model, ann_rebuild_threshold()).await
+}
+
+async fn fresh_tail_capped_at_threshold(
+    rt: &KhiveRuntime,
+    model: &str,
+    live_threshold: f64,
+) -> FreshTailOutcome {
     match tail_exists(rt, model, 0).await {
         Ok(false) => return FreshTailOutcome::Ops(Vec::new()),
         Ok(true) => {}
@@ -2396,7 +2404,7 @@ async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
             return FreshTailOutcome::Skipped("fresh-tail: tail-existence read failed");
         }
     }
-    match fetch_final_tail(rt, model, 0, Some(FRESH_TAIL_CAPPED_MAX_ROWS)).await {
+    match fetch_final_tail(rt, model, 0, Some(live_threshold)).await {
         Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: capped tail fetch failed; skipping exact leg");
@@ -2726,6 +2734,147 @@ async fn classify_and_adopt_segment(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    struct InterleavingTailReader {
+        subject: Uuid,
+        calls: Vec<String>,
+    }
+
+    impl InterleavingTailReader {
+        fn row(columns: Vec<(&str, SqlValue)>) -> khive_storage::SqlRow {
+            khive_storage::SqlRow {
+                columns: columns
+                    .into_iter()
+                    .map(|(name, value)| khive_storage::types::SqlColumn {
+                        name: name.to_owned(),
+                        value,
+                    })
+                    .collect(),
+            }
+        }
+
+        fn embedding(values: &[f32]) -> SqlValue {
+            SqlValue::Blob(
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for InterleavingTailReader {
+        async fn query_row(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Option<khive_storage::SqlRow>> {
+            panic!("fresh-tail replay must use query_all")
+        }
+
+        async fn query_all(
+            &mut self,
+            statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Vec<khive_storage::SqlRow>> {
+            let label = statement.label.unwrap_or_default();
+            self.calls.push(label.clone());
+            let id = SqlValue::Text(self.subject.to_string());
+            Ok(match label.as_str() {
+                // The coherent snapshot: the suffix and its matching current
+                // vector are both the pre-commit state.
+                "memory_ann_fresh_tail_snapshot" => {
+                    assert!(
+                        statement.sql.contains("COUNT(*) AS live_count"),
+                        "the snapshot statement must derive the corpus-relative cap"
+                    );
+                    assert!(
+                        statement.sql.contains("LIMIT (SELECT"),
+                        "the snapshot statement must apply the derived newest-suffix cap"
+                    );
+                    assert!(
+                        statement.sql.contains("LEFT JOIN vec_snapshot_race_model"),
+                        "the snapshot statement must hydrate the selected suffix's vectors"
+                    );
+                    assert!(
+                        statement.sql.contains("LEFT JOIN notes"),
+                        "the snapshot statement must evaluate note liveness"
+                    );
+                    vec![Self::row(vec![
+                        ("seq", SqlValue::Integer(1)),
+                        ("subject_id", id),
+                        ("op", SqlValue::Text("upsert".into())),
+                        ("vector_model", SqlValue::Text("snapshot-race-model".into())),
+                        ("vector_kind", SqlValue::Text("note".into())),
+                        ("vector_field", SqlValue::Text("note.content".into())),
+                        ("embedding", Self::embedding(&[1.0, 0.0])),
+                        ("live_note_id", SqlValue::Text(self.subject.to_string())),
+                    ])]
+                }
+                // Legacy multi-query behavior: a writer commits immediately
+                // after suffix selection, so the next pooled read observes a
+                // newer vector than the selected log row described.
+                "memory_ann_fetch_tail" => vec![Self::row(vec![
+                    ("seq", SqlValue::Integer(1)),
+                    ("subject_id", id),
+                    ("op", SqlValue::Text("upsert".into())),
+                ])],
+                "memory_ann_tail_point_read" => vec![Self::row(vec![
+                    (
+                        "embedding_model",
+                        SqlValue::Text("snapshot-race-model".into()),
+                    ),
+                    ("kind", SqlValue::Text("note".into())),
+                    ("field", SqlValue::Text("note.content".into())),
+                    ("embedding", Self::embedding(&[0.0, 1.0])),
+                ])],
+                "memory_ann_tail_live_notes" => vec![Self::row(vec![(
+                    "id",
+                    SqlValue::Text(self.subject.to_string()),
+                )])],
+                other => panic!("unexpected fresh-tail query label: {other}"),
+            })
+        }
+
+        async fn query_scalar(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Option<SqlValue>> {
+            panic!("fresh-tail replay must use query_all")
+        }
+
+        async fn explain(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Vec<khive_storage::SqlRow>> {
+            panic!("fresh-tail replay must not issue EXPLAIN")
+        }
+    }
+
+    /// A writer committing between suffix selection and corpus hydration must
+    /// not let a pool-backed reader combine the old log row with the new
+    /// vector. One statement makes the commit entirely visible or entirely
+    /// invisible; this seam deterministically advances after the first call.
+    #[tokio::test]
+    async fn fresh_tail_snapshot_cannot_return_a_torn_log_vector_pair() {
+        let subject = Uuid::new_v4();
+        let mut reader = InterleavingTailReader {
+            subject,
+            calls: Vec::new(),
+        };
+
+        let (ops, watermark) =
+            fetch_final_tail_on(&mut reader, "snapshot-race-model", 0, Some(0.20))
+                .await
+                .expect("fresh-tail snapshot");
+
+        assert_eq!(watermark, 1);
+        assert_eq!(ops, vec![(subject, Some(vec![1.0, 0.0]))]);
+        assert_eq!(
+            reader.calls,
+            vec!["memory_ann_fresh_tail_snapshot"],
+            "one logical no-index replay must execute exactly one SQLite statement"
+        );
+    }
 
     #[test]
     fn outcome_into_candidates_replace_with_reason_discloses_degradation() {
@@ -3164,9 +3313,11 @@ mod tests {
     /// for the pathless publication lock and revalidate the now-active row,
     /// not evict the candidate that the checkpoint is about to publish.
     #[tokio::test]
+    #[serial(adr118_fresh_tail)]
     async fn pathless_pending_reader_waits_for_checkpoint_activation() {
         const MODEL: &str = "pathless-pending-publication-wait";
         let rt = KhiveRuntime::memory().expect("runtime");
+        provision_test_vector_store(&rt, MODEL, 4);
         let ann = new_shared();
         let key = AnnKey::new(MODEL);
         register_consumer(&rt, MODEL)
@@ -3223,6 +3374,7 @@ mod tests {
     /// loses its registration while the reader is blocked, revalidation must
     /// still evict and return an empty replacement leg.
     #[tokio::test]
+    #[serial(adr118_fresh_tail)]
     async fn pathless_pending_reader_evicts_after_registration_loss() {
         const MODEL: &str = "pathless-pending-publication-loss";
         let rt = KhiveRuntime::memory().expect("runtime");
@@ -3871,6 +4023,23 @@ mod tests {
         async fn build(&self) -> Result<Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
             Ok(Arc::new(HashVecService { dims: self.dims }))
         }
+    }
+
+    /// Provision the real sqlite-vec store that backs a manually installed
+    /// test bridge. Production bridges are built from an existing store; tests
+    /// that install one directly must preserve that schema invariant.
+    fn provision_test_vector_store(rt: &KhiveRuntime, model: &str, dims: usize) {
+        rt.register_embedder(HashVecProvider {
+            model_name: model.to_owned(),
+            dims,
+        });
+        let token = rt
+            .authorize(Namespace::local())
+            .expect("authorize vector-store fixture");
+        drop(
+            rt.vectors_for_model(&token, model)
+                .expect("provision vector-store fixture"),
+        );
     }
 
     fn test_runtime_with_hash_embedder(model: &str, dims: usize) -> KhiveRuntime {
@@ -4563,9 +4732,62 @@ mod tests {
 
     // ── ADR-118: fresh-tail exact leg ───────────────────────────────────────
 
+    /// #1161 regression: the no-index fallback follows ADR-118's
+    /// ceil(threshold × live corpus) ceiling instead of a flat 20,000-row
+    /// suffix. Six live vectors at 0.20 admit exactly the two newest raw log
+    /// rows; this also pins ceil rounding rather than truncation.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_no_index_cap_tracks_live_corpus_fraction() {
+        const MODEL: &str = "adr118-corpus-relative-cap-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let mut ids = Vec::new();
+
+        for i in 0..6u32 {
+            let note = rt
+                .create_note_with_decay_for_embedding_model(
+                    &token,
+                    "memory",
+                    None,
+                    &format!("corpus-relative cap note {i}"),
+                    Some(0.7),
+                    0.01,
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .expect("create note");
+            ids.push(note.id);
+        }
+
+        let ops = match fresh_tail_capped_at_threshold(&rt, MODEL, 0.20).await {
+            FreshTailOutcome::Ops(ops) => ops,
+            FreshTailOutcome::Replace(..) => {
+                panic!("no-index capped leg must not produce replacement candidates")
+            }
+            FreshTailOutcome::Skipped(reason) => {
+                panic!("no-index capped leg unexpectedly skipped: {reason}")
+            }
+        };
+        let selected: Vec<Uuid> = ops.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            selected,
+            ids[4..].to_vec(),
+            "ceil(0.20 × 6) must select the two newest raw log rows"
+        );
+    }
+
     /// A subject present in the stale warm ANN index whose final tail op is
     /// `delete` must be dropped from the merged candidate list — the tail is
-    /// authoritative for every subject it names.
+    /// authoritative for every subject it names. This is also #1828's direct
+    /// file-backed fresh-tail regression: `fresh_tail_serving` must retain one
+    /// admitted reader across BEGIN → registry-min → tail → COMMIT. Its
+    /// `Skipped` failure arm reports the exact reason (notably
+    /// `fresh-tail: snapshot begin failed`) so this contract cannot regress as
+    /// an opaque candidate mismatch again.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_leg_drops_subject_whose_final_tail_op_is_delete() {
@@ -4638,7 +4860,9 @@ mod tests {
         let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
             FreshTailOutcome::Ops(ops) => ops,
             FreshTailOutcome::Replace(..) => panic!("fresh-tail leg unexpectedly re-resolved"),
-            FreshTailOutcome::Skipped(_) => panic!("fresh-tail leg unexpectedly skipped"),
+            FreshTailOutcome::Skipped(reason) => {
+                panic!("fresh-tail leg unexpectedly skipped: {reason}")
+            }
         };
         let merged = merge_fresh_tail(raw, &query, ops);
         assert!(

@@ -59,7 +59,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.get",
-        description: "Fetch a single atom or domain by UUID or slug",
+        description: "Fetch a single atom or domain by UUID, exact slug, or unique short prefix",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -67,7 +67,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "id",
                 param_type: "string",
                 required: true,
-                description: "Atom/domain UUID or slug",
+                description: "Atom/domain full UUID, exact slug, or unique 8+ hex UUID prefix. Resolution order is full UUID, exact caller-namespace slug, then prefix. UUID and prefix forms are namespace-agnostic by-ID reads.",
             },
             ParamDef {
                 name: "include_sections",
@@ -429,7 +429,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.import",
-        description: "Ingest atlas markdown file(s) as atoms with parsed sections",
+        description: "Validate and ingest atlas markdown file(s) with stable path identity",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -437,7 +437,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "path",
                 param_type: "string",
                 required: true,
-                description: "Filesystem path to a markdown file or directory",
+                description: "Filesystem path to a .md file or bounded directory tree",
             },
             ParamDef {
                 name: "format",
@@ -449,7 +449,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "chunk_strategy",
                 param_type: "string",
                 required: false,
-                description: "\"section\" (one section per atom, default) or \"atom\" (entire file as one atom)",
+                description: "\"section\" (atom plus parsed section rows, default) or \"atom\" (whole markdown in one atom, no section rows)",
             },
         ],
     },

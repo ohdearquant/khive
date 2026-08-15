@@ -30,8 +30,8 @@ mod test_harness;
 
 #[cfg(test)]
 use test_harness::{
-    reset_counters, DAEMON_DISPATCH, FORCE_PID_IS_DAEMON, FORCE_PID_IS_FOREIGN, KILL_COUNT,
-    RECOVERY_RACE_BARRIER, SPAWN_COUNT,
+    reset_counters, DAEMON_DISPATCH, FORCED_CONNECT_ERROR, FORCE_PID_IS_DAEMON,
+    FORCE_PID_IS_FOREIGN, KILL_COUNT, RECOVERY_RACE_BARRIER, SPAWN_COUNT,
 };
 
 // ── local-dispatch fallback telemetry ─────────────────────────────────────────
@@ -105,8 +105,9 @@ impl FallbackReason {
             FallbackReason::ProtocolMismatch | FallbackReason::ParseFailure => {
                 FallbackSeverity::RolloutTransient
             }
-            // No daemon reachable at all — the ADR-049-mandated fallback
-            // path (CI, `KHIVE_NO_DAEMON=1`, read-only FS, spawn failure).
+            // The socket is definitively absent/refused — the ADR-049-mandated
+            // fallback path. Access-denied/indeterminate connect failures are
+            // terminal and never enter this metrics tier (#1242).
             FallbackReason::NoSocket => FallbackSeverity::NoDaemon,
         }
     }
@@ -211,6 +212,7 @@ struct ConfigIdFields<'a> {
     db: &'a str,
     embed: &'a str,
     extra: &'a str,
+    fresh_tail: &'a str,
     backend: &'a str,
     outbound: &'a str,
     git_write: &'a str,
@@ -234,6 +236,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
     let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
     let outbound = outbound.strip_suffix(']')?;
     let (rest, backend) = rest.rsplit_once(";backend=")?;
+    let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
     let (rest, extra) = rest.rsplit_once(";extra=[")?;
     let extra = extra.strip_suffix(']')?;
     let (db, embed) = rest.rsplit_once(";embed=")?;
@@ -243,6 +246,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         db,
         embed,
         extra,
+        fresh_tail,
         backend,
         outbound,
         git_write,
@@ -267,6 +271,8 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "embed"
     } else if client.extra != daemon.extra {
         "extra"
+    } else if client.fresh_tail != daemon.fresh_tail {
+        "fresh_tail"
     } else if client.backend != daemon.backend {
         "backend"
     } else if client.outbound != daemon.outbound {
@@ -451,8 +457,16 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
 enum ForwardOutcome {
     /// Successfully received and decoded a response frame.
     Response(Box<DaemonResponseFrame>),
-    /// Socket was unreachable (connection refused / no file).
+    /// The socket is absent/refused, or the frame failed before it could reach
+    /// dispatch. These outcomes are safe to route through recovery.
     NoSocket,
+    /// This process could not establish whether a daemon is listening. An OS
+    /// access/policy failure is not proof that the daemon is absent, so it must
+    /// never enter lifecycle recovery or local fallback (#1242).
+    Unreachable {
+        kind: std::io::ErrorKind,
+        os_error_code: Option<i32>,
+    },
     /// Connected but the response could not be decoded — most likely a stale
     /// daemon speaking a different wire format.
     ParseFailure,
@@ -466,11 +480,32 @@ enum ForwardOutcome {
     ProtocolMismatch,
 }
 
+fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) {
+        ForwardOutcome::NoSocket
+    } else {
+        ForwardOutcome::Unreachable {
+            kind: error.kind(),
+            os_error_code: error.raw_os_error(),
+        }
+    }
+}
+
 async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
     let sock = socket_path();
+    #[cfg(test)]
+    {
+        let forced_error = FORCED_CONNECT_ERROR.load(std::sync::atomic::Ordering::SeqCst);
+        if forced_error != 0 {
+            return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
+        }
+    }
     let mut stream = match UnixStream::connect(&sock).await {
         Ok(s) => s,
-        Err(_) => return ForwardOutcome::NoSocket,
+        Err(error) => return classify_socket_connect_error(error),
     };
     let payload = match serde_json::to_vec(frame) {
         Ok(p) => p,
@@ -1106,6 +1141,18 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
             | ForwardOutcome::ParseFailure
             | ForwardOutcome::ProtocolMismatch,
         ) => ProbeOutcome::Dead,
+        Ok(ForwardOutcome::Unreachable {
+            kind,
+            os_error_code,
+        }) => {
+            tracing::debug!(
+                ?kind,
+                ?os_error_code,
+                "under-lock probe could not reach the daemon socket; treating its state as \
+                 uncertain and suppressing lifecycle recovery"
+            );
+            ProbeOutcome::Timeout
+        }
     }
 }
 
@@ -1433,6 +1480,31 @@ fn ambiguous_forward_error() -> McpError {
         "daemon response lost after request was sent; not retrying or locally \
          dispatching to avoid duplicate execution",
         None,
+    )
+}
+
+fn daemon_unreachable_error(
+    frame: &DaemonRequestFrame,
+    kind: std::io::ErrorKind,
+    os_error_code: Option<i32>,
+) -> McpError {
+    let config_id = opaque_config_id(&frame.config_id);
+    tracing::error!(
+        reason = "daemon_unreachable",
+        config_id = %config_id,
+        namespace = %frame.namespace,
+        ?kind,
+        ?os_error_code,
+        "daemon socket is unreachable from this process; lifecycle recovery suppressed"
+    );
+    McpError::internal_error(
+        "cannot reach daemon socket from this process; refusing daemon lifecycle recovery \
+         because the daemon may still be healthy",
+        Some(serde_json::json!({
+            "reason": "daemon_unreachable",
+            "os_error_kind": format!("{kind:?}"),
+            "os_error_code": os_error_code,
+        })),
     )
 }
 
@@ -1952,13 +2024,13 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// Forward a request to the daemon, auto-spawning it if absent.
 ///
 /// Returns `None` only when nothing was ever written to the daemon and local
-/// dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or no daemon socket
-/// could be reached (`NoSocket`) — never after the real frame has been
-/// written. `Some(Ok)` / `Some(Err)` both mean the request's fate is already
-/// decided at the daemon and the caller must not dispatch locally. Under
-/// `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes
-/// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit
-/// caller opt-out, not a fallback).
+/// dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or the socket is
+/// definitively absent/refused (`NoSocket`) — never when connection access is
+/// denied (`Unreachable`) and never after the real frame has been written.
+/// `Some(Ok)` / `Some(Err)` both mean the caller must not dispatch locally.
+/// Under `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes
+/// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit caller
+/// opt-out, not a fallback).
 ///
 /// The real (possibly mutating) request frame is written to the daemon
 /// socket at most once per call; a `NoSocket` outcome never writes anything,
@@ -2020,6 +2092,10 @@ where
             // Nothing was written; fall through to the spawn/recover-then-send
             // path below.
         }
+        ForwardOutcome::Unreachable {
+            kind,
+            os_error_code,
+        } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
         ForwardOutcome::ParseFailure => {
             let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
@@ -2177,6 +2253,10 @@ where
                     None,
                 )));
             }
+            ForwardOutcome::Unreachable {
+                kind,
+                os_error_code,
+            } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
             ForwardOutcome::NoSocket => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -2554,17 +2634,43 @@ mod tests {
 
     #[test]
     fn first_config_mismatch_field_follows_fingerprint_order() {
-        let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];\
+        let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=client-policy";
-        let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];\
+        let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=daemon-policy";
 
         assert_eq!(first_config_mismatch_field(client, Some(daemon)), "packs");
     }
 
     #[test]
+    fn first_config_mismatch_field_names_fresh_tail_from_computed_ids() {
+        let config = RuntimeConfig::no_embeddings();
+        let enabled = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, true);
+        let disabled = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, false);
+
+        assert_eq!(
+            first_config_mismatch_field(&enabled, Some(&disabled)),
+            "fresh_tail"
+        );
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_later_field_from_computed_ids() {
+        let config = RuntimeConfig::no_embeddings();
+        let mut changed = config.clone();
+        changed.allowed_outbound_namespaces = vec![Namespace::parse("remote").unwrap()];
+        let client = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, true);
+        let daemon = crate::server::compute_config_id_with_ann_fresh_tail(&changed, None, true);
+
+        assert_eq!(
+            first_config_mismatch_field(&client, Some(&daemon)),
+            "outbound"
+        );
+    }
+
+    #[test]
     fn first_config_mismatch_field_names_backend_topology_without_values() {
-        let base = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main;\
+        let base = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;backend=main;\
                     outbound=[];git_write=policy";
         let client =
             format!("{base};backends=[main:Sqlite:/private/client.db];pack_backends=[kg=main]");
@@ -2578,12 +2684,29 @@ mod tests {
     }
 
     #[test]
+    fn first_config_mismatch_field_recognizes_read_only_runtime_mode() {
+        let config = RuntimeConfig::no_embeddings();
+        let writable =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, false);
+        let read_only =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, true);
+
+        assert_eq!(
+            first_config_mismatch_field(&read_only, Some(&writable)),
+            "backend",
+            "storage-mode separation must retain a structured mismatch field"
+        );
+    }
+
+    #[test]
     #[serial]
     fn map_response_config_mismatch_logs_opaque_ids_and_field_without_values() {
         reset_fallback_counters();
-        let client = "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];\
+        let client =
+            "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=same-policy";
-        let daemon = "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];\
+        let daemon =
+            "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=same-policy";
         let response = DaemonResponseFrame {
             ok: false,
@@ -2939,6 +3062,105 @@ mod tests {
             from_wire: false,
             request_id: None,
         }
+    }
+
+    #[test]
+    fn socket_connect_error_classification_distinguishes_absence_from_denial() {
+        for error_code in [libc::ENOENT, libc::ECONNREFUSED] {
+            assert!(matches!(
+                classify_socket_connect_error(std::io::Error::from_raw_os_error(error_code)),
+                ForwardOutcome::NoSocket
+            ));
+        }
+
+        for error_code in [libc::EACCES, libc::EPERM] {
+            match classify_socket_connect_error(std::io::Error::from_raw_os_error(error_code)) {
+                ForwardOutcome::Unreachable {
+                    kind,
+                    os_error_code,
+                } => {
+                    assert_eq!(kind, std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(os_error_code, Some(error_code));
+                }
+                _ => panic!("EACCES/EPERM must be unreachable, never safe-to-recover NoSocket"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn permission_denied_socket_fails_without_lifecycle_or_local_fallback() {
+        clear_daemon_env();
+        reset_counters();
+        reset_fallback_counters();
+        let _cleanup = RecoveryTestGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+        FORCED_CONNECT_ERROR.store(libc::EPERM, std::sync::atomic::Ordering::SeqCst);
+
+        let config_id = crate::server::compute_config_id(&memory_runtime_config(), None);
+        let result = forward_or_spawn(&unreachable_daemon_frame(&config_id)).await;
+
+        assert_eq!(
+            KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unreachable socket must never trigger a kill"
+        );
+        assert_eq!(
+            SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unreachable socket must never trigger a spawn"
+        );
+        assert_eq!(
+            fallback_total(),
+            0,
+            "an unreachable socket must return an error, not local fallback"
+        );
+        match result {
+            Some(Err(error)) => {
+                assert!(
+                    error.message.contains("cannot reach daemon socket"),
+                    "the caller-visible error must name the unreachable socket: {}",
+                    error.message
+                );
+                let data = error.data.as_ref().expect("unreachable error data");
+                assert_eq!(data["reason"], "daemon_unreachable");
+                assert_eq!(data["os_error_kind"], "PermissionDenied");
+                assert_eq!(data["os_error_code"], libc::EPERM);
+            }
+            other => panic!(
+                "unreachable must be Some(Err), never None/local fallback or success: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_socket_connection_refused_remains_safe_to_recover() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+
+        {
+            let listener = tokio::net::UnixListener::bind(&sock).expect("bind stale socket");
+            drop(listener);
+        }
+        assert!(sock.exists(), "dropped listener must leave a stale socket");
+
+        let config_id = crate::server::compute_config_id(&memory_runtime_config(), None);
+        assert!(matches!(
+            try_forward_inner(&unreachable_daemon_frame(&config_id)).await,
+            ForwardOutcome::NoSocket
+        ));
+
+        clear_daemon_env();
     }
 
     struct RespawnDisclosureFixture {
@@ -3540,7 +3762,31 @@ mod tests {
             })
             .await
             .expect("local dispatch of stats() must succeed");
-        assert_eq!(resp.result.as_deref(), Some(reference_result.as_str()));
+        let mut daemon_result: serde_json::Value = serde_json::from_str(
+            resp.result
+                .as_deref()
+                .expect("daemon dispatch of stats() must return JSON"),
+        )
+        .expect("daemon stats response must be valid JSON");
+        let mut local_result: serde_json::Value = serde_json::from_str(&reference_result)
+            .expect("local stats response must be valid JSON");
+        // Usage counters are request-local. The daemon dispatch may count its
+        // own audit event before serializing while the direct reference call
+        // observes a different event boundary, so they are not an equivalence
+        // oracle for the transport round trip exercised by this test.
+        for result in [&mut daemon_result, &mut local_result] {
+            if let Some(entries) = result
+                .get_mut("results")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for entry in entries {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.remove("usage");
+                    }
+                }
+            }
+        }
+        assert_eq!(daemon_result, local_result);
         assert!(reference_result.contains("\"entities\""));
 
         // (b) ADR-096 Fork 1: a different namespace, same config_id, is no
@@ -4009,10 +4255,9 @@ mod tests {
                 first["ok"], true,
                 "list op must succeed inside daemon result: {first}"
             );
-            let rows = first["result"]
+            let rows = first["result"]["items"]
                 .as_array()
-                .or_else(|| first["result"]["items"].as_array())
-                .expect("list result must be an array or object with items");
+                .expect("list result must contain the stable items array");
             rows.iter()
                 .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
                 .collect()

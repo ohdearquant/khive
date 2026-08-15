@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowRight, GitBranch, LoaderCircle, Search, ShieldCheck } from "lucide-react";
+import { ArrowRight, GitBranch, LoaderCircle, Search, ShieldCheck } from "@/icons";
 import Link from "next/link";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 

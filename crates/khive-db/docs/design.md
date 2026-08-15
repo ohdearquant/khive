@@ -26,6 +26,8 @@
   array.
 - V6/V7/V8 are frozen no-op slots; their `name` strings appear in the
   production `_schema_migrations` table and must not change.
+- V20 adds durable `blob_gc_claims` plus entity INSERT/UPDATE trigger fences
+  for ADR-091 Amendment 9's external-I/O-free transactional blob sweep.
 
 ### Pack Standard — Pack-Auxiliary Schema (ADR-017)
 
@@ -70,16 +72,16 @@
 - The tags/domain filter in `SqlEntityStore` normalizes values to lowercase
   before comparison so that domain filtering is case-insensitive.
 
-### Brain Pack + Knowledge Sections (ADR-048)
+### Historical pre-consolidation Brain Pack + Knowledge Sections (ADR-048)
 
-- V20 creates `brain_profile_snapshots` and `brain_event_log` tables for
+- Historical V20 creates `brain_profile_snapshots` and `brain_event_log` tables for
   the brain pack (Phase 1).
-- V21 creates `knowledge_sections` with a 10-value SectionType enum, FK to
+- Historical V21 creates `knowledge_sections` with a 10-value SectionType enum, FK to
   `knowledge_atoms`, and UNIQUE(atom_id, section_type) (Phase 2).
 
 ### Daemon & Warm Startup (ADR-049)
 
-- V22 extends `knowledge_atoms`, `knowledge_sections`, and `knowledge_domains`
+- Historical V22 extends `knowledge_atoms`, `knowledge_sections`, and `knowledge_domains`
   with a `status` column (NOT NULL DEFAULT 'draft'), plus `source_uri` and
   `source_type` provenance columns on atoms. Indexes accelerate
   status-filtered list/search paths. Existing finalized atoms are backfilled
@@ -94,15 +96,40 @@ stores would open independent connections that contend with each other at
 `BEGIN IMMEDIATE`, defeating the purpose of a write queue. `ConnectionPool`
 lazily spawns a single `WriterTask` behind a `OnceLock`: the first caller to
 need it runs the init closure, every later caller (from any store, any
-namespace) receives a clone of the same handle. When `KHIVE_WRITE_QUEUE=1`,
-store methods route single-row DML through this shared `WriterTask` instead
-of taking the pool mutex directly; `orphan_sweep` and other closures that
-manage their own transaction bypass the queue via the "unmanaged" path
-instead, since a transaction-owning closure cannot be sent through a channel
-that already wraps every request in its own transaction.
+namespace) receives a clone of the same handle. Store methods resolve that
+handle again at write time, so construction before a Tokio runtime cannot
+permanently cache a queue bypass. Single-row, batch, and transaction-owning
+operations submit DML-only closures through the shared task; the task owns the
+outer transaction. A non-strict compatibility fallback may still use the
+legacy standalone/pool-mutex writer and records a store-specific
+`direct_route_violation`. Strict mode refuses that fallback before it opens a
+direct writer.
+
+Strict routing remains opt-in. Flipping its default is separately gated by
+ADR-135 F2 and ADR-136 D2 production A/B evidence plus the release gate; this
+write-time routing hardening does not claim that evidence. The unified helper
+covers the SQLite store layer; remaining runtime-orchestration direct-writer
+call sites stay in #1847's follow-up inventory rather than being silently
+classified as complete.
 
 See `crates/khive-db/docs/api/pool.md` and `crates/khive-db/docs/api/vectors.md`
 for the per-function routing rules and the tests that pin them down.
+
+### Write-transaction external-work invariant (ADR-091 Amendment 9)
+
+SQLite write transactions contain database statement execution and bounded
+in-memory preparation only. They never contain filesystem/process/network I/O,
+sleeps, blocking waits, embedding/model work, or another subsystem call. The
+enumerated owner/caller audit lives in ADR-091 and is a review invariant: adding
+or widening any `BEGIN IMMEDIATE`, `WriterGuard::transaction`, writer-task
+request, or `SqlAccess::atomic_unit` scope requires updating that table.
+
+Filesystem blob GC is the cross-resource reference design. A database-scoped
+process/advisory owner lock makes every pre-existing claim safely recoverable
+even after root relocation or database restore. Candidate recovery, claim,
+physical deletion, and cleanup proceed in batches of at most 128. Each claim
+and cleanup transaction is SQL-only and commits before filesystem deletion;
+entity triggers reject claimed references in every released-writer interval.
 
 ## Consistency Notes
 
@@ -114,4 +141,4 @@ for the per-function routing rules and the tests that pin them down.
   `embedding_coverage: 0.0` regardless of actual indexed vector count. This is
   a known lie in the stats implementation, not a data issue.
 
-Last reviewed: 2026-06-06
+Last reviewed: 2026-08-09

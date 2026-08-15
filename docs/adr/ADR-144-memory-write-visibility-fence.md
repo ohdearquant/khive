@@ -105,10 +105,9 @@ Add an additive, operation-scoped visibility contract to the memory pack:
 
 ## Out of scope
 
-- The Cold/Empty cap divergence (fixed 20,000-row constant vs ADR-118's
-  threshold-relative text vs the knowledge pack's corpus-relative
-  implementation) is a live divergence tracked in #1161 and belongs to an
-  ADR-118 alignment, not this contract.
+- The Cold/Empty cap belongs to ADR-118, not this contract. Its former
+  cross-pack divergence was resolved by #1161: both memory and knowledge use
+  the corpus-relative rebuild threshold for the newest log suffix.
 - Knowledge-pack freshness: the fresh-tail helper landed (#1589) and the pack
   proves no current gap; this ADR adds no knowledge-pack requirement.
 

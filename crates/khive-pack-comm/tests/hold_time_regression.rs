@@ -38,7 +38,11 @@
 //! a shape (which is the failure mode this gate exists to catch).
 //!
 //! Each shape is sampled `SAMPLES` times after `WARMUP` untimed iterations
-//! (first-call allocator/index warmup). The gate asserts on the **median**
+//! (first-call allocator/index warmup). A process-local async mutex serializes
+//! the two shapes under the standard test harness; the nextest repository
+//! configuration additionally reserves every test slot for this binary, so
+//! workspace tests cannot add scheduler delay to a wall-clock sample. The
+//! gate asserts on the **median**
 //! (resistant to a single scheduler-preemption outlier) and on **p95**
 //! (catches a shape whose tail — not just typical case — regressed). Both
 //! bounds are `calibrated median/p95 x SAFETY_FACTOR`, calibrated from a
@@ -61,6 +65,12 @@ use serde_json::json;
 
 const WARMUP: usize = 5;
 const SAMPLES: usize = 40;
+
+/// Serialize the two measurement tests when the standard test harness runs
+/// them in one process. Nextest launches one test per process and applies the
+/// repository-level all-slot reservation to this binary.
+static MEASUREMENT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Calibration safety factor applied to both the measured median and p95
 /// bounds below. See module doc: generous-absolute over brittle-ratchet.
@@ -118,8 +128,8 @@ fn scale_bound(bound: Duration, factor: f64) -> Duration {
     Duration::from_secs_f64(bound.as_secs_f64() * factor)
 }
 
-/// Runs `iters` untimed warmup calls, then `SAMPLES` timed calls of `op`,
-/// returning the per-call wall-clock durations. `op` must perform exactly
+/// Runs `WARMUP` untimed calls, then `SAMPLES` timed calls of `op`, returning
+/// the per-call wall-clock durations. `op` must perform exactly
 /// one dispatch of the shape under measurement — no setup/teardown inside
 /// the timed closure.
 async fn sample_shape<F, Fut>(mut op: F) -> Vec<Duration>
@@ -141,6 +151,7 @@ where
 
 #[tokio::test]
 async fn hold_time_regression_comm_send_new_root() {
+    let _measurement_guard = MEASUREMENT_LOCK.lock().await;
     let (registry, _rt) = build_registry();
 
     let mut durations = sample_shape(|| {
@@ -189,6 +200,7 @@ async fn hold_time_regression_comm_send_new_root() {
 
 #[tokio::test]
 async fn hold_time_regression_comm_reply() {
+    let _measurement_guard = MEASUREMENT_LOCK.lock().await;
     let (registry, _rt) = build_registry();
 
     // Seed one root OUTSIDE the timed region: the timed closure below must

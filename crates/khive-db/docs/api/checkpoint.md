@@ -134,7 +134,8 @@ await with no further calls."
 ## Metrics read-surface (load/perf harness)
 
 See `crates/khive-db/src/checkpoint.rs` — the module-scoped `AtomicU64`
-statics (`LAST_WAL_PAGES`, `TRUNCATE_ATTEMPTS`, etc.) and their accessors.
+compatibility counters (`LAST_WAL_PAGES`, `TRUNCATE_ATTEMPTS`, etc.) plus the
+backend-keyed `RoutineWalObservation` registry.
 
 Mirrors the fallback-counter pattern in `khive-mcp/src/daemon.rs`
 (`FALLBACK_*` statics + their `pub(crate)` accessors): the checkpoint task is
@@ -145,6 +146,22 @@ atomics rather than a struct threaded through every `checkpoint_once`/
 existing test call site). Read-only surface: nothing here is ever reset
 outside `#[cfg(test)]`, and nothing reachable over the daemon wire can reset
 them either (see `khive_runtime::daemon::DaemonRequestFrame::metrics_only`).
+
+Issue #1838 adds the pressure-episode and lifecycle-sink counters exposed by
+`db_diagnostics`: elevated observations, episode starts/recoveries, actual
+primary-store append attempts/failures, and bounded-handoff drops. These are
+process-lifetime aggregates across checkpoint tasks. They preserve per-attempt
+operator evidence without writing one event row per attempt into a pinned WAL.
+
+Each periodic tick issues exactly one routine `PRAGMA wal_checkpoint(PASSIVE)`
+and retains that row's `busy`, `log`, and `checkpointed` values. Logical
+backlog is `max(log - checkpointed, 0)`. The same tick stats the backend's
+physical `-wal` sidecar and records its byte allocation independently. This
+matters because PASSIVE can drain every logical frame while SQLite retains the
+sidecar's high-water allocation for reuse. `routine_wal_observation(pool)` is
+a pure backend-scoped memory read: a metrics scrape performs neither another
+checkpoint nor another filesystem stat, and a secondary backend cannot win a
+process-global race and masquerade as the main backend's sample (#1849).
 
 ## `run_checkpoint_task` — shutdown design history
 
@@ -165,23 +182,31 @@ backend is in-memory and only secondary file-backed tasks are spawned, the
 first secondary task owns emission. Other tasks receive no owner, so the API
 cannot silently discard a caller-supplied event store based on `is_main`.
 
-Lifecycle persistence is isolated from the scheduler (issue #1434). The task
-serializes each outcome and uses a zero-wait `try_send` into a dedicated append
-worker with capacity for one queued event behind the append in progress. If
-both slots are occupied, that outcome is dropped; the first drop in each
-uninterrupted full-queue episode warns, and a later successful enqueue re-arms
-the warning. The worker logs sink failures and continues. This preserves
-accepted-event order and bounds work and memory under writer contention while
-ensuring event-store checkout or SQLite busy waits cannot delay a later
-PASSIVE/TRUNCATE cycle. Checkpoint-task shutdown aborts the scheduler-owned
-async worker instead of waiting for its current append future. That guarantee
-is local to `run_checkpoint_task`, not daemon, runtime, or process shutdown: if
-the event store already admitted the append to `spawn_blocking` or a
-`WriterTask`, aborting the worker does not cancel it, and at most one such sink
-operation may outlive the checkpoint task. If a recovery/drain row meets a full
-queue, the task keeps the elevation episode open and retries that drain on the
-next healthy tick; a dropped enqueue therefore cannot permanently suppress the
-row that closes a previously accepted elevated sequence.
+Lifecycle persistence is isolated from the scheduler (issues #1434 and
+#1838). The task serializes only pressure-state transitions and uses a
+zero-wait `try_send` into a dedicated append worker with capacity for one
+queued event behind the append in progress. One opening row marks elevation;
+sustained elevated ticks update a bounded in-memory count and peak only; one
+recovery row carries the complete episode summary. These transition rows use
+payload schema version 2; the two additive summary fields remain optional so
+version-1 rows decode unchanged. Thus primary-store writes are O(state
+transitions), not O(checkpoint attempts), even when a reader pins the WAL
+indefinitely. If both handoff slots are occupied, that transition is dropped;
+the first drop in each uninterrupted full-queue episode warns, and a later
+successful enqueue re-arms the warning. The accepted elevation state is
+unchanged on a rejected transition, so opening/recovery handoffs can retry
+without creating per-tick store calls. Actual append attempts, failures, and
+handoff drops have separate diagnostics counters.
+
+The worker logs sink failures and continues. This preserves accepted-event
+order and bounds work and memory under writer contention while ensuring
+event-store checkout or SQLite busy waits cannot delay a later PASSIVE/TRUNCATE
+cycle. Checkpoint-task shutdown aborts the scheduler-owned async worker instead
+of waiting for its current append future. That guarantee is local to
+`run_checkpoint_task`, not daemon, runtime, or process shutdown: if the event
+store already admitted the append to `spawn_blocking` or a `WriterTask`,
+aborting the worker does not cancel it, and at most one such sink operation may
+outlive the checkpoint task.
 
 ## Private tx-registry logging helpers (Plank 0)
 
@@ -430,3 +455,29 @@ concurrently-running write path (e.g. `graph_upsert_edges`) could do in the
 real suite. The fix (looking up this test's own entry by label via
 `snapshot()` instead of trusting global `oldest()`) must still correctly
 name and escalate THIS entry despite that older decoy.
+
+### Healthy-tick WAL-pin sidecar collection
+
+After the task refreshes its own WAL-pin beacon/heartbeat, every
+sidecar-enabled checkpoint tick that did not already run no-progress
+attribution runs one bounded `walpin::housekeep_live` pass. It removes only
+positively dead/reused-PID residue and preserves malformed, uninspectable, and
+live-but-stale evidence for attribution. Legacy records with no declared
+producer cadence use the session-sweep fallback captured once at task startup
+(the ADR-defined compiled default, 5000 ms), never the daemon's checkpoint
+interval or the enumerator's current environment override.
+
+The TRUNCATE-no-progress path instead runs the destructive attribution
+enumerator. The synchronous checkpoint core only records a request containing
+the pre-TRUNCATE holder census and stable sidecar inputs. The async task then
+executes the directory walk in an awaited `spawn_blocking` before it considers
+ordinary housekeeping or emits the tick's lifecycle outcome; report logging
+cannot consume a partial result. It marks the tick attempted before spawning,
+so a successful pass, a trust-boundary enumeration error, or a blocking-worker
+join failure all suppress same-tick housekeeping. This is fail-safe for the
+one-pass bound because a failed worker may already have completed part of the
+walk. Enumeration and worker failures retain distinct classifications and
+warn without stopping the task. There is therefore at most one
+sidecar-directory pass per tick, processing at most `MAX_SIDECAR_ENTRIES`,
+including on a no-progress tick. Collection does not depend on WAL pressure or
+checkpoint availability; explicitly disabling the sidecar disables it.

@@ -400,7 +400,13 @@ impl PackRuntime for MemoryPack {
     }
 
     async fn warm(&self) {
-        crate::ann::warm_existing_memory_indexes(&self.runtime, &self.ann).await;
+        // ANN warm is not a read-only operation: a missing consumer is first
+        // registered as pending, and a cold/stale segment can checkpoint and
+        // compact. Snapshot inspection must not enter that lifecycle. The FTS
+        // population check below is genuinely load-only and remains useful.
+        if !self.runtime.is_read_only() {
+            crate::ann::warm_existing_memory_indexes(&self.runtime, &self.ann).await;
+        }
         fts_population_guard(&self.runtime).await;
     }
 
@@ -480,12 +486,14 @@ impl MemoryPack {
             None => recall_deadline_ms(),
         };
         let start = std::time::Instant::now();
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(budget_ms),
-            self.handle_recall(token, params, registry),
-        )
-        .await
-        {
+        // `handle_recall` is a large state machine: its text/vector fan-out
+        // contains several cancellation-aware select/join branches. Keep that
+        // generator behind one heap pointer at the deadline boundary so it is
+        // not embedded again in this future, `PackRuntime::dispatch`, and the
+        // MCP request stack. Inlining it here can overflow Tokio's worker stack
+        // even though the pipeline has no recursive call cycle.
+        let recall = Box::pin(self.handle_recall(token, params, registry));
+        match tokio::time::timeout(std::time::Duration::from_millis(budget_ms), recall).await {
             Ok(result) => result,
             Err(_) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -507,6 +515,60 @@ impl MemoryPack {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recall_future_footprint_tests {
+    use super::*;
+
+    use khive_runtime::{Namespace, VerbRegistryBuilder};
+
+    #[test]
+    fn deadline_wrapper_does_not_embed_the_recall_pipeline() {
+        // Measure on an explicitly roomy stack so the regression reports the
+        // historical inline footprint instead of aborting the test process.
+        let (pipeline_bytes, deadline_bytes) = std::thread::Builder::new()
+            .name("recall-future-footprint".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+                let token = runtime
+                    .authorize(Namespace::local())
+                    .expect("authorize local");
+                let registry = VerbRegistryBuilder::new().build().expect("empty registry");
+                let pack = MemoryPack::new(runtime);
+
+                let pipeline_bytes = std::mem::size_of_val(&pack.handle_recall(
+                    &token,
+                    serde_json::json!({"query": "future footprint probe"}),
+                    &registry,
+                ));
+                let deadline_bytes = std::mem::size_of_val(&pack.handle_recall_with_deadline(
+                    &token,
+                    serde_json::json!({"query": "future footprint probe"}),
+                    &registry,
+                ));
+                (pipeline_bytes, deadline_bytes)
+            })
+            .expect("spawn footprint measurement")
+            .join()
+            .expect("footprint measurement panicked");
+
+        assert!(
+            deadline_bytes < pipeline_bytes,
+            "the deadline wrapper must hold the recall pipeline behind a pointer: \
+             wrapper={deadline_bytes}B pipeline={pipeline_bytes}B"
+        );
+        // On the 64-bit CI target the unboxed candidate collector made this
+        // future 8,968 bytes; boxing that 6,792-byte child reduces it to 4,888
+        // bytes. Seven KiB leaves ample platform/layout headroom while still
+        // catching either candidate await being inlined again.
+        assert!(
+            pipeline_bytes < 7 * 1024,
+            "the recall pipeline re-embedded its candidate fan-out: \
+             pipeline={pipeline_bytes}B"
+        );
     }
 }
 
@@ -635,6 +697,97 @@ async fn fts_population_guard(rt: &KhiveRuntime) {
                  Fix: run `kkernel reindex --no-knowledge` to repopulate {fts_table}."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod read_only_warm_tests {
+    use super::*;
+
+    use crate::test_support::HashVecProvider;
+    use khive_runtime::RuntimeConfig;
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    #[tokio::test]
+    async fn read_only_warm_keeps_ann_lifecycle_out_of_the_writer_plane() {
+        const MODEL: &str = "read-only-warm-model";
+        const DIMS: usize = 8;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("read-only-memory-warm.db");
+        let cfg = RuntimeConfig {
+            db_path: Some(path),
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        let writable = KhiveRuntime::new(cfg.clone()).expect("writable snapshot source");
+        writable.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+        let token = writable
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize local");
+        writable
+            .vectors_for_model(&token, MODEL)
+            .expect("materialize optional vector table");
+        let mut writer = writable.sql().writer().await.expect("seed writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) \
+                      VALUES (?1, ?2, ?3, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("memory-notes:note.content".into()),
+                    SqlValue::Text("*".into()),
+                    SqlValue::Text(MODEL.into()),
+                ],
+                label: Some("seed_read_only_warm_consumer".into()),
+            })
+            .await
+            .expect("seed active consumer");
+        drop(writer);
+
+        // `vectors_for_model` and `SqlAccess::writer` lazily spawn the
+        // file-backed pool's shared writer task. Own its one-shot join before
+        // dropping the runtime, then wait for the queue and close-time WAL
+        // work to settle before reopening the same file read-only. Otherwise
+        // this regression can observe fixture teardown instead of the
+        // read-only warm path it is meant to discriminate.
+        let writer_join = writable.backend().pool().take_writer_task_join();
+        drop(token);
+        drop(writable);
+        if let Some(join) = writer_join {
+            tokio::time::timeout(std::time::Duration::from_secs(5), join)
+                .await
+                .expect("writable fixture writer task must drain before read-only reopen")
+                .expect("writable fixture writer task must not panic");
+        }
+
+        let read_only = KhiveRuntime::new_readonly(cfg).expect("read-only snapshot runtime");
+        read_only.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+        let before = read_only.backend().pool().writer_acquisition_snapshot();
+
+        let pack = MemoryPack::new(read_only.clone());
+        pack.warm().await;
+        let read_token = read_only
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize read-only local");
+        assert!(
+            !crate::ann::ensure_ann_background(&read_only, &read_token, &pack.ann, MODEL).await,
+            "a read-only recall cache miss must not enqueue a writer-bearing ANN task"
+        );
+
+        assert_eq!(
+            read_only.backend().pool().writer_acquisition_snapshot(),
+            before,
+            "daemon warm must not acquire a writer for ANN registration, checkpoint, or \
+             optional-table inspection on a read-only runtime"
+        );
     }
 }
 

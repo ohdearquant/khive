@@ -549,9 +549,9 @@ pub struct DaemonResponseFrame {
 ///
 /// Every field here is a **server-side** gauge reachable from `handle_conn`
 /// without any mutation: [`khive_storage::tx_registry`] (ADR-091 Plank 0,
-/// process-global singleton), the WAL checkpoint task's last-observed page
-/// count and TRUNCATE counters (`khive_db::checkpoint`), and the ADR-067
-/// Component A write queue depth (only when `KHIVE_WRITE_QUEUE=1`). There is
+/// process-global singleton), the main pool's backend-keyed routine WAL
+/// sample and process TRUNCATE counters (`khive_db::checkpoint`), and the
+/// ADR-067 Component A write queue depth/latest writer-stage sample. There is
 /// no reset reachable through this type or through [`DaemonRequestFrame`] —
 /// gauges out, nothing in.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -561,6 +561,22 @@ pub struct MetricsSnapshot {
     /// (for example, an in-memory dispatcher with no pool, or a daemon that
     /// just started and hasn't hit its first tick yet).
     pub wal_pages: Option<u64>,
+    /// Logical frames present in the WAL at the main backend's most recent
+    /// periodic PASSIVE checkpoint. Kept separate from physical allocation.
+    #[serde(default)]
+    pub wal_log_frames: Option<u64>,
+    /// Frames backfilled by that same periodic PASSIVE pass.
+    #[serde(default)]
+    pub wal_checkpointed_frames: Option<u64>,
+    /// Logical frames still pending after that pass (`log - checkpointed`).
+    #[serde(default)]
+    pub wal_pending_frames: Option<u64>,
+    /// Physical `-wal` sidecar bytes captured at the same routine tick.
+    #[serde(default)]
+    pub wal_physical_bytes: Option<u64>,
+    /// Wall-clock timestamp of the routine WAL sample, for staleness checks.
+    #[serde(default)]
+    pub wal_observed_at_unix_ms: Option<u64>,
     /// Total WAL TRUNCATE escalation attempts (ADR-091 Plank 2) made in this
     /// process's lifetime, regardless of whether they succeeded in reclaiming
     /// pages.
@@ -600,13 +616,35 @@ pub struct MetricsSnapshot {
     /// (`PoolConfig::write_queue_capacity`), gated the same as
     /// `write_queue_depth`.
     pub write_queue_capacity: Option<usize>,
+    /// Latest completed writer-task span: bounded-channel admission/backlog.
+    #[serde(default)]
+    pub write_last_queue_wait_micros: Option<u64>,
+    /// Latest completed writer-task span: `BEGIN IMMEDIATE` acquisition.
+    #[serde(default)]
+    pub write_last_transaction_acquire_micros: Option<u64>,
+    /// Latest completed writer-task span: application transaction body.
+    #[serde(default)]
+    pub write_last_body_micros: Option<u64>,
+    /// Latest completed writer-task span: SQLite COMMIT/fsync phase.
+    #[serde(default)]
+    pub write_last_commit_micros: Option<u64>,
+    /// Whole latest writer-task request span, retained for compatibility and
+    /// comparison with the decomposed stages.
+    #[serde(default)]
+    pub write_last_total_micros: Option<u64>,
+    /// Wall-clock timestamp of the writer-stage sample.
+    #[serde(default)]
+    pub write_last_observed_at_unix_ms: Option<u64>,
 }
 
 // ── framing ───────────────────────────────────────────────────────────────────
 
 /// Read one length-prefixed frame (4-byte BE u32 length + JSON bytes).
 #[cfg(unix)]
-pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+pub async fn read_frame<R>(stream: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -623,7 +661,10 @@ pub async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
 
 /// Write one length-prefixed frame.
 #[cfg(unix)]
-pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
+pub async fn write_frame<W>(stream: &mut W, payload: &[u8]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     if payload.len() > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -933,14 +974,32 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
             None => (None, None),
         };
 
-    let (write_queue_depth, write_queue_capacity) = dispatcher
-        .pool_for_checkpoint()
+    let checkpoint_pool = dispatcher.pool_for_checkpoint();
+    let routine_wal = checkpoint_pool
+        .as_deref()
+        .and_then(khive_db::checkpoint::routine_wal_observation);
+    let writer_stages = checkpoint_pool
+        .as_deref()
+        .and_then(khive_db::writer_task::last_writer_stage_observation);
+    let (write_queue_depth, write_queue_capacity) = checkpoint_pool
+        .as_ref()
         .and_then(|pool| pool.writer_task_handle().ok().flatten())
         .map(|handle| (Some(handle.queue_depth()), Some(handle.capacity())))
         .unwrap_or((None, None));
 
     MetricsSnapshot {
-        wal_pages: khive_db::checkpoint::last_observed_wal_pages(),
+        wal_pages: routine_wal.as_ref().map(|sample| sample.log_frames),
+        wal_log_frames: routine_wal.as_ref().map(|sample| sample.log_frames),
+        wal_checkpointed_frames: routine_wal
+            .as_ref()
+            .map(|sample| sample.checkpointed_frames),
+        wal_pending_frames: routine_wal.as_ref().map(|sample| sample.pending_frames),
+        wal_physical_bytes: routine_wal
+            .as_ref()
+            .and_then(|sample| sample.physical_wal_bytes),
+        wal_observed_at_unix_ms: routine_wal
+            .as_ref()
+            .map(|sample| sample.observed_at_unix_ms),
         wal_truncate_attempts: khive_db::checkpoint::truncate_attempts(),
         wal_truncate_consecutive_failures: khive_db::checkpoint::truncate_consecutive_failures(),
         wal_checkpoint_skipped_ticks: khive_db::checkpoint::checkpoint_skipped_ticks(),
@@ -951,11 +1010,46 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
         open_tx_count,
         write_queue_depth,
         write_queue_capacity,
+        write_last_queue_wait_micros: writer_stages
+            .as_ref()
+            .map(|sample| sample.queue_wait_micros),
+        write_last_transaction_acquire_micros: writer_stages
+            .as_ref()
+            .map(|sample| sample.transaction_acquire_micros),
+        write_last_body_micros: writer_stages.as_ref().map(|sample| sample.body_micros),
+        write_last_commit_micros: writer_stages.as_ref().map(|sample| sample.commit_micros),
+        write_last_total_micros: writer_stages.as_ref().map(|sample| sample.total_micros),
+        write_last_observed_at_unix_ms: writer_stages
+            .as_ref()
+            .map(|sample| sample.observed_at_unix_ms),
     }
 }
 
 #[cfg(unix)]
-async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
+async fn wait_for_peer_disconnect(read: &mut tokio::net::unix::OwnedReadHalf) {
+    let mut byte = [0u8; 1];
+    // One request is admitted per connection. EOF, a read error, or any
+    // subsequent byte all make this connection no longer a valid response
+    // peer, so the first completed read is the entire observation.
+    let _ = read.read(&mut byte).await;
+}
+
+#[cfg(all(unix, test))]
+async fn handle_conn<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
+    handle_conn_with_shutdown(stream, dispatcher, None).await;
+}
+
+#[cfg(unix)]
+async fn handle_conn_with_shutdown<D: DaemonDispatch>(
+    mut stream: UnixStream,
+    dispatcher: D,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown = shutdown.unwrap_or(local_shutdown_rx);
+    // Keeps the fallback receiver open in direct/test calls. Production owns
+    // a sender at the daemon-run scope and passes its receiver above.
+    let _local_shutdown_tx = local_shutdown_tx;
     let raw = match read_frame(&mut stream).await {
         Ok(r) => r,
         Err(e) => {
@@ -970,6 +1064,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             return;
         }
     };
+    let (mut peer_read, mut peer_write) = stream.into_split();
 
     let served_config_id = Some(dispatcher.config_id().to_string());
     let resp = if frame.protocol_version != PROTOCOL_VERSION {
@@ -1068,18 +1163,34 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
-        match dispatcher
-            .dispatch(
-                frame.ops,
-                frame.presentation,
-                frame.presentation_per_op,
-                frame.format,
-                frame.format_per_op,
-                frame.from_wire,
-                Some(identity),
-            )
-            .await
-        {
+        let (read_cancel_tx, read_cancel_rx) = tokio::sync::watch::channel(false);
+        let dispatch = khive_storage::scope_request_read_cancellation(
+            shutdown,
+            khive_storage::scope_request_read_cancellation(
+                read_cancel_rx,
+                khive_storage::scope_request_read_deadline(
+                    khive_storage::request_read_timeout_from_env(),
+                    dispatcher.dispatch(
+                        frame.ops,
+                        frame.presentation,
+                        frame.presentation_per_op,
+                        frame.format,
+                        frame.format_per_op,
+                        frame.from_wire,
+                        Some(identity),
+                    ),
+                ),
+            ),
+        );
+        tokio::pin!(dispatch);
+        let dispatch_result = tokio::select! {
+            result = &mut dispatch => result,
+            _ = wait_for_peer_disconnect(&mut peer_read) => {
+                let _ = read_cancel_tx.send(true);
+                dispatch.await
+            }
+        };
+        match dispatch_result {
             Ok(result) => DaemonResponseFrame {
                 ok: true,
                 result: Some(result),
@@ -1138,11 +1249,11 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                     request_id: resp.request_id,
                 };
                 if let Ok(err_payload) = serde_json::to_vec(&err_resp) {
-                    if let Err(e) = write_frame(&mut stream, &err_payload).await {
+                    if let Err(e) = write_frame(&mut peer_write, &err_payload).await {
                         tracing::debug!(error = %e, "failed to write oversized-response error frame");
                     }
                 }
-            } else if let Err(e) = write_frame(&mut stream, &payload).await {
+            } else if let Err(e) = write_frame(&mut peer_write, &payload).await {
                 tracing::debug!(error = %e, "failed to write daemon response frame");
             }
         }
@@ -1619,6 +1730,10 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
     }
 
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connection_tasks = Arc::new(std::sync::Mutex::new(
+        Vec::<tokio::task::JoinHandle<()>>::new(),
+    ));
+    let (request_shutdown_tx, request_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let shutdown = async {
         // REASON: signal handler registration can only fail if the global Tokio runtime
@@ -1678,9 +1793,15 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
                             }
                         }
                         let d = dispatcher.clone();
-                        spawn_connection_task(Arc::clone(&active), async move {
-                            handle_conn(stream, d).await;
+                        let shutdown = request_shutdown_rx.clone();
+                        let handle = spawn_connection_task(Arc::clone(&active), async move {
+                            handle_conn_with_shutdown(stream, d, Some(shutdown)).await;
                         });
+                        let mut tasks = connection_tasks
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        tasks.retain(|task| !task.is_finished());
+                        tasks.push(handle);
                     }
                     Err(e) => tracing::error!(error = %e, "accept failed"),
                 }
@@ -1694,12 +1815,23 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
     // task outliving the drain window (or the process) unsignalled.
     let _ = checkpoint_shutdown_tx.send(());
 
+    // Per-run signal: read scopes stop promptly, admitted writes ignore it and
+    // retain the rest of the configured drain window to commit or roll back.
+    let _ = request_shutdown_tx.send(true);
+
     // Same ordering contract for ADR-119 daemon components: cancel before
     // drain, so each component's supervisor (itself a tracked task) can run
     // its bounded shutdown inside the drain wait.
     daemon_shutdown_token().cancel();
 
-    drain(&active).await;
+    let drained = drain(&active).await;
+    let tasks = {
+        let mut retained = connection_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *retained)
+    };
+    finish_connection_tasks(tasks, drained).await;
 
     // A concurrent client's `kill_and_respawn` may have already decided
     // this daemon looked stale, killed it, and spawned a replacement that
@@ -1897,13 +2029,21 @@ async fn pid_file_names_a_reachable_daemon(
 }
 
 #[cfg(unix)]
-async fn drain(active: &std::sync::atomic::AtomicUsize) {
+async fn drain(active: &std::sync::atomic::AtomicUsize) -> bool {
+    drain_with_timeout(active, drain_timeout()).await
+}
+
+#[cfg(unix)]
+async fn drain_with_timeout(
+    active: &std::sync::atomic::AtomicUsize,
+    timeout: std::time::Duration,
+) -> bool {
     use std::sync::atomic::Ordering;
     let remaining = || active.load(Ordering::Relaxed) + background_task_count();
     if remaining() == 0 {
-        return;
+        return true;
     }
-    let deadline = tokio::time::Instant::now() + drain_timeout();
+    let deadline = tokio::time::Instant::now() + timeout;
     while remaining() > 0 {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
@@ -1911,9 +2051,27 @@ async fn drain(active: &std::sync::atomic::AtomicUsize) {
                 remaining_background_tasks = background_task_count(),
                 "drain timeout reached; forcing shutdown"
             );
-            break;
+            return false;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+async fn finish_connection_tasks(tasks: Vec<tokio::task::JoinHandle<()>>, drained: bool) {
+    if !drained {
+        for task in &tasks {
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+    }
+    for task in tasks {
+        let _ = task.await;
     }
 }
 
@@ -1994,11 +2152,70 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    struct AppendCompletionEventStore {
+        inner: Arc<dyn khive_storage::EventStore>,
+        first_append: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl khive_storage::EventStore for AppendCompletionEventStore {
+        async fn append_event(
+            &self,
+            event: khive_storage::Event,
+        ) -> khive_storage::StorageResult<()> {
+            self.inner.append_event(event).await?;
+            if let Some(completed) = self
+                .first_append
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = completed.send(());
+            }
+            Ok(())
+        }
+
+        async fn append_events(
+            &self,
+            events: Vec<khive_storage::Event>,
+        ) -> khive_storage::StorageResult<khive_storage::BatchWriteSummary> {
+            self.inner.append_events(events).await
+        }
+
+        async fn get_event(
+            &self,
+            id: uuid::Uuid,
+        ) -> khive_storage::StorageResult<Option<khive_storage::Event>> {
+            self.inner.get_event(id).await
+        }
+
+        async fn query_events(
+            &self,
+            filter: khive_storage::EventFilter,
+            page: khive_storage::PageRequest,
+        ) -> khive_storage::StorageResult<khive_storage::Page<khive_storage::Event>> {
+            self.inner.query_events(filter, page).await
+        }
+
+        async fn count_events(
+            &self,
+            filter: khive_storage::EventFilter,
+        ) -> khive_storage::StorageResult<u64> {
+            self.inner.count_events(filter).await
+        }
+    }
+
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn secondary_only_checkpoint_topology_emits_lifecycle_outcome() {
         let main_backend = khive_db::StorageBackend::memory().expect("in-memory main backend");
-        let event_store = main_backend.events().expect("main event store");
+        let inner_event_store = main_backend.events().expect("main event store");
+        let (first_append_tx, first_append_rx) = tokio::sync::oneshot::channel();
+        let event_store: Arc<dyn khive_storage::EventStore> =
+            Arc::new(AppendCompletionEventStore {
+                inner: inner_event_store,
+                first_append: std::sync::Mutex::new(Some(first_append_tx)),
+            });
         let secondary_dir = tempfile::tempdir().expect("secondary tempdir");
         let secondary_backend =
             khive_db::StorageBackend::sqlite(secondary_dir.path().join("secondary.db"))
@@ -2032,12 +2249,13 @@ mod tests {
             task.is_main,
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        shutdown_tx.send(()).expect("send checkpoint shutdown");
-        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+        // The scheduler intentionally aborts its bounded append worker during
+        // shutdown. Wait on the append's completion edge before requesting
+        // shutdown, so the observation cannot race that deliberate abort.
+        tokio::time::timeout(std::time::Duration::from_secs(10), first_append_rx)
             .await
-            .expect("checkpoint task should exit within 1s")
-            .expect("checkpoint task panicked");
+            .expect("secondary checkpoint owner did not complete an append within 10s")
+            .expect("checkpoint lifecycle append completion sender dropped");
 
         let events = event_store
             .query_events(
@@ -2049,6 +2267,12 @@ mod tests {
             )
             .await
             .expect("query lifecycle events");
+
+        shutdown_tx.send(()).expect("send checkpoint shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
         assert!(
             !events.items.is_empty()
                 && events
@@ -2289,6 +2513,58 @@ mod tests {
             .expect("empty drain should return immediately");
     }
 
+    #[tokio::test(start_paused = true)]
+    #[serial(background_tasks)]
+    async fn graceful_drain_has_a_hard_upper_bound_with_stuck_work() {
+        use std::sync::atomic::Ordering;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = spawn_connection_task(Arc::clone(&active), async {
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        let started = tokio::time::Instant::now();
+
+        let drained = drain_with_timeout(&active, std::time::Duration::from_millis(250)).await;
+
+        assert!(!drained, "stuck work must exhaust the drain bound");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(250)
+                && started.elapsed() < std::time::Duration::from_millis(350),
+            "graceful shutdown exceeded its configured bound: {:?}",
+            started.elapsed()
+        );
+        finish_connection_tasks(vec![task], drained).await;
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            0,
+            "hard-bound escalation must abort, await, and release the handler"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(background_tasks)]
+    async fn admitted_work_finishes_inside_drain_window_without_abort() {
+        use std::sync::atomic::Ordering;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committed_in_task = Arc::clone(&committed);
+        let task = spawn_connection_task(Arc::clone(&active), async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            committed_in_task.store(true, Ordering::SeqCst);
+        });
+
+        let drained = drain_with_timeout(&active, std::time::Duration::from_millis(250)).await;
+        assert!(
+            drained,
+            "admitted work should finish inside the drain window"
+        );
+        finish_connection_tasks(vec![task], drained).await;
+        assert!(committed.load(Ordering::SeqCst));
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
     // `drain()` must wait for tracked background tasks (e.g. memory.recall's
     // serve-ledger append), not just in-flight connections, or a SIGTERM
     // lands mid-flight with no log and no row.
@@ -2461,6 +2737,42 @@ mod tests {
         dispatch_err: Option<String>,
     }
 
+    #[derive(Clone)]
+    struct CancellationAwareDispatch {
+        started: Arc<tokio::sync::Notify>,
+        cancellation_observed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl DaemonDispatch for CancellationAwareDispatch {
+        async fn dispatch(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
+            _identity: Option<RequestIdentity>,
+        ) -> Result<String, String> {
+            self.started.notify_one();
+            khive_storage::wait_for_request_read_cancellation().await;
+            self.cancellation_observed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("{}".to_string())
+        }
+
+        async fn warm_all(&self) {}
+
+        fn namespace(&self) -> &str {
+            "local"
+        }
+
+        fn config_id(&self) -> &str {
+            "disconnect-test"
+        }
+    }
+
     #[async_trait]
     impl DaemonDispatch for MockDispatch {
         async fn dispatch(
@@ -2530,6 +2842,34 @@ mod tests {
         let raw = read_frame(&mut client).await.expect("read response frame");
         handle.await.expect("handle_conn task panicked");
         serde_json::from_slice(&raw).expect("decode response frame")
+    }
+
+    #[tokio::test]
+    async fn daemon_peer_disconnect_signals_request_read_cancellation() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancellation_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatcher = CancellationAwareDispatch {
+            started: Arc::clone(&started),
+            cancellation_observed: Arc::clone(&cancellation_observed),
+        };
+        let (mut client, server) = UnixStream::pair().expect("unix stream pair");
+        let request = base_request_frame("disconnect-test");
+        let payload = serde_json::to_vec(&request).expect("encode request frame");
+        let handler = tokio::spawn(async move { handle_conn(server, dispatcher).await });
+        write_frame(&mut client, &payload)
+            .await
+            .expect("write request frame");
+        started.notified().await;
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_millis(500), handler)
+            .await
+            .expect("daemon handler ignored peer disconnect")
+            .expect("daemon handler panicked");
+        assert!(
+            cancellation_observed.load(std::sync::atomic::Ordering::SeqCst),
+            "peer loss did not reach the request-scoped read cancellation signal"
+        );
     }
 
     /// Protocol v4 makes `process_ref` part of dispatch semantics. A still-warm
@@ -2826,6 +3166,11 @@ mod tests {
             snapshot.wal_pages.is_some(),
             "wal_pages must be observed after a real checkpoint tick, got {snapshot:?}"
         );
+        assert_eq!(snapshot.wal_log_frames, snapshot.wal_pages);
+        assert!(snapshot.wal_checkpointed_frames.is_some());
+        assert!(snapshot.wal_pending_frames.is_some());
+        assert!(snapshot.wal_physical_bytes.is_some());
+        assert!(snapshot.wal_observed_at_unix_ms.is_some());
         // The snapshot carries the checkpoint-pressure fields read-only
         // (no mutation path reachable through `MetricsSnapshot`/`DaemonRequestFrame`);
         // an observed tick (not a skip) must report a zero-length skip streak.
@@ -2833,6 +3178,59 @@ mod tests {
             snapshot.wal_checkpoint_consecutive_skips, 0,
             "an observed (non-skipped) tick must report zero consecutive skips, got {snapshot:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_exposes_decomposed_writer_stages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("metrics_writer_stage_test.db");
+        let pool = Arc::new(
+            ConnectionPool::new(khive_db::PoolConfig {
+                path: Some(path),
+                ..khive_db::PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let handle = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("file-backed default writer task");
+        handle
+            .send(|conn| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                conn.execute("INSERT INTO t VALUES (1)", [])
+                    .map_err(|error| khive_storage::error::StorageError::Pool {
+                        operation: "metrics_writer_stage_test".into(),
+                        message: error.to_string(),
+                    })
+            })
+            .await
+            .unwrap();
+
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-writer-stages".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: Some(pool),
+            dispatch_err: None,
+        };
+        let snapshot = build_metrics_snapshot(&dispatcher);
+        assert!(snapshot.write_last_queue_wait_micros.is_some());
+        assert!(snapshot.write_last_transaction_acquire_micros.is_some());
+        assert!(snapshot.write_last_commit_micros.is_some());
+        assert!(
+            snapshot.write_last_body_micros >= Some(25_000),
+            "synthetic delay must be attributed to the body: {snapshot:?}"
+        );
+        assert!(snapshot.write_last_total_micros >= snapshot.write_last_body_micros);
+        assert!(snapshot.write_last_observed_at_unix_ms.is_some());
     }
 
     /// Test 3: the tx-pin oracle. The registry is process-global, so an

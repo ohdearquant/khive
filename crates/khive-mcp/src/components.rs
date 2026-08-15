@@ -354,7 +354,10 @@ fn component_registrations(
         .into_iter()
         .map(ComponentRegistration::from)
         .collect();
-    if let Some(runtime) = schedule_runtime {
+    // Defense in depth for callers outside the normal serve constructor: the
+    // schedule loop begins every tick with stale-claim reclaim DML, so a
+    // read-only assigned runtime must never become a supervised component.
+    if let Some(runtime) = schedule_runtime.filter(|runtime| !runtime.is_read_only()) {
         regs.push(schedule_component_registration(
             runtime,
             crate::pending_events::tick_interval_from_env(),
@@ -629,6 +632,23 @@ mod tests {
         (f, path)
     }
 
+    #[cfg(unix)]
+    fn freeze_snapshot_sidecars(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+            }
+        }
+    }
+
     async fn make_server(db_path: &str) -> KhiveMcpServer {
         let cfg = RuntimeConfig {
             db_path: Some(std::path::PathBuf::from(db_path)),
@@ -749,6 +769,39 @@ mod tests {
         assert_eq!(reg.backoff_initial_ms, 1_000);
         assert_eq!(reg.backoff_max_ms, 60_000);
         assert_eq!(reg.shutdown_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn schedule_roster_omits_read_only_assigned_runtime_without_writer_acquisition() {
+        let (_f, db) = tmp_db();
+        let cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(db)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        };
+        KhiveRuntime::new(cfg.clone()).expect("create and migrate snapshot source");
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(cfg.db_path.as_ref().expect("db path"));
+        let read_only = KhiveRuntime::new_readonly(cfg).expect("open schedule snapshot read-only");
+        let before = read_only.backend().pool().writer_acquisition_snapshot();
+
+        let schedule_count = component_registrations(Some(read_only.clone()))
+            .into_iter()
+            .filter(|reg| reg.name == SCHEDULE_COMPONENT_NAME)
+            .count();
+
+        assert_eq!(
+            schedule_count, 0,
+            "a read-only schedule backend must not launch the writer-dependent ticker"
+        );
+        assert_eq!(
+            read_only.backend().pool().writer_acquisition_snapshot(),
+            before,
+            "component roster construction must not probe a read-only backend through a writer"
+        );
     }
 
     #[tokio::test]

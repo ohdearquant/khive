@@ -102,6 +102,31 @@
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
   20 kg-substrate bare verbs. These are validated by the contract test.
 
+### Serial non-atomic ops-file dispatch (ADR-099 Amendment 4)
+
+`exec.rs` owns an opt-in `--ops-file --serial` scheduling policy for backends
+whose reader or model resources cannot safely serve multiple handlers at once.
+The complete source is first validated into the same byte-bounded stable
+snapshot, including a whole-snapshot typed-JSON structural preflight, before
+the runtime is built or any operation can write. Execution retains one local
+`KhiveMcpServer` and therefore one loaded model instance. Each existing
+100-op/32 MiB logical chunk is parsed and dispatched as one complete parallel
+batch through the same server path, but that batch's trusted scheduler cap is
+one. The next handler starts only after the current handler completes.
+
+This is scheduling, not chain or transaction semantics: `$prev` remains
+invalid, operations commit independently, and progress/save/strict/
+reconciliation, write-key conflict preflight, and aggregate response budget stay
+on the existing logical chunk boundary. The default path remains bounded
+parallel. `--serial` conflicts with `--atomic`, whose prepared whole-file
+transaction is owned by `atomic_apply.rs` below.
+
+The server's established request-read deadline remains scoped to the full
+logical batch and is not silently renewed per operation. Long-running trusted
+local model work must select the documented bounded
+`KHIVE_REQUEST_READ_TIMEOUT_SECS` override explicitly; serial scheduling itself
+does not weaken cancellation policy.
+
 ### Atomic `exec --ops-file --atomic` execution path (ADR-099 Slice B3)
 
 `atomic_apply.rs` is the CLI-boundary orchestrator for `kkernel exec --ops-file --atomic`.
@@ -127,6 +152,24 @@ It runs, in order:
    Its typed embedding outcomes are matched back to the originating update plan, so an atomic
    update whose embedding input was bounded carries the same per-result `warnings` advisory as
    the canonical non-atomic handler.
+
+The commit pass is the retry-safety boundary. Once it returns `Committed`, a reindex, canonical
+result-rendering, or save-file publication failure cannot make the database mutation retryable:
+the base DML is already durable. Reindex and rendering failures return success with
+`atomic.committed=true`,
+`atomic.status="committed_degraded"`, `atomic.retryable=false`, and typed entries in
+`atomic.degradations` (`post_commit_reindex` or `result_rendering`). A render-degraded operation
+keeps `ok=true` and the committed summary count, carries `result=null`, and repeats the typed
+non-retry marker on that result entry. This prevents automation from replaying the mutation while
+still making index repair or result re-read work explicit. An ordinary committed run and every
+pre-commit/rollback shape remain unchanged.
+
+`--save-file` preflights its sibling temp file before execution. On successful publication, the
+stdout manifest preserves the envelope's complete top-level `atomic` block. A write, flush, or
+rename failure after commit instead appends the `save_file_publish` degradation, prints the full
+committed/non-retryable envelope to stdout, and then returns `Err` so the file request still exits
+non-zero. That error is about the sink only; the stdout commit fact is authoritative and forbids
+replay.
 
 Preflight and prepare failures cross back to `exec.rs` as a typed `AtomicExecFailure` containing
 the unchanged terminal message plus a result envelope over the real ops-file entries. The shared
@@ -234,6 +277,17 @@ the wrong value would silently ignore an operator's in-memory isolation request.
 the canonical anchor captured alongside `cfg`, threaded through so fallback construction never
 re-reads a changed `HOME`.
 
+Non-atomic `--ops-file` chunks cross into that server through
+`dispatch_typed_json_batch_local_for_exec`. The JSONL reader has already enforced
+its 96 MiB line, 512 MiB file, 32 MiB chunk, and 100-op ceilings, so reserializing
+the decoded values and re-running the raw request parser would incorrectly apply
+the unrelated 1 MiB MCP/HTTP/daemon/inline-string cap a second time. The typed seam
+only replaces that redundant serialization/parse step: `parse_typed_json_batch`
+still enforces JSON-form nesting, `$prev`, reserved-envelope, and count rules, and
+the resulting `ParsedRequest` enters the same `run_parsed` identity, gate, audit,
+presentation, strict-refusal, rendering, and response-envelope pipeline. Public
+raw request paths continue to call `parse_request` and retain the 1 MiB limit.
+
 ### `exec` daemon-bypass second-writer contract (#548; ADR-067, ADR-099)
 
 **Decision:** keep `exec --save-file` and both `exec --ops-file` modes on the in-process path.
@@ -261,6 +315,18 @@ The observable failure contract stays mode-specific:
 - Non-atomic `--ops-file` preserves per-op commits and continues collecting results. A contended
   op can fail after earlier ops committed; the final summary identifies every failed op.
   `--strict` makes any failure a non-zero exit, while a fully failed file is always non-zero.
+- Combined non-atomic `--ops-file --save-file` keeps those incremental database commits but makes
+  only destination-file publication atomic. Once a chunk has been dispatched, every termination
+  emits a reconciliation manifest. Success publishes the complete JSONL and preserves the ordinary
+  manifest shape. A failure before the manifest is finalized discards the incomplete temp file,
+  preserves any prior destination, and
+  emits an additive `status="aborted"` manifest naming the confirmed `committed_chunks` plus any
+  unverified `dispatched_chunk`; that unverified chunk may already have database effects. Its
+  `summary` covers confirmed rows and `unconfirmed_ops` accounts for the remainder without
+  classifying unknown outcomes as aborted. The manifest, not existence of a newly published result
+  file, is the recovery boundary. A batch that runs to completion publishes the ordinary manifest
+  first, so the later non-zero exits from `--strict` or from an all-failed file retain that
+  manifest rather than replacing it with an aborted one; every op outcome is known on those paths.
 - `--ops-file --atomic` holds one bounded, DML-only `BEGIN IMMEDIATE` during its commit pass, per
   ADR-099. Daemon writes wait behind that unit and can fail if its hold exceeds their own busy
   timeout. Admissibility and prepare failures print a typed per-op result envelope over the real
@@ -277,8 +343,8 @@ sink not represented in `DaemonRequestFrame`; bulk apply deliberately avoids the
 and atomic bulk apply would require a new daemon transaction protocol. Refusing based on a daemon
 liveness probe would be racy. Any future daemon-routed design must be an explicit protocol change,
 not a liveness-dependent fallback. Until then, operators configure busy timeouts independently in
-both processes, inspect the complete result before retrying, and retry only operations known to be
-idempotent.
+both processes, inspect the manifest and the result file when one was published, and retry only
+operations known to be idempotent.
 
 ### `exec.rs` regression test notes
 

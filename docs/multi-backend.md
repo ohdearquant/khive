@@ -308,9 +308,12 @@ protocol-version mismatch, never for config-id drift.
 
 ### Full schema on every backend
 
-Every declared backend receives the full khive schema via `run_migrations()` at
-startup. Packs do not write to tables outside their substrate; the schema is
-applied uniformly for simplicity. There is no per-backend schema trimming.
+Every writable declared backend receives the full khive schema via
+`run_migrations()` at startup. Packs do not write to tables outside their
+substrate; the schema is applied uniformly for simplicity. There is no
+per-backend schema trimming. A read-only backend is validated against the
+build's exact current core-schema version instead; boot never attempts a
+migration or pack-auxiliary DDL against it.
 
 ### Canonical-path deduplication
 
@@ -322,11 +325,97 @@ backends are never deduplicated (each gets its own in-process database).
 
 ### Read-only backends
 
-Setting `read_only = true` opens reader connections with
-`SQLITE_OPEN_READ_ONLY` and applies `PRAGMA query_only = ON` to the writer slot,
-so any write attempt (DDL or DML) through that backend returns an error. The
-regression test `read_only_backend_rejects_writes` in
-`crates/khive-mcp/src/serve.rs` verifies this behavior.
+Setting `read_only = true` opens every connection with
+`SQLITE_OPEN_READ_ONLY` and also applies `PRAGMA query_only = ON` to the pool's
+writer slot, so any write attempt (DDL or DML) through that backend returns an
+error. Normal single-backend boot also selects this mode when an existing
+SQLite file has no filesystem write bits. Explicit read-only configuration
+does not create a missing database or its parent directory.
+
+Persistent-WAL inspection is physically source-side-effect free. A clean,
+checkpointed WAL database with no sidecars is opened through an encoded
+read-only immutable URI so SQLite cannot materialize fresh `-wal`/`-shm`
+files. A complete frozen snapshot that still has committed WAL frames must
+include both `-wal` and a filesystem-read-only `-shm`; it is opened with
+ordinary read-only WAL semantics so those frames remain visible. A non-empty
+`-wal` without that frozen index is rejected before SQLite opens (immutable
+mode would silently omit the committed frames), as is any writable `-shm`
+(evidence of potentially live shared state). Rollback-journal databases never
+use immutable mode and retain SQLite locking and change detection.
+
+Read-only boot is an inspection path, not a migration path. It requires the
+snapshot's core migration ledger to be the exact contiguous canonical sequence
+through the build's latest migration; a missing middle row or foreign version
+is rejected even when `MAX(version)` matches. Core-ledger and optional-table
+inspection use genuine read-only reader connections. This remains true for a
+rollback-journal snapshot: a read-only file pool retains a dedicated reader
+instead of degrading `reader()` onto its query-only writer slot. It skips
+configured embedding-model registration, lazy store-schema/repair writes, pack
+schema application, writer-task startup, checkpointing, and WAL sweeps. Optional
+vector, sparse, and text tables are checked through reader connections and must
+already exist. Read-only ANN cache misses do not enqueue registration or
+rebuild work; memory uses exact sqlite-vec fallback and knowledge retains FTS
+plus its load-only fresh-tail path. Prepare and migrate a writable copy before
+inspection if validation fails.
+
+Daemon background work follows the assigned backend, not a blanket main-mode
+switch. Writer-bearing memory/knowledge ANN warm and session mirroring do not
+run for a read-only pack runtime, and warm phase telemetry does not append to a
+read-only event store; neither does lazy embedder-initialization telemetry. The
+schedule ticker is omitted only when the schedule
+pack's own runtime is read-only: it remains enabled on a writable secondary
+beside a read-only main, and remains disabled on a read-only secondary beside a
+writable main.
+
+Blob storage follows the runtime assigned to the `blob` pack by the same rule.
+A read-only blob runtime opens only an already-existing filesystem root, never
+creates the default `blobs/` directory, and rejects `blob.put` plus lower-level
+delete/sweep mutators. This remains true for a read-only blob secondary beside
+a writable main; conversely, a writable blob secondary beside a read-only main
+retains normal puts.
+
+Feature-enabled email and Telegram background work is also admitted by the
+runtime that serves each loop's verbs, not by `--daemon` alone. Inbound polling
+requires the assigned `comm` runtime to be writable because it dispatches
+`comm.ingest`, heartbeat, and cursor writes. Outbound delivery requires the
+assigned `kg` runtime to be writable because it uses generic `list`/`update` to
+claim and mark a message; otherwise no external send task starts, avoiding a
+send followed by an inevitably failed `delivered_at` write. These gates are
+independent, so a mixed topology can admit one direction without admitting the
+other.
+
+The explicit `read_only` value participates in the backend-topology portion of
+the warm-daemon `config_id`. In multi-backend configuration it must agree with
+the file mode: a path with no filesystem write bits and `read_only = false` is
+rejected with a remedy to declare the inspection mode. Normal single-backend
+boot can detect that mode from the existing file and folds the effective mode
+into the same fingerprint, preventing a read-only client from reusing a daemon
+that opened the path while it was writable.
+
+Because the main event store is itself read-only, successful MCP operations do
+not attempt the per-dispatch audit append. Each successful non-help operation
+instead carries a stable machine-readable warning beside its canonical result:
+
+```json
+{
+  "ok": true,
+  "tool": "stats",
+  "result": { "entities": 42 },
+  "advisories": [
+    {
+      "code": "audit_persistence_skipped_read_only",
+      "severity": "warning",
+      "component": "audit_event_store",
+      "reason": "read_only_backend"
+    }
+  ]
+}
+```
+
+The warning does not weaken mutation checks: mutating verbs still return a
+per-operation error from the read-only SQLite contract. Operators that require
+durable audit or accounting must use a writable backend; this inspection mode
+does not claim those durability guarantees.
 
 ### Cross-backend link and federated search
 

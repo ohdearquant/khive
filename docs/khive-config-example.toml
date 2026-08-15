@@ -13,12 +13,15 @@
 #   3. ./.khive/config.toml                           (project-local hidden dir)
 #   4. ~/.khive/config.toml                           (user-global)
 #
-# Unknown keys are ignored (forward-compatible): a config written for a newer khive
-# still loads on an older build, and vice versa.
+# Unknown keys are ignored (forward-compatible), except for the security-sensitive
+# [gate] table: this build rejects any present [gate] table because it does not yet
+# implement ADR-143's store-held caller-grant model. It must never silently accept
+# an enrollment policy it will not enforce.
 #
 # Sections in this file:
 #   [actor]         default identity + namespace read/write scope
 #   [runtime]       brain profile + default output format
+#   [gate]          reserved; rejected by this build (do not configure)
 #   [[engines]]     embedding engines (replaces the KHIVE_EMBEDDING_MODEL env pair)
 #   [[backends]]    named storage backends (ADR-028)
 #   [packs.<name>]  per-pack backend assignment (ADR-028)
@@ -78,6 +81,12 @@
 # Precedence (high→low): per-request `format` → KHIVE_OUTPUT_FORMAT → this → "json".
 # Keep "json" if anything parses khive's output.
 # default_output_format = "json"
+
+# ── [gate] — reserved authorization surface ───────────────────────────────────────
+#
+# Do not add a live [gate] table. The accepted design uses store-held caller grants
+# (ADR-143), which are not implemented by this build. Startup rejects even an empty
+# [gate] table so caller-enrollment policy cannot be mistaken for active enforcement.
 
 # ── Embedding engines ──────────────────────────────────────────────────────────
 #
@@ -255,12 +264,19 @@ fusion_weight = 0.5
 #   KHIVE_PID=~/.khive/khived.pid                Daemon PID file path.
 #   KHIVE_LOCK=~/.khive/khived.recovery.lock     Stale-daemon recovery lock file path.
 #   KHIVE_DRAIN_TIMEOUT_SECS=10  Seconds the daemon waits for in-flight requests before shutdown.
+#   KHIVE_REQUEST_READ_TIMEOUT_SECS=30
+#                                Absolute ceiling for request-owned reads and compose (1..=3600).
+#                                Zero, invalid, or out-of-range values use the nonzero default.
+#   KHIVE_SQLITE_INTERRUPT_GRACE_MS=500
+#                                Read-interrupt settlement window in milliseconds (10..=5000).
+#                                Does not interrupt admitted writes.
 #
 # ── SQLite storage tuning (advanced — defaults are well-chosen; change only to profile) ──
 #   An unparseable numeric value here is treated as unset (falls back to the default).
 #   KHIVE_BUSY_TIMEOUT_SECS=30           SQLite busy_timeout per connection.
 #   KHIVE_CHECKOUT_TIMEOUT_SECS=5        Max wait to check out a pooled reader connection.
-#   KHIVE_WAL_AUTOCHECKPOINT_PAGES=4000  PRAGMA wal_autocheckpoint threshold (in pages).
+#   WAL autocheckpoint is not configurable: disabled where the dedicated checkpoint task runs
+#   (it owns routine passes), bounded at 4000 pages on pools without one.
 #   KHIVE_WAL_HIGH_WATER_PAGES=6000      WAL size that logs a high-pressure warning. Must be > 0.
 #   KHIVE_WAL_WARN_PAGES=2000            WAL size that logs a warning. Must be > 0.
 #   KHIVE_JOURNAL_SIZE_LIMIT_BYTES=67108864   PRAGMA journal_size_limit (64 MiB).

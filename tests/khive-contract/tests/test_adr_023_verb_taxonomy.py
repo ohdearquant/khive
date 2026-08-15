@@ -67,8 +67,9 @@ def test_kg_bare_product_verbs_are_reachable(
     assert fetched.get("kind") == "concept", f"get must return granular kind 'concept': {fetched}"
 
     # list
-    entities = khive_session.verb("list", {"kind": "entity", "entity_kind": "concept",
-                                            "namespace": ns})
+    page = khive_session.verb("list", {"kind": "entity", "entity_kind": "concept",
+                                        "namespace": ns})
+    entities = page["items"]
     assert isinstance(entities, list), "list must return a list"
     assert any(e["id"] == entity_a["id"] for e in entities), "list must include created entity"
 

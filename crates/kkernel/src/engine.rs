@@ -277,7 +277,32 @@ mod tests {
     fn temp_db() -> (TempDir, Option<std::path::PathBuf>) {
         let tmp = TempDir::new().expect("temp dir");
         let path = tmp.path().join("engine_test.db");
-        std::fs::File::create(&path).expect("create empty db file");
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(path.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("create and migrate engine test database");
+        drop(runtime);
+        // SQLite connection close is deferred, so the drop above can leave
+        // writable `-wal`/`-shm` sidecars behind; the commands under test
+        // open this database read-only, which accepts only the frozen
+        // snapshot form. No engine test writes after this point.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
         (tmp, Some(path))
     }
 

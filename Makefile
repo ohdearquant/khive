@@ -44,7 +44,7 @@ override CARGO_VALUE := $(value CARGO)
 unexport CARGO
 export CARGO_VALUE
 
-.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check
 
 check:
 	cd crates && cargo check --workspace
@@ -152,6 +152,13 @@ bench-1m-ci:
 	@echo "==> Running Vamana CI smoke bench (2-point: 10K/50K, <60 s)..."
 	@echo "    Set SIFT_DIR to the sift_base.fvecs / sift_query.fvecs directory."
 	bash scripts/bench_1m.sh --ci
+
+eval-retrieval-gold-check:
+	@echo "==> Retrieval eval harness: re-running A_fused_direct against committed gold..."
+	@echo "    (tolerance 0.002 absorbs a pre-existing rank-10-boundary tie-break jitter"
+	@echo "    in memory.recall unrelated to this harness's temporal-weight hermeticity fix"
+	@echo "    -- see benches/retrieval/README.md Determinism section)"
+	cd benches/retrieval && uv run python evaluate.py --check-gold --gold-tolerance 0.002
 
 hold-time-gate:
 	@echo "==> ADR-135 F4 release gate: per-shape writer hold-time regression coverage..."

@@ -48,10 +48,10 @@ impl SqlEventStore {
         namespace: impl Into<String>,
     ) -> Self {
         // Enabled by default for file-backed pools; explicit off/degraded
-        // fallback remains possible (ADR-067 Component A, mirrors
-        // entity.rs policy): a missing writer task degrades to the legacy
-        // pool-mutex / standalone-connection path rather than failing
-        // construction.
+        // construction remains synchronous (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task is cached without failing
+        // construction. Every write re-resolves it and applies
+        // strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Self {
             pool,
@@ -67,21 +67,24 @@ impl SqlEventStore {
             .map_err(|e| map_sqlite_err(e, "open_event_writer"))
     }
 
-    fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
         self.pool
-            .open_standalone_reader()
-            .map_err(|e| map_sqlite_err(e, "open_event_reader"))
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
     }
 
     /// Route a single-row write through the pool-wide `WriterTask` when
-    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
-    /// to the legacy standalone-connection / pool-mutex path (ADR-067
-    /// Component A, Fork C slice 2).
+    /// the write queue is enabled and a handle is available. Strict mode
+    /// refuses a missing handle; compatibility mode falls back to the legacy
+    /// standalone-connection / pool-mutex path (ADR-067 Component A, Fork C
+    /// slice 2).
     ///
-    /// `append_event`/`append_events` do their own flag check and return
-    /// early on `Some`, so their fallback calls into this helper only ever
-    /// execute on the flag-off path (`self.writer_task` is `None` by
-    /// construction whenever those calls are reached) — no double-routing.
+    /// `append_event`/`append_events` perform the same write-time lookup
+    /// first; a non-strict `None` then falls through this helper, which
+    /// records the actual compatibility fallback. Strict mode returns before
+    /// the direct-writer seam.
     /// `f` must be DML-only on the flag-on path (no bare `BEGIN IMMEDIATE`)
     /// since it runs inside the WriterTask's own transaction.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
@@ -89,12 +92,14 @@ impl SqlEventStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteEventGeneralWrite);
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
             let db = crate::timeout_sink::db_label(&self.pool);
@@ -127,18 +132,35 @@ impl SqlEventStore {
         R: Send + 'static,
     {
         if self.is_file_backed {
-            let conn = self.open_standalone_reader()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
+            let pool = Arc::clone(&self.pool);
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Events,
+                op,
+                move |scope| {
+                    scope.ensure_active()?;
+                    let conn = pool
+                        .open_standalone_reader()
+                        .map_err(|error| map_sqlite_err(error, op))?;
+                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
+                },
+            )
+            .await
         } else {
             let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.reader().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Events,
+                op,
+                move |scope| {
+                    let mut guard = pool
+                        .reader_until(|| scope.should_stop())
+                        .map_err(|e| map_sqlite_err(e, op))?
+                        .ok_or_else(|| StorageError::Timeout {
+                            operation: op.into(),
+                        })?;
+                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
+                },
+            )
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
         }
     }
 }
@@ -1004,7 +1026,7 @@ impl EventStore for SqlEventStore {
         // curation, mutation events — is covered without per-call-site
         // instrumentation. The enclosing per-dispatch audit row is appended
         // only after the usage snapshot is frozen, so it never counts itself.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("append_event")? {
             return writer_task
                 .send_bounded(move |conn| {
                     insert_event_with_observations(conn, &event)
@@ -1046,7 +1068,7 @@ impl EventStore for SqlEventStore {
         // all-or-nothing semantics (first failed insert aborts the whole
         // batch) — the WriterTask's run loop owns the enclosing transaction
         // and issues the ROLLBACK on `Err`.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("append_events")? {
             return writer_task
                 .send_bounded(move |conn| {
                     batch_append_events_dml(conn, &events, attempted)

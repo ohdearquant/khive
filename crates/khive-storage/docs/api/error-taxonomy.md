@@ -74,6 +74,21 @@ the wrapper's `capability`/`operation`. Its `message` field keeps the historical
 rendering for compatibility. This timeout occurs before SQLite executes and
 must not be classified as `SQLITE_BUSY` or checkpoint starvation.
 
+## Typed writer-task BEGIN contention
+
+`StorageError::WriterTaskBusy { timeout_ms }` means the writer queue accepted
+and dequeued the request, but SQLite returned `SQLITE_BUSY` or `SQLITE_LOCKED`
+until the connection's configured busy timeout expired. The writer task never
+invoked the request operation, so retrying that one failed operation is safe.
+The variant is capability-neutral and `is_retryable()` returns `true`.
+
+MCP preserves this proof with `code`/`stage` set to
+`writer_task_begin_busy`, `operation: "writer_task_begin"`, and
+`retryable: true`. Its `scope` and `retry_after_ms` are null: unlike
+`writer_queue_saturated`, the queue did accept this request, and no separate
+backoff policy is defined. Other `BEGIN IMMEDIATE` failures retain the generic
+pool error and are not promoted by rendered-message matching.
+
 ## `is_fts5_syntax_error`
 
 `TextSearch::search` returns the same `Driver` variant for a malformed MATCH

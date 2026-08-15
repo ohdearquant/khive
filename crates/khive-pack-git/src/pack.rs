@@ -15,8 +15,8 @@ use khive_types::{EdgeEndpointRule, EntityTypeDef, HandlerDef, Pack};
 use crate::hook::{CommitHook, IssueLikeHook};
 use crate::vocab::{GIT_ENTITY_TYPES, GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS};
 
-/// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendment 1 and ADR-108)
-/// — registers `commit` / `issue` / `pull_request` note kinds populated by
+/// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendments 1 and 2, plus
+/// ADR-108) — registers `commit` / `issue` / `pull_request` note kinds populated by
 /// the batch ingester in `src/ingest.rs`, one read/ingest agent-facing verb,
 /// `git.digest` (`src/handlers.rs`), and three write verbs, `git.commit` /
 /// `git.branch` / `git.push` (`src/write_handlers.rs`, ADR-108). Extends the

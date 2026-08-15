@@ -4,8 +4,9 @@
 //! and namespace isolation using an in-memory runtime.
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_storage::blob::ContentRef;
 use khive_storage::types::{Direction, PageRequest, TraversalOptions, TraversalRequest};
-use khive_storage::{EdgeRelation, Event, EventFilter};
+use khive_storage::{BlobStore, EdgeRelation, Event, EventFilter};
 use khive_types::{EventKind, SubstrateKind};
 use uuid::Uuid;
 
@@ -64,6 +65,67 @@ async fn entity_create_with_properties_and_tags() {
     let fetched = rt.get_entity(&research_tok, entity.id).await.unwrap();
     assert_eq!(fetched.properties, Some(props));
     assert_eq!(fetched.tags, vec!["fine-tuning", "quantization"]);
+}
+
+#[tokio::test]
+async fn entity_create_with_content_ref_roundtrip() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let blob_store = std::sync::Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(temp.path().to_path_buf(), 0).unwrap(),
+    );
+    rt.install_blob_store(blob_store.clone());
+    let content_ref = blob_store.put(b"asset bytes".to_vec()).await.unwrap();
+
+    let entity = rt
+        .create_entity_with_content_ref(
+            &tok,
+            "artifact",
+            Some("visual_asset"),
+            "asset",
+            None,
+            None,
+            vec![],
+            &content_ref,
+        )
+        .await
+        .unwrap();
+
+    let fetched = rt.get_entity(&tok, entity.id).await.unwrap();
+    assert_eq!(fetched.content_ref.as_deref(), Some(content_ref.as_str()));
+}
+
+#[tokio::test]
+async fn entity_create_with_content_ref_rejects_unpublished_blob() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    rt.install_blob_store(std::sync::Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(temp.path().to_path_buf(), 0).unwrap(),
+    ));
+    let missing = ContentRef::from_digest_bytes(&[7; 32]);
+
+    let error = rt
+        .create_entity_with_content_ref(
+            &tok,
+            "artifact",
+            Some("visual_asset"),
+            "asset",
+            None,
+            None,
+            vec![],
+            &missing,
+        )
+        .await
+        .expect_err("unpublished ref must fail");
+
+    assert!(error.to_string().contains("requires a published blob"));
+    assert!(rt
+        .list_entities(&tok, None, None, 10, 0)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

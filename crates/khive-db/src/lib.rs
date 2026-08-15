@@ -7,7 +7,7 @@
 pub mod backend;
 /// Periodic WAL checkpoint task.
 pub mod checkpoint;
-/// Read-only-by-intent WAL/checkpoint diagnostics operator surface.
+/// Read-only-by-intent database-integrity and WAL/checkpoint diagnostics.
 pub mod diagnostics;
 /// Error types for the SQLite layer.
 pub mod error;
@@ -17,6 +17,7 @@ pub mod extension;
 pub mod migrations;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
+mod read_cancellation;
 /// `SqlAccess` trait bridge to `ConnectionPool`.
 pub mod sql_bridge;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).
@@ -25,9 +26,9 @@ pub mod stores;
 mod timeout_sink;
 /// Cross-process WAL-pin attribution sidecar (ADR-091 Amendment 2 Plank B).
 /// The sidecar write path (heartbeat/beacon) and identity primitives are
-/// portable; directory enumeration (`enumerate_live`) is Unix-only — its
-/// only caller is the daemon's checkpoint task, and daemon mode itself
-/// requires Unix (see `khive-mcp/src/serve.rs`).
+/// portable; directory collection (`enumerate_live`/`housekeep_live`) is
+/// Unix-only — its only caller is the daemon's checkpoint task, and daemon
+/// mode itself requires Unix (see `khive-mcp/src/serve.rs`).
 pub mod walpin;
 /// Single-writer task and bounded write queue (ADR-067 Component A).
 pub mod writer_task;
@@ -39,10 +40,20 @@ pub use checkpoint::{
 };
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use error::SqliteError;
+pub use khive_storage::{
+    await_request_read_phase, effective_request_read_deadline, ensure_request_read_active,
+    inherit_request_read_cancellation, inherit_request_read_context, request_read_is_cancelled,
+    request_read_timeout_from_env, scope_request_read_cancellation, scope_request_read_deadline,
+    scope_request_read_deadline_at, wait_for_request_read_cancellation, RequestReadDeadline,
+    DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+};
 pub use migrations::{
     inspect_schema_version, query_embedding_models, read_schema_version, run_migrations,
     EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, WriterGuard};
+#[cfg(test)]
+pub use read_cancellation::scope_test_read_progress;
+pub use read_cancellation::{sqlite_interrupt_grace_from_env, DEFAULT_SQLITE_INTERRUPT_GRACE_MS};
 pub use sql_bridge::SqlBridge;
 pub use writer_task::WriterTaskHandle;

@@ -976,6 +976,259 @@ async fn get_by_domain_uuid_returns_canonical_domain_not_mirror_atom() {
     assert_eq!(members[0], "rag");
 }
 
+#[tokio::test]
+async fn get_resolves_atom_by_compact_prefix_longer_than_eight_chars() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "prefix-atom",
+            "name": "Prefix Atom",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "prefix-atom" }))
+        .await
+        .expect("get atom by slug");
+    let full_id = by_slug["id"].as_str().expect("full atom id");
+    let compact: String = full_id.chars().filter(|ch| *ch != '-').take(12).collect();
+
+    let by_prefix = f
+        .dispatch("knowledge.get", json!({ "id": compact }))
+        .await
+        .expect("get atom by unique compact prefix");
+    assert_eq!(by_prefix["id"], full_id);
+    assert_eq!(by_prefix["kind"], "atom");
+
+    let compact_uuid = full_id.replace('-', "");
+    let by_compact_uuid = f
+        .dispatch("knowledge.get", json!({ "id": compact_uuid }))
+        .await
+        .expect("32-character compact UUID is a complete identifier");
+    assert_eq!(by_compact_uuid["id"], full_id);
+}
+
+#[tokio::test]
+async fn get_exact_all_hex_slug_wins_over_uuid_prefix_collision() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "hex-prefix-source",
+            "name": "Hex Prefix Source",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("upsert prefix source");
+
+    let source = f
+        .dispatch("knowledge.get", json!({ "id": "hex-prefix-source" }))
+        .await
+        .expect("get prefix source");
+    let source_id = source["id"].as_str().expect("source id").to_string();
+    let hex_slug = source_id.replace('-', "")[..16].to_string();
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": hex_slug.clone(),
+            "name": "Exact Hex Slug",
+            "content": "exact hexadecimal slug retrieval must precede compact identifier prefix interpretation across knowledge corpus reads and preserve deterministic registered slug addressing"
+        }] }),
+    )
+    .await
+    .expect("upsert exact all-hex slug");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": hex_slug.clone() }))
+        .await
+        .expect("exact all-hex slug must win over UUID prefix collision");
+    assert_eq!(by_slug["slug"], hex_slug);
+    assert_eq!(by_slug["name"], "Exact Hex Slug");
+    assert_ne!(
+        by_slug["id"], source_id,
+        "prefix interpretation must not return the colliding source record"
+    );
+}
+
+#[tokio::test]
+async fn get_exact_all_hex_slug_wins_when_uuid_prefix_matches_nothing() {
+    const HEX_SLUG: &str = "fffffffffffffffffffffffffffffffff";
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": HEX_SLUG,
+            "name": "Overlong Hex Slug",
+            "content": "overlong hexadecimal slug lookup remains exact and addressable even though no canonical UUID can match a prefix longer than thirty two hexadecimal characters"
+        }] }),
+    )
+    .await
+    .expect("upsert overlong all-hex slug");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": HEX_SLUG }))
+        .await
+        .expect("exact all-hex slug must resolve before a guaranteed prefix miss");
+    assert_eq!(by_slug["slug"], HEX_SLUG);
+    assert_eq!(by_slug["name"], "Overlong Hex Slug");
+}
+
+#[tokio::test]
+async fn get_domain_prefix_deduplicates_same_uuid_mirror_atom() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{
+            "slug": "prefix-domain",
+            "name": "Prefix Domain",
+            "description": "Retrieval concepts techniques algorithms implementations applications use cases and design patterns in sufficient detail for this deterministic domain prefix regression fixture"
+        }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "prefix-domain" }))
+        .await
+        .expect("get domain by slug");
+    let full_id = by_slug["id"].as_str().expect("full domain id");
+    let prefix = &full_id[..8];
+
+    let by_prefix = f
+        .dispatch("knowledge.get", json!({ "id": prefix }))
+        .await
+        .expect("domain and mirror atom must count as one prefix match");
+    assert_eq!(by_prefix["id"], full_id);
+    assert_eq!(by_prefix["kind"], "domain");
+}
+
+#[tokio::test]
+async fn get_rejects_ambiguous_prefix_across_distinct_knowledge_records() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let mut writer = runtime.sql().writer().await.expect("knowledge writer");
+    writer
+        .execute_batch(vec![
+            SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, created_at, updated_at) \
+                      VALUES (?1, 'local', 'ambiguous-a', 'Ambiguous A', 'content a', 1, 1)"
+                    .into(),
+                params: vec![SqlValue::Text(
+                    "deadbeef-0000-4000-8000-000000000001".into(),
+                )],
+                label: Some("test.knowledge_get.ambiguous_a".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, created_at, updated_at) \
+                      VALUES (?1, 'local', 'ambiguous-b', 'Ambiguous B', 'content b', 2, 2)"
+                    .into(),
+                params: vec![SqlValue::Text(
+                    "deadbeef-0000-4000-8000-000000000002".into(),
+                )],
+                label: Some("test.knowledge_get.ambiguous_b".into()),
+            },
+        ])
+        .await
+        .expect("seed colliding prefixes");
+    drop(writer);
+
+    let err = f
+        .dispatch("knowledge.get", json!({ "id": "deadbeef" }))
+        .await
+        .expect_err("distinct UUIDs sharing a prefix must be ambiguous");
+    let RuntimeError::AmbiguousPrefix { prefix, matches } = err else {
+        panic!("expected AmbiguousPrefix, got {err:?}");
+    };
+    assert_eq!(prefix, "deadbeef");
+    assert_eq!(matches.len(), 2);
+}
+
+#[tokio::test]
+async fn get_by_id_is_namespace_agnostic_and_loads_sections_from_stored_namespace() {
+    let f = pack(rt());
+    let foreign_namespace = "identifier-contract-foreign";
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "namespace": foreign_namespace,
+            "atoms": [{
+                "slug": "foreign-prefix-atom",
+                "name": "Foreign Prefix Atom",
+                "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+            }]
+        }),
+    )
+    .await
+    .expect("upsert foreign atom");
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "namespace": foreign_namespace,
+            "id": "foreign-prefix-atom",
+            "sections": [{
+                "section_type": "overview",
+                "content": "This section belongs to the foreign namespace atom and proves that a namespace-agnostic by-ID read loads sections using the resolved record namespace."
+            }]
+        }),
+    )
+    .await
+    .expect("add foreign section");
+
+    let foreign = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "namespace": foreign_namespace, "id": "foreign-prefix-atom" }),
+        )
+        .await
+        .expect("get foreign atom by scoped slug");
+    let full_id = foreign["id"].as_str().expect("foreign atom id").to_string();
+    let compact_prefix = full_id.replace('-', "")[..12].to_string();
+
+    f.dispatch("knowledge.get", json!({ "id": "foreign-prefix-atom" }))
+        .await
+        .expect_err("slug lookup must remain scoped to the caller namespace");
+
+    let by_id = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": full_id.clone(), "include_sections": true }),
+        )
+        .await
+        .expect("full UUID read must be namespace-agnostic");
+    assert_eq!(by_id["namespace"], foreign_namespace);
+    assert_eq!(
+        by_id["sections"].as_array().expect("sections array").len(),
+        1,
+        "section lookup must use the resolved atom's stored namespace"
+    );
+
+    let by_prefix = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": compact_prefix, "include_sections": true }),
+        )
+        .await
+        .expect("unique prefix read must be namespace-agnostic");
+    assert_eq!(by_prefix["id"], full_id);
+    assert_eq!(by_prefix["namespace"], foreign_namespace);
+    assert_eq!(
+        by_prefix["sections"]
+            .as_array()
+            .expect("prefix sections array")
+            .len(),
+        1,
+        "prefix section lookup must use the resolved atom's stored namespace"
+    );
+}
+
 // ── knowledge.get + include_sections ─────────────────────────────────────────
 
 #[tokio::test]
@@ -4267,6 +4520,12 @@ mod kg_blend {
     /// batches of 2+ texts (query + candidates).
     struct FailingBlendEmbedService;
 
+    const CANCEL_QUERY: &str = "zzzquantumfoo cancellation boundary kv cache paging decode \
+        attention retrieval augmented generation dense sparse benchmark corpus";
+
+    static CANCEL_ON_BLEND_FAILURE: std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>> =
+        std::sync::Mutex::new(None);
+
     #[async_trait]
     impl EmbeddingService for FailingBlendEmbedService {
         async fn embed(
@@ -4274,7 +4533,16 @@ mod kg_blend {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
-            if texts.len() == 1 && texts[0] == QUERY {
+            if texts.len() == 1 && (texts[0] == QUERY || texts[0] == CANCEL_QUERY) {
+                if texts[0] == CANCEL_QUERY {
+                    if let Some(cancel) = CANCEL_ON_BLEND_FAILURE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = cancel.send(true);
+                    }
+                }
                 return Err(EmbedError::Internal(
                     "simulated KG blend-path embed failure".into(),
                 ));
@@ -4375,6 +4643,35 @@ mod kg_blend {
         assert!(
             !md.contains("Knowledge graph"),
             "markdown must not contain a Knowledge graph section when the blend fails, got: {md}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_kg_blend_failure_never_degrades_to_success() {
+        let f = pack(rt_with_failing_blend_embedder());
+        let domain_id = seed_domain_and_atom(&f).await;
+        seed_kg_concept(&f).await;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        *CANCEL_ON_BLEND_FAILURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel_tx);
+
+        let result = khive_storage::scope_request_read_cancellation(
+            cancel_rx,
+            f.dispatch(
+                "knowledge.compose",
+                json!({ "domain_ids": [domain_id], "query": CANCEL_QUERY }),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(khive_runtime::RuntimeError::Storage(
+                    khive_storage::StorageError::Timeout { .. }
+                ))
+            ),
+            "request cancellation at the KG-blend catch must propagate, got {result:?}"
         );
     }
 }

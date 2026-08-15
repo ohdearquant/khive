@@ -242,3 +242,15 @@ Out of scope, not rejected on technical merit. Independent files can scale aggre
 ## Provenance
 
 This decision is grounded in a static write-path code census (every cited path and symbol re-read at a pinned revision), and in an independent queueing-theory analysis of embedded-store writer scaling whose `NEEDS-EXPERIMENT` qualifications bound how its claims are used here. The bundled SQLite version was established from the vendored `libsqlite3-sys` source, not from a claim. A bundled-SQLite upgrade past the WAL-reset fix serves the F7 version gate and remains an open prerequisite in this tree (`libsqlite3-sys` 0.31.0 / SQLite 3.48.0 at the time of writing); it should merge before any concurrency experiment produces an architectural verdict.
+
+### 2026-08-09 amendment: autocheckpoint is no longer an application-path experiment
+
+Production checkpoint ownership now disables `wal_autocheckpoint` on every writer-capable
+connection of a pool the scheduled checkpoint task has claimed, as specified by ADR-091
+Amendment 10; pools without a running checkpoint task keep a bounded 4,000-page fallback so a
+writable pool never loses WAL reclamation entirely. This supersedes the Context and Consequences
+statements that describe `wal_autocheckpoint=4000` as unconditional current behavior, and removes
+F7's current-versus-disabled comparison from the production topology matrix. An isolated benchmark
+may still issue a raw pragma to construct a historical control, but neither `PoolConfig` nor an
+environment variable selects the posture in a shipped connection constructor — only the ownership
+claim does.

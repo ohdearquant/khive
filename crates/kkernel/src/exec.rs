@@ -17,16 +17,28 @@
 //!
 //! `kkernel exec --ops-file batch.jsonl` reads a JSONL file where each
 //! non-blank line is a JSON op object `{"tool":"verb","args":{...}}`.  All
-//! lines are parsed first; a malformed line aborts before any writes.  Valid
-//! ops are dispatched in chunks of 100 (`OPS_FILE_CHUNK_SIZE`) through the same
+//! lines are validated first into a bounded temporary snapshot; a malformed
+//! line aborts before any writes without retaining the whole file in memory.
+//! Physical lines are capped at 96 MiB and the file at 512 MiB. Valid ops are
+//! dispatched in chunks of at most 100 and 32 MiB (one larger op runs alone)
+//! through the same
 //! in-process runtime path (daemon fast-path is intentionally skipped for
 //! bulk apply — the daemon is warm-state optimised, not throughput optimised).
-//! A progress line is printed per chunk.  `--dry-run` validates every line and
-//! prints a per-verb summary without writing anything.
+//! A progress line is printed per chunk. `--save-file` streams ordered rows to
+//! a sink whose final-file publication is atomic; the database chunks commit
+//! incrementally. After dispatch begins, success and failure both print a
+//! reconciliation manifest. An aborted manifest names confirmed committed
+//! chunks and any dispatched chunk whose response could not be verified.
+//! Without `--save-file`, validated row payloads are discarded after aggregation.
+//! `--serial` keeps the same logical chunks and one warm server/model instance,
+//! but runs each full chunk through the same batch path with handler concurrency
+//! capped at one. The default remains bounded parallel execution; `--serial`
+//! conflicts with `--atomic`.
+//! `--dry-run` validates every line and prints a per-verb summary without writes.
 
 use std::collections::BTreeMap;
-use std::io::BufRead as _;
-use std::path::PathBuf;
+use std::io::{BufRead as _, Read as _, Seek as _, Write as _};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -37,11 +49,11 @@ use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
     enforce_strict_actor_mode, install_resolved_blob_store,
     normalize_redundant_db_override_with_source, reject_conflicting_db_override_with_source,
-    RuntimeConfigInputs,
+    validate_declared_backend_access_modes, RuntimeConfigInputs,
 };
-#[cfg(unix)]
-use khive_mcp::server::compute_config_id;
 use khive_mcp::server::KhiveMcpServer;
+#[cfg(unix)]
+use khive_mcp::server::{compute_config_id, compute_config_id_with_storage_mode};
 use khive_mcp::tools::request::RequestParams;
 #[cfg(unix)]
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
@@ -330,6 +342,34 @@ pub(crate) fn acquire_local_construction_guard(
 /// [`khive_request::MAX_OPS`] so the batch always fits inside the parser limit.
 const OPS_FILE_CHUNK_SIZE: usize = 100;
 
+/// Large payloads reduce the op count per dispatch so a 100-op chunk cannot
+/// duplicate/stringify the entire accepted input snapshot at once. One op may
+/// exceed this budget (up to the physical-line ceiling) and runs alone.
+const OPS_FILE_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// A single JSONL op may carry one 64 MiB Moodboard object as base64 plus its
+/// bounded metadata, but cannot grow without limit before JSON validation.
+const MAX_OPS_FILE_LINE_BYTES: usize = 96 * 1024 * 1024;
+
+/// The validated on-disk snapshot bounds both disk amplification and the
+/// all-in-memory atomic path. Non-atomic execution retains only one chunk.
+const MAX_OPS_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+const MAX_OPS_FILE_FAILURE_DETAILS: usize = 1_000;
+const MAX_OPS_FILE_FAILURE_ERROR_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpsFileDispatchMode {
+    BoundedParallel,
+    Serial,
+}
+
+impl OpsFileDispatchMode {
+    const fn is_serial(self) -> bool {
+        matches!(self, Self::Serial)
+    }
+}
+
 /// Arguments for `kkernel exec` — execute a verb DSL expression against a chosen
 /// database and namespace, the same syntax accepted by the MCP `request` tool.
 #[derive(Parser, Debug)]
@@ -404,6 +444,11 @@ pub struct ExecArgs {
     /// Valid values: `json` (compact, lossless — default), `auto` (shape-aware:
     /// markdown table for record arrays, key-value block for single records),
     /// `table` (force markdown table).
+    ///
+    /// The legacy `--ops-file` path without `--save-file` keeps its established
+    /// aggregate JSON summary and does not forward this override to transient
+    /// rows. Combined bulk save always persists lossless JSON rows, matching
+    /// inline save.
     #[arg(long, value_name = "FORMAT")]
     pub output_format: Option<String>,
 
@@ -416,7 +461,13 @@ pub struct ExecArgs {
     /// The manifest (`{path, rows, per_column_null_counts, schema_fingerprint,
     /// checksum, summary, failures?}`) is printed to stdout instead of the raw
     /// results. Optional `failures` entries project each failed row's error and
-    /// any stable reason. Parent directories are created if absent.
+    /// any stable reason. With `--ops-file`, ordered per-op envelopes from every
+    /// chunk are retained in one JSONL file. Database chunks commit incrementally;
+    /// after dispatch begins every exit prints a reconciliation manifest. A
+    /// post-dispatch failure prints `status="aborted"`, the confirmed committed
+    /// chunks, and any dispatched-but-unverified chunk. Its incomplete temp file
+    /// is discarded, so a prior destination remains unchanged. Parent directories
+    /// are created if absent.
     ///
     /// Note: `--save-file` always runs in-process and bypasses the warm daemon,
     /// so ANN-dependent verbs (e.g. `knowledge.suggest`, `knowledge.compose`) may
@@ -424,7 +475,7 @@ pub struct ExecArgs {
     ///
     /// Example:
     ///   kkernel exec 'list(kind="entity")' --save-file /tmp/entities.jsonl
-    #[arg(long)]
+    #[arg(long, conflicts_with = "dry_run")]
     pub save_file: Option<String>,
 
     /// JSONL file of ops to apply in bulk.
@@ -434,8 +485,18 @@ pub struct ExecArgs {
     /// parsed before any write.  A malformed line prints the line number and
     /// error, then aborts without writing.
     ///
-    /// Progress is printed per chunk to stderr; the final aggregate summary is
-    /// printed to stdout.
+    /// The source is capped at 512 MiB total and 96 MiB per physical line, then
+    /// spooled to a validated temporary snapshot before writes. Dispatch chunks
+    /// are capped at 100 ops and 32 MiB (one larger op runs alone). Progress is
+    /// printed per chunk to stderr; the final aggregate summary is printed to
+    /// stdout, or `--save-file` incrementally writes ordered JSONL rows to a
+    /// sibling temp file. Success atomically publishes the complete file and
+    /// prints its ordinary manifest. A later failure leaves database effects
+    /// incremental, discards the incomplete temp file, and prints an aborted
+    /// reconciliation manifest before returning non-zero.
+    /// Pass `--serial` to retain those logical chunks while awaiting every
+    /// handler before starting the next; this keeps one warm server/model and
+    /// limits handler concurrency to one.
     ///
     /// Mutually exclusive with the positional `ops` argument.
     #[arg(long, value_name = "PATH")]
@@ -445,6 +506,20 @@ pub struct ExecArgs {
     /// without writing anything.  Only valid with `--ops-file`.
     #[arg(long, requires = "ops_file")]
     pub dry_run: bool,
+
+    /// Await each JSON op to completion before dispatching the next one.
+    ///
+    /// This keeps one in-process server and its loaded models warm while
+    /// limiting handler concurrency to exactly one. It is intended for
+    /// resource-constrained backends where an ordinary parallel ops-file batch
+    /// can exhaust a reader or model resource. Only valid with `--ops-file` and
+    /// mutually exclusive with both positional inline ops and `--atomic`.
+    #[arg(
+        long,
+        requires = "ops_file",
+        conflicts_with_all = ["atomic", "ops"]
+    )]
+    pub serial: bool,
 
     /// Run the whole ops-file as ONE cross-op atomic unit (ADR-099): every op
     /// commits or the whole file rolls back, with zero partial state either
@@ -479,10 +554,296 @@ pub struct ExecArgs {
 }
 
 /// A single parsed op entry from an ops-file line.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct OpsFileEntry {
     pub(crate) tool: String,
     pub(crate) args: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct ValidatedOpsFile {
+    snapshot: std::fs::File,
+    total: usize,
+    per_verb: BTreeMap<String, usize>,
+}
+
+fn parse_ops_file_line(raw: &str, line_num: usize) -> Result<Option<OpsFileEntry>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let obj: serde_json::Value = serde_json::from_str(trimmed).map_err(|error| {
+        refusal_error(
+            RefusalReason::ParseError,
+            format!("ops-file line {line_num}: invalid JSON: {error}"),
+        )
+    })?;
+    let obj = obj.as_object().ok_or_else(|| {
+        refusal_error(
+            RefusalReason::ParseError,
+            format!(
+                "ops-file line {line_num}: expected a JSON object \
+                 {{\"tool\":...,\"args\":...}}, got a non-object value"
+            ),
+        )
+    })?;
+    let tool = obj
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            refusal_error(
+                RefusalReason::ParseError,
+                format!("ops-file line {line_num}: missing or non-string \"tool\" field"),
+            )
+        })?
+        .to_owned();
+    let args = match obj.get("args") {
+        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(v) if v.is_object() => v.clone(),
+        Some(v) => {
+            return Err(refusal_error(
+                RefusalReason::ParseError,
+                format!("ops-file line {line_num}: \"args\" must be a JSON object, got {v}"),
+            ))
+        }
+    };
+    Ok(Some(OpsFileEntry { tool, args }))
+}
+
+fn read_bounded_ops_line<R: std::io::BufRead>(
+    reader: &mut R,
+    line_num: usize,
+) -> Result<Option<String>> {
+    read_bounded_ops_line_with_limit(reader, line_num, MAX_OPS_FILE_LINE_BYTES)
+}
+
+fn read_bounded_ops_line_with_limit<R: std::io::BufRead>(
+    reader: &mut R,
+    line_num: usize,
+    limit: usize,
+) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let read = {
+        let mut limited = (&mut *reader).take((limit + 1) as u64);
+        limited
+            .read_until(b'\n', &mut bytes)
+            .with_context(|| format!("read ops-file line {line_num}"))?
+    };
+    if read == 0 {
+        return Ok(None);
+    }
+    if read > limit {
+        anyhow::bail!("ops-file line {line_num} exceeds the {limit}-byte physical-line limit");
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("ops-file line {line_num} is not valid UTF-8: {error}"))
+}
+
+/// Validate the complete source before runtime construction or writes, while
+/// spooling a stable bounded snapshot instead of retaining all argument Values.
+fn validate_ops_file(path: &Path) -> Result<ValidatedOpsFile> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("open ops-file {}", path.display()))?;
+    let metadata_len = file
+        .metadata()
+        .with_context(|| format!("stat ops-file {}", path.display()))?
+        .len();
+    if metadata_len > MAX_OPS_FILE_BYTES {
+        anyhow::bail!(
+            "ops-file {} is {metadata_len} bytes, exceeding the {MAX_OPS_FILE_BYTES}-byte total limit",
+            path.display()
+        );
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut snapshot = tempfile::tempfile().context("create validated ops-file snapshot")?;
+    let mut total = 0_usize;
+    let mut total_bytes = 0_u64;
+    let mut per_verb = BTreeMap::new();
+    let mut line_num = 1_usize;
+    while let Some(raw) = read_bounded_ops_line(&mut reader, line_num)? {
+        total_bytes = total_bytes
+            .checked_add(raw.len() as u64)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("ops-file byte count overflow"))?;
+        if total_bytes > MAX_OPS_FILE_BYTES {
+            anyhow::bail!(
+                "ops-file exceeds the {MAX_OPS_FILE_BYTES}-byte total limit while reading line {line_num}"
+            );
+        }
+        if let Some(op) = parse_ops_file_line(&raw, line_num)? {
+            *per_verb.entry(op.tool).or_insert(0) += 1;
+            snapshot
+                .write_all(raw.trim().as_bytes())
+                .context("write validated ops-file snapshot")?;
+            snapshot
+                .write_all(b"\n")
+                .context("write validated ops-file snapshot newline")?;
+            total += 1;
+        }
+        line_num += 1;
+    }
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot")?;
+    Ok(ValidatedOpsFile {
+        snapshot,
+        total,
+        per_verb,
+    })
+}
+
+fn parse_validated_snapshot<R>(snapshot: &mut R) -> Result<Vec<OpsFileEntry>>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot")?;
+    let mut reader = std::io::BufReader::new(snapshot);
+    let mut ops = Vec::new();
+    let mut line_num = 1_usize;
+    while let Some(raw) = read_bounded_ops_line(&mut reader, line_num)? {
+        if let Some(op) = parse_ops_file_line(&raw, line_num)? {
+            ops.push(op);
+        }
+        line_num += 1;
+    }
+    Ok(ops)
+}
+
+/// Validate every decoded JSON op in the stable snapshot before the first
+/// handler can mutate state.
+///
+/// This is deliberately a bounded second pass: at most one ordinary logical
+/// chunk is materialized, and one over-target physical line may stand alone.
+/// It pins the typed parser's nesting, `$prev`, and reserved-envelope guards
+/// across the whole file rather than discovering a later invalid op after an
+/// earlier serial dispatch has committed.
+fn preflight_typed_validated_snapshot<R>(snapshot: &mut R, expected_total: usize) -> Result<()>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot for typed preflight")?;
+    let result: Result<()> = (|| {
+        let mut reader = std::io::BufReader::new(&mut *snapshot);
+        let mut processed = 0_usize;
+        let mut line_number = 1_usize;
+        let mut chunk_number = 0_usize;
+        let mut pending: Option<(OpsFileEntry, usize)> = None;
+        let mut eof = false;
+
+        while !eof {
+            let mut chunk = Vec::with_capacity(OPS_FILE_CHUNK_SIZE);
+            let mut chunk_bytes = 0_usize;
+            if let Some((op, bytes)) = pending.take() {
+                chunk_bytes = bytes;
+                chunk.push(op);
+            }
+            while chunk.len() < OPS_FILE_CHUNK_SIZE {
+                let Some(raw) = read_bounded_ops_line(&mut reader, line_number)? else {
+                    eof = true;
+                    break;
+                };
+                let physical_bytes = raw.len().saturating_add(1);
+                if let Some(op) = parse_ops_file_line(&raw, line_number)? {
+                    if should_defer_chunk_entry(chunk.len(), chunk_bytes, physical_bytes) {
+                        pending = Some((op, physical_bytes));
+                        line_number += 1;
+                        break;
+                    }
+                    chunk_bytes = chunk_bytes.saturating_add(physical_bytes);
+                    chunk.push(op);
+                }
+                line_number += 1;
+            }
+            if chunk.is_empty() {
+                break;
+            }
+
+            chunk_number += 1;
+            let chunk_len = chunk.len();
+            let typed_ops = chunk
+                .into_iter()
+                .map(|op| {
+                    let serde_json::Value::Object(args) = op.args else {
+                        unreachable!("validated ops-file args are always JSON objects")
+                    };
+                    khive_request::TypedJsonOp {
+                        tool: op.tool,
+                        args,
+                    }
+                })
+                .collect();
+            khive_request::parse_typed_json_batch(typed_ops).map_err(|error| {
+                refusal_error(
+                    RefusalReason::ParseError,
+                    format!("ops-file typed preflight chunk {chunk_number}: {error}"),
+                )
+            })?;
+            processed += chunk_len;
+        }
+
+        if processed != expected_total {
+            anyhow::bail!(
+                "validated ops-file snapshot changed during typed preflight: expected \
+                 {expected_total} ops, read {processed}"
+            );
+        }
+        Ok(())
+    })();
+    snapshot
+        .rewind()
+        .context("rewind typed-preflighted ops-file snapshot")?;
+    result
+}
+
+fn validated_tool_names<R>(snapshot: &mut R) -> Result<Vec<String>>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot")?;
+    let mut reader = std::io::BufReader::new(snapshot);
+    let mut tools = Vec::new();
+    let mut line_num = 1_usize;
+    while let Some(raw) = read_bounded_ops_line(&mut reader, line_num)? {
+        if let Some(op) = parse_ops_file_line(&raw, line_num)? {
+            tools.push(op.tool);
+        }
+        line_num += 1;
+    }
+    Ok(tools)
+}
+
+/// Enforce the atomic operation ceiling before the validated snapshot is
+/// parsed into owned JSON values. The second guard in `atomic_apply` remains
+/// defense in depth for callers that bypass this CLI transport seam.
+fn parse_atomic_validated_snapshot<R>(
+    snapshot: &mut R,
+    total: usize,
+    max_ops: usize,
+) -> Result<Vec<OpsFileEntry>>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    if total > max_ops {
+        anyhow::bail!(
+            "--atomic op count {total} exceeds the configured maximum {max_ops}; \
+             split the file or raise --atomic-max-ops"
+        );
+    }
+    parse_validated_snapshot(snapshot)
 }
 
 /// Parse a JSONL ops-file.
@@ -493,71 +854,10 @@ pub(crate) struct OpsFileEntry {
 /// Each line must be a JSON object `{"tool":"verb","args":{...}}`.  `"args"`
 /// is optional and defaults to an empty object.  Any other top-level keys are
 /// silently ignored so the format is forward-compatible.
-pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("open ops-file {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
-
-    let mut ops: Vec<OpsFileEntry> = Vec::new();
-
-    for (line_idx, result) in reader.lines().enumerate() {
-        let line_num = line_idx + 1;
-        let raw = result.with_context(|| format!("read ops-file line {line_num}"))?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Parse as a JSON object.
-        let obj: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-            refusal_error(
-                RefusalReason::ParseError,
-                format!("ops-file line {line_num}: invalid JSON: {e}"),
-            )
-        })?;
-
-        let obj = obj.as_object().ok_or_else(|| {
-            refusal_error(
-                RefusalReason::ParseError,
-                format!(
-                    "ops-file line {line_num}: expected a JSON object \
-                     {{\"tool\":...,\"args\":...}}, got a non-object value"
-                ),
-            )
-        })?;
-
-        // "tool" is required.
-        let tool = obj
-            .get("tool")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                refusal_error(
-                    RefusalReason::ParseError,
-                    format!("ops-file line {line_num}: missing or non-string \"tool\" field"),
-                )
-            })?
-            .to_owned();
-
-        // "args" defaults to an empty object.
-        let args = match obj.get("args") {
-            None => serde_json::Value::Object(serde_json::Map::new()),
-            Some(v) => {
-                if !v.is_object() {
-                    return Err(refusal_error(
-                        RefusalReason::ParseError,
-                        format!(
-                            "ops-file line {line_num}: \"args\" must be a JSON object, got {v}"
-                        ),
-                    ));
-                }
-                v.clone()
-            }
-        };
-
-        ops.push(OpsFileEntry { tool, args });
-    }
-
-    Ok(ops)
+#[cfg(test)]
+pub(crate) fn parse_ops_file(path: &Path) -> Result<Vec<OpsFileEntry>> {
+    let mut validated = validate_ops_file(path)?;
+    parse_validated_snapshot(&mut validated.snapshot)
 }
 
 /// Extract the failed entries of one dispatched chunk as `{op_index, tool,
@@ -565,9 +865,18 @@ pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
 /// without the per-op reason strings is unactionable: a gate rejection, a
 /// schema error, and a transient failure all look identical, and pipelines
 /// that trust the counts alone lose records silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpsFileReportMode {
+    /// Preserve the pre-save-file CLI wire exactly for compatibility.
+    LegacyNoSave,
+    /// Bound durable manifest diagnostics independently from saved rows.
+    BoundedSave,
+}
+
 fn collect_op_failures(
     parsed: &serde_json::Value,
     applied_before: usize,
+    mode: OpsFileReportMode,
 ) -> Vec<serde_json::Value> {
     let Some(results) = parsed["results"].as_array() else {
         return Vec::new();
@@ -579,6 +888,7 @@ fn collect_op_failures(
         .map(|(i, entry)| {
             let error = match &entry["error"] {
                 serde_json::Value::Null => serde_json::Value::from("unknown error"),
+                other if mode == OpsFileReportMode::BoundedSave => bounded_failure_error(other),
                 other => other.clone(),
             };
             let mut failure = serde_json::json!({
@@ -586,107 +896,759 @@ fn collect_op_failures(
                 "tool": entry["tool"].as_str().unwrap_or("?"),
                 "error": error,
             });
-            if let Some(reason) = entry["reason"].as_str().and_then(RefusalReason::from_token) {
-                failure["reason"] = serde_json::json!(reason.as_str());
+            if mode == OpsFileReportMode::BoundedSave {
+                failure["aborted"] =
+                    serde_json::Value::Bool(entry["aborted"].as_bool().unwrap_or(false));
+                if let Some(reason) = entry["reason"].as_str().and_then(RefusalReason::from_token) {
+                    failure["reason"] = serde_json::json!(reason.as_str());
+                }
             }
             failure
         })
         .collect()
 }
 
+fn retain_failure_detail(
+    mode: OpsFileReportMode,
+    failure: serde_json::Value,
+    failures: &mut Vec<serde_json::Value>,
+    omitted: &mut usize,
+) -> bool {
+    if mode == OpsFileReportMode::BoundedSave && failures.len() >= MAX_OPS_FILE_FAILURE_DETAILS {
+        *omitted += 1;
+        false
+    } else {
+        failures.push(failure);
+        true
+    }
+}
+
+fn ops_file_progress_line(
+    mode: OpsFileReportMode,
+    applied: usize,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    aborted: usize,
+) -> String {
+    match mode {
+        OpsFileReportMode::LegacyNoSave => {
+            format!("applied {applied}/{total} (ok={succeeded}, failed={failed})")
+        }
+        OpsFileReportMode::BoundedSave => format!(
+            "applied {applied}/{total} (ok={succeeded}, failed={failed}, aborted={aborted})"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ops_file_summary(
+    mode: OpsFileReportMode,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    aborted: usize,
+    failures: Vec<serde_json::Value>,
+    failure_details_omitted: usize,
+) -> serde_json::Value {
+    let mut summary = match mode {
+        OpsFileReportMode::LegacyNoSave => serde_json::json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+        }),
+        OpsFileReportMode::BoundedSave => serde_json::json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "aborted": aborted,
+        }),
+    };
+    if !failures.is_empty() {
+        summary["failures"] = serde_json::Value::Array(failures);
+    }
+    if mode == OpsFileReportMode::BoundedSave && failure_details_omitted > 0 {
+        summary["failure_details_omitted"] = serde_json::json!(failure_details_omitted);
+    }
+    summary
+}
+
+fn bounded_failure_error(error: &serde_json::Value) -> serde_json::Value {
+    let mut writer = CountingWriter::default();
+    if serde_json::to_writer(&mut writer, error).is_ok()
+        && writer.bytes <= MAX_OPS_FILE_FAILURE_ERROR_BYTES
+    {
+        error.clone()
+    } else {
+        serde_json::Value::String(format!(
+            "error detail omitted: exceeds {MAX_OPS_FILE_FAILURE_ERROR_BYTES}-byte ops-file diagnostic limit"
+        ))
+    }
+}
+
+fn required_summary_count(parsed: &serde_json::Value, field: &str) -> Result<usize> {
+    let value = parsed
+        .pointer(&format!("/summary/{field}"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("dispatch result is missing integer summary.{field}"))?;
+    usize::try_from(value).context("dispatch summary count does not fit usize")
+}
+
+fn classify_ordered_chunk(
+    expected_tools: &[String],
+    results: &[serde_json::Value],
+) -> Result<(usize, usize, usize)> {
+    if results.len() != expected_tools.len() {
+        anyhow::bail!(
+            "ordered chunk result count {} does not match input count {}",
+            results.len(),
+            expected_tools.len()
+        );
+    }
+    let mut succeeded = 0_usize;
+    let mut failed = 0_usize;
+    let mut aborted = 0_usize;
+    for (index, (expected_tool, row)) in expected_tools.iter().zip(results).enumerate() {
+        let object = row
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} is not a JSON object"))?;
+        let returned_tool = object
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} has no string tool"))?;
+        if returned_tool != expected_tool {
+            anyhow::bail!(
+                "dispatch result row {index} tool mismatch: expected {:?}, got {:?}",
+                expected_tool,
+                returned_tool
+            );
+        }
+        let ok = object
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} has no boolean ok"))?;
+        let row_aborted = match object.get("aborted") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                anyhow::anyhow!("dispatch result row {index} has non-boolean aborted")
+            })?,
+        };
+        match (ok, row_aborted) {
+            (true, false) => {
+                if !object.contains_key("result") {
+                    anyhow::bail!(
+                        "dispatch result row {index} is successful but has no result field"
+                    );
+                }
+                if object.contains_key("error") {
+                    anyhow::bail!(
+                        "dispatch result row {index} is successful but also has an error field"
+                    );
+                }
+                succeeded += 1;
+            }
+            (false, false) => {
+                if !object.contains_key("error") {
+                    anyhow::bail!("dispatch result row {index} failed but has no error field");
+                }
+                if object.contains_key("result") {
+                    anyhow::bail!("dispatch result row {index} failed but also has a result field");
+                }
+                failed += 1;
+            }
+            (false, true) => {
+                if !object.contains_key("error") {
+                    anyhow::bail!("dispatch result row {index} aborted but has no error field");
+                }
+                if object.contains_key("result") {
+                    anyhow::bail!(
+                        "dispatch result row {index} aborted but also has a result field"
+                    );
+                }
+                aborted += 1;
+            }
+            (true, true) => {
+                anyhow::bail!("dispatch result row {index} cannot be both successful and aborted")
+            }
+        }
+    }
+    Ok((succeeded, failed, aborted))
+}
+
+fn validate_ordered_chunk_envelope(
+    expected_tools: &[String],
+    parsed: &serde_json::Value,
+    chunk_number: usize,
+) -> Result<(usize, usize, usize)> {
+    let results = parsed
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("dispatch chunk {chunk_number} returned no results array")
+        })?;
+    let chunk_total = required_summary_count(parsed, "total")?;
+    let chunk_succeeded = required_summary_count(parsed, "succeeded")?;
+    let chunk_failed = required_summary_count(parsed, "failed")?;
+    let chunk_aborted = required_summary_count(parsed, "aborted")?;
+    let (derived_succeeded, derived_failed, derived_aborted) =
+        classify_ordered_chunk(expected_tools, results)?;
+    if chunk_total != expected_tools.len()
+        || chunk_succeeded != derived_succeeded
+        || chunk_failed != derived_failed
+        || chunk_aborted != derived_aborted
+    {
+        anyhow::bail!(
+            "dispatch chunk {chunk_number} summary disagrees with ordered rows: expected total {}, summary total {}, derived/summary succeeded {derived_succeeded}/{chunk_succeeded}, failed {derived_failed}/{chunk_failed}, aborted {derived_aborted}/{chunk_aborted}",
+            expected_tools.len(),
+            chunk_total,
+        );
+    }
+    let status = parsed
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("dispatch chunk {chunk_number} returned no string status")
+        })?;
+    let expected_status = if derived_failed == 0 && derived_aborted == 0 {
+        "success"
+    } else {
+        "partial"
+    };
+    if status != expected_status {
+        anyhow::bail!(
+            "dispatch chunk {chunk_number} status disagrees with ordered rows: expected {expected_status:?}, got {status:?}"
+        );
+    }
+    Ok((chunk_succeeded, chunk_failed, chunk_aborted))
+}
+
+fn should_defer_chunk_entry(current_count: usize, current_bytes: usize, next_bytes: usize) -> bool {
+    current_count > 0
+        && (current_count >= OPS_FILE_CHUNK_SIZE
+            || current_bytes.saturating_add(next_bytes) > OPS_FILE_CHUNK_MAX_BYTES)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.checked_add(buffer.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::FileTooLarge, "JSON byte count overflow")
+        })?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct AbortedOpsFileError {
+    message: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    manifest: serde_json::Value,
+}
+
+impl std::fmt::Display for AbortedOpsFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AbortedOpsFileError {}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_aborted_ops_file_manifest(
+    error: anyhow::Error,
+    save_path: &str,
+    requested_total: usize,
+    confirmed_ops: usize,
+    committed_chunks: &[usize],
+    dispatched_chunk: Option<usize>,
+    summary: serde_json::Value,
+) -> anyhow::Error {
+    let message = format!("{error:#}");
+    let mut manifest = serde_json::json!({
+        "status": "aborted",
+        "path": save_path,
+        "file_published": false,
+        "requested_total": requested_total,
+        "confirmed_ops": confirmed_ops,
+        "unconfirmed_ops": requested_total.saturating_sub(confirmed_ops),
+        "committed_chunks": committed_chunks,
+        "summary": summary,
+        "error": message.clone(),
+    });
+    if let Some(chunk_number) = dispatched_chunk {
+        manifest["dispatched_chunk"] = serde_json::json!(chunk_number);
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&manifest).expect("serialize aborted ops-file manifest")
+    );
+    anyhow::Error::new(AbortedOpsFileError { message, manifest })
+}
+
 /// Apply a parsed ops-file against the given server, printing progress to
-/// stderr and the final summary to stdout.
+/// stderr and either the final summary or a success/aborted save manifest.
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+async fn apply_ops_file_reader<R: std::io::BufRead>(
+    server: &KhiveMcpServer,
+    reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+) -> Result<serde_json::Value> {
+    apply_ops_file_reader_with_dispatch_mode(
+        server,
+        reader,
+        total,
+        presentation,
+        _output_format,
+        save_file,
+        strict,
+        OpsFileDispatchMode::BoundedParallel,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_reader_with_dispatch_mode<R: std::io::BufRead>(
+    server: &KhiveMcpServer,
+    reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
+) -> Result<serde_json::Value> {
+    apply_ops_file_reader_with_response_transform_and_dispatch_mode(
+        server,
+        reader,
+        total,
+        presentation,
+        _output_format,
+        save_file,
+        strict,
+        dispatch_mode,
+        |_, raw| raw,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+async fn apply_ops_file_reader_with_response_transform<R, F>(
+    server: &KhiveMcpServer,
+    reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    response_transform: F,
+) -> Result<serde_json::Value>
+where
+    R: std::io::BufRead,
+    F: FnMut(usize, String) -> String,
+{
+    apply_ops_file_reader_with_response_transform_and_dispatch_mode(
+        server,
+        reader,
+        total,
+        presentation,
+        _output_format,
+        save_file,
+        strict,
+        OpsFileDispatchMode::BoundedParallel,
+        response_transform,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_reader_with_response_transform_and_dispatch_mode<R, F>(
+    server: &KhiveMcpServer,
+    mut reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
+    mut response_transform: F,
+) -> Result<serde_json::Value>
+where
+    R: std::io::BufRead,
+    F: FnMut(usize, String) -> String,
+{
+    let report_mode = if save_file.is_some() {
+        OpsFileReportMode::BoundedSave
+    } else {
+        OpsFileReportMode::LegacyNoSave
+    };
+    let mut total_succeeded: usize = 0;
+    let mut total_failed: usize = 0;
+    let mut total_aborted: usize = 0;
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    let mut failure_details_omitted = 0_usize;
+    // Preflight the destination before the first chunk can commit. Rows then
+    // stream to its sibling temp file. Success publishes it atomically; after
+    // dispatch begins, failure drops it and emits a reconciliation manifest.
+    let save_path = save_file.clone();
+    let mut save_sink = save_file
+        .as_deref()
+        .map(|path| khive_mcp::save_sink::JsonlSaveSink::new(Path::new(path), false))
+        .transpose()?;
+    let mut processed = 0_usize;
+    let mut snapshot_line = 1_usize;
+    let mut chunk_idx = 0_usize;
+    let mut eof = false;
+    let mut pending: Option<(OpsFileEntry, usize)> = None;
+    let mut confirmed_ops = 0_usize;
+    let mut committed_chunks = Vec::new();
+    let mut dispatched_chunk = None;
+
+    let execution_result: Result<()> = async {
+        while !eof {
+            // `--serial` changes handler concurrency, not the established
+            // logical chunk/progress/reconciliation boundary.
+            let mut chunk = Vec::with_capacity(OPS_FILE_CHUNK_SIZE);
+            let mut chunk_bytes = 0_usize;
+            if let Some((op, bytes)) = pending.take() {
+                chunk_bytes = bytes;
+                chunk.push(op);
+            }
+            while chunk.len() < OPS_FILE_CHUNK_SIZE {
+                let Some(raw) = read_bounded_ops_line(&mut reader, snapshot_line)? else {
+                    eof = true;
+                    break;
+                };
+                let physical_bytes = raw.len().saturating_add(1);
+                if let Some(op) = parse_ops_file_line(&raw, snapshot_line)? {
+                    if should_defer_chunk_entry(chunk.len(), chunk_bytes, physical_bytes) {
+                        pending = Some((op, physical_bytes));
+                        snapshot_line += 1;
+                        break;
+                    }
+                    chunk_bytes = chunk_bytes.saturating_add(physical_bytes);
+                    chunk.push(op);
+                }
+                snapshot_line += 1;
+            }
+            if chunk.is_empty() {
+                break;
+            }
+            let applied_before = processed;
+
+            let chunk_len = chunk.len();
+            let expected_tools: Vec<String> = chunk.iter().map(|op| op.tool.clone()).collect();
+            let typed_ops: Vec<khive_request::TypedJsonOp> = chunk
+                .into_iter()
+                .map(|op| {
+                    let serde_json::Value::Object(args) = op.args else {
+                        unreachable!("validated ops-file args are always JSON objects")
+                    };
+                    khive_request::TypedJsonOp {
+                        tool: op.tool,
+                        args,
+                    }
+                })
+                .collect();
+
+            let chunk_number = chunk_idx + 1;
+            dispatched_chunk = Some(chunk_number);
+            let output_format = save_sink.is_some().then(|| "json".to_string());
+            let raw = if dispatch_mode.is_serial() {
+                server
+                    .dispatch_typed_json_batch_serial_local_for_exec(
+                        typed_ops,
+                        presentation.clone(),
+                        output_format,
+                        strict,
+                    )
+                    .await
+            } else {
+                server
+                    .dispatch_typed_json_batch_local_for_exec(
+                        typed_ops,
+                        presentation.clone(),
+                        // Inline --save-file writes raw results before format
+                        // rendering. Reproduce that lossless shape for combined
+                        // bulk save. No-save preserves its legacy behavior.
+                        output_format,
+                        strict,
+                    )
+                    .await
+            }
+            .map_err(|error| anyhow::anyhow!("dispatch chunk {chunk_number}: {error}"))?;
+            let raw = response_transform(chunk_number, raw);
+
+            let mut parsed: serde_json::Value =
+                serde_json::from_str(&raw).context("parse dispatch result")?;
+            annotate_and_emit_refusals(&mut parsed, strict);
+            let (chunk_succeeded, chunk_failed, chunk_aborted) =
+                validate_ordered_chunk_envelope(&expected_tools, &parsed, chunk_number)?;
+            let chunk_results = parsed["results"]
+                .as_array()
+                .expect("validated ordered results array");
+
+            total_succeeded += chunk_succeeded;
+            total_failed += chunk_failed;
+            total_aborted += chunk_aborted;
+            confirmed_ops += chunk_len;
+            committed_chunks.push(chunk_number);
+            dispatched_chunk = None;
+
+            for failure in collect_op_failures(&parsed, applied_before, report_mode) {
+                let reason = match &failure["error"] {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let op_index = failure["op_index"].clone();
+                let tool = failure["tool"].as_str().unwrap_or("?").to_string();
+                if retain_failure_detail(
+                    report_mode,
+                    failure,
+                    &mut failures,
+                    &mut failure_details_omitted,
+                ) {
+                    eprintln!("op {} ({}) failed: {reason}", op_index, tool);
+                }
+            }
+
+            if let Some(save_sink) = save_sink.as_mut() {
+                for row in chunk_results {
+                    save_sink.write_row(row)?;
+                }
+            }
+
+            processed += chunk_len;
+            let applied_now = processed;
+            eprintln!(
+                "{}",
+                ops_file_progress_line(
+                    report_mode,
+                    applied_now,
+                    total,
+                    total_succeeded,
+                    total_failed,
+                    total_aborted,
+                )
+            );
+            chunk_idx += 1;
+        }
+        if processed != total {
+            anyhow::bail!(
+                "validated ops-file snapshot changed: expected {total} ops, read {}",
+                processed
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = execution_result {
+        if let Some(path) = save_path
+            .as_deref()
+            .filter(|_| !committed_chunks.is_empty() || dispatched_chunk.is_some())
+        {
+            drop(save_sink.take());
+            let summary = ops_file_summary(
+                report_mode,
+                confirmed_ops,
+                total_succeeded,
+                total_failed,
+                total_aborted,
+                failures,
+                failure_details_omitted,
+            );
+            return Err(emit_aborted_ops_file_manifest(
+                error,
+                path,
+                total,
+                confirmed_ops,
+                &committed_chunks,
+                dispatched_chunk,
+                summary,
+            ));
+        }
+        return Err(error);
+    }
+
+    let summary = ops_file_summary(
+        report_mode,
+        total,
+        total_succeeded,
+        total_failed,
+        total_aborted,
+        failures,
+        failure_details_omitted,
+    );
+    let output = if let Some(save_sink) = save_sink {
+        let manifest = match save_sink.finish(summary.clone()) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let path = save_path
+                    .as_deref()
+                    .expect("save sink exists only when save path exists");
+                return Err(emit_aborted_ops_file_manifest(
+                    error,
+                    path,
+                    total,
+                    confirmed_ops,
+                    &committed_chunks,
+                    None,
+                    summary,
+                ));
+            }
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&manifest).expect("serialize save manifest")
+        );
+        manifest
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).expect("serialize summary")
+        );
+        summary
+    };
+    if total > 0 && total_succeeded == 0 {
+        match report_mode {
+            OpsFileReportMode::LegacyNoSave => anyhow::bail!(
+                "every op failed: {total_failed} op(s) failed out of {total}, 0 succeeded (see printed summary above)"
+            ),
+            OpsFileReportMode::BoundedSave => anyhow::bail!(
+                "every op failed: {total_failed} failed, {total_aborted} aborted out of {total}, 0 succeeded (see printed output above)"
+            ),
+        }
+    }
+    if strict {
+        match report_mode {
+            OpsFileReportMode::LegacyNoSave if total_failed > 0 => anyhow::bail!(
+                "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
+            ),
+            OpsFileReportMode::BoundedSave if total_failed > 0 || total_aborted > 0 => {
+                anyhow::bail!(
+                    "--strict: {total_failed} op(s) failed, {total_aborted} op(s) aborted out of {total} (see printed output above)"
+                )
+            }
+            _ => {}
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
 async fn apply_ops_file(
     server: &KhiveMcpServer,
     ops: Vec<OpsFileEntry>,
     presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
     strict: bool,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     let total = ops.len();
-    let mut total_succeeded: usize = 0;
-    let mut total_failed: usize = 0;
-    let mut failures: Vec<serde_json::Value> = Vec::new();
-
-    for (chunk_idx, chunk) in ops.chunks(OPS_FILE_CHUNK_SIZE).enumerate() {
-        let applied_before = (chunk_idx * OPS_FILE_CHUNK_SIZE).min(total);
-
-        // Build the JSON array string for this chunk.
-        let batch_arr: Vec<serde_json::Value> = chunk
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "tool": e.tool,
-                    "args": e.args,
-                })
-            })
-            .collect();
-        let batch_json = serde_json::to_string(&batch_arr).context("serialize chunk to JSON")?;
-
-        let params = RequestParams {
-            ops: batch_json,
-            presentation: presentation.clone(),
-            presentation_per_op: None,
-            save_to: None,
-            format: None,
-            format_per_op: None,
-            request_id: None,
-        };
-
-        let raw = server
-            .dispatch_request_local(params)
-            .await
-            .map_err(|e| anyhow::anyhow!("dispatch chunk {}: {}", chunk_idx + 1, e))?;
-
-        let mut parsed: serde_json::Value =
-            serde_json::from_str(&raw).context("parse dispatch result")?;
-        annotate_and_emit_refusals(&mut parsed, strict);
-
-        let chunk_succeeded = parsed["summary"]["succeeded"].as_u64().unwrap_or(0) as usize;
-        let chunk_failed = parsed["summary"]["failed"].as_u64().unwrap_or(0) as usize;
-
-        total_succeeded += chunk_succeeded;
-        total_failed += chunk_failed;
-
-        for failure in collect_op_failures(&parsed, applied_before) {
-            let reason = match &failure["error"] {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            eprintln!(
-                "op {} ({}) failed: {reason}",
-                failure["op_index"],
-                failure["tool"].as_str().unwrap_or("?"),
-            );
-            failures.push(failure);
-        }
-
-        let applied_now = applied_before + chunk.len();
-        eprintln!("applied {applied_now}/{total} (ok={total_succeeded}, failed={total_failed})");
+    let mut encoded = Vec::new();
+    for op in ops {
+        serde_json::to_writer(
+            &mut encoded,
+            &serde_json::json!({"tool": op.tool, "args": op.args}),
+        )
+        .context("serialize test ops-file entry")?;
+        encoded.push(b'\n');
     }
+    apply_ops_file_reader(
+        server,
+        std::io::Cursor::new(encoded),
+        total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+    )
+    .await
+}
 
-    let mut summary = serde_json::json!({
-        "total": total,
-        "succeeded": total_succeeded,
-        "failed": total_failed,
-    });
-    if !failures.is_empty() {
-        summary["failures"] = serde_json::Value::Array(failures);
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_with_dispatch_mode(
+    server: &KhiveMcpServer,
+    ops: Vec<OpsFileEntry>,
+    presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
+) -> Result<serde_json::Value> {
+    let total = ops.len();
+    let mut encoded = Vec::new();
+    for op in ops {
+        serde_json::to_writer(
+            &mut encoded,
+            &serde_json::json!({"tool": op.tool, "args": op.args}),
+        )
+        .context("serialize test ops-file entry")?;
+        encoded.push(b'\n');
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&summary).expect("serialize summary")
-    );
-    if total > 0 && total_succeeded == 0 {
-        anyhow::bail!(
-            "every op failed: {total_failed} op(s) failed out of {total}, 0 succeeded (see printed summary above)"
-        );
+    apply_ops_file_reader_with_dispatch_mode(
+        server,
+        std::io::Cursor::new(encoded),
+        total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+        dispatch_mode,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_with_response_transform<F>(
+    server: &KhiveMcpServer,
+    ops: Vec<OpsFileEntry>,
+    presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    response_transform: F,
+) -> Result<serde_json::Value>
+where
+    F: FnMut(usize, String) -> String,
+{
+    let total = ops.len();
+    let mut encoded = Vec::new();
+    for op in ops {
+        serde_json::to_writer(
+            &mut encoded,
+            &serde_json::json!({"tool": op.tool, "args": op.args}),
+        )
+        .context("serialize test ops-file entry")?;
+        encoded.push(b'\n');
     }
-    if strict && total_failed > 0 {
-        anyhow::bail!(
-            "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
-        );
-    }
-    Ok(())
+    apply_ops_file_reader_with_response_transform(
+        server,
+        std::io::Cursor::new(encoded),
+        total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+        response_transform,
+    )
+    .await
 }
 
 /// Execute the DSL expression, routing through the warm daemon when available.
@@ -707,6 +1669,14 @@ async fn apply_ops_file(
 /// skipped entirely, and all ops are dispatched through the in-process runtime
 /// in chunks (see module-level docs).
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
+    // Clap enforces these relations for normal CLI entry. Keep the same
+    // boundary for library callers that construct `ExecArgs` directly.
+    if args.serial && (args.ops_file.is_none() || args.ops.is_some() || args.atomic) {
+        anyhow::bail!(
+            "--serial requires --ops-file and conflicts with positional ops and --atomic"
+        );
+    }
+
     // ── pending-events drain ─────────────────────────────────────────────────
     if args.pending_events {
         let summary = pending_events::run_pending_events_with_config(
@@ -736,7 +1706,6 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         (Some(ops), None) => ExecMode::Inline(ops.clone()),
         (None, Some(path)) => ExecMode::OpsFile(path.clone()),
     };
-
     // Parsing is the invocation boundary, before identity/configuration guards
     // choose a competing refusal. This makes malformed inline DSL and malformed
     // JSONL deterministically report `parse-error` regardless of whether strict
@@ -831,8 +1800,11 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 path,
                 cfg,
                 args.presentation,
+                args.output_format,
+                args.save_file,
                 args.dry_run,
                 db_context,
+                args.serial,
                 args.atomic,
                 args.atomic_max_ops,
                 args.strict,
@@ -1040,7 +2012,7 @@ fn preflight_inline_ops(ops: &str) -> Result<()> {
 fn preflight_exec_mode(mode: &ExecMode) -> Result<()> {
     match mode {
         ExecMode::Inline(ops) => preflight_inline_ops(ops),
-        ExecMode::OpsFile(path) => match parse_ops_file(path) {
+        ExecMode::OpsFile(path) => match validate_ops_file(path) {
             Ok(_) => Ok(()),
             Err(error) => {
                 if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
@@ -1073,9 +2045,11 @@ fn report_mode_refusal(
             let tools = request.ops.into_iter().map(|op| op.tool).collect();
             (tools, chain)
         }),
-        ExecMode::OpsFile(path) => parse_ops_file(path)
-            .ok()
-            .map(|ops| (ops.into_iter().map(|op| op.tool).collect::<Vec<_>>(), false)),
+        ExecMode::OpsFile(path) => validate_ops_file(path).ok().and_then(|mut validated| {
+            validated_tool_names(&mut validated.snapshot)
+                .ok()
+                .map(|tools| (tools, false))
+        }),
     };
     match parsed {
         Some((tools, chain)) if !tools.is_empty() => {
@@ -1231,8 +2205,10 @@ async fn run_exec_inline_with_forward(
     // correctly rejects it. A matching concrete override is redundant, so its
     // fingerprint and captured construction anchor are normalized to the same
     // values used when no override is supplied.
-    if !khive_cfg.backends.is_empty() {
-        normalize_redundant_db_override_with_source(
+    let force_memory = if khive_cfg.backends.is_empty() {
+        false
+    } else {
+        let force_memory = normalize_redundant_db_override_with_source(
             &mut cfg,
             db_context.raw.as_deref(),
             &khive_cfg.backends,
@@ -1241,6 +2217,11 @@ async fn run_exec_inline_with_forward(
         if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
             db_context.anchor = cfg.db_path.clone();
         }
+        force_memory
+    };
+
+    if !force_memory {
+        validate_declared_backend_access_modes(&khive_cfg.backends)?;
     }
 
     disclose_resolved_database(&cfg, &khive_cfg);
@@ -1267,8 +2248,16 @@ async fn run_exec_inline_with_forward(
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
             // Fold the SAME backends topology the daemon folds (`Some(&khive_cfg)`)
-            // instead of `None` — see the `khive_cfg` load above.
-            config_id: compute_config_id(&cfg, Some(&khive_cfg)),
+            // instead of `None` — see the `khive_cfg` load above. A force-memory
+            // override also supplies the effective writable mode explicitly:
+            // the declaration can say `main.read_only = true`, but the runtime
+            // the child opens is writable memory and fingerprints that captured
+            // mode after construction.
+            config_id: if force_memory {
+                compute_config_id_with_storage_mode(&cfg, Some(&khive_cfg), false)
+            } else {
+                compute_config_id(&cfg, Some(&khive_cfg))
+            },
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
             metrics_only: false,
@@ -1399,20 +2388,68 @@ fn build_local_fallback_server(
     }
 }
 
+struct AtomicSavePublishFailure {
+    stdout: String,
+    error: anyhow::Error,
+}
+
+/// Render the authoritative atomic stdout value. A save sink is preflighted
+/// before execution, but its writes/flush/rename necessarily happen after the
+/// database outcome is known. If that publication fails after a commit, keep
+/// the process failure while returning a reconciliation envelope that makes
+/// the durable, non-retryable outcome explicit.
+fn render_atomic_output(
+    envelope: &mut serde_json::Value,
+    save_sink: Option<khive_mcp::save_sink::JsonlSaveSink>,
+) -> std::result::Result<String, AtomicSavePublishFailure> {
+    let Some(save_sink) = save_sink else {
+        return Ok(serde_json::to_string_pretty(envelope).expect("serialize atomic envelope"));
+    };
+
+    match save_sink.write_envelope(envelope) {
+        Ok(manifest) => {
+            Ok(serde_json::to_string(&manifest).expect("serialize atomic save manifest"))
+        }
+        Err(error) => {
+            let committed = crate::atomic_apply::record_save_file_publish_failure(envelope, &error);
+            let stdout = serde_json::to_string_pretty(envelope)
+                .expect("serialize atomic save failure reconciliation envelope");
+            let error = if committed {
+                error.context(
+                    "atomic database changes committed but --save-file publication failed; \
+                     do not replay the mutation (inspect stdout for reconciliation details)",
+                )
+            } else {
+                error.context("atomic --save-file publication failed")
+            };
+            Err(AtomicSavePublishFailure { stdout, error })
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
     cfg: RuntimeConfig,
     presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
     dry_run: bool,
     db_context: ExecDbContext,
+    serial: bool,
     atomic: bool,
     atomic_max_ops: Option<usize>,
     strict: bool,
 ) -> Result<()> {
-    // Parse the whole file first — fail before any writes if any line is bad.
-    let ops = match parse_ops_file(&path) {
-        Ok(ops) => ops,
+    if serial && atomic {
+        anyhow::bail!("--serial conflicts with --atomic");
+    }
+
+    // Validate the whole file and spool a stable bounded snapshot before any
+    // runtime construction or writes. Non-atomic dispatch retains only one
+    // request chunk plus ordered result envelopes in memory.
+    let mut validated = match validate_ops_file(&path) {
+        Ok(validated) => validated,
         Err(error) => {
             if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
                 return Err(report_unscoped_refusal(
@@ -1424,20 +2461,29 @@ async fn run_exec_ops_file(
         }
     };
 
-    if ops.is_empty() {
+    if validated.total == 0 {
         anyhow::bail!("ops-file is empty (no non-blank lines): {}", path.display());
     }
 
-    if dry_run {
-        // Count ops per verb and report — no dispatch.
-        let mut per_verb: BTreeMap<String, usize> = BTreeMap::new();
-        for op in &ops {
-            *per_verb.entry(op.tool.clone()).or_insert(0) += 1;
+    if serial {
+        if let Err(error) =
+            preflight_typed_validated_snapshot(&mut validated.snapshot, validated.total)
+        {
+            if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
+                return Err(report_unscoped_refusal(
+                    refusal.reason,
+                    refusal.message.as_str(),
+                ));
+            }
+            return Err(error);
         }
+    }
+
+    if dry_run {
         let summary = serde_json::json!({
             "dry_run": true,
-            "total": ops.len(),
-            "per_verb": per_verb,
+            "total": validated.total,
+            "per_verb": validated.per_verb,
         });
         println!(
             "{}",
@@ -1452,8 +2498,9 @@ async fn run_exec_ops_file(
     // `[[backends]]` multi-backend topology exactly like the daemon-fallback
     // path — see `build_local_fallback_server`.
     if let Err(error) = enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs) {
+        let tools = validated_tool_names(&mut validated.snapshot)?;
         return Err(report_tools_refusal(
-            ops.iter().map(|op| op.tool.clone()).collect(),
+            tools,
             false,
             RefusalReason::AnonymousActor,
             error.to_string(),
@@ -1477,6 +2524,15 @@ async fn run_exec_ops_file(
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
+        let ops =
+            parse_atomic_validated_snapshot(&mut validated.snapshot, validated.total, max_ops)?;
+        // Preflight a deterministic save target before the atomic unit can
+        // commit. An execution error drops the unfinished sibling temp file
+        // and leaves any prior complete destination untouched.
+        let save_sink = save_file
+            .as_deref()
+            .map(|path| khive_mcp::save_sink::JsonlSaveSink::new(Path::new(path), false))
+            .transpose()?;
         let mut envelope =
             match crate::atomic_apply::execute_atomic_ops_file(ops, cfg, &khive_cfg, max_ops).await
             {
@@ -1497,10 +2553,17 @@ async fn run_exec_ops_file(
                 }
             };
         annotate_and_emit_refusals(&mut envelope, strict);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&envelope).expect("serialize atomic envelope")
-        );
+        let output = match render_atomic_output(&mut envelope, save_sink) {
+            Ok(output) => output,
+            Err(failure) => {
+                // stdout is the machine reconciliation channel. Emit it before
+                // returning the non-zero sink error so callers never infer that
+                // silence means the atomic database unit is safe to replay.
+                println!("{}", failure.stdout);
+                return Err(failure.error);
+            }
+        };
+        println!("{output}");
         return Ok(());
     }
 
@@ -1511,7 +2574,26 @@ async fn run_exec_ops_file(
         db_context.anchor.as_deref(),
     )?;
 
-    apply_ops_file(&server, ops, presentation, strict).await
+    validated
+        .snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot for dispatch")?;
+    apply_ops_file_reader_with_dispatch_mode(
+        &server,
+        std::io::BufReader::new(validated.snapshot),
+        validated.total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+        if serial {
+            OpsFileDispatchMode::Serial
+        } else {
+            OpsFileDispatchMode::BoundedParallel
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -1520,6 +2602,7 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
     use tempfile::NamedTempFile;
+    use uuid::Uuid;
 
     // ── collect_op_failures: per-op error surfacing (#1228) ───────────────────
 
@@ -1533,7 +2616,7 @@ mod tests {
             ],
             "summary": {"total": 3, "succeeded": 1, "failed": 2}
         });
-        let failures = collect_op_failures(&parsed, 500);
+        let failures = collect_op_failures(&parsed, 500, OpsFileReportMode::LegacyNoSave);
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0]["op_index"], 501);
         assert_eq!(failures[0]["tool"], "create");
@@ -1557,7 +2640,7 @@ mod tests {
             ],
             "summary": {"total": 1, "succeeded": 0, "failed": 1}
         });
-        let failures = collect_op_failures(&parsed, 0);
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
         assert_eq!(
             failures[0]["error"],
             serde_json::json!({"kind": "invalid_input", "message": "content rejected"}),
@@ -1578,9 +2661,14 @@ mod tests {
             ],
             "summary": {"total": 1, "succeeded": 0, "failed": 1}
         });
-        let failures = collect_op_failures(&parsed, 9);
+        let failures = collect_op_failures(&parsed, 9, OpsFileReportMode::BoundedSave);
         assert_eq!(failures[0]["reason"], "verb-refused");
         assert_eq!(failures[0]["op_index"], 9);
+        let legacy = collect_op_failures(&parsed, 9, OpsFileReportMode::LegacyNoSave);
+        assert!(
+            legacy[0].get("reason").is_none(),
+            "legacy no-save summary must retain its pre-reason wire shape"
+        );
     }
 
     #[test]
@@ -1589,8 +2677,156 @@ mod tests {
             "results": [{"ok": true, "tool": "stats", "result": {}}],
             "summary": {"total": 1, "succeeded": 1, "failed": 0}
         });
-        assert!(collect_op_failures(&all_ok, 0).is_empty());
-        assert!(collect_op_failures(&serde_json::json!({}), 0).is_empty());
+        assert!(collect_op_failures(&all_ok, 0, OpsFileReportMode::LegacyNoSave).is_empty());
+        assert!(
+            collect_op_failures(&serde_json::json!({}), 0, OpsFileReportMode::LegacyNoSave)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_save_reporting_matches_exact_legacy_golden() {
+        let parsed = serde_json::json!({
+            "results": [
+                {"ok": true, "tool": "create", "result": {}},
+                {"ok": false, "tool": "search", "error": "boom"},
+            ],
+        });
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].get("aborted").is_none());
+        let summary = ops_file_summary(OpsFileReportMode::LegacyNoSave, 2, 1, 1, 0, failures, 0);
+
+        assert_eq!(
+            ops_file_progress_line(OpsFileReportMode::LegacyNoSave, 2, 2, 1, 1, 0),
+            "applied 2/2 (ok=1, failed=1)"
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&summary).unwrap(),
+            concat!(
+                "{\n",
+                "  \"failed\": 1,\n",
+                "  \"failures\": [\n",
+                "    {\n",
+                "      \"error\": \"boom\",\n",
+                "      \"op_index\": 1,\n",
+                "      \"tool\": \"search\"\n",
+                "    }\n",
+                "  ],\n",
+                "  \"succeeded\": 1,\n",
+                "  \"total\": 2\n",
+                "}"
+            )
+        );
+        assert!(summary.get("aborted").is_none());
+        assert!(summary.get("failure_details_omitted").is_none());
+    }
+
+    #[test]
+    fn no_save_reporting_retains_more_than_one_thousand_failures() {
+        let parsed = serde_json::json!({
+            "results": (0..=MAX_OPS_FILE_FAILURE_DETAILS)
+                .map(|index| serde_json::json!({
+                    "ok": false,
+                    "tool": "create",
+                    "error": format!("failure-{index}"),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let mut retained = Vec::new();
+        let mut omitted = 0;
+        for failure in collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave) {
+            assert!(retain_failure_detail(
+                OpsFileReportMode::LegacyNoSave,
+                failure,
+                &mut retained,
+                &mut omitted,
+            ));
+        }
+        assert_eq!(retained.len(), MAX_OPS_FILE_FAILURE_DETAILS + 1);
+        assert_eq!(omitted, 0);
+
+        let summary = ops_file_summary(
+            OpsFileReportMode::LegacyNoSave,
+            retained.len(),
+            0,
+            retained.len(),
+            0,
+            retained,
+            omitted,
+        );
+        assert_eq!(
+            summary["failures"].as_array().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_DETAILS + 1
+        );
+        assert!(summary.get("failure_details_omitted").is_none());
+    }
+
+    #[test]
+    fn no_save_reporting_retains_error_larger_than_four_kib() {
+        let large_error = "x".repeat(MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1);
+        let parsed = serde_json::json!({
+            "results": [{"ok": false, "tool": "create", "error": large_error}],
+        });
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
+        assert_eq!(
+            failures[0]["error"].as_str().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1
+        );
+        assert_eq!(failures[0]["error"], large_error);
+    }
+
+    #[test]
+    fn save_reporting_bounds_failure_count_and_error_detail() {
+        let large_error = "x".repeat(MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1);
+        let parsed = serde_json::json!({
+            "results": (0..=MAX_OPS_FILE_FAILURE_DETAILS)
+                .map(|index| serde_json::json!({
+                    "ok": false,
+                    "tool": "create",
+                    "aborted": index % 2 == 0,
+                    "error": if index == 0 {
+                        serde_json::Value::String(large_error.clone())
+                    } else {
+                        serde_json::Value::String(format!("failure-{index}"))
+                    },
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let mut retained = Vec::new();
+        let mut omitted = 0;
+        for failure in collect_op_failures(&parsed, 0, OpsFileReportMode::BoundedSave) {
+            retain_failure_detail(
+                OpsFileReportMode::BoundedSave,
+                failure,
+                &mut retained,
+                &mut omitted,
+            );
+        }
+        assert_eq!(retained.len(), MAX_OPS_FILE_FAILURE_DETAILS);
+        assert_eq!(omitted, 1);
+        assert_eq!(retained[0]["aborted"], true);
+        assert_eq!(
+            retained[0]["error"],
+            format!(
+                "error detail omitted: exceeds {MAX_OPS_FILE_FAILURE_ERROR_BYTES}-byte ops-file diagnostic limit"
+            )
+        );
+
+        let summary = ops_file_summary(
+            OpsFileReportMode::BoundedSave,
+            MAX_OPS_FILE_FAILURE_DETAILS + 1,
+            0,
+            MAX_OPS_FILE_FAILURE_DETAILS + 1,
+            0,
+            retained,
+            omitted,
+        );
+        assert_eq!(summary["failure_details_omitted"], 1);
+        assert_eq!(
+            summary["failures"].as_array().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_DETAILS
+        );
     }
 
     // ── HOME isolation for local-fallback tests ───────────────────────────────
@@ -2001,6 +3237,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn serial_requires_ops_file_conflicts_with_inline_and_atomic_and_defaults_off() {
+        let serial =
+            ExecArgs::try_parse_from(["exec", "--ops-file", "/tmp/batch.jsonl", "--serial"])
+                .expect("--serial must be accepted for a non-atomic ops-file");
+        assert!(serial.serial);
+
+        let default_parallel = ExecArgs::parse_from(["exec", "--ops-file", "/tmp/batch.jsonl"]);
+        assert!(!default_parallel.serial);
+
+        assert!(
+            ExecArgs::try_parse_from(["exec", "stats()", "--serial"]).is_err(),
+            "--serial without --ops-file must fail during CLI parsing"
+        );
+        assert!(
+            ExecArgs::try_parse_from([
+                "exec",
+                "stats()",
+                "--ops-file",
+                "/tmp/batch.jsonl",
+                "--serial",
+            ])
+            .is_err(),
+            "--serial must not compose with inline positional ops"
+        );
+        assert!(
+            ExecArgs::try_parse_from([
+                "exec",
+                "--ops-file",
+                "/tmp/batch.jsonl",
+                "--atomic",
+                "--serial",
+            ])
+            .is_err(),
+            "--serial and --atomic are distinct execution contracts and must conflict"
+        );
+    }
+
     // ── isolated DB helpers ────────────────────────────────────────────────────
 
     /// Build an isolated in-process runtime using a temp-file SQLite database.
@@ -2019,6 +3293,117 @@ mod tests {
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
         KhiveMcpServer::new(rt).expect("server on temp db")
+    }
+
+    struct OpsFileConcurrencyProbePack {
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        reject_overlap: bool,
+    }
+
+    impl khive_types::Pack for OpsFileConcurrencyProbePack {
+        const NAME: &'static str = "ops-file-concurrency-probe";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+            name: "reader_probe",
+            description: "records test-only handler concurrency",
+            visibility: khive_runtime::Visibility::Verb,
+            category: khive_runtime::VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    struct ProbeInFlightGuard {
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for ProbeInFlightGuard {
+        fn drop(&mut self) {
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for OpsFileConcurrencyProbePack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            params: serde_json::Value,
+            _registry: &khive_runtime::VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> std::result::Result<serde_json::Value, khive_runtime::RuntimeError> {
+            let current = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let _guard = ProbeInFlightGuard {
+                in_flight: self.in_flight.clone(),
+            };
+            self.max_in_flight
+                .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            if params["fail"].as_bool().unwrap_or(false) {
+                return Err(khive_runtime::RuntimeError::Internal(
+                    "requested probe failure".to_string(),
+                ));
+            }
+            if self.reject_overlap && current > 1 {
+                return Err(khive_runtime::RuntimeError::Internal(
+                    "sql_bridge.reader_open constrained-reader overlap".to_string(),
+                ));
+            }
+            Ok(serde_json::json!({"sequence": params["sequence"]}))
+        }
+    }
+
+    fn concurrency_probe_server(
+        reject_overlap: bool,
+    ) -> (
+        KhiveMcpServer,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(OpsFileConcurrencyProbePack {
+            in_flight: in_flight.clone(),
+            max_in_flight: max_in_flight.clone(),
+            reject_overlap,
+        });
+        (
+            KhiveMcpServer::from_registry(builder.build().expect("probe registry")),
+            in_flight,
+            max_in_flight,
+        )
+    }
+
+    fn reader_probe_ops(count: usize) -> Vec<OpsFileEntry> {
+        (0..count)
+            .map(|sequence| OpsFileEntry {
+                tool: "reader_probe".to_string(),
+                args: serde_json::json!({"sequence": sequence}),
+            })
+            .collect()
     }
 
     // ── isolated_server ignores ambient KHIVE_PACKS (#1276) ───────────────────
@@ -2057,6 +3442,33 @@ mod tests {
         let _server = isolated_server(&db_path);
     }
 
+    fn rerun_in_command_scoped_empty_home(child_marker: &str, test_name: &str) -> bool {
+        if std::env::var_os(child_marker).is_some() {
+            return false;
+        }
+
+        let calling_process_home = std::env::var_os("HOME");
+        let empty_home = tempfile::tempdir().expect("isolated child HOME");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg(test_name)
+                .arg("--exact")
+                .env("HOME", empty_home.path())
+                .env_remove("KHIVE_EMBEDDING_MODEL")
+                .env_remove("KHIVE_ADDITIONAL_EMBEDDING_MODELS")
+                .env_remove("KHIVE_ACTOR")
+                .env(child_marker, "1")
+                .status()
+                .expect("spawn isolated config-discovery test process");
+        assert_eq!(
+            std::env::var_os("HOME"),
+            calling_process_home,
+            "command-scoped HOME must not mutate the calling test process"
+        );
+        assert!(status.success(), "isolated child test failed: {status}");
+        true
+    }
+
     // ── exec-path / serve-path config_id parity (#581) ────────────────────────
     //
     // `run_exec`'s cfg construction (above) and `kkernel mcp`'s `build_server`
@@ -2074,9 +3486,12 @@ mod tests {
     #[test]
     #[serial]
     fn exec_config_id_matches_serve_config_id_for_project_toml_actor() {
-        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
-        std::env::remove_var("KHIVE_ACTOR");
+        const CHILD_MARKER: &str = "KKERNEL_EXEC_PROJECT_CONFIG_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::exec_config_id_matches_serve_config_id_for_project_toml_actor";
+        if rerun_in_command_scoped_empty_home(CHILD_MARKER, TEST_NAME) {
+            return;
+        }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -2183,9 +3598,12 @@ default = true
     #[test]
     #[serial]
     fn actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback() {
-        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
-        std::env::remove_var("KHIVE_ACTOR");
+        const CHILD_MARKER: &str = "KKERNEL_ACTOR_PIN_CONFIG_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback";
+        if rerun_in_command_scoped_empty_home(CHILD_MARKER, TEST_NAME) {
+            return;
+        }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -2579,7 +3997,7 @@ id = "lambda:fallback"
                 .await
                 .expect("list must dispatch");
             let resp: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-            resp["results"][0]["result"]
+            resp["results"][0]["result"]["items"]
                 .as_array()
                 .map(|a| a.len())
                 .unwrap_or(0)
@@ -2950,7 +4368,7 @@ id = "lambda:fallback"
         f.write_all(b"{\"tool\":\"stats\",\"args\":{}}\n").unwrap();
         f.write_all(b"\n").unwrap(); // blank
         f.write_all(b"{\"tool\":\"stats\",\"args\":{}}\n").unwrap();
-        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        let ops = parse_ops_file(f.path()).unwrap();
         assert_eq!(ops.len(), 2);
     }
 
@@ -2960,7 +4378,7 @@ id = "lambda:fallback"
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"{\"tool\":\"stats\",\"args\":{}}\n").unwrap();
         f.write_all(b"not-json\n").unwrap(); // line 2 is bad
-        let err = parse_ops_file(&f.path().to_path_buf()).unwrap_err();
+        let err = parse_ops_file(f.path()).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ExecRefusal>().map(|error| error.reason),
             Some(RefusalReason::ParseError)
@@ -2977,13 +4395,185 @@ id = "lambda:fallback"
         use std::io::Write as _;
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"{\"notool\":\"x\",\"args\":{}}\n").unwrap();
-        let err = parse_ops_file(&f.path().to_path_buf()).unwrap_err();
+        let err = parse_ops_file(f.path()).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ExecRefusal>().map(|error| error.reason),
             Some(RefusalReason::ParseError)
         );
         let msg = format!("{err:#}");
         assert!(msg.contains("line 1"), "should report line number: {msg}");
+    }
+
+    #[test]
+    fn atomic_op_limit_is_checked_before_snapshot_materialization() {
+        struct PanicOnSnapshotAccess;
+
+        impl std::io::Read for PanicOnSnapshotAccess {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("over-limit atomic snapshot must not be read or materialized")
+            }
+        }
+
+        impl std::io::Seek for PanicOnSnapshotAccess {
+            fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+                panic!("over-limit atomic snapshot must not be rewound or materialized")
+            }
+        }
+
+        let error = parse_atomic_validated_snapshot(&mut PanicOnSnapshotAccess, 2, 1)
+            .expect_err("the validated op count exceeds the configured atomic ceiling");
+        assert!(
+            error
+                .to_string()
+                .contains("op count 2 exceeds the configured maximum 1"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn ops_file_physical_line_and_total_caps_are_fail_closed() {
+        let mut within = std::io::Cursor::new(b"1234567\n".to_vec());
+        assert_eq!(
+            read_bounded_ops_line_with_limit(&mut within, 1, 8)
+                .unwrap()
+                .unwrap(),
+            "1234567"
+        );
+        let mut over = std::io::Cursor::new(b"12345678\n".to_vec());
+        let error = read_bounded_ops_line_with_limit(&mut over, 7, 8).unwrap_err();
+        assert!(error.to_string().contains("line 7"));
+
+        let oversized = NamedTempFile::new().unwrap();
+        oversized.as_file().set_len(MAX_OPS_FILE_BYTES + 1).unwrap();
+        let error = validate_ops_file(oversized.path()).unwrap_err();
+        assert!(error.to_string().contains("total limit"));
+    }
+
+    #[test]
+    fn large_ops_file_payload_is_read_from_path_not_argv() {
+        let mut file = NamedTempFile::new().unwrap();
+        let payload = "x".repeat(1024 * 1024);
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({"tool":"stats","args":{"payload":payload}}),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let path = file.path().to_str().unwrap();
+        let args = ExecArgs::try_parse_from(["exec", "--ops-file", path]).unwrap();
+        assert!(args.ops.is_none());
+        assert_eq!(args.ops_file.as_deref(), Some(file.path()));
+        assert_eq!(validate_ops_file(file.path()).unwrap().total, 1);
+    }
+
+    #[test]
+    fn chunk_byte_boundary_is_exact() {
+        assert!(!should_defer_chunk_entry(
+            0,
+            0,
+            OPS_FILE_CHUNK_MAX_BYTES + 1
+        ));
+        assert!(!should_defer_chunk_entry(
+            1,
+            OPS_FILE_CHUNK_MAX_BYTES - 1,
+            1
+        ));
+        assert!(should_defer_chunk_entry(1, OPS_FILE_CHUNK_MAX_BYTES, 1));
+    }
+
+    #[test]
+    fn ordered_chunk_contract_rejects_tool_or_summary_drift() {
+        let tools = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
+        let valid = serde_json::json!({
+            "results": [
+                {"ok":true,"tool":"first","result":{}},
+                {"ok":false,"tool":"second","error":"no"},
+                {"ok":false,"tool":"third","aborted":true,"error":"not attempted"}
+            ],
+            "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
+            "status":"partial"
+        });
+        assert_eq!(
+            validate_ordered_chunk_envelope(&tools, &valid, 1).unwrap(),
+            (1, 1, 1)
+        );
+
+        let mut wrong_tool = valid.clone();
+        wrong_tool["results"][1]["tool"] = serde_json::json!("third");
+        assert!(validate_ordered_chunk_envelope(&tools, &wrong_tool, 1).is_err());
+
+        let mut lying_summary = valid;
+        lying_summary["summary"]["succeeded"] = serde_json::json!(2);
+        lying_summary["summary"]["failed"] = serde_json::json!(0);
+        assert!(validate_ordered_chunk_envelope(&tools, &lying_summary, 1).is_err());
+
+        let mut missing_result = serde_json::json!({
+            "results": [
+                {"ok":true,"tool":"first"},
+                {"ok":false,"tool":"second","error":"no"},
+                {"ok":false,"tool":"third","aborted":true,"error":"not attempted"}
+            ],
+            "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
+            "status":"partial"
+        });
+        assert!(validate_ordered_chunk_envelope(&tools, &missing_result, 1).is_err());
+        missing_result["results"][0]["result"] = serde_json::Value::Null;
+        missing_result["results"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("error");
+        assert!(validate_ordered_chunk_envelope(&tools, &missing_result, 1).is_err());
+
+        let mut contradictory = serde_json::json!({
+            "results": [
+                {"ok":true,"tool":"first","result":null,"error":null},
+                {"ok":false,"tool":"second","error":"no","result":null},
+                {"ok":false,"tool":"third","aborted":true,"error":"not attempted"}
+            ],
+            "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
+            "status":"partial"
+        });
+        assert!(validate_ordered_chunk_envelope(&tools, &contradictory, 1).is_err());
+        contradictory["results"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("error");
+        assert!(validate_ordered_chunk_envelope(&tools, &contradictory, 1).is_err());
+    }
+
+    fn status_contract_fixture(status: &str) -> (Vec<String>, serde_json::Value) {
+        (
+            vec!["first".to_string(), "second".to_string()],
+            serde_json::json!({
+                "results": [
+                    {"ok":true,"tool":"first","result":{}},
+                    {"ok":false,"tool":"second","error":"no"}
+                ],
+                "summary":{"total":2,"succeeded":1,"failed":1,"aborted":0},
+                "status":status
+            }),
+        )
+    }
+
+    #[test]
+    fn ordered_chunk_truthful_status_passes() {
+        let (ops, envelope) = status_contract_fixture("partial");
+        assert_eq!(
+            validate_ordered_chunk_envelope(&ops, &envelope, 1).unwrap(),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn ordered_chunk_contradicting_status_is_rejected() {
+        let (ops, envelope) = status_contract_fixture("success");
+        let error = validate_ordered_chunk_envelope(&ops, &envelope, 1).unwrap_err();
+        assert!(error.to_string().contains("status"));
     }
 
     // ── integration: bulk apply (isolated DB) ─────────────────────────────────
@@ -3004,9 +4594,17 @@ id = "lambda:fallback"
             f.write_all(line.as_bytes()).unwrap();
         }
 
-        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        let ops = parse_ops_file(f.path()).unwrap();
         assert_eq!(ops.len(), 3);
-        apply_ops_file(&server, ops, None, false).await.unwrap();
+        let summary = apply_ops_file(&server, ops, None, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(summary["total"], 3);
+        assert_eq!(summary["succeeded"], 3);
+        assert_eq!(summary["failed"], 0);
+        assert!(summary.get("aborted").is_none());
+        assert!(summary.get("failure_details_omitted").is_none());
+        assert!(summary.get("results").is_none());
 
         // Verify all 3 entities are present.
         let params = RequestParams {
@@ -3020,15 +4618,781 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // Agent presentation: `{"results":[{"ok":true,"result":[...],"tool":"list"}],...}`.
-        // The `list` verb returns an array of entities directly under `result`.
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
         assert_eq!(
             count, 3,
             "all 3 entities should be present after apply\nraw: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_ops_file_max_in_flight_is_one_while_default_remains_parallel() {
+        let op_count = OPS_FILE_CHUNK_SIZE;
+        let (parallel_server, parallel_in_flight, parallel_max) = concurrency_probe_server(false);
+        let parallel_summary = apply_ops_file(
+            &parallel_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+        )
+        .await
+        .expect("the ordinary bounded-parallel batch must succeed");
+        assert_eq!(parallel_summary["succeeded"], op_count);
+        let observed_parallel_max = parallel_max.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed_parallel_max, 8,
+            "default dispatch must retain the server's bounded parallelism"
+        );
+        assert_eq!(
+            parallel_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let (serial_server, serial_in_flight, serial_max) = concurrency_probe_server(false);
+        let serial_summary = apply_ops_file_with_dispatch_mode(
+            &serial_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("serial dispatch must succeed");
+        assert_eq!(serial_summary["succeeded"], op_count);
+        assert_eq!(
+            serial_max.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "--serial must await every handler before starting the next"
+        );
+        assert_eq!(
+            serial_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_ops_file_succeeds_with_a_reader_that_refuses_overlap() {
+        let op_count = 4;
+        let (parallel_server, _, parallel_max) = concurrency_probe_server(true);
+        let parallel_summary = apply_ops_file(
+            &parallel_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+        )
+        .await
+        .expect("one parallel probe succeeds, so partial failure remains in-band");
+        assert_eq!(parallel_summary["succeeded"], 1);
+        assert_eq!(parallel_summary["failed"], op_count - 1);
+        assert_eq!(
+            parallel_max.load(std::sync::atomic::Ordering::SeqCst),
+            op_count
+        );
+        assert!(parallel_summary["failures"]
+            .as_array()
+            .expect("failure rows")
+            .iter()
+            .all(|failure| failure["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sql_bridge.reader_open")));
+
+        let (serial_server, _, serial_max) = concurrency_probe_server(true);
+        let serial_summary = apply_ops_file_with_dispatch_mode(
+            &serial_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("serial dispatch must avoid constrained-reader overlap");
+        assert_eq!(serial_summary["succeeded"], op_count);
+        assert_eq!(serial_summary["failed"], 0);
+        assert_eq!(serial_max.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn serial_ops_file_preserves_order_save_rows_and_strict_failure() {
+        let (server, _, max_in_flight) = concurrency_probe_server(false);
+        let mut ops = reader_probe_ops(3);
+        ops[1].args["fail"] = serde_json::json!(true);
+        let output_dir = tempfile::tempdir().expect("output dir");
+        let save_path = output_dir.path().join("serial-ordered.jsonl");
+
+        let error = apply_ops_file_with_dispatch_mode(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect_err("strict mode must report the middle handler failure");
+        assert!(error.to_string().contains("--strict"), "{error:#}");
+        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(save_path)
+            .expect("strict failure still publishes all confirmed ordered rows")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON result row"))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["tool"], "reader_probe");
+        assert_eq!(rows[0]["ok"], true);
+        assert_eq!(rows[0]["result"]["sequence"], 0);
+        assert_eq!(rows[1]["tool"], "reader_probe");
+        assert_eq!(rows[1]["ok"], false);
+        assert_eq!(rows[1]["reason"], "strict-op-failure");
+        assert_eq!(rows[2]["tool"], "reader_probe");
+        assert_eq!(rows[2]["ok"], true);
+        assert_eq!(rows[2]["result"]["sequence"], 2);
+    }
+
+    #[tokio::test]
+    async fn serial_dispatch_consumes_the_preflighted_stable_snapshot() {
+        use std::io::{Seek as _, Write as _};
+
+        let mut source = NamedTempFile::new().expect("ops source");
+        for sequence in 0..2 {
+            serde_json::to_writer(
+                source.as_file_mut(),
+                &serde_json::json!({
+                    "tool": "reader_probe",
+                    "args": {"sequence": sequence},
+                }),
+            )
+            .expect("write source op");
+            source.write_all(b"\n").expect("write newline");
+        }
+        let mut validated = validate_ops_file(source.path()).expect("preflight source");
+
+        source.as_file_mut().set_len(0).expect("truncate source");
+        source
+            .as_file_mut()
+            .rewind()
+            .expect("rewind replacement source");
+        source
+            .write_all(b"{malformed replacement\n")
+            .expect("replace source after preflight");
+        source.flush().expect("flush replacement");
+
+        let (server, _, max_in_flight) = concurrency_probe_server(false);
+        let summary = apply_ops_file_reader_with_dispatch_mode(
+            &server,
+            std::io::BufReader::new(&mut validated.snapshot),
+            validated.total,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("dispatch must consume the immutable validated snapshot");
+        assert_eq!(summary["total"], 2);
+        assert_eq!(summary["succeeded"], 2);
+        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn serial_typed_preflight_rejects_later_prev_before_first_write() {
+        use std::io::Write as _;
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let mut source = NamedTempFile::new().expect("ops source");
+        source
+            .write_all(
+                b"{\"tool\":\"create\",\"args\":{\"kind\":\"concept\",\"name\":\"must-not-land\"}}\n",
+            )
+            .expect("write valid first op");
+        source
+            .write_all(b"{\"tool\":\"stats\",\"args\":{\"probe\":\"$prev.id\"}}\n")
+            .expect("write typed-invalid later op");
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from(&db_path)),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            cfg,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(db_path.clone()),
+                anchor: Some(PathBuf::from(&db_path)),
+                config: Some(config_path),
+            },
+            true,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("later $prev must fail before the first serial handler starts");
+        assert!(error.to_string().contains("$prev"), "{error:#}");
+
+        let server = isolated_server(&db_path);
+        let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([]),
+            "whole-snapshot typed preflight must prevent the valid first write"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_whole_snapshot_preflight_does_not_change_default_chunk_commit_parity() {
+        use std::io::Write as _;
+
+        let mut source = NamedTempFile::new().expect("ops source");
+        for sequence in 0..OPS_FILE_CHUNK_SIZE {
+            serde_json::to_writer(
+                source.as_file_mut(),
+                &serde_json::json!({
+                    "tool": "create",
+                    "args": {
+                        "kind": "concept",
+                        "name": format!("default-first-chunk-{sequence}"),
+                    },
+                }),
+            )
+            .expect("write valid first-chunk op");
+            source.write_all(b"\n").expect("write newline");
+        }
+        source
+            .write_all(b"{\"tool\":\"stats\",\"args\":{\"probe\":\"$prev.id\"}}\n")
+            .expect("write typed-invalid second-chunk op");
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+
+        let default_db = NamedTempFile::new().expect("default db");
+        let default_db_path = default_db.path().to_str().expect("utf8").to_string();
+        let default_error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            RuntimeConfig {
+                db_path: Some(PathBuf::from(&default_db_path)),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            },
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(default_db_path.clone()),
+                anchor: Some(PathBuf::from(&default_db_path)),
+                config: Some(config_path.clone()),
+            },
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("default mode must reject the typed-invalid second chunk");
+        assert!(
+            default_error.to_string().contains("$prev"),
+            "{default_error:#}"
+        );
+        let default_server = isolated_server(&default_db_path);
+        let default_response =
+            dispatch_json(&default_server, r#"list(kind="concept", limit=200)"#).await;
+        assert_eq!(
+            default_response["results"][0]["result"]["items"]
+                .as_array()
+                .expect("default concept rows")
+                .len(),
+            OPS_FILE_CHUNK_SIZE,
+            "backward-compatible default mode must commit its first logical chunk"
+        );
+
+        let serial_db = NamedTempFile::new().expect("serial db");
+        let serial_db_path = serial_db.path().to_str().expect("utf8").to_string();
+        let serial_error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            RuntimeConfig {
+                db_path: Some(PathBuf::from(&serial_db_path)),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            },
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(serial_db_path.clone()),
+                anchor: Some(PathBuf::from(&serial_db_path)),
+                config: Some(config_path),
+            },
+            true,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("serial mode must reject the later invalid op before dispatch");
+        assert!(
+            serial_error.to_string().contains("$prev"),
+            "{serial_error:#}"
+        );
+        let serial_server = isolated_server(&serial_db_path);
+        let serial_response =
+            dispatch_json(&serial_server, r#"list(kind="concept", limit=200)"#).await;
+        assert_eq!(
+            serial_response["results"][0]["result"]["items"],
+            serde_json::json!([]),
+            "serial whole-snapshot preflight must reject before its first write"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_single_ops_file_reaches_handler_validation() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let ops = vec![OpsFileEntry {
+            tool: "stats".to_string(),
+            args: serde_json::json!({
+                "payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1),
+            }),
+        }];
+        let mut observed_handler_error = false;
+
+        let error = apply_ops_file_with_response_transform(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            |_, raw| {
+                let response: serde_json::Value =
+                    serde_json::from_str(&raw).expect("handler response must be JSON");
+                assert_eq!(response["results"][0]["tool"], "stats");
+                assert_eq!(response["results"][0]["ok"], false);
+                assert!(
+                    response["results"][0]["error"]
+                        .to_string()
+                        .contains("payload"),
+                    "the oversized typed op must reach stats argument validation: {response}"
+                );
+                observed_handler_error = true;
+                raw
+            },
+        )
+        .await
+        .expect_err("the only op is intentionally invalid at the handler boundary");
+
+        assert!(
+            observed_handler_error,
+            "ops-file dispatch must not reapply the public 1 MiB raw-DSL limit"
+        );
+        assert!(error.to_string().contains("every op failed"));
+    }
+
+    #[tokio::test]
+    async fn oversized_multi_op_chunk_preserves_order_save_and_strict() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let payload = "x".repeat(600 * 1024);
+        let ops = vec![
+            OpsFileEntry {
+                tool: "create".to_string(),
+                args: serde_json::json!({
+                    "kind": "concept",
+                    "name": "oversized ordered success",
+                    "description": payload,
+                }),
+            },
+            OpsFileEntry {
+                tool: "stats".to_string(),
+                args: serde_json::json!({
+                    "payload": "y".repeat(600 * 1024),
+                }),
+            },
+        ];
+        let encoded_len = serde_json::to_vec(&ops).unwrap().len();
+        assert!(encoded_len > khive_request::MAX_OPS_INPUT_LEN);
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("oversized-ordered.jsonl");
+
+        let error = apply_ops_file(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .expect_err("strict mode must report the handler-level stats failure");
+
+        assert!(error.to_string().contains("--strict"), "{error:#}");
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&save_path)
+            .expect("strict failure still publishes the complete ordered result file")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["tool"], "create");
+        assert_eq!(rows[0]["ok"], true);
+        assert_eq!(rows[1]["tool"], "stats");
+        assert_eq!(rows[1]["ok"], false);
+        assert_eq!(rows[1]["reason"], "strict-op-failure");
+    }
+
+    #[tokio::test]
+    async fn public_dispatch_still_rejects_oversized_raw_ops() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let params = RequestParams {
+            ops: serde_json::json!({
+                "tool": "stats",
+                "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
+            })
+            .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+
+        let error = server
+            .dispatch_request_local(params)
+            .await
+            .expect_err("the raw request surface must retain its 1 MiB safety bound");
+        assert!(
+            error.to_string().contains("ops input is")
+                && error.to_string().contains(&format!(
+                    "max is {} bytes",
+                    khive_request::MAX_OPS_INPUT_LEN
+                )),
+            "unexpected public dispatch error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_save_retains_order_rows_checksum_and_json_override() {
+        use sha2::Digest as _;
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path)
+            .with_default_output_format(khive_runtime::OutputFormat::Table);
+        let ops: Vec<OpsFileEntry> = (0..=OPS_FILE_CHUNK_SIZE)
+            .map(|index| OpsFileEntry {
+                tool: "create".to_string(),
+                args: serde_json::json!({
+                    "kind": "concept",
+                    "name": format!("ordered-{index:03}"),
+                }),
+            })
+            .collect();
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("ordered.jsonl");
+
+        let manifest = apply_ops_file(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let manifest_keys: std::collections::BTreeSet<_> = manifest
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            manifest_keys,
+            std::collections::BTreeSet::from([
+                "checksum",
+                "path",
+                "per_column_null_counts",
+                "rows",
+                "schema_fingerprint",
+                "summary",
+            ]),
+            "the successful manifest shape must remain unchanged"
+        );
+        assert_eq!(manifest["rows"], OPS_FILE_CHUNK_SIZE + 1);
+        assert_eq!(manifest["summary"]["total"], OPS_FILE_CHUNK_SIZE + 1);
+        assert_eq!(manifest["summary"]["succeeded"], OPS_FILE_CHUNK_SIZE + 1);
+        assert_eq!(manifest["summary"]["failed"], 0);
+        assert_eq!(manifest["summary"]["aborted"], 0);
+
+        let bytes = std::fs::read(&save_path).unwrap();
+        let checksum = format!("{:x}", sha2::Sha256::digest(&bytes));
+        assert_eq!(manifest["checksum"], checksum);
+        let rows: Vec<serde_json::Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), OPS_FILE_CHUNK_SIZE + 1);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["tool"], "create");
+            assert_eq!(row["ok"], true);
+            assert_eq!(row["result"]["name"], format!("ordered-{index:03}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_later_chunk_emits_aborted_manifest_for_prior_commits() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let ops: Vec<OpsFileEntry> = (0..=OPS_FILE_CHUNK_SIZE)
+            .map(|index| OpsFileEntry {
+                tool: "create".to_string(),
+                args: serde_json::json!({
+                    "kind": "concept",
+                    "name": format!("abort-manifest-{index:03}"),
+                }),
+            })
+            .collect();
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("must-not-publish.jsonl");
+
+        let error = apply_ops_file_with_response_transform(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+            |chunk_number, raw| {
+                if chunk_number == 2 {
+                    "{malformed-response".to_string()
+                } else {
+                    raw
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let aborted = error
+            .downcast_ref::<AbortedOpsFileError>()
+            .expect("post-dispatch failure must carry its emitted manifest");
+        assert_eq!(aborted.manifest["status"], "aborted");
+        assert_eq!(aborted.manifest["committed_chunks"], serde_json::json!([1]));
+        assert_eq!(aborted.manifest["dispatched_chunk"], 2);
+        assert_eq!(aborted.manifest["file_published"], false);
+        assert_eq!(
+            aborted.manifest["summary"]["succeeded"],
+            OPS_FILE_CHUNK_SIZE
+        );
+        assert_eq!(aborted.manifest["summary"]["total"], OPS_FILE_CHUNK_SIZE);
+        assert_eq!(aborted.manifest["summary"]["aborted"], 0);
+        assert_eq!(aborted.manifest["unconfirmed_ops"], 1);
+        assert!(
+            !save_path.exists(),
+            "an aborted run must not publish partial JSONL"
+        );
+
+        // `committed_chunks: [1]` is a claim about DURABLE STATE, and the manifest
+        // asserting it is assembled locally. Every assertion above would still pass
+        // if chunk 1's writes had been rolled back or never reached storage, because
+        // the bookkeeping would simply agree with itself. Read it back through the
+        // same server so the reconciliation record is checked against the database
+        // it describes. The stable list contract wraps rows in `items` whether or
+        // not the requested limit reaches the entity cap.
+        let params = RequestParams {
+            ops: r#"list(kind="concept", limit=200)"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+        let raw = server.dispatch_request_local(params).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let rows = response["results"][0]["result"]["items"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "read-back list result must contain an items array; got {}",
+                    response["results"][0]["result"]
+                )
+            });
+        // A row that carries no string name is an unreadable instrument, not an
+        // absent entity, so it panics here rather than being dropped silently.
+        let mut observed: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row["name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("read-back row carries no string name: {row}"))
+                    .to_owned()
+            })
+            .collect();
+        // An empty or unparsed read-back is an instrument failure, not a pass.
+        assert!(
+            !observed.is_empty(),
+            "read-back yielded no rows; result was {}",
+            response["results"][0]["result"]
+        );
+        observed.sort_unstable();
+
+        // Enumerate the two legal outcomes instead of bounding a count. Entity
+        // names carry no uniqueness constraint and the upsert is keyed by UUID,
+        // so any count of distinct names is a proxy: a duplicate row satisfies
+        // it while the property it stands for is broken. Comparing the whole
+        // sorted list pins which rows are present, and how many of each.
+        let committed: Vec<String> = (0..OPS_FILE_CHUNK_SIZE)
+            .map(|index| format!("abort-manifest-{index:03}"))
+            .collect();
+        // Chunk 2 was dispatched without a verified response, so its single op
+        // may or may not have landed. The manifest reports it as unconfirmed
+        // rather than committed precisely because both outcomes are legal here.
+        let mut with_unconfirmed = committed.clone();
+        with_unconfirmed.push(format!("abort-manifest-{OPS_FILE_CHUNK_SIZE:03}"));
+
+        assert!(
+            observed == committed || observed == with_unconfirmed,
+            "manifest reports chunk 1 committed and chunk 2 unconfirmed, so the database must \
+             hold exactly the {OPS_FILE_CHUNK_SIZE} confirmed rows, optionally plus the one \
+             unconfirmed row; found {} rows: {observed:?}",
+            observed.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_save_directory_is_rejected_before_any_op_side_effect() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let output_dir = tempfile::tempdir().unwrap();
+        let ops = vec![OpsFileEntry {
+            tool: "create".to_string(),
+            args: serde_json::json!({"kind":"concept","name":"must-not-exist"}),
+        }];
+
+        let error = apply_ops_file(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(output_dir.path().to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("absent or an existing regular file"));
+
+        let params = RequestParams {
+            ops: r#"list(kind="concept")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+        let raw = server.dispatch_request_local(params).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn save_manifest_preserves_partial_summary_and_strict_writes_rows() {
+        fn partial_ops(success_name: &str) -> Vec<OpsFileEntry> {
+            vec![
+                OpsFileEntry {
+                    tool: "create".to_string(),
+                    args: serde_json::json!({"kind":"concept","name":success_name}),
+                },
+                OpsFileEntry {
+                    tool: "search".to_string(),
+                    args: serde_json::json!({"kind":"not_a_real_kind","query":"x"}),
+                },
+            ]
+        }
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("partial.jsonl");
+        let manifest = apply_ops_file(
+            &server,
+            partial_ops("partial-ok"),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest["rows"], 2);
+        assert_eq!(manifest["summary"]["succeeded"], 1);
+        assert_eq!(manifest["summary"]["failed"], 1);
+        assert_eq!(manifest["summary"]["aborted"], 0);
+
+        let strict_path = output_dir.path().join("strict-partial.jsonl");
+        let error = apply_ops_file(
+            &server,
+            partial_ops("strict-partial-ok"),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(strict_path.to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("--strict"));
+        assert_eq!(
+            std::fs::read_to_string(strict_path)
+                .unwrap()
+                .lines()
+                .count(),
+            2
         );
     }
 
@@ -3172,10 +5536,10 @@ id = "lambda:fallback"
         )
         .unwrap();
 
-        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        let ops = parse_ops_file(f.path()).unwrap();
         assert_eq!(ops.len(), 2);
 
-        let err = apply_ops_file(&server, ops, None, true)
+        let err = apply_ops_file(&server, ops, None, None, None, true)
             .await
             .expect_err("strict mode must surface the per-op failure as a process error");
         assert!(format!("{err}").contains("1 op(s) failed"));
@@ -3194,8 +5558,8 @@ id = "lambda:fallback"
         )
         .unwrap();
 
-        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
-        let err = apply_ops_file(&server, ops, None, false)
+        let ops = parse_ops_file(f.path()).unwrap();
+        let err = apply_ops_file(&server, ops, None, None, None, false)
             .await
             .expect_err("a fully-failed ops-file must exit non-zero even without --strict");
         assert!(format!("{err}").contains("every op failed"));
@@ -3348,8 +5712,11 @@ id = "lambda:fallback"
             path.clone(),
             cfg.clone(),
             None,
+            None,
+            None,
             true,
             ExecDbContext::default(),
+            false,
             false,
             None,
             false,
@@ -3370,7 +5737,7 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -3908,6 +6275,308 @@ id = "lambda:fallback"
             Some(":memory:".to_string()),
             "the daemon spawn seam must receive the raw --db override so a spawned daemon \
              can be constructed with the same ephemeral in-memory storage"
+        );
+    }
+
+    /// A declared read-only SQLite `main` backend becomes a writable memory
+    /// backend when `--db :memory:` forces the whole topology ephemeral. The
+    /// pre-open exec frame must fingerprint that effective runtime mode, not
+    /// the superseded declaration, or the freshly spawned daemon rejects its
+    /// very first request as a config mismatch.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn force_memory_exec_frame_matches_opened_read_only_topology_runtime() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().expect("force-memory config tempdir");
+        let config_path = fixture.path().join("read-only-topology.toml");
+        let declared_main = fixture.path().join("declared-main.db");
+        let declared_archive = fixture.path().join("declared-archive.db");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+read_only = true
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+"#,
+                declared_main.display(),
+                declared_archive.display(),
+            ),
+        )
+        .expect("write read-only topology config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&config_path),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve force-memory exec config");
+        assert_eq!(
+            cfg.db_path, None,
+            "the force-memory anchor must be in-memory"
+        );
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(result.is_ok(), "force-memory dispatch failed: {result:?}");
+
+        let frame_config_id = SPY_CAPTURED_CONFIG_ID
+            .with(|captured| captured.borrow_mut().take())
+            .expect("spy must capture the forwarded config id");
+        let khive_cfg = KhiveConfig::load_with_home_fallback(Some(&config_path), None)
+            .expect("load force-memory topology")
+            .expect("explicit config must exist");
+        let opened =
+            khive_mcp::serve::build_registry_for_multi_backend(cfg, &khive_cfg, Some(":memory:"))
+                .expect("force-memory runtime must build");
+        restore_home(prev_home);
+
+        assert!(
+            !opened.default_runtime.is_read_only(),
+            "force-memory replaces the declared read-only SQLite main with writable memory"
+        );
+        assert_eq!(
+            frame_config_id, opened.config_id,
+            "the pre-open exec frame and opened force-memory runtime must have identical config ids"
+        );
+        assert!(
+            !declared_main.exists() && !declared_archive.exists(),
+            "force-memory parity setup must not materialize either declared SQLite path"
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_writable_multi_backend_config(
+        config_path: &Path,
+        main_path: &Path,
+        secondary_path: &Path,
+    ) {
+        std::fs::write(
+            config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+"#,
+                main_path.display(),
+                secondary_path.display(),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn chmod_read_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(path, permissions).unwrap();
+
+        // A writable fixture's connections can close asynchronously and leave
+        // `-wal`/`-shm` sidecars behind; read-only admission rejects a writable
+        // `-shm` as potentially live. Freeze any lingering sidecars so the
+        // snapshot takes the documented frozen form.
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().unwrap().to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().unwrap().join(name);
+            if sidecar.exists() {
+                let mut sidecar_permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+                sidecar_permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, sidecar_permissions).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn runtime_config_for_explicit_multi_backend(
+        config_path: &Path,
+        db: Option<&str>,
+    ) -> RuntimeConfig {
+        resolve_runtime_config(RuntimeConfigInputs {
+            db,
+            config: Some(config_path),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .unwrap()
+    }
+
+    /// A client must not reuse a daemon that retained a write-capable handle
+    /// after the declared main file was chmod'd into snapshot mode. The
+    /// filesystem-mode refusal belongs before the forwarding seam.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_main_chmod_refuses_before_daemon_forward() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"main snapshot fixture").unwrap();
+        std::fs::write(&archive_path, b"archive fixture").unwrap();
+        chmod_read_only(&main_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, None),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        let error = result.expect_err("an undeclared main snapshot mode must fail closed");
+        assert!(error.to_string().contains("read_only = true"), "{error}");
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_none()),
+            "the retained writable daemon must never receive the frame"
+        );
+    }
+
+    /// The topology fingerprint includes secondary modes too; apply the same
+    /// pre-forward refusal to every declared SQLite backend, not only `main`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_secondary_chmod_refuses_before_daemon_forward() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"main fixture").unwrap();
+        std::fs::write(&archive_path, b"archive snapshot fixture").unwrap();
+        chmod_read_only(&archive_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, None),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        let error = result.expect_err("an undeclared secondary snapshot mode must fail closed");
+        assert!(error.to_string().contains("archive"), "{error}");
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_none()),
+            "the retained writable daemon must never receive the frame"
+        );
+    }
+
+    /// `--db :memory:` supersedes every declared file. Its pre-open/runtime
+    /// parity must therefore skip filesystem-mode checks on those unused paths.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn force_memory_skips_declared_chmod_preflight_and_forwards() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"unused main snapshot fixture").unwrap();
+        std::fs::write(&archive_path, b"unused archive snapshot fixture").unwrap();
+        chmod_read_only(&main_path);
+        chmod_read_only(&archive_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, Some(":memory:")),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "force-memory forwarding must remain valid: {result:?}"
+        );
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_some()),
+            "the force-memory frame must reach the forwarding seam"
         );
     }
 
@@ -4564,7 +7233,7 @@ backend = "sessions"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -4614,6 +7283,20 @@ backend = "sessions"
             packs: vec!["kg".to_string()],
             ..Default::default()
         }
+    }
+
+    async fn replace_fts_entities_with_incompatible_table(db_path: &str) {
+        let runtime = KhiveRuntime::new(atomic_cfg(db_path)).expect("runtime for FTS fault setup");
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.expect("writer for FTS fault setup");
+        writer
+            .execute_script(
+                "DROP TABLE fts_entities; \
+                 CREATE TABLE fts_entities (broken_column TEXT);"
+                    .to_string(),
+            )
+            .await
+            .expect("replace FTS table to inject post-commit reindex failure");
     }
 
     #[tokio::test]
@@ -4746,6 +7429,125 @@ backend = "sessions"
         assert_eq!(y_resp["results"][0]["result"]["name"], "AtomicY-renamed");
     }
 
+    #[tokio::test]
+    async fn atomic_post_commit_reindex_failure_returns_committed_non_retryable_envelope() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="PostCommitReindexBefore")"#,
+            )
+            .await;
+            response["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        // Migration state remains current, but an incompatible ordinary table
+        // occupies the post-commit FTS name. Store initialization cannot
+        // recreate the virtual table through IF NOT EXISTS; prepare and base
+        // DML do not touch it, so the failure occurs at the real reindex seam.
+        replace_fts_entities_with_incompatible_table(&db_path).await;
+
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![atomic_op(
+                "update",
+                serde_json::json!({"id": entity_id, "name": "PostCommitReindexAfter"}),
+            )],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("post-commit failure must return a reconciliation envelope");
+
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["atomic"]["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["degradations"][0]["stage"], "post_commit_reindex",
+            "{envelope}"
+        );
+        assert_eq!(envelope["summary"]["succeeded"], 1, "{envelope}");
+
+        let runtime =
+            KhiveRuntime::new(atomic_cfg(&db_path)).expect("runtime for committed-row check");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let entity = runtime
+            .get_entity(&token, Uuid::parse_str(&entity_id).unwrap())
+            .await
+            .expect("committed entity row");
+        assert_eq!(entity.name, "PostCommitReindexAfter");
+    }
+
+    #[tokio::test]
+    async fn atomic_result_read_failure_keeps_later_committed_delete_non_retryable() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="RenderThenDelete")"#,
+            )
+            .await;
+            response["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        // Both plans prepare against the same live row. The unit then updates
+        // and hard-deletes it atomically. Rendering op 0 performs its real
+        // post-commit read and cannot find the row removed by op 1.
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({"id": entity_id, "name": "NeverRendered"}),
+                ),
+                atomic_op("delete", serde_json::json!({"id": entity_id, "hard": true})),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("render failure after commit must be a reconciliation envelope");
+
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["atomic"]["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["degradations"][0]["stage"], "result_rendering",
+            "{envelope}"
+        );
+        assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+        assert_eq!(
+            envelope["results"][0]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["results"][0]["retryable"], false, "{envelope}");
+        assert_eq!(envelope["results"][1]["result"]["deleted"], true);
+
+        let runtime =
+            KhiveRuntime::new(atomic_cfg(&db_path)).expect("runtime for deleted-row check");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let deleted = runtime
+            .get_entity(&token, Uuid::parse_str(&entity_id).unwrap())
+            .await;
+        assert!(deleted.is_err(), "hard delete must remain committed");
+    }
+
     /// Acceptance test 1b: a mid-unit failure rolls the WHOLE unit back —
     /// zero partial state, including the op that "succeeded" before the
     /// failing one.
@@ -4815,6 +7617,238 @@ backend = "sessions"
         assert!(
             x_resp["results"][0]["result"]["deleted_at"].is_null(),
             "x must NOT be deleted — the whole unit must have rolled back: {x_resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_rollback_preserves_zero_exit_with_or_without_save_and_strict() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let (x_id, y_id) = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="AtomicExitX"), create(kind="concept", name="AtomicExitY")]"#,
+            )
+            .await;
+            (
+                response["results"][0]["result"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                response["results"][1]["result"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+        let mut file = NamedTempFile::new().unwrap();
+        for op in [
+            serde_json::json!({"tool":"delete","args":{"id":x_id.clone(),"hard":true}}),
+            serde_json::json!({
+                "tool":"link",
+                "args":{"source_id":y_id,"target_id":x_id,"relation":"extends"}
+            }),
+        ] {
+            serde_json::to_writer(&mut file, &op).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let db_context = || ExecDbContext {
+            raw: Some(db_path.clone()),
+            anchor: Some(PathBuf::from(&db_path)),
+            config: Some(config_path.clone()),
+        };
+
+        run_exec_ops_file(
+            file.path().to_path_buf(),
+            atomic_cfg(&db_path),
+            None,
+            None,
+            None,
+            false,
+            db_context(),
+            false,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("atomic rollback remains a successful CLI seam even with --strict");
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("atomic-rollback.jsonl");
+        run_exec_ops_file(
+            file.path().to_path_buf(),
+            atomic_cfg(&db_path),
+            None,
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            false,
+            db_context(),
+            false,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("atomic save preserves the existing rollback exit contract");
+        assert_eq!(
+            std::fs::read_to_string(save_path).unwrap().lines().count(),
+            2
+        );
+    }
+
+    #[test]
+    fn atomic_save_persist_failure_returns_committed_reconciliation_stdout() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("publish-race.jsonl");
+        let sink = khive_mcp::save_sink::JsonlSaveSink::new(&save_path, false)
+            .expect("preflight save sink");
+        // Deterministic post-preflight publication failure: a directory wins
+        // the destination path after the sibling temp file has been created,
+        // so row writes and flush succeed but the final atomic rename fails.
+        std::fs::create_dir(&save_path).expect("occupy destination with a directory");
+        let mut envelope = serde_json::json!({
+            "results": [{
+                "ok": true,
+                "tool": "update",
+                "op_index": 0,
+                "result": {"id": Uuid::new_v4()}
+            }],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0},
+            "atomic": {
+                "committed": true,
+                "rolled_back": false,
+                "failed_op_index": null,
+                "error": null
+            }
+        });
+
+        let failure = render_atomic_output(&mut envelope, Some(sink))
+            .expect_err("persist failure must remain a non-zero CLI outcome");
+        let stdout: serde_json::Value =
+            serde_json::from_str(&failure.stdout).expect("structured stdout envelope");
+
+        assert_eq!(stdout["atomic"]["committed"], true, "{stdout}");
+        assert_eq!(stdout["atomic"]["status"], "committed_degraded", "{stdout}");
+        assert_eq!(stdout["atomic"]["retryable"], false, "{stdout}");
+        assert_eq!(
+            stdout["atomic"]["degradations"][0]["stage"], "save_file_publish",
+            "{stdout}"
+        );
+        assert!(
+            stdout["atomic"]["degradations"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("persist temp file")),
+            "{stdout}"
+        );
+        assert!(
+            format!("{:#}", failure.error).contains("do not replay the mutation"),
+            "terminal error must point automation at reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_invalid_save_directory_is_rejected_before_commit() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let mut file = NamedTempFile::new().unwrap();
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "tool":"create",
+                "args":{"kind":"concept","name":"atomic-must-not-exist"}
+            }),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let save_directory = tempfile::tempdir().unwrap();
+        let error = run_exec_ops_file(
+            file.path().to_path_buf(),
+            atomic_cfg(&db_path),
+            None,
+            Some("json".to_string()),
+            Some(save_directory.path().to_string_lossy().into_owned()),
+            false,
+            ExecDbContext {
+                raw: Some(db_path.clone()),
+                anchor: Some(PathBuf::from(&db_path)),
+                config: Some(config_path),
+            },
+            false,
+            true,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("absent or an existing regular file"));
+
+        let server = isolated_server(&db_path);
+        let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_preflighted_save_keeps_prior_file_on_execution_error() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let mut file = NamedTempFile::new().unwrap();
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "tool":"create",
+                "args":{"kind":"concept","name":"atomic-rejected"}
+            }),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("prior.jsonl");
+        std::fs::write(&save_path, b"prior-complete-output\n").unwrap();
+
+        let error = run_exec_ops_file(
+            file.path().to_path_buf(),
+            atomic_cfg(&db_path),
+            None,
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            false,
+            ExecDbContext {
+                raw: Some(db_path),
+                anchor: Some(PathBuf::from(db_file.path())),
+                config: Some(config_path),
+            },
+            false,
+            true,
+            Some(1),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--atomic rejected"),
+            "unexpected atomic execution error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&save_path).unwrap(),
+            b"prior-complete-output\n"
         );
     }
 
@@ -5222,7 +8256,13 @@ backend = "sessions"
             );
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
-            assert_eq!(resp["results"][0]["result"].as_array().unwrap().len(), 0);
+            assert_eq!(
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
         }
 
         // (b) read verb.
@@ -5323,7 +8363,10 @@ backend = "sessions"
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
             assert_eq!(
-                resp["results"][0]["result"].as_array().unwrap().len(),
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
                 0,
                 "no write must have landed for {verb:?}"
             );
@@ -5357,7 +8400,10 @@ backend = "sessions"
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
             assert_eq!(
-                resp["results"][0]["result"].as_array().unwrap().len(),
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
                 0,
                 "no write must have landed for merge"
             );

@@ -52,15 +52,15 @@ pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
     CommittedPostCommitEffects,
 };
-pub use blob::resolve_blob_store;
+pub use blob::{resolve_blob_store, resolve_blob_store_for_mode};
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
-pub use config::process_ref_from_env;
+pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_error, note_embedding_text,
     note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
     EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, MergeEdgeConflictPreimage,
-    MergeEdgePreimage, MergeSummary, NotePatch,
+    MergeEdgePreimage, MergeSummary, MergeTxBudgetReport, MergeTxLimits, NotePatch,
 };
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
@@ -74,9 +74,9 @@ pub use engine_config::{
     GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
 };
 pub use error::{
-    fts_text_leg_or_err, AdmissionFailureContext, GuardedWriteFailure, RuntimeError, RuntimeResult,
-    WriterPoolCheckoutTimeoutContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
-    WRITER_QUEUE_SATURATED_STAGE,
+    fts_text_leg_or_err, AdmissionFailureContext, ChannelIngestFailureClass, GuardedWriteFailure,
+    RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext, WRITER_ADMISSION_SCOPE,
+    WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
 };
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
@@ -112,7 +112,7 @@ pub use pack::{
     NoteKindSpec, NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError,
     PackRegistration, PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan,
     ParamDef, RequestIdentity, SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry,
-    VerbRegistryBuilder, VerifiedActor, Visibility,
+    VerbRegistryBuilder, VerifiedActor, Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
@@ -127,8 +127,8 @@ pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, NoteMutationHookFn,
-    NoteWriteValidatorFn, RuntimeConfig,
+    BackendId, EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken,
+    NoteMutationHookFn, NoteWriteValidatorFn, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use validation::{

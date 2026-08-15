@@ -28,7 +28,8 @@ pub struct CodeIngestOptions<'a> {
     pub source_run: Option<&'a str>,
 }
 
-/// Deterministic entity, finding-note, and annotation-edge records ready for persistence.
+/// Deterministic entity, repository-scoped v2 finding-note, and annotation-edge records ready for
+/// persistence.
 ///
 /// See `crates/khive-pack-code/docs/api/findings-ingest.md`.
 #[derive(Clone, Debug)]
@@ -101,6 +102,21 @@ fn require_str<'a>(
             expected: "string",
         }),
     }
+}
+
+fn require_nonblank_str<'a>(
+    obj: &'a Map<String, Value>,
+    key: &'static str,
+    path: &'static str,
+) -> Result<&'a str, CodeIngestError> {
+    let value = require_str(obj, key, path)?;
+    if value.trim().is_empty() {
+        return Err(CodeIngestError::InvalidType {
+            path: path.to_string(),
+            expected: "non-blank string",
+        });
+    }
+    Ok(value)
 }
 
 fn optional_str(
@@ -204,12 +220,13 @@ impl ValidatedAudit {
             }
         }
         Ok(Self {
-            date: require_str(obj, "date", "audit.date")?.to_string(),
-            scope: require_str(obj, "scope", "audit.scope")?.to_string(),
-            repo: require_str(obj, "repo", "audit.repo")?.to_string(),
-            branch: require_str(obj, "branch", "audit.branch")?.to_string(),
-            commit: require_str(obj, "commit", "audit.commit")?.to_string(),
-            standards_file: require_str(obj, "standards_file", "audit.standards_file")?.to_string(),
+            date: require_nonblank_str(obj, "date", "audit.date")?.to_string(),
+            scope: require_nonblank_str(obj, "scope", "audit.scope")?.to_string(),
+            repo: require_nonblank_str(obj, "repo", "audit.repo")?.to_string(),
+            branch: require_nonblank_str(obj, "branch", "audit.branch")?.to_string(),
+            commit: require_nonblank_str(obj, "commit", "audit.commit")?.to_string(),
+            standards_file: require_nonblank_str(obj, "standards_file", "audit.standards_file")?
+                .to_string(),
             extra,
         })
     }
@@ -253,7 +270,7 @@ const KNOWN_FINDING_KEYS: &[&str] = &[
 
 impl ValidatedFinding {
     fn parse(obj: &Map<String, Value>, finding_index: usize) -> Result<Self, CodeIngestError> {
-        let id = require_str(obj, "id", "findings[].id")?.to_string();
+        let id = require_nonblank_str(obj, "id", "findings[].id")?.to_string();
         let title = require_str(obj, "title", "findings[].title")?.to_string();
         if title.trim().is_empty() {
             return Err(CodeIngestError::InvalidType {
@@ -419,7 +436,10 @@ pub fn ingest_findings_json(
 
     for finding in &validated_findings {
         // Excluding observation time makes retries stable while content changes create new IDs.
-        let identity_value = sort_json_keys(&json!({
+        // Retain the exact v1 tuple as an audit witness, but mint v2 from the
+        // repository/project-scoped extension so identical producer runs in
+        // different repositories can never share a finding note.
+        let legacy_identity_value = sort_json_keys(&json!({
             "kind": "code-finding",
             "schema_version": 1,
             "namespace": options.namespace,
@@ -441,11 +461,24 @@ pub fn ingest_findings_json(
             "refs": finding.refs,
             "raw": finding.raw,
         }));
+        let legacy_id_v1 = uuid5_tuple(&legacy_identity_value)?;
+        let mut identity_object = legacy_identity_value
+            .as_object()
+            .expect("finding identity is constructed as an object")
+            .clone();
+        identity_object.insert("schema_version".into(), json!(2));
+        identity_object.insert("repo".into(), json!(audit.repo));
+        identity_object.insert("project_id".into(), json!(project_id));
+        let identity_value = sort_json_keys(&Value::Object(identity_object));
         let finding_id = uuid5_tuple(&identity_value)?;
         let finding_external_id = serde_json::to_string(&identity_value)?;
 
         let mut props = Map::new();
         props.insert("external_id".into(), json!(finding_external_id));
+        props.insert("identity_schema_version".into(), json!(2));
+        props.insert("legacy_id_v1".into(), json!(legacy_id_v1));
+        props.insert("repo".into(), json!(audit.repo));
+        props.insert("project_id".into(), json!(project_id));
         props.insert("finding_id".into(), json!(finding.id));
         props.insert("severity".into(), json!(finding.severity));
         props.insert("confidence".into(), json!(finding.confidence));

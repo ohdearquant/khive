@@ -138,6 +138,7 @@ pub(crate) struct UpsertDomainsParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetParams {
+    /// Full UUID, exact namespace-scoped slug, or unique 8+ hexadecimal UUID prefix.
     pub id: String,
     /// When `true`, include the atom's sections in the response under a `sections` key.
     /// Defaults to `false`; domains ignore this flag (they have no sections).
@@ -398,8 +399,8 @@ pub(crate) struct ImportParams {
     /// Markdown format hint.  Only `"atlas_md"` is supported in v1.
     #[serde(default)]
     pub format: Option<String>,
-    /// Chunk strategy: `"section"` (one section per atom, default) or `"atom"`
-    /// (entire file as one atom).
+    /// Chunk strategy: `"section"` (atom plus parsed section rows, default) or
+    /// `"atom"` (whole markdown in one atom with no section rows).
     #[serde(default)]
     pub chunk_strategy: Option<String>,
 }

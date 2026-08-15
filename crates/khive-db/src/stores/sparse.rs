@@ -211,10 +211,10 @@ impl SqliteSparseStore {
         namespace: String,
     ) -> Result<Self, SqliteError> {
         let table_name = format!("sparse_{}", model_key);
-        // Enabled by default for file-backed pools; explicit off/degraded
-        // fallback remains possible (ADR-067 Component A, mirrors
-        // entity.rs policy): a missing writer task degrades to the legacy
-        // pool-mutex path rather than failing construction.
+        // Enabled by default for file-backed pools. Construction stays
+        // synchronous (ADR-067 Component A, mirrors entity.rs policy): a
+        // missing writer task is cached without failing construction. Every
+        // write re-resolves it and applies strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Ok(Self {
             pool,
@@ -225,30 +225,40 @@ impl SqliteSparseStore {
         })
     }
 
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        self.pool
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
+    }
+
     /// Route a single-row write through the pool-wide `WriterTask` when
-    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
-    /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
+    /// the write queue is enabled and a handle is available. Strict mode
+    /// refuses a missing handle; compatibility mode falls back to the legacy
+    /// pool-mutex path (ADR-067 Component A, Fork C slice 2).
     ///
     /// This is the ONE routing point for every `with_writer` caller in this
     /// store (`upsert_sparse_vector`, `delete_sparse_subject`). `f` must be
     /// DML-only — on the flag-on path it runs inside the WriterTask's own
     /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
     /// nested-transaction rule. `insert_sparse_batch` (the batch method)
-    /// does its own flag check and returns early on `Some`, so its
-    /// fallback call into this helper only ever executes on the flag-off
-    /// path (`self.writer_task` is `None` by construction whenever that
-    /// call is reached) — no double-routing.
+    /// performs the same write-time lookup first; a non-strict `None` then
+    /// falls through this helper, which records the actual compatibility
+    /// fallback. Strict mode returns before the direct-writer seam.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteSparseGeneralWrite);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
@@ -265,29 +275,35 @@ impl SqliteSparseStore {
     {
         if self.is_file_backed {
             // For file-backed DBs open a standalone read-only connection.
-            let config = self.pool.config();
-            let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-                operation: "sparse_reader".into(),
-                message: "in-memory databases do not support standalone connections".into(),
-            })?;
-            let conn = rusqlite::Connection::open_with_flags(
-                path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            let pool = Arc::clone(&self.pool);
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Sparse,
+                op,
+                move |scope| {
+                    scope.ensure_active()?;
+                    let conn = pool
+                        .open_standalone_reader()
+                        .map_err(|error| map_sqlite_err(error, op))?;
+                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
+                },
             )
-            .map_err(|e| map_err(e, op))?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Sparse, op, e))?
+            .await
         } else {
             let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.reader().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Sparse,
+                op,
+                move |scope| {
+                    let mut guard = pool
+                        .reader_until(|| scope.should_stop())
+                        .map_err(|e| map_sqlite_err(e, op))?
+                        .ok_or_else(|| StorageError::Timeout {
+                            operation: op.into(),
+                        })?;
+                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
+                },
+            )
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Sparse, op, e))?
         }
     }
 
@@ -353,7 +369,7 @@ impl SqliteSparseStore {
         // through the pool-wide WriterTask. DML-only closure — no BEGIN
         // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
         // owns the transaction.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("sparse_insert_batch")? {
             let table2 = table.clone();
             return writer_task
                 .send_bounded(move |conn| {

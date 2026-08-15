@@ -27,6 +27,13 @@ serialization logic. These
 responsibilities are tightly coupled through the shared `AnnState` and cannot be split
 without obscuring the generation-fenced install and warm-ownership lock protocol.
 
+`warm_known_snapshots` is not a read-only lifecycle: classification may register
+a missing consumer, replay and checkpoint a tail, or publish a rebuild. The
+pack therefore omits this ANN warm when its assigned runtime is an ADR-028 A2
+read-only snapshot. Request-time exact/vector fallback remains available from
+the already-materialized snapshot tables; no rejected writer path is used as a
+substitute for warm persistence.
+
 ## Fresh-tail serving (ADR-118)
 
 `knowledge.search` and `knowledge.suggest` capture ANN candidates and the loaded bridge's
@@ -63,6 +70,8 @@ Every process rejects cached, v2, and legacy-v1 state while `-1` remains; only a
 full scan may transition it to a normal watermark. Failed or Empty scans keep the sentinel so a
 re-created row cannot be mistaken for uninterrupted registry history.
 `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg but does not bypass this registry guard.
+The variable is sampled once at `KhiveRuntime` construction; request-time serving reads
+the immutable runtime value rather than process-global environment state.
 
 Migration V18 also distinguishes a never-activated registration (`-2` plus a timestamp) from a
 real active checkpoint at `S = 0`. Knowledge treats `-2` exactly like registry loss and promotes it
