@@ -1,0 +1,29 @@
+{
+  "by_class": {
+    "exact_specific": {
+      "MRR@10": 1.0,
+      "Recall@100": 1.0,
+      "TargetRecall@100": 1.0,
+      "nDCG@10": 0.5750267307178916
+    },
+    "fresh_directive": {
+      "MRR@10": 1.0,
+      "Recall@100": 1.0,
+      "TargetRecall@100": 1.0,
+      "nDCG@10": 0.654445710297268
+    },
+    "paraphrase_specific": {
+      "MRR@10": 1.0,
+      "Recall@100": 0.9907407407407408,
+      "TargetRecall@100": 1.0,
+      "nDCG@10": 0.5526074473822127
+    }
+  },
+  "kkernel_version": "kkernel 0.7.0 (revision d25b83759fa388cade1f1cd7a2e4a2997d135960, built 2026-08-15T02:10:51Z)",
+  "overall": {
+    "MRR@10": 1.0,
+    "Recall@100": 0.9972222222222221,
+    "TargetRecall@100": 1.0,
+    "nDCG@10": 0.5921266395910006
+  }
+}
