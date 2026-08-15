@@ -12,6 +12,7 @@
 // dispatch and is intentionally co-located.
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     sync::{
         atomic::{AtomicI64, Ordering},
@@ -30,7 +31,10 @@ use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
-use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, PrevFailure};
+use khive_request::{
+    parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, ParsedOp,
+    ParsedRequest, PrevFailure, TypedJsonOp,
+};
 use khive_runtime::{
     present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
     PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
@@ -42,6 +46,26 @@ use khive_storage::{EdgeRelation, StorageCapability};
 
 use crate::coordinator::{CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
+
+const MAX_BACKEND_ERROR_ENTRIES: usize = 16;
+const MAX_BACKEND_ERROR_KEY_CHARS: usize = 256;
+const MAX_BACKEND_ERROR_MESSAGE_CHARS: usize = 1_024;
+const MAX_BACKEND_ERROR_INPUT_CHARS: usize = MAX_BACKEND_ERROR_MESSAGE_CHARS * 4;
+/// A legal request carries at most `MAX_OPS` operation envelopes. Reserving a
+/// quarter of the daemon frame for their mandatory diagnostic metadata leaves
+/// another quarter for JSON escaping and half for fixed envelope fields.
+const MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP: usize =
+    khive_runtime::daemon::MAX_FRAME_BYTES / khive_request::MAX_OPS / 4;
+// A JSON scalar needs at most six bytes (`\uXXXX`). The key occurs in both
+// `missing_backends` and `backend_errors`; 1 KiB covers the typed object,
+// integer metadata, punctuation, and the optional ellipsis.
+const MAX_SINGLE_BACKEND_SEARCH_DIAGNOSTIC_BYTES: usize =
+    MAX_BACKEND_ERROR_KEY_CHARS * 6 * 2 + MAX_BACKEND_ERROR_MESSAGE_CHARS * 6 + 1_024;
+const _: () = assert!(
+    MAX_SINGLE_BACKEND_SEARCH_DIAGNOSTIC_BYTES <= MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP,
+    "the search diagnostic budget must retain at least one backend cause"
+);
+const MISSING_BACKEND_ERROR_MESSAGE: &str = "backend search failed without diagnostic detail";
 
 /// Per-operation completeness discriminator for the `search` verb (ADR-130
 /// §1). `SearchDegradation::status == None` means "not a search op" — no
@@ -61,10 +85,20 @@ impl SearchStatus {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BackendErrorDiagnostic {
+    message: String,
+    backend_id_masked: bool,
+    backend_id_truncated: bool,
+    backend_id_chars: usize,
+}
+
 #[derive(Debug, Default)]
 struct SearchDegradation {
     status: Option<SearchStatus>,
     missing_backends: Vec<String>,
+    backend_errors: BTreeMap<String, BackendErrorDiagnostic>,
+    backend_errors_omitted: usize,
 }
 
 impl SearchDegradation {
@@ -76,32 +110,188 @@ impl SearchDegradation {
         Self {
             status: Some(SearchStatus::Complete),
             missing_backends: Vec::new(),
+            backend_errors: BTreeMap::new(),
+            backend_errors_omitted: 0,
         }
     }
 
     fn from_result(result: &CoordSearchResult) -> Self {
-        let mut missing_backends: Vec<String> = result
+        let failed_backend_count = result
             .per_backend
             .iter()
             .filter(|backend| backend.error.is_some())
-            .map(|backend| backend.backend_id.as_str().to_string())
-            .collect();
-        missing_backends.sort();
-        missing_backends.dedup();
-        let status = if result.partial || !missing_backends.is_empty() {
+            .count();
+        let mut candidates = BTreeMap::new();
+        for (backend, error) in result
+            .per_backend
+            .iter()
+            .filter_map(|backend| backend.error.as_deref().map(|error| (backend, error)))
+        {
+            let (key, backend_id_masked, backend_id_truncated, backend_id_chars) =
+                bounded_backend_error_key(backend.backend_id.as_str());
+            candidates.insert(
+                key,
+                BackendErrorDiagnostic {
+                    message: bounded_backend_error_message(error),
+                    backend_id_masked,
+                    backend_id_truncated,
+                    backend_id_chars,
+                },
+            );
+            if candidates.len() > MAX_BACKEND_ERROR_ENTRIES {
+                let _ = candidates.pop_last();
+            }
+        }
+
+        let mut backend_errors = BTreeMap::new();
+        for (backend, diagnostic) in candidates {
+            let mut candidate = backend_errors.clone();
+            candidate.insert(backend, diagnostic);
+            let candidate_degradation = Self {
+                status: Some(SearchStatus::Partial),
+                missing_backends: candidate.keys().cloned().collect(),
+                backend_errors_omitted: failed_backend_count.saturating_sub(candidate.len()),
+                backend_errors: candidate.clone(),
+            };
+            if search_diagnostic_wire_len(&candidate_degradation)
+                <= MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP
+            {
+                backend_errors = candidate;
+            }
+        }
+
+        let missing_backends: Vec<String> = backend_errors.keys().cloned().collect();
+        let backend_errors_omitted = failed_backend_count.saturating_sub(backend_errors.len());
+        let is_partial = failed_backend_count > 0;
+        debug_assert!(!is_partial || !backend_errors.is_empty());
+        debug_assert_eq!(
+            missing_backends,
+            backend_errors.keys().cloned().collect::<Vec<_>>()
+        );
+        debug_assert_eq!(result.partial, is_partial);
+        let status = if is_partial {
             SearchStatus::Partial
         } else {
             SearchStatus::Complete
         };
+        for (backend, diagnostic) in &backend_errors {
+            tracing::warn!(
+                backend,
+                error = %diagnostic.message,
+                "fan-out search backend failed"
+            );
+        }
+        if backend_errors_omitted > 0 {
+            tracing::warn!(
+                failed_backend_count,
+                retained_backend_errors = backend_errors.len(),
+                backend_errors_omitted,
+                "additional fan-out search backend diagnostics omitted by bounds"
+            );
+        }
         Self {
             status: Some(status),
             missing_backends,
+            backend_errors,
+            backend_errors_omitted,
         }
     }
 
     fn is_partial(&self) -> bool {
         self.status == Some(SearchStatus::Partial)
     }
+}
+
+fn bounded_backend_error_message(message: &str) -> String {
+    let bounded_input: String = message
+        .chars()
+        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
+        .collect();
+    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    if masked.trim().is_empty() {
+        return MISSING_BACKEND_ERROR_MESSAGE.to_string();
+    }
+    let mut chars = masked.chars();
+    let mut bounded: String = chars
+        .by_ref()
+        .take(MAX_BACKEND_ERROR_MESSAGE_CHARS)
+        .collect();
+    if chars.next().is_some() || message.chars().nth(MAX_BACKEND_ERROR_INPUT_CHARS).is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn bounded_backend_error_key(backend_id: &str) -> (String, bool, bool, usize) {
+    let backend_id_chars = backend_id.chars().count();
+    let bounded_input: String = backend_id
+        .chars()
+        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
+        .collect();
+    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    let backend_id_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
+    let sanitized = if masked.trim().is_empty() {
+        "masked-backend"
+    } else {
+        masked.as_ref()
+    };
+    if !backend_id_masked && backend_id_chars <= MAX_BACKEND_ERROR_KEY_CHARS {
+        return (sanitized.to_string(), false, false, backend_id_chars);
+    }
+
+    let fingerprint = format!("{:x}", Sha256::digest(backend_id.as_bytes()));
+    let suffix = format!("…#{fingerprint}");
+    let prefix_chars = MAX_BACKEND_ERROR_KEY_CHARS - suffix.chars().count();
+    let prefix: String = sanitized.chars().take(prefix_chars).collect();
+    (
+        format!("{prefix}{suffix}"),
+        backend_id_masked,
+        backend_id_chars > MAX_BACKEND_ERROR_KEY_CHARS,
+        backend_id_chars,
+    )
+}
+
+fn backend_errors_value(errors: &BTreeMap<String, BackendErrorDiagnostic>) -> Value {
+    Value::Object(
+        errors
+            .iter()
+            .map(|(backend, diagnostic)| {
+                let mut value = json!({
+                    "kind": "backend_error",
+                    "message": diagnostic.message,
+                });
+                if diagnostic.backend_id_masked {
+                    value["backend_id_masked"] = Value::Bool(true);
+                }
+                if diagnostic.backend_id_truncated {
+                    value["backend_id_truncated"] = Value::Bool(true);
+                    value["backend_id_chars"] = json!(diagnostic.backend_id_chars);
+                }
+                (backend.clone(), value)
+            })
+            .collect(),
+    )
+}
+
+fn search_diagnostic_value(degradation: &SearchDegradation) -> Value {
+    let mut value = json!({
+        "kind": "search_incomplete",
+        "message": "no-match was not established because selected backends failed",
+        "retryable": false,
+        "missing_backends": degradation.missing_backends,
+        "backend_errors": backend_errors_value(&degradation.backend_errors),
+    });
+    if degradation.backend_errors_omitted > 0 {
+        value["backend_errors_truncated"] = Value::Bool(true);
+        value["backend_errors_omitted"] = json!(degradation.backend_errors_omitted);
+    }
+    value
+}
+
+fn search_diagnostic_wire_len(degradation: &SearchDegradation) -> usize {
+    serde_json::to_vec(&search_diagnostic_value(degradation))
+        .expect("search diagnostic metadata is always serializable")
+        .len()
 }
 
 struct OpSuccess {
@@ -141,13 +331,8 @@ fn op_success_from_registry_result(tool: &str, is_help: bool, result: Value) -> 
 /// keeps `ok=true` with an empty `result`; this is `ok=false` — a caller
 /// doing `if response.ok && response.result.is_empty()` sees the two cases
 /// differently, instead of concluding "no match" in both.
-fn search_incomplete_error(missing_backends: Vec<String>) -> Value {
-    json!({
-        "kind": "search_incomplete",
-        "message": "no-match was not established because selected backends failed",
-        "retryable": false,
-        "missing_backends": missing_backends,
-    })
+fn search_incomplete_error(degradation: SearchDegradation) -> Value {
+    search_diagnostic_value(&degradation)
 }
 
 /// Per-request parallelism stays bounded even when the parser accepts 100 ops; must be nonzero.
@@ -171,8 +356,31 @@ pub(crate) enum DispatchOrigin {
 #[derive(Clone, Copy)]
 struct RunParsedContext<'a> {
     enforce_response_budget: bool,
+    max_batch_concurrency: usize,
     from_wire: bool,
     identity: Option<&'a khive_runtime::RequestIdentity>,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedDispatchPolicy {
+    strict_refusals: bool,
+    max_batch_concurrency: usize,
+}
+
+impl ParsedDispatchPolicy {
+    const fn bounded_parallel(strict_refusals: bool) -> Self {
+        Self {
+            strict_refusals,
+            max_batch_concurrency: MAX_BATCH_CONCURRENCY,
+        }
+    }
+
+    const fn serial(strict_refusals: bool) -> Self {
+        Self {
+            strict_refusals,
+            max_batch_concurrency: 1,
+        }
+    }
 }
 
 /// Typed failure crossing the dispatch/envelope seam.
@@ -1131,27 +1339,41 @@ impl KhiveMcpServer {
     /// `--resumed-generation` marker means the normal `.serve()` handshake
     /// runs exactly as before this change.
     ///
-    /// Both branches wrap the raw stdio transport in
-    /// `crate::daemon::SelfHealOnFlushTransport` — the actual happens-after
-    /// edge that fires an armed self-heal re-exec (or drain-and-exit) only
-    /// once a message has genuinely finished flushing to the client, never
-    /// on a fixed timer that could race a slow or backpressured stdout.
+    /// Both branches keep `crate::daemon::SelfHealOnFlushTransport` directly
+    /// around the raw stdio transport — the actual happens-after edge that
+    /// fires an armed self-heal re-exec (or drain-and-exit) only once a message
+    /// has genuinely finished flushing to the client. The outer EOF adapter
+    /// shares rmcp's root cancellation token so disconnect cancels every
+    /// per-request child before rmcp starts its graceful drain.
     #[cfg(unix)]
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
-        let build_transport = || {
+        let root = tokio_util::sync::CancellationToken::new();
+        let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
-            crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(read, write))
+            crate::transport::CancelOnEofTransport::new(
+                crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
+                    read, write,
+                )),
+                root,
+            )
         };
 
         match stdio_serve_mode_for(crate::daemon::resumed_generation()) {
             StdioServeMode::Resumed => {
-                let service = rmcp::service::serve_directly(self, build_transport(), None);
+                let service = rmcp::service::serve_directly_with_ct(
+                    self,
+                    build_transport(root.clone()),
+                    None,
+                    root,
+                );
                 service.waiting().await?;
             }
             StdioServeMode::Handshake => {
-                let service = self.serve(build_transport()).await?;
+                let service = self
+                    .serve_with_ct(build_transport(root.clone()), root)
+                    .await?;
                 service.waiting().await?;
             }
         }
@@ -1164,13 +1386,20 @@ impl KhiveMcpServer {
     /// Unix-domain-socket daemon-forwarding protocol mismatch — there is
     /// nothing to self-heal from on this target (`--daemon` mode itself is
     /// Unix-only, see `serve.rs::serve_server`), so this path always runs the
-    /// normal MCP `initialize` handshake directly over the raw stdio
-    /// transport, with no resumed-generation skip and no flush-triggered hook.
+    /// normal MCP `initialize` handshake, with no resumed-generation skip and
+    /// no flush-triggered hook. It still shares rmcp's root token with the EOF
+    /// adapter so disconnect cancellation is platform-independent.
     #[cfg(not(unix))]
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
-        use rmcp::transport::stdio;
+        use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
-        let service = self.serve(stdio()).await?;
+        let root = tokio_util::sync::CancellationToken::new();
+        let (read, write) = stdio();
+        let transport = crate::transport::CancelOnEofTransport::new(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+        );
+        let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
         Ok(())
     }
@@ -1349,9 +1578,10 @@ impl KhiveMcpServer {
     /// "partial", ADR-130 §1), which lives inside that op's `results` entry,
     /// never at this top level. A successful but incomplete coordinator
     /// search remains a success (`status="partial"` on that entry) and
-    /// carries a typed `missing_backends` advisory plus the deprecated
-    /// `partial` alias; a search where no hit survives a backend failure is
-    /// instead a failed op (`ok: false`, `error.kind: "search_incomplete"`).
+    /// carries bounded `missing_backends` and `backend_errors` diagnostics
+    /// plus the deprecated `partial` alias; a search where no hit survives a
+    /// backend failure is instead a failed op (`ok: false`,
+    /// `error.kind: "search_incomplete"`).
     ///
     /// Response envelope:
     /// ```json
@@ -1378,9 +1608,11 @@ impl KhiveMcpServer {
     ) -> Value {
         let RunParsedContext {
             enforce_response_budget,
+            max_batch_concurrency,
             from_wire,
             identity,
         } = context;
+        debug_assert!(max_batch_concurrency > 0);
         let response_budget = if mode == ExecutionMode::Parallel && enforce_response_budget {
             BATCH_RESPONSE_BUDGET_BYTES
         } else {
@@ -1581,7 +1813,8 @@ impl KhiveMcpServer {
                         },
                     }
                 });
-                let results = execute_bounded_batch(futures, response_budget).await;
+                let results =
+                    execute_bounded_batch(futures, response_budget, max_batch_concurrency).await;
                 parallel_batch_envelope(results)
             }
             ExecutionMode::Chain => {
@@ -1787,6 +2020,7 @@ async fn dispatch_via_coordinator_inner(
                         let coord_result = coord
                             .fan_out_search(&request, &namespace, &extra_visible)
                             .await;
+                        khive_storage::ensure_request_read_active("search")?;
                         let degradation = SearchDegradation::from_result(&coord_result);
 
                         // Preserve the coordinator search response's compatibility
@@ -1868,7 +2102,7 @@ async fn dispatch_via_coordinator_inner(
                     if outcome.metadata.is_partial() && is_empty {
                         Err(DispatchFailure::unclassified(
                             tool,
-                            search_incomplete_error(outcome.metadata.missing_backends),
+                            search_incomplete_error(outcome.metadata),
                         ))
                     } else {
                         Ok(OpSuccess {
@@ -2006,15 +2240,26 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         result,
         degradation,
     } = success;
-    let is_partial = degradation.is_partial();
-    let extra_fields = usize::from(degradation.status.is_some()) + if is_partial { 2 } else { 0 };
+    let SearchDegradation {
+        status,
+        missing_backends,
+        backend_errors,
+        backend_errors_omitted,
+    } = degradation;
+    let is_partial = status == Some(SearchStatus::Partial);
+    let extra_fields = usize::from(status.is_some())
+        + if is_partial {
+            3 + usize::from(backend_errors_omitted > 0) * 2
+        } else {
+            0
+        };
     let mut map = serde_json::Map::with_capacity(3 + extra_fields);
     map.insert("ok".to_string(), Value::Bool(true));
     map.insert("tool".to_string(), Value::String(tool));
     map.insert("result".to_string(), result);
     // ADR-130 §1: `status` is present on every successful search envelope
     // (complete or partial); absent for every other verb.
-    if let Some(status) = degradation.status {
+    if let Some(status) = status {
         map.insert(
             "status".to_string(),
             Value::String(status.as_str().to_string()),
@@ -2026,14 +2271,19 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         map.insert("partial".to_string(), Value::Bool(true));
         map.insert(
             "missing_backends".to_string(),
-            Value::Array(
-                degradation
-                    .missing_backends
-                    .into_iter()
-                    .map(Value::String)
-                    .collect(),
-            ),
+            Value::Array(missing_backends.into_iter().map(Value::String).collect()),
         );
+        map.insert(
+            "backend_errors".to_string(),
+            backend_errors_value(&backend_errors),
+        );
+        if backend_errors_omitted > 0 {
+            map.insert("backend_errors_truncated".to_string(), Value::Bool(true));
+            map.insert(
+                "backend_errors_omitted".to_string(),
+                json!(backend_errors_omitted),
+            );
+        }
     }
     Value::Object(map)
 }
@@ -2239,6 +2489,62 @@ fn apply_presentation_to_result(
 
 // ── single MCP tool ─────────────────────────────────────────────────────────
 
+fn request_read_timeout() -> std::time::Duration {
+    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let configured = std::env::var("KHIVE_REQUEST_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        let timeout = configured
+            .filter(|seconds| (1..=3_600).contains(seconds))
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| {
+                if let Some(invalid) = configured {
+                    tracing::warn!(
+                        invalid,
+                        default = khive_storage::DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+                        "KHIVE_REQUEST_READ_TIMEOUT_SECS must be in [1, 3600]"
+                    );
+                }
+                khive_storage::request_read_timeout_from_env()
+            });
+        khive_runtime::config_ledger::record_config_locked(
+            "KHIVE_REQUEST_READ_TIMEOUT_SECS",
+            timeout.as_secs().to_string(),
+        );
+        timeout
+    })
+}
+
+async fn scope_mcp_request_read_cancellation<F>(
+    cancellation: tokio_util::sync::CancellationToken,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    // Seed synchronously: a pre-cancelled rmcp context must be visible even
+    // when the wrapped request future is ready before the bridge task's first
+    // poll.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(cancellation.is_cancelled());
+    let _bridge = AbortOnDrop(tokio::spawn(async move {
+        cancellation.cancelled().await;
+        let _ = cancel_tx.send(true);
+    }));
+    khive_storage::scope_request_read_cancellation(
+        cancel_rx,
+        khive_storage::scope_request_read_deadline(request_read_timeout(), future),
+    )
+    .await
+}
+
 #[tool_router]
 impl KhiveMcpServer {
     #[tool(description = r#"Run one or more khive verbs in a single MCP call.
@@ -2287,10 +2593,12 @@ entry's own `ok` field rather than assuming batch-level atomicity.
 `search` carries its own per-op `status` ("complete" | "partial") inside that
 op's `result` entry, separate from the top-level batch `status` above. A
 degraded-but-answered search stays ok:true with status="partial" plus a
-missing_backends list (and the deprecated partial:true alias). When a backend
-failure leaves no hit standing after filtering, the op instead fails outright
-with ok:false and error.kind="search_incomplete" — that case must not be read
-as "no results found."
+missing_backends list, bounded backend_errors causes, and the deprecated
+partial:true alias. Truncation is explicit through backend_errors_truncated and
+backend_errors_omitted. When a backend failure leaves no hit standing after
+filtering, the op instead fails outright with ok:false and
+error.kind="search_incomplete" while retaining the same diagnostics — that case
+must not be read as "no results found."
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -2299,7 +2607,17 @@ schemas live in each pack's docs and SKILL.md files.
 Tip: for one-shot calls, the single-op form is the densest. Use batch when
 several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
-    async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
+    async fn request(
+        &self,
+        Parameters(p): Parameters<RequestParams>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<String, McpError> {
+        scope_mcp_request_read_cancellation(cancellation, self.request_with_cancellation(p)).await
+    }
+}
+
+impl KhiveMcpServer {
+    async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
         // Parse before the daemon decision. The daemon protocol's historical
         // error channel is string-only, so forwarding malformed DSL would turn
         // `invalid_params` plus its structured `parse-error` reason into an
@@ -2327,7 +2645,15 @@ result (e.g. create then link with the new entity's id)."#)]
         #[cfg(unix)]
         if p.save_to.is_none() {
             let frame = self.wire_daemon_frame(&p);
-            if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
+            let forwarded = crate::daemon::forward_or_spawn(&frame);
+            tokio::pin!(forwarded);
+            let forwarded = tokio::select! {
+                result = &mut forwarded => result,
+                _ = khive_storage::wait_for_request_read_cancellation() => {
+                    return Err(McpError::internal_error("request cancelled", None));
+                }
+            };
+            if let Some(res) = forwarded {
                 return match res {
                     Ok(s) => Ok(s),
                     // #947/#898: a strict-mode pre-dispatch rejection is
@@ -2401,11 +2727,16 @@ fn batch_budget_error(tool: &str, response_budget: usize) -> Value {
     })
 }
 
-async fn execute_bounded_batch<I, F>(tasks: I, response_budget: usize) -> Vec<Value>
+async fn execute_bounded_batch<I, F>(
+    tasks: I,
+    response_budget: usize,
+    max_concurrency: usize,
+) -> Vec<Value>
 where
     I: IntoIterator<Item = BatchTask<F>>,
     F: Future<Output = Value>,
 {
+    assert!(max_concurrency > 0, "batch concurrency must be nonzero");
     let mut queued: std::collections::VecDeque<_> = tasks.into_iter().collect();
     let total = queued.len();
     let mut in_flight = FuturesUnordered::new();
@@ -2413,7 +2744,7 @@ where
         let entry = task.future.await;
         (task.index, task.tool, entry)
     };
-    for _ in 0..MAX_BATCH_CONCURRENCY {
+    for _ in 0..max_concurrency {
         if let Some(task) = queued.pop_front() {
             in_flight.push(start(task));
         }
@@ -2616,6 +2947,81 @@ impl KhiveMcpServer {
         .await
     }
 
+    /// Dispatch a bounded, already-decoded JSON batch for `kkernel exec --ops-file`.
+    ///
+    /// The ops-file reader owns its 96 MiB line, 512 MiB file, 32 MiB chunk,
+    /// and 100-op limits. This seam preserves JSON-form validation but avoids
+    /// serializing those typed values back into the public raw-DSL parser,
+    /// whose independent 1 MiB limit remains unchanged for MCP, HTTP, daemon,
+    /// inline exec, and every other string request surface.
+    pub async fn dispatch_typed_json_batch_local_for_exec(
+        &self,
+        ops: Vec<TypedJsonOp>,
+        presentation: Option<String>,
+        format: Option<String>,
+        strict_refusals: bool,
+    ) -> Result<String, McpError> {
+        self.dispatch_typed_json_batch_local_for_exec_with_policy(
+            ops,
+            presentation,
+            format,
+            ParsedDispatchPolicy::bounded_parallel(strict_refusals),
+        )
+        .await
+    }
+
+    /// Dispatch one full typed ops-file chunk with exactly one handler in
+    /// flight while retaining ordinary parallel-batch semantics.
+    ///
+    /// Parsing, write-key conflict detection, aggregate response budgeting,
+    /// result ordering, presentation, audit, and strict-refusal handling remain
+    /// shared with [`Self::dispatch_typed_json_batch_local_for_exec`]. Only the
+    /// trusted local scheduler's concurrency cap changes.
+    pub async fn dispatch_typed_json_batch_serial_local_for_exec(
+        &self,
+        ops: Vec<TypedJsonOp>,
+        presentation: Option<String>,
+        format: Option<String>,
+        strict_refusals: bool,
+    ) -> Result<String, McpError> {
+        self.dispatch_typed_json_batch_local_for_exec_with_policy(
+            ops,
+            presentation,
+            format,
+            ParsedDispatchPolicy::serial(strict_refusals),
+        )
+        .await
+    }
+
+    async fn dispatch_typed_json_batch_local_for_exec_with_policy(
+        &self,
+        ops: Vec<TypedJsonOp>,
+        presentation: Option<String>,
+        format: Option<String>,
+        policy: ParsedDispatchPolicy,
+    ) -> Result<String, McpError> {
+        debug_assert!(policy.max_batch_concurrency > 0);
+        let parsed = parse_typed_json_batch(ops).map_err(dsl_err_to_mcp)?;
+        let p = RequestParams {
+            ops: String::new(),
+            presentation,
+            presentation_per_op: None,
+            save_to: None,
+            format,
+            format_per_op: None,
+            request_id: None,
+        };
+        let dispatch = Box::pin(self.dispatch_parsed_request_inner_scoped(
+            p,
+            parsed,
+            false,
+            None,
+            DispatchOrigin::Local,
+            policy,
+        ));
+        khive_storage::scope_request_read_deadline(request_read_timeout(), dispatch).await
+    }
+
     /// Replay one stored public-surface request under a host-verified actor.
     ///
     /// An attributed actor must come from an out-of-band provenance check,
@@ -2693,6 +3099,55 @@ impl KhiveMcpServer {
         origin: DispatchOrigin,
         strict_refusals: bool,
     ) -> Result<String, McpError> {
+        // `dispatch_request_inner_scoped` is the complete parse/dispatch/render
+        // pipeline. Keep that large generator behind one pointer before handing
+        // it to the generic task-local scope: otherwise the scope embeds the
+        // pipeline in every MCP, local-exec, and replay request future. LLVM
+        // coverage instrumentation amplifies the resulting poll stack enough to
+        // overflow Tokio's normal worker stack even for unrelated small verbs.
+        let dispatch = Box::pin(self.dispatch_request_inner_scoped(
+            p,
+            from_wire,
+            identity,
+            origin,
+            strict_refusals,
+        ));
+        khive_storage::scope_request_read_deadline(request_read_timeout(), dispatch).await
+    }
+
+    async fn dispatch_request_inner_scoped(
+        &self,
+        p: RequestParams,
+        from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
+        origin: DispatchOrigin,
+        strict_refusals: bool,
+    ) -> Result<String, McpError> {
+        let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        self.dispatch_parsed_request_inner_scoped(
+            p,
+            parsed,
+            from_wire,
+            identity,
+            origin,
+            ParsedDispatchPolicy::bounded_parallel(strict_refusals),
+        )
+        .await
+    }
+
+    async fn dispatch_parsed_request_inner_scoped(
+        &self,
+        p: RequestParams,
+        parsed: ParsedRequest,
+        from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
+        origin: DispatchOrigin,
+        policy: ParsedDispatchPolicy,
+    ) -> Result<String, McpError> {
+        let ParsedDispatchPolicy {
+            strict_refusals,
+            max_batch_concurrency,
+        } = policy;
         let save_to = p.save_to.clone();
         let identity = identity.or_else(|| {
             p.request_id
@@ -2708,7 +3163,6 @@ impl KhiveMcpServer {
                     request_id: Some(request_id),
                 })
         });
-        let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
 
         // Parse presentation strings → PresentationMode.
         let presentation = parse_presentation_mode(p.presentation.as_deref())
@@ -2766,6 +3220,7 @@ impl KhiveMcpServer {
                 presentation_per_op.clone(),
                 RunParsedContext {
                     enforce_response_budget: save_to.is_none(),
+                    max_batch_concurrency,
                     from_wire,
                     identity: identity.as_ref(),
                 },
@@ -3110,6 +3565,9 @@ fn frame_budget_omission(entry: &Value) -> Value {
         "status",
         "partial",
         "missing_backends",
+        "backend_errors",
+        "backend_errors_truncated",
+        "backend_errors_omitted",
         "advisories",
     ] {
         if let Some(value) = entry.get(key) {
@@ -3253,6 +3711,43 @@ mod tests {
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
 
+    #[derive(Clone, Default)]
+    struct SearchCapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SearchCapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured search log mutex poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SearchCapturedLog {
+        type Writer = SearchCapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl SearchCapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.0
+                    .lock()
+                    .expect("captured search log mutex poisoned")
+                    .clone(),
+            )
+            .expect("captured search logs are UTF-8")
+        }
+    }
+
     // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
     // connections close asynchronously; read-only admission rejects a writable
     // `-shm` as potentially live.
@@ -3280,6 +3775,44 @@ mod tests {
         let parse_error = parse_request("stats(").expect_err("input must be malformed");
         let error = dsl_err_to_mcp(parse_error);
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["reason"].as_str()),
+            Some("parse-error")
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_dispatch_retains_raw_one_mib_input_limit() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let params = RequestParams {
+            ops: json!({
+                "tool": "stats",
+                "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
+            })
+            .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+
+        let error = server
+            .dispatch_request_wire(params)
+            .await
+            .expect_err("the public wire path must reject raw ops above 1 MiB");
+
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("ops input is"), "{error}");
         assert_eq!(
             error.data.as_ref().and_then(|data| data["reason"].as_str()),
             Some("parse-error")
@@ -3383,6 +3916,238 @@ mod tests {
                 .expect("test supplies a valid byte count");
             Ok(json!("x".repeat(bytes)))
         }
+    }
+
+    struct SlowSqlReadPack {
+        bridge: khive_db::SqlBridge,
+    }
+
+    impl khive_types::Pack for SlowSqlReadPack {
+        const NAME: &'static str = "slow-sql-read-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "slow_sql_read",
+                description: "runs SQLite work until the request read deadline interrupts it",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "pending_read_phase",
+                description: "waits until the request read deadline interrupts it",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for SlowSqlReadPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            use khive_storage::{SqlAccess, SqlStatement};
+
+            if verb == "pending_read_phase" {
+                khive_storage::await_request_read_phase(
+                    "outer-deadline-probe",
+                    std::future::pending::<()>(),
+                )
+                .await?;
+                return Ok(Value::Null);
+            }
+
+            let mut reader = self.bridge.reader().await?;
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: "WITH RECURSIVE numbers(value) AS (\
+                          SELECT 1 UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000\
+                          ) SELECT SUM(a.value * b.value * c.value) \
+                          FROM numbers AS a CROSS JOIN numbers AS b CROSS JOIN numbers AS c"
+                        .into(),
+                    params: vec![],
+                    label: Some("canonical-dispatch-deadline-probe".into()),
+                })
+                .await?;
+            Ok(json!({ "rows": rows.len() }))
+        }
+    }
+
+    fn slow_sql_read_test_server() -> KhiveMcpServer {
+        let pool = Arc::new(
+            khive_db::ConnectionPool::new(khive_db::PoolConfig::default())
+                .expect("in-memory SQLite pool"),
+        );
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SlowSqlReadPack {
+            bridge: khive_db::SqlBridge::new(pool, false),
+        });
+        KhiveMcpServer::from_registry(builder.build().expect("slow-SQL test registry"))
+    }
+
+    #[test]
+    fn canonical_request_deadline_wrapper_does_not_embed_dispatch_pipeline() {
+        // Construct the generators on an explicitly roomy stack so this
+        // regression reports their footprint instead of reproducing the LLVM
+        // coverage stack abort it is meant to prevent. Nothing is polled, so an
+        // empty registry is sufficient and the test performs no storage work.
+        let (pipeline_bytes, wrapper_bytes) = std::thread::Builder::new()
+            .name("request-dispatch-future-footprint".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let server = KhiveMcpServer::from_registry(
+                    VerbRegistryBuilder::new()
+                        .build()
+                        .expect("empty test registry"),
+                );
+                let pipeline_bytes = std::mem::size_of_val(&server.dispatch_request_inner_scoped(
+                    RequestParams {
+                        ops: "stats()".to_string(),
+                        ..Default::default()
+                    },
+                    false,
+                    None,
+                    DispatchOrigin::Local,
+                    false,
+                ));
+                let wrapper_bytes =
+                    std::mem::size_of_val(&server.dispatch_request_inner_with_strict_refusals(
+                        RequestParams {
+                            ops: "stats()".to_string(),
+                            ..Default::default()
+                        },
+                        false,
+                        None,
+                        DispatchOrigin::Local,
+                        false,
+                    ));
+                (pipeline_bytes, wrapper_bytes)
+            })
+            .expect("spawn request future footprint measurement")
+            .join()
+            .expect("request future footprint measurement panicked");
+
+        assert!(
+            wrapper_bytes.saturating_mul(2) < pipeline_bytes,
+            "the canonical deadline wrapper must keep the dispatch pipeline behind a pointer: \
+             wrapper={wrapper_bytes}B pipeline={pipeline_bytes}B"
+        );
+    }
+
+    fn assert_request_read_timed_out(response: &str) {
+        let envelope: Value = serde_json::from_str(response).expect("JSON response envelope");
+        assert_eq!(envelope["summary"]["failed"], 1, "{envelope}");
+        let error = envelope["results"][0]["error"].to_string().to_lowercase();
+        assert!(
+            error.contains("timeout") || error.contains("timed out"),
+            "request read must fail as a timeout: {envelope}"
+        );
+    }
+
+    // These dispatch-layer regressions compose with khive-db's
+    // `request_deadline_interrupts_statement_without_outer_timeout`, which
+    // separately proves that the same SQL bridge deadline sees SQLite VM
+    // progress and stops it before returning. Do not assert that paused Tokio
+    // time reaches the full default here: the SQLite wall-clock/progress
+    // backstop may win first under instrumentation. The typed timeout proves
+    // the canonical scope reached the database; the test below independently
+    // pins absolute Tokio-deadline ordering.
+    #[tokio::test(start_paused = true)]
+    async fn local_exec_dispatch_installs_the_default_request_read_deadline() {
+        let server = slow_sql_read_test_server();
+        let expected = request_read_timeout();
+        let response = tokio::time::timeout(
+            expected
+                .saturating_add(khive_db::sqlite_interrupt_grace_from_env())
+                .saturating_add(Duration::from_secs(1)),
+            server.dispatch_request_local_for_exec(
+                RequestParams {
+                    ops: "slow_sql_read()".to_string(),
+                    ..Default::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .expect("canonical local request-read deadline was never installed")
+        .expect("deadline is a per-op failure, not an RPC failure");
+
+        assert_request_read_timed_out(&response);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_dispatch_installs_the_default_request_read_deadline() {
+        let server = slow_sql_read_test_server();
+        let expected = request_read_timeout();
+        let response = tokio::time::timeout(
+            expected
+                .saturating_add(khive_db::sqlite_interrupt_grace_from_env())
+                .saturating_add(Duration::from_secs(1)),
+            server.dispatch_request_replay_as(
+                RequestParams {
+                    ops: "slow_sql_read()".to_string(),
+                    ..Default::default()
+                },
+                "local",
+                None,
+            ),
+        )
+        .await
+        .expect("canonical replay request-read deadline was never installed")
+        .expect("deadline is a per-op failure, not an RPC failure");
+
+        assert_request_read_timed_out(&response);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canonical_dispatch_preserves_an_earlier_outer_deadline() {
+        let server = slow_sql_read_test_server();
+        let outer = Duration::from_millis(50);
+        let default = request_read_timeout();
+        let started = tokio::time::Instant::now();
+        let response = khive_storage::scope_request_read_deadline(
+            outer,
+            server.dispatch_request_local(RequestParams {
+                ops: "pending_read_phase()".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("deadline is a per-op failure, not an RPC failure");
+        let elapsed = tokio::time::Instant::now().duration_since(started);
+
+        assert!(
+            elapsed >= outer,
+            "outer deadline fired too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < default,
+            "canonical dispatch renewed an earlier outer deadline: {elapsed:?}"
+        );
+        assert_request_read_timed_out(&response);
     }
 
     /// Receipt-only stand-in for the Git pack. Two operations can return
@@ -3569,6 +4334,134 @@ mod tests {
         KhiveMcpServer::from_registry(builder.build().expect("test registry"))
     }
 
+    fn typed_test_op(tool: &str, args: Value) -> TypedJsonOp {
+        let Value::Object(args) = args else {
+            panic!("typed test args must be an object")
+        };
+        TypedJsonOp {
+            tool: tool.to_string(),
+            args,
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_serial_dispatch_retains_full_batch_write_conflict_preflight() {
+        let ops = vec![
+            typed_test_op("update", json!({"id": "same-id", "name": "new"})),
+            typed_test_op("delete", json!({"id": "same-id"})),
+        ];
+        let server = large_result_test_server();
+        let parallel: Value = serde_json::from_str(
+            &server
+                .dispatch_typed_json_batch_local_for_exec(
+                    ops.clone(),
+                    Some("verbose".to_string()),
+                    Some("json".to_string()),
+                    false,
+                )
+                .await
+                .expect("parallel typed dispatch"),
+        )
+        .expect("parallel response JSON");
+        let serial: Value = serde_json::from_str(
+            &server
+                .dispatch_typed_json_batch_serial_local_for_exec(
+                    ops,
+                    Some("verbose".to_string()),
+                    Some("json".to_string()),
+                    false,
+                )
+                .await
+                .expect("serial typed dispatch"),
+        )
+        .expect("serial response JSON");
+
+        assert_eq!(serial["summary"], parallel["summary"]);
+        assert_eq!(serial["status"], parallel["status"]);
+        for (serial_row, parallel_row) in serial["results"]
+            .as_array()
+            .expect("serial rows")
+            .iter()
+            .zip(parallel["results"].as_array().expect("parallel rows"))
+        {
+            assert_eq!(serial_row["ok"], false);
+            assert_eq!(serial_row["tool"], parallel_row["tool"]);
+            assert_eq!(serial_row["error"], parallel_row["error"]);
+            assert!(serial_row["error"]
+                .as_str()
+                .expect("conflict error")
+                .contains("writes overlap"));
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_serial_dispatch_retains_one_aggregate_response_budget() {
+        let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
+        let ops: Vec<TypedJsonOp> = (0..12)
+            .map(|_| typed_test_op("large_result", json!({"bytes": result_bytes})))
+            .collect();
+        let server = large_result_test_server();
+        let parallel: Value = serde_json::from_str(
+            &server
+                .dispatch_typed_json_batch_local_for_exec(
+                    ops.clone(),
+                    Some("verbose".to_string()),
+                    Some("json".to_string()),
+                    false,
+                )
+                .await
+                .expect("parallel typed dispatch"),
+        )
+        .expect("parallel response JSON");
+        let serial: Value = serde_json::from_str(
+            &server
+                .dispatch_typed_json_batch_serial_local_for_exec(
+                    ops,
+                    Some("verbose".to_string()),
+                    Some("json".to_string()),
+                    false,
+                )
+                .await
+                .expect("serial typed dispatch"),
+        )
+        .expect("serial response JSON");
+
+        let serial_rows = serial["results"].as_array().expect("serial rows");
+        let first_serial_budget_error = serial_rows
+            .iter()
+            .position(|row| {
+                row["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("batch response budget"))
+            })
+            .expect("serial tail must contain canonical budget errors");
+        assert!(
+            first_serial_budget_error >= 3 && first_serial_budget_error < serial_rows.len(),
+            "serial dispatch must spend one aggregate budget, not reset it per op"
+        );
+        assert!(serial_rows[..first_serial_budget_error]
+            .iter()
+            .all(|row| row["ok"] == json!(true)));
+        assert!(serial_rows[first_serial_budget_error..].iter().all(|row| {
+            row["ok"] == json!(false)
+                && row["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(&BATCH_RESPONSE_BUDGET_BYTES.to_string()))
+        }));
+
+        let parallel_budget_error = parallel["results"]
+            .as_array()
+            .expect("parallel rows")
+            .iter()
+            .find_map(|row| row["error"].as_str())
+            .expect("parallel undispatched tail must use the same budget error");
+        assert_eq!(
+            serial_rows[first_serial_budget_error]["error"],
+            json!(parallel_budget_error),
+            "serial and default typed scheduling must single-source the budget/error contract"
+        );
+    }
+
     #[tokio::test]
     async fn bounded_batch_preserves_input_order() {
         let count = MAX_BATCH_CONCURRENCY + 3;
@@ -3587,7 +4480,7 @@ mod tests {
             )
         });
 
-        let results = execute_bounded_batch(futures, usize::MAX).await;
+        let results = execute_bounded_batch(futures, usize::MAX, MAX_BATCH_CONCURRENCY).await;
 
         let indices: Vec<u64> = results
             .iter()
@@ -3639,7 +4532,7 @@ mod tests {
 
         let results = tokio::time::timeout(
             Duration::from_secs(1),
-            execute_bounded_batch(futures, budget),
+            execute_bounded_batch(futures, budget, MAX_BATCH_CONCURRENCY),
         )
         .await
         .expect("started operations must settle promptly after a budget breach");
@@ -3823,14 +4716,175 @@ mod tests {
             "status": "partial",
             "partial": true,
             "missing_backends": ["archive"],
+            "backend_errors": {
+                "archive": {
+                    "kind": "backend_error",
+                    "message": "storage unavailable"
+                }
+            },
         }));
 
         assert_eq!(omitted["ok"], json!(true));
         assert_eq!(omitted["status"], json!("partial"));
         assert_eq!(omitted["partial"], json!(true));
         assert_eq!(omitted["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            omitted["backend_errors"]["archive"]["message"],
+            json!("storage unavailable")
+        );
         assert!(omitted.get("result").is_none());
         assert!(omitted.get("result_omitted").is_some());
+    }
+
+    #[test]
+    fn backend_error_evidence_is_masked_and_bounded_before_preservation() {
+        let secret = format!("storage auth token sk_live_{} failed", "a".repeat(32));
+        let masked = bounded_backend_error_message(&secret);
+        assert!(masked.contains("***MASKED***"));
+        assert!(!masked.contains("sk_live_"));
+
+        let backend_secret = format!("archive auth token sk_live_{}", "b".repeat(32));
+        let (key, key_masked, key_truncated, key_chars) =
+            bounded_backend_error_key(&backend_secret);
+        assert!(key_masked);
+        assert!(!key_truncated);
+        assert_eq!(key_chars, backend_secret.chars().count());
+        assert!(key.contains("***MASKED***"));
+        assert!(!key.contains("sk_live_"));
+        assert!(key.chars().count() <= MAX_BACKEND_ERROR_KEY_CHARS);
+
+        let oversized = "x".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS + 100);
+        let bounded = bounded_backend_error_message(&oversized);
+        assert_eq!(bounded.chars().count(), MAX_BACKEND_ERROR_MESSAGE_CHARS + 1);
+        assert!(bounded.ends_with('…'));
+        assert_eq!(
+            bounded_backend_error_message(" \t\n"),
+            MISSING_BACKEND_ERROR_MESSAGE
+        );
+    }
+
+    #[test]
+    fn backend_error_evidence_has_aggregate_budget_and_exact_key_parity() {
+        fn degraded_result(reverse: bool) -> CoordSearchResult {
+            let mut per_backend: Vec<crate::coordinator::BackendSearchResult> = (0
+                ..MAX_BACKEND_ERROR_ENTRIES + 9)
+                .map(|index| crate::coordinator::BackendSearchResult {
+                    backend_id: khive_runtime::BackendId::new(format!(
+                        "backend-{index:03}-{}",
+                        "x".repeat(MAX_BACKEND_ERROR_KEY_CHARS)
+                    )),
+                    entity_hits: Vec::new(),
+                    note_hits: Vec::new(),
+                    error: Some(format!(
+                        "backend failure {index}: {}",
+                        "\0\"\\".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS)
+                    )),
+                })
+                .collect();
+            if reverse {
+                per_backend.reverse();
+            }
+            CoordSearchResult {
+                entity_hits: Vec::new(),
+                note_hits: Vec::new(),
+                per_backend,
+                partial: true,
+                entity_kinds: std::collections::HashMap::new(),
+                note_kinds: std::collections::HashMap::new(),
+                entity_created_at: std::collections::HashMap::new(),
+                note_created_at: std::collections::HashMap::new(),
+                note_names: std::collections::HashMap::new(),
+            }
+        }
+
+        let forward = SearchDegradation::from_result(&degraded_result(false));
+        let reversed = SearchDegradation::from_result(&degraded_result(true));
+
+        assert!(!forward.backend_errors.is_empty());
+        assert!(forward.backend_errors.len() <= MAX_BACKEND_ERROR_ENTRIES);
+        assert!(forward.backend_errors.iter().all(|(backend, diagnostic)| {
+            backend.chars().count() <= MAX_BACKEND_ERROR_KEY_CHARS
+                && diagnostic.backend_id_truncated
+                && diagnostic.message.chars().count() <= MAX_BACKEND_ERROR_MESSAGE_CHARS + 1
+        }));
+        assert_eq!(
+            forward.missing_backends,
+            forward.backend_errors.keys().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            forward.backend_errors_omitted,
+            MAX_BACKEND_ERROR_ENTRIES + 9 - forward.backend_errors.len()
+        );
+        assert_eq!(forward.missing_backends, reversed.missing_backends);
+        assert_eq!(
+            backend_errors_value(&forward.backend_errors),
+            backend_errors_value(&reversed.backend_errors)
+        );
+        assert!(search_diagnostic_wire_len(&forward) <= MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP);
+
+        let envelope = ok_envelope(
+            "search".to_string(),
+            OpSuccess {
+                result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
+                degradation: forward,
+            },
+        );
+        assert_eq!(envelope["backend_errors_truncated"], true);
+        assert!(envelope["backend_errors_omitted"].as_u64().unwrap() > 0);
+        assert_eq!(
+            envelope["missing_backends"].as_array().unwrap(),
+            &envelope["backend_errors"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn backend_id_credentials_are_absent_from_wire_and_warning() {
+        let secret = format!("archive auth token sk_live_{}", "c".repeat(32));
+        let result = CoordSearchResult {
+            entity_hits: Vec::new(),
+            note_hits: Vec::new(),
+            per_backend: vec![crate::coordinator::BackendSearchResult {
+                backend_id: khive_runtime::BackendId::new(secret.clone()),
+                entity_hits: Vec::new(),
+                note_hits: Vec::new(),
+                error: Some("storage unavailable".to_string()),
+            }],
+            partial: true,
+            entity_kinds: std::collections::HashMap::new(),
+            note_kinds: std::collections::HashMap::new(),
+            entity_created_at: std::collections::HashMap::new(),
+            note_created_at: std::collections::HashMap::new(),
+            note_names: std::collections::HashMap::new(),
+        };
+        let captured = SearchCapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let degradation = tracing::subscriber::with_default(subscriber, || {
+            SearchDegradation::from_result(&result)
+        });
+        let wire = search_diagnostic_value(&degradation).to_string();
+        let logs = captured.contents();
+
+        assert!(!wire.contains("sk_live_"), "wire leaked backend credential");
+        assert!(
+            !logs.contains("sk_live_"),
+            "warning leaked backend credential"
+        );
+        let backend = degradation
+            .missing_backends
+            .first()
+            .expect("failed backend diagnostic retained");
+        assert!(backend.contains("***MASKED***"));
+        assert!(degradation.backend_errors[backend].backend_id_masked);
     }
 
     #[test]
@@ -3858,6 +4912,14 @@ mod tests {
             "message": "no-match was not established because selected backends failed",
             "retryable": false,
             "missing_backends": ["archive"],
+            "backend_errors": {
+                "archive": {
+                    "kind": "backend_error",
+                    "message": "storage unavailable"
+                }
+            },
+            "backend_errors_truncated": true,
+            "backend_errors_omitted": 2,
         });
         let omitted = frame_budget_omission(&json!({
             "ok": false,
@@ -4010,7 +5072,9 @@ mod tests {
             )
         });
 
-        let response = parallel_batch_envelope(execute_bounded_batch(futures, usize::MAX).await);
+        let response = parallel_batch_envelope(
+            execute_bounded_batch(futures, usize::MAX, MAX_BATCH_CONCURRENCY).await,
+        );
 
         assert_eq!(
             response["summary"],
@@ -4039,7 +5103,7 @@ mod tests {
             )
         });
 
-        let results = execute_bounded_batch(futures, usize::MAX).await;
+        let results = execute_bounded_batch(futures, usize::MAX, MAX_BATCH_CONCURRENCY).await;
 
         assert_eq!(results.len(), count);
         assert_eq!(max_in_flight.load(Ordering::SeqCst), MAX_BATCH_CONCURRENCY);
@@ -4794,6 +5858,16 @@ mod tests {
             degradation: SearchDegradation {
                 status: Some(SearchStatus::Partial),
                 missing_backends: vec!["archive".to_string()],
+                backend_errors: BTreeMap::from([(
+                    "archive".to_string(),
+                    BackendErrorDiagnostic {
+                        message: "storage unavailable".to_string(),
+                        backend_id_masked: false,
+                        backend_id_truncated: false,
+                        backend_id_chars: "archive".chars().count(),
+                    },
+                )]),
+                backend_errors_omitted: 0,
             },
         };
         let envelope = present_ok_envelope_or_depth_error(
@@ -4807,6 +5881,10 @@ mod tests {
         assert_eq!(envelope["status"], json!("partial"));
         assert_eq!(envelope["partial"], json!(true));
         assert_eq!(envelope["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            envelope["backend_errors"]["archive"]["message"],
+            json!("storage unavailable")
+        );
         assert!(envelope.get("result").is_some());
     }
 
@@ -4852,6 +5930,7 @@ mod tests {
                 None,
                 RunParsedContext {
                     enforce_response_budget: true,
+                    max_batch_concurrency: MAX_BATCH_CONCURRENCY,
                     from_wire: false,
                     identity: None,
                 },
@@ -4924,6 +6003,7 @@ mod tests {
                 None,
                 RunParsedContext {
                     enforce_response_budget: true,
+                    max_batch_concurrency: MAX_BATCH_CONCURRENCY,
                     from_wire: false,
                     identity: None,
                 },
@@ -4963,6 +6043,20 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_LOCK");
         std::env::remove_var("KHIVE_PROCESS_REF");
+    }
+
+    fn stats_without_request_local_usage(raw: &str) -> Value {
+        let mut envelope: Value = serde_json::from_str(raw).expect("stats response JSON");
+        for entry in envelope["results"]
+            .as_array_mut()
+            .expect("stats results array")
+        {
+            entry
+                .as_object_mut()
+                .expect("stats result object")
+                .remove("usage");
+        }
+        envelope
     }
 
     /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`
@@ -5025,15 +6119,18 @@ mod tests {
 
         let server = make_daemon_save_to_test_server();
         server
-            .request(Parameters(RequestParams {
-                // Explicit `namespace="local"` so the write lands in the
-                // same namespace the server's audit `EventStore` handle is
-                // scoped to at construction (`Namespace::local()`), matching
-                // `find_audit_event_with_request_id`'s read scope.
-                ops: "stats(namespace=\"local\")".to_string(),
-                request_id: Some(9001),
-                ..Default::default()
-            }))
+            .request(
+                Parameters(RequestParams {
+                    // Explicit `namespace="local"` so the write lands in the
+                    // same namespace the server's audit `EventStore` handle is
+                    // scoped to at construction (`Namespace::local()`), matching
+                    // `find_audit_event_with_request_id`'s read scope.
+                    ops: "stats(namespace=\"local\")".to_string(),
+                    request_id: Some(9001),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("request() must succeed via local dispatch under KHIVE_NO_DAEMON");
 
@@ -5063,12 +6160,15 @@ mod tests {
         let server = make_daemon_save_to_test_server();
         let sink_path = dir.path().join("out.jsonl");
         server
-            .request(Parameters(RequestParams {
-                ops: "stats(namespace=\"local\")".to_string(),
-                save_to: Some(sink_path.to_string_lossy().to_string()),
-                request_id: Some(9002),
-                ..Default::default()
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats(namespace=\"local\")".to_string(),
+                    save_to: Some(sink_path.to_string_lossy().to_string()),
+                    request_id: Some(9002),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("request() with save_to must succeed");
 
@@ -5132,15 +6232,18 @@ mod tests {
 
         let sink_path = dir.path().join("out.jsonl");
         let resp = server
-            .request(Parameters(RequestParams {
-                ops: "stats()".to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: Some(sink_path.to_string_lossy().to_string()),
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats()".to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: Some(sink_path.to_string_lossy().to_string()),
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("request with save_to must succeed even with a warm daemon reachable");
 
@@ -5190,10 +6293,13 @@ mod tests {
         connect_when_daemon_ready(&sock).await;
 
         let error = server
-            .request(Parameters(RequestParams {
-                ops: "stats(".to_string(),
-                ..Default::default()
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats(".to_string(),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect_err("malformed DSL must be rejected before forwarding");
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -5205,10 +6311,13 @@ mod tests {
         // Prove this was the normal warm-daemon environment, not a no-daemon
         // fallback that happened to retain the local error shape.
         server
-            .request(Parameters(RequestParams {
-                ops: "stats()".to_string(),
-                ..Default::default()
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("valid follow-up must dispatch through the warm daemon");
 
@@ -5279,15 +6388,18 @@ mod tests {
             .expect("baseline stats() must succeed");
 
         let resp = server
-            .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await;
 
         match resp {
@@ -5318,8 +6430,10 @@ mod tests {
             })
             .await
             .expect("post-request stats() must succeed");
+
         assert_eq!(
-            after, baseline,
+            stats_without_request_local_usage(&after),
+            stats_without_request_local_usage(&baseline),
             "the comm.send op must NEVER have run locally after the ambiguous \
              forward outcome — a double-dispatch would mutate local state here"
         );
@@ -5402,15 +6516,18 @@ mod tests {
 
         // ── single op ──────────────────────────────────────────────────────
         let single_resp = server
-            .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+            .request(
+                Parameters(RequestParams {
+                    ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
         let single: Value =
@@ -5427,17 +6544,20 @@ mod tests {
 
         // ── parallel batch ─────────────────────────────────────────────────
         let batch_resp = server
-            .request(Parameters(RequestParams {
-                ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
+            .request(
+                Parameters(RequestParams {
+                    ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
                        comm.send(to=\"bob\", content=\"strict-batch-2\")]"
-                    .to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+                        .to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
         let batch: Value =
@@ -5454,17 +6574,20 @@ mod tests {
 
         // ── chain (must abort remaining ops per the wire contract) ─────────
         let chain_resp = server
-            .request(Parameters(RequestParams {
-                ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
+            .request(
+                Parameters(RequestParams {
+                    ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
                       comm.send(to=\"bob\", content=\"strict-chain-2\")"
-                    .to_string(),
-                presentation: None,
-                presentation_per_op: None,
-                save_to: None,
-                format: None,
-                format_per_op: None,
-                request_id: None,
-            }))
+                        .to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
         let chain: Value =
@@ -5495,7 +6618,8 @@ mod tests {
             .await
             .expect("post-request stats() must succeed");
         assert_eq!(
-            after, baseline,
+            stats_without_request_local_usage(&after),
+            stats_without_request_local_usage(&baseline),
             "no comm.send op must ever have run locally under strict-mode fallback \
              rejection — a local dispatch would mutate local state here"
         );
@@ -5776,5 +6900,173 @@ mod tests {
             parsed["status"], "partial",
             "a chain with an aborted op must report status=partial; got {parsed}"
         );
+    }
+}
+#[cfg(test)]
+mod request_read_cancellation_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct EofProbeServer {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    impl rmcp::ServerHandler for EofProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let started = self.started.clone();
+            let cancelled = self.cancelled.clone();
+            async move {
+                started.notify_one();
+                scope_mcp_request_read_cancellation(context.ct, async {
+                    khive_storage::wait_for_request_read_cancellation().await;
+                })
+                .await;
+                cancelled.notify_one();
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_eof_cancels_root_and_request_read_before_rmcp_drain() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let probe = EofProbeServer {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::new(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        client_io
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("rmcp never admitted the request handler");
+
+        drop(client_io);
+
+        tokio::time::timeout(Duration::from_secs(2), cancelled.notified())
+            .await
+            .expect("stdio EOF did not cancel the request read scope promptly");
+        assert!(
+            root.is_cancelled(),
+            "EOF must cancel the exact root token passed into rmcp"
+        );
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("rmcp remained in its five-second EOF drain")
+            .expect("rmcp service task panicked");
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after EOF: {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rmcp_cancellation_token_reaches_request_read_scope() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_for_scope = token.clone();
+        let observed = tokio::spawn(async move {
+            scope_mcp_request_read_cancellation(token_for_scope, async {
+                khive_storage::wait_for_request_read_cancellation().await;
+                true
+            })
+            .await
+        });
+
+        token.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), observed)
+                .await
+                .expect("rmcp cancellation never reached the read scope")
+                .expect("scope task panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_rmcp_token_is_visible_without_yielding() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let observed = scope_mcp_request_read_cancellation(token, async {
+            khive_storage::request_read_is_cancelled()
+        })
+        .await;
+
+        assert!(
+            observed,
+            "a synchronously-ready request raced past a pre-cancelled rmcp context"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_tool_path_honors_an_already_cancelled_rmcp_token() {
+        std::env::set_var("KHIVE_NO_DAEMON", "1");
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: khive_runtime::Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+
+        let response = server
+            .request(
+                Parameters(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                }),
+                cancellation,
+            )
+            .await;
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        match response {
+            Err(error) => {
+                let rendered = format!("{error:?}").to_ascii_lowercase();
+                assert!(
+                    rendered.contains("timeout") || rendered.contains("cancel"),
+                    "cancelled request returned an unrelated RPC error: {rendered}"
+                );
+            }
+            Ok(payload) => {
+                let parsed: Value = serde_json::from_str(&payload).expect("JSON response envelope");
+                assert!(
+                    parsed["summary"]["failed"].as_u64().unwrap_or(0) > 0,
+                    "the actual request tool path ignored its cancelled token: {parsed}"
+                );
+            }
+        }
     }
 }

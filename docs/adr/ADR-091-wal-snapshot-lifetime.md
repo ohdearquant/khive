@@ -1425,3 +1425,68 @@ unrelated writer a 100 ms SQLite busy bound. The unrelated commit succeeds insid
 deletion is still parked; under the former one-transaction implementation it remained behind the
 parked filesystem phase and reached the busy timeout. This is the measured boundary for #1850:
 external deletion contributes zero time to SQLite's exclusive writer hold.
+
+### 2026-08-11 amendment (Amendment 12): abandoned reads release WAL snapshots
+
+Request abandonment is now an active snapshot-lifetime boundary. MCP
+`notifications/cancelled`, daemon peer EOF/reset, daemon shutdown, coordinator
+search timeout, and the general request-read deadline merge into one absolute
+read context. A SQLite read installs the common progress/interrupt guard on
+its exact connection; graph traversal contributes its own budget predicate to
+that same callback. `knowledge.compose` also checks the context between awaits,
+inside domain/atom loops, and during synchronous tokenization/BM25/scoring so a
+caught degradable backend error cannot start later reads after cancellation.
+
+Stdio EOF cancels the exact rmcp root token before rmcp starts its graceful
+drain, so each in-flight request child reaches this read context immediately
+instead of running for the drain's five-second allowance. The canonical DSL
+dispatch boundary installs the default request-read deadline for wire calls,
+daemon frames, local/operator execution, and provenance-verified scheduled
+replay. A previously installed outer deadline remains authoritative when it is
+earlier; the boundary never renews it. Detached warm, checkpoint, sweep, and
+channel-maintenance tasks do not inherit a request context unless they are an
+explicit response-owned child wrapped by the context-inheritance helper.
+
+An interrupted explicit reader transaction finalizes its cursor and rolls
+back before callback removal and permit release. If rollback or handler
+cleanup cannot prove a clean autocommit connection, that connection is closed
+rather than cached. Consequently an abandoned read cannot keep a WAL tail
+pinned after its interrupt settles; the regression establishes a real table
+snapshot, observes `wal_checkpoint(PASSIVE)` pinned before cancellation, then
+requires `log == checkpointed`, prompt sole-reader recovery, stopped VM
+progress, and no callback bleed on reuse.
+
+"Settles" is a two-stage bound, not a single grace window. `spawn_blocking`
+cannot be force-aborted once started, so the async boundary cannot prove a
+worker's connection and admission were actually released without joining the
+real worker. On grace expiry it does not detach: it escalates to a second,
+longer join bounded by `KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS`. Ordinary
+interrupted work — including a slow UDF or table-valued call that SQLite
+cannot check the interrupt flag inside of — settles within this window, and
+the caller's typed timeout is only returned once the real worker has joined,
+so admission and any WAL snapshot are provably released by the time the
+caller sees the response. Only a worker that ignores the interrupt for the
+entire grace-plus-hard-cap window (a callback/UDF that never returns) is
+detached; that worker's connection and admission are not recovered until it
+eventually exits on its own, and detachment is logged at `error` with the
+operation name so it is distinguishable from ordinary settlement. This is
+strictly narrower than "keeps a WAL tail pinned after its interrupt settles":
+it is "pinned only while genuinely hostile work has not yet settled, bounded
+by grace plus the hard cap." A cancellation arriving while a raw-SQL
+statement is still being prepared and classified — before it is known to be
+a read or a write — takes the same bounded path rather than the
+completion-preserving one: nothing has executed against SQLite yet, so
+abandoning the wait cannot strand a write mid-flight. Only a statement that
+has actually been classified as an admitted write/transaction-control
+statement and started executing is completion-preserving. Write admission and
+final hard-cap detachment arbitrate through one atomic phase: if admission wins,
+the async boundary waits without another cancellation timeout; if detachment
+wins, a later classifier returns the typed timeout before executing SQLite.
+
+Operator controls are `KHIVE_REQUEST_READ_TIMEOUT_SECS` (default 30, valid
+1–3600 seconds, invalid/zero falls back to the nonzero default),
+`KHIVE_SQLITE_INTERRUPT_GRACE_MS` (default 500, valid 10–5000 ms), and
+`KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS` (default 5000, valid 100–60000 ms, the
+second-stage join bound above). These bound read work and interrupt
+settlement only. They do not change write admission, commit, rollback,
+checkpoint, or TRUNCATE policy.

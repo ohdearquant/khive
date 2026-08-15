@@ -27,6 +27,9 @@ function isDataVisualization(relativePath: string, svgTag: string): boolean {
       svgTag.includes(' data-visualization="hotspot"') ||
       svgTag.includes(' data-visualization="cadence"');
   }
+  if (relativePath === "components/ontology-mark.tsx") {
+    return svgTag.includes('className="ontology-derived-glyph-icon"');
+  }
   return false;
 }
 
@@ -52,6 +55,14 @@ describe("shared icon contract", () => {
       isDataVisualization(
         showcase,
         '<svg role="img" data-visualization="cadence">',
+      ),
+    ).toBe(true);
+    const ontology = "components/ontology-mark.tsx";
+    expect(isDataVisualization(ontology, '<svg role="img">')).toBe(false);
+    expect(
+      isDataVisualization(
+        ontology,
+        '<svg aria-hidden="true" className="ontology-derived-glyph-icon" viewBox="0 0 24 24">',
       ),
     ).toBe(true);
   });

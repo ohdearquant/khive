@@ -692,3 +692,103 @@ The reindex stage remains best-effort as D3 already requires. Its failure means 
 index may need repair; it does not mean the source row update failed. Full success, pre-commit
 failure, and rollback envelopes are unchanged. This is a CLI-only additive contract and does not
 change the MCP `request` wire surface.
+
+---
+
+## Amendment 3 (2026-08-12) — endpoint-bounded typed dispatch for non-atomic ops-files
+
+The non-atomic ops-file path accepted endpoint-specific limits that were wider than the raw
+`request.ops` string boundary: 96 MiB per physical JSONL line, 512 MiB per file, 32 MiB per
+dispatch chunk, and 100 operations per chunk. After validating and decoding those JSONL rows, the
+implementation serialized each typed chunk back into a `RequestParams.ops` string and called
+`dispatch_request_local`. That redundant second parse incorrectly applied
+`MAX_OPS_INPUT_LEN` (1 MiB), so one valid large operation or multiple individually valid image
+operations could fail before any handler ran. The documented ops-file limits were therefore not
+an executable contract.
+
+**Decision:** a validated non-atomic ops-file chunk enters the existing MCP server dispatcher as
+an already-decoded typed JSON batch. The ops-file reader remains the only owner of the wider raw,
+line, file, chunk-byte, and operation-count limits. Before dispatch, the typed parser preserves
+the JSON batch's structural validation: non-empty and at most 100 operations, array/object nesting
+depth, no `$prev` anywhere in JSON values, and rejection of request-envelope fields inside verb
+arguments. The resulting `ParsedRequest` joins the same `run_parsed` path as string requests, so
+write-conflict handling, pack dispatch, identity and namespace attribution, gate/audit behavior,
+bounded concurrency, presentation, strict refusal annotation, output rendering, ordered rows,
+and save-file reconciliation do not fork.
+
+The raw serialized-body limit remains endpoint-class-specific. MCP, HTTP, daemon frames, inline
+`kkernel exec` strings, and every other untrusted string request continue to call
+`parse_request`, which rejects more than 1 MiB before expensive parsing. This amendment does not
+raise `MAX_OPS_INPUT_LEN`, add a larger public wire envelope, route bulk payloads through the
+daemon, or make the typed Rust API suitable for an unbounded caller. The additive
+`TypedJsonOp`/`parse_typed_json_batch` and local-exec server methods are narrow host APIs whose
+precondition is an independently byte-bounded trusted transport; they do not promise a stable
+remote protocol.
+
+Mutation-sensitive acceptance tests pin both sides of the boundary:
+
+- a single typed ops-file operation larger than 1 MiB reaches handler-level validation;
+- a multi-operation chunk larger than 1 MiB preserves ordered result rows, save publication, and
+  strict-failure classification;
+- the ordinary raw dispatch surface still rejects an operation string above 1 MiB; and
+- typed parsing preserves count, nesting, `$prev`, and reserved-envelope guards.
+
+Non-atomic output and commit semantics remain unchanged: operations are independent, chunk commits
+are incremental, and the legacy no-save summary plus save-file manifest contracts retain their
+existing shapes. Atomic ops-files continue through the separate ADR-099 prepare/apply runner and
+are unaffected by this amendment.
+
+---
+
+## Amendment 4 (2026-08-12) — opt-in serial scheduling for constrained resources
+
+Real image-ingest smoke testing proved the Amendment 3 typed transport reaches the handler and
+loads one shared model as intended, but also exposed a distinct resource boundary: two independent
+image handlers in the same default parallel batch can concurrently contend for a constrained
+SQLite reader and fail at `sql_bridge.reader_open`. Spawning one process per image would discard
+the warm runtime/model advantage and is not an acceptable bulk-execution contract.
+
+**Decision:** add the explicit operator flag `kkernel exec --ops-file <path> --serial`. The
+ordinary default remains bounded parallel for backward compatibility. Serial mode keeps one
+in-process `KhiveMcpServer` and the same loaded model instances. It parses and submits each full
+logical typed batch through the same Amendment 3 server path while selecting a trusted scheduler
+cap of one, so a handler's complete response settles before the next handler starts. Maximum
+handler concurrency is therefore exactly one; no child process is spawned per operation.
+
+The source is still independent JSON operations, not a DSL chain: `$prev` remains forbidden.
+Before runtime construction or the first mutation, the entire byte-bounded stable snapshot
+receives both its existing JSONL validation and a bounded typed-parser pass, preserving
+operation-count, nesting, `$prev`, and reserved-envelope validation for later rows. Serial
+execution then retains the existing 100-op/32 MiB logical chunk boundaries, input order,
+incremental per-op commits, whole-batch write-key conflict preflight, progress cadence, strict
+refusal classification, save-file row ordering/publication, the single aggregate response budget,
+and success/aborted reconciliation. It changes scheduling only.
+
+The established request-read deadline remains one absolute deadline around the complete logical
+batch; serial mode does not renew or bypass it per operation. Trusted long-running local model
+batches must explicitly select the existing bounded `KHIVE_REQUEST_READ_TIMEOUT_SECS` operator
+configuration (1–3600 seconds) and record that setting in run evidence. Public request policy and
+wire limits remain unchanged.
+
+`--serial` requires `--ops-file` and conflicts with positional inline ops and `--atomic`. Atomic
+mode already defines a different whole-file prepared transaction contract; silently composing
+both flags would make the scheduling flag misleading. Dry-run may use `--serial`, but since
+dry-run stops after whole-file preflight it performs no dispatch.
+
+Mutation-sensitive tests pin the decision:
+
+- Clap and direct-library boundaries reject missing ops-file, inline, and `--atomic --serial`
+  combinations while defaulting the flag off;
+- a concurrency probe observes exactly one in-flight handler in serial mode and the existing
+  eight-handler server bound in the bounded-parallel default;
+- a constrained-reader probe fails overlapping parallel handlers but succeeds for every serial
+  operation on the same server;
+- serial and default scheduling share full-batch write-key conflict detection and canonical
+  aggregate response-budget errors; the budget never resets per operation;
+- ordered result/save rows, middle-operation failure, strict classification, and logical
+  progress/summary semantics survive serial scheduling; and
+- replacing the source after validation cannot change execution, while a later typed-invalid
+  `$prev` row is rejected before an earlier valid write lands.
+
+This operator-only CLI flag does not change the MCP/HTTP/raw DSL wire protocol, its 1 MiB limit,
+or the additive typed Rust host API stability statement in Amendment 3.

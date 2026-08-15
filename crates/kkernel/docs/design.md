@@ -102,6 +102,31 @@
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
   20 kg-substrate bare verbs. These are validated by the contract test.
 
+### Serial non-atomic ops-file dispatch (ADR-099 Amendment 4)
+
+`exec.rs` owns an opt-in `--ops-file --serial` scheduling policy for backends
+whose reader or model resources cannot safely serve multiple handlers at once.
+The complete source is first validated into the same byte-bounded stable
+snapshot, including a whole-snapshot typed-JSON structural preflight, before
+the runtime is built or any operation can write. Execution retains one local
+`KhiveMcpServer` and therefore one loaded model instance. Each existing
+100-op/32 MiB logical chunk is parsed and dispatched as one complete parallel
+batch through the same server path, but that batch's trusted scheduler cap is
+one. The next handler starts only after the current handler completes.
+
+This is scheduling, not chain or transaction semantics: `$prev` remains
+invalid, operations commit independently, and progress/save/strict/
+reconciliation, write-key conflict preflight, and aggregate response budget stay
+on the existing logical chunk boundary. The default path remains bounded
+parallel. `--serial` conflicts with `--atomic`, whose prepared whole-file
+transaction is owned by `atomic_apply.rs` below.
+
+The server's established request-read deadline remains scoped to the full
+logical batch and is not silently renewed per operation. Long-running trusted
+local model work must select the documented bounded
+`KHIVE_REQUEST_READ_TIMEOUT_SECS` override explicitly; serial scheduling itself
+does not weaken cancellation policy.
+
 ### Atomic `exec --ops-file --atomic` execution path (ADR-099 Slice B3)
 
 `atomic_apply.rs` is the CLI-boundary orchestrator for `kkernel exec --ops-file --atomic`.
@@ -251,6 +276,17 @@ constructor the production MCP boot path uses. `cli_db_override` is the raw, pre
 the wrong value would silently ignore an operator's in-memory isolation request. `db_anchor` is
 the canonical anchor captured alongside `cfg`, threaded through so fallback construction never
 re-reads a changed `HOME`.
+
+Non-atomic `--ops-file` chunks cross into that server through
+`dispatch_typed_json_batch_local_for_exec`. The JSONL reader has already enforced
+its 96 MiB line, 512 MiB file, 32 MiB chunk, and 100-op ceilings, so reserializing
+the decoded values and re-running the raw request parser would incorrectly apply
+the unrelated 1 MiB MCP/HTTP/daemon/inline-string cap a second time. The typed seam
+only replaces that redundant serialization/parse step: `parse_typed_json_batch`
+still enforces JSON-form nesting, `$prev`, reserved-envelope, and count rules, and
+the resulting `ParsedRequest` enters the same `run_parsed` identity, gate, audit,
+presentation, strict-refusal, rendering, and response-envelope pipeline. Public
+raw request paths continue to call `parse_request` and retain the 1 MiB limit.
 
 ### `exec` daemon-bypass second-writer contract (#548; ADR-067, ADR-099)
 

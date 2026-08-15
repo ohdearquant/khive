@@ -58,6 +58,7 @@ pub use pack::VerbDef;
 pub use pack::{
     EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, Pack,
     PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};

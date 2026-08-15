@@ -597,14 +597,11 @@ impl KgPack {
             .collect();
 
         let items = to_json(&items)?;
-        if requested <= effective {
-            return Ok(items);
-        }
         Ok(serde_json::json!({
             "items": items,
             "requested_limit": requested,
             "effective_limit": effective,
-            "limit_clamped": true,
+            "limit_clamped": requested > effective,
         }))
     }
 }

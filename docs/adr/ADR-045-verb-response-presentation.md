@@ -346,8 +346,9 @@ it's metadata, not logic.
       },
       {/* ... */}
     ],
-    "total": 2,
-    "page_cursor": null
+    "requested_limit": 2,
+    "effective_limit": 2,
+    "limit_clamped": false
   }
 }
 ```
@@ -375,14 +376,31 @@ it's metadata, not logic.
       },
       {/* ... */}
     ],
-    "total": 2
+    "requested_limit": 2,
+    "effective_limit": 2,
+    "limit_clamped": false
   }
 }
 ```
 
 Note: `completed_at` and `due_at` are preserved as `null` (lifecycle markers —
-§3 Drop semantics). `tags`, `dependencies`, `result`, and `page_cursor` are
-dropped (`[]`, `[]`, `null` non-lifecycle, `null` non-lifecycle respectively).
+§3 Drop semantics). `tags`, `dependencies`, and `result` are dropped (`[]`,
+`[]`, and non-lifecycle `null`, respectively).
+
+#### Amendment 1 (2026-08-08): stable list envelopes are structural
+
+ADR-023's stable pagination envelope is an exception to the generic empty/null
+drop rule. Agent mode MUST retain offset-mode `items` even when it is `[]`, and
+MUST retain `requested_limit`, `effective_limit`, and `limit_clamped`. Entity,
+note, and edge cursor pages similarly retain their substrate-specific
+`entities`/`notes`/`edges` array and retain `next_after` even when it is `null`,
+along with the same three limit fields. Row fields inside those arrays continue
+to receive the ordinary Agent transform.
+
+This exception is envelope-scoped: an unrelated response object containing an
+empty field named `items`, `entities`, `notes`, or `edges` still drops it. The
+three limit-metadata fields identify a list envelope at the presentation
+boundary.
 
 On synthetic 10-item task listings with full timestamps and UUIDs, the Agent
 transform reduced response JSON byte length by ~55–60%. On smaller responses
@@ -588,6 +606,18 @@ so a misspelling such as `presentaton` fails at the call boundary instead of sil
 falling back to the default presentation. This closure applies only to the outer MCP
 tool envelope; verb arguments continue through the separately governed request DSL and
 pack validation seams.
+
+## Amendment 2 (2026-08-14): both envelope-owned names are reserved
+
+The wire-shape section above reserves the argument name `presentation` but is silent on
+`presentation_per_op`, even though both fields are owned by the request envelope. The
+implementation reserves both: the shared list `khive-types::pack::RESERVED_ENVELOPE_ARGS`
+enumerates `presentation` and `presentation_per_op`, the DSL parser rejects either name as
+a verb argument, and the runtime registry refuses at boot any verb or subhandler metadata
+that advertises either name. This amendment aligns the normative text with that contract:
+**both `presentation` and `presentation_per_op` are RESERVED at the request-envelope level
+and CANNOT be used as verb argument names.** The reserved-name list is a closed set owned
+by this ADR; adding a third envelope field reserves its name here first.
 
 ## References
 

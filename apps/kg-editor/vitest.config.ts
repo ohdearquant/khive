@@ -11,6 +11,10 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     css: false,
-    exclude: [...configDefaults.exclude, "e2e/**"],
+    exclude: [
+      ...configDefaults.exclude,
+      "e2e/**",
+      "scripts/design-token-contract.test.mjs",
+    ],
   },
 });

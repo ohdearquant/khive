@@ -183,6 +183,17 @@ async fn registry_exposes_exact_v1_handler_names() {
             .collect::<Vec<_>>(),
         expected
     );
+    let serve = MoodboardPack::HANDLERS
+        .iter()
+        .find(|handler| handler.name == "moodboard.serve")
+        .expect("moodboard.serve handler metadata");
+    let serve_params = serve
+        .params
+        .iter()
+        .map(|parameter| parameter.name)
+        .collect::<Vec<_>>();
+    assert!(serve_params.contains(&"exposure"));
+    assert!(!serve_params.contains(&"presentation"));
     for verb in expected {
         let help = registry
             .dispatch(verb, serde_json::json!({"help": true}))
@@ -286,40 +297,42 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(MoodboardPack::new(runtime.clone()));
     let registry = builder.build().expect("actor registry");
+    let serve_payload = serde_json::json!({
+        "board_entity_id": board.id,
+        "board_id": board_fingerprint,
+        "descriptor": {
+            "model_key": "fixture_visual_model",
+            "descriptor_fingerprint": "b".repeat(64),
+        },
+        "source_report_sha256": "c".repeat(64),
+        "candidates": [
+            {
+                "state": "scored",
+                "asset_id": assets[0].0.id,
+                "content_ref": assets[0].1,
+                "source_rank": 1,
+                "features": [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0],
+            },
+            {
+                "state": "scored",
+                "asset_id": assets[1].0.id,
+                "content_ref": assets[1].1,
+                "source_rank": 2,
+                "features": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+            }
+        ],
+        "selection": {
+            "policy_revision": "uniform-pair-v1",
+            "pair_propensity": 0.5,
+            "candidate_pool_sha256": "d".repeat(64),
+        },
+        "exposure": {
+            "preference_probability_shown": false,
+            "source_rank_shown": true,
+        }
+    });
     let serve = registry
-        .dispatch(
-            "moodboard.serve",
-            serde_json::json!({
-                "board_entity_id": board.id,
-                "board_id": board_fingerprint,
-                "descriptor": {
-                    "model_key": "fixture_visual_model",
-                    "descriptor_fingerprint": "b".repeat(64),
-                },
-                "source_report_sha256": "c".repeat(64),
-                "candidates": [
-                    {
-                        "state": "scored",
-                        "asset_id": assets[0].0.id,
-                        "content_ref": assets[0].1,
-                        "source_rank": 1,
-                        "features": [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0],
-                    },
-                    {
-                        "state": "scored",
-                        "asset_id": assets[1].0.id,
-                        "content_ref": assets[1].1,
-                        "source_rank": 2,
-                        "features": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-                    }
-                ],
-                "selection": {
-                    "policy_revision": "uniform-pair-v1",
-                    "pair_propensity": 0.5,
-                    "candidate_pool_sha256": "d".repeat(64),
-                }
-            }),
-        )
+        .dispatch("moodboard.serve", serve_payload.clone())
         .await
         .expect("serve");
     let serve_id = serve["serve_id"].as_str().expect("serve id");
@@ -342,9 +355,86 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
         Some(0 | 1)
     ));
     assert!(event.payload["randomization"]["swap_applied"].is_boolean());
+    assert_eq!(event.payload["presentation"]["source_rank_shown"], true);
+    assert_eq!(
+        event.payload["presentation"]["preference_probability_shown"],
+        false
+    );
+    assert_eq!(
+        event.payload["presentation"]["served_preference_model_id"],
+        serde_json::Value::Null
+    );
+    assert!(
+        event.payload.get("exposure").is_none(),
+        "durable v1 payload identity must retain its presentation member"
+    );
     assert_ne!(
         serve["left"]["result_occurrence_id"],
         serve["right"]["result_occurrence_id"]
+    );
+
+    let mut missing_model_payload = serve_payload.clone();
+    missing_model_payload["exposure"] = serde_json::json!({
+        "preference_probability_shown": true,
+        "source_rank_shown": true,
+    });
+    let missing_model_error = registry
+        .dispatch("moodboard.serve", missing_model_payload)
+        .await
+        .expect_err("probability exposure requires its governed model identity");
+    assert!(
+        missing_model_error
+            .to_string()
+            .contains("exposure.served_preference_model_id is required"),
+        "unexpected error: {missing_model_error}"
+    );
+
+    let mut unshown_model_payload = serve_payload.clone();
+    unshown_model_payload["exposure"] = serde_json::json!({
+        "preference_probability_shown": false,
+        "source_rank_shown": true,
+        "served_preference_model_id": "00000000-0000-4000-8000-000000000301",
+    });
+    let unshown_model_error = registry
+        .dispatch("moodboard.serve", unshown_model_payload)
+        .await
+        .expect_err("an unshown probability cannot claim a served model");
+    assert!(
+        unshown_model_error
+            .to_string()
+            .contains("exposure.served_preference_model_id is only valid"),
+        "unexpected error: {unshown_model_error}"
+    );
+
+    let mut default_payload = serve_payload;
+    default_payload
+        .as_object_mut()
+        .expect("serve payload object")
+        .remove("exposure");
+    let default_serve = registry
+        .dispatch("moodboard.serve", default_payload)
+        .await
+        .expect("default exposure serve");
+    let default_serve_id = uuid::Uuid::parse_str(
+        default_serve["serve_id"]
+            .as_str()
+            .expect("default serve id"),
+    )
+    .expect("default serve uuid");
+    let default_event = runtime
+        .events(&event_token)
+        .expect("events")
+        .get_event(default_serve_id)
+        .await
+        .expect("default event read")
+        .expect("default serve event");
+    assert_eq!(
+        default_event.payload["presentation"],
+        serde_json::json!({
+            "preference_probability_shown": false,
+            "source_rank_shown": false,
+            "served_preference_model_id": null,
+        })
     );
 
     let judgment_payload = serde_json::json!({
@@ -360,6 +450,32 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
         .await
         .expect("first judgment");
     assert_eq!(first["created"], true);
+    let judgment_uuid = uuid::Uuid::parse_str(first["judgment_id"].as_str().expect("judgment id"))
+        .expect("judgment uuid");
+    let judgment_event = runtime
+        .events(&event_token)
+        .expect("events")
+        .get_event(judgment_uuid)
+        .await
+        .expect("judgment event read")
+        .expect("judgment event");
+    assert_eq!(judgment_event.verb, "moodboard.judgment_record");
+    assert_eq!(
+        judgment_event.payload["presentation"]["source_rank_shown"],
+        true
+    );
+    assert_eq!(
+        judgment_event.payload["presentation"]["preference_probability_shown"],
+        false
+    );
+    assert_eq!(
+        judgment_event.payload["presentation"]["served_preference_model_id"],
+        serde_json::Value::Null
+    );
+    assert!(
+        judgment_event.payload.get("exposure").is_none(),
+        "durable v1 judgment payload identity must retain its presentation member"
+    );
     let retry = registry
         .dispatch("moodboard.judge", judgment_payload)
         .await
@@ -642,7 +758,7 @@ async fn serve_rejects_source_rank_shown_without_candidate_ranks() {
                 "selection": {
                     "policy_revision": "support-fixture-v1",
                 },
-                "presentation": {
+                "exposure": {
                     "source_rank_shown": true,
                 }
             }),
@@ -651,6 +767,25 @@ async fn serve_rejects_source_rank_shown_without_candidate_ranks() {
         .expect_err("source_rank_shown without both ranks must be refused");
     assert!(
         error.to_string().contains("requires source_rank"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn serve_rejects_reserved_presentation_as_a_business_argument() {
+    let error = registry_with_actor(Some("moodboard-tester"))
+        .dispatch(
+            "moodboard.serve",
+            serde_json::json!({
+                "presentation": {
+                    "source_rank_shown": true,
+                }
+            }),
+        )
+        .await
+        .expect_err("the envelope-reserved presentation spelling must not be a serve argument");
+    assert!(
+        error.to_string().contains("unknown field `presentation`"),
         "unexpected error: {error}"
     );
 }

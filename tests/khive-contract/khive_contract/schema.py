@@ -96,7 +96,61 @@ GET_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 LIST_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "array",
+    "type": "object",
+    "required": ["requested_limit", "effective_limit", "limit_clamped"],
+    "properties": {
+        "items": {"type": "array"},
+        "entities": {"type": "array"},
+        "notes": {"type": "array"},
+        "edges": {"type": "array"},
+        "next_after": {"type": ["string", "null"]},
+        "requested_limit": {"type": "integer", "minimum": 0},
+        "effective_limit": {"type": "integer", "minimum": 0},
+        "limit_clamped": {"type": "boolean"},
+    },
+    "oneOf": [
+        {
+            "required": ["items"],
+            "not": {
+                "anyOf": [
+                    {"required": ["entities"]},
+                    {"required": ["notes"]},
+                    {"required": ["edges"]},
+                    {"required": ["next_after"]},
+                ]
+            },
+        },
+        {
+            "required": ["entities", "next_after"],
+            "not": {
+                "anyOf": [
+                    {"required": ["items"]},
+                    {"required": ["notes"]},
+                    {"required": ["edges"]},
+                ]
+            },
+        },
+        {
+            "required": ["notes", "next_after"],
+            "not": {
+                "anyOf": [
+                    {"required": ["items"]},
+                    {"required": ["entities"]},
+                    {"required": ["edges"]},
+                ]
+            },
+        },
+        {
+            "required": ["edges", "next_after"],
+            "not": {
+                "anyOf": [
+                    {"required": ["items"]},
+                    {"required": ["entities"]},
+                    {"required": ["notes"]},
+                ]
+            },
+        },
+    ],
 }
 
 SEARCH_RESPONSE_SCHEMA: dict[str, Any] = {

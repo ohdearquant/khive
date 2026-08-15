@@ -253,7 +253,7 @@ List records with optional filtering.
 | `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `tags`                       | array\<string\>          | no       | Case-insensitive OR-match over entity tags or note `properties.tags`; valid for `kind="entity"` and `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -271,13 +271,13 @@ List records with optional filtering.
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
 
-Requests within the kind's server-side row cap keep the existing array response. If `limit`
-exceeds the cap, the response is `{"items": [...], "requested_limit": N,
-"effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
-the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
-1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
+Offset-mode responses always use `{"items": [...], "requested_limit": N,
+"effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the
+server-side cap binds. Advance `offset` by `items.length`, not by either limit field;
+`effective_limit` discloses the server cap but is not a guaranteed row count. The caps are entity
+500, note 200, edge 1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
 `{"entities": [...], "next_after": ...}`, `{"notes": [...], "next_after": ...}`, or
-`{"edges": [...], "next_after": ...}` and add the same limit metadata when clamped.
+`{"edges": [...], "next_after": ...}` and always include the same limit metadata.
 
 Set `after=""` to begin a stable cursor walk, then pass each non-null `next_after` value into the
 next request with the same filters. The cursor's public value is a UUID; storage resolves it to an
@@ -290,11 +290,16 @@ extend the walk. After a substrate/namespace query returns `next_after: null`, r
 that terminal query require a new walk from `after=""`. Updates and deletes can change whether an
 unvisited row matches the filters. A cursor that was hard-deleted, is outside the caller's visible
 namespaces, or otherwise cannot be resolved returns an error instead of silently restarting. Cursor
-mode and `offset` are mutually exclusive. Filtered message walks may additionally return
-`scan_incomplete: true` with a continuation cursor when their 10,000-row safety ceiling is reached
-before another matching message is proven.
+mode and `offset` are mutually exclusive. Filtered note cursor walks may additionally return
+`scan_incomplete: true` with the last safe continuation cursor when their 10,000-row safety
+ceiling is reached before another matching note is proven.
 
-Row shape (each item in the array or cursor/clamp envelope) depends on `kind`.
+Outcome-filtered event offset pages may also set `scan_incomplete: true` when their bounded
+post-filter scan cannot prove exhaustion. Such a short page is not terminal: advance only by the
+rows actually returned, and treat an incomplete empty page as non-resumable without a narrower
+filter or a larger effective limit.
+
+Row shape (each item in the offset or cursor envelope) depends on `kind`.
 For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
 for that substrate, listed below in its **verbose** form (the shape returned with
 `presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).
@@ -442,11 +447,15 @@ fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
 
-In multi-backend mode a backend failure yields the successful hits from the
-remaining backends and adds `partial: true` plus `missing_backends` to that
-operation's request envelope. These fields sit beside `result` rather than
-inside the search result array, and remain present through presentation and
-response-frame compaction.
+In multi-backend mode a backend failure with surviving hits yields those hits
+with `status: "partial"`, deprecated `partial: true`, `missing_backends`, and a
+`backend_errors` object mapping each retained failed backend to its bounded,
+credential-masked backend id and cause. Masked backend ids use a stable hash
+suffix so distinct failed legs remain distinguishable. These fields sit beside `result` and survive
+presentation and response-frame compaction. If no hit survives filtering, the
+operation is `ok: false` with `error.kind="search_incomplete"`; the structured
+error carries the same diagnostics. `backend_errors_truncated` plus
+`backend_errors_omitted` explicitly report causes omitted by safety bounds.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
@@ -1795,17 +1804,25 @@ request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\
 
 ### `knowledge.import` — Commissive
 
-Ingest atlas markdown file(s) as atoms with parsed sections.
+Validate and ingest atlas markdown file(s) with stable root-relative identity.
 
-| Param            | Type   | Required | Notes                                                                         |
-| ---------------- | ------ | -------- | ----------------------------------------------------------------------------- |
-| `path`           | string | yes      | Filesystem path to a markdown file or directory.                              |
-| `format`         | string | no       | Only `atlas_md` supported (default).                                          |
-| `chunk_strategy` | string | no       | `section` (default, one section per atom) or `atom` (whole file as one atom). |
+| Param            | Type   | Required | Notes                                                                           |
+| ---------------- | ------ | -------- | ------------------------------------------------------------------------------- |
+| `path`           | string | yes      | Filesystem path to a `.md` file or bounded directory tree.                      |
+| `format`         | string | no       | Only `atlas_md` supported (default).                                            |
+| `chunk_strategy` | string | no       | `section` (atom plus section rows) or `atom` (whole markdown, no section rows). |
 
 ```
 request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
 ```
+
+Directory slugs use normalized root-relative components joined by `--`; source paths are
+retained in `properties.source_path`. Traversal and source validation complete before writes,
+normalization collisions fail closed, and symlinks are not followed. Root directory symlinks are
+rejected with or without a trailing separator. Entry, depth, and file-limit errors include the
+exact failing path plus current and configured traversal counts. Successful responses add
+`entries_visited`, `files_discovered`, `files_skipped`, `traversal_errors`, `sections_discovered`,
+and `sections_skipped` to the existing import counters.
 
 ### `knowledge.challenge` — Commissive
 
@@ -1965,8 +1982,10 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ## `git` pack — 4 verbs
 
-Git-history ingester plus a hardened write surface (ADR-088, ADR-088 Amendment 1,
-ADR-108). Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
+Git-history ingester plus a hardened write surface (ADR-088,
+[ADR-088 Amendment 1](../adr/ADR-088-amendment-1-git-digest.md),
+[ADR-088 Amendment 2](../adr/ADR-088-amendment-2-anchor-identity.md), ADR-108).
+Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
 `issue` / `pull_request` note kinds, used by `git.digest` below and by the `kkernel
 git-ingest` CLI (both drive the same underlying ingest core, so ingest enrichment —
 readable `name`s, `Closes #N` reference edges, parent→child commit `precedes` edges —
@@ -1981,12 +2000,12 @@ resolving or auto-creating the repo-anchor
 `project` entity. Bounded and cursor-resumable: call again with the same
 `source`/`project` while the response's `done` field is `false`.
 
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                         |
-| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
-| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                                                                                                            |
-| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                              |
-| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                 |
+| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                 |
+| ----------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected.         |
+| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolution is slug-first through `properties.repo_slug`, then exact and normalized `properties.repo_url` reconciliation; a new anchor is created only when no identity evidence matches. Names are never a match key. See `project_id` and `project_created`. |
+| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                                      |
+| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                         |
 
 ```
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")

@@ -12,6 +12,13 @@
 use crate::edge::EdgeRelation;
 use crate::entity_type::EntityTypeDef;
 
+/// Argument names owned by the outer request envelope rather than verb handlers.
+///
+/// Handler metadata must not advertise these names because every request parser rejects them
+/// before pack dispatch. Keeping this list in the shared type crate lets both request parsing and
+/// registry construction enforce one exact contract.
+pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
+
 /// Visibility tier for a handler.
 ///
 /// `Verb` entries appear on the MCP wire and are invokable by agents.

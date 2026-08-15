@@ -5075,7 +5075,7 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Edge>> {
-        let limit = limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT);
+        let limit = limit.min(Self::EDGE_LIST_MAX_LIMIT);
         let visible = token.visible_namespaces();
 
         // Common case: a single visible namespace — page directly against the

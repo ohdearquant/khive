@@ -17,7 +17,7 @@ pub const MAX_OPS_INPUT_LEN: usize = 1024 * 1024;
 pub const NESTING_DEPTH_LIMIT: usize = 64;
 
 /// Names reserved at the request-envelope level; rejected if they appear inside verb args.
-pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
+pub use khive_types::RESERVED_ENVELOPE_ARGS;
 
 /// Returns whether every array/object in `value` is at most `max_depth` deep.
 ///
@@ -384,6 +384,16 @@ pub struct ParsedOp {
 pub struct ParsedRequest {
     pub ops: Vec<ParsedOp>,
     pub mode: ExecutionMode,
+}
+
+/// One already-decoded JSON operation for a bounded trusted transport.
+///
+/// This type does not imply semantic validity. Pass it through
+/// [`crate::parse_typed_json_batch`] before dispatch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedJsonOp {
+    pub tool: String,
+    pub args: serde_json::Map<String, Value>,
 }
 
 /// Request syntax or preflight error surfaced as MCP `invalid_params`.

@@ -25,6 +25,7 @@ use serde_json::Value;
 pub use khive_types::{
     EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, NoteKindSpec, NoteLifecycleSpec,
     PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -621,6 +622,23 @@ impl VerbRegistryBuilder {
                     first_idx: prev_idx,
                     second_idx: idx,
                 });
+            }
+        }
+
+        // Apply this metadata invariant to every HandlerDef, including Subhandlers. Subhandlers
+        // are not top-level MCP-callable, but their describe/help contract still cannot truthfully
+        // advertise a name rejected by every typed request parser before visibility dispatch.
+        for pack in &packs {
+            for handler in pack.handlers() {
+                for parameter in handler.params {
+                    if RESERVED_ENVELOPE_ARGS.contains(&parameter.name) {
+                        return Err(RuntimeError::ReservedEnvelopeParam {
+                            pack: pack.name().to_string(),
+                            verb: handler.name.to_string(),
+                            param: parameter.name.to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -1654,7 +1672,12 @@ impl VerbRegistry {
                 // dispatch happens to observe the queue non-empty first:
                 // an accepted provenance quirk, preferred over threading an
                 // `EventStore` handle into every synchronous
-                // `OnceLock::get_or_init` call site.
+                // `OnceLock::get_or_init` call site. The verb column is NOT
+                // inherited from that bystander dispatch: a config-lock row
+                // wearing an operation verb pollutes verb-filtered queries
+                // (e.g. per-verb receipt counts), so these rows carry their
+                // own `config.lock` pseudo-verb and remain discoverable by
+                // `EventKind::ConfigLocked`.
                 if let Some(store) = &self.event_store {
                     if crate::config_ledger::PENDING
                         .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -1663,13 +1686,14 @@ impl VerbRegistry {
                             let payload = serde_json::json!({ "key": key, "value": value });
                             let storage_event = Event::new(
                                 gate_req.namespace.as_str(),
-                                verb,
+                                "config.lock",
                                 EventKind::ConfigLocked,
                                 SubstrateKind::Event,
                                 format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                             )
                             .with_payload(payload);
-                            append_audit_event_best_effort(store, storage_event, verb).await;
+                            append_audit_event_best_effort(store, storage_event, "config.lock")
+                                .await;
                         }
                     }
                 }
@@ -3406,6 +3430,51 @@ pub(crate) mod tests {
         }
     }
 
+    struct ReservedEnvelopeParamPack;
+
+    impl Pack for ReservedEnvelopeParamPack {
+        const NAME: &'static str = "reserved-envelope-param";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "broken.serve",
+            description: "declares a transport-owned argument",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[ParamDef {
+                name: "presentation",
+                param_type: "object",
+                required: false,
+                description: "invalid collision with the request envelope",
+            }],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for ReservedEnvelopeParamPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            unreachable!("invalid handler metadata must fail before dispatch")
+        }
+    }
+
     #[async_trait]
     impl PackRuntime for BetaPack {
         fn name(&self) -> &str {
@@ -3469,6 +3538,97 @@ pub(crate) mod tests {
         assert!(
             msg.contains("alpha") || msg.contains("colliding"),
             "error must name one of the conflicting packs: {msg}"
+        );
+    }
+
+    #[test]
+    fn reserved_request_envelope_param_is_boot_time_error() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(ReservedEnvelopeParamPack);
+        let error = builder
+            .build()
+            .err()
+            .expect("transport-owned parameter names must fail registry construction");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::ReservedEnvelopeParam {
+                    ref pack,
+                    ref verb,
+                    ref param,
+                } if pack == "reserved-envelope-param"
+                    && verb == "broken.serve"
+                    && param == "presentation"
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn reserved_request_envelope_param_is_boot_time_error_for_subhandler() {
+        struct ReservedEnvelopeSubhandlerParamPack;
+
+        impl Pack for ReservedEnvelopeSubhandlerParamPack {
+            const NAME: &'static str = "reserved-envelope-subhandler-param";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+                name: "broken.internal",
+                description: "declares a transport-owned argument on an internal handler",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Assertive,
+                params: &[ParamDef {
+                    name: "presentation_per_op",
+                    param_type: "string",
+                    required: false,
+                    description: "invalid collision with the request envelope",
+                }],
+            }];
+        }
+
+        #[async_trait]
+        impl PackRuntime for ReservedEnvelopeSubhandlerParamPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                unreachable!("invalid handler metadata must fail before dispatch")
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(ReservedEnvelopeSubhandlerParamPack);
+        let error = builder
+            .build()
+            .err()
+            .expect("transport-owned parameter names must fail registry construction");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::ReservedEnvelopeParam {
+                    ref pack,
+                    ref verb,
+                    ref param,
+                } if pack == "reserved-envelope-subhandler-param"
+                    && verb == "broken.internal"
+                    && param == "presentation_per_op"
+            ),
+            "unexpected error: {error:?}"
         );
     }
 

@@ -251,7 +251,7 @@ Both must be full UUIDs. Source must be a document, person, or org entity.
 ### Import markdown as atoms
 
 ```
-request(ops="knowledge.import(path=\"/path/to/notes.md\", chunk_strategy=\"heading\")")
+request(ops="knowledge.import(path=\"/path/to/notes.md\", chunk_strategy=\"section\")")
 ```
 
 ### Search the corpus

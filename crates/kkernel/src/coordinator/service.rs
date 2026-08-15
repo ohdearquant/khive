@@ -114,6 +114,9 @@ impl CoordinatorService for SubstrateCoordinatorService {
         let mut entity_kinds: HashMap<Uuid, String> = HashMap::new();
         let mut entity_created_at: HashMap<Uuid, i64> = HashMap::new();
         for hit in &entity_hits {
+            if khive_storage::request_read_is_cancelled() {
+                break;
+            }
             let backend_id = self.inner.locate(hit.entity_id, namespace).await;
             if let Some(bid) = backend_id {
                 if let Some(entry) = self.inner.registry().get(&bid) {
@@ -133,6 +136,9 @@ impl CoordinatorService for SubstrateCoordinatorService {
         let mut note_created_at: HashMap<Uuid, i64> = HashMap::new();
         let mut note_names: HashMap<Uuid, Option<String>> = HashMap::new();
         for hit in &note_hits {
+            if khive_storage::request_read_is_cancelled() {
+                break;
+            }
             let backend_id = self.inner.locate(hit.note_id, namespace).await;
             if let Some(bid) = backend_id {
                 if let Some(entry) = self.inner.registry().get(&bid) {

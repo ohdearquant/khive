@@ -150,13 +150,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List records with optional filtering. Requests within the kind's row cap \
-                      keep the existing array response. If limit exceeds the cap, the result is \
-                      {\"items\": [...], \"requested_limit\": N, \"effective_limit\": CAP, \
-                      \"limit_clamped\": true}. Entity, note, and edge cursor modes return \
-                      {\"entities|notes|edges\": [...], \"next_after\": ...} and add the same \
-                      limit metadata when clamped. Caps are entity 500, note 200, edge 1000, \
-                      event 1000, and proposal 500.",
+        description: "List records with optional filtering. Offset-mode results always use \
+                      {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
+                      \"limit_clamped\": bool}; clients advance offset by items.length, while M \
+                      discloses the server cap and is not a guaranteed row count. \
+                      Entity, note, and edge cursor modes return \
+                      {\"entities|notes|edges\": [...], \"next_after\": ...} with the same \
+                      limit metadata. Caps are entity 500, note 200, edge 1000, event 1000, \
+                      and proposal 500.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -221,7 +222,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "tags",
                 param_type: "array of string",
                 required: false,
-                description: "Filter entities by any of these tags (kind=\"entity\" only).",
+                description: "Case-insensitive OR-filter over entity tags or note \
+                              properties.tags (kind=\"entity\" or kind=\"note\").",
             },
             ParamDef {
                 name: "source_id",

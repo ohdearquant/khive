@@ -296,3 +296,35 @@ regardless of `KHIVE_DAEMON_STRICT`.
 
 `KHIVE_NO_DAEMON=1` remains the explicit operator opt-out for intentionally daemonless execution.
 This amendment changes neither that opt-out nor the exactly-once boundary after a frame write.
+
+## Amendment 5 (2026-08-11): disconnect propagation and bounded request drain
+
+Each accepted connection now owns a retained handler `JoinHandle` and a
+per-daemon-run read-cancellation receiver. After its single request frame is
+read, the daemon monitors the peer read half concurrently with dispatch. EOF,
+reset, or unexpected additional bytes signals the request's read scopes; an
+already-admitted write is still awaited to its normal commit/rollback boundary.
+The client-side MCP forwarding path likewise closes the stream when its rmcp
+cancellation token or original absolute deadline fires, so the daemon never
+renews a disconnected client's budget.
+
+The stdio transport itself shares one root cancellation token with rmcp. Its
+EOF adapter cancels that token before returning EOF to rmcp, which cancels
+every admitted per-request child before rmcp begins its graceful response
+drain. On Unix this adapter wraps the existing post-flush self-heal transport:
+successful response flushes still fire the armed action at the same
+happens-after edge, and resumed generations still use the handshake-free
+`serve_directly` path. The non-Unix handshake path uses the same EOF adapter.
+EOF only abandons request-owned reads; admitted writes keep their existing
+commit/rollback boundary.
+
+Shutdown stops acceptance, signals every run-local read scope, and permits
+admitted handlers to finish inside `KHIVE_DRAIN_TIMEOUT_SECS`. Connection
+handles are retained rather than detached. At the bound, remaining async
+handlers are aborted and every join is drained before rendezvous cleanup; a
+dropped read future fires its exact SQLite interrupt guard. The historical
+process-global one-shot shutdown token remains component coordination only and
+is not consulted as request cancellation state, preserving repeated daemon-run
+tests. A blocking write that ignores async abort continues to own its SQLite
+connection until its blocking closure exits; the daemon never interrupts that
+write or reports a retryable read timeout for it.
