@@ -4,8 +4,10 @@ import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
+import { normalizeRepositoryUrl } from "@/lib/showcase-registry";
 
 export const SHOWCASE_ANALYSIS_MAX_BYTES = 8 * 1024 * 1024;
+export const SHOWCASE_ANALYSIS_MAX_ENTRIES = 64;
 const ANALYSIS_REPORT_NAME = "khive.repo.v1.json";
 const analysisIdPattern = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 
@@ -45,9 +47,14 @@ export class ShowcaseAnalysisError extends Error {
   }
 }
 
+export type ShowcaseAnalysisCatalogEntry = Readonly<{
+  analysis_id: string;
+  canonical_url: string;
+}>;
+
 export type ShowcaseAnalysisRegistry = Readonly<{
   root: string;
-  ids: ReadonlySet<string>;
+  entries: readonly ShowcaseAnalysisCatalogEntry[];
 }>;
 
 export type MaterializedShowcaseAnalysis = Readonly<{
@@ -58,17 +65,63 @@ export type MaterializedShowcaseAnalysis = Readonly<{
 
 type Environment = Readonly<Record<string, string | undefined>>;
 
-function configuredAnalysisIds(value: string | undefined): ReadonlySet<string> {
-  const ids = new Set(
-    (value ?? "")
-      .split(",")
-      .map((id) => id.trim())
-      .filter(Boolean),
-  );
-  if (ids.size === 0 || [...ids].some((id) => !analysisIdPattern.test(id))) {
+function configuredAnalyses(
+  value: string | undefined,
+): readonly ShowcaseAnalysisCatalogEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value ?? "");
+  } catch {
     throw new ShowcaseAnalysisError("NOT_CONFIGURED");
   }
-  return ids;
+  if (
+    !Array.isArray(parsed) || parsed.length === 0 ||
+    parsed.length > SHOWCASE_ANALYSIS_MAX_ENTRIES
+  ) {
+    throw new ShowcaseAnalysisError("NOT_CONFIGURED");
+  }
+
+  const entries: ShowcaseAnalysisCatalogEntry[] = [];
+  const ids = new Set<string>();
+  const urls = new Set<string>();
+  for (const candidate of parsed) {
+    if (
+      !candidate || typeof candidate !== "object" ||
+      Array.isArray(candidate) ||
+      Object.keys(candidate).sort().join(",") !==
+        "analysis_id,canonical_url"
+    ) {
+      throw new ShowcaseAnalysisError("NOT_CONFIGURED");
+    }
+    const analysisId = Reflect.get(candidate, "analysis_id");
+    const canonicalUrl = Reflect.get(candidate, "canonical_url");
+    if (
+      typeof analysisId !== "string" ||
+      !analysisIdPattern.test(analysisId) ||
+      typeof canonicalUrl !== "string"
+    ) {
+      throw new ShowcaseAnalysisError("NOT_CONFIGURED");
+    }
+    const normalizedUrl = normalizeRepositoryUrl(canonicalUrl);
+    if (
+      !normalizedUrl.ok || ids.has(analysisId) || urls.has(normalizedUrl.value)
+    ) {
+      throw new ShowcaseAnalysisError("NOT_CONFIGURED");
+    }
+    ids.add(analysisId);
+    urls.add(normalizedUrl.value);
+    entries.push({
+      analysis_id: analysisId,
+      canonical_url: normalizedUrl.value,
+    });
+  }
+  return entries.sort((left, right) =>
+    left.analysis_id < right.analysis_id
+      ? -1
+      : left.analysis_id > right.analysis_id
+      ? 1
+      : 0
+  );
 }
 
 export function resolveShowcaseAnalysisRegistry(
@@ -80,8 +133,16 @@ export function resolveShowcaseAnalysisRegistry(
   }
   return {
     root,
-    ids: configuredAnalysisIds(environment.KHIVE_SHOWCASE_ANALYSIS_IDS),
+    entries: configuredAnalyses(environment.KHIVE_SHOWCASE_ANALYSES),
   };
+}
+
+export function configuredShowcaseAnalysis(
+  id: string,
+  registry: ShowcaseAnalysisRegistry,
+): ShowcaseAnalysisCatalogEntry | undefined {
+  if (!analysisIdPattern.test(id)) return undefined;
+  return registry.entries.find((entry) => entry.analysis_id === id);
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -156,7 +217,8 @@ export async function loadMaterializedShowcaseAnalysis(
   id: string,
   registry: ShowcaseAnalysisRegistry = resolveShowcaseAnalysisRegistry(),
 ): Promise<MaterializedShowcaseAnalysis> {
-  if (!analysisIdPattern.test(id) || !registry.ids.has(id)) {
+  const configured = configuredShowcaseAnalysis(id, registry);
+  if (!configured) {
     throw new ShowcaseAnalysisError("NOT_CONFIGURED");
   }
 
@@ -212,6 +274,16 @@ export async function loadMaterializedShowcaseAnalysis(
     const json = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     bundle = parseRepoBundle(JSON.parse(json));
   } catch {
+    throw new ShowcaseAnalysisError("ANALYSIS_INVALID");
+  }
+  const bundleUrl = normalizeRepositoryUrl(
+    bundle.meta.repository.canonical_url,
+  );
+  const configuredUrl = normalizeRepositoryUrl(configured.canonical_url);
+  if (
+    !bundleUrl.ok || !configuredUrl.ok ||
+    bundleUrl.value !== configuredUrl.value
+  ) {
     throw new ShowcaseAnalysisError("ANALYSIS_INVALID");
   }
 

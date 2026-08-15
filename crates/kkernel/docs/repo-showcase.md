@@ -136,3 +136,24 @@ kkernel repo build \
 
 KG Studio receives only the opaque `khive` ID. It never receives the paths above and
 does not run this command in response to a browser request.
+
+Configure the server with an explicit ID-to-repository binding:
+
+```bash
+KHIVE_SHOWCASE_ANALYSIS_ROOT=<analysis-root> \
+KHIVE_SHOWCASE_ANALYSES='[{"analysis_id":"khive","canonical_url":"https://github.com/ohdearquant/khive"}]' \
+npm run dev
+```
+
+`KHIVE_SHOWCASE_ANALYSES` accepts one to 64 strict objects. Both the ID and normalized
+repository URL must be unique across the array; malformed JSON, unknown fields, invalid
+IDs or URLs, and duplicate bindings make the complete catalog unavailable. The legacy
+ID-only allowlist is not accepted because an ID without a repository identity cannot
+bind the materialized report to operator intent.
+
+`GET /api/showcase/analyses` returns the sorted
+`khive.showcase.catalog.v1` catalog. It exposes only `analysis_id` and `canonical_url`,
+does not enumerate the analysis root, and does not read reports, databases, or process
+state. `GET /api/showcase/analyses/khive` reads the explicit bounded report and rejects
+it when the bundle's normalized repository URL differs from the configured URL. Both
+routes return sanitized, private, non-cacheable responses.

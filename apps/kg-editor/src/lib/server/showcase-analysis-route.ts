@@ -1,4 +1,5 @@
 import {
+  configuredShowcaseAnalysis,
   loadMaterializedShowcaseAnalysis,
   type MaterializedShowcaseAnalysis,
   resolveShowcaseAnalysisRegistry,
@@ -35,7 +36,7 @@ export function createShowcaseAnalysisGet(
     const { id } = await context.params;
     try {
       const registry = await loadRegistry();
-      if (!registry.ids.has(id)) {
+      if (!configuredShowcaseAnalysis(id, registry)) {
         throw new ShowcaseAnalysisError("NOT_CONFIGURED");
       }
       const analysis = await loadAnalysis(id, registry);
@@ -49,6 +50,49 @@ export function createShowcaseAnalysisGet(
           "x-khive-analysis-source": "khive-db-snapshot",
         },
       });
+    } catch (error) {
+      const safeError = error instanceof ShowcaseAnalysisError
+        ? error
+        : new ShowcaseAnalysisError("ANALYSIS_UNAVAILABLE");
+      return Response.json(showcaseAnalysisErrorBody(safeError), {
+        status: safeError.status,
+        headers: responseHeaders,
+      });
+    }
+  };
+}
+
+export function createShowcaseAnalysisCatalogGet(
+  loadRegistry: RegistryLoader = resolveShowcaseAnalysisRegistry,
+) {
+  return async function get(): Promise<Response> {
+    try {
+      const registry = await loadRegistry();
+      const entries = registry.entries
+        .map(({ analysis_id, canonical_url }) => ({
+          analysis_id,
+          canonical_url,
+        }))
+        .sort((left, right) =>
+          left.analysis_id < right.analysis_id
+            ? -1
+            : left.analysis_id > right.analysis_id
+            ? 1
+            : 0
+        );
+      return new Response(
+        JSON.stringify({
+          schema_version: "khive.showcase.catalog.v1",
+          entries,
+        }),
+        {
+          status: 200,
+          headers: {
+            ...responseHeaders,
+            "content-type": "application/json; charset=utf-8",
+          },
+        },
+      );
     } catch (error) {
       const safeError = error instanceof ShowcaseAnalysisError
         ? error
