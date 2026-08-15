@@ -34,19 +34,52 @@ baseline.
   temp directory. The default `--scratch-dir` is always a freshly created
   private directory (`tempfile.mkdtemp`); a caller-supplied `--scratch-dir`
   is rejected if any existing component of its path is a symlink (the root
-  itself, its parent, or any ancestor hop — macOS's OS-owned `/tmp` ->
-  `/private/tmp` mapping excepted), or if it already exists and is
+  itself, its parent, or any ancestor hop — macOS's OS-owned `/tmp`, `/var`,
+  `/etc` -> `/private/...` firmlink mappings excepted, and only those exact
+  three prefixes), or if it already exists and is
   non-empty — the harness only ever writes into a scratch root it created
   itself. The child process gets a minimal
-  allowlisted environment (`PATH`, `HOME`/`TMPDIR` redirected into the
-  scratch root, `KHIVE_DB`, and a pinned `KHIVE_EMBEDDING_MODEL`) instead of
+  allowlisted environment (`PATH`, `HOME`/`TMPDIR` redirected into `home`/
+  `tmp` subdirectories created through the pinned scratch-root fd, `KHIVE_DB`,
+  and a pinned `KHIVE_EMBEDDING_MODEL`) instead of
   the caller's full environment, so no inherited `KHIVE_*` variable can
   change what gets scored. The runner refuses to start if an inherited
   `KHIVE_DB` already points at an existing file outside its own scratch
   directory — it never reads or writes a production database.
   `evaluate.py --self-test` exercises these refusals directly (symlinked
-  root, pre-existing/non-empty root, symlinked `eval.db`) without needing a
-  `kkernel` binary.
+  root, pre-existing/non-empty root, symlinked `eval.db`, directory
+  substitution at cleanup, degraded/budget-capped recall envelopes) without
+  needing a `kkernel` binary.
+
+  **Residual TOCTOU window (by design, not closed):** every scratch path
+  handed to `sqlite3`/the `kkernel` subprocess is verified (device + inode,
+  through a TOCTOU-guarded root fd) immediately before that call —
+  `verified_scratch_path`/`VerifiedScratchPath` in `evaluate.py`. Neither
+  API accepts an already-open descriptor (and macOS has no `/proc/self/fd`
+  to convert one), so a swap landing between that verification and the
+  instant the consumer itself opens the path cannot be prevented from this
+  side; `VerifiedScratchPath.recheck()`, called after the consumer returns,
+  detects — but does not prevent — that residual race for paths the
+  consumer only reads. Do not read this harness's path verification as
+  full race-resistance for the lifetime of a returned path.
+
+  **Residual TOCTOU window in cleanup (by design, not closed):**
+  `cleanup_scratch` walks the scratch tree through a TOCTOU-guarded fd and,
+  at every recursion depth, checks each directory's identity two ways: its
+  `fstat`ed (device, inode) must match the inode `os.scandir()` observed
+  for that name moments earlier (catching a directory swapped in *after*
+  this run started walking the tree — same mechanism regardless of nesting
+  depth, not just at the top level), and, for `home`/`tmp`, against the
+  identity recorded when this run created them. Neither check can see a
+  substitution that already happened *before* this run's own listing of a
+  given directory — e.g. a directory the `kkernel` subprocess itself
+  creates during the run (`blobs`, `eval.db.ann`, `.khive`, `.lattice/...`)
+  has no creation-time identity recorded for it — only the listing-time
+  check made when this run's own walk reaches it. A directory already
+  replaced by the time that walk arrives is indistinguishable from one the
+  subprocess legitimately created. This is the same category of residual
+  as the path-API race above: detectable-forward-from-a-known-point, not
+  closed for all time.
 - **Binary identity**: every run records `kkernel --version` and prints it;
   `gold/A_fused_direct.json` embeds the `kkernel_version` it was derived
   with. A revision differing from gold's recorded one is reported as
