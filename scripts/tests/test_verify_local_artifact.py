@@ -1168,13 +1168,15 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertNotIn("SIGNED_PROBE_RECORD", recipe)
 
     def test_local_dependency_chain_is_build_then_verify_then_install(self) -> None:
-        self.assertIn("verify-local-artifact: build-local\n", self.makefile)
+        self.assertIn(
+            "verify-local-artifact: validate-make-inputs build-local\n", self.makefile
+        )
         self.assertIn("local: verify-local-artifact\n", self.makefile)
         self.assertIn("LOCAL_VERB_FLOOR := 90", self.makefile)
 
         local_recipe = self.makefile[self.makefile.index("local: verify-local-artifact") :]
         self.assertNotIn("cargo build", local_recipe)
-        stamp_check = local_recipe.index('--inspect-stamp "$(LOCAL_VERIFY_STAMP)"')
+        stamp_check = local_recipe.index('--inspect-stamp "$$LOCAL_VERIFY_STAMP_VALUE"')
         assignments = local_recipe.index('eval "$$VERIFIED_ASSIGNMENTS"')
         hash_check = local_recipe.index(
             'if [ "$$VERIFIED_SHA256" != "$$SRC_SHA256" ]'
@@ -1195,18 +1197,48 @@ class MakefileGateContractTests(unittest.TestCase):
 
     def test_fleet_targets_split_build_verification_from_verification_only(self) -> None:
         self.assertIn("fleet-build: verify-local-artifact\n", self.makefile)
-        self.assertIn("fleet-check:\n", self.makefile)
+        self.assertIn("fleet-check: validate-make-inputs\n", self.makefile)
         self.assertIn('if [ -n "$$FLEET_ARTIFACT_VALUE" ]; then', self.makefile)
         self.assertIn('--artifact "$$FLEET_ARTIFACT_VALUE"', self.makefile)
-        self.assertIn('--build-receipt "$(LOCAL_BUILD_RECEIPT)"', self.makefile)
+        self.assertIn('--build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE"', self.makefile)
 
         fleet_check = self.makefile[
-            self.makefile.index("fleet-check:\n") : self.makefile.index("clean:\n")
+            self.makefile.index("fleet-check: validate-make-inputs\n") : self.makefile.index(
+                "clean:\n"
+            )
         ]
         self.assertNotIn("$(FLEET_ARTIFACT)", fleet_check)
+        self.assertNotIn("$(LOCAL_VERB_FLOOR)", fleet_check)
+        self.assertNotIn("$(LOCAL_BUILD_RECEIPT)", fleet_check)
         self.assertNotIn("build_local_artifact.py", fleet_check)
         self.assertNotIn("~/.cargo/bin", fleet_check)
         self.assertNotIn("pkill", fleet_check)
+
+    def test_recipes_never_splice_caller_controlled_vars_as_make_refs(self) -> None:
+        """FULL_PACKS, LOCAL_VERB_FLOOR, LOCAL_BUILD_RECEIPT, LOCAL_VERIFY_STAMP,
+        and CARGO must reach recipe shell text only via the `$$<VAR>_VALUE`
+        environment path, never as a raw `$(VAR)` splice — that splice is the
+        shell-injection surface this contract guards against regressing."""
+        forbidden = (
+            "$(FULL_PACKS)",
+            "$(LOCAL_VERB_FLOOR)",
+            "$(LOCAL_BUILD_RECEIPT)",
+            "$(LOCAL_VERIFY_STAMP)",
+            "$(CARGO)",
+        )
+        recipe_lines = [
+            line
+            for line in self.makefile.splitlines()
+            if line.startswith("\t") or line.startswith("    ")
+        ]
+        recipe_text = "\n".join(recipe_lines)
+        for token in forbidden:
+            self.assertNotIn(
+                token,
+                recipe_text,
+                f"{token} was spliced directly into recipe shell text; it must "
+                "be passed through the environment as $$<VAR>_VALUE instead",
+            )
 
         fleet_build = subprocess.run(
             ["make", "--no-print-directory", "-n", "fleet-build"],
@@ -1519,9 +1551,9 @@ class MakefileGateContractTests(unittest.TestCase):
     def test_cargo_receipt_drives_verifier_and_ci_runs_regression_suite(self) -> None:
         self.assertIn("scripts/build_local_artifact.py", self.makefile)
         self.assertIn("scripts/verify_local_artifact.py", self.makefile)
-        self.assertIn('--build-receipt "$(LOCAL_BUILD_RECEIPT)"', self.makefile)
-        self.assertIn('--min-verbs "$(LOCAL_VERB_FLOOR)"', self.makefile)
-        self.assertIn('--stamp "$(LOCAL_VERIFY_STAMP)"', self.makefile)
+        self.assertIn('--build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE"', self.makefile)
+        self.assertIn('--min-verbs "$$LOCAL_VERB_FLOOR_VALUE"', self.makefile)
+        self.assertIn('--stamp "$$LOCAL_VERIFY_STAMP_VALUE"', self.makefile)
         self.assertNotIn("LOCAL_ARTIFACT", self.makefile)
         self.assertNotIn("/release/kkernel", self.makefile)
         self.assertIn(
