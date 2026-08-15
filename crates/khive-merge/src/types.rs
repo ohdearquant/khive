@@ -80,8 +80,12 @@ pub enum MergeConflict {
         theirs: Uuid,
     },
     /// An edge's identity change collided with another edge's durable UUID
-    /// already claimed in the merged set; the edge keeps its unmodified base
-    /// identity instead of duplicating the other edge's UUID.
+    /// already claimed in the merged set. If the key's own unmodified base
+    /// UUID is still unclaimed, the edge falls back to it and
+    /// `retained_edge_id` differs from `attempted_edge_id`. Otherwise there
+    /// is no identity left to restore without creating a second duplicate,
+    /// so the edge is dropped from the merged set and `retained_edge_id`
+    /// equals `attempted_edge_id`.
     EdgeIdentityCollision {
         source_id: Uuid,
         target_id: Uuid,

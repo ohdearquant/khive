@@ -197,18 +197,31 @@ pub fn merge_edges(
 
         if !identity_is_base && !used_edge_ids.insert(edge.edge_id) {
             let attempted_edge_id = edge.edge_id;
-            if let Some(&base_edge) = base_edge_map.get(&key) {
-                edge.edge_id = base_edge.edge_id;
-                used_edge_ids.insert(edge.edge_id);
-            }
+            // The key's own base id is only a safe fallback if nothing else
+            // has claimed it yet -- e.g. an earlier-sorted edge that
+            // branch-chose this exact id. `insert`'s return value must be
+            // checked, or a chained collision silently duplicates that
+            // earlier edge's id instead of being caught here.
+            let resolved_edge_id = base_edge_map
+                .get(&key)
+                .map(|&base_edge| base_edge.edge_id)
+                .filter(|&id| used_edge_ids.insert(id));
 
             conflicts.push(MergeConflict::EdgeIdentityCollision {
                 source_id: key.source,
                 target_id: key.target,
                 relation: key.relation.clone(),
                 attempted_edge_id,
-                retained_edge_id: edge.edge_id,
+                retained_edge_id: resolved_edge_id.unwrap_or(attempted_edge_id),
             });
+
+            match resolved_edge_id {
+                Some(id) => edge.edge_id = id,
+                // No unclaimed identity to restore -- dropping the edge is
+                // the only way to keep the merged set duplicate-free; the
+                // conflict entry above is the record of what was dropped.
+                None => continue,
+            }
         }
 
         merged.push(edge);
@@ -742,6 +755,76 @@ mod tests {
         let base = archive(vec![edge1_base.clone(), edge2.clone()]);
         let ours = archive(vec![edge1_ours, edge2.clone()]);
         let theirs = archive(vec![edge1_base, edge2.clone()]);
+
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+
+        let mut seen_ids = HashSet::new();
+        for merged_edge in &merged {
+            assert!(
+                seen_ids.insert(merged_edge.edge_id),
+                "merge output must not contain duplicate durable edge_id {:?}: {merged:?}",
+                merged_edge.edge_id
+            );
+        }
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| matches!(c, MergeConflict::EdgeIdentityCollision { .. })),
+            "expected an EdgeIdentityCollision conflict, got: {conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn chained_identity_collision_through_base_fallback_is_rejected() {
+        // Three semantic edges, sorted by (source, target, relation) as
+        // key1 < key_early < key_chained:
+        //
+        //   key1:        base-identity edge, reserves ID_B in the second pass.
+        //   key_early:   a freshly added edge that branch-chooses ID_X, which
+        //                happens to equal key_chained's *own* base edge_id.
+        //                It claims ID_X first because it sorts before
+        //                key_chained.
+        //   key_chained: a modified edge whose branch-chosen id collides with
+        //                ID_B (already reserved), so it falls back to its own
+        //                base id -- ID_X -- but ID_X was just claimed by
+        //                key_early. The fallback insert must be checked, or
+        //                key_chained silently duplicates key_early's ID_X.
+        let s1 = Uuid::from_u128(1);
+        let t1 = Uuid::from_u128(2);
+        let s2 = Uuid::from_u128(3);
+        let t2 = Uuid::from_u128(4);
+        let s3 = Uuid::from_u128(5);
+        let t3 = Uuid::from_u128(6);
+
+        let id_b = Uuid::from_u128(100);
+        let id_x = Uuid::from_u128(200);
+
+        let key1_base = edge(s1, t1, 1.0);
+        let mut key1_ours = key1_base.clone();
+        key1_ours.edge_id = id_b;
+        let mut key1_base_fixed = key1_base.clone();
+        key1_base_fixed.edge_id = id_b;
+        let key1_base = key1_base_fixed;
+        key1_ours.weight = 2.0;
+
+        let key_chained_base = {
+            let mut e = edge(s3, t3, 1.0);
+            e.edge_id = id_x;
+            e
+        };
+        let mut key_chained_ours = key_chained_base.clone();
+        key_chained_ours.edge_id = id_b; // collides with key1's reserved id_b
+        key_chained_ours.weight = 2.0;
+
+        let key_early_ours = {
+            let mut e = edge(s2, t2, 1.0);
+            e.edge_id = id_x; // collides with key_chained's fallback target
+            e
+        };
+
+        let base = archive(vec![key1_base.clone(), key_chained_base.clone()]);
+        let ours = archive(vec![key1_ours, key_early_ours, key_chained_ours]);
+        let theirs = archive(vec![key1_base, key_chained_base]);
 
         let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
 

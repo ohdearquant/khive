@@ -21,7 +21,7 @@ The merge API separates valid semantic conflicts from invalid inputs and interna
 | `DuplicateAddition`     | both branches add the same UUID with different content                         |
 | `EdgeModifyDelete`      | one branch changes edge identity, weight, or properties while the other deletes it |
 | `EdgeIdentityMismatch`  | both branches replace one semantic edge's durable UUID differently             |
-| `EdgeIdentityCollision` | a branch-chosen edge UUID already belongs to a different semantic edge in the merged set; the edge keeps its base UUID instead |
+| `EdgeIdentityCollision` | a branch-chosen edge UUID already belongs to a different semantic edge in the merged set; the edge falls back to its own unclaimed base UUID, or is dropped from the merged set if none is available |
 | `EdgePropertyMismatch`  | both branches change the same property key on one semantic edge differently    |
 | `DanglingEdge`          | a selected edge references an entity absent from the merged entity set         |
 
