@@ -62,6 +62,24 @@ baseline.
   detects — but does not prevent — that residual race for paths the
   consumer only reads. Do not read this harness's path verification as
   full race-resistance for the lifetime of a returned path.
+
+  **Residual TOCTOU window in cleanup (by design, not closed):**
+  `cleanup_scratch` walks the scratch tree through a TOCTOU-guarded fd and,
+  at every recursion depth, checks each directory's identity two ways: its
+  `fstat`ed (device, inode) must match the inode `os.scandir()` observed
+  for that name moments earlier (catching a directory swapped in *after*
+  this run started walking the tree — same mechanism regardless of nesting
+  depth, not just at the top level), and, for `home`/`tmp`, against the
+  identity recorded when this run created them. Neither check can see a
+  substitution that already happened *before* this run's own listing of a
+  given directory — e.g. a directory the `kkernel` subprocess itself
+  creates during the run (`blobs`, `eval.db.ann`, `.khive`, `.lattice/...`)
+  has no creation-time identity recorded for it — only the listing-time
+  check made when this run's own walk reaches it. A directory already
+  replaced by the time that walk arrives is indistinguishable from one the
+  subprocess legitimately created. This is the same category of residual
+  as the path-API race above: detectable-forward-from-a-known-point, not
+  closed for all time.
 - **Binary identity**: every run records `kkernel --version` and prints it;
   `gold/A_fused_direct.json` embeds the `kkernel_version` it was derived
   with. A revision differing from gold's recorded one is reported as

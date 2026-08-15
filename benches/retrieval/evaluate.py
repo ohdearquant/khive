@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -291,6 +292,14 @@ class VerifiedScratchPath:
     landing between this verification and the moment the consumer itself
     opens the path cannot be prevented from here. See
     `verified_scratch_path`'s docstring for the accepted residual window.
+
+    Also a context manager: entering returns self, and exiting always calls
+    `close()`, so a caller that wraps a consumer call in `with
+    verified_scratch_path(...) as vp:` cannot leak `_leaf_fd` if that
+    consumer raises before `.recheck()`/`.discard()` runs. `close()` is
+    idempotent — calling it after `.recheck()`/`.discard()` already closed
+    the fd is a no-op, so the normal-path call and the exit-time safety net
+    never double-close.
     """
 
     __slots__ = ("path", "_leaf_fd")
@@ -298,6 +307,21 @@ class VerifiedScratchPath:
     def __init__(self, path: str, leaf_fd: int) -> None:
         self.path = path
         self._leaf_fd = leaf_fd
+
+    def __enter__(self) -> "VerifiedScratchPath":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Idempotently close the held leaf fd without any identity check.
+        The unconditional safety net: call directly, or rely on `__exit__`,
+        so a consumer that raises before `.recheck()`/`.discard()` runs
+        still cannot leak the descriptor."""
+        if self._leaf_fd is not None:
+            os.close(self._leaf_fd)
+            self._leaf_fd = None
 
     def recheck(self) -> None:
         """Call after the consumer (sqlite3/subprocess) that was handed
@@ -316,9 +340,15 @@ class VerifiedScratchPath:
         try:
             fd_stat = os.fstat(self._leaf_fd)
             path_stat = os.stat(self.path, follow_symlinks=False)
-        finally:
-            os.close(self._leaf_fd)
-        if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+        except BaseException:
+            self.close()
+            raise
+        mismatched = (path_stat.st_dev, path_stat.st_ino) != (
+            fd_stat.st_dev,
+            fd_stat.st_ino,
+        )
+        self.close()
+        if mismatched:
             raise SystemExit(
                 f"refusing to trust output produced through {self.path}: it no "
                 "longer matches the file this run verified before handing the "
@@ -332,7 +362,7 @@ class VerifiedScratchPath:
         (e.g. a write-then-rename output file), where a changed inode after
         the call is the intended durability mechanism, not a signal worth
         checking."""
-        os.close(self._leaf_fd)
+        self.close()
 
 
 def verified_scratch_path(root: Path, root_fd: int, name: str) -> VerifiedScratchPath:
@@ -368,9 +398,13 @@ def verified_scratch_path(root: Path, root_fd: int, name: str) -> VerifiedScratc
             f"refusing to use {root / name}: could not open {name!r} through the "
             f"validated scratch-root fd without following a symlink (TOCTOU guard): {e}"
         ) from e
-    fd_stat = os.fstat(leaf_fd)
-    resolved = os.path.realpath(str(root / name))
-    path_stat = os.stat(resolved, follow_symlinks=False)
+    try:
+        fd_stat = os.fstat(leaf_fd)
+        resolved = os.path.realpath(str(root / name))
+        path_stat = os.stat(resolved, follow_symlinks=False)
+    except BaseException:
+        os.close(leaf_fd)
+        raise
     if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
         os.close(leaf_fd)
         raise SystemExit(
@@ -394,14 +428,34 @@ def _rmtree_contents_via_fd(
 
     `O_NOFOLLOW` alone stops a symlink substitution but not a *real*
     directory substitution — a concurrent process renaming an external,
-    non-empty directory onto an entry name this run owns. Before recursing
-    into any directory, its opened fd's device must match `root_identity`'s
-    device (a foreign filesystem is refused outright) and, for entries this
-    run recorded an identity for at creation time (`known_children` — today
-    just the top-level `home`/`tmp` dirs, threaded in only at the top-level
-    call), the fd's (device, inode) must still match what was recorded.
-    Either mismatch fails the run loudly rather than recursing into and
-    deleting content this run does not own.
+    non-empty directory onto an entry name this run owns. Two independent
+    checks guard every directory at every recursion depth, not just the
+    top level:
+
+    1. Listing-consistency: `DirEntry.inode()` reads the inode straight out
+       of the `readdir()` entry this run's own `os.scandir()` call already
+       captured, no extra syscall, so it reflects what occupied that name at
+       listing time. The fd opened moments later (`O_NOFOLLOW`) is `fstat`ed
+       and must report the *same* inode; a directory renamed onto that name
+       in the gap between listing and open — same-device, so the plain
+       device check below would not catch it — produces a mismatch instead
+       of a silent recursion into substituted content. This is the general
+       fix for the finding that a nested substitution bypassed the
+       top-level-only `known_children` manifest.
+    2. Device match against `root_identity` (a foreign filesystem is refused
+       outright) and, for entries this run recorded an identity for at
+       *creation* time (`known_children` — today just the top-level
+       `home`/`tmp` dirs, threaded in only at the top-level call), the fd's
+       (device, inode) must still match what was recorded — a stronger,
+       longer-lived guarantee than check 1 for the two names this run
+       controls end-to-end.
+
+    Neither check can distinguish a directory that was already substituted
+    *before* this call's own `os.scandir()` ran (nothing was ever recorded
+    for it to compare against) from one this run's consumer legitimately
+    created — that residual is disclosed in README.md rather than silently
+    assumed away. Any mismatch this code *can* see fails the run loudly
+    rather than recursing into and deleting content this run does not own.
     """
     with os.scandir(dir_fd) as it:
         entries = list(it)
@@ -409,11 +463,23 @@ def _rmtree_contents_via_fd(
         if entry.is_symlink():
             os.unlink(entry.name, dir_fd=dir_fd)
         elif entry.is_dir(follow_symlinks=False):
+            listed_inode = entry.inode()
             child_fd = os.open(
                 entry.name, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
             )
             try:
                 child_stat = os.fstat(child_fd)
+                child_identity = (child_stat.st_dev, child_stat.st_ino)
+                if child_stat.st_ino != listed_inode:
+                    raise SystemExit(
+                        f"refusing to recurse into {entry.name!r}: the "
+                        "directory just opened does not match the one this "
+                        f"run's own listing saw moments earlier (inode "
+                        f"{listed_inode} listed, {child_stat.st_ino} opened) "
+                        "— looks like a directory was substituted into the "
+                        "scratch tree while this run was walking it (TOCTOU "
+                        "guard); leaving it for operator cleanup"
+                    )
                 if child_stat.st_dev != root_identity[0]:
                     raise SystemExit(
                         f"refusing to recurse into {entry.name!r}: its device "
@@ -423,14 +489,7 @@ def _rmtree_contents_via_fd(
                         "(TOCTOU guard); leaving it for operator cleanup"
                     )
                 expected = (known_children or {}).get(entry.name)
-                if (
-                    expected is not None
-                    and (
-                        child_stat.st_dev,
-                        child_stat.st_ino,
-                    )
-                    != expected
-                ):
+                if expected is not None and child_identity != expected:
                     raise SystemExit(
                         f"refusing to recurse into {entry.name!r}: its identity "
                         "no longer matches what this run recorded when it "
@@ -594,31 +653,36 @@ def seed_corpus(
     write_scratch_jsonl(root_fd, "seed_ops.jsonl", ops)
     _claim_scratch_file(root_fd, "seed_save.jsonl")
 
-    ops_vp = verified_scratch_path(root, root_fd, "seed_ops.jsonl")
-    save_vp = verified_scratch_path(root, root_fd, "seed_save.jsonl")
-    db_vp = verified_scratch_path(root, root_fd, "eval.db")
-    run_kkernel(
-        kkernel,
-        [
-            "exec",
-            "--ops-file",
-            ops_vp.path,
-            "--save-file",
-            save_vp.path,
-            "--db",
-            db_vp.path,
-        ],
-        env,
-    )
-    ops_vp.recheck()
-    # save_vp is not rechecked: `kkernel exec --save-file` publishes its
-    # output via tempfile-write-then-rename (crates/kkernel/src/exec.rs,
-    # atomic_apply::record_save_file_publish_failure), so the path
-    # legitimately names a different inode after a successful run than the
-    # one `_claim_scratch_file`/`verified_scratch_path` observed before the
-    # call — that is the intended durability mechanism, not a substitution.
-    save_vp.discard()
-    db_vp.recheck()
+    with contextlib.ExitStack() as stack:
+        ops_vp = stack.enter_context(
+            verified_scratch_path(root, root_fd, "seed_ops.jsonl")
+        )
+        save_vp = stack.enter_context(
+            verified_scratch_path(root, root_fd, "seed_save.jsonl")
+        )
+        db_vp = stack.enter_context(verified_scratch_path(root, root_fd, "eval.db"))
+        run_kkernel(
+            kkernel,
+            [
+                "exec",
+                "--ops-file",
+                ops_vp.path,
+                "--save-file",
+                save_vp.path,
+                "--db",
+                db_vp.path,
+            ],
+            env,
+        )
+        ops_vp.recheck()
+        # save_vp is not rechecked: `kkernel exec --save-file` publishes its
+        # output via tempfile-write-then-rename (crates/kkernel/src/exec.rs,
+        # atomic_apply::record_save_file_publish_failure), so the path
+        # legitimately names a different inode after a successful run than the
+        # one `_claim_scratch_file`/`verified_scratch_path` observed before the
+        # call — that is the intended durability mechanism, not a substitution.
+        save_vp.discard()
+        db_vp.recheck()
 
     rows = read_scratch_jsonl(root_fd, "seed_save.jsonl")
     failed = [r for r in rows if not r.get("ok")]
@@ -631,42 +695,42 @@ def seed_corpus(
 
 
 def key_id_map(root: Path, root_fd: int) -> dict[str, str]:
-    db_vp = verified_scratch_path(root, root_fd, "eval.db")
-    conn = sqlite3.connect(db_vp.path)
-    try:
-        cur = conn.execute(
-            "SELECT id, properties FROM notes WHERE properties IS NOT NULL"
-        )
-        mapping: dict[str, str] = {}
-        for note_id, props_json in cur.fetchall():
-            props = json.loads(props_json)
-            for tag in props.get("tags", []):
-                if tag.startswith("k:"):
-                    mapping[tag[2:]] = note_id
-    finally:
-        conn.close()
-    db_vp.recheck()
+    with verified_scratch_path(root, root_fd, "eval.db") as db_vp:
+        conn = sqlite3.connect(db_vp.path)
+        try:
+            cur = conn.execute(
+                "SELECT id, properties FROM notes WHERE properties IS NOT NULL"
+            )
+            mapping: dict[str, str] = {}
+            for note_id, props_json in cur.fetchall():
+                props = json.loads(props_json)
+                for tag in props.get("tags", []):
+                    if tag.startswith("k:"):
+                        mapping[tag[2:]] = note_id
+        finally:
+            conn.close()
+        db_vp.recheck()
     return mapping
 
 
 def set_ages(
     root: Path, root_fd: int, notes: list[dict], key_to_id: dict[str, str]
 ) -> None:
-    db_vp = verified_scratch_path(root, root_fd, "eval.db")
-    conn = sqlite3.connect(db_vp.path)
-    try:
-        for n in notes:
-            note_id = key_to_id[n["key"]]
-            dt = datetime.fromisoformat(n["created_at_iso"].replace("Z", "+00:00"))
-            micros = int(dt.timestamp() * 1_000_000)
-            conn.execute(
-                "UPDATE notes SET created_at = ?, updated_at = ? WHERE id = ?",
-                (micros, micros, note_id),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    db_vp.recheck()
+    with verified_scratch_path(root, root_fd, "eval.db") as db_vp:
+        conn = sqlite3.connect(db_vp.path)
+        try:
+            for n in notes:
+                note_id = key_to_id[n["key"]]
+                dt = datetime.fromisoformat(n["created_at_iso"].replace("Z", "+00:00"))
+                micros = int(dt.timestamp() * 1_000_000)
+                conn.execute(
+                    "UPDATE notes SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (micros, micros, note_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        db_vp.recheck()
 
 
 def run_condition(
@@ -697,27 +761,28 @@ def run_condition(
     write_scratch_jsonl(root_fd, ops_name, ops)
     _claim_scratch_file(root_fd, save_name)
 
-    ops_vp = verified_scratch_path(root, root_fd, ops_name)
-    save_vp = verified_scratch_path(root, root_fd, save_name)
-    db_vp = verified_scratch_path(root, root_fd, "eval.db")
-    run_kkernel(
-        kkernel,
-        [
-            "exec",
-            "--ops-file",
-            ops_vp.path,
-            "--save-file",
-            save_vp.path,
-            "--db",
-            db_vp.path,
-        ],
-        env,
-    )
-    ops_vp.recheck()
-    # See seed_corpus: kkernel publishes --save-file via write-then-rename,
-    # so a changed inode here is the intended durability mechanism.
-    save_vp.discard()
-    db_vp.recheck()
+    with contextlib.ExitStack() as stack:
+        ops_vp = stack.enter_context(verified_scratch_path(root, root_fd, ops_name))
+        save_vp = stack.enter_context(verified_scratch_path(root, root_fd, save_name))
+        db_vp = stack.enter_context(verified_scratch_path(root, root_fd, "eval.db"))
+        run_kkernel(
+            kkernel,
+            [
+                "exec",
+                "--ops-file",
+                ops_vp.path,
+                "--save-file",
+                save_vp.path,
+                "--db",
+                db_vp.path,
+            ],
+            env,
+        )
+        ops_vp.recheck()
+        # See seed_corpus: kkernel publishes --save-file via write-then-rename,
+        # so a changed inode here is the intended durability mechanism.
+        save_vp.discard()
+        db_vp.recheck()
 
     rows = read_scratch_jsonl(root_fd, save_name)
     if len(rows) != len(queries):
@@ -986,6 +1051,48 @@ def _expect_systemexit(fn, *a, **kw) -> tuple[bool, str]:
 def _record(failures: list[str], name: str, ok: bool, msg: str) -> None:
     if not ok:
         failures.append(f"{name}: {msg}")
+
+
+@contextlib.contextmanager
+def _inject_after_scandir(trigger_names: set[str], side_effect):
+    """Test-only: monkeypatch `os.scandir` so that, the first time it
+    returns a listing containing every name in `trigger_names`, the real
+    listing is fully materialized and only then does `side_effect()` run —
+    before control returns to `_rmtree_contents_via_fd`'s caller and it
+    starts opening those entries. Triggering on the listed *names* rather
+    than a specific `dir_fd` sidesteps having to predict an fd number
+    `_rmtree_contents_via_fd` opens internally; this reproduces,
+    deterministically and without a real race or thread, a directory
+    substitution landing in the window between this run's own directory
+    listing and the per-entry `open()` calls that follow it.
+    """
+    real_scandir = os.scandir
+    fired = False
+
+    class _ReplayScandir:
+        def __init__(self, entries: list) -> None:
+            self._entries = entries
+
+        def __enter__(self):
+            return iter(self._entries)
+
+        def __exit__(self, *exc_info: object) -> bool:
+            return False
+
+    def fake_scandir(dir_fd=None):
+        nonlocal fired
+        with real_scandir(dir_fd) as it:
+            entries = list(it)
+        if not fired and trigger_names.issubset({e.name for e in entries}):
+            fired = True
+            side_effect()
+        return _ReplayScandir(entries)
+
+    os.scandir = fake_scandir
+    try:
+        yield
+    finally:
+        os.scandir = real_scandir
 
 
 def run_self_tests() -> int:
@@ -1304,12 +1411,136 @@ def run_self_tests() -> int:
         "arbitrary /opt prefix was accepted as an ambient /private mapping",
     )
 
+    # 19. a legitimately run-owned nested directory tree — one this harness
+    # never recorded an identity for at creation time, matching what the
+    # kkernel subprocess itself creates under `home` (e.g. `.khive`,
+    # `.lattice/models/...`) — is still recursed into and removed by
+    # ordinary cleanup. Directory-admission table row B: unrecorded-but-ours
+    # must not be refused just because check 18 below now exists.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        root_fd = open_scratch_root_fd(root)
+        try:
+            known = init_scratch_dirs(root_fd)
+            nested = root / "home" / "nested" / "deeper"
+            nested.mkdir(parents=True)
+            (nested / "owned.txt").write_text("owned by this run")
+            cleanup_scratch(root, root_fd, known)
+            ok = not root.exists()
+            msg = (
+                "ok"
+                if ok
+                else "scratch root survived cleanup of a legitimate nested tree"
+            )
+            _record(failures, "legitimate-nested-dir-cleaned", ok, msg)
+        finally:
+            os.close(root_fd)
+
+    # 20. the round-2 review's own nested-same-device-substitution probe
+    # shape: a foreign, same-device directory is renamed onto a nested
+    # entry name in the window between this run's own `os.scandir()`
+    # listing of `home`'s contents and the subsequent per-entry `open()` —
+    # bypassing the top-level-only `known_children` manifest, exactly the
+    # gap the finding described. The general listing-consistency check
+    # (`DirEntry.inode()` captured at listing time vs. the opened fd's
+    # `fstat`) must catch this at any recursion depth, not just the top
+    # level. Directory-admission table row D.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        root_fd = open_scratch_root_fd(root)
+        try:
+            known = init_scratch_dirs(root_fd)
+            (root / "home" / "nested").mkdir()
+            foreign = Path(td) / "foreign"
+            foreign.mkdir()
+            (foreign / "victim.txt").write_text("do not touch")
+
+            def _swap_nested() -> None:
+                (root / "home" / "nested").rmdir()
+                foreign.rename(root / "home" / "nested")
+
+            with _inject_after_scandir({"nested"}, _swap_nested):
+                ok, msg = _expect_systemexit(cleanup_scratch, root, root_fd, known)
+            _record(failures, "nested-same-device-substitution-refused", ok, msg)
+            if not (root / "home" / "nested" / "victim.txt").exists():
+                failures.append(
+                    "nested-same-device-substitution-refused: victim content "
+                    "was deleted"
+                )
+        finally:
+            os.close(root_fd)
+
+    # 21. `verified_scratch_path` must not leak `leaf_fd` when the
+    # path-based `os.stat` call raises before the identity-mismatch branch
+    # runs — a real unlink/race between the fd-relative open and the path
+    # stat can produce the same error path.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        root_fd = open_scratch_root_fd(root)
+        try:
+            _claim_scratch_file(root_fd, "claimed.txt")
+            real_open = os.open
+            real_stat = os.stat
+            captured: dict[str, int] = {}
+
+            def _spy_open(path, flags, mode=0o777, *, dir_fd=None):
+                fd = real_open(path, flags, mode, dir_fd=dir_fd)
+                if path == "claimed.txt":
+                    captured["fd"] = fd
+                return fd
+
+            def _failing_stat(path, *, dir_fd=None, follow_symlinks=True):
+                if (
+                    dir_fd is None
+                    and isinstance(path, str)
+                    and path.endswith("claimed.txt")
+                ):
+                    raise OSError(5, "injected stat failure")
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            os.open = _spy_open
+            os.stat = _failing_stat
+            raised = False
+            try:
+                try:
+                    verified_scratch_path(root, root_fd, "claimed.txt")
+                except OSError:
+                    raised = True
+            finally:
+                os.open = real_open
+                os.stat = real_stat
+
+            leaked = False
+            if "fd" in captured:
+                try:
+                    os.close(captured["fd"])
+                    leaked = True
+                except OSError:
+                    leaked = False
+            ok = raised and "fd" in captured and not leaked
+            if not raised:
+                msg = "did not raise the injected OSError"
+            elif "fd" not in captured:
+                msg = "leaf fd open call was never observed"
+            elif leaked:
+                msg = "leaf fd was leaked (still open after injected stat failure)"
+            else:
+                msg = "ok"
+            _record(
+                failures, "verified-scratch-path-closes-fd-on-stat-failure", ok, msg
+            )
+        finally:
+            os.close(root_fd)
+
     if failures:
         print(f"\nSELF-TEST FAILED ({len(failures)}):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("\nSELF-TEST PASSED (18 checks)")
+    print("\nSELF-TEST PASSED (21 checks)")
     return 0
 
 
@@ -1358,20 +1589,21 @@ def main() -> int:
         _reject_existing_scratch_db(db_path)
         _claim_scratch_file(root_fd, "eval.db")
         known_children = init_scratch_dirs(root_fd)
-        home_vp = verified_scratch_path(root, root_fd, "home")
-        tmp_vp = verified_scratch_path(root, root_fd, "tmp")
-        env = scratch_env(home_vp.path, tmp_vp.path, db_path)
-        home_vp.recheck()
-        tmp_vp.recheck()
+        with contextlib.ExitStack() as stack:
+            home_vp = stack.enter_context(verified_scratch_path(root, root_fd, "home"))
+            tmp_vp = stack.enter_context(verified_scratch_path(root, root_fd, "tmp"))
+            env = scratch_env(home_vp.path, tmp_vp.path, db_path)
+            home_vp.recheck()
+            tmp_vp.recheck()
 
         try:
-            migrate_vp = verified_scratch_path(root, root_fd, "eval.db")
-            run_kkernel(
-                args.kkernel,
-                ["db", "migrate", "--db", migrate_vp.path],
-                env,
-            )
-            migrate_vp.recheck()
+            with verified_scratch_path(root, root_fd, "eval.db") as migrate_vp:
+                run_kkernel(
+                    args.kkernel,
+                    ["db", "migrate", "--db", migrate_vp.path],
+                    env,
+                )
+                migrate_vp.recheck()
             queries = generate_corpus.parse_queries(args.queries)
             notes = seed_corpus(args.kkernel, env, root, root_fd, args.seed, args.epoch)
             key_to_id = key_id_map(root, root_fd)
