@@ -78,32 +78,47 @@ def refuse_unsafe_db_env() -> None:
         )
 
 
-def _validate_scratch_root(root: Path) -> None:
-    """Reject anything a caller-supplied --scratch-dir must not be: a symlink
-    for the root itself or the parent -> root hop, or a pre-existing
-    non-empty directory. Both are how a scratch root can be steered to write
-    through to a target the harness does not own.
+def _ambient_symlink(p: Path) -> bool:
+    """macOS publishes /tmp, /var, and /etc as symlinks into /private as an
+    OS convention. Those are OS-owned, not planted, and a scratch root under
+    them must not be misreported as an attack."""
+    try:
+        rel = p.relative_to("/")
+    except ValueError:
+        return False
+    return os.path.realpath(str(p)) == str(Path("/private") / rel)
 
-    The parent directory's realpath is used as the comparison base (not a
-    raw abspath) so ambient OS-level ancestor symlinks — e.g. macOS mapping
-    /tmp and /var to /private/tmp and /private/var — are tolerated on both
-    sides of the comparison instead of misreported as a planted symlink.
-    """
+
+def _validate_scratch_root(root: Path) -> None:
+    """Reject anything a caller-supplied --scratch-dir must not contain: a
+    symlink anywhere among its existing path components (the root itself, its
+    parent, or any ancestor hop), or a pre-existing non-empty directory.
+    Either is how a scratch root can be steered to write through to a target
+    the harness does not own — mkdir(parents=True) follows a symlinked
+    ancestor silently, so every component that already exists is checked with
+    lstat before anything is created. Components that do not exist yet cannot
+    be symlinks; mkdir creates them as real directories (and the eval.db
+    defense-in-depth check covers the validation-to-use window)."""
     root = root.absolute()
-    if root.is_symlink():
-        raise SystemExit(f"refusing --scratch-dir {root}: is itself a symlink")
-    parent = root.parent
-    if parent.exists() and root.exists():
-        resolved_parent = Path(os.path.realpath(str(parent)))
-        resolved_root = Path(os.path.realpath(str(root)))
-        expected = resolved_parent / root.name
-        if resolved_root != expected:
-            raise SystemExit(
-                f"refusing --scratch-dir {root}: resolves to {resolved_root}, "
-                f"not {expected}; a component between the parent directory and "
-                "this path is a symlink. This harness never follows symlinks "
-                "for scratch storage."
+    cur = Path(root.anchor)
+    for part in root.relative_to(root.anchor).parts:
+        cur = cur / part
+        if cur.is_symlink():
+            if _ambient_symlink(cur):
+                continue
+            what = (
+                "is itself a symlink"
+                if cur == root
+                else f"component {cur} is a symlink"
             )
+        elif not cur.exists():
+            break
+        else:
+            continue
+        raise SystemExit(
+            f"refusing --scratch-dir {root}: {what}. This harness never "
+            "follows symlinks for scratch storage."
+        )
     if root.exists():
         if not root.is_dir():
             raise SystemExit(
@@ -452,9 +467,14 @@ def version_drift_note(gold: dict, kkernel_version: str) -> str | None:
     to keep a metric mismatch from being misdiagnosed when the binary really
     did drift."""
     gold_version = gold.get("kkernel_version")
-    if gold_version is not None and kkernel_revision(gold_version) != kkernel_revision(
-        kkernel_version
-    ):
+    if gold_version is None:
+        return (
+            "kkernel_version: gold file has no kkernel_version field, so binary "
+            "identity was not checked for this comparison — a legacy or "
+            "hand-edited gold file carries no provenance; re-derive it with "
+            "--write-gold to record the binary it comes from"
+        )
+    if kkernel_revision(gold_version) != kkernel_revision(kkernel_version):
         return (
             f"kkernel_version: got {kkernel_version!r} vs gold {gold_version!r} — "
             "the kkernel binary this run used does not match the one gold was "
@@ -566,12 +586,50 @@ def run_self_tests() -> int:
         ok, msg = _expect_systemexit(_reject_existing_scratch_db, db_path)
         _record(failures, "preexisting-eval-db-file-refused", ok, msg)
 
+    # 7. a nonexistent leaf below a symlinked PARENT is refused, and nothing
+    # is created behind the symlink — mkdir(parents=True) would otherwise
+    # follow the parent hop silently.
+    with tempfile.TemporaryDirectory() as td:
+        victim = Path(td) / "victim"
+        victim.mkdir()
+        link = Path(td) / "link"
+        link.symlink_to(victim)
+        ok, msg = _expect_systemexit(make_scratch, str(link / "new"))
+        _record(failures, "symlinked-parent-of-new-leaf-refused", ok, msg)
+        if any(victim.iterdir()):
+            failures.append(
+                "symlinked-parent-of-new-leaf-refused: something was created "
+                "behind the symlinked parent"
+            )
+
+    # 8. the macOS ambient /tmp -> /private/tmp mapping is tolerated: a fresh
+    # root under /tmp validates (on Linux /tmp is a real directory and passes
+    # trivially, so the check is meaningful on both).
+    with tempfile.TemporaryDirectory(dir="/tmp") as td:
+        candidate = Path(td) / "fresh"
+        try:
+            _validate_scratch_root(candidate)
+            ok, msg = True, "ok"
+        except SystemExit as e:
+            ok, msg = False, f"ambient /tmp ancestry misreported as planted: {e}"
+        _record(failures, "ambient-tmp-ancestry-accepted", ok, msg)
+
+    # 9. a gold file with no kkernel_version yields a drift note (binary
+    # identity unchecked must be said, never silently treated as verified).
+    note = version_drift_note({}, "kkernel 0.0.0 (revision 0000000, built x)")
+    _record(
+        failures,
+        "gold-missing-kkernel-version-noted",
+        note is not None and "no kkernel_version" in note,
+        f"expected a missing-provenance note, got {note!r}",
+    )
+
     if failures:
         print(f"\nSELF-TEST FAILED ({len(failures)}):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("\nSELF-TEST PASSED (6 checks)")
+    print("\nSELF-TEST PASSED (9 checks)")
     return 0
 
 

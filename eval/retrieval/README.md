@@ -33,9 +33,11 @@ baseline.
 - **Isolation**: every run seeds a fresh scratch SQLite database under a
   temp directory. The default `--scratch-dir` is always a freshly created
   private directory (`tempfile.mkdtemp`); a caller-supplied `--scratch-dir`
-  is rejected if it (or the parent -> root hop) is a symlink, or if it
-  already exists and is non-empty — the harness only ever writes into a
-  scratch root it created itself. The child process gets a minimal
+  is rejected if any existing component of its path is a symlink (the root
+  itself, its parent, or any ancestor hop — macOS's OS-owned `/tmp` ->
+  `/private/tmp` mapping excepted), or if it already exists and is
+  non-empty — the harness only ever writes into a scratch root it created
+  itself. The child process gets a minimal
   allowlisted environment (`PATH`, `HOME`/`TMPDIR` redirected into the
   scratch root, `KHIVE_DB`, and a pinned `KHIVE_EMBEDDING_MODEL`) instead of
   the caller's full environment, so no inherited `KHIVE_*` variable can
@@ -54,7 +56,9 @@ baseline.
   the gold file) changes the revision hash without touching retrieval
   behavior. The gate's verdict rides on the metrics; the version line
   keeps a real binary drift from being misdiagnosed as a ranking
-  regression.
+  regression. A gold file carrying no `kkernel_version` field at all
+  warns that binary identity went unchecked rather than passing
+  silently.
 
 ## Running it
 
@@ -62,8 +66,11 @@ baseline.
 # Full run, prints the aggregate + per-class tables, writes per-query rows
 uv run python evaluate.py --out results/A_fused_direct.jsonl
 
-# Re-run and diff against the committed gold baseline (exit 0 = pass)
-uv run python evaluate.py --check-gold
+# Re-run and diff against the committed gold baseline (exit 0 = pass).
+# The tolerance matches the `make eval-retrieval-gold-check` target; the
+# bare default is 0.0, which trips on a known rank-boundary tie-break
+# jitter (see Determinism below).
+uv run python evaluate.py --check-gold --gold-tolerance 0.002
 
 # Re-derive the committed gold baseline (writes kkernel_version + metrics)
 uv run python evaluate.py --write-gold gold/A_fused_direct.json
