@@ -19,11 +19,24 @@ export type LoadedShowcaseBundle = Readonly<{
   source: ShowcaseBundleSource;
 }>;
 
+export class ShowcaseAnalysisNotFoundError extends Error {
+  readonly canonicalUrl: string;
+
+  constructor(canonicalUrl: string) {
+    super("The configured repository analysis is not available.");
+    this.name = "ShowcaseAnalysisNotFoundError";
+    this.canonicalUrl = canonicalUrl;
+  }
+}
+
 export async function loadPreferredShowcaseBundle(
   entry: ShowcaseRegistryEntry,
   fetchBundle: ShowcaseFetch = fetch,
 ): Promise<LoadedShowcaseBundle> {
   if (!isAllowedShowcaseAnalysis(entry)) {
+    if (!entry.assetPath) {
+      throw new ShowcaseAnalysisNotFoundError(entry.canonicalUrl);
+    }
     return {
       bundle: await loadStaticShowcaseBundle(entry, fetchBundle),
       source: "curated-static-fallback",
@@ -38,6 +51,9 @@ export async function loadPreferredShowcaseBundle(
   });
 
   if (response.status === 404) {
+    if (!entry.assetPath) {
+      throw new ShowcaseAnalysisNotFoundError(entry.canonicalUrl);
+    }
     return {
       bundle: await loadStaticShowcaseBundle(entry, fetchBundle),
       source: "curated-static-fallback",

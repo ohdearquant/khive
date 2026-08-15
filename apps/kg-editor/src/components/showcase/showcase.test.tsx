@@ -4,11 +4,28 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { loadPreferredShowcaseBundle } from "@/lib/adapters/preferred-showcase-source";
+import {
+  loadPreferredShowcaseBundle,
+  ShowcaseAnalysisNotFoundError,
+} from "@/lib/adapters/preferred-showcase-source";
+import { loadShowcaseAnalysisCatalog } from "@/lib/adapters/showcase-analysis-catalog";
 import { parseRepoBundle } from "@/lib/repo-bundle";
 
 vi.mock("@/lib/adapters/preferred-showcase-source", () => ({
   loadPreferredShowcaseBundle: vi.fn(),
+  ShowcaseAnalysisNotFoundError: class ShowcaseAnalysisNotFoundError extends Error {
+    canonicalUrl: string;
+
+    constructor(canonicalUrl: string) {
+      super("The configured repository analysis is not available.");
+      this.canonicalUrl = canonicalUrl;
+    }
+  },
+}));
+
+vi.mock("@/lib/adapters/showcase-analysis-catalog", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/adapters/showcase-analysis-catalog")>(),
+  loadShowcaseAnalysisCatalog: vi.fn(),
 }));
 
 import { Showcase } from "@/components/showcase/showcase";
@@ -16,12 +33,23 @@ import { Showcase } from "@/components/showcase/showcase";
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
 const bundle = parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
 const mockedLoad = vi.mocked(loadPreferredShowcaseBundle);
+const mockedCatalog = vi.mocked(loadShowcaseAnalysisCatalog);
+const defaultCatalogEntry = {
+  analysis_id: "khive",
+  canonical_url: "https://github.com/ohdearquant/khive",
+} as const;
 
 describe("materialized repository lookup", () => {
   beforeEach(() => {
     window.history.replaceState(null, "", "/");
-    mockedLoad.mockClear();
+    mockedLoad.mockReset();
     mockedLoad.mockResolvedValue({ bundle, source: "khive-db-snapshot" });
+    mockedCatalog.mockReset();
+    mockedCatalog.mockResolvedValue({
+      status: "ready",
+      entries: [defaultCatalogEntry],
+      message: "1 configured repository analysis discovered.",
+    });
   });
 
   it("resolves the repository in a direct URL before loading the default", async () => {
@@ -122,5 +150,160 @@ describe("materialized repository lookup", () => {
     expect(new URL(window.location.href).searchParams.get("module")).toBe(
       pool.source_path,
     );
+  });
+
+  it("waits for catalog discovery before resolving a dynamic deep link", async () => {
+    const dynamicAnalysisId = "deep-link-only";
+    let releaseCatalog: ((value: Awaited<ReturnType<typeof loadShowcaseAnalysisCatalog>>) => void) | undefined;
+    mockedCatalog.mockReturnValue(new Promise((resolveCatalog) => {
+      releaseCatalog = resolveCatalog;
+    }));
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent("https://github.com/example/dynamic-only")}`,
+    );
+
+    render(<Showcase />);
+
+    const selector = screen.getByRole("combobox", { name: "Repository analysis" });
+    expect(selector).toHaveAttribute("aria-busy", "true");
+    expect(mockedLoad).not.toHaveBeenCalled();
+
+    releaseCatalog?.({
+      status: "ready",
+      entries: [{
+        analysis_id: dynamicAnalysisId,
+        canonical_url: "https://github.com/example/dynamic-only",
+      }],
+      message: "1 configured repository analysis discovered.",
+    });
+
+    await waitFor(() => expect(mockedLoad).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: `analysis:${dynamicAnalysisId}`,
+        analysisId: dynamicAnalysisId,
+        assetPath: undefined,
+      }),
+    ));
+  });
+
+  it("keeps the curated static repository usable when the catalog degrades", async () => {
+    mockedCatalog.mockResolvedValue({
+      status: "degraded",
+      entries: [],
+      message: "The server analysis catalog is unavailable; curated static repositories remain available.",
+    });
+    mockedLoad.mockResolvedValue({
+      bundle,
+      source: "curated-static-fallback",
+    });
+
+    const { container } = render(<Showcase />);
+
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    expect(screen.getByRole("status", { name: "Repository catalog status" }))
+      .toHaveTextContent(/catalog is unavailable.*static repositories remain available/i);
+    expect(screen.getByRole("combobox", { name: "Repository analysis" }))
+      .toHaveValue("github.com/ohdearquant/khive");
+    expect(screen.getByLabelText("Analysis source")).toHaveTextContent(
+      "curated static fallback",
+    );
+    expect(mockedLoad).toHaveBeenCalledWith(expect.objectContaining({
+      assetPath: "/showcase/khive-repo-v1-khive.json",
+      analysisId: undefined,
+    }));
+  });
+
+  it("switches a native repository selector and exposes URL, source, busy, and status", async () => {
+    const user = userEvent.setup();
+    const dynamicAnalysisId = "selector-only";
+    const dynamicUrl = "https://github.com/example/dynamic-only";
+    const dynamicBundle = {
+      ...bundle,
+      meta: {
+        ...bundle.meta,
+        repository: {
+          ...bundle.meta.repository,
+          canonical_url: dynamicUrl,
+        },
+      },
+    };
+    let releaseDynamic: (() => void) | undefined;
+    mockedCatalog.mockResolvedValue({
+      status: "ready",
+      entries: [
+        {
+          analysis_id: dynamicAnalysisId,
+          canonical_url: dynamicUrl,
+        },
+        defaultCatalogEntry,
+      ],
+      message: "2 configured repository analyses discovered.",
+    });
+    mockedLoad.mockImplementation((entry) => {
+      if (entry.analysisId !== dynamicAnalysisId) {
+        return Promise.resolve({ bundle, source: "khive-db-snapshot" });
+      }
+      return new Promise((resolveLoad) => {
+        releaseDynamic = () => resolveLoad({
+          bundle: dynamicBundle,
+          source: "khive-db-snapshot",
+        });
+      });
+    });
+    const { container } = render(<Showcase />);
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+
+    const selector = screen.getByRole("combobox", { name: "Repository analysis" });
+    expect(screen.getByLabelText("Public repository URL")).toBeVisible();
+    expect(screen.getByRole("status", { name: "Repository catalog status" }))
+      .toHaveTextContent("2 configured repository analyses discovered.");
+
+    await user.selectOptions(selector, `analysis:${dynamicAnalysisId}`);
+
+    expect(selector).toHaveAttribute("aria-busy", "true");
+    expect(container.querySelector(".repo-result")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("status", { name: "Repository analysis status" }))
+      .toHaveTextContent(/opening.*dynamic-only/i);
+    releaseDynamic?.();
+
+    await waitFor(() => expect(selector).toHaveAttribute("aria-busy", "false"));
+    expect(screen.getByLabelText("Public repository URL")).toHaveValue(
+      dynamicUrl,
+    );
+    expect(new URL(window.location.href).searchParams.get("repo")).toBe(
+      dynamicUrl,
+    );
+    expect(screen.getByLabelText("Analysis source")).toHaveTextContent(
+      "khive DB snapshot",
+    );
+  });
+
+  it("renders an honest miss when a dynamic-only analysis disappears", async () => {
+    const dynamicUrl = "https://github.com/example/dynamic-only";
+    const dynamicAnalysisId = "missing-only";
+    mockedCatalog.mockResolvedValue({
+      status: "ready",
+      entries: [{
+        analysis_id: dynamicAnalysisId,
+        canonical_url: dynamicUrl,
+      }],
+      message: "1 configured repository analysis discovered.",
+    });
+    mockedLoad.mockRejectedValue(new ShowcaseAnalysisNotFoundError(dynamicUrl));
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent(dynamicUrl)}`,
+    );
+
+    const { container } = render(<Showcase />);
+
+    await waitFor(() => expect(container.querySelector('[data-state="empty"]')).toBeVisible());
+    expect(screen.getByText("Configured repository analysis is unavailable"))
+      .toBeVisible();
+    expect(container.querySelector('[data-state="empty"]')).toHaveTextContent(dynamicUrl);
+    expect(mockedLoad).toHaveBeenCalledOnce();
   });
 });

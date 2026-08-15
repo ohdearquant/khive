@@ -179,6 +179,39 @@
   text-transform: uppercase;
 }
 
+.repo-url-form > .repo-analysis-picker {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.repo-analysis-picker select {
+  background: var(--khive-color-surface-overlay);
+  border: 1px solid var(--khive-color-border);
+  border-radius: var(--khive-radius-lg);
+  color: var(--repo-navy);
+  cursor: pointer;
+  font-family: var(--khive-font-mono);
+  font-size: var(--khive-type-base);
+  font-weight: 600;
+  min-width: 0;
+  padding: 12px;
+  text-transform: none;
+  width: 100%;
+}
+
+.repo-analysis-picker select:focus-visible {
+  border-color: var(--repo-green);
+  box-shadow: 0 0 0 4px var(--khive-color-accent-soft);
+  outline: none;
+}
+
+.repo-analysis-picker select:disabled,
+.repo-url-form button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
 .repo-url-form > div {
   background: var(--khive-color-surface-overlay);
   border: 1px solid var(--khive-color-border);
@@ -222,8 +255,40 @@
 }
 
 .repo-url-form button:hover { background: var(--khive-color-accent-hover); }
+.repo-url-form button:disabled:hover { background: var(--repo-navy); }
 .repo-url-form button svg { height: 13px; width: 13px; }
 .repo-url-form small { color: var(--repo-muted); display: block; font-size: var(--khive-type-md); line-height: 1.5; margin: 10px 3px 0; }
+
+.repo-analysis-statuses {
+  border-left: 2px solid var(--khive-color-accent-soft);
+  display: grid;
+  gap: 4px;
+  margin: 13px 3px 0;
+  padding-left: 10px;
+}
+
+.repo-analysis-statuses > span,
+.repo-analysis-statuses p {
+  color: var(--repo-muted);
+  font-size: var(--khive-type-sm);
+  line-height: 1.45;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.repo-analysis-statuses > span {
+  align-items: baseline;
+  display: flex;
+  gap: 6px;
+  text-transform: uppercase;
+}
+
+.repo-analysis-statuses output {
+  color: var(--repo-navy);
+  font-family: var(--khive-font-mono);
+  font-weight: 700;
+  text-transform: none;
+}
 
 .repo-result {
   margin: 0 auto;

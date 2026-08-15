@@ -2,7 +2,10 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { loadPreferredShowcaseBundle } from "@/lib/adapters/preferred-showcase-source";
+import {
+  loadPreferredShowcaseBundle,
+  ShowcaseAnalysisNotFoundError,
+} from "@/lib/adapters/preferred-showcase-source";
 import { SHOWCASE_REGISTRY } from "@/lib/showcase-registry";
 
 const golden = readFileSync(
@@ -30,6 +33,11 @@ function response(
 }
 
 describe("preferred showcase source", () => {
+  const configuredStaticEntry = {
+    ...SHOWCASE_REGISTRY[0],
+    analysisId: "khive",
+  };
+
   it("prefers the configured khive DB snapshot and verifies its provenance", async () => {
     const fetchBundle = vi.fn(async () =>
       response(golden, 200, {
@@ -39,7 +47,7 @@ describe("preferred showcase source", () => {
     );
 
     const result = await loadPreferredShowcaseBundle(
-      SHOWCASE_REGISTRY[0],
+      configuredStaticEntry,
       fetchBundle,
     );
 
@@ -61,7 +69,7 @@ describe("preferred showcase source", () => {
     );
 
     const result = await loadPreferredShowcaseBundle(
-      SHOWCASE_REGISTRY[0],
+      configuredStaticEntry,
       fetchBundle,
     );
 
@@ -76,7 +84,7 @@ describe("preferred showcase source", () => {
     const fetchBundle = vi.fn(async () => response(new Uint8Array(), 503));
 
     await expect(
-      loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
+      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle),
     ).rejects.toThrow(/database snapshot.*503/i);
     expect(fetchBundle).toHaveBeenCalledOnce();
   });
@@ -90,7 +98,7 @@ describe("preferred showcase source", () => {
     );
 
     await expect(
-      loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
+      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle),
     ).rejects.toThrow(/provenance/i);
   });
 
@@ -106,8 +114,45 @@ describe("preferred showcase source", () => {
     );
 
     await expect(
-      loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
+      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle),
     ).rejects.toThrow(/repository identity/i);
     expect(fetchBundle).toHaveBeenCalledOnce();
+  });
+
+  it("loads a static-only entry without probing the analysis API", async () => {
+    const fetchBundle = vi.fn(async () => response(golden, 200));
+
+    const result = await loadPreferredShowcaseBundle(
+      {
+        ...SHOWCASE_REGISTRY[0],
+        analysisId: undefined,
+      },
+      fetchBundle,
+    );
+
+    expect(result.source).toBe("curated-static-fallback");
+    expect(fetchBundle).toHaveBeenCalledOnce();
+    expect(fetchBundle).toHaveBeenCalledWith(
+      "/showcase/khive-repo-v1-khive.json",
+      expect.any(Object),
+    );
+  });
+
+  it("returns a miss for a dynamic-only analysis 404", async () => {
+    const entry = {
+      id: "analysis:dynamic-only",
+      canonicalUrl: "https://github.com/example/dynamic-only",
+      aliases: ["https://github.com/example/dynamic-only"],
+      analysisId: "dynamic-only",
+    };
+    const fetchBundle = vi.fn(async () => response(new Uint8Array(), 404));
+
+    await expect(loadPreferredShowcaseBundle(entry, fetchBundle)).rejects
+      .toBeInstanceOf(ShowcaseAnalysisNotFoundError);
+    expect(fetchBundle).toHaveBeenCalledOnce();
+    expect(fetchBundle).toHaveBeenCalledWith(
+      "/api/showcase/analyses/dynamic-only",
+      expect.any(Object),
+    );
   });
 });
