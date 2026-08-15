@@ -31,10 +31,25 @@ baseline.
   fusion, a reranker) — add a name and the extra `memory.recall` args to
   layer on top of the shared base.
 - **Isolation**: every run seeds a fresh scratch SQLite database under a
-  temp directory, with `HOME` and `KHIVE_DB` both redirected there for the
-  duration of the run. The runner refuses to start if an inherited `KHIVE_DB`
-  already points at an existing file outside its own scratch directory — it
-  never reads or writes a production database.
+  temp directory. The default `--scratch-dir` is always a freshly created
+  private directory (`tempfile.mkdtemp`); a caller-supplied `--scratch-dir`
+  is rejected if it (or the parent -> root hop) is a symlink, or if it
+  already exists and is non-empty — the harness only ever writes into a
+  scratch root it created itself. The child process gets a minimal
+  allowlisted environment (`PATH`, `HOME`/`TMPDIR` redirected into the
+  scratch root, `KHIVE_DB`, and a pinned `KHIVE_EMBEDDING_MODEL`) instead of
+  the caller's full environment, so no inherited `KHIVE_*` variable can
+  change what gets scored. The runner refuses to start if an inherited
+  `KHIVE_DB` already points at an existing file outside its own scratch
+  directory — it never reads or writes a production database.
+  `evaluate.py --self-test` exercises these refusals directly (symlinked
+  root, pre-existing/non-empty root, symlinked `eval.db`) without needing a
+  `kkernel` binary.
+- **Binary identity**: every run records `kkernel --version` and prints it;
+  `gold/A_fused_direct.json` embeds the `kkernel_version` it was derived
+  with, and `--check-gold` reports a version mismatch as its own labeled
+  failure line (separate from metric mismatches) so a drifted binary is
+  named rather than misdiagnosed as a ranking regression.
 
 ## Running it
 
@@ -44,6 +59,12 @@ uv run python evaluate.py --out results/A_fused_direct.jsonl
 
 # Re-run and diff against the committed gold baseline (exit 0 = pass)
 uv run python evaluate.py --check-gold
+
+# Re-derive the committed gold baseline (writes kkernel_version + metrics)
+uv run python evaluate.py --write-gold gold/A_fused_direct.json
+
+# Scratch-dir/KHIVE_DB safety regression checks — no kkernel required
+uv run python evaluate.py --self-test
 
 # Paired comparison between two conditions' result JSONLs
 uv run python bootstrap.py results/A_fused_direct.jsonl results/B_other.jsonl
@@ -75,6 +96,36 @@ unseeded RNG — the corpus, note ages, and query order are all fixed by
 `--seed`/`--epoch`. Running the harness twice back to back must produce
 metric-for-metric identical per-query results; `gold/A_fused_direct.json` was
 committed only after verifying that on this corpus.
+
+Note ages are frozen via `--epoch`, but `memory.recall` itself computes
+recency from `Utc::now()` at request time (`age_days`/`temporal_recency` in
+`crates/khive-pack-memory/src/handlers/recall.rs` and
+`crates/khive-pack-memory/src/scoring.rs`) — a fixed corpus epoch does not
+freeze that clock read. `evaluate.py` sends every `memory.recall` call with
+an explicit `config.scoring.weights.temporal = 0.0` (relevance/salience left
+at the product defaults, 0.7/0.2, so the weight sum stays positive and the
+non-temporal balance is unchanged) so the wall clock cannot influence the
+composite rank score, and gold is clock-hermetic regardless of when the
+harness runs. Temporal ranking behavior itself is deliberately out of this
+gate's coverage until the runtime grows an evaluation-time clock override
+that this harness can pin instead of disabling the term outright.
+
+Independent of the temporal term, `--check-gold` uses a small nonzero
+`--gold-tolerance` (0.002, set by the `make eval-retrieval-gold-check`
+target) rather than exact equality: on repeated runs against an identical
+scratch corpus and an identical pinned config, a rank-10-boundary tie in the
+`fresh_directive` class occasionally resolves in either of two orderings
+(nDCG@10 differs by up to ~0.0008; Recall@100/TargetRecall@100/MRR@10 are
+unaffected — the retrieved candidate *set* is stable, only its order at an
+exact score tie flips). This is a pre-existing `memory.recall`
+scoring/fusion tie-break characteristic, not a wall-clock leak — verified by
+running back to back with a fixed epoch and the temporal weight pinned to
+0.0, where two of four consecutive runs matched exactly and two matched
+each other exactly, in two discrete states rather than a wall-clock-driven
+drift. Root-causing that tie-break is out of scope for this eval-only PR
+(it would require a runtime change under `crates/`); the tolerance keeps the
+gate meaningful for real regressions without chasing a single flipped rank
+at an exact score tie.
 
 ## Relationship to the #939 measurement
 

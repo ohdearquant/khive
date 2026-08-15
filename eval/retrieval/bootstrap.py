@@ -25,21 +25,40 @@ N_SIGN_FLIP = 50_000
 
 
 def load_rows(path: Path) -> dict[str, dict]:
-    rows = {}
+    rows: dict[str, dict] = {}
     with path.open() as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             d = json.loads(line)
-            rows[d["query_id"]] = d
+            qid = d["query_id"]
+            if qid in rows:
+                raise ValueError(
+                    f"{path}: duplicate query_id {qid!r} at line {lineno} — "
+                    "already loaded from an earlier line in this file"
+                )
+            rows[qid] = d
     return rows
 
 
 def paired_deltas(a: dict[str, dict], b: dict[str, dict], metric: str) -> list[float]:
-    shared = sorted(set(a) & set(b))
-    if not shared:
-        raise ValueError("no shared query_id between the two result files")
+    ids_a, ids_b = set(a), set(b)
+    if ids_a != ids_b:
+        detail = []
+        only_a = sorted(ids_a - ids_b)
+        only_b = sorted(ids_b - ids_a)
+        if only_a:
+            detail.append(f"in A but missing from B: {only_a}")
+        if only_b:
+            detail.append(f"in B but missing from A: {only_b}")
+        raise ValueError(
+            "paired comparison requires identical query_id sets between the "
+            "two result files; " + "; ".join(detail)
+        )
+    if not ids_a:
+        raise ValueError("no query_id rows in either result file")
+    shared = sorted(ids_a)
     return [b[q][metric] - a[q][metric] for q in shared]
 
 
@@ -67,12 +86,24 @@ def sign_flip_p(deltas: list[float], rng: random.Random, n: int) -> float:
     return count / n
 
 
-def cohens_dz(deltas: list[float]) -> float:
-    if len(deltas) < 2:
-        return 0.0
+def cohens_dz(deltas: list[float]) -> float | None:
+    """Paired standardized effect size. Returns None ("undefined") when the
+    sample standard deviation is zero: every delta is the same nonzero value,
+    a deterministic uniform shift with no defined standardized size — not a
+    zero effect, which 0.0 would misreport it as. Precondition: len(deltas)
+    >= 2; compare() reports n<2 as insufficient sample separately and does
+    not call this."""
     mean = sum(deltas) / len(deltas)
     sd = statistics.stdev(deltas)
-    return mean / sd if sd > 0 else 0.0
+    return mean / sd if sd > 0 else None
+
+
+def cohens_dz_note(deltas: list[float], dz: float | None) -> str | None:
+    if dz is not None:
+        return None
+    if len(deltas) < 2:
+        return "insufficient sample (n<2)"
+    return "undefined (zero variance)"
 
 
 def compare(path_a: Path, path_b: Path, seed: int) -> list[dict]:
@@ -84,7 +115,7 @@ def compare(path_a: Path, path_b: Path, seed: int) -> list[dict]:
         rng = random.Random(seed)
         ci_lo, ci_hi = bootstrap_ci(deltas, rng, N_BOOTSTRAP)
         p = sign_flip_p(deltas, rng, N_SIGN_FLIP)
-        dz = cohens_dz(deltas)
+        dz = cohens_dz(deltas) if len(deltas) >= 2 else None
         out.append(
             {
                 "metric": metric,
@@ -94,6 +125,7 @@ def compare(path_a: Path, path_b: Path, seed: int) -> list[dict]:
                 "ci95_hi": ci_hi,
                 "p_sign_flip": p,
                 "cohens_dz": dz,
+                "cohens_dz_note": cohens_dz_note(deltas, dz),
             }
         )
     return out
@@ -113,10 +145,15 @@ def main() -> int:
     print("| Metric | n | Δ mean | 95% CI | p (sign-flip) | Cohen's dz |")
     print("| --- | --- | --- | --- | --- | --- |")
     for r in rows:
+        dz_display = (
+            f"{r['cohens_dz']:.4f}"
+            if r["cohens_dz"] is not None
+            else r["cohens_dz_note"]
+        )
         print(
             f"| {r['metric']} | {r['n_queries']} | {r['mean_delta']:.4f} | "
             f"[{r['ci95_lo']:.4f}, {r['ci95_hi']:.4f}] | {r['p_sign_flip']:.4f} | "
-            f"{r['cohens_dz']:.4f} |"
+            f"{dz_display} |"
         )
 
     if args.out:
