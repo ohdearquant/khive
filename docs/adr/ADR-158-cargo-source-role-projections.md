@@ -1,4 +1,4 @@
-# ADR-157: Cargo Source-Role Projections for Repository Showcase
+# ADR-158: Cargo Source-Role Projections for Repository Showcase
 
 **Status**: proposed\
 **Date**: 2026-08-15\
