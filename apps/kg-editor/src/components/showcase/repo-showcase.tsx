@@ -40,6 +40,10 @@ import {
   RelationMark,
 } from "@/components/ontology-mark";
 import { settleGraphLayout } from "@/lib/graph-layout";
+import {
+  buildInvestigationBrief,
+  InvestigationBriefError,
+} from "@/lib/investigation-brief";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import { buildRepositoryBrief } from "@/lib/repository-brief";
 import {
@@ -1585,9 +1589,11 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
   }> | null>(null);
   const [navigationStatus, setNavigationStatus] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
+  const [evidenceBriefStatus, setEvidenceBriefStatus] = useState("");
   const moduleInspectorRef = useRef<HTMLElement>(null);
   const dashboardRef = useRef<HTMLDivElement>(null);
   const copyLinkRef = useRef<HTMLButtonElement>(null);
+  const evidenceCopySequence = useRef(0);
 
   useEffect(() => {
     function restoreLocation(announce = false) {
@@ -1640,6 +1646,8 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         staleSnapshot ? parsed.location.structureGraph : null,
       );
       setCopyStatus("");
+      evidenceCopySequence.current += 1;
+      setEvidenceBriefStatus("");
       setLocationNotice(messages.length
         ? {
             title: staleSnapshot
@@ -1765,6 +1773,8 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     setPendingStaleStructureGraph(null);
     setLocationNotice(null);
     setCopyStatus("");
+    evidenceCopySequence.current += 1;
+    setEvidenceBriefStatus("");
   }
 
   function selectView(view: ViewId) {
@@ -1785,6 +1795,8 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     setPendingStaleStructureGraph(null);
     setLocationNotice(null);
     setCopyStatus("");
+    evidenceCopySequence.current += 1;
+    setEvidenceBriefStatus("");
   }
 
   function dismissLocationNotice() {
@@ -1822,6 +1834,8 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         }
       : null);
     setCopyStatus("");
+    evidenceCopySequence.current += 1;
+    setEvidenceBriefStatus("");
     queueMicrotask(() => copyLinkRef.current?.focus());
   }
 
@@ -1849,6 +1863,51 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       setCopyStatus("Investigation link copied.");
     } catch {
       setCopyStatus("Investigation link could not be copied.");
+    }
+  }
+
+  async function copyEvidenceBrief() {
+    if (!selectedModuleId) return;
+    const operation = ++evidenceCopySequence.current;
+    const sourceHref = window.location.href;
+    setEvidenceBriefStatus("");
+    try {
+      const current = locationFor(
+        selectedModuleId,
+        activeView,
+        unresolvedModule?.path ?? null,
+        structureGraph,
+      );
+      const markdown = buildInvestigationBrief({
+        bundle,
+        analysisSource,
+        canonicalUrl: current.href,
+        activeView,
+        selectedModuleId,
+        structureGraph,
+      });
+      if (!markdown) {
+        throw new Error("Selected module evidence is unavailable");
+      }
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard access is unavailable");
+      }
+      await navigator.clipboard.writeText(markdown);
+      if (
+        evidenceCopySequence.current !== operation ||
+        window.location.href !== sourceHref
+      ) return;
+      setEvidenceBriefStatus("Evidence brief copied.");
+    } catch (error) {
+      if (
+        evidenceCopySequence.current !== operation ||
+        window.location.href !== sourceHref
+      ) return;
+      setEvidenceBriefStatus(
+        error instanceof InvestigationBriefError
+          ? `Evidence brief could not be copied: ${error.message}`
+          : "Evidence brief could not be copied.",
+      );
     }
   }
 
@@ -1903,6 +1962,8 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         }
       : null);
     setCopyStatus("");
+    evidenceCopySequence.current += 1;
+    setEvidenceBriefStatus("");
   }
   return (
     <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
@@ -1945,6 +2006,8 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         onRecoverModule={recoverModule}
         canRecoverModule={defaultModuleId !== null}
         onOpenAnalysis={openAnalysis}
+        onCopyEvidenceBrief={copyEvidenceBrief}
+        evidenceBriefStatus={evidenceBriefStatus}
       />
       <div
         className="repo-dashboard"

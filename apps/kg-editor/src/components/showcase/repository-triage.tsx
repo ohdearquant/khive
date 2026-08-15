@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   CircleHelp,
   Code2,
+  Copy,
   Eye,
   FileText,
   GitCommitHorizontal,
@@ -41,6 +42,8 @@ export type RepositoryTriageProps = Readonly<{
   unresolvedModule: Readonly<{ path: string; reason: string }> | null;
   onRecoverModule: () => void;
   canRecoverModule: boolean;
+  onCopyEvidenceBrief: () => void;
+  evidenceBriefStatus: string;
 }>;
 
 function formatNumber(value: number): string {
@@ -169,6 +172,8 @@ export function RepositoryTriage({
   unresolvedModule,
   onRecoverModule,
   canRecoverModule,
+  onCopyEvidenceBrief,
+  evidenceBriefStatus,
 }: RepositoryTriageProps) {
   const brief = useMemo(() => buildRepositoryBrief(bundle), [bundle]);
   const labels = bundle.capability.labels;
@@ -494,9 +499,23 @@ export function RepositoryTriage({
             ? (
               <>
                 <header className={styles.inspectorHeader}>
-                  <span>
-                    <FileText aria-hidden="true" /> {moduleLabel} evidence
-                  </span>
+                  <div className={styles.inspectorHeaderTop}>
+                    <span>
+                      <FileText aria-hidden="true" /> {moduleLabel} evidence
+                    </span>
+                    <button type="button" onClick={onCopyEvidenceBrief}>
+                      <Copy aria-hidden="true" /> Copy evidence brief
+                    </button>
+                  </div>
+                  {evidenceBriefStatus && (
+                    <span
+                      aria-label="Evidence brief copy status"
+                      className={styles.copyStatus}
+                      role="status"
+                    >
+                      {evidenceBriefStatus}
+                    </span>
+                  )}
                   <nav
                     className={styles.breadcrumb}
                     aria-label="Investigation location"

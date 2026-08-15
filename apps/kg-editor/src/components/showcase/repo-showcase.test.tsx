@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -165,6 +165,124 @@ describe("repository showcase", () => {
       "role",
       "status",
     );
+  });
+
+  it("copies a source-honest bounded evidence brief from the module inspector", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    writeText.mockClear();
+    const { container } = render(
+      <RepoShowcase bundle={bundle} analysisSource="khive-db-snapshot" />,
+    );
+
+    await waitFor(() =>
+      expect(new URL(window.location.href).searchParams.get("at")).toBe(
+        bundle.meta.snapshot.head_sha,
+      )
+    );
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+    await user.click(within(inspector).getByRole("button", {
+      name: "Copy evidence brief",
+    }));
+
+    expect(writeText).toHaveBeenCalledOnce();
+    const copied = writeText.mock.calls[0][0];
+    expect(copied).toContain("# Bounded repository investigation brief");
+    expect(copied).toContain("Materialized khive DB snapshot");
+    expect(copied).toContain(bundle.meta.snapshot.head_sha);
+    expect(copied).toContain(window.location.href);
+    expect(within(inspector).getByText("Evidence brief copied."))
+      .toHaveAttribute("role", "status");
+  });
+
+  it("makes evidence-brief clipboard rejection visible", async () => {
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockRejectedValue(new Error("clipboard denied"));
+    writeText.mockClear();
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+
+    await user.click(within(inspector).getByRole("button", {
+      name: "Copy evidence brief",
+    }));
+
+    expect(writeText).toHaveBeenCalledOnce();
+    expect(within(inspector).getByText("Evidence brief could not be copied."))
+      .toHaveAttribute("role", "status");
+  });
+
+  it("visibly refuses a SHA-bound brief for mismatched module evidence", async () => {
+    const bundle = golden();
+    for (const moduleNode of bundle.graph.modules.items) {
+      moduleNode.source_revision = "0".repeat(40);
+    }
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    writeText.mockClear();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+
+    await user.click(within(inspector).getByRole("button", {
+      name: "Copy evidence brief",
+    }));
+
+    expect(writeText).not.toHaveBeenCalled();
+    expect(within(inspector).getByRole("status", {
+      name: "Evidence brief copy status",
+    })).toHaveTextContent(/revision does not match.*snapshot SHA/i);
+  });
+
+  it("does not report an older evidence copy after module navigation", async () => {
+    const bundle = golden();
+    let finishCopy: (() => void) | undefined;
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockImplementation(() => new Promise<void>((resolve) => {
+        finishCopy = resolve;
+      }));
+    writeText.mockClear();
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+    const originalPath = within(inspector).getByRole("heading", {
+      level: 3,
+    }).textContent;
+
+    await user.click(within(inspector).getByRole("button", {
+      name: "Copy evidence brief",
+    }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledOnce());
+    const search = screen.getByRole("searchbox", {
+      name: "Find a module or path",
+    });
+    await user.type(search, "writer_task.rs");
+    await user.click(within(screen.getByLabelText("Module search results"))
+      .getByRole("button", { name: /Inspect .*writer_task\.rs/ }));
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 }).textContent)
+        .not.toBe(originalPath)
+    );
+
+    await act(async () => {
+      finishCopy?.();
+      await Promise.resolve();
+    });
+
+    expect(within(inspector).queryByText("Evidence brief copied."))
+      .not.toBeInTheDocument();
+    expect(within(inspector).queryByText("Evidence brief could not be copied."))
+      .not.toBeInTheDocument();
   });
 
   it("preserves stale-link evidence when clipboard access fails", async () => {

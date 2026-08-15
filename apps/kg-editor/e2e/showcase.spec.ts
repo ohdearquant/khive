@@ -1,4 +1,71 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { expect, test } from "@playwright/test";
+
+const showcaseBundle = readFileSync(
+  resolve(
+    process.cwd(),
+    "../../docs/schemas/examples/khive-repo-v1-khive.json",
+  ),
+  "utf8",
+);
+
+for (const source of [
+  {
+    id: "curated-static-fallback",
+    label: "Curated static fallback bundle",
+  },
+  {
+    id: "khive-db-snapshot",
+    label: "Materialized khive DB snapshot",
+  },
+] as const) {
+  test(`copies a bounded source-honest brief from ${source.id}`, async ({
+    context,
+    page,
+  }) => {
+    await context.grantPermissions(
+      ["clipboard-read", "clipboard-write"],
+      { origin: "http://127.0.0.1:3017" },
+    );
+    await page.route("**/api/showcase/analyses/khive", async (route) => {
+      if (source.id === "curated-static-fallback") {
+        await route.fulfill({ status: 404 });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: {
+          "x-khive-analysis-id": "khive",
+          "x-khive-analysis-source": "khive-db-snapshot",
+        },
+        body: showcaseBundle,
+      });
+    });
+
+    await page.goto("/");
+    const overview = page.locator("[data-analysis-source]");
+    await expect(overview).toHaveAttribute("data-analysis-source", source.id);
+    await expect(page).toHaveURL(/at=[0-9a-f]{40}/);
+    const inspector = page.locator("[data-module-inspector]");
+    await inspector.getByRole("button", { name: "Copy evidence brief" })
+      .click();
+    await expect(inspector.getByRole("status", {
+      name: "Evidence brief copy status",
+    })).toHaveText("Evidence brief copied.");
+
+    const copied = await page.evaluate(() => navigator.clipboard.readText());
+    expect(copied).toContain("# Bounded repository investigation brief");
+    expect(copied).toContain(source.label);
+    expect(copied).toContain("captured evidence, not a live repository query");
+    expect(copied).toContain(page.url());
+    expect(copied).toContain(
+      "Verify at the recorded full SHA: inspect the named source paths",
+    );
+  });
+}
 
 test("dogfoods every repository analysis from the curated static bundle", async ({ page }) => {
   const consoleErrors: string[] = [];

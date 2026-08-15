@@ -1,0 +1,366 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+import {
+  buildInvestigationBrief,
+  INVESTIGATION_BRIEF_MAX_CHARS,
+  INVESTIGATION_BRIEF_VERIFY_INSTRUCTION,
+  markdownCodeSpan,
+} from "@/lib/investigation-brief";
+import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
+import { canonicalCouplingPair } from "@/lib/repository-location";
+
+const goldenPath = resolve(
+  process.cwd(),
+  "../../docs/schemas/examples/khive-repo-v1-khive.json",
+);
+
+function golden(): RepoBundle {
+  return parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
+}
+
+const graphImplementation = "crates/khive-db/src/stores/graph.rs";
+const graphTests = "crates/khive-db/src/stores/graph_tests.rs";
+
+function moduleId(bundle: RepoBundle, sourcePath: string): string {
+  return bundle.graph.modules.items.find((item) =>
+    item.source_path === sourcePath
+  )!.id;
+}
+
+function focusedBrief(
+  bundle = golden(),
+  analysisSource: "khive-db-snapshot" | "curated-static-fallback" =
+    "curated-static-fallback",
+  activeView: "structure_graph" | "scorecard" = "structure_graph",
+  canonicalUrl?: string,
+) {
+  const currentUrl = new URL("https://demo.example/");
+  currentUrl.searchParams.set(
+    "repo",
+    "https://github.com/ohdearquant/khive",
+  );
+  currentUrl.searchParams.set("at", bundle.meta.snapshot.head_sha);
+  currentUrl.searchParams.set("module", graphImplementation);
+  currentUrl.searchParams.set("view", activeView);
+  if (activeView === "structure_graph") {
+    currentUrl.searchParams.set("pkg", "khive-db");
+    currentUrl.searchParams.set("lens", "hidden_coupling");
+    currentUrl.searchParams.append("pair", graphImplementation);
+    currentUrl.searchParams.append("pair", graphTests);
+  }
+  return buildInvestigationBrief({
+    bundle,
+    analysisSource,
+    canonicalUrl: canonicalUrl ?? currentUrl.href,
+    activeView,
+    selectedModuleId: moduleId(bundle, graphImplementation),
+    structureGraph: {
+      packageName: "khive-db",
+      lens: "hidden_coupling",
+      couplingPair: canonicalCouplingPair(graphImplementation, graphTests),
+    },
+  });
+}
+
+describe("bounded investigation brief", () => {
+  it("exports a deterministic, provenance-honest focused investigation", () => {
+    const bundle = golden();
+    const pairPageBefore = structuredClone(
+      bundle.aggregates.hidden_coupling.data,
+    );
+    const first = focusedBrief(bundle);
+    const second = focusedBrief(bundle);
+
+    expect(first).not.toBeNull();
+    expect(first).toBe(second);
+    expect(bundle.aggregates.hidden_coupling.data).toEqual(pairPageBefore);
+    expect(first).toContain("# Bounded repository investigation brief");
+    expect(first).toContain("Curated static fallback bundle");
+    expect(first).toContain("captured evidence, not a live repository query");
+    expect(first).toContain(bundle.meta.snapshot.head_sha);
+    expect(first).toContain(bundle.meta.snapshot.ingested_at);
+    expect(first).toContain(bundle.meta.producer.exporter);
+    expect(first).toContain("https://demo.example/?repo=");
+    expect(first).toContain(markdownCodeSpan(graphImplementation));
+    expect(first).toMatch(/Observed module evidence/i);
+    expect(first).toMatch(/SCC membership/i);
+    expect(first).toMatch(/Captured history/i);
+    expect(first).toMatch(/Observed ownership evidence/i);
+    expect(first).toMatch(/Candidate hidden coupling/i);
+    expect(first).toMatch(/Observed co-change evidence: 24 co-changes; 2\.6% support/i);
+    expect(first).toMatch(/365-day analysis window/i);
+    expect(first).toMatch(/No captured direct dependency edge/i);
+    expect(first).toContain("Module-page coverage");
+    expect(first).toContain("Topology-module coverage");
+    expect(first).toContain("SCC-page coverage");
+    expect(first).toContain("Structure-edge coverage");
+    expect(first).toContain("Module-history-index coverage");
+    expect(first).toContain("Selected-module history coverage");
+    expect(first).toContain("Commit-record coverage");
+    expect(first).toContain("Ownership-module coverage");
+    expect(first).toContain("Selected-module author coverage");
+    expect(first).toContain("Hidden-coupling coverage");
+    expect(first).toContain("Hotspot coverage");
+    expect(first).toContain("Dependency topology window");
+    expect(first).toContain("Hotspot window");
+    expect(first).toContain("Ownership window");
+    expect(first).toContain("Hidden-coupling window");
+    expect(first).toContain("Source-role caveat");
+    expect(first?.trimEnd().endsWith(INVESTIGATION_BRIEF_VERIFY_INSTRUCTION))
+      .toBe(true);
+    expect(first!.length).toBeLessThanOrEqual(
+      INVESTIGATION_BRIEF_MAX_CHARS,
+    );
+  });
+
+  it("labels the database source as materialized captured evidence, never live", () => {
+    const brief = focusedBrief(golden(), "khive-db-snapshot");
+
+    expect(brief).toContain("Materialized khive DB snapshot");
+    expect(brief).not.toMatch(/live snapshot/i);
+    expect(brief).toContain("not a live repository query");
+  });
+
+  it("does not infer an absent dependency from an incomplete structure page", () => {
+    const bundle = golden();
+    bundle.graph.structure_edges.truncated = true;
+    bundle.graph.structure_edges.next_cursor = "more-structure-edges";
+    bundle.graph.structure_edges.disclosure = {
+      status: "truncated",
+      reason: "structure export reached its bound",
+    };
+
+    const brief = focusedBrief(bundle);
+
+    expect(brief).toMatch(
+      /Direct-edge evidence is unknown because structure-edge coverage is incomplete/i,
+    );
+    expect(brief).not.toMatch(/No captured direct dependency edge/i);
+    expect(brief).toContain("structure export reached its bound");
+  });
+
+  it("rejects a selected module whose source revision is not the recorded HEAD", () => {
+    const bundle = golden();
+    const selected = bundle.graph.modules.items.find((item) =>
+      item.source_path === graphImplementation
+    )!;
+    selected.source_revision = "0".repeat(40);
+
+    expect(() => focusedBrief(bundle)).toThrowError(
+      expect.objectContaining({
+        name: "InvestigationBriefError",
+        code: "selected_module_revision_mismatch",
+      }),
+    );
+  });
+
+  it("rejects a focused pair endpoint whose source revision is not the recorded HEAD", () => {
+    const bundle = golden();
+    const endpoint = bundle.graph.modules.items.find((item) =>
+      item.source_path === graphTests
+    )!;
+    endpoint.source_revision = "f".repeat(40);
+
+    expect(() => focusedBrief(bundle)).toThrowError(
+      expect.objectContaining({
+        name: "InvestigationBriefError",
+        code: "focused_pair_revision_mismatch",
+      }),
+    );
+  });
+
+  it("rejects a non-selected SCC member whose source path would be SHA-bound", () => {
+    const bundle = golden();
+    const cycle = bundle.aggregates.dependency_topology.cycles.items[0];
+    const selectedModuleId = cycle.module_ids[0];
+    const staleMember = bundle.graph.modules.items.find((item) =>
+      item.id === cycle.module_ids[1]
+    )!;
+    staleMember.source_revision = "e".repeat(40);
+
+    expect(() => buildInvestigationBrief({
+      bundle,
+      analysisSource: "curated-static-fallback",
+      canonicalUrl: "https://demo.example/?view=scorecard",
+      activeView: "scorecard",
+      selectedModuleId,
+      structureGraph: {
+        packageName: null,
+        lens: "structure",
+        couplingPair: null,
+      },
+    })).toThrowError(
+      expect.objectContaining({
+        name: "InvestigationBriefError",
+        code: "referenced_module_revision_mismatch",
+      }),
+    );
+  });
+
+  it("does not export retained graph history when the current view is not Structure Graph", () => {
+    const brief = focusedBrief(
+      golden(),
+      "curated-static-fallback",
+      "scorecard",
+    );
+
+    expect(brief).toContain(
+      "No focused hidden-coupling pair is encoded in the current structure location.",
+    );
+    expect(brief).not.toContain("Candidate hidden coupling");
+    expect(brief).not.toContain(markdownCodeSpan(graphTests));
+  });
+
+  it("reports a captured direct edge even when absence cannot be evaluated", () => {
+    const bundle = golden();
+    const left = moduleId(bundle, graphImplementation);
+    const right = moduleId(bundle, graphTests);
+    bundle.graph.structure_edges.items.push({
+      ...bundle.graph.structure_edges.items[0],
+      id: "captured-direct-edge",
+      source: left,
+      target: right,
+      relation: "depends_on",
+      origin: "ingested",
+    });
+    bundle.graph.structure_edges.total_count = {
+      status: "available",
+      value: bundle.graph.structure_edges.items.length,
+    };
+
+    expect(focusedBrief(bundle)).toMatch(
+      /Observed direct-edge evidence: a captured direct dependency edge is present/i,
+    );
+  });
+
+  it("escapes arbitrary backtick runs and stays within its hard output bound", () => {
+    expect(markdownCodeSpan("path`with``ticks")).toBe(
+      "``` path`with``ticks ```",
+    );
+    const bundle = golden();
+    const targetId = moduleId(bundle, graphImplementation);
+    const history = bundle.graph.history_navigation.by_module.items.find(
+      (item) => item.module_id === targetId,
+    )!;
+    const commitIds = new Set(history.commits.items);
+    for (const commit of bundle.graph.commits.items) {
+      if (commitIds.has(commit.id)) {
+        commit.subject = "`[]*_".repeat(20_000);
+      }
+    }
+    bundle.graph.structure_edges.disclosure.reason = "reason`[]*_".repeat(
+      20_000,
+    );
+
+    const brief = focusedBrief(bundle);
+
+    expect(brief).not.toBeNull();
+    expect(brief!.length).toBeLessThanOrEqual(
+      INVESTIGATION_BRIEF_MAX_CHARS,
+    );
+    expect(brief).toContain("Optional detail coverage");
+    expect(brief?.trimEnd().endsWith(INVESTIGATION_BRIEF_VERIFY_INSTRUCTION))
+      .toBe(true);
+  });
+
+  it("bounds final escaped Markdown and reserves an exact omission disclosure", () => {
+    const bundle = golden();
+    const hostile = "`".repeat(100_000);
+    bundle.meta.producer.exporter = hostile;
+    for (const page of [
+      bundle.graph.modules,
+      bundle.aggregates.dependency_topology.modules,
+      bundle.aggregates.dependency_topology.cycles,
+      bundle.graph.structure_edges,
+      bundle.graph.history_navigation.by_module,
+      bundle.graph.commits,
+      bundle.aggregates.ownership.modules,
+      bundle.aggregates.hidden_coupling.data,
+    ]) {
+      page.bound.order = hostile;
+      page.total_count = { status: "unavailable", reason: hostile };
+      page.next_cursor = hostile;
+      page.truncated = true;
+      page.disclosure = { status: "truncated", reason: hostile };
+    }
+    const selectedId = moduleId(bundle, graphImplementation);
+    const cycleMembers = bundle.graph.modules.items
+      .filter((item) =>
+        item.id !== selectedId && item.source_path !== graphTests
+      )
+      .slice(0, 18);
+    for (const [index, member] of cycleMembers.entries()) {
+      member.source_path = `${hostile.slice(0, 1_000)}${index}`;
+    }
+    bundle.aggregates.dependency_topology.cycles.items = [0, 1, 2].map(
+      (index) => ({
+        id: `hostile-cycle-${index}`,
+        module_ids: [
+          ...cycleMembers.slice(index * 6, index * 6 + 6).map((item) =>
+            item.id
+          ),
+          selectedId,
+        ],
+      }),
+    );
+    const history = bundle.graph.history_navigation.by_module.items.find(
+      (item) => item.module_id === selectedId,
+    )!;
+    history.commits.bound.order = hostile;
+    history.commits.next_cursor = hostile;
+    history.commits.truncated = true;
+    history.commits.disclosure = { status: "truncated", reason: hostile };
+    const ownership = bundle.aggregates.ownership.modules.items.find(
+      (item) => item.module_id === selectedId,
+    )!;
+    ownership.authors.items = Array.from({ length: 5 }, (_, index) => ({
+      author: `${hostile}${index}`,
+      commits: index + 1,
+      share: 0.2,
+    }));
+    ownership.authors.bound.order = hostile;
+    ownership.authors.next_cursor = hostile;
+    ownership.authors.truncated = true;
+    ownership.authors.disclosure = { status: "truncated", reason: hostile };
+    const selectedCommitIds = new Set(history.commits.items);
+    for (const commit of bundle.graph.commits.items) {
+      if (selectedCommitIds.has(commit.id)) commit.subject = hostile;
+    }
+
+    const hostileBundle = parseRepoBundle(structuredClone(bundle));
+    const brief = focusedBrief(
+      hostileBundle,
+      "curated-static-fallback",
+      "structure_graph",
+      `https://demo.example/?hostile=${hostile}`,
+    );
+
+    expect(brief).not.toBeNull();
+    expect(brief!.length).toBeLessThanOrEqual(
+      INVESTIGATION_BRIEF_MAX_CHARS,
+    );
+    expect(brief).toMatch(
+      /Optional detail coverage: \*\*truncated\*\*; [1-9]\d* bounded detail blocks? (?:was|were) omitted/,
+    );
+    expect(brief?.trimEnd().endsWith(INVESTIGATION_BRIEF_VERIFY_INSTRUCTION))
+      .toBe(true);
+  });
+
+  it("returns null when the selected module is outside the bounded bundle", () => {
+    expect(buildInvestigationBrief({
+      bundle: golden(),
+      analysisSource: "curated-static-fallback",
+      canonicalUrl: "https://demo.example/",
+      activeView: "structure_graph",
+      selectedModuleId: "missing-module",
+      structureGraph: {
+        packageName: null,
+        lens: "structure",
+        couplingPair: null,
+      },
+    })).toBeNull();
+  });
+});
