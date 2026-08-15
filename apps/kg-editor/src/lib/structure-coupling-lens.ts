@@ -26,7 +26,7 @@ export type StructureCouplingLens = Readonly<{
   dependencyCoverageReason: string | null;
 }>;
 
-function undirectedPairKey(left: string, right: string): string {
+export function structureCouplingPairKey(left: string, right: string): string {
   return left.localeCompare(right) <= 0
     ? `${left}${pairSeparator}${right}`
     : `${right}${pairSeparator}${left}`;
@@ -51,7 +51,7 @@ export function buildStructureCouplingLens({
   const capturedDependencies = new Set(
     structureEdgePage.items
       .filter((edge) => edge.relation === "depends_on")
-      .map((edge) => undirectedPairKey(edge.source, edge.target)),
+      .map((edge) => structureCouplingPairKey(edge.source, edge.target)),
   );
   const visiblePairs = pairPage.items
     .filter((pair) =>
@@ -83,7 +83,10 @@ export function buildStructureCouplingLens({
 
   return {
     pairs: visiblePairs.slice(0, boundedLimit).map((pair) => {
-      const key = undirectedPairKey(pair.left_module_id, pair.right_module_id);
+      const key = structureCouplingPairKey(
+        pair.left_module_id,
+        pair.right_module_id,
+      );
       return {
         key,
         leftModuleId: pair.left_module_id,

@@ -6,7 +6,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
-import { repositoryLocationUrl } from "@/lib/repository-location";
+import {
+  DEFAULT_STRUCTURE_GRAPH_LOCATION,
+  repositoryLocationUrl,
+} from "@/lib/repository-location";
 
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
 const showcaseSourcePath = resolve(process.cwd(), "src/components/showcase/repo-showcase.tsx");
@@ -38,6 +41,7 @@ describe("repository showcase", () => {
       snapshotSha: bundle.meta.snapshot.head_sha,
       modulePath: pool.source_path,
       view: "dependency_topology",
+      structureGraph: DEFAULT_STRUCTURE_GRAPH_LOCATION,
     });
     window.history.replaceState(null, "", direct);
     const user = userEvent.setup();
@@ -116,6 +120,7 @@ describe("repository showcase", () => {
       snapshotSha: "0000000000000000000000000000000000000000",
       modulePath: missingPath,
       view: "scorecard",
+      structureGraph: DEFAULT_STRUCTURE_GRAPH_LOCATION,
     });
     window.history.replaceState(null, "", direct);
     const user = userEvent.setup();
@@ -170,6 +175,7 @@ describe("repository showcase", () => {
       snapshotSha: staleSha,
       modulePath: bundle.graph.modules.items[0].source_path,
       view: "scorecard",
+      structureGraph: DEFAULT_STRUCTURE_GRAPH_LOCATION,
     });
     window.history.replaceState(null, "", direct);
     const writeText = vi.spyOn(navigator.clipboard, "writeText")
@@ -572,6 +578,7 @@ describe("repository showcase", () => {
         snapshotSha: bundle.meta.snapshot.head_sha,
         modulePath: moduleNode.source_path,
         view: "history_structure_navigation",
+        structureGraph: DEFAULT_STRUCTURE_GRAPH_LOCATION,
       }),
     );
 

@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
+import { repositoryLocationUrl } from "@/lib/repository-location";
 
 const settleGraphLayoutSpy = vi.hoisted(() => vi.fn());
 
@@ -88,6 +89,48 @@ describe("repository showcase graph layout", () => {
     };
     rerender(<RepoShowcase bundle={replacedModulePage} />);
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps a deep-linked package inside the bounded scope selector", async () => {
+    const bundle = structuredClone(golden());
+    const template = bundle.graph.packages.items[0]!;
+    const extraPackages = Array.from({ length: 205 }, (_, index) => ({
+      ...template,
+      id: `khive:package:test:${index.toString().padStart(3, "0")}`,
+      name: `deep-package-${index.toString().padStart(3, "0")}`,
+    }));
+    bundle.graph.packages.items.push(...extraPackages);
+    bundle.graph.packages.total_count = {
+      status: "available",
+      value: bundle.graph.packages.items.length,
+    };
+    const target = extraPackages.at(-1)!;
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: null,
+      view: "structure_graph",
+      structureGraph: {
+        packageName: target.name,
+        lens: "structure",
+        couplingPair: null,
+      },
+    });
+    window.history.replaceState(null, "", direct);
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const packageSelect = await screen.findByRole("combobox", {
+      name:
+        `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+    });
+
+    expect(packageSelect).toHaveValue(target.id);
+    expect(within(packageSelect).getByRole("option", { name: target.name }))
+      .toBeInTheDocument();
+    expect(within(packageSelect).getAllByRole("option")).toHaveLength(201);
+    expect(container.querySelector(
+      `[data-state="truncated"][data-shown="200"][data-known-total="${bundle.graph.packages.items.length}"]`,
+    )).toHaveTextContent(/Package scope options/i);
   });
 
   it.each(["click", "Enter"] as const)(

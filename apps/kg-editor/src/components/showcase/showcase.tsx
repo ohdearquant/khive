@@ -54,6 +54,9 @@ function replaceRepositoryQuery(
     query.searchParams.delete("at");
     query.searchParams.delete("module");
     query.searchParams.delete("view");
+    query.searchParams.delete("pkg");
+    query.searchParams.delete("lens");
+    query.searchParams.delete("pair");
   }
   const search = query.searchParams.size ? `?${query.searchParams.toString()}` : "";
   window.history.replaceState(null, "", `${query.pathname}${search}${query.hash}`);
