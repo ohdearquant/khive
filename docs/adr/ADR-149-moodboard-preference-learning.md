@@ -95,10 +95,15 @@ digests are 64-lowercase-hex SHA-256 strings.
 - optional finite `pair_propensity` in `(0,1]`;
 - optional `candidate_pool_sha256`.
 
-It also records whether source ranks or a learned probability were shown. A shown learned
-probability requires a fully validated `served_preference_model_id`; a model ID is rejected when no
-probability was shown. Probability-exposed judgments remain auditable but are excluded from v1
-training to avoid an immediate self-confirming feedback loop.
+Its optional `exposure` request object also records whether source ranks or a learned probability
+were shown. The business object is deliberately not named `presentation`: ADR-045 (Amendment 2) reserves
+both `presentation` and `presentation_per_op` for the outer request envelope, whose values control
+wire rendering rather than experiment provenance. A shown learned probability requires a fully
+validated `served_preference_model_id`; a model ID is rejected when no probability was shown.
+Probability-exposed judgments remain auditable but are excluded from v1 training to avoid an
+immediate self-confirming feedback loop. Durable v1 serve and judgment event payloads retain their
+original internal `presentation` member so this request-contract repair does not rewrite or fork
+immutable evidence.
 
 The server generates a UUIDv4 `serve_id` and one UUIDv4 `result_occurrence_id` per candidate. It
 computes:

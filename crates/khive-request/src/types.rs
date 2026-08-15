@@ -17,7 +17,7 @@ pub const MAX_OPS_INPUT_LEN: usize = 1024 * 1024;
 pub const NESTING_DEPTH_LIMIT: usize = 64;
 
 /// Names reserved at the request-envelope level; rejected if they appear inside verb args.
-pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
+pub use khive_types::RESERVED_ENVELOPE_ARGS;
 
 /// Returns whether every array/object in `value` is at most `max_depth` deep.
 ///

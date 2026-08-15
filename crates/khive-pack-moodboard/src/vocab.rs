@@ -147,10 +147,10 @@ pub static MOODBOARD_HANDLERS: [HandlerDef; 7] = [
                 description: "Pair-selection policy, optional propensity, and candidate-pool digest.",
             },
             ParamDef {
-                name: "presentation",
+                name: "exposure",
                 param_type: "object",
                 required: false,
-                description: "Exposure provenance; defaults to no ranks or learned probability shown.",
+                description: "Display-exposure provenance; defaults to no ranks or learned probability shown.",
             },
         ],
     },

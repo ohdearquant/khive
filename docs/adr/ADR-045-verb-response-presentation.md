@@ -607,6 +607,18 @@ falling back to the default presentation. This closure applies only to the outer
 tool envelope; verb arguments continue through the separately governed request DSL and
 pack validation seams.
 
+## Amendment 2 (2026-08-14): both envelope-owned names are reserved
+
+The wire-shape section above reserves the argument name `presentation` but is silent on
+`presentation_per_op`, even though both fields are owned by the request envelope. The
+implementation reserves both: the shared list `khive-types::pack::RESERVED_ENVELOPE_ARGS`
+enumerates `presentation` and `presentation_per_op`, the DSL parser rejects either name as
+a verb argument, and the runtime registry refuses at boot any verb or subhandler metadata
+that advertises either name. This amendment aligns the normative text with that contract:
+**both `presentation` and `presentation_per_op` are RESERVED at the request-envelope level
+and CANNOT be used as verb argument names.** The reserved-name list is a closed set owned
+by this ADR; adding a third envelope field reserves its name here first.
+
 ## References
 
 - ADR-016 (Request DSL) §"UUID arguments" — short-prefix resolution on input
