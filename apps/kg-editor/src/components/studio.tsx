@@ -457,7 +457,7 @@ function ChangesView({
         <label className="filter-input">
           <Search aria-hidden="true" />
           <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Filter entities, edges, tiers…" />
-          {query && <button type="button" onClick={() => onQuery("")} aria-label="Clear filter"><X /></button>}
+          {query && <button type="button" onClick={() => onQuery("")} aria-label="Clear filter text"><X /></button>}
         </label>
       </div>
       <div className="diff-legend">

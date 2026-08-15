@@ -181,7 +181,12 @@ describe("repository showcase", () => {
 
     const { container } = render(<RepoShowcase bundle={bundle} />);
 
-    const state = container.querySelector<HTMLElement>('[data-state="truncated"]');
+    // Multiple `[data-state="truncated"]` disclosures can coexist: the browser-side
+    // local display slice (bound = shown, always ambient once a list exceeds the UI
+    // row cap) is a separate concern from the bundle's own page-bound disclosure.
+    // Target the modules page's own disclosure by its distinguishing reason text.
+    const state = Array.from(container.querySelectorAll<HTMLElement>('[data-state="truncated"]'))
+      .find((node) => node.textContent?.includes("fixture node budget"));
     expect(state).toBeVisible();
     expect(state).toHaveAttribute("data-bound", String(bundle.graph.modules.bound.max_items));
     if (bundle.graph.modules.total_count.status === "available") {
@@ -280,7 +285,7 @@ describe("repository showcase", () => {
     await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
 
     expect(container.querySelectorAll(".repo-view-panel tbody tr")).toHaveLength(200);
-    expect(Array.from(container.querySelectorAll(".repo-view-panel .repo-bounded.truncated")).some((node) => node.textContent?.includes(bundle.capability.labels.truncated))).toBe(true);
+    expect(Array.from(container.querySelectorAll(".repo-view-panel .repo-bounded.truncated")).some((node) => node.textContent?.toLocaleLowerCase().includes(bundle.capability.labels.truncated.toLocaleLowerCase()))).toBe(true);
   });
 
   it("settles the structure graph without collapsing nodes onto a handful of shared coordinates", () => {
