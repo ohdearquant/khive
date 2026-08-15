@@ -1491,7 +1491,7 @@ class MakefileGateContractTests(unittest.TestCase):
         PARSE time — before any recipe (real or dry-run) is considered — so
         a `$(shell ...)` payload in the receipt path ran as soon as Make
         parsed the Makefile with that override on the command line."""
-        pwned = Path(tempfile.gettempdir()) / "pr1809_r4_pwned"
+        pwned = Path(tempfile.gettempdir()) / "khive-make-parse-time-injection-probe"
         pwned.unlink(missing_ok=True)
         self.addCleanup(lambda: pwned.unlink(missing_ok=True))
 
