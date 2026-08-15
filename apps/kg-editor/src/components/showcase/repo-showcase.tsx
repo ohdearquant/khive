@@ -303,67 +303,87 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
   const [zoom, setZoom] = useState(1);
   const [selectedId, setSelectedId] = useState(graph.repository.id);
   const {
-    subtreePackageCount,
-    displayedPackages,
-    selectablePackages,
-    subtreeModuleCount,
-    displayedModules,
     displayedEdges,
-    visibleIds,
+    displayedModules,
+    displayedPackages,
     positions,
+    selectablePackages,
+    subtreeModules,
+    subtreePackages,
+    visibleIds,
   } = useMemo(() => {
-    const subtreePackages = subtreeId === graph.repository.id
+    const nextSubtreePackages = subtreeId === graph.repository.id
       ? graph.packages.items
       : graph.packages.items.filter((item) => item.id === subtreeId);
     // Sort by id before truncating so the displayed slice — and therefore the
     // shared seeded layout fed by it — is independent of input array order
     // (ADR-153 D4).
-    const displayedPackages = [...subtreePackages].sort((left, right) => left.id.localeCompare(right.id)).slice(0, 8);
-    const selectablePackages = graph.packages.items.slice(0, UI_ROW_LIMIT);
-    const displayedPackageIds = new Set(displayedPackages.map((item) => item.id));
-    const subtreeModules = graph.modules.items.filter((item) => subtreeId === graph.repository.id || item.package_id === subtreeId);
-    const displayedModules = subtreeModules.filter((item) => displayedPackageIds.has(item.package_id))
+    const nextDisplayedPackages = [...nextSubtreePackages]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .slice(0, 8);
+    const nextSelectablePackages = graph.packages.items.slice(0, UI_ROW_LIMIT);
+    const displayedPackageIds = new Set(nextDisplayedPackages.map((item) => item.id));
+    const nextSubtreeModules = graph.modules.items.filter((item) =>
+      subtreeId === graph.repository.id || item.package_id === subtreeId
+    );
+    const nextDisplayedModules = nextSubtreeModules
+      .filter((item) => displayedPackageIds.has(item.package_id))
       .sort((left, right) => left.id.localeCompare(right.id))
       .slice(0, 42);
-    const visibleIds = new Set([
+    const nextVisibleIds = new Set([
       graph.repository.id,
-      ...displayedPackages.map((item) => item.id),
-      ...displayedModules.map((item) => item.id),
+      ...nextDisplayedPackages.map((item) => item.id),
+      ...nextDisplayedModules.map((item) => item.id),
     ]);
-    const visibleEdges = graph.structure_edges.items.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
-    const displayedEdges = visibleEdges.slice(0, UI_GRAPH_EDGE_LIMIT);
+    const visibleEdges = graph.structure_edges.items.filter((edge) =>
+      nextVisibleIds.has(edge.source) && nextVisibleIds.has(edge.target)
+    );
+    const nextDisplayedEdges = visibleEdges.slice(0, UI_GRAPH_EDGE_LIMIT);
     const layoutNodes = [
       { id: graph.repository.id },
-      ...displayedPackages.map((item) => ({ id: item.id })),
-      ...displayedModules.map((item) => ({ id: item.id })),
+      ...nextDisplayedPackages.map((item) => ({ id: item.id })),
+      ...nextDisplayedModules.map((item) => ({ id: item.id })),
     ];
     const layoutEdges = [
-      ...displayedPackages.map((item) => ({
+      ...nextDisplayedPackages.map((item) => ({
         id: `contains-${graph.repository.id}-${item.id}`,
         source: graph.repository.id,
         target: item.id,
       })),
-      ...displayedModules.map((item) => ({
+      ...nextDisplayedModules.map((item) => ({
         id: `contains-${item.package_id}-${item.id}`,
         source: item.package_id,
         target: item.id,
       })),
-      ...displayedEdges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target })),
+      ...nextDisplayedEdges.map((edge) => ({
+        id: edge.id,
+        source: edge.source,
+        target: edge.target,
+      })),
     ];
-    const positions = new Map(
-      settleGraphLayout(layoutNodes, layoutEdges).map((node) => [node.id, { x: node.x, y: node.y }]),
+    const nextPositions = new Map(
+      settleGraphLayout(layoutNodes, layoutEdges).map((node) => [
+        node.id,
+        { x: node.x, y: node.y },
+      ]),
     );
     return {
-      subtreePackageCount: subtreePackages.length,
-      displayedPackages,
-      selectablePackages,
-      subtreeModuleCount: subtreeModules.length,
-      displayedModules,
-      displayedEdges,
-      visibleIds,
-      positions,
+      displayedEdges: nextDisplayedEdges,
+      displayedModules: nextDisplayedModules,
+      displayedPackages: nextDisplayedPackages,
+      positions: nextPositions,
+      selectablePackages: nextSelectablePackages,
+      subtreeModules: nextSubtreeModules,
+      subtreePackages: nextSubtreePackages,
+      visibleIds: nextVisibleIds,
     };
-  }, [graph, subtreeId]);
+  }, [
+    graph.repository.id,
+    graph.packages.items,
+    graph.modules.items,
+    graph.structure_edges.items,
+    subtreeId,
+  ]);
   const degrees = new Map<string, number>();
   const fanIn = new Map<string, number>();
   const fanOut = new Map<string, number>();
@@ -532,8 +552,8 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
           ))}
         </ul>
         <LocalSliceDisclosure shown={displayedEdges.length} total={graph.structure_edges.items.length} label={capability.views.structure_graph.label} labels={labels} />
-        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackageCount} label={labels.node_types.package} labels={labels} />
-        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModuleCount} label={labels.node_types.module} labels={labels} />
+        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackages.length} label={labels.node_types.package} labels={labels} />
+        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModules.length} label={labels.node_types.module} labels={labels} />
       </div>
       <BoundDisclosure page={graph.packages} labels={labels} />
       <BoundDisclosure page={graph.modules} labels={labels} />
