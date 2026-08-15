@@ -21,11 +21,13 @@ questions that matter operationally: which parts survive a restart, which are re
 guarantees results are identical before and after, and what the read path does when a stored
 hit's backing artifact has since disappeared.
 
-Restart semantics have been exercised end to end for the preference-model and blob lifecycle
-(a serving process restarted between training and inference, with exact-equality checks on the
-results). The named-vector reopen path — index, restart, search, exact hit and score equality —
-is not yet covered by such a test; for that path this record states the intended contract, and
-acceptance of this ADR gates on a persistent reopen test with exact hit and score assertions.
+Restart durability has been exercised for the preference-model and blob lifecycle: a persisted
+model bundle and its blob-backed artifacts are loaded by a recreated runtime and produce a
+valid prediction. That test demonstrates load-after-restart, not result equality — it records
+no pre-restart prediction to compare against. The named-vector reopen path — index, restart,
+search, exact hit and score equality — is likewise not yet covered; for both, this record
+states the intended contract, and acceptance of this ADR gates on a persistent reopen test
+with exact hit and score assertions.
 
 ## Decision
 
