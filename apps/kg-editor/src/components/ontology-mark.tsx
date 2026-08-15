@@ -9,13 +9,13 @@ import {
   FileText,
   FolderKanban,
   Lightbulb,
-  type LucideIcon,
+  type IconComponent,
   Package,
   ServerCog,
   Signpost,
   Sparkles,
   User,
-} from "lucide-react";
+} from "@/icons";
 import type { CSSProperties } from "react";
 
 import {
@@ -48,7 +48,7 @@ const iconComponents = {
   signpost: Signpost,
   bookmark: Bookmark,
   circle: Circle,
-} satisfies Record<OntologyIconName, LucideIcon>;
+} satisfies Record<OntologyIconName, IconComponent>;
 
 type OntologyStyle = CSSProperties & {
   "--ontology-kind-hue"?: string;
@@ -107,7 +107,7 @@ function KindMark({
         ? `${entry.label}: ${rawKind}`
         : undefined}
     >
-      <Icon aria-hidden="true" strokeWidth={1.5} />
+      <Icon aria-hidden="true" />
       {showLabel && <span>{entry.label}</span>}
     </span>
   );

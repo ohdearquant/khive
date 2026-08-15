@@ -34,7 +34,7 @@ import {
   Upload,
   X,
   XCircle,
-} from "lucide-react";
+} from "@/icons";
 import { useMemo, useRef, useState } from "react";
 
 import {
