@@ -15,11 +15,15 @@ replaced an earlier note, the replacement was recorded only in note text rather 
 note it replaced. The remaining 20 of 42 queries had no stored answer at all — a
 persistence gap outside retrieval's reach and explicitly out of scope here.
 
-Today the recall pipeline reads `supersedes` edges only as a binary exclusion filter,
-implemented as one graph query per candidate (an N+1 access pattern), and no edge
-influences ranking. A previous attempt at additive temporal scoring was reverted because
-recency terms outweighed semantic relevance on unrelated queries; any mechanism here must
-not reintroduce that class.
+Today the recall pipeline applies supersession only as binary suppression after scoring.
+It gathers all ranked candidate IDs into one `EdgeFilter`, pages that candidate-batched
+filter to exhaustion, unions the matched target IDs with a `properties.supersedes`
+shortcut, and removes those IDs. This is already a batched exclusion operation, not a
+per-candidate graph access pattern. It cannot substitute a chain head that retrieval did
+not rank or preserve a matched member's fused retrieval evidence for that head. A previous
+attempt at additive temporal scoring was reverted because recency terms outweighed
+semantic relevance on unrelated queries; any mechanism here must not reintroduce that
+class.
 
 ## Teardown
 
@@ -28,50 +32,96 @@ not reintroduce that class.
   failure mechanism. That supports a narrow correctness mechanism, not a ranking program.
 - **Write-time edges plus binary filtering are sufficient.** No. Write-time capture is
   prospective; filtering can remove obsolete candidates but cannot guarantee that a weaker
-  successor enters the served set. It also preserves the current N+1 graph-query cliff.
+  successor enters the served set.
 - **An edge alone enables chain-head replacement.** No. A chain member must be present in
-  the pre-final candidates, the chain must have one visible head, and that head must
-  satisfy the evaluation timestamp.
+  the pre-final candidates, every traversed edge and node must remain in that candidate's
+  namespace, and the chain must have one live memory head created no later than the query
+  start.
 - **Correction-like text is trustworthy structure.** No. Negation, quotations, malformed
-  IDs, and scope differences can fabricate graph truth. Text may support a review
+  IDs, and scope differences can fabricate graph truth. Text may support a curation
   proposal, never automatic edge creation.
 - **Cluster recency safely approximates supersession.** No. Similarity does not establish
   replacement, and it cannot recover targets absent from the served pools.
 - **A reranker feature is the smallest change.** Under ADR-033, feature reranking is
   optional and replaces default scoring when configured. Verified truth must not depend on
   an optional weight.
-- **Corpus check.** The prior-decision search was inconclusive at authoring time;
-  sign-off review must confirm no conflicting accepted ADR was missed.
+- **Corpus check.** The prior-decision search was inconclusive at authoring time; the
+  acceptance check must confirm no conflicting accepted ADR was missed.
 
 ## Decision
 
 Treat supersession as verified truth canonicalization, not as a general ranking signal.
+Canonicalization follows only edges and live (non-deleted) memory nodes in the candidate's
+write namespace, selects only a live memory head in that namespace, and excludes every
+note or edge created after the recall query's start snapshot.
 
-Adopt explicit write-time capture, reviewed historical backfill, and one batched
+Adopt explicit write-time capture, curated historical backfill, and one batched
 serve-time chain-head substitution. Do not adopt cluster recency or reranker features from
 this evidence.
+
+### Component boundary
+
+```mermaid
+flowchart LR
+  W["memory.remember request"] --> G["Authorization Gate"]
+  G --> V["Supersession invariant validation"]
+  V --> S[("Notes and edges")]
+  R["Fused recall candidates"] --> C["One bounded closure query"]
+  S --> C
+  C --> Q["Canonical substitution and scoring"]
+```
+
+The Gate is the authorization seam. The write validator enforces data-integrity
+invariants, while the closure query applies serving predicates without changing stored
+records.
 
 ### 1. Capture supersession atomically
 
 `memory.remember` may gain an optional, bounded `supersedes: [<full-memory-uuid>, ...]`
 field.
 
-Edges are directed `new --supersedes--> old`. Every target must be a visible memory note
-in the same write namespace, and the write must not create a cycle. The note and all
+Edges are directed `new --supersedes--> old`. Every target must be a live (non-deleted)
+memory note in the caller's resolved write namespace, which is also the new note's
+namespace. A target outside that namespace is refused as `invalid_supersedes`; namespace
+visibility alone is not sufficient. The write must not create a cycle. The note and all
 declared edges commit atomically; failed validation or edge creation commits neither.
+
+The write remains authorized at the existing ADR-018 Gate seam. Its `GateRequest` carries
+the resolved caller actor, the resolved write namespace, and the unchanged target IDs in
+the request arguments, so deployed policy can evaluate all three. After the Gate allows
+dispatch, the handler defensively enforces the same-namespace, liveness, memory-kind, and
+cycle invariants. These checks do not create a new capability system and are not storage
+authorization checks.
+
+Each created edge carries the write namespace and durable
+`metadata.created_by_actor = {"kind": <kind>, "id": <id>}` attribution copied from the
+resolved caller identity. Edge creation must continue through the centralized endpoint
+validator. Before implementation is enabled, a contract test must prove that the composed
+ADR-002 base rules and loaded ADR-017 `EDGE_RULES` accept memory-note-to-memory-note
+`supersedes`; no handler-local bypass is permitted.
+
+The request field is an edge-creation instruction, not a second authority marker in note
+properties. A supersedes edge can be removed through the existing by-ID curation surface,
+`delete(id=<edge-uuid>)`, which remains subject to the existing Gate. The next recall
+snapshot then excludes that edge and restores the prior eligible head. This is the recovery
+path for an incorrect or malicious supersession; no separate unsupersede verb is
+introduced.
 
 Correction-text detection may emit diagnostics or proposals. It may not mint edges or
 affect ordering.
 
-### 2. Backfill through review
+### 2. Backfill through curation
 
-An offline campaign may scan historical notes for supersession claims. It produces
-dry-run proposals containing the source note, resolved target, evidence span, resolution
-method, and per-edge annotation.
+An offline campaign may scan historical notes for supersession claims. Each scan is
+bounded to live (non-deleted) notes of kind `memory` in one captured namespace snapshot.
+Both the proposed source and target must be live memory notes in that same namespace. The
+campaign produces dry-run proposals containing the source note, resolved target, evidence
+span, resolution method, and per-edge annotation.
 
 Full UUIDs may be proposed directly. Short IDs are eligible only when uniquely resolved
 against the captured namespace snapshot. Ambiguous claims remain observations. Only
-approved proposals create edges.
+approved proposals create edges. Approved writes traverse the same Gate and atomic
+validation path as explicit capture and stamp the approving caller's durable attribution.
 
 Complexity is `O(N × L + P)` offline, with no recall hot-path cost.
 
@@ -79,38 +129,79 @@ Complexity is `O(N × L + P)` offline, with no recall hot-path cost.
 
 After fusion and before note-local scoring or optional reranking:
 
-1. Collect at most `C ≤ 200` candidate IDs.
-2. Fetch their bounded supersession closure in one database query.
-3. Follow incoming edges toward newer notes, with depth 16 and 800 expanded-node caps.
-4. Map each valid component to its unique visible head.
-5. Preserve the best fused retrieval evidence from matched members.
-6. Take salience, decay, content, timestamps, and other note-local features from the head.
-7. Deduplicate before scoring.
+1. At query entry, open the consistent read snapshot used for candidate hydration and
+   closure, and read the storage query-start timestamp `Tq` from that snapshot before
+   candidate retrieval.
+2. Collect at most `C ≤ 200` candidates that are live (non-deleted) notes of kind `memory`,
+   belong to the recall visible set, and have `created_at ≤ Tq`. Retain each candidate's
+   write namespace as part of the closure input.
+3. In one database query against that snapshot, fetch the bounded supersession closure.
+   For each root candidate, traverse only live `supersedes` edges whose edge namespace is
+   identical to the candidate namespace and whose `created_at ≤ Tq`. Every source,
+   intermediate node, target, and selected head must also be a live (non-deleted) note of
+   kind `memory` in that same namespace with `created_at ≤ Tq`.
+4. Follow eligible incoming edges toward newer notes, with depth 16 and 800 expanded-node
+   caps. Detect a continuation that crosses a namespace or reaches an ineligible node, but
+   do not follow it.
+5. Map each valid component to its unique eligible head. If its only head is in another
+   namespace, is deleted, is not a memory note, or was created after `Tq`, classify the
+   component as head-unavailable; never emit that head.
+6. Preserve the best fused retrieval evidence from matched members.
+7. Take salience, decay, content, timestamps, and every other note-local scoring feature
+   only from the eligible head selected from the query-start snapshot.
+8. Deduplicate before scoring.
 
 This is pointer substitution licensed by an explicit relation — not a recency boost.
 
-Graph work is one round trip and `O(C + E_b)`. The current per-candidate graph checks are
-removed. There may be no N+1 fallback.
+The same-namespace closure is a serving/view-layer predicate consistent with ADR-007's
+attribution-only namespace model. It restricts what `memory.recall` may substitute; it
+does not reject or remove cross-namespace graph data, make namespace an authorization
+boundary, or change namespace-agnostic by-ID operations. Multiple visible namespaces are
+canonicalized as independent components.
+
+Graph work is one round trip and `O(C + E_b)`. One bounded closure query replaces the
+current candidate-batched, paginated exclusion query; there may be no per-candidate
+fallback. The legacy `properties.supersedes` shortcut does not license substitution after
+activation. A curated legacy property must first become an attributed edge through the
+backfill path, which keeps edge deletion authoritative for recovery.
+
+### Serving sequence
+
+```mermaid
+sequenceDiagram
+  participant Recall as memory.recall
+  participant Store as Storage snapshot
+  participant Score as Scoring pipeline
+  Recall->>Store: Open snapshot and capture Tq
+  Recall->>Store: Retrieve and hydrate eligible candidates
+  Recall->>Store: One closure query (IDs, namespaces, Tq)
+  Store-->>Recall: Eligible components and boundary markers
+  Recall->>Recall: Select heads, degrade, and deduplicate
+  Recall->>Score: Fused evidence plus head-local features
+```
 
 ### 4. Degradation contract
 
 The existing recall audit payload gains additive degradation modes; the public recall
-result shape remains unchanged.
+result shape remains unchanged. Each mode has a named consumer and must not ship until
+that consumer recognizes it.
 
-| Condition                  | Behavior                                                                             | Mode                            |
-| -------------------------- | ------------------------------------------------------------------------------------ | ------------------------------- |
-| Batch graph query fails    | Return baseline ranking without canonicalization; no N+1 retry                       | `supersession_lookup_failed`    |
-| Unique head is unavailable | Suppress known superseded members; fill from unaffected candidates                   | `supersession_head_unavailable` |
-| Multiple heads             | Inject no branch; suppress non-heads; independently retrieved heads compete normally | `supersession_fork`             |
-| Cycle or traversal cap     | Suppress the affected component                                                      | `supersession_chain_invalid`    |
-| Invalid explicit write     | Commit neither note nor edges                                                        | `invalid_supersedes`            |
-| Ambiguous backfill         | Create no edge; retain review record                                                 | `backfill_ambiguous`            |
+| Condition                                                                                                     | Behavior                                                                                      | Mode                            | Required consumer                                       |
+| ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------- | ------------------------------------------------------- |
+| Batch closure query fails                                                                                     | Return baseline ranking without canonicalization; no per-candidate retry                      | `supersession_lookup_failed`    | `RecallExecuted` projection and frozen replay evaluator |
+| Unique eligible head is unavailable, including a cross-namespace, deleted, non-memory, or post-`Tq` only head | Suppress known superseded members; fill from unaffected candidates                            | `supersession_head_unavailable` | `RecallExecuted` projection and frozen replay evaluator |
+| Multiple eligible heads                                                                                       | Inject no branch; suppress non-heads; independently retrieved eligible heads compete normally | `supersession_fork`             | `RecallExecuted` projection and frozen replay evaluator |
+| Cycle or traversal cap                                                                                        | Suppress the affected component                                                               | `supersession_chain_invalid`    | `RecallExecuted` projection and frozen replay evaluator |
+| Invalid explicit write, including a target outside the caller's write namespace                               | Commit neither note nor edges                                                                 | `invalid_supersedes`            | `memory.remember` error mapper and Gate audit stream    |
+| Ambiguous or ineligible backfill                                                                              | Create no edge; retain the proposal record                                                    | `backfill_ambiguous`            | backfill proposal processor                             |
 
 ### 5. Activation gate
 
-Replay the frozen evaluation pools with a frozen, reviewed edge overlay. The evaluator may
-introduce a target only through deterministic substitution from a captured candidate chain
-member. It may not rerun retrieval or admit a note created after the original query.
+Replay the frozen evaluation pools with a frozen, curated edge overlay. Each replay query
+must use its captured `Tq` and a consistent snapshot. The evaluator may introduce a target
+only through deterministic substitution from a captured candidate chain member and only
+when the edge, every intermediate node, and the head satisfy the same-namespace,
+live-memory, and `created_at ≤ Tq` predicates. It may not rerun retrieval.
 
 Activation requires:
 
@@ -118,10 +209,15 @@ Activation requires:
 - no existing top-10 correct answer falls out across the 22 answerable queries;
 - nDCG@10 remains at least 0.673;
 - the 20 no-stored-answer cases remain classified as persistence failures;
-- exactly one graph query at `C = 200`;
-- recall p50 and p95 within a predeclared 5% non-inferiority margin; and
-- test coverage of chains, duplicate mappings, forks, cycles, unavailable heads, batch
-  failure, and atomic rollback.
+- exactly one closure query at `C = 200`, compared with the existing one batched exclusion
+  query;
+- recall p50 and p95 within a predeclared 5% non-inferiority margin;
+- test coverage of chains, duplicate mappings, forks, cycles, cross-namespace edges,
+  deleted/non-memory/post-`Tq` heads, unavailable heads, edge-delete recovery, closure-query
+  failure, atomic rollback, and a write rejected by the Gate;
+- an endpoint-contract test through `validate_edge_relation_endpoints` with the memory pack
+  loaded; and
+- a consumer test for every degradation mode named above.
 
 If both misses are not recovered, do not enable substitution. Record the result as
 candidate-generation or persistence evidence; do not compensate with cluster recency.
@@ -134,19 +230,19 @@ A mechanism affecting only the two misses can improve mean nDCG by at most `2/22
 giving a loose ceiling of 0.764. Its top-10 ceiling is 22/22 and, if only those two reach
 rank 1, its top-1 ceiling is 9/22.
 
-| Option                                | Recovery ceiling on the frozen set                                                             | Complexity                           | Verdict                                 |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------ | --------------------------------------- |
-| Write-time linking                    | 0/2 historical misses                                                                          | `O(S)`, `S ≤ 16`; leaves current N+1 | Adopt explicit input only               |
-| Chain resolution                      | 0/2 without edges or a candidate chain member; conditionally 2/2                               | One `O(C + E_b)` query               | Adopt with linking + backfill and proof |
-| Cluster recency                       | 0/2 hard misses; could at most move 13 reachable non-top-1 targets                             | `O(C²d)` pairwise                    | Reject                                  |
-| Reranker feature                      | 0/2 if scoring existing candidates; head injection is chain resolution                         | `O(C)` after batched metadata        | Reject                                  |
-| Backfill alone                        | Guaranteed 0/2 on frozen served pools; theoretical ≤2/2 only from a wider hidden candidate set | Offline `O(NL + P)`                  | Necessary but insufficient              |
-| Linking + backfill + chain resolution | Conditional 2/2; nDCG ≤ 0.764, top-10 ≤ 22/22                                                  | Bounded write + one recall query     | Chosen, activation-gated                |
+| Option                                | Recovery ceiling on the frozen set                                                             | Complexity                                                  | Verdict                                 |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------- |
+| Write-time linking                    | 0/2 historical misses                                                                          | `O(S)`, `S ≤ 16`; existing batched suppression remains      | Adopt explicit input only               |
+| Chain resolution                      | 0/2 without edges or a candidate chain member; conditionally 2/2                               | One `O(C + E_b)` closure query replaces one exclusion query | Adopt with linking + backfill and proof |
+| Cluster recency                       | 0/2 hard misses; could at most move 13 reachable non-top-1 targets                             | `O(C²d)` pairwise                                           | Reject                                  |
+| Reranker feature                      | 0/2 if scoring existing candidates; head injection is chain resolution                         | `O(C)` after batched metadata                               | Reject                                  |
+| Backfill alone                        | Guaranteed 0/2 on frozen served pools; theoretical ≤2/2 only from a wider hidden candidate set | Offline `O(NL + P)`                                         | Necessary but insufficient              |
+| Linking + backfill + chain resolution | Conditional 2/2; nDCG ≤ 0.764, top-10 ≤ 22/22                                                  | Bounded write plus one recall closure query                 | Chosen, activation-gated                |
 
 ## Alternatives considered
 
 - **Linking + backfill + current binary filter:** cheapest fallback, but cannot guarantee
-  successor promotion and retains N+1 access.
+  successor promotion and remains suppression-only.
 - **Cluster-scoped multiplicative recency:** might improve reachable ordering, but cannot
   recover absent targets and confuses similarity with authority.
 - **ADR-033 chain-position feature:** optional weighting is the wrong contract for
@@ -161,10 +257,10 @@ rank 1, its top-1 ceiling is 9/22.
 Supersession differs from freshness. Freshness says a note is newer; supersession says it
 intentionally replaces another. Only the latter licenses substitution.
 
-Explicit linking prevents new unlinked chains, reviewed backfill repairs historical
+Explicit linking prevents new unlinked chains, curated backfill repairs historical
 structure, and batched chain resolution prevents a lexically rich obsolete note from
-eclipsing its terse successor. Batching also removes the existing per-candidate scale
-cliff.
+eclipsing its terse successor. The closure retains the current batched graph-access shape
+while upgrading the operation from exclusion to bounded canonical substitution.
 
 This remains a data-integrity intervention with a serving canonicalizer — not a general
 ranking program.
@@ -175,7 +271,8 @@ ranking program.
 
 - Add bounded, optional, atomic supersession capture to `memory.remember`.
 - Use text detection for warnings, observations, or proposals.
-- Replace binary N+1 filtering with one bounded batch closure.
+- Replace the candidate-batched binary edge/property suppression with one bounded batch
+  closure.
 - Add non-breaking internal audit and diagnostic fields.
 
 ### MAY NOT
@@ -185,13 +282,17 @@ ranking program.
 - Create edges from text alone.
 - Query the graph per candidate, including during degradation.
 - Make verified supersession depend on reranker configuration.
-- Cross namespace boundaries or credit post-query notes.
+- Traverse an edge or node outside the root candidate's namespace, emit a deleted or
+  non-memory head, or credit a note or edge created after `Tq`.
+- Treat the same-namespace serving predicate as storage isolation, authorization, or a
+  restriction on by-ID operations.
 - Claim improvement for the 20 no-stored-answer queries.
 
 ### Verify by
 
 - Frozen evaluation replay under the activation gate above.
 - Query-count instrumentation at `C = 1, 10, 100, 200`.
-- Latency comparison against the removed N+1 implementation.
-- Determinism and degradation-path tests.
-- Design sign-off before dependent implementation merges.
+- Latency comparison against the existing candidate-batched exclusion operation.
+- Determinism, namespace-boundary, live-memory, query-snapshot, edge-delete recovery, and
+  degradation-consumer tests.
+- Central endpoint-rule legality verification before dependent implementation merges.
