@@ -116,7 +116,7 @@ pub enum ProposalChangeset {
         edge_id: Uuid,
         expected: ExpectedEdgePreimage,
         disposition: GovernanceDisposition,
-        reason_code: Option<String>,
+        reason_code: Option<GovernanceReasonCode>,
     },
     /// Compound: an ordered sequence of the above, applied atomically.
     /// NOTE: as of PR #517, only single-step Compound is accepted at propose-time
@@ -850,9 +850,31 @@ migrating existing edges.
 A changeset step is **governance-bearing** when it is either:
 
 - `AddEdge` with `relation = supersedes` whose source and target are both
-  live notes of kind `memory` in the proposal's namespace; or
+  live notes of kind `memory` in the proposal's namespace and in the local
+  store; or
 - `ClassifyExistingEdgeGovernance` whose target edge, expected preimage, and
   both live endpoints all carry the proposal's namespace (A2).
+
+**The classification recurses.** A `Compound` is governance-bearing iff any
+step it contains is, evaluated to full nesting depth — the base ADR accepts
+single-step `Compound` and applies it recursively, so a shallow top-level
+match on the outer variant would let `Compound([AddEdge{supersedes, …}])`
+bypass every rule in this amendment. Every propose-time and review-time
+check in this amendment evaluates the recursive classification, never the
+outer variant alone.
+
+**Two memory-supersedes shapes are rejected at propose time** rather than
+left to the plain link path:
+
+- an `AddEdge` with `relation = supersedes` between memory notes in
+  _different_ namespaces. Under ADR-159 such an edge would be created
+  ungoverned and canonicalization-inert, so an approved proposal would
+  produce an edge that silently does nothing — a proposer-facing lie. The
+  proposal surface refuses it with a typed error; cross-namespace
+  supersession has no proposal route.
+- an `AddEdge` with `relation = supersedes` between memory notes where
+  either endpoint is not in the local store. Governance is local-only
+  (ADR-159 §2); the same silent-inert trap applies.
 
 All other steps — including `SupersedeEntity` (entity-level supersession) and
 `AddEdge` for any other relation or endpoint pair — are unaffected by this
@@ -896,11 +918,17 @@ by-ID contract, not a change to it.
 Apply dispatches to the storage primitive
 `classify_existing_edge_governance`, which in one write transaction: selects
 the edge by UUID including current liveness; requires exact equality with the
-full expected preimage, `relation = 'supersedes'`, live memory-note
+full expected preimage (`target_backend` compared null-safe and required to
+be NULL — governance is local-only per ADR-159 §2, and a cross-backend
+target's liveness cannot be validated atomically in this store's write
+transaction, ADR-029), `relation = 'supersedes'`, live memory-note
 endpoints, and the namespace binding above; consumes and revalidates the
-internal authority receipt for an `Authorize` disposition; appends the
-governance decision; and reconciles the active projection with the new
-disposition. Reconciliation is defined for both prior states, so a
+internal authority receipt for **both dispositions** — a rejection is an
+authority claim about the edge exactly as an authorization is, and
+`Reject` over a governed edge revokes live authority, so an unauthorized
+or stale-provider path must not be able to revoke any more than to grant;
+appends the governance decision; and reconciles the active projection with
+the new disposition. Reconciliation is defined for both prior states, so a
 classification can never leave a projection that contradicts the newest
 decision: `Authorize` on an unclassified edge inserts the projection row;
 `Authorize` on an already-governed edge fails the apply (re-authorizing live
@@ -932,9 +960,17 @@ binding-validated authority receipt (A4.3). `governed_link` commits the edge ups
 decision, and the active projection row in one writer transaction, and it
 returns and stamps the actual incumbent edge UUID selected by the
 natural-key upsert, so the decision row binds the edge incarnation that
-really exists rather than the one the proposer imagined. On any receipt
-revalidation failure at apply time the transaction rolls back and the apply
-fails with the same stale-preimage contract as A2.
+really exists rather than the one the proposer imagined. If the incumbent
+edge the natural-key upsert selects is **already actively governed** — a
+row for it exists in the active projection — the apply FAILS with the same
+typed stale-preimage contract as A2 and no row is written: `governed_link`
+never appends a second active decision, never reactivates spent authority,
+and never silently preserves the incumbent's authority under a new
+decision's name. The existing authority must first be revoked through a
+`ClassifyExistingEdgeGovernance` proposal with disposition `Reject` (A2's
+reconciliation arm); only an unclassified incumbent is eligible. On any
+receipt revalidation failure at apply time the transaction rolls back and
+the apply fails with the same stale-preimage contract as A2.
 
 A governance-bearing `AddEdge` in a proposal that is applied WITHOUT a valid
 receipt on file (for example, a deployment that disabled the authority
@@ -957,36 +993,63 @@ Non-self establishes only that the reviewer is a _different_ actor, and
 being different is not being entitled (ADR-159, Context defect 2). This
 amendment adds, for governance-bearing changesets only:
 
-1. **Authority is checked at the dispatch Gate, not in the handler**
+1. **Authority is checked at the dispatch site, not in the handler**
    (ADR-127: handlers never authorize; the dispatch site is the sole
    enforcement point — this amendment preserves that invariant rather than
-   amending it). When the `review` verb is dispatched with
-   `decision = Approve` against a proposal whose changeset is
-   governance-bearing, the Gate's admission check (ADR-018) evaluates
-   endpoint-scoped authority for action `memory.supersede` over each
-   superseded memory named by the changeset (the `AddEdge` target, or the
+   amending it). The check is a **two-stage dispatch admission**, both
+   stages running at the dispatch site before the handler. Stage 1 is the
+   unmodified ADR-018 Gate over the raw request (actor, namespace, verb,
+   args, context) — the Gate's existing contract is not widened and it
+   receives no storage capability. Stage 2 is a governance admission step
+   that runs only when the `review` verb carries `decision = Approve`; it
+   is equipped with a **read-only proposal resolver** — a dispatch-site
+   capability, not a Gate input and not a handler privilege — which loads
+   the stored proposal named by the request's proposal id, classifies its
+   changeset (A1), and, when governance-bearing, evaluates endpoint-scoped
+   authority for action `memory.supersede` over each superseded memory
+   named by the changeset (the `AddEdge` target, or the
    `expected.target_id` of a classification step). Denial refuses the
    dispatch with a typed error
    (`ReviewerNotAuthorized { proposal_id, actor_id }`) — parallel to
    `SelfApprovalForbidden`, before the handler runs and before any event
-   lands. On allow, the Gate attaches the endpoint-scoped
-   `AuthorityReceipt` to the decision as an obligation (ADR-018's
-   decision/obligation interface); the handler consumes the obligation's
-   receipt and performs no authorization of its own.
+   lands. **Admission errors fail closed for this class**: a resolver
+   failure, an authority-provider error, or an unavailable provider
+   refuses the dispatch exactly as a denial does; the base dispatch path's
+   fail-open treatment of Gate errors is explicitly overridden for
+   governance-bearing review dispatch, while ungoverned verbs keep their
+   existing behavior. On allow, stage 2 issues the endpoint-scoped
+   `AuthorityReceipt` and the dispatch site hands it to the handler
+   in-process (item 2); the handler performs no authorization of its own.
 2. The receipt is runtime-internal and non-serializable (ADR-159 §2), and
    it is **mechanically bound**: it carries the `proposal_id`, the
-   `review_event_id` it authorizes (bound when that event is minted), and a
-   digest of the complete changeset it was evaluated against, alongside the
-   action and authority subject. It is never written into any event
-   payload. What the event log carries is the unchanged `ProposalReviewed`
-   event; the governance decision row carries `proposal_id` and the
-   mandatory `review_event_id`, naming the reviewer as `authorizer` and the
-   apply worker's identity (`system:propose-apply`) only as `applied_by`.
-   Authority is never inferred from the apply worker's system identity.
+   `review_event_id` it authorizes, and a digest of the complete changeset
+   it was evaluated against, alongside the action and authority subject.
+   The event-id binding is resolved by **preallocation**: stage 2
+   preallocates the `ProposalReviewed` event id before issuing the
+   receipt, binds that id into the receipt, and the handler MUST commit
+   the `ProposalReviewed` event under exactly that preallocated id in the
+   same operation that records the review — the receipt is therefore never
+   issued against an event id that the committed event does not carry, and
+   a committed event id differing from the receipt's bound id fails the
+   apply-time binding validation (item 3). Transport is an **in-process
+   dispatch handoff**: the dispatch site passes the receipt to the handler
+   invocation directly as a typed in-memory argument. It is NEVER carried
+   through ADR-018's obligation interface — every obligation variant is
+   serializable by construction and allow-decision obligations are copied
+   into audit events, so an obligation-borne receipt would be serialized
+   into the audit log, defeating non-serializability. It is never written
+   into any event payload. What the event log carries is the unchanged
+   `ProposalReviewed` event; the governance decision row carries
+   `proposal_id` and the mandatory `review_event_id`, naming the reviewer
+   as `authorizer` and the apply worker's identity (`system:propose-apply`)
+   only as `applied_by`. Authority is never inferred from the apply
+   worker's system identity.
 3. At apply time the worker does not rely on any receipt merely found on
    file, and a receipt cannot be carried in memory across processes at all
    (it is non-serializable by construction): the applying process
-   **re-obtains** the receipt from the Gate/authority provider, scoped to
+   **re-obtains** the receipt through the same stage-2 admission seam —
+   the authority provider, reached with the same read-only proposal
+   resolver, with the same fail-closed error contract — scoped to
    the same action and subjects and bound to the applying proposal's
    `proposal_id`, `review_event_id`, and changeset digest, then validates
    that binding against the proposal being applied. A receipt whose binding
@@ -1060,3 +1123,19 @@ reviewer test.
 - A seam test: with the Gate's authority check disabled, a
   governance-bearing approve must fail closed rather than fall through to
   a handler-side check — proving the handler carries none.
+- A fail-closed admission pair: with the authority provider erroring
+  (erroring, not denying), a governance-bearing approve is refused with a
+  typed error and no `ProposalReviewed` event exists afterward; an
+  ungoverned verb dispatched under the same provider error keeps its base
+  behavior — proving the override is scoped to the governance class.
+- An event-id binding test: the committed `ProposalReviewed` event id
+  equals the receipt's preallocated bound id; a forced mismatch fails the
+  apply-time binding validation with zero graph mutation.
+- A transport test: the audit events and event payloads emitted by a
+  governance-bearing approve contain no serialized receipt — asserted on
+  the obligation/audit channel contents, proving the receipt rode the
+  in-process handoff and nothing else.
+- An incumbent-governed upsert test: a governance-bearing `AddEdge` whose
+  natural-key upsert selects an actively governed incumbent fails the
+  apply with the stale-preimage contract, appends no decision row, and
+  leaves the incumbent's projection row untouched.
