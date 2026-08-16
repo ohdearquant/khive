@@ -394,6 +394,26 @@ the head satisfy the same-namespace, live-memory, and `created_at ≤ Tq`
 predicates. It may not rerun retrieval, and its overlay may not grant
 governance to an edge lacking an active marker.
 
+**Ordering.** The replay gate runs after ADR-159's migration classification
+is terminal for the inventoried population and before its fence transaction
+commits `status = 'active'`. During the gate, the evaluator applies
+ADR-159's closure predicate with the `edge_governance_state.status ==
+'active'` conjunct treated as satisfied by the staged activation under
+evaluation; every other conjunct — live edge, live memory endpoints,
+active-marker row, bound-preimage equality — is evaluated against real
+storage. This as-if-active reading is sound because the governance decisions
+and active markers for the inventoried population exist before the fence per
+ADR-159 §6's pre-fence steps, and any edge arriving after the inventory
+receives its durable disposition inside the fence transaction itself and,
+being created after the frozen pools were captured, could not satisfy any
+replayed query's `Tq` predicate in any case. Only when the gate passes does
+the fence commit `status = 'active'`; that single committed write is what
+flips `memory.recall` to the governed serving predicate through §3's
+consumption rule, so serving changes atomically with activation and never
+before the gate has passed. In the requirement list below, the first item is
+therefore discharged at fence commit time — the gate's pass is a
+precondition of that commit, not the reverse.
+
 Activation requires:
 
 - ADR-159's activation preconditions satisfied and its
