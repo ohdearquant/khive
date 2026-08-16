@@ -317,16 +317,16 @@ fn quote_fts5_phrase(raw_query: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Build a recall-oriented FTS expression from the same lexical terms the
-/// in-memory scorer consumes.
+/// Build the per-term FTS5 match clauses the candidate fetch runs bounded
+/// subqueries over — one quoted phrase per de-duplicated, non-stop, expanded
+/// term. Queries with no scoreable term fall back to the exact raw phrase
+/// (same fallback `fts5_candidate_expression` uses).
 ///
 /// FTS is only the candidate generator; TF-IDF remains the ranker. Requiring
 /// the whole raw query as one phrase drops candidates whose matching terms are
-/// separated in the document. OR-ing the de-duplicated, non-stop terms keeps
-/// those non-contiguous matches in the pool for the scorer to judge. Queries
-/// with no scoreable term retain the exact-phrase fallback used by the
-/// exact-name-only path.
-fn fts5_candidate_expression(raw_query: &str) -> String {
+/// separated in the document; per-term clauses keep those non-contiguous
+/// matches reachable for the scorer to judge.
+fn fts5_candidate_terms(raw_query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut terms: Vec<String> = matching::tokenize_field(raw_query)
         .into_iter()
@@ -335,18 +335,23 @@ fn fts5_candidate_expression(raw_query: &str) -> String {
         .collect();
 
     if terms.is_empty() {
-        quote_fts5_phrase(raw_query)
+        vec![quote_fts5_phrase(raw_query)]
     } else {
         // Candidate recall observes the same singular/plural expansion as the
         // scorer. The returned set is used by IDF weighting later; expansion's
         // mutation of `terms` is the only result needed here.
         let _ = expand_terms(&mut terms);
-        terms
-            .iter()
-            .map(|term| quote_fts5_phrase(term))
-            .collect::<Vec<_>>()
-            .join(" OR ")
+        terms.iter().map(|term| quote_fts5_phrase(term)).collect()
     }
+}
+
+/// The OR-joined form of [`fts5_candidate_terms`], used only for the cheap
+/// unordered existence probe in `fetch_fts_candidates` (no `ORDER BY bm25`,
+/// `LIMIT 1`) — never as the ordered candidate query itself. See issue #1930:
+/// running that ordered query over the full OR-joined match set is what made
+/// `knowledge.suggest`/`knowledge.search` blow the read deadline at scale.
+fn fts5_candidate_expression(raw_query: &str) -> String {
+    fts5_candidate_terms(raw_query).join(" OR ")
 }
 
 /// SQL eligibility predicate for the public atom/domain kind filter.
@@ -366,6 +371,45 @@ fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
 
 // ─── FTS5 candidate pool fetch ────────────────────────────────────────────────
 
+/// Per-term bounded candidate cap (issue #1930). A single-term `MATCH` orders
+/// a much smaller row set than the OR-joined expression over every expanded
+/// term, so bounding each term independently — instead of bounding only the
+/// combined result — keeps the read cost proportional to the number of terms,
+/// never to the size of the full match set.
+const FTS_TERM_LIMIT: usize = 500;
+
+/// Outcome of the bounded lexical candidate fetch.
+///
+/// `timed_out` is set only for [`khive_storage::StorageError::Timeout`] — the
+/// request-scoped read deadline elapsing mid-fetch. Any other storage error
+/// (including a genuine FTS5 syntax/parser error) still surfaces as an `Err`;
+/// fail-open applies to a timeout only.
+struct FtsFetchOutcome {
+    atoms: Vec<Atom>,
+    timed_out: bool,
+}
+
+fn is_timeout(e: &khive_storage::StorageError) -> bool {
+    matches!(e, khive_storage::StorageError::Timeout { .. })
+}
+
+/// Same check, for the `RuntimeError` shape `?`-propagated storage timeouts
+/// arrive in at the handler layer.
+fn is_read_timeout(e: &RuntimeError) -> bool {
+    matches!(
+        e,
+        RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
+    )
+}
+
+/// Fetch a bounded lexical candidate pool.
+///
+/// Replaces a single `ORDER BY bm25(...)` over one OR-joined match expression
+/// (whose cost scales with the size of the entire match set — the #1930 read
+/// timeout at ~94K atoms) with one bounded, independently-capped subquery per
+/// term, unioned and deduplicated in application code. FTS remains only the
+/// candidate generator; TF-IDF in `search_core` remains the ranker, so the
+/// per-term merge order does not need to be a globally correct bm25 rank.
 async fn fetch_fts_candidates(
     runtime: &KhiveRuntime,
     ns: &str,
@@ -374,93 +418,149 @@ async fn fetch_fts_candidates(
     statuses: &[String],
     exclude_statuses: &[&str],
     fetch_limit: usize,
-) -> Result<Vec<Atom>, RuntimeError> {
+) -> Result<FtsFetchOutcome, RuntimeError> {
     let sql = runtime.sql();
     let mut reader = sql
         .reader()
         .await
         .map_err(|e| sql_err("search fts reader", e))?;
 
-    let match_expr = fts5_candidate_expression(raw_query);
-    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 4);
+    let terms = fts5_candidate_terms(raw_query);
     let type_clause = type_eligibility_sql(type_filter, "a");
+    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 4);
+    let per_term_limit = fetch_limit.clamp(1, FTS_TERM_LIMIT);
+
+    let mut seen_ids: HashSet<Uuid> = HashSet::new();
+    let mut combined: Vec<Atom> = Vec::new();
+
+    // Join the canonical atom row before LIMIT so deleted, status-ineligible,
+    // and wrong-kind FTS rows cannot consume the bounded candidate window.
+    // bm25 orders each term's eligible matches before its own cap; slug is
+    // the stable tie break for equal lexical rank.
+    let per_term_sql = format!(
+        "SELECT a.* FROM fts_knowledge \
+         JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+         WHERE fts_knowledge MATCH ?1 \
+           AND fts_knowledge.namespace = ?2 \
+           AND a.namespace = ?2 \
+           AND a.deleted_at IS NULL{status_clause}{type_clause} \
+         ORDER BY bm25(fts_knowledge), a.slug \
+         LIMIT ?3"
+    );
+
+    for term in &terms {
+        if combined.len() >= fetch_limit {
+            break;
+        }
+        let mut params = vec![
+            SqlValue::Text(term.clone()),
+            SqlValue::Text(ns.to_owned()),
+            SqlValue::Integer(per_term_limit as i64),
+        ];
+        params.extend(status_params.iter().cloned());
+
+        let rows = match reader
+            .query_all(SqlStatement {
+                sql: per_term_sql.clone(),
+                params,
+                label: None,
+            })
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) if is_timeout(&e) => {
+                return Ok(FtsFetchOutcome {
+                    atoms: combined,
+                    timed_out: true,
+                });
+            }
+            Err(e) => return Err(sql_err("search fts query", e)),
+        };
+
+        for atom in rows.iter().filter_map(atom_from_row) {
+            if seen_ids.insert(atom.id) {
+                combined.push(atom);
+            }
+        }
+    }
+
+    if !combined.is_empty() {
+        return Ok(FtsFetchOutcome {
+            atoms: combined,
+            timed_out: false,
+        });
+    }
+
+    // No term produced an eligible row. Preserve the fallback's established
+    // meaning: it is for a lexical miss, not for a lexical match whose rows
+    // were all ineligible. In the latter case an empty result is correct; a
+    // full scan could otherwise admit unrelated zero-score rows when
+    // min_score is the default 0. This probe has no ORDER BY and LIMIT 1, so
+    // it stays cheap even over the OR-joined expression.
+    let match_expr = fts5_candidate_expression(raw_query);
+    let raw_fts_match = match reader
+        .query_row(SqlStatement {
+            sql: "SELECT 1 AS present FROM fts_knowledge \
+                  WHERE fts_knowledge MATCH ?1 AND namespace = ?2 LIMIT 1"
+                .to_string(),
+            params: vec![SqlValue::Text(match_expr), SqlValue::Text(ns.to_owned())],
+            label: None,
+        })
+        .await
+    {
+        Ok(row) => row,
+        Err(e) if is_timeout(&e) => {
+            return Ok(FtsFetchOutcome {
+                atoms: Vec::new(),
+                timed_out: true,
+            });
+        }
+        Err(e) => return Err(sql_err("search fts eligibility probe", e)),
+    };
+    if raw_fts_match.is_some() {
+        return Ok(FtsFetchOutcome {
+            atoms: Vec::new(),
+            timed_out: false,
+        });
+    }
+
+    // FTS returned nothing — fall back to a bounded full scan. Eligibility
+    // remains inside SQL so the cap is filled from rows the caller can
+    // actually receive.
+    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 3);
+    let sql_str = format!(
+        "SELECT a.* FROM knowledge_atoms AS a \
+         WHERE a.namespace = ?1 AND a.deleted_at IS NULL{status_clause}{type_clause} \
+         ORDER BY a.created_at DESC, a.slug LIMIT ?2"
+    );
     let mut params = vec![
-        SqlValue::Text(match_expr.clone()),
         SqlValue::Text(ns.to_owned()),
         SqlValue::Integer(fetch_limit as i64),
     ];
     params.extend(status_params);
 
-    // Join the canonical atom row before LIMIT so deleted, status-ineligible,
-    // and wrong-kind FTS rows cannot consume the bounded candidate window.
-    // bm25 orders the eligible matches before the cap; slug is the stable tie
-    // break for equal lexical rank.
-    let fts_rows = reader
+    let rows = match reader
         .query_all(SqlStatement {
-            sql: format!(
-                "SELECT a.* FROM fts_knowledge \
-                 JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
-                 WHERE fts_knowledge MATCH ?1 \
-                   AND fts_knowledge.namespace = ?2 \
-                   AND a.namespace = ?2 \
-                   AND a.deleted_at IS NULL{status_clause}{type_clause} \
-                 ORDER BY bm25(fts_knowledge), a.slug \
-                 LIMIT ?3"
-            ),
+            sql: sql_str,
             params,
             label: None,
         })
         .await
-        .map_err(|e| sql_err("search fts query", e))?;
-
-    if fts_rows.is_empty() {
-        // Preserve the fallback's established meaning: it is for a lexical
-        // miss, not for a lexical match whose rows were all ineligible. In the
-        // latter case an empty result is correct; a full scan could otherwise
-        // admit unrelated zero-score rows when min_score is the default 0.
-        let raw_fts_match = reader
-            .query_row(SqlStatement {
-                sql: "SELECT 1 AS present FROM fts_knowledge \
-                      WHERE fts_knowledge MATCH ?1 AND namespace = ?2 LIMIT 1"
-                    .to_string(),
-                params: vec![SqlValue::Text(match_expr), SqlValue::Text(ns.to_owned())],
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("search fts eligibility probe", e))?;
-        if raw_fts_match.is_some() {
-            return Ok(Vec::new());
+    {
+        Ok(rows) => rows,
+        Err(e) if is_timeout(&e) => {
+            return Ok(FtsFetchOutcome {
+                atoms: Vec::new(),
+                timed_out: true,
+            });
         }
+        Err(e) => return Err(sql_err("search full scan", e)),
+    };
 
-        // FTS returned nothing — fall back to a bounded full scan. Eligibility
-        // remains inside SQL so the cap is filled from rows the caller can
-        // actually receive.
-        let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 3);
-        let type_clause = type_eligibility_sql(type_filter, "a");
-        let sql_str = format!(
-            "SELECT a.* FROM knowledge_atoms AS a \
-             WHERE a.namespace = ?1 AND a.deleted_at IS NULL{status_clause}{type_clause} \
-             ORDER BY a.created_at DESC, a.slug LIMIT ?2"
-        );
-        let mut params = vec![
-            SqlValue::Text(ns.to_owned()),
-            SqlValue::Integer(fetch_limit as i64),
-        ];
-        params.extend(status_params);
-
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: sql_str,
-                params,
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("search full scan", e))?;
-
-        return Ok(rows.iter().filter_map(atom_from_row).collect());
-    }
-
-    Ok(fts_rows.iter().filter_map(atom_from_row).collect())
+    Ok(FtsFetchOutcome {
+        atoms: rows.iter().filter_map(atom_from_row).collect(),
+        timed_out: false,
+    })
 }
 
 // ─── search context ───────────────────────────────────────────────────────────
@@ -479,7 +579,16 @@ struct SearchCtx<'a> {
 
 // ─── core single-pass search ──────────────────────────────────────────────────
 
-async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>, RuntimeError> {
+/// `search_core`'s result plus whether the lexical/FTS candidate fetch hit the
+/// request read deadline (issue #1930's fail-open signal). A caller sees
+/// `hits` possibly empty/partial and `lexical_timed_out = true` instead of an
+/// `Err` — never a verb-level error for a genuine timeout.
+struct SearchCoreOutcome {
+    hits: Vec<ScoredHit>,
+    lexical_timed_out: bool,
+}
+
+async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutcome, RuntimeError> {
     let runtime = ctx.runtime;
     let ns = ctx.ns;
     let role = ctx.role;
@@ -489,7 +598,10 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
     let fetch_limit = ctx.fetch_limit;
     let raw_query = query.trim().to_string();
     if raw_query.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SearchCoreOutcome {
+            hits: Vec::new(),
+            lexical_timed_out: false,
+        });
     }
 
     let scored_query = match role {
@@ -519,7 +631,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
     // fall through to exact-name-bonus-only scoring rather than returning early.
     let terms_only_exact = terms.is_empty();
 
-    let atoms = fetch_fts_candidates(
+    let FtsFetchOutcome { atoms, timed_out } = fetch_fts_candidates(
         runtime,
         ns,
         &raw_query,
@@ -530,12 +642,18 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
     )
     .await?;
     if atoms.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SearchCoreOutcome {
+            hits: Vec::new(),
+            lexical_timed_out: timed_out,
+        });
     }
 
     let candidates = load_candidates_from_atoms(&atoms, type_filter);
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SearchCoreOutcome {
+            hits: Vec::new(),
+            lexical_timed_out: timed_out,
+        });
     }
 
     let idf = compute_idf(&candidates, &terms, &expanded, w.expand_discount);
@@ -570,20 +688,23 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
     });
     scored.truncate(fetch_limit);
 
-    Ok(scored
-        .into_iter()
-        .map(|(score, cand)| ScoredHit {
-            id: cand.id.clone(),
-            slug: cand.slug.clone(),
-            name: cand.name_raw.clone(),
-            content: cand.content_raw.clone(),
-            tags: cand.tags_raw.clone(),
-            status: cand.status_raw.clone(),
-            finalized: cand.finalized,
-            is_domain: cand.is_domain,
-            score,
-        })
-        .collect())
+    Ok(SearchCoreOutcome {
+        hits: scored
+            .into_iter()
+            .map(|(score, cand)| ScoredHit {
+                id: cand.id.clone(),
+                slug: cand.slug.clone(),
+                name: cand.name_raw.clone(),
+                content: cand.content_raw.clone(),
+                tags: cand.tags_raw.clone(),
+                status: cand.status_raw.clone(),
+                finalized: cand.finalized,
+                is_domain: cand.is_domain,
+                score,
+            })
+            .collect(),
+        lexical_timed_out: timed_out,
+    })
 }
 
 // ─── decomposed search ───────────────────────────────────────────────────────
@@ -592,7 +713,7 @@ async fn search_decomposed(
     ctx: &SearchCtx<'_>,
     query: &str,
     intersection_bonus: f32,
-) -> Result<Vec<ScoredHit>, RuntimeError> {
+) -> Result<SearchCoreOutcome, RuntimeError> {
     let non_stop: Vec<&str> = query
         .split_whitespace()
         .filter(|w| w.len() >= MIN_TERM_LEN && !is_stop(&w.to_lowercase()))
@@ -603,7 +724,10 @@ async fn search_decomposed(
     let sub_q2: String = non_stop[mid..].join(" ");
     let sub_limit = ctx.fetch_limit.min(50);
 
-    let full = search_core(ctx, query).await?;
+    let SearchCoreOutcome {
+        hits: full,
+        lexical_timed_out: full_timed_out,
+    } = search_core(ctx, query).await?;
     let sub_ctx1 = SearchCtx {
         runtime: ctx.runtime,
         ns: ctx.ns,
@@ -615,8 +739,15 @@ async fn search_decomposed(
         statuses: ctx.statuses,
         exclude_statuses: ctx.exclude_statuses,
     };
-    let s1 = search_core(&sub_ctx1, &sub_q1).await?;
-    let s2 = search_core(&sub_ctx1, &sub_q2).await?;
+    let SearchCoreOutcome {
+        hits: s1,
+        lexical_timed_out: s1_timed_out,
+    } = search_core(&sub_ctx1, &sub_q1).await?;
+    let SearchCoreOutcome {
+        hits: s2,
+        lexical_timed_out: s2_timed_out,
+    } = search_core(&sub_ctx1, &sub_q2).await?;
+    let lexical_timed_out = full_timed_out || s1_timed_out || s2_timed_out;
 
     let mut scores: HashMap<String, f32> = HashMap::new();
     let mut data: HashMap<String, ScoredHit> = HashMap::new();
@@ -665,7 +796,10 @@ async fn search_decomposed(
             .then_with(|| a.slug.cmp(&b.slug))
     });
     ranked.truncate(ctx.fetch_limit);
-    Ok(ranked)
+    Ok(SearchCoreOutcome {
+        hits: ranked,
+        lexical_timed_out,
+    })
 }
 
 // ─── embedding rerank ────────────────────────────────────────────────────────
@@ -938,6 +1072,20 @@ fn attach_hydration_degradation(out: &mut Value, hydration_failures: usize) {
         out["degraded"] = json!({});
     }
     out["degraded"]["hydration_failures"] = json!(hydration_failures);
+}
+
+/// Flag that the lexical/FTS candidate fetch hit the request read deadline
+/// (issue #1930). Set alongside whatever ANN-backed results (if any) still
+/// made it into the response — a timed-out lexical stage degrades the
+/// response, it never fails the verb outright.
+fn attach_lexical_timeout_degradation(out: &mut Value) {
+    if !out
+        .get("degraded")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        out["degraded"] = json!({});
+    }
+    out["degraded"]["lexical_timeout"] = json!(true);
 }
 
 struct EligibleAnnSearchState {
@@ -1627,55 +1775,86 @@ impl KnowledgeHandlers {
             exclude_statuses: &effective_exclude_statuses,
         };
 
-        let mut hits = if do_decompose && non_stop_count >= decompose_threshold {
+        // Trigger background warm — never block search on the ANN rebuild.
+        vamana::ensure_ann_background(runtime, token, ann);
+
+        // Fetch ANN candidates BEFORE the lexical stage. The lexical fetch is
+        // now bounded (issue #1930) but still non-zero cost; running ANN
+        // first means a lexical read-deadline timeout afterward cannot
+        // discard ANN results that were already safely computed — the
+        // degraded arm below can then report ANN-backed results instead of
+        // erroring the whole verb. A read timeout in this ANN stage itself
+        // is likewise fail-open, never propagated as a verb-level error.
+        let mut ann_hits: Vec<ScoredHit> = Vec::new();
+        let mut ann_availability: Option<AnnAvailability> = None;
+        let mut hydration_failures = 0usize;
+        let ann_k = fetch_limit.max(20);
+        match khive_storage::await_request_read_phase(
+            "knowledge.search",
+            runtime.embed_query(&raw_query),
+        )
+        .await
+        {
+            Ok(Ok(query_emb)) => {
+                let model = runtime.default_embedder_name();
+                let key = vamana::AnnKey::new(&ns, model);
+                match search_eligible_ann_with_refill(
+                    &ctx, token, ann, &key, &query_emb, ann_k, ann_k,
+                )
+                .await
+                {
+                    Ok(EligibleAnnSearchState {
+                        hits,
+                        availability,
+                        hydration_failures: ann_hydration_failures,
+                    }) => {
+                        hydration_failures += ann_hydration_failures;
+                        ann_hits = hits;
+                        ann_availability = Some(availability);
+                    }
+                    Err(e) if is_read_timeout(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(Err(_)) => {}
+            Err(e) if is_timeout(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let SearchCoreOutcome {
+            mut hits,
+            lexical_timed_out,
+        } = if do_decompose && non_stop_count >= decompose_threshold {
             search_decomposed(&ctx, &raw_query, intersection_bonus).await?
         } else {
             search_core(&ctx, &raw_query).await?
         };
 
-        // Trigger background warm — never block search on the ANN rebuild.
-        vamana::ensure_ann_background(runtime, token, ann);
-
         let mut ann_unavailable = false;
-        let mut hydration_failures = 0usize;
-        let query_embedding = khive_storage::await_request_read_phase(
-            "knowledge.search",
-            runtime.embed_query(&raw_query),
-        )
-        .await?;
-        if let Ok(query_emb) = query_embedding {
-            let ann_k = fetch_limit.max(20);
-            let model = runtime.default_embedder_name();
-            let key = vamana::AnnKey::new(&ns, model);
-            let EligibleAnnSearchState {
-                hits: ann_hits,
-                availability,
-                hydration_failures: ann_hydration_failures,
-            } = search_eligible_ann_with_refill(&ctx, token, ann, &key, &query_emb, ann_k, ann_k)
-                .await?;
-            hydration_failures += ann_hydration_failures;
-
-            if !ann_hits.is_empty() {
-                fuse_ann_hits(&mut hits, &ann_hits, min_score);
-            }
-            // FTS hits remain valid partial results. Preserve the existing
-            // advisory only for a non-empty corpus with no lexical fallback.
-            if matches!(
-                availability,
-                AnnAvailability::WarmingTimedOut {
-                    corpus_non_empty: true
-                }
-            ) && hits.is_empty()
-            {
-                ann_unavailable = true;
-            }
+        if !ann_hits.is_empty() {
+            fuse_ann_hits(&mut hits, &ann_hits, min_score);
+        }
+        // FTS hits remain valid partial results. Preserve the existing
+        // advisory only for a non-empty corpus with no lexical fallback.
+        if matches!(
+            ann_availability,
+            Some(AnnAvailability::WarmingTimedOut {
+                corpus_non_empty: true
+            })
+        ) && hits.is_empty()
+        {
+            ann_unavailable = true;
         }
         // Apply shared eligibility unconditionally so every source observes the
         // same final status and kind contract even when ANN did not run.
         filter_hits_by_status(&mut hits, &requested_statuses, &effective_exclude_statuses);
         filter_hits_by_type(&mut hits, type_filter);
 
-        if do_rerank && !hits.is_empty() {
+        // See `suggest`'s matching guard: a lexical-stage timeout means the
+        // request read deadline is already spent, so skip the further
+        // embedding read rather than let it convert a degraded-but-ok
+        // response into a verb-level error.
+        if do_rerank && !hits.is_empty() && !lexical_timed_out {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
         }
 
@@ -1705,8 +1884,16 @@ impl KnowledgeHandlers {
         if ann_unavailable {
             out["ann_unavailable"] = json!(true);
         }
+        if lexical_timed_out {
+            attach_lexical_timeout_degradation(&mut out);
+        }
         attach_hydration_degradation(&mut out, hydration_failures);
-        khive_storage::ensure_request_read_active("knowledge.search")?;
+        // A lexical-stage timeout already committed this call to a degraded
+        // response (never a verb-level error, issue #1930) — re-checking the
+        // same expired deadline here would discard it.
+        if !lexical_timed_out {
+            khive_storage::ensure_request_read_active("knowledge.search")?;
+        }
         Ok(out)
     }
 
@@ -1749,63 +1936,98 @@ impl KnowledgeHandlers {
             exclude_statuses: SUGGEST_EXCLUDE,
         };
 
-        let mut hits = search_core(&ctx, &raw_query).await?;
-
+        // Fetch ANN candidates BEFORE the lexical stage — same rationale as
+        // `search`: the lexical fetch is bounded (issue #1930) but still
+        // non-zero cost, so computing ANN first means a lexical read-deadline
+        // timeout afterward cannot discard ANN results already in hand.
         vamana::ensure_ann_background(runtime, token, ann);
-        let mut ann_unavailable = false;
+        let mut ann_hits: Vec<ScoredHit> = Vec::new();
+        let mut ann_availability: Option<AnnAvailability> = None;
         let mut hydration_failures = 0usize;
-        let query_embedding = khive_storage::await_request_read_phase(
+        // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
+        // limit*3 would return mostly atoms that all get dropped after type filtering.
+        // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
+        // top ANN neighbors before the type gate discards atom hits.
+        let ann_k = (limit * 50).max(200);
+        match khive_storage::await_request_read_phase(
             "knowledge.suggest",
             runtime.embed_query(&raw_query),
         )
-        .await?;
-        if let Ok(query_emb) = query_embedding {
-            // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
-            // limit*3 would return mostly atoms that all get dropped after type filtering.
-            // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
-            // top ANN neighbors before the type gate discards atom hits.
-            let ann_k = (limit * 50).max(200);
-            let model = runtime.default_embedder_name();
-            let key = vamana::AnnKey::new(&ns, model);
-            let EligibleAnnSearchState {
-                hits: ann_hits,
-                availability,
-                hydration_failures: ann_hydration_failures,
-            } = search_eligible_ann_with_refill(
-                &ctx,
-                token,
-                ann,
-                &key,
-                &query_emb,
-                ctx.fetch_limit,
-                ann_k,
-            )
-            .await?;
-            hydration_failures += ann_hydration_failures;
+        .await
+        {
+            Ok(Ok(query_emb)) => {
+                let model = runtime.default_embedder_name();
+                let key = vamana::AnnKey::new(&ns, model);
+                match search_eligible_ann_with_refill(
+                    &ctx,
+                    token,
+                    ann,
+                    &key,
+                    &query_emb,
+                    ctx.fetch_limit,
+                    ann_k,
+                )
+                .await
+                {
+                    Ok(EligibleAnnSearchState {
+                        hits,
+                        availability,
+                        hydration_failures: ann_hydration_failures,
+                    }) => {
+                        hydration_failures += ann_hydration_failures;
+                        ann_hits = hits;
+                        ann_availability = Some(availability);
+                    }
+                    Err(e) if is_read_timeout(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(Err(_)) => {}
+            Err(e) if is_timeout(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
 
-            if !ann_hits.is_empty() {
-                fuse_ann_hits(&mut hits, &ann_hits, 0.0);
-            }
-            // Suggest always reports degraded candidate recall for a
-            // non-empty corpus, even when lexical candidates survived.
-            if let AnnAvailability::WarmingTimedOut { corpus_non_empty } = availability {
-                ann_unavailable = corpus_non_empty;
-            }
+        let SearchCoreOutcome {
+            mut hits,
+            lexical_timed_out,
+        } = search_core(&ctx, &raw_query).await?;
+
+        let mut ann_unavailable = false;
+        if !ann_hits.is_empty() {
+            fuse_ann_hits(&mut hits, &ann_hits, 0.0);
+        }
+        // Suggest always reports degraded candidate recall for a
+        // non-empty corpus, even when lexical candidates survived.
+        if let Some(AnnAvailability::WarmingTimedOut { corpus_non_empty }) = ann_availability {
+            ann_unavailable = corpus_non_empty;
         }
 
         filter_hits_by_status(&mut hits, &[], SUGGEST_EXCLUDE);
         filter_hits_by_type(&mut hits, Some("domain"));
 
-        let fresh_rerank_applied =
-            rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?;
+        // A lexical-stage timeout already committed this call to a degraded,
+        // ANN-backed response — the request read deadline is spent, so
+        // skip further reads/embedding calls rather than let them convert
+        // this into a verb-level error.
+        let fresh_rerank_applied = if lexical_timed_out {
+            false
+        } else {
+            rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?
+        };
 
         // Safety net: retain only domain hits in case any non-domain survived above.
         hits.retain(|h| h.is_domain);
         hits.truncate(limit);
 
         let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
-        let member_token_sizes = load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?;
-        khive_storage::ensure_request_read_active("knowledge.suggest")?;
+        let member_token_sizes = if lexical_timed_out {
+            HashMap::new()
+        } else {
+            load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
+        };
+        if !lexical_timed_out {
+            khive_storage::ensure_request_read_active("knowledge.suggest")?;
+        }
 
         // Price the member atom bodies that compose expands, not the much smaller
         // domain mirror description used for retrieval. The batched join keeps the
@@ -1863,8 +2085,13 @@ impl KnowledgeHandlers {
                 "note": note,
             });
         }
+        if lexical_timed_out {
+            attach_lexical_timeout_degradation(&mut out);
+        }
         attach_hydration_degradation(&mut out, hydration_failures);
-        khive_storage::ensure_request_read_active("knowledge.suggest")?;
+        if !lexical_timed_out {
+            khive_storage::ensure_request_read_active("knowledge.suggest")?;
+        }
         Ok(out)
     }
 
@@ -2379,6 +2606,57 @@ impl KnowledgeHandlers {
     }
 }
 
+/// Seeds `n` atoms whose content each carries exactly one term from a
+/// `vocab_size`-word vocabulary (`term0`..`term{vocab_size-1}`), so an
+/// OR-joined query over `k` of those terms matches roughly `k/vocab_size`
+/// of the corpus while any single term matches roughly `1/vocab_size` — the
+/// same low-overlap shape that makes the OR-joined bm25 sort in the
+/// pre-#1930 query cost far more than any one term's bounded subquery.
+/// `pub(crate)` (not scoped to `mod tests` below) so the handler-level
+/// degrade tests in `ann_degrade_tests.rs` can reuse the same corpus shape.
+#[cfg(test)]
+pub(crate) async fn seed_low_overlap_corpus(runtime: &KhiveRuntime, n: u32, vocab_size: u32) {
+    let y_stride: u32 = 100;
+    assert_eq!(
+        n % y_stride,
+        0,
+        "seed_low_overlap_corpus requires n a multiple of 100"
+    );
+    let x_max = n / y_stride - 1;
+    let y_max = y_stride - 1;
+
+    let access = runtime.sql();
+    let mut writer = access.writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: format!(
+                "WITH RECURSIVE x(n) AS ( \
+                     VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < {x_max} \
+                 ), y(n) AS ( \
+                     VALUES(0) UNION ALL SELECT n + 1 FROM y WHERE n < {y_max} \
+                 ) \
+                 INSERT INTO knowledge_atoms ( \
+                     id, namespace, slug, name, content, tags, properties, finalized, \
+                     status, source_uri, source_type, created_at, updated_at, deleted_at \
+                 ) \
+                 SELECT \
+                     printf('80000000-0000-0000-0000-%012d', x.n * {y_stride} + y.n), \
+                     'local', printf('lowoverlap-%06d', x.n * {y_stride} + y.n), \
+                     printf('Low Overlap %06d', x.n * {y_stride} + y.n), \
+                     'synthetic corpus content entry ' || (x.n * {y_stride} + y.n) || \
+                     ' discusses topic term' || ((x.n * {y_stride} + y.n) % {vocab_size}) || \
+                     ' with padding context sentence for realistic length and additional filler', \
+                     '[]', NULL, 1, 'reviewed', NULL, NULL, \
+                     x.n * {y_stride} + y.n, x.n * {y_stride} + y.n, NULL \
+                 FROM x CROSS JOIN y WHERE x.n * {y_stride} + y.n < {n}"
+            ),
+            params: Vec::new(),
+            label: None,
+        })
+        .await
+        .expect("seed low-overlap corpus");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2419,6 +2697,77 @@ mod tests {
             fts5_candidate_expression("the and"),
             "\"the and\"",
             "stop-only queries retain the exact-phrase fallback"
+        );
+    }
+
+    /// Issue #1930: the pre-fix query shape (single OR-joined FTS5 MATCH,
+    /// `ORDER BY bm25(...)` over the entire match set, `LIMIT` applied only
+    /// after that sort) must exceed a tight request read deadline at scale
+    /// (old-red), while the bounded per-term fetch this file now ships
+    /// (`fetch_fts_candidates`) stays under the same deadline on the same
+    /// corpus and query (new-green).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_per_term_fetch_stays_under_budget_where_or_joined_query_does_not() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        const N: u32 = 200_000;
+        const VOCAB: u32 = 20;
+        seed_low_overlap_corpus(&runtime, N, VOCAB).await;
+
+        let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+        // Measured on this corpus/query shape: the OR-joined query consistently
+        // takes ~770-790ms; the bounded per-term fetch consistently takes
+        // ~530-550ms (see .khive/IMPL_REPORT_1930.md for the calibration runs).
+        // 650ms sits with >100ms margin on both sides of that stable split.
+        let deadline = std::time::Duration::from_millis(650);
+
+        // OLD shape: exactly the pre-fix query text — one OR-joined MATCH,
+        // ordered by bm25 over the whole match set, LIMIT applied last.
+        let old_match_expr = fts5_candidate_expression(query);
+        let old_sql = "SELECT a.* FROM fts_knowledge \
+             JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+             WHERE fts_knowledge MATCH ?1 \
+               AND fts_knowledge.namespace = ?2 \
+               AND a.namespace = ?2 \
+               AND a.deleted_at IS NULL \
+             ORDER BY bm25(fts_knowledge), a.slug \
+             LIMIT ?3"
+            .to_string();
+        let old_result = khive_storage::scope_request_read_deadline(deadline, async {
+            let sql = runtime.sql();
+            let mut reader = sql.reader().await.expect("reader");
+            reader
+                .query_all(SqlStatement {
+                    sql: old_sql,
+                    params: vec![
+                        SqlValue::Text(old_match_expr),
+                        SqlValue::Text("local".into()),
+                        SqlValue::Integer(CANDIDATE_POOL as i64),
+                    ],
+                    label: None,
+                })
+                .await
+        })
+        .await;
+        assert!(
+            matches!(old_result, Err(khive_storage::StorageError::Timeout { .. })),
+            "old-red: the pre-fix OR-joined/bm25-then-limit query must exceed a {deadline:?} \
+             budget over a {N}-row low-overlap corpus; got {old_result:?}"
+        );
+
+        // NEW shape: the shipped bounded per-term fetch, same corpus/query/deadline.
+        let new_result = khive_storage::scope_request_read_deadline(deadline, async {
+            fetch_fts_candidates(&runtime, "local", query, None, &[], &[], CANDIDATE_POOL).await
+        })
+        .await;
+        let outcome = new_result.expect("new-green: bounded per-term fetch must not error");
+        assert!(
+            !outcome.timed_out,
+            "new-green: bounded per-term fetch must stay under the {deadline:?} budget over the \
+             same corpus/query the OR-joined query timed out on; got timed_out=true"
+        );
+        assert!(
+            !outcome.atoms.is_empty(),
+            "bounded per-term fetch must still return real candidates, not just avoid the timeout"
         );
     }
 
