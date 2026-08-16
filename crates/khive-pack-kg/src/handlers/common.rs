@@ -91,6 +91,38 @@ pub(crate) fn validate_entity_type(
     Ok(resolved.entity_type)
 }
 
+/// Collapse case and separator-style differences (space/hyphen/underscore) so
+/// cosmetic formatting doesn't get flagged as an alias substitution below.
+fn normalize_for_comparison(s: &str) -> String {
+    s.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == ' ' || c == '-' { '_' } else { c })
+        .collect()
+}
+
+/// Describe an `entity_type` alias resolution when the resolved value is a
+/// genuinely different word than what the caller wrote (e.g. the built-in
+/// `method` -> `function` alias), as opposed to a mere case/separator
+/// normalization of the same word (e.g. `Blog-Post` -> `blog_post`).
+///
+/// `validate_entity_type`'s alias table is deliberate (ADR-085 code
+/// subtypes, model/model_family, etc.) — the defect this guards against is
+/// not that a substitution happens, but that it happened invisibly: a
+/// caller who wrote `method` and never saw `function` come back has no way
+/// to know their data was rewritten. Callers embed this in the `create`
+/// response so the applied substitution is always visible.
+pub(crate) fn describe_entity_type_normalization(
+    raw: Option<&str>,
+    resolved: Option<&str>,
+) -> Option<Value> {
+    let (raw, resolved) = (raw?, resolved?);
+    if normalize_for_comparison(raw) == resolved {
+        return None;
+    }
+    Some(json!({"requested": raw, "stored": resolved}))
+}
+
 // ---- Granular `kind` discriminator ----
 
 /// Resolved shape of a `kind` discriminator string: which substrate (entity, note,

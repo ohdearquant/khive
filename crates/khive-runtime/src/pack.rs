@@ -1209,6 +1209,22 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
     rows
 }
 
+/// Shared explanation of the id contract, appended by [`VerbRegistry::describe_verb`]
+/// to every parameter declared `param_type: "uuid"` across every pack's
+/// `HandlerDef`, rather than pasted into each individual `ParamDef.description`.
+///
+/// A full UUID demonstrates the caller already knows the specific record, so
+/// it resolves the same way everywhere regardless of namespace. A short hex
+/// prefix is a *resolution* — a search — scoped to the caller's own
+/// namespace like any other search: it can match nothing, or match
+/// ambiguously, across a namespace the caller doesn't share. This is why
+/// some verbs accept a prefix and others require a full UUID: the asymmetry
+/// tracks whether the operation can assume the caller's namespace, not an
+/// inconsistency between verbs.
+const ID_PARAM_CONTRACT: &str = "ID contract: a full UUID is namespace-agnostic (the caller \
+    already knows the specific record). A short hex prefix is a namespace-scoped resolution — \
+    a search — and may match nothing, or match ambiguously, outside the caller's own namespace.";
+
 impl VerbRegistry {
     /// This registry's construction-baked default namespace.
     ///
@@ -1271,6 +1287,10 @@ impl VerbRegistry {
     /// `link`'s envelope additionally carries `endpoint_rules` — the composed
     /// per-relation source/target allowlist (issue #964) — so batch callers can
     /// defer to the kernel's own table instead of re-implementing it locally.
+    /// Every `param_type == "uuid"` parameter description has
+    /// [`ID_PARAM_CONTRACT`] appended — a single shared explanation of the
+    /// full-UUID-vs-short-prefix contract instead of restating it per param
+    /// across every `HandlerDef` in every pack.
     /// Unknown verbs return `RuntimeError::InvalidInput`. Full shape documented
     /// in `docs/protocol.md` §Request Schema.
     pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
@@ -1282,11 +1302,16 @@ impl VerbRegistry {
                         .params
                         .iter()
                         .map(|p| {
+                            let description = if p.param_type == "uuid" {
+                                format!("{} {}", p.description, ID_PARAM_CONTRACT)
+                            } else {
+                                p.description.to_string()
+                            };
                             serde_json::json!({
                                 "name": p.name,
                                 "type": p.param_type,
                                 "required": p.required,
-                                "description": p.description,
+                                "description": description,
                             })
                         })
                         .collect();
@@ -7954,6 +7979,16 @@ mod help_tests {
     // Used to test that help=true on a Subhandler returns callable_via_mcp: false.
     static EMBED_PARAMS: [ParamDef; 0] = [];
 
+    // A uuid-typed param, used to verify `describe_verb` appends
+    // ID_PARAM_CONTRACT to every `param_type: "uuid"` description instead of
+    // requiring each `HandlerDef` to paste the contract in by hand.
+    static GET_PARAMS: [ParamDef; 1] = [ParamDef {
+        name: "id",
+        param_type: "uuid",
+        required: true,
+        description: "UUID of the record to fetch.",
+    }];
+
     struct HelpPack {
         invocations: Arc<AtomicUsize>,
     }
@@ -7992,6 +8027,13 @@ mod help_tests {
                 visibility: Visibility::Verb,
                 category: VerbCategory::Commissive,
                 params: &[],
+            },
+            HandlerDef {
+                name: "get",
+                description: "Fetch a record by id",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &GET_PARAMS,
             },
         ];
     }
@@ -8106,6 +8148,50 @@ mod help_tests {
         assert!(identifier_help["parameter_rule"]
             .as_str()
             .is_some_and(|text| text.contains("submitted again")));
+    }
+
+    /// `describe_verb` appends the shared id contract to every `param_type:
+    /// "uuid"` parameter's description, so the full-UUID-vs-short-prefix
+    /// rule is stated once (here) and inherited by every verb, rather than
+    /// requiring each `HandlerDef` to paste its own explanation. The
+    /// contract must explain what a prefix *is* (a namespace-scoped
+    /// resolution), not just which verbs happen to accept one.
+    #[tokio::test]
+    async fn test_help_true_uuid_param_carries_shared_id_contract() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let reg = build_help_registry(invocations.clone());
+
+        let result = reg
+            .dispatch("get", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed for a known verb");
+
+        let params = result["params"]
+            .as_array()
+            .expect("params must be a JSON array");
+        let id_param = params
+            .iter()
+            .find(|p| p["name"] == "id")
+            .expect("params array must include the 'id' parameter");
+        let description = id_param["description"]
+            .as_str()
+            .expect("description must be a string");
+
+        // The verb-specific text must still be present...
+        assert!(
+            description.contains("UUID of the record to fetch"),
+            "shared contract must be appended, not replace, the verb-specific text; got: {description}"
+        );
+        // ...and the shared contract must explain what a prefix IS (a
+        // namespace-scoped resolution), not just restate "must be a UUID".
+        assert!(
+            description.contains("namespace"),
+            "id contract must explain the namespace-scoping rule; got: {description}"
+        );
+        assert!(
+            description.to_ascii_lowercase().contains("prefix"),
+            "id contract must describe short-prefix semantics; got: {description}"
+        );
     }
 
     /// help=true on `recall` returns a schema envelope including the `query` param.
