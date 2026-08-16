@@ -75,12 +75,12 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-057](ADR-057-comm-actor-addressed-delivery.md)                     | Comm Actor-Addressed Delivery                                                                              |
 | [ADR-058](ADR-058-brain-posterior-read-path.md)                         | Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking                                  |
 | [ADR-059](ADR-059-namespace-write-tiers.md)                             | Namespace Write Tiers and Cross-Namespace Link Access Control                                              |
-| [ADR-060](ADR-060-number-retired.md)                                    | Number Retired — Never Allocated                                                                           |
+| [ADR-060](ADR-060-number-retired.md)                                    | Number Retired — v0-Series Record Archived                                                                 |
 | [ADR-061](ADR-061-pack-extensible-by-id-resolution.md)                  | Pack-Extensible by-ID Resolution                                                                           |
 | [ADR-062](ADR-062-fts-ann-consolidation.md)                             | FTS and ANN Consolidation -- Unified Search Tables (Schema V4)                                             |
 | [ADR-063](ADR-063-comm-principal-model.md)                              | Comm Pack Principal Model and Remote Backend Isolation                                                     |
-| [ADR-064](ADR-064-number-retired.md)                                    | Number Retired — Never Allocated                                                                           |
-| [ADR-065](ADR-065-number-retired.md)                                    | Number Retired — Never Allocated                                                                           |
+| [ADR-064](ADR-064-number-retired.md)                                    | Number Retired — v0-Series Record Archived                                                                 |
+| [ADR-065](ADR-065-number-retired.md)                                    | Number Retired — Draft Archived                                                                            |
 | [ADR-066](ADR-066-autonomous-merge-pipeline.md)                         | Autonomous Merge Pipeline — Gate Wall as Reviewer                                                          |
 | [ADR-067](ADR-067-write-owner-daemon.md)                                | Write-Owner Daemon — Single-Writer Task and Write Queue                                                    |
 | [ADR-068](ADR-068-process-isolation-topology.md)                        | Per-Process Isolation Topology                                                                             |
@@ -92,7 +92,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-074](ADR-074-graph-aware-recall.md)                                | Graph-Aware Recall — Graph-Proximity Signal in Memory Retrieval                                            |
 | [ADR-075](ADR-075-owl-rdf-interoperability.md)                          | OWL/RDF Interoperability -- Publishing the khive Vocabulary and Aligning with External Ontologies          |
 | [ADR-076](ADR-076-relation-calculability-and-system-role.md)            | Relation-Set Calculability — System Role and the Non-Redundancy Certificate                                |
-| [ADR-077](ADR-077-number-retired.md)                                    | Number Retired — Never Allocated                                                                           |
+| [ADR-077](ADR-077-number-retired.md)                                    | Number Retired — v0-Series Record Archived                                                                 |
 | [ADR-078](ADR-078-output-format-shape-aware-rendering.md)               | Output Format and Shape-Aware Rendering                                                                    |
 | [ADR-079](ADR-079-ann-persistence-warm-path-integration.md)             | ANN Persistence Warm-Path Integration — Wiring v2 Persistence into the Daemon                              |
 | [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md)                | Session Pack — OSS Storage Mechanism                                                                       |
