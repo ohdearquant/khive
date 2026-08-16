@@ -305,6 +305,12 @@ migration. Two modes exist:
 Mode is part of the activation receipt; upgrading single-principal →
 multi-actor is a new migration with its own review, not a flag flip.
 
+At every boot while `edge_governance_state.status` is `active`, the runtime
+MUST re-verify the invalidation triggers' names and normalized SQL against
+the activation receipt; a missing or altered trigger demotes the status to
+`inactive` — keeping ADR-157 canonicalization off — until a new activation
+review restores it. This check is normative, not advisory.
+
 ### 8. Backward compatibility
 
 Rejected legacy edges remain visible through `get`, `list`, `neighbors`,
