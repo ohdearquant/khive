@@ -140,14 +140,15 @@ or rejection:
   implementing migration; unknown codes are rejected at insert).
 
 **`edge_governance_invalidations`** — append-only ledger of every
-invalidation event, written by the same database triggers that delete
-active markers (§3):
+invalidation event, written by the database triggers that delete active
+markers (§3) and by the one governance-plane writer, the classification
+primitive's revocation arm (ADR-046 amendment):
 
 - `invalidation_id` (PK), `decision_id` (references the decision whose
   marker was removed), `edge_id`;
-- `cause`: the triggering mutation class (endpoint/relation/backend
+- `cause`: the invalidating event class (endpoint/relation/backend
   rewrite, merge rewire, edge liveness transition, endpoint-note liveness
-  transition, hard delete);
+  transition, hard delete, `revoked_by_decision`);
 - `invalidated_at`.
 
 An invalidated decision is permanently spent: no rebuild, migration, or
