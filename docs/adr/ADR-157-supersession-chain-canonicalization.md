@@ -1,6 +1,6 @@
 # ADR-157: Canonicalize Verified Supersession Chains Before Memory Recall Scoring
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-08-15
 **Scope**: the `memory.recall` serving predicate for supersession chain-head
 substitution, its degradation contract, its activation gate, and the bounded
