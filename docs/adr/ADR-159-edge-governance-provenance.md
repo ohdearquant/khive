@@ -119,27 +119,51 @@ can join cheaply.
 
 ### 1. Storage shape
 
-Three objects, added by versioned migration (ADR-015):
+Four objects, added by versioned migration (ADR-015):
 
 **`edge_governance_decisions`** — append-only record of every authorization
 or rejection:
 
 - `decision_id` (PK), `edge_id`;
 - bound preimage: `edge_namespace`, `source_id`, `target_id`, `relation`
-  (constrained to `supersedes`);
+  (constrained to `supersedes`), `target_backend`;
 - `disposition`: `authorized` | `rejected`;
-- `via`: `owner_direct` | `reviewed_proposal` | `migration_review`;
+- `via`: `owner_direct` | `reviewed_proposal` | `migration_review` |
+  `cutover_fence`;
 - authorizer identity (actor kind + id);
+- `applied_by` (nullable): the apply worker's system identity on reviewed
+  paths; never an authority source;
 - authority evidence: action, authority subject (at minimum the superseded
   memory), policy/provider id and revision;
 - optional `proposal_id`, mandatory `review_event_id` for reviewed paths;
-- `decided_at` and a bounded reason code.
+- `decided_at` and a bounded reason code (closed vocabulary declared by the
+  implementing migration; unknown codes are rejected at insert).
+
+**`edge_governance_invalidations`** — append-only ledger of every
+invalidation event, written by the same database triggers that delete
+active markers (§3):
+
+- `invalidation_id` (PK), `decision_id` (references the decision whose
+  marker was removed), `edge_id`;
+- `cause`: the triggering mutation class (endpoint/relation/backend
+  rewrite, merge rewire, edge liveness transition, endpoint-note liveness
+  transition, hard delete);
+- `invalidated_at`.
+
+An invalidated decision is permanently spent: no rebuild, migration, or
+reauthorization path may treat a decision referenced by an invalidation
+row as live authority. Fresh authority requires a fresh decision. This
+ledger is what makes marker deletion durable — without it, a projection
+rebuild from the append-only decision log could re-mint authority for an
+edge whose preimage has recurred (same-key resurrection restores the same
+UUID and endpoint tuple, so preimage equality alone cannot distinguish the
+original incarnation from a revived one).
 
 **`edge_governance_active`** — one row per currently governed edge, the
 serving projection:
 
 - `edge_id` (PK), `decision_id` (unique);
-- the same bound namespace/source/target/relation;
+- the same bound namespace/source/target/relation/target_backend;
 - `stamped_at`;
 - covering index beginning with `target_id`, e.g.
   `(target_id, source_id, edge_id)`.
@@ -187,25 +211,43 @@ review event. It contains no key or secret.
 
 ### 3. Invalidation rules
 
-| Mutation                                             | Active governance result                                                                                                                                                                     |
-| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| New generic edge                                     | No marker; edge visible, canonicalization-inert.                                                                                                                                             |
-| UUID upsert changes namespace, endpoint, or relation | Trigger deletes the active marker; bound-column join also mismatches.                                                                                                                        |
-| Entity/note merge rewires an endpoint                | Trigger deletes the marker on the moved edge. No decision transfers.                                                                                                                         |
-| Merge natural-key conflict deletes the incoming edge | Incoming marker deleted; the survivor keeps only its own prior marker, if any.                                                                                                               |
-| Soft delete                                          | Trigger deletes the marker.                                                                                                                                                                  |
-| Same-key resurrection                                | The `deleted_at` transition already deleted any stale marker; only a fresh governed transaction may re-stamp after resurrection.                                                             |
-| Hard delete / cascade                                | Trigger deletes the marker; decision history remains.                                                                                                                                        |
-| Generic update of weight or metadata                 | Marker retained — neither field enters the closure predicate. If a future serving ADR makes either field semantic, it must first add that field to the binding and the invalidation trigger. |
+| Mutation                                                               | Active governance result                                                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| New generic edge                                                       | No marker; edge visible, canonicalization-inert.                                                                                                                                                                                                                                                                                                                                  |
+| UUID upsert changes namespace, endpoint, relation, or `target_backend` | Trigger deletes the active marker and appends an invalidation row; bound-column join also mismatches.                                                                                                                                                                                                                                                                             |
+| Natural-key upsert rewrites `target_backend`                           | Trigger deletes the marker and appends an invalidation row. The store's natural-key conflict arm sets `target_backend = excluded.target_backend` (`crates/khive-db/src/stores/graph.rs`), so backend routing is reachable through generic upsert and must invalidate.                                                                                                             |
+| Entity/note merge rewires an endpoint                                  | Trigger deletes the marker on the moved edge and appends an invalidation row. No decision transfers.                                                                                                                                                                                                                                                                              |
+| Merge natural-key conflict deletes the incoming edge                   | Incoming marker deleted with an invalidation row; the survivor keeps only its own prior marker, if any.                                                                                                                                                                                                                                                                           |
+| Edge `deleted_at` transition (either direction)                        | Trigger deletes the marker and appends an invalidation row.                                                                                                                                                                                                                                                                                                                       |
+| Same-key resurrection                                                  | The `deleted_at` transition already deleted any stale marker and recorded a durable invalidation; only a fresh governed transaction may re-stamp after resurrection. The ledger row is load-bearing here: the revived row carries the original UUID and preimage, so without it a later projection rebuild could not tell the incarnations apart.                                 |
+| Endpoint note `deleted_at` transition (either direction)               | Trigger deletes the marker on every incident governed edge and appends invalidation rows. Note soft-delete leaves edges in place (ADR-014), and the note upsert can restore the same note ID with `deleted_at = NULL` and wholly new content (`crates/khive-db/src/stores/note.rs`); authority granted over a memory does not survive that memory's disappearance or replacement. |
+| Hard delete / cascade                                                  | Trigger deletes the marker and appends an invalidation row; decision history remains.                                                                                                                                                                                                                                                                                             |
+| Generic update of weight or metadata                                   | Marker retained — neither field enters the closure predicate. If a future serving ADR makes either field semantic, it must first add that field to the binding and the invalidation trigger.                                                                                                                                                                                      |
 
 Invalidation is installed as SQLite triggers — `AFTER UPDATE OF namespace,
-source_id, target_id, relation, deleted_at` plus delete triggers — at the
-database layer, because merge rewires include raw `UPDATE graph_edges`
-statements that bypass handler code
-(`crates/khive-runtime/src/curation.rs`). Handler-only clearing is
-insufficient by construction. `INSERT OR REPLACE` on `graph_edges` may not
-become a supported writer shortcut; every insert/upsert form must have an
-explicit resurrection test before activation.
+source_id, target_id, relation, target_backend, deleted_at` on
+`graph_edges`, `AFTER UPDATE OF deleted_at` on `notes` scoped to notes
+with incident governed edges, plus delete triggers — at the database
+layer, because merge rewires include raw `UPDATE graph_edges` statements
+that bypass handler code (`crates/khive-runtime/src/curation.rs`).
+Handler-only clearing is insufficient by construction. Each trigger
+performs two writes in the same statement-level transaction: delete the
+marker, append the invalidation row referencing the marker's
+`decision_id`. `INSERT OR REPLACE` on `graph_edges` may not become a
+supported writer shortcut; every insert/upsert form must have an explicit
+resurrection test before activation.
+
+**Relationship to ADR-014.** ADR-014's public contract stands unchanged:
+`delete(kind="edge")` is always hard, and edges have no soft-delete state
+on the verb surface. The `graph_edges` schema nonetheless carries a
+`deleted_at` column, and the natural-key upsert arm clears it
+(`deleted_at = NULL` in its conflict set), so the revived-row state is
+reachable at the store layer regardless of which paths write the column
+today. This ADR binds invalidation to column transitions, not to any
+verb: if no current path soft-deletes an edge, the edge-liveness triggers
+are dormant; if a future path does, invalidation already covers it.
+Nothing here introduces, requires, or permits edge soft-delete semantics
+on the public surface, and this ADR does not amend ADR-014.
 
 ### 4. Closure predicate (consumed by ADR-157)
 
@@ -218,7 +260,8 @@ AND graph_edge is live
 AND graph_edge.relation == 'supersedes'
 AND both endpoints are live memory notes
 AND edge_governance_active.edge_id == graph_edge.id
-AND active.bound namespace/source/target/relation == current edge preimage
+AND active.bound namespace/source/target/relation/target_backend
+    == current edge preimage
 ```
 
 Expansion starts from `edge_governance_active.target_id` via the covering
@@ -236,7 +279,8 @@ ADR-046 must add a distinct, closed changeset operation:
 ```text
 ClassifyExistingEdgeGovernance {
   edge_id,
-  expected: { namespace, source_id, target_id, relation, deleted_at: null },
+  expected: { namespace, source_id, target_id, relation, target_backend,
+              deleted_at: null },
   disposition: authorize | reject,
   reason_code?
 }
@@ -276,10 +320,16 @@ long-held lock, or an epoch column:
 3. Enter one `BEGIN IMMEDIATE` transaction through the normal single-writer
    owner.
 4. Re-scan for live legacy edges without a matching decision. Record each
-   late arrival as `rejected_at_cutover_unreviewed`, or abort if the delta
-   exceeds a configured bound.
-5. Verify counts plus trigger/schema identity (trigger names and normalized
-   SQL, not mere table existence), set state `active`, commit.
+   late arrival as a decision with `disposition = rejected`,
+   `via = cutover_fence`, reason code `late_arrival_unreviewed`, authorizer
+   = the migration's system identity acting under the activation mode's
+   authority (single-principal at this deployment) — or abort if the delta
+   exceeds a configured bound. Like every rejection, this is reversible
+   only by explicit later reauthorization (§8), never by rerunning the
+   fence.
+5. Verify counts plus trigger/schema identity against the trigger manifest
+   (§7 — names and normalized-SQL digests, not mere table existence), set
+   state `active`, commit.
 
 File-backed khive uses WAL with one writer and concurrent readers, and
 writer transactions use `BEGIN IMMEDIATE` (`crates/khive-db/src/pool.rs`,
@@ -305,11 +355,21 @@ migration. Two modes exist:
 Mode is part of the activation receipt; upgrading single-principal →
 multi-actor is a new migration with its own review, not a flag flip.
 
-At every boot while `edge_governance_state.status` is `active`, the runtime
-MUST re-verify the invalidation triggers' names and normalized SQL against
-the activation receipt; a missing or altered trigger demotes the status to
-`inactive` — keeping ADR-157 canonicalization off — until a new activation
-review restores it. This check is normative, not advisory.
+The activation receipt carries a **trigger manifest**: for every
+invalidation trigger this ADR requires, its exact name and a digest of its
+normalized SQL. Normalization is defined as: take the trigger's `sql` text
+from `sqlite_master`, collapse every run of whitespace to a single space,
+trim, and digest the resulting bytes (SHA-256). The expected manifest is
+authored in the same versioned migration that installs the triggers, so
+`schema_version` names exactly one expected manifest and the comparison
+has an immutable reference on both sides.
+
+At every boot while `edge_governance_state.status` is `active`, the
+runtime MUST recompute the manifest from `sqlite_master` and compare it to
+the activation receipt: a missing trigger, an unexpected name, or a digest
+mismatch demotes the status to `inactive` — keeping ADR-157
+canonicalization off — until a new activation review restores it. This
+check is normative, not advisory.
 
 ### 8. Backward compatibility
 
@@ -340,9 +400,10 @@ Pre-activation metadata stamps remain inert and are not scrubbed.
 The selected design separates three concerns the metadata design conflated:
 graph edges record _assertions_ and stay usable by every generic surface;
 governance decisions record _who authorized or rejected one exact
-incarnation and why_; the active projection is a cheap serving index,
-disposable and rebuildable from authorized decisions plus current edge
-state. Failure modes are explicit and fail closed: a missing marker means
+incarnation and why_; the invalidation ledger records _which decisions
+have been spent_; the active projection is a cheap serving index,
+disposable and rebuildable from authorized decisions that have no
+invalidation row, plus current edge state. Failure modes are explicit and fail closed: a missing marker means
 no substitution; endpoint mutation cannot carry authority (trigger deletion
 and bound-column equality both reject it); rejected rows stay auditable
 without corrupting graph history; authority policy stays at the
@@ -387,7 +448,12 @@ recorded in § Context.)
 
 - Regression matrix: UUID endpoint rewrite, same-key resurrection, entity
   merge, note merge, merge-conflict survivor, soft/hard delete, generic
-  metadata forgery, generic relink, governed reauthorization.
+  metadata forgery, generic relink, governed reauthorization,
+  `target_backend` rewrite through both upsert arms, endpoint-note
+  soft-delete and same-ID restore.
+- Rebuild test: authorize → invalidate (any cause) → restore the original
+  preimage via same-key resurrection → rebuild the projection; the spent
+  decision must NOT reactivate, and a fresh governed transaction must.
 - Security tests: a non-self reviewer without target authority — neither
   review approval nor the apply worker's system identity may produce an
   active marker.
@@ -402,11 +468,13 @@ recorded in § Context.)
 
 ## Implementation fences
 
-**MAY**: add versioned DDL for the three objects, indexes, and triggers;
+**MAY**: add versioned DDL for the four objects, indexes, and triggers;
 introduce internal non-serializable `AuthorityReceipt`, `governed_link`,
 and `classify_existing_edge_governance`; keep ungoverned edges visible but
-inert; rebuild the active projection from authorized decisions only after
-rechecking current preimages and liveness.
+inert; rebuild the active projection only from authorized decisions that
+no invalidation row references, and only after rechecking current
+preimages and liveness — an invalidated decision is spent forever, and a
+recurring preimage (same-key resurrection) never revives it.
 
 **MAY NOT**: read `metadata.created_by_actor` or any edge JSON as
 governance evidence; accept caller-supplied authorizer, scope, policy
@@ -416,6 +484,7 @@ in a multi-actor deployment; carry, copy, or merge an active marker across
 endpoint/relation mutation, delete, resurrection, or natural-key conflict;
 recreate an edge to migrate it, or change UUID/`created_at`/metadata while
 stamping it; derive the serving predicate from best-effort audit events;
-perform per-edge HMAC verification on recall; activate canonicalization
-before schema/trigger verification and final-delta classification commit
-atomically.
+rebuild or backfill the projection from any decision an invalidation row
+references; perform per-edge HMAC verification on recall; activate
+canonicalization before schema/trigger verification and final-delta
+classification commit atomically.
