@@ -420,15 +420,25 @@ async fn fetch_fts_candidates(
     fetch_limit: usize,
 ) -> Result<FtsFetchOutcome, RuntimeError> {
     let sql = runtime.sql();
-    let mut reader = sql
-        .reader()
-        .await
-        .map_err(|e| sql_err("search fts reader", e))?;
+    let mut reader = match sql.reader().await {
+        Ok(reader) => reader,
+        Err(e) if is_timeout(&e) => {
+            return Ok(FtsFetchOutcome {
+                atoms: Vec::new(),
+                timed_out: true,
+            });
+        }
+        Err(e) => return Err(sql_err("search fts reader", e)),
+    };
 
     let terms = fts5_candidate_terms(raw_query);
     let type_clause = type_eligibility_sql(type_filter, "a");
     let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 4);
-    let per_term_limit = fetch_limit.clamp(1, FTS_TERM_LIMIT);
+    let per_term_limit = if terms.len() == 1 {
+        fetch_limit
+    } else {
+        fetch_limit.clamp(1, FTS_TERM_LIMIT)
+    };
 
     let mut seen_ids: HashSet<Uuid> = HashSet::new();
     let mut combined: Vec<Atom> = Vec::new();
@@ -448,10 +458,15 @@ async fn fetch_fts_candidates(
          LIMIT ?3"
     );
 
+    // Query every term rather than stopping once `combined` reaches
+    // `fetch_limit` — an early break made pool membership depend on query
+    // word order (a fast-filling early term could starve every later term
+    // of a query at all). Each term's rows are collected independently and
+    // merged round-robin below, so no single term can crowd out the rest.
+    let mut per_term_rows: Vec<Vec<Atom>> = Vec::with_capacity(terms.len());
+    let mut term_query_timed_out = false;
+
     for term in &terms {
-        if combined.len() >= fetch_limit {
-            break;
-        }
         let mut params = vec![
             SqlValue::Text(term.clone()),
             SqlValue::Text(ns.to_owned()),
@@ -469,19 +484,34 @@ async fn fetch_fts_candidates(
         {
             Ok(rows) => rows,
             Err(e) if is_timeout(&e) => {
-                return Ok(FtsFetchOutcome {
-                    atoms: combined,
-                    timed_out: true,
-                });
+                term_query_timed_out = true;
+                break;
             }
             Err(e) => return Err(sql_err("search fts query", e)),
         };
 
-        for atom in rows.iter().filter_map(atom_from_row) {
-            if seen_ids.insert(atom.id) {
-                combined.push(atom);
+        per_term_rows.push(rows.iter().filter_map(atom_from_row).collect());
+    }
+
+    let max_term_rows = per_term_rows.iter().map(Vec::len).max().unwrap_or(0);
+    'merge: for i in 0..max_term_rows {
+        for term_rows in &per_term_rows {
+            if combined.len() >= fetch_limit {
+                break 'merge;
+            }
+            if let Some(atom) = term_rows.get(i) {
+                if seen_ids.insert(atom.id) {
+                    combined.push(atom.clone());
+                }
             }
         }
+    }
+
+    if term_query_timed_out {
+        return Ok(FtsFetchOutcome {
+            atoms: combined,
+            timed_out: true,
+        });
     }
 
     if !combined.is_empty() {
@@ -2768,6 +2798,92 @@ mod tests {
         assert!(
             !outcome.atoms.is_empty(),
             "bounded per-term fetch must still return real candidates, not just avoid the timeout"
+        );
+    }
+
+    /// Issue #1930 rework: the per-term loop used to `break` as soon as the
+    /// merged pool reached `fetch_limit`, checked *before* querying the next
+    /// term. A term that sorts first and alone has more matches than
+    /// `fetch_limit` then fills the pool on its own turn, so every later
+    /// term never gets queried at all — pool membership depended on query
+    /// word order. This seeds "alpha" with more rows than `fetch_limit` and
+    /// a disjoint, small "beta" set, then asserts beta's rows survive into
+    /// the returned pool. Against the pre-fix early-break loop this must
+    /// FAIL: alpha's own per-term query (capped at `fetch_limit`) already
+    /// fills `combined` to `fetch_limit` before the loop reaches "beta", so
+    /// "beta" is never queried and none of its rows can appear.
+    #[tokio::test]
+    async fn round_robin_merge_keeps_later_term_candidates_from_starving() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "WITH RECURSIVE x(n) AS ( \
+                              VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 9 \
+                          ) \
+                          INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) \
+                          SELECT \
+                              printf('90000000-0000-0000-0000-%012d', x.n), \
+                              'local', printf('alpha-%02d', x.n), printf('Alpha %02d', x.n), \
+                              'synthetic content about alpha only', '[]', NULL, 1, \
+                              'reviewed', NULL, NULL, x.n, x.n, NULL \
+                          FROM x"
+                        .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed alpha rows");
+            writer
+                .execute(SqlStatement {
+                    sql: "WITH RECURSIVE x(n) AS ( \
+                              VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 2 \
+                          ) \
+                          INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) \
+                          SELECT \
+                              printf('91000000-0000-0000-0000-%012d', x.n), \
+                              'local', printf('beta-%02d', x.n), printf('Beta %02d', x.n), \
+                              'synthetic content about beta only', '[]', NULL, 1, \
+                              'reviewed', NULL, NULL, x.n, x.n, NULL \
+                          FROM x"
+                        .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed beta rows");
+        }
+
+        let fetch_limit = 5;
+        let outcome =
+            fetch_fts_candidates(&runtime, "local", "alpha beta", None, &[], &[], fetch_limit)
+                .await
+                .expect("fetch must not error");
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.atoms.len(), fetch_limit);
+
+        let beta_present = outcome
+            .atoms
+            .iter()
+            .any(|atom| atom.slug.starts_with("beta-"));
+        assert!(
+            beta_present,
+            "round-robin merge must keep the second term's candidates in the pool \
+             even though the first term alone has more matches than fetch_limit; \
+             got {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
