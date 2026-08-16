@@ -163,6 +163,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-154](ADR-154-sqlite-disk-reserve-admission.md)                     | SQLite Disk-Reserve Admission Before Logical Writes                                                        |
 | [ADR-155](ADR-155-pack-artifact-ingest-blobstore.md)                    | Pack Artifact Ingest over BlobStore                                                                        |
 | [ADR-156](ADR-156-named-vector-restart-durability.md)                   | Named-Vector Search Restart and Durability Semantics                                                       |
+| [ADR-159](ADR-159-edge-governance-provenance.md)                        | Durable Edge-Governance Provenance for Supersession Canonicalization                                       |
 
 <!-- END GENERATED ADR CATALOG -->
 
