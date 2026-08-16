@@ -651,6 +651,19 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn get_bounded_verified(
+            &self,
+            content_ref: &ContentRef,
+            max_bytes: u64,
+        ) -> khive_storage::types::StorageResult<Vec<u8>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Err(khive_storage::StorageError::BlobTooLarge {
+                content_ref: content_ref.clone(),
+                max_bytes,
+                observed_at_least: MAX_OBJECT_BYTES as u64 + 1,
+            })
+        }
+
         async fn exists(
             &self,
             _content_ref: &ContentRef,

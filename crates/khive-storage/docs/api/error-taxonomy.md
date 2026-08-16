@@ -63,6 +63,30 @@ this variant is nevertheless a Rust source-compatibility change for downstream
 code that exhaustively matches every variant; those matches must add a
 `WriterTaskTerminated` arm.
 
+## Bounded blob read failures
+
+`BlobTooLarge`, `BlobSizeMismatch`, and `BlobDigestMismatch` are typed
+fail-closed outcomes of `BlobStore::get_bounded_verified`. All three report
+`Some(StorageCapability::Blob)` from `capability()` and are non-retryable by
+default. Their owned `ContentRef` fields preserve validated content-addressed
+identity; no raw or malformed digest string enters the backend contract.
+
+This addition is intentionally Rust source-breaking: `BlobStore` gains a
+required method with no default, and `StorageError` is a public enum without
+`#[non_exhaustive]`. Downstream implementations must provide
+`get_bounded_verified`; exhaustive error matches must add arms for all three
+new variants. The existing `get` method remains available during the staged
+ADR-160 migration and is removed only after every production consumer moves to
+the bounded runtime path.
+
+`BlobTooLarge.observed_at_least` is a lower bound, not always a verified final
+size. It may come from same-object metadata that caused an early refusal or
+from the byte prefix that first crossed the caller's limit.
+`BlobSizeMismatch` wins over digest validation once a bounded body reaches EOF,
+and `BlobDigestMismatch` is evaluated only for a metadata-consistent complete
+body. None of these variants carries bytes or changes the existing flattened
+runtime/MCP error envelope.
+
 ## Typed writer-pool checkout timeout source
 
 `khive-db` retains `SqliteError::WriterPoolCheckoutTimeout` as the typed source
