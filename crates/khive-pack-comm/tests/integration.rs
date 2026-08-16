@@ -5659,6 +5659,122 @@ async fn ingest_dedup_without_stored_thread_id_falls_back_with_warning() {
     );
 }
 
+// ── transport-owned message property write boundary (PR #1839 round 2) ──
+
+/// `try_create_note` is a public `khive-runtime` method reachable by any
+/// in-process caller holding a `NamespaceToken` — it is not routed through
+/// the generic `create` verb funnel's pack-installed note-write validator.
+/// `comm.ingest` is documented as the sole legitimate writer of
+/// `quarantined` / `channel_kind` / `channel_slug` (transport-owned
+/// evidence `comm.health` trusts at face value). A direct `try_create_note`
+/// call attempting to forge any of those three properties must be rejected,
+/// individually and in combination — and no row must be left behind for
+/// `comm.health` to count as real quarantine backlog.
+#[tokio::test]
+async fn try_create_note_rejects_forged_transport_owned_message_properties() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    for (key, value) in [
+        ("quarantined", serde_json::json!(true)),
+        ("channel_kind", serde_json::json!("email")),
+        ("channel_slug", serde_json::json!("forged-channel")),
+    ] {
+        let err = rt
+            .try_create_note(
+                &token,
+                "message",
+                None,
+                "forged quarantine row via direct runtime write",
+                Some(serde_json::json!({ key: value })),
+            )
+            .await
+            .expect_err(&format!(
+                "try_create_note must reject a direct write setting `{key}`"
+            ));
+        assert!(
+            err.to_string().contains(key),
+            "rejection must name the offending property `{key}`: {err}"
+        );
+    }
+
+    // All three at once must also be rejected as a single write.
+    let err = rt
+        .try_create_note(
+            &token,
+            "message",
+            None,
+            "forged quarantine row via direct runtime write (all three)",
+            Some(serde_json::json!({
+                "quarantined": true,
+                "channel_kind": "email",
+                "channel_slug": "forged-channel",
+            })),
+        )
+        .await
+        .expect_err("try_create_note must reject all three transport-owned properties at once");
+    assert!(!err.to_string().is_empty());
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["quarantined_count"].as_u64(),
+        Some(0),
+        "a rejected direct write must leave no row for comm.health to count: {health:?}"
+    );
+    assert_eq!(
+        health["channels"].as_array().map(Vec::len),
+        Some(0),
+        "no channel_health backlog entry should exist either: {health:?}"
+    );
+}
+
+/// The trusted-ingest entry point must still permit `comm.ingest` (its sole
+/// caller) to establish the same three properties `try_create_note` refuses,
+/// and `comm.health` must count the resulting row.
+#[tokio::test]
+async fn try_create_note_as_trusted_ingest_permits_comm_ingest_quarantine() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    let note = rt
+        .try_create_note_as_trusted_ingest(
+            &token,
+            "message",
+            None,
+            "legitimate quarantine row via the trusted ingest path",
+            Some(serde_json::json!({
+                "quarantined": true,
+                "channel_kind": "email",
+                "channel_slug": "trusted-channel",
+                "direction": "inbound",
+                "from_actor": "external:sender",
+            })),
+        )
+        .await
+        .expect("trusted ingest write")
+        .expect("insert must not be deduplicated");
+    assert_eq!(
+        note.properties
+            .as_ref()
+            .and_then(|p| p.get("quarantined"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(health["quarantined_count"].as_u64(), Some(1));
+}
+
 // ── list(kind=message) thread filter: legacy all-hex labels vs. UUID prefixes ──
 
 /// Regression (PR #1623 round 2): an all-hex >=8-char stored thread label

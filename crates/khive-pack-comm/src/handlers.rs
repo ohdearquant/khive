@@ -2103,8 +2103,12 @@ pub(crate) async fn handle_ingest(
         }
     }
 
+    // Trusted-ingest entry point: comm.ingest is the sole legitimate writer of
+    // transport-owned quarantine disposition and channel provenance (`quarantined`,
+    // `channel_kind`, `channel_slug`), derived above from the inbound transport
+    // itself. Every other write path uses `try_create_note`, which refuses them.
     let note = match runtime
-        .try_create_note(
+        .try_create_note_as_trusted_ingest(
             token,
             "message",
             p.subject.as_deref(),
