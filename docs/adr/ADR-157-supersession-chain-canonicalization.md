@@ -95,10 +95,11 @@ chain-head substitution.
 **GOVERNED is defined by ADR-159 and only by ADR-159**: an edge is governed
 when it satisfies ADR-159's closure predicate in the recall query's read
 snapshot — `edge_governance_state.status == 'active'`, the edge is live with
-`relation == 'supersedes'` and live memory-note endpoints, an
+`relation == 'supersedes'`, `target_backend` IS NULL (governance is
+local-only per ADR-159 §2), and live memory-note endpoints, an
 `edge_governance_active` row exists with `edge_id` equal to the edge's ID,
 and that row's bound namespace/source/target/relation/target_backend
-equal the edge's current preimage. Nothing in edge `metadata`, note `properties`, or any
+match the edge's current preimage under null-safe (`IS`) comparison. Nothing in edge `metadata`, note `properties`, or any
 other caller-writable surface confers or removes governance, and no
 classification, degradation, suppression, or substitution in this ADR may
 branch on an ungoverned edge.
