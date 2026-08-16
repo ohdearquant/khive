@@ -63,6 +63,13 @@ performing operations; they do not append events directly, and no verb accepts a
 caller-composed event for insertion into the authoritative log. What a caller can assert,
 it can forge; the plane records what the runtime observed, in the runtime's own words.
 
+This forbids caller-composed events, not caller-supplied content inside runtime-composed
+ones. A verb whose arguments carry caller-supplied data — a feedback signal, a judgment, a
+payload — may have that data recorded in the event the runtime composes for the operation:
+the runtime stamps the event's kind, attribution, and context, and the caller's data
+appears as what the caller supplied, never as what the runtime observed independently. The
+distinction is authorship of the event, not presence of caller data within it.
+
 ### 2. Attribution rides the dispatch seam
 
 Every event on the plane attributes to the actor the runtime's own dispatch seam resolved
@@ -124,9 +131,11 @@ dispatch-audit class decoupled, and it must state the availability cost it accep
 synchronous posture makes event-store write availability part of the operation's
 availability).
 
-Owner: the runtime's event-plane maintainer. Gate: a decision on this section — with the
-per-class posture table filled in and the collision above resolved explicitly — before any
-surface advertises a replayable session or transcript contract backed by this plane.
+Owner: the named maintainer on the tracking issue opened for this section when this ADR
+merges — an open section without an accountable assignee is treated as unowned and this ADR
+as unimplemented on that point. Gate: a decision on this section — with the per-class
+posture table filled in and the collision above resolved explicitly — before any surface
+advertises a replayable session or transcript contract backed by this plane.
 
 ## Open section B — availability (not decided here)
 
@@ -141,8 +150,15 @@ all"), consistent with the degraded-state reporting this substrate already pract
 elsewhere; the open work is fixing the discriminant's contract on the ADR-022 surface and
 the write-side refusal semantics.
 
-Owner: the runtime's event-plane maintainer. Gate: a decision on this section before any
-merge-gating or admission-control consumer takes the plane as its sole input.
+One consumer-side ruling is upstream of this section and does not belong to the plane's
+maintainer: whether a merge-gating or admission-control consumer may block on plane outage
+at all, and under what availability objective. That ruling sits with project ownership;
+this section's contract must name it as an input rather than decide it.
+
+Owner: the named maintainer on the tracking issue opened for this section when this ADR
+merges, under the same unowned-means-unimplemented rule as section A. Gate: a decision on
+this section before any merge-gating or admission-control consumer takes the plane as its
+sole input.
 
 ## Non-goals
 
