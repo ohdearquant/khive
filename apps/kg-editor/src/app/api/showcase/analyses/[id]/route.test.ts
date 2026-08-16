@@ -5,6 +5,9 @@ import { dirname, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createShowcaseAnalysisGet } from "@/lib/server/showcase-analysis-route";
+import {
+  ShowcaseAnalysisError,
+} from "@/lib/server/materialized-showcase-source";
 
 const goldenPath = resolve(
   process.cwd(),
@@ -18,7 +21,13 @@ async function configuredAnalysis() {
   const report = resolve(root, "khive", "khive.repo.v1.json");
   await mkdir(dirname(report), { recursive: true });
   await writeFile(report, await readFile(goldenPath));
-  return { root, ids: new Set(["khive"]) };
+  return {
+    root,
+    entries: [{
+      analysis_id: "khive",
+      canonical_url: "https://github.com/ohdearquant/khive",
+    }],
+  };
 }
 
 afterEach(async () => {
@@ -63,7 +72,10 @@ describe("GET /api/showcase/analyses/[id]", () => {
   it("returns a stable sanitized error envelope for an unknown id", async () => {
     const registry = {
       root: "/a/server/private/path/that/must/not/be-read",
-      ids: new Set(["khive"]),
+      entries: [{
+        analysis_id: "khive",
+        canonical_url: "https://github.com/ohdearquant/khive",
+      }],
     };
     const loadAnalysis = vi.fn();
     const get = createShowcaseAnalysisGet(() => registry, loadAnalysis);
@@ -86,5 +98,39 @@ describe("GET /api/showcase/analyses/[id]", () => {
     });
     expect(body).not.toContain(registry.root);
     expect(loadAnalysis).not.toHaveBeenCalled();
+  });
+
+  it("sanitizes a configured report that fails identity validation", async () => {
+    const registry = {
+      root: "/a/server/private/path/that/must/not-be-returned",
+      entries: [{
+        analysis_id: "khive",
+        canonical_url: "https://github.com/operator/private-repository",
+      }],
+    };
+    const get = createShowcaseAnalysisGet(
+      () => registry,
+      async () => {
+        throw new ShowcaseAnalysisError("ANALYSIS_INVALID");
+      },
+    );
+
+    const response = await get(
+      new Request("http://localhost/api/showcase/analyses/khive"),
+      { params: Promise.resolve({ id: "khive" }) },
+    );
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    const body = await response.text();
+    expect(JSON.parse(body)).toEqual({
+      error: {
+        code: "ANALYSIS_INVALID",
+        message: "This repository analysis did not pass validation.",
+      },
+    });
+    expect(body).not.toContain(registry.root);
+    expect(body).not.toContain(registry.entries[0].canonical_url);
   });
 });

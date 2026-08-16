@@ -323,3 +323,47 @@ in TypeScript. The server boundary can land independently while the static adapt
 remains the default. This amendment does not authorize request-time `repo export`,
 arbitrary-URL ingestion, or direct browser/Next.js access to SQLite. Those remain slice
 2 and require the queueing, sandboxing, resource-limit, and abuse-control design in D4.
+
+## Amendment 2 — Operator-configured analysis catalog (2026-08-14)
+
+Amendment 1 allowed an operator to name completed materialized reports by opaque ID, but
+an ID-only allowlist left two missing contracts: a browser could not discover the
+configured set without an out-of-band static registry, and the report route did not bind
+an ID to the repository identity inside the loaded bundle. This amendment closes both
+gaps without adding discovery of server-private storage.
+
+The operator configuration is `KHIVE_SHOWCASE_ANALYSES`, a JSON array of strict
+`{analysis_id, canonical_url}` objects. It contains one to 64 entries. Analysis IDs use
+the Amendment 1 closed ID grammar. Repository URLs pass the same normalization used by
+the showcase lookup: HTTP and HTTPS inputs canonicalize to HTTPS, host names are
+case-normalized, the GitHub `www` alias and a terminal `.git` suffix are removed, and
+query, fragment, and trailing-slash variations do not create new identities. Both
+analysis ID and normalized URL are unique across the array. Malformed JSON, a non-array,
+an empty or oversized array, unknown object fields, an invalid ID or URL, or either kind
+of duplicate makes the whole configuration unavailable. The former
+`KHIVE_SHOWCASE_ANALYSIS_IDS` setting is not a compatibility surface.
+
+`GET /api/showcase/analyses` returns this exact deterministic envelope, ordered by
+`analysis_id`:
+
+```json
+{
+  "schema_version": "khive.showcase.catalog.v1",
+  "entries": [{ "analysis_id": "khive", "canonical_url": "https://github.com/ohdearquant/khive" }]
+}
+```
+
+Each entry contains exactly `analysis_id` and `canonical_url`. No server path, report
+metadata, database state, build state, or operator-only field is present. Catalog
+handling parses the bounded explicit configuration only: it does not enumerate the
+analysis root, read a report, open SQLite, or execute a process. The response is JSON
+with `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`. Missing or
+invalid configuration returns Amendment 1's sanitized `NOT_CONFIGURED` 404 envelope.
+
+The existing `GET /api/showcase/analyses/[id]` route additionally resolves the configured
+entry before any filesystem access. After its existing bounded, symlink-resistant read
+and closed `khive.repo.v1` validation, it normalizes
+`meta.repository.canonical_url` and requires equality with that entry's configured URL.
+A mismatch is `ANALYSIS_INVALID`; neither URL nor a private path is reflected in the
+error. Request-time clone, export, SQLite access, process execution, directory scanning,
+and arbitrary URL ingest remain forbidden.
