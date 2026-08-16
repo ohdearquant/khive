@@ -166,6 +166,10 @@ fn comm_pack_requires_kg() {
     assert_eq!(CommPack::REQUIRES, &["kg"]);
 }
 
+/// Self-send (`to: "local"`) dual-writes an outbound record plus an inbound sibling, and
+/// the inbound copy's read status depends on delivery ordering — so the inbox query uses
+/// `status: "all"` (not the unread default) and asserts only that a `count` field is
+/// present, since a count of zero is a legal outcome of this fixture.
 #[tokio::test]
 async fn send_and_inbox_roundtrip() {
     let (registry, _rt) = build_registry();
