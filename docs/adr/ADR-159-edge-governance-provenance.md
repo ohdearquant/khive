@@ -210,6 +210,28 @@ and binds authorizer, action, authority subject and scope, source, target,
 relation, policy/provider version, and — when reviewed — proposal and
 review event. It contains no key or secret.
 
+**Governance is local-only.** An edge is governance-eligible only when its
+`target_backend` IS NULL — both endpoints live in the same store. Both
+stamping paths refuse a non-NULL `target_backend` with a typed error:
+`governed_link` and `classify_existing_edge_governance` reject the
+operation before any write. The reason is structural, not a deferral of
+effort: ADR-029 stores a cross-backend edge on the source backend while
+the target note lives in an independent SQLite file, so the endpoint-note
+liveness trigger (§3) cannot observe a remote target's `deleted_at`
+transition. A remote note could be soft-deleted and restored under the
+same ID with wholly new content while the source-side marker stayed
+active, and canonicalization would then reuse authorization granted over
+a memory that no longer exists. Until a durable cross-backend
+invalidation protocol is specified in a future ADR, cross-backend
+`supersedes` edges remain creatable through the plain `link` path
+(ADR-017's endpoint contract is untouched) but are ungoverned and
+canonicalization-inert — the same standing as every other ungoverned
+edge. Throughout this ADR, every `target_backend` comparison — trigger
+predicates, closure predicate, preimage equality, migration selection —
+uses SQL null-safe semantics (`IS`, `IS NOT`), never bare `=`: local
+edges carry NULL, and `NULL = NULL` is not true in SQLite, so an
+equality-written predicate would silently exclude every governed edge.
+
 ### 3. Invalidation rules
 
 | Mutation                                                               | Active governance result                                                                                                                                                                                                                                                                                                                                                          |
@@ -231,7 +253,17 @@ source_id, target_id, relation, target_backend, deleted_at` on
 with incident governed edges, plus delete triggers — at the database
 layer, because merge rewires include raw `UPDATE graph_edges` statements
 that bypass handler code (`crates/khive-runtime/src/curation.rs`).
-Handler-only clearing is insufficient by construction. Each trigger
+Handler-only clearing is insufficient by construction. Every UPDATE
+trigger MUST carry a `WHEN` value-transition predicate over its watched
+columns (`OLD.col IS NOT NEW.col`, null-safe, OR-joined across the
+trigger's column list): SQLite fires `AFTER UPDATE OF` whenever a listed
+column is _assigned_, even to its current value, and both upsert conflict
+arms always assign `target_backend` and `deleted_at`
+(`crates/khive-db/src/stores/graph.rs`, `stores/note.rs`). A literal
+column-list-only implementation would therefore invalidate governance on
+every ordinary same-value relink and note upsert; the invalidation table
+above reads "transition", and the `WHEN` predicate is what makes the
+trigger fire on transitions rather than assignments. Each trigger
 performs two writes in the same statement-level transaction: delete the
 marker, append the invalidation row referencing the marker's
 `decision_id`. `INSERT OR REPLACE` on `graph_edges` may not become a
@@ -259,10 +291,11 @@ of the following hold in the same read snapshot:
 edge_governance_state.status == 'active'
 AND graph_edge is live
 AND graph_edge.relation == 'supersedes'
+AND graph_edge.target_backend IS NULL
 AND both endpoints are live memory notes
 AND edge_governance_active.edge_id == graph_edge.id
 AND active.bound namespace/source/target/relation/target_backend
-    == current edge preimage
+    matches the current edge preimage (null-safe: IS, per §2)
 ```
 
 Expansion starts from `edge_governance_active.target_id` via the covering
@@ -293,11 +326,28 @@ policy revision — those come from the review/apply runtime.
 
 The storage primitive `classify_existing_edge_governance` must, in one
 transaction: (1) select the edge by UUID including current liveness;
-(2) require exact equality with the full expected preimage,
-`relation = 'supersedes'`, and live memory-note endpoints; (3) consume and
-revalidate the internal authority receipt for an `authorize` disposition;
-(4) append the decision; (5) insert the active projection only for
-`authorize`. It issues **no update to `graph_edges`** — UUID, `created_at`,
+(2) require null-safe equality with the full expected preimage,
+`relation = 'supersedes'`, `target_backend` IS NULL (a non-NULL expected
+or stored value is a typed rejection — governance is local-only, §2), and
+live memory-note endpoints; (3) consume and revalidate the internal
+authority receipt — for **both** dispositions: a rejection is an authority
+claim over the edge exactly as an authorization is, and `reject` over a
+governed edge revokes live authority, so neither arm may run on a stale or
+absent receipt; (4) append the decision; (5) reconcile the active
+projection by arm:
+
+- `authorize` over an **unclassified** edge inserts the active projection
+  row;
+- `authorize` over an edge that is **already actively governed** FAILS
+  with the stale-preimage contract — re-authorizing live authority is not
+  a meaningful operation; the existing authority must be revoked first;
+- `reject` over an unclassified edge appends only the decision;
+- `reject` over an **already-governed** edge deletes the active projection
+  row in the same transaction and appends an invalidation-ledger row with
+  cause `revoked_by_decision` referencing the displaced decision, which is
+  thereby permanently spent (§1).
+
+It issues **no update to `graph_edges`** — UUID, `created_at`,
 `updated_at`, weight, metadata, and deletion state are preserved
 byte-for-byte. A stale UUID/preimage or changed authority rolls back with
 no decision and no graph mutation.
@@ -311,8 +361,23 @@ inferred from the apply worker's system identity.
 ### 6. Write fence and cutover
 
 This ADR owns cutover, because it owns the sidecar schema, the invalidation
-triggers, and the activation receipt; ADR-157 only consumes the state. The
-fence is a short single-writer transaction, not a process pause, a
+triggers, and the activation receipt; ADR-157 only consumes the state.
+
+**Governance state, activation, and the fence are per-store.** Every
+backend SQLite file that participates carries its own
+`edge_governance_state` row, runs its own fence, and activates
+independently; there is no cross-backend fence, epoch, or coordination
+protocol, and none is needed: governance is local-only (§2), so every
+governance-eligible edge of a store — its `supersedes` edges with
+`target_backend` IS NULL, both endpoints local — is fully covered by that
+store's own single-writer `BEGIN IMMEDIATE` transaction. Writes admitted
+concurrently on _other_ backends cannot create an edge this store's
+governance could ever admit, so they are outside the no-gap claim by
+construction, not missed by it. The no-gap guarantee below is therefore a
+per-store guarantee, which is exactly the scope of the authority it
+protects.
+
+The fence is a short single-writer transaction, not a process pause, a
 long-held lock, or an epoch column:
 
 1. Deploy schema, triggers, and governed write paths with state `inactive`.
@@ -465,6 +530,25 @@ recorded in § Context.)
   active without a decision or silently cross regimes.
 - Activation test: dropping or altering an invalidation trigger keeps
   canonicalization inactive.
+- Local-only refusal pair: `governed_link` and
+  `classify_existing_edge_governance` each reject a non-NULL
+  `target_backend` with the typed error and zero writes; the same edge
+  remains creatable ungoverned through plain `link`.
+- Null-safe predicate test: a governed local edge (`target_backend` NULL)
+  satisfies the closure predicate and the trigger/migration preimage
+  comparisons; an equality-written (`=`) control predicate must fail to
+  match it, proving the `IS` semantics are load-bearing.
+- Transition-predicate pair: a same-value natural-key relink and a
+  same-value note upsert (both conflict arms assign) leave the active
+  marker in place and append no invalidation row; the identical statement
+  with an actual value change deletes the marker and appends one.
+- Reconciliation-arm tests: `authorize` over an actively governed edge
+  fails with no new decision row; `reject` over an actively governed edge
+  deletes the projection row and appends a `revoked_by_decision`
+  invalidation in one transaction, and the displaced decision never
+  reactivates on rebuild.
+- Per-store activation test: activating governance on one store leaves a
+  second store's state untouched and its edges ungoverned.
 - Query-plan and latency gates from the measurements above.
 
 ## Implementation fences
