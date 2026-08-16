@@ -52,7 +52,10 @@ pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
     CommittedPostCommitEffects,
 };
-pub use blob::{resolve_blob_store, resolve_blob_store_for_mode};
+pub use blob::{
+    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, VerifiedBlob,
+    DEFAULT_BLOB_HYDRATION_BYTES,
+};
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
 pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};

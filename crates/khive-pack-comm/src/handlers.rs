@@ -3125,6 +3125,7 @@ mod tests {
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -3645,6 +3646,7 @@ mod tests {
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -3760,6 +3762,7 @@ mod tests {
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
                 git_write: Default::default(),
                 db_path: None,
+                blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::parse(&ns).unwrap(),
                 embedding_model: None,
                 additional_embedding_models: vec![],

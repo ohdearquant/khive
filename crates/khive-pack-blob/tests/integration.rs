@@ -15,7 +15,9 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime, tempfile::TempDir) {
     let store = FsBlobStore::new(dir.path().to_path_buf(), 0).expect("fs blob store");
 
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-    runtime.install_blob_store(std::sync::Arc::new(store));
+    runtime
+        .install_blob_store(std::sync::Arc::new(store))
+        .expect("install blob store");
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(BlobPack::new(runtime.clone()));

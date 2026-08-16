@@ -1011,6 +1011,7 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     let config = RuntimeConfig {
         git_write: Default::default(),
         db_path: Some(path.clone()),
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
         embedding_model: None,
         additional_embedding_models: vec![],
@@ -1194,6 +1195,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     let config = RuntimeConfig {
         git_write: Default::default(),
         db_path: Some(path.clone()),
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
         embedding_model: None,
         additional_embedding_models: vec![],

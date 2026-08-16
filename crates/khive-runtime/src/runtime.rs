@@ -4,7 +4,7 @@
 //! live in `super::config` and are re-exported from here.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use khive_db::StorageBackend;
 #[cfg(test)]
@@ -214,15 +214,13 @@ pub struct KhiveRuntime {
     /// properties survive a `merge` unchanged. Empty until installed (bare
     /// runtime), which leaves both rules inert.
     pack_owned_note_kinds: Arc<RwLock<Vec<String>>>,
-    /// The config-resolved `BlobStore` (ADR-111 Amendment 2), installed by
-    /// the boot path (`khive-mcp`'s single- and multi-backend startup paths)
-    /// via [`install_blob_store`](Self::install_blob_store) once `khive.toml`'s
-    /// `[storage.blob]` selection has been resolved through
-    /// `khive_runtime::resolve_blob_store`. `None` until installed — every
-    /// constructor here defaults it unset rather than eagerly resolving a
-    /// filesystem default, because many callers (unit tests, `memory()`) use
-    /// an in-memory backend with no blob root configured at all.
-    blob_store: Arc<RwLock<Option<Arc<dyn khive_storage::BlobStore>>>>,
+    /// The immutable runtime-owned store/hydration pair (ADR-160 D3).
+    ///
+    /// Boot resolves one store and constructs exactly one shared hydrator,
+    /// then installs that same `Arc` on every runtime handle. The one-shot
+    /// slot rejects replacement so pack runtimes cannot silently split the
+    /// aggregate byte budget after startup. Bare runtimes leave it unset.
+    blob_hydrator: Arc<OnceLock<Arc<crate::blob::BlobHydrator>>>,
     /// Pack-registered custom fusion executors (ADR-012), keyed by the name
     /// carried in `FusionStrategy::Custom { name, .. }`.
     ///
@@ -275,7 +273,7 @@ impl KhiveRuntime {
             note_mutation_hook: Arc::new(RwLock::new(None)),
             note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
-            blob_store: Arc::new(RwLock::new(None)),
+            blob_hydrator: Arc::new(OnceLock::new()),
             fusion_executors: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -308,7 +306,7 @@ impl KhiveRuntime {
             note_mutation_hook: Arc::new(RwLock::new(None)),
             note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
-            blob_store: Arc::new(RwLock::new(None)),
+            blob_hydrator: Arc::new(OnceLock::new()),
             fusion_executors: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -344,7 +342,7 @@ impl KhiveRuntime {
             note_mutation_hook: Arc::new(RwLock::new(None)),
             note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
-            blob_store: Arc::new(RwLock::new(None)),
+            blob_hydrator: Arc::new(OnceLock::new()),
             fusion_executors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -406,7 +404,7 @@ impl KhiveRuntime {
                     note_mutation_hook: self.note_mutation_hook.clone(),
                     note_write_validator: self.note_write_validator.clone(),
                     pack_owned_note_kinds: self.pack_owned_note_kinds.clone(),
-                    blob_store: self.blob_store.clone(),
+                    blob_hydrator: self.blob_hydrator.clone(),
                     fusion_executors: self.fusion_executors.clone(),
                 }
             }
@@ -889,17 +887,76 @@ impl KhiveRuntime {
         }
     }
 
-    /// Install the config-resolved `BlobStore` (ADR-111 Amendment 2).
+    /// Install an already-paired blob hydrator into this runtime.
     ///
-    /// Called by the boot path (`khive-mcp`'s single- and multi-backend
-    /// startup paths, `crates/khive-mcp/src/serve.rs`) once
-    /// `khive_runtime::resolve_blob_store` has selected the backend
-    /// `khive.toml`'s `[storage.blob]` section requests. Idempotent: a later
-    /// call overwrites the previous handle.
-    pub fn install_blob_store(&self, store: Arc<dyn khive_storage::BlobStore>) {
-        if let Ok(mut guard) = self.blob_store.write() {
-            *guard = Some(store);
+    /// Reinstalling the exact same `Arc` is idempotent. A different pair is
+    /// rejected: replacing it would split or reset the aggregate admission
+    /// budget while requests may still hold leases.
+    pub fn install_blob_hydrator(
+        &self,
+        hydrator: Arc<crate::blob::BlobHydrator>,
+    ) -> RuntimeResult<()> {
+        if hydrator.budget_bytes() != self.config.blob_hydration_bytes {
+            return Err(RuntimeError::InvalidInput(format!(
+                "blob hydrator budget {} does not match this runtime's resolved budget {}",
+                hydrator.budget_bytes(),
+                self.config.blob_hydration_bytes
+            )));
         }
+        if let Some(current) = self.blob_hydrator.get() {
+            return if Arc::ptr_eq(current, &hydrator) {
+                Ok(())
+            } else {
+                Err(RuntimeError::InvalidInput(
+                    "a different blob hydrator is already installed".to_string(),
+                ))
+            };
+        }
+
+        match self.blob_hydrator.set(hydrator) {
+            Ok(()) => Ok(()),
+            Err(candidate) => {
+                let current = self.blob_hydrator.get().ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "blob hydrator install raced without a visible winner".to_string(),
+                    )
+                })?;
+                if Arc::ptr_eq(current, &candidate) {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::InvalidInput(
+                        "a different blob hydrator is already installed".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Pair and install a store using this runtime's resolved hydration budget.
+    ///
+    /// Boot paths that own multiple runtimes should instead construct one
+    /// [`crate::BlobHydrator`] and call [`Self::install_blob_hydrator`] with
+    /// the same `Arc` on every handle.
+    pub fn install_blob_store(
+        &self,
+        store: Arc<dyn khive_storage::BlobStore>,
+    ) -> RuntimeResult<()> {
+        if let Some(current) = self.blob_hydrator.get() {
+            let current_store = current.store();
+            if Arc::ptr_eq(&current_store, &store) {
+                return Ok(());
+            }
+        }
+        let hydrator = Arc::new(crate::blob::BlobHydrator::new(
+            store,
+            self.config.blob_hydration_bytes,
+        )?);
+        self.install_blob_hydrator(hydrator)
+    }
+
+    /// Return the installed shared blob hydrator, if boot configured one.
+    pub fn blob_hydrator(&self) -> Option<Arc<crate::blob::BlobHydrator>> {
+        self.blob_hydrator.get().cloned()
     }
 
     /// Return the installed `BlobStore`, if the boot path resolved and
@@ -907,7 +964,7 @@ impl KhiveRuntime {
     /// installed — e.g. a bare/test runtime constructed without going
     /// through the `khive-mcp` boot path.
     pub fn blob_store(&self) -> Option<Arc<dyn khive_storage::BlobStore>> {
-        self.blob_store.read().ok().and_then(|guard| guard.clone())
+        self.blob_hydrator.get().map(|hydrator| hydrator.store())
     }
 
     /// Install the pack-aggregated valid entity and note kinds.
@@ -1478,10 +1535,86 @@ mod tests {
     use khive_gate::GateRef;
     use serial_test::serial;
 
+    fn test_blob_hydrator() -> (tempfile::TempDir, Arc<crate::BlobHydrator>) {
+        let root = tempfile::tempdir().expect("blob root");
+        let store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(root.path().to_path_buf(), 0)
+                .expect("fs blob store"),
+        );
+        let hydrator = Arc::new(
+            crate::BlobHydrator::new(store, crate::DEFAULT_BLOB_HYDRATION_BYTES)
+                .expect("blob hydrator"),
+        );
+        (root, hydrator)
+    }
+
     #[test]
     fn memory_runtime_creates_successfully() {
         let rt = KhiveRuntime::memory().expect("memory runtime should create");
         assert!(rt.config().db_path.is_none());
+    }
+
+    #[test]
+    fn installed_blob_hydrator_is_shared_by_clone_and_core_handles() {
+        let main_backend = Arc::new(StorageBackend::memory().expect("main backend"));
+        let pack_backend = Arc::new(StorageBackend::memory().expect("pack backend"));
+        let mut config = RuntimeConfig::no_embeddings();
+        config.backend_id = BackendId::new("assets");
+        let runtime = KhiveRuntime::from_backend(pack_backend, config)
+            .with_core_backend(Arc::clone(&main_backend));
+        let (_root, hydrator) = test_blob_hydrator();
+
+        runtime
+            .install_blob_hydrator(Arc::clone(&hydrator))
+            .expect("first install");
+
+        for handle in [runtime.clone(), runtime.core()] {
+            let installed = handle.blob_hydrator().expect("installed hydrator");
+            assert!(Arc::ptr_eq(&installed, &hydrator));
+        }
+    }
+
+    #[test]
+    fn blob_hydrator_install_is_idempotent_but_rejects_replacement() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let (_first_root, first) = test_blob_hydrator();
+        let (_second_root, second) = test_blob_hydrator();
+
+        runtime
+            .install_blob_hydrator(Arc::clone(&first))
+            .expect("first install");
+        runtime
+            .install_blob_hydrator(Arc::clone(&first))
+            .expect("same Arc reinstall is idempotent");
+
+        let error = runtime
+            .install_blob_hydrator(second)
+            .expect_err("a different hydrator must not replace the installed pair");
+        assert!(error.to_string().contains("already installed"));
+        assert!(Arc::ptr_eq(
+            &runtime.blob_hydrator().expect("original remains"),
+            &first
+        ));
+    }
+
+    #[test]
+    fn blob_hydrator_install_rejects_a_budget_that_disagrees_with_runtime_identity() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let root = tempfile::tempdir().expect("blob root");
+        let store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(root.path().to_path_buf(), 0)
+                .expect("fs blob store"),
+        );
+        let mismatched = Arc::new(
+            crate::BlobHydrator::new(store, khive_storage::MAX_BLOB_WHOLE_BYTES)
+                .expect("minimum blob budget"),
+        );
+
+        let error = runtime
+            .install_blob_hydrator(mismatched)
+            .expect_err("live admission must match the construction-baked config identity");
+        assert!(matches!(error, RuntimeError::InvalidInput(_)));
+        assert!(runtime.blob_hydrator().is_none());
     }
 
     #[test]
@@ -1541,6 +1674,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             db_path: Some(path),
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -1565,6 +1699,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -1587,6 +1722,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             db_path: Some(path.clone()),
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -1613,6 +1749,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             db_path: Some(path.clone()),
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -1681,6 +1818,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             db_path: Some(path.clone()),
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -1762,6 +1900,7 @@ mod tests {
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
                 git_write: Default::default(),
                 db_path: Some(db_path),
+                blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
                 embedding_model: None,
                 additional_embedding_models: vec![],
@@ -1807,6 +1946,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -1972,6 +2112,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -1997,6 +2138,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -2030,6 +2172,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -2055,6 +2198,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -2215,6 +2359,7 @@ mod tests {
         RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -2292,6 +2437,7 @@ mod tests {
         let main_config = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -2429,6 +2575,7 @@ mod tests {
             RuntimeConfig {
                 git_write: Default::default(),
                 db_path: None,
+                blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
                 embedding_model: None,
                 additional_embedding_models: vec![],

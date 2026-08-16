@@ -20,6 +20,24 @@
 - The audit payload field holds the full `AuditEvent` envelope (not a bare verb result)
 - Top-level event fields follow the ADR-004/ADR-005 schema
 
+### Shared Blob Hydration (ADR-160 D3)
+
+- Each installed `BlobStore` is paired with one immutable, runtime-owned
+  `Arc<BlobHydrator>`; default, core, and pack runtime handles sharing that
+  store receive the same hydrator and therefore one aggregate byte budget
+- Admission reserves the caller's declared whole-object maximum before backend
+  I/O. `[runtime] blob_hydration_bytes` defaults to 256 MiB and startup rejects
+  values below the portable 64 MiB object envelope
+- `VerifiedBlob` exposes borrowed bytes and retains its weighted lease until
+  drop; it has no clone or owned-byte extraction API
+- A tracked supervisor owns admitted backend work. Request cancellation drops
+  only the waiter, while capacity remains charged until native work ends; daemon
+  drain observes the supervisor through ADR-119 background-task accounting
+- Raw store access remains temporarily available for mutation, stat, existence,
+  and compatibility with the still-unmigrated whole-buffer readers. ADR-160
+  Phase 3 routes those production reads through `BlobHydrator` and removes the
+  raw read surface
+
 ### Namespace Strategy (Rev 6) (ADR-007)
 
 - Namespace is attribution and gate-policy input, not a storage partition; it is not a

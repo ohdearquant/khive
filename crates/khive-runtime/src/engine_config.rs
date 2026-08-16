@@ -73,6 +73,11 @@ pub enum ConfigError {
     #[error("[[git_write.allowed]] entry {repo:?}: {reason}")]
     InvalidGitWriteEntry { repo: String, reason: String },
 
+    #[error(
+        "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
+    )]
+    InvalidBlobHydrationBytes { value: u64, min: u64, max: u64 },
+
     #[error("the explicitly selected config file does not exist: {path}")]
     ExplicitConfigMissing { path: PathBuf },
 
@@ -414,9 +419,10 @@ pub struct KhiveConfig {
 
 /// `[runtime]` section in `khive.toml`.
 ///
-/// Carries runtime knobs that mirror the CLI flag / env var tier.
-/// All fields are optional; absent keys fall through to env vars or built-in
-/// defaults.
+/// Carries runtime knobs resolved during process construction. Most mirror a
+/// CLI flag / environment tier; field documentation calls out exceptions.
+/// All fields are optional and preserve their already-resolved base value when
+/// absent.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuntimeSectionConfig {
     /// Packs to load when neither `--pack` nor `KHIVE_PACKS` selects them.
@@ -441,6 +447,15 @@ pub struct RuntimeSectionConfig {
     /// Accepted values: `"json"` (default), `"auto"`, `"table"`.
     #[serde(default)]
     pub default_output_format: Option<OutputFormat>,
+
+    /// Aggregate process-local admission budget for digest-verified blob
+    /// hydration (ADR-160 D3), in raw bytes.
+    ///
+    /// This knob has no environment-variable counterpart. When absent, the
+    /// resolved runtime keeps its built-in 256 MiB default (or a value supplied
+    /// directly through `RuntimeConfig`).
+    #[serde(default)]
+    pub blob_hydration_bytes: Option<u64>,
 }
 
 impl KhiveConfig {
@@ -677,6 +692,14 @@ impl KhiveConfig {
                 return Err(ConfigError::UnsupportedTopLevelDb {
                     value: value.to_string(),
                 });
+            }
+        }
+
+        if let Some(value) = self.runtime.blob_hydration_bytes {
+            let min = khive_storage::MAX_BLOB_WHOLE_BYTES;
+            let max = tokio::sync::Semaphore::MAX_PERMITS as u64;
+            if value < min || value > max {
+                return Err(ConfigError::InvalidBlobHydrationBytes { value, min, max });
             }
         }
 
@@ -1168,6 +1191,92 @@ model = "paraphrase-multilingual-minilm-l12-v2"
             .expect("file should be found");
         assert!(cfg.engines.is_empty());
         cfg.validate().expect("empty config should be valid");
+    }
+
+    #[test]
+    fn runtime_blob_hydration_budget_parses_and_resolves_before_engine_early_return() {
+        use crate::runtime::runtime_config_from_khive_config;
+        use crate::RuntimeConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[runtime]
+blob_hydration_bytes = 134217728
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("load should succeed")
+            .expect("file should be found");
+
+        assert_eq!(cfg.runtime.blob_hydration_bytes, Some(134_217_728));
+        let resolved = runtime_config_from_khive_config(&cfg, RuntimeConfig::default());
+        assert_eq!(resolved.blob_hydration_bytes, 134_217_728);
+    }
+
+    #[test]
+    fn runtime_blob_hydration_budget_below_one_whole_blob_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = khive_storage::MAX_BLOB_WHOLE_BYTES - 1;
+        let path = write_toml(
+            &dir,
+            &format!("[runtime]\nblob_hydration_bytes = {value}\n"),
+        );
+
+        let err = KhiveConfig::load(Some(&path)).expect_err("undersized budget must fail closed");
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidBlobHydrationBytes {
+                    value: actual,
+                    min,
+                    ..
+                } if actual == value && min == khive_storage::MAX_BLOB_WHOLE_BYTES
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_blob_hydration_budget_accepts_the_inclusive_portable_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = khive_storage::MAX_BLOB_WHOLE_BYTES;
+        let path = write_toml(
+            &dir,
+            &format!("[runtime]\nblob_hydration_bytes = {value}\n"),
+        );
+
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("the inclusive minimum must be valid")
+            .expect("config should exist");
+        assert_eq!(cfg.runtime.blob_hydration_bytes, Some(value));
+    }
+
+    #[test]
+    fn runtime_blob_hydration_budget_above_semaphore_capacity_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let max = tokio::sync::Semaphore::MAX_PERMITS as u64;
+        let value = max
+            .checked_add(1)
+            .expect("tokio maximum fits below u64::MAX");
+        let path = write_toml(
+            &dir,
+            &format!("[runtime]\nblob_hydration_bytes = {value}\n"),
+        );
+
+        let err = KhiveConfig::load(Some(&path)).expect_err("oversized budget must fail closed");
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidBlobHydrationBytes {
+                    value: actual,
+                    max: actual_max,
+                    ..
+                } if actual == value && actual_max == max
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
