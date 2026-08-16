@@ -554,7 +554,9 @@ recorded in § Context.)
   present and well-formed as far as the activation gate can observe, no-op
   only the invalidation-row append while retaining the marker deletion —
   constructible without touching the monitored trigger DDL, for example
-  by a `BEFORE INSERT` trigger on the ledger that raises `IGNORE` — state
+  by a `BEFORE INSERT` trigger on `edge_governance_invalidations` that
+  raises `IGNORE`; the decision log is a separate table (§1), so the
+  setup phase's decision inserts are unaffected — state
   the expected reddened arm before the run, and re-run the rebuild test.
   It must fail by the spent decision reactivating on the rebuild step —
   not by an activation-gate refusal, which would leave the rebuild-path
