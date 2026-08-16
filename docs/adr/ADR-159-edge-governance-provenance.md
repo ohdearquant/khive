@@ -552,16 +552,22 @@ recorded in § Context.)
 - Query-plan and latency gates from the measurements above.
 - Invalidation-write mutation control: with the invalidation triggers
   present and well-formed as far as the activation gate can observe, no-op
-  only the invalidation-row append (marker deletion retained), state the
-  expected reddened arms before the run, and re-run the rebuild and
-  same-key-resurrection arms. Both must fail by the spent decision
-  reactivating — not by an activation-gate refusal, which would leave the
-  rebuild-path assertion unreachable rather than falsified. The fixture
-  must isolate the ledger as the sole resurrection defense: the recurred
-  preimage satisfies the preimage and liveness rechecks by construction
-  (§3, same-key resurrection), so the append is load-bearing exactly
-  where every other mechanism passes, and an arm that stays green under
-  this mutant is measuring one of the other mechanisms instead.
+  only the invalidation-row append while retaining the marker deletion —
+  constructible without touching the monitored trigger DDL, for example
+  by a `BEFORE INSERT` trigger on the ledger that raises `IGNORE` — state
+  the expected reddened arm before the run, and re-run the rebuild test.
+  It must fail by the spent decision reactivating on the rebuild step —
+  not by an activation-gate refusal, which would leave the rebuild-path
+  assertion unreachable rather than falsified. The rebuild test is the
+  arm this mutant isolates: its same-key resurrection restores the exact
+  original preimage, so the preimage and liveness rechecks pass by
+  construction (§3) and only the ledger separates the incarnations. The
+  resurrection rows of the regression matrix are not expected to redden
+  by reactivation — without a rebuild step no path re-inserts an active
+  marker — and may catch the mutant only through a direct
+  ledger-row-appended assertion; an implementation whose rebuild test
+  stays green under this mutant is measuring one of the other mechanisms
+  instead.
 
 ## Implementation fences
 

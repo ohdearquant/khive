@@ -1139,14 +1139,17 @@ reviewer test.
   natural-key upsert selects an actively governed incumbent fails the
   apply with the stale-preimage contract, appends no decision row, and
   leaves the incumbent's projection row untouched.
-- A recursion pair on the A1 classification: a proposal whose only
-  governance-bearing step is nested at depth two or more —
-  `Compound([Compound([AddEdge{supersedes, …}])])` — is treated as
-  governance-bearing by every propose-time and review-time check: the
-  propose-time rejection shapes fire on the nested form, and a
-  provider-denied reviewer's approve is refused exactly as for the flat
-  form. Mutation control on the same pair: a classifier restricted to the
-  outer variant (any shallow, non-recursive evaluation) must redden both
-  halves — the nested proposal is admitted at propose time and the denied
-  reviewer's approve lands — proving the recursive evaluation of A1 is
-  load-bearing rather than incidental.
+- A recursion pair on the A1 classification, two distinct proposals since
+  the rejected shapes and the governance-bearing class are disjoint by
+  A1: (i) a proposal whose only step is one of the propose-time rejection
+  shapes nested at depth two or more — for example a cross-namespace
+  memory-supersedes inside `Compound([Compound([AddEdge{…}])])` — is
+  refused at propose time with the same typed error as its flat form;
+  (ii) a proposal whose only governance-bearing step is nested at the
+  same depth is classified governance-bearing, so a provider-denied
+  reviewer's approve is refused exactly as for the flat form. Mutation
+  control on the pair: a classifier restricted to the outer variant (any
+  shallow, non-recursive evaluation) must redden both — the nested
+  rejected shape is admitted at propose time, and the denied reviewer's
+  approve lands on the nested governance-bearing proposal — proving the
+  recursive evaluation of A1 is load-bearing rather than incidental.
