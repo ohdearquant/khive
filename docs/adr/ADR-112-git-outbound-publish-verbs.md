@@ -4,9 +4,9 @@
 **Date**: 2026-07-13\
 **Authors**: khive maintainers\
 **Depends on**: ADR-088 (Git-Lifecycle Pack) and its Amendments 1-2 (`git.digest`), ADR-108
-(Git Write Surface Through khive, Phase B), ADR-018 (Authorization Gate), ADR-017 (Pack
-Standard), ADR-016 (Request DSL), ADR-004 (Substrate Observables - `Event` store used for
-audit), ADR-013 (Note Kind Taxonomy)\
+(Git Write Surface Through khive, Phase B), ADR-018 (Authorization Gate, as amended by ADR-129),
+ADR-017 (Pack Standard), ADR-016 (Request DSL), ADR-004 (Substrate Observables - `Event` store
+used for audit), ADR-013 (Note Kind Taxonomy)\
 **Related**: ADR-002 (Edge Ontology - `annotates`), ADR-007 Rev 7 (Namespace as
 Attribution-Only)
 
@@ -328,9 +328,9 @@ authorization, and hygiene scanning have completed:
 Verb dispatch passes through the Gate (ADR-018) at the registry boundary before the pack
 handler. For exactly `git.publish_issue`, `git.publish_comment`, `git.publish_pr`, and
 `git.publish_release`, that boundary **must use strict fail-closed Gate evaluation and
-publish-specific reason redaction**. These are verb-scoped overrides of ADR-018's general
-fail-open default for Gate errors and reason-preserving explicit denials (ADR-018 lines 32-34,
-71-74, 184-194, and 209-222); they do not change Gate behavior for any other verb.
+publish-specific reason redaction**. ADR-129 now makes Gate infrastructure errors fail closed for
+every dispatch; this proposal's verb-scoped additions are content-free reason replacement and the
+stronger audit-persistence rule below. They do not change Gate behavior for any other verb.
 
 For these four verbs, the registry owns a publish-specific redaction boundary immediately
 after `Gate::check` returns and before `AuditEvent::from_check`, tracing, Event construction
@@ -1511,10 +1511,11 @@ Four forks were presented for this design; each is resolved in place.
   candidate for future adoption by ADR-108 surfaces (for example, scanning a `git.commit`
   message) - not specified by this ADR, noted as a natural extension point.
 - ADR-018 - Authorization Gate; the dispatch-time authorization seam every verb, including
-  this ADR's four, passes through independent of the hygiene scan. ADR-112 makes two
-  verb-scoped exceptions for the four publish verbs: Gate errors fail closed, and both
-  Gate-provided explicit-denial reasons and error text are replaced at the registry boundary
-  with stable content-free reasons. All other verbs retain ADR-018 behavior.
+  this ADR's four, passes through independent of the hygiene scan. ADR-129 supplies the common
+  fail-closed Gate-error posture; ADR-112 additionally replaces both Gate-provided
+  explicit-denial reasons and error text at the registry boundary with stable content-free reasons
+  and requires persistence for the outage record. All other verbs retain ADR-018 as amended by
+  ADR-129.
 - ADR-017 - Pack Standard; `HandlerDef`, `PackRuntime::dispatch`, the mechanism these verbs
   register through.
 - ADR-016 - Request DSL; the wire surface these verbs are reachable through.

@@ -159,7 +159,7 @@ impl Gate for RegoGate {
             engine.eval_rule(self.entrypoint.clone())
         };
 
-        // Gate errors are dispatcher-fail-open; policy evaluation uncertainty must deny.
+        // Keep policy evaluation uncertainty distinguishable from a gate infrastructure outage.
         let value = match result {
             Ok(v) => v,
             Err(e) => {

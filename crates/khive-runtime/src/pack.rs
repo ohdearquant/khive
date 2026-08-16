@@ -550,8 +550,7 @@ impl VerbRegistryBuilder {
     ///
     /// Defaults to `AllowAllGate` if not set. `Deny` is authoritative — a deny
     /// decision aborts dispatch with `RuntimeError::PermissionDenied`. Gate
-    /// infrastructure errors fail open (logged via `tracing::warn!`, dispatch
-    /// proceeds).
+    /// infrastructure errors abort dispatch with `RuntimeError::GateUnavailable`.
     pub fn with_gate(&mut self, gate: GateRef) -> &mut Self {
         self.gate = gate;
         self
@@ -569,8 +568,8 @@ impl VerbRegistryBuilder {
     /// Set the `EventStore` used to persist audit events.
     ///
     /// When configured, every gate check appends one `Event` (substrate =
-    /// `Event`, outcome = `Success` on allow, `Denied` on deny) in addition to
-    /// the `tracing::info!` emission that was already present in v0.2.
+    /// `Event`, outcome = `Success` on allow, `Denied` on deny, or `Error` on
+    /// gate unavailability) in addition to the `tracing::info!` emission.
     ///
     /// Callers that do not set this field continue to use tracing-only emission
     /// (the v0.2 default), except `git.digest`: its successful response carries
@@ -1361,7 +1360,7 @@ impl VerbRegistry {
     ///
     /// Multi-backend transports use this to route an operation through a
     /// coordinator while retaining [`Self::dispatch_with_identity`]'s gate and
-    /// audit lifecycle. Deny is authoritative, gate errors fail open, and an
+    /// audit lifecycle. Deny is authoritative, gate errors fail closed, and an
     /// allowed audit is persisted after the intercepted operation resolves so
     /// its outcome and duration reflect the operation result. Successful
     /// `git.digest` interception uses the same strict durable-receipt exception
@@ -1436,8 +1435,9 @@ impl VerbRegistry {
                 Some(audit)
             }
             Err(err) => {
-                tracing::warn!(verb, error = %err, "gate check failed (fail-open)");
-                None
+                return Err(self
+                    .gate_unavailable_error(&gate_req, &err, request_id)
+                    .await);
             }
         };
 
@@ -1590,11 +1590,43 @@ impl VerbRegistry {
         Ok(GateRequest::new(actor, namespace, verb, params.clone()))
     }
 
+    async fn gate_unavailable_error(
+        &self,
+        gate_req: &GateRequest,
+        error: &khive_gate::GateError,
+        request_id: Option<u64>,
+    ) -> RuntimeError {
+        let audit = AuditEvent::gate_unavailable(gate_req, self.gate.impl_name());
+        tracing::info!(
+            audit_event = %serde_json::to_string(&audit)
+                .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
+            "gate.check"
+        );
+        tracing::warn!(
+            verb = %gate_req.verb,
+            error = %error,
+            "gate check failed (fail-closed)"
+        );
+        if let Some(store) = &self.event_store {
+            let event = build_audit_storage_event(
+                gate_req,
+                &audit,
+                EventOutcome::Error,
+                Some(crate::cost_unit::base_resource_payload(request_id)),
+            );
+            append_audit_event_best_effort(store, event, gate_req.verb.as_str()).await;
+        }
+        RuntimeError::GateUnavailable {
+            verb: gate_req.verb.clone(),
+            reason: error.to_string(),
+        }
+    }
+
     /// Dispatch a verb to the first pack that handles it.
     ///
     /// Routes through the gate, then invokes the matching pack handler. When
     /// `params["help"] == true`, short-circuits to `describe_verb` with no side effects.
-    /// Gate errors are fail-open. Full dispatch flow documented in `docs/protocol.md`.
+    /// Gate errors fail closed. Full dispatch flow documented in `docs/protocol.md`.
     ///
     /// Equivalent to `self.dispatch_with_identity(verb, params, None)` — uses
     /// this registry's construction-baked `default_namespace` / `actor_id` /
@@ -1652,7 +1684,7 @@ impl VerbRegistry {
         //
         // - Ok(Allow) → proceed to pack dispatch (tracing + optional EventStore).
         // - Ok(Deny) → emit audit, persist if store configured, return PermissionDenied.
-        // - Err(_) → warn via tracing, fail-open (no audit persisted).
+        // - Err(_) → emit an outage audit and return GateUnavailable.
         let (gate_blocked, mut deferred_audit) = match self.gate.check(&gate_req) {
             Ok(decision) => {
                 let is_deny = matches!(decision, GateDecision::Deny { .. });
@@ -1747,10 +1779,9 @@ impl VerbRegistry {
                 (reason, deferred)
             }
             Err(err) => {
-                // Gate infrastructure failure — fail-open.
-                // No decision was produced; no audit event is persisted.
-                tracing::warn!(verb, error = %err, "gate check failed (fail-open)");
-                (None, None)
+                return Err(self
+                    .gate_unavailable_error(&gate_req, &err, request_id)
+                    .await);
             }
         };
 
@@ -3304,6 +3335,54 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct GateErrorTrackingPack {
+        invoked: Arc<AtomicUsize>,
+    }
+
+    impl Pack for GateErrorTrackingPack {
+        const NAME: &'static str = "gate_error_tracking";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "guarded",
+            description: "track whether gate-error dispatch reaches the handler",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for GateErrorTrackingPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.invoked.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"invoked": true}))
+        }
+    }
+
     /// A pack whose `dispatch` sleeps for a fixed, generous duration so
     /// `duration_us` regression tests (ADR-103 Stage 1) have a reliably
     /// nonzero, non-flaky measured dispatch time to assert against.
@@ -4638,9 +4717,9 @@ pub(crate) mod tests {
     /// fails closed rather than opening a security hole.
     /// `RegoGate::check` converts all evaluation failures (missing rule,
     /// undefined result, serialization error, poisoned engine) to
-    /// `Ok(GateDecision::Deny)`, so dispatch is blocked. The runtime's
-    /// fail-open `Err(_)` branch remains for non-evaluation gate errors
-    /// (e.g. infrastructure faults from other `Gate` implementations).
+    /// `Ok(GateDecision::Deny)`, so dispatch is blocked as a policy refusal.
+    /// Infrastructure faults from other `Gate` implementations remain
+    /// distinguishable as `RuntimeError::GateUnavailable`.
     #[tokio::test]
     async fn rego_gate_missing_entrypoint_returns_permission_denied() {
         use khive_gate_rego::RegoGate;
@@ -4648,8 +4727,8 @@ pub(crate) mod tests {
         // Policy defines `verdict` but NOT `data.khive.gate.decision` (the
         // default entrypoint).  Construction succeeds — from_policy_str does
         // not validate the default entrypoint.  check() must convert the
-        // missing-rule evaluation error to Ok(Deny) so the runtime denies
-        // the request rather than treating the Err as a fail-open signal.
+        // missing-rule evaluation error to Ok(Deny) so the runtime reports a
+        // policy refusal rather than a gate infrastructure outage.
         let policy = r#"
             package khive.gate
             import rego.v1
@@ -4930,6 +5009,51 @@ pub(crate) mod tests {
             audit.deny_reason.is_none(),
             "deny_reason must be None on Allow"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_tracing_emits_one_gate_check_event_when_gate_is_unavailable() {
+        #[derive(Debug)]
+        struct TracingUnavailableGate;
+        impl Gate for TracingUnavailableGate {
+            fn check(&self, _: &GateRequest) -> Result<GateDecision, GateError> {
+                Err(GateError::Internal("tracing gate broken".into()))
+            }
+
+            fn impl_name(&self) -> &'static str {
+                "TracingUnavailableGate"
+            }
+        }
+
+        let events = capture_dispatch_events(async {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(AlphaPack);
+            builder.with_gate(Arc::new(TracingUnavailableGate));
+            let reg = builder.build().expect("registry builds");
+            let error = reg
+                .dispatch("list", Value::Null)
+                .await
+                .expect_err("gate outage must refuse dispatch");
+            assert!(matches!(error, RuntimeError::GateUnavailable { .. }));
+        });
+
+        let gate_events = gate_check_events_for(&events, "TracingUnavailableGate");
+        assert_eq!(
+            gate_events.len(),
+            1,
+            "exactly one gate.check tracing event per gate outage; got {gate_events:?}"
+        );
+        let payload = gate_events[0]
+            .audit_event
+            .as_ref()
+            .expect("gate outage trace must carry an audit_event field");
+        let audit: AuditEvent =
+            serde_json::from_str(payload).expect("audit_event payload must decode");
+        assert_eq!(audit.decision, AuditDecision::GateUnavailable);
+        assert!(audit.deny_reason.is_none());
+        assert!(audit.obligations.is_empty());
+        assert_eq!(audit.gate_impl, "TracingUnavailableGate");
     }
 
     // ---- Hard enforcement + EventStore persistence ----
@@ -5248,7 +5372,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn git_digest_gate_fail_open_cannot_bypass_the_receipt_contract() {
+    async fn git_digest_gate_unavailable_precedes_the_receipt_contract() {
         #[derive(Debug)]
         struct FailingGate;
         impl Gate for FailingGate {
@@ -5271,15 +5395,119 @@ pub(crate) mod tests {
         let err = registry
             .dispatch("git.digest", serde_json::json!({}))
             .await
-            .expect_err("no gate audit means no complete receipt");
+            .expect_err("gate unavailability must refuse before the handler or receipt path");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::GateUnavailable { ref verb, ref reason }
+                if verb == "git.digest" && reason.contains("injected gate failure")
         ));
-        assert!(
-            store.events.lock().unwrap().is_empty(),
-            "a missing gate decision must not fabricate an audit receipt"
+        let event = only_git_digest_event(&store);
+        assert_eq!(event.outcome, EventOutcome::Error);
+        assert_eq!(event.payload["decision"], "gate_unavailable");
+        assert!(event.payload.get("result").is_none());
+    }
+
+    #[tokio::test]
+    async fn intercepted_gate_error_returns_typed_refusal_without_invoking_operation() {
+        #[derive(Debug)]
+        struct FailingGate;
+        impl Gate for FailingGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, khive_gate::GateError> {
+                Err(khive_gate::GateError::Internal(
+                    "intercepted gate broken".into(),
+                ))
+            }
+        }
+
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let invoked_by_operation = Arc::clone(&invoked);
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(Arc::new(FailingGate));
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+        let identity = RequestIdentity {
+            namespace: "identity-default".to_string(),
+            request_id: Some(1_600),
+            ..Default::default()
+        };
+
+        let err = registry
+            .dispatch_intercepted_with_identity(
+                "list",
+                &serde_json::json!({"namespace": "test-ns"}),
+                Some(&identity),
+                move |_namespace| {
+                    invoked_by_operation.fetch_add(1, Ordering::SeqCst);
+                    async move { Ok(serde_json::json!({"invoked": true})) }
+                },
+            )
+            .await
+            .expect_err("gate unavailability must refuse intercepted dispatch");
+
+        assert!(matches!(
+            err,
+            RuntimeError::GateUnavailable { ref verb, ref reason }
+                if verb == "list" && reason.contains("intercepted gate broken")
+        ));
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "intercepted operation must not run after a gate infrastructure error"
+        );
+
+        let events = store.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].verb, "list");
+        assert_eq!(events[0].namespace, "test-ns");
+        assert_eq!(events[0].outcome, EventOutcome::Error);
+        assert_eq!(events[0].payload["decision"], "gate_unavailable");
+        assert!(events[0].payload.get("deny_reason").is_none());
+        assert_eq!(events[0].payload["resource"]["work_class"], "interactive");
+        assert_eq!(events[0].payload["resource"]["request_id"], 1_600);
+        assert!(events[0].payload["resource"].get("cost_unit").is_none());
+    }
+
+    #[tokio::test]
+    async fn intercepted_deny_remains_distinct_and_does_not_invoke_operation() {
+        #[derive(Debug)]
+        struct DenyingGate;
+        impl Gate for DenyingGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("intercepted policy denied"))
+            }
+        }
+
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let invoked_by_operation = Arc::clone(&invoked);
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(Arc::new(DenyingGate));
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch_intercepted_with_identity("list", &Value::Null, None, move |_namespace| {
+                invoked_by_operation.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(serde_json::json!({"invoked": true})) }
+            })
+            .await
+            .expect_err("explicit gate denial must refuse intercepted dispatch");
+
+        assert!(matches!(
+            err,
+            RuntimeError::PermissionDenied { ref verb, ref reason }
+                if verb == "list" && reason == "intercepted policy denied"
+        ));
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+
+        let events = store.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, EventOutcome::Denied);
+        assert_eq!(events[0].payload["decision"], "deny");
+        assert_eq!(
+            events[0].payload["deny_reason"],
+            "intercepted policy denied"
         );
     }
 
@@ -5789,7 +6017,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn gate_error_does_not_persist_to_event_store() {
+    async fn gate_error_returns_typed_refusal_without_invoking_pack() {
         #[derive(Debug)]
         struct FailingGate;
         impl Gate for FailingGate {
@@ -5799,23 +6027,91 @@ pub(crate) mod tests {
         }
 
         let store = Arc::new(MemoryEventStore::default());
+        let invoked = Arc::new(AtomicUsize::new(0));
         let mut builder = VerbRegistryBuilder::new();
-        builder.register(AlphaPack);
+        builder.register(GateErrorTrackingPack {
+            invoked: Arc::clone(&invoked),
+        });
         builder.with_gate(Arc::new(FailingGate));
         builder.with_event_store(store.clone());
         let reg = builder.build().expect("registry builds");
 
-        // Gate Err → fail-open, dispatch proceeds.
-        let res = reg.dispatch("list", Value::Null).await.unwrap();
+        let err = reg
+            .dispatch("guarded", Value::Null)
+            .await
+            .expect_err("gate unavailability must refuse normal dispatch");
+        assert!(matches!(
+            err,
+            RuntimeError::GateUnavailable { ref verb, ref reason }
+                if verb == "guarded" && reason.contains("gate broken")
+        ));
         assert_eq!(
-            res["pack"], "alpha",
-            "gate error must fail-open, not block dispatch"
+            invoked.load(Ordering::SeqCst),
+            0,
+            "pack handler must not run after a gate infrastructure error"
         );
 
         let count = store.count_events(EventFilter::default()).await.unwrap();
+        assert_eq!(count, 1, "gate infrastructure error must be audited");
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let event = &page.items[0];
+        assert_eq!(event.verb, "guarded");
+        assert_eq!(event.outcome, EventOutcome::Error);
+        assert_eq!(event.payload["decision"], "gate_unavailable");
+        assert!(event.payload.get("deny_reason").is_none());
+        assert_eq!(event.payload["resource"]["work_class"], "interactive");
+        assert!(event.payload["resource"].get("cost_unit").is_none());
+    }
+
+    #[tokio::test]
+    #[serial(audit_append_failures)]
+    async fn gate_error_audit_failure_cannot_reopen_dispatch_or_replace_typed_error() {
+        #[derive(Debug)]
+        struct FailingGate;
+        impl Gate for FailingGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Err(GateError::Internal("gate still broken".into()))
+            }
+        }
+
+        let before = audit_append_failure_count();
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GateErrorTrackingPack {
+            invoked: Arc::clone(&invoked),
+        });
+        builder.with_gate(Arc::new(FailingGate));
+        builder.with_event_store(store);
+        let registry = builder.build().expect("registry builds");
+
+        let error = registry
+            .dispatch("guarded", Value::Null)
+            .await
+            .expect_err("audit persistence failure must not reopen dispatch");
+
+        assert!(matches!(
+            error,
+            RuntimeError::GateUnavailable { ref verb, ref reason }
+                if verb == "guarded" && reason.contains("gate still broken")
+        ));
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
         assert_eq!(
-            count, 0,
-            "gate infrastructure error must NOT produce an audit event in EventStore"
+            audit_append_failure_count(),
+            before + 1,
+            "best-effort audit failure remains diagnostic without changing the refusal"
         );
     }
 

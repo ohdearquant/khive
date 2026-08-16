@@ -74,9 +74,9 @@ assert!(gate.check(&req).unwrap().is_allow());
 
 ## Evaluation failures and fail-closed behavior
 
-Per ADR-018, a `GateError` returned from `Gate::check` is treated as a fail-open infrastructure
-failure by the dispatcher. `RegoGate` therefore converts policy evaluation uncertainty into an
-explicit `Ok(GateDecision::Deny)`:
+Per ADR-018 and ADR-129, a `GateError` returned from `Gate::check` is audited and refused as an
+infrastructure outage by the dispatcher. `RegoGate` converts policy evaluation uncertainty into
+an explicit `Ok(GateDecision::Deny)` so it remains distinguishable as a policy denial:
 
 - a poisoned engine mutex;
 - an evaluation error or missing rule;

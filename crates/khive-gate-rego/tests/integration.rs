@@ -122,8 +122,8 @@ fn malformed_policy_returns_policy_error() {
 fn missing_entrypoint_returns_deny_not_error() {
     // Compiles fine but has no `decision` rule — the default entrypoint
     // data.khive.gate.decision will be absent.  check() must return
-    // Ok(Deny) rather than Err so the runtime's fail-open Err branch is
-    // never reached.
+    // Ok(Deny) rather than Err so callers observe a policy denial rather than
+    // a gate infrastructure outage.
     let policy = r#"
         package khive.gate
         import rego.v1
