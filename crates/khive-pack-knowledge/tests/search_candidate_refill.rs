@@ -144,6 +144,7 @@ fn runtime_with_embedder() -> KhiveRuntime {
     let runtime = KhiveRuntime::new(RuntimeConfig {
         git_write: Default::default(),
         db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
         additional_embedding_models: vec![],

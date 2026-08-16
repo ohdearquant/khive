@@ -1594,6 +1594,7 @@ mod tests {
         KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: Some(db_path.to_path_buf()),
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -1651,7 +1652,9 @@ mod tests {
         let blob_root = temp.path().join("blobs");
         let runtime = persistent_runtime(&db_path, "alice");
         let blob_store = Arc::new(FsBlobStore::new(blob_root.clone(), 0).unwrap());
-        runtime.install_blob_store(blob_store.clone());
+        runtime
+            .install_blob_store(blob_store.clone())
+            .expect("install blob store");
         let token = runtime.authorize(Namespace::local()).unwrap();
         let content_ref = blob_store
             .put(b"moodboard candidate raster bytes".to_vec())
@@ -1871,7 +1874,9 @@ mod tests {
         let blob_root = temp.path().join("blobs");
         let runtime = persistent_runtime(&db_path, "alice");
         let blob_store = Arc::new(FsBlobStore::new(blob_root.clone(), 0).unwrap());
-        runtime.install_blob_store(blob_store.clone());
+        runtime
+            .install_blob_store(blob_store.clone())
+            .expect("install blob store");
         let token = runtime.authorize(Namespace::local()).unwrap();
         let scope = PreferenceScope {
             namespace: "local".to_string(),
@@ -2006,7 +2011,9 @@ mod tests {
         drop(blob_store);
 
         let restarted = persistent_runtime(&db_path, "alice");
-        restarted.install_blob_store(Arc::new(FsBlobStore::new(blob_root, 0).unwrap()));
+        restarted
+            .install_blob_store(Arc::new(FsBlobStore::new(blob_root, 0).unwrap()))
+            .expect("install blob store");
         let restarted_token = restarted.authorize(Namespace::local()).unwrap();
         let loaded = load_preference_model(&restarted, &restarted_token, model_id, &scope)
             .await

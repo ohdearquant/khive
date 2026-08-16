@@ -9,6 +9,10 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
 - **`KhiveRuntime`** — a cloneable handle wrapping a `khive-db::StorageBackend` with
   namespace-scoped accessors for every storage capability, plus a lazily-configured
   embedder registry
+- **`BlobHydrator`** — one store-paired, runtime-shared weighted byte budget for
+  bounded, digest-verified whole-blob reads. Its non-cloneable `VerifiedBlob`
+  keeps admission until callers finish using the borrowed bytes, and tracked
+  supervisors keep native work visible to daemon drain after request cancellation
 - **`VerbRegistry` / `VerbRegistryBuilder`** — registers packs (`PackRuntime` impls),
   an authorization `Gate`, an actor identity, and dispatches verbs by name
 - **`PackRuntime` trait** — the object-safe runtime counterpart to `khive-types::Pack`;
@@ -68,9 +72,9 @@ let result = registry
                         │
               StorageBackend (khive-db)
                         │
-     ┌──────────────────┼──────────────────────┐
-authorize(ns)     entities/graph/notes/…   embedder(name)
-     │             (khive-storage traits)  (lattice-embed)
+     ┌──────────────────┼─────────────────────────────┐
+authorize(ns)     entities/graph/notes/…   BlobHydrator / embedder(name)
+     │             (khive-storage traits)  (bounded bytes / lattice-embed)
      ▼
 NamespaceToken ──── VerbRegistryBuilder::register(pack) × N
                          │
