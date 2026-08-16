@@ -837,9 +837,12 @@ committed unit with incomplete post-processing is not.
 
 **Depends on**: ADR-159 (edge-governance provenance — storage shape, stamping
 paths, closure predicate). **Consumed by**: ADR-157 (supersession chain
-canonicalization). This amendment lands after ADR-159 and implements the two
-contracts ADR-159 delegates to this ADR: endpoint-scoped reviewer authority on
-the reviewed stamping path, and the in-place classification primitive for
+canonicalization). Acceptance ordering is normative: ADR-159 must be Accepted
+before this amendment, so every type, table, and predicate referenced below
+has a merged normative definition at the time this text takes effect; ADR-157
+consumes both and lands last. This amendment implements the two contracts
+ADR-159 delegates to this ADR: endpoint-scoped reviewer authority on the
+reviewed stamping path, and the in-place classification primitive for
 migrating existing edges.
 
 ### A1. Governance-bearing changesets (definition)
@@ -848,7 +851,8 @@ A changeset step is **governance-bearing** when it is either:
 
 - `AddEdge` with `relation = supersedes` whose source and target are both
   live notes of kind `memory` in the proposal's namespace; or
-- `ClassifyExistingEdgeGovernance` (any target).
+- `ClassifyExistingEdgeGovernance` whose target edge, expected preimage, and
+  both live endpoints all carry the proposal's namespace (A2).
 
 All other steps — including `SupersedeEntity` (entity-level supersession) and
 `AddEdge` for any other relation or endpoint pair — are unaffected by this
@@ -860,9 +864,10 @@ amendment and keep the base ADR's review and apply semantics unchanged.
 ClassifyExistingEdgeGovernance {
     edge_id:     Uuid,
     expected:    ExpectedEdgePreimage,   // namespace, source_id, target_id,
-                                         // relation, deleted_at: must be null
+                                         // relation, target_backend,
+                                         // deleted_at: must be null
     disposition: GovernanceDisposition,  // Authorize | Reject
-    reason_code: Option<String>,         // bounded vocabulary
+    reason_code: Option<GovernanceReasonCode>, // closed enum, see below
 }
 ```
 
@@ -872,13 +877,39 @@ policy revision — those are stamped by the review/apply runtime, never
 deserialized from proposal JSON (ADR-159 §5). `deny_unknown_fields` applies;
 a payload carrying any authority-shaped field is rejected at propose time.
 
+`GovernanceReasonCode` is a closed enum, not free text. Initial variants:
+`migration_authorized`, `migration_rejected_unowned`,
+`migration_rejected_disputed`, `revocation`. An unknown code fails
+deserialization at propose time; extending the vocabulary is an amendment to
+this list, mirrored in ADR-159 §1's decision-row constraint.
+
+**Namespace binding.** This arm is namespace-bound end to end, notwithstanding
+the base substrate's namespace-agnostic by-ID reads (ADR-007 Rev 6): at
+propose time, `expected.namespace` must equal the proposal's namespace or the
+proposal is rejected with a typed error; at apply time, the storage primitive
+additionally requires the live edge row's namespace AND both live endpoints'
+namespaces to equal the proposal's namespace, failing the apply otherwise. A
+proposal in one namespace can therefore never classify, authorize, or reject
+an edge in another. This is a governance-plane restriction layered above the
+by-ID contract, not a change to it.
+
 Apply dispatches to the storage primitive
 `classify_existing_edge_governance`, which in one write transaction: selects
 the edge by UUID including current liveness; requires exact equality with the
-full expected preimage, `relation = 'supersedes'`, and live memory-note
-endpoints; consumes and revalidates the internal authority receipt for an
-`Authorize` disposition; appends the governance decision; and inserts the
-active projection row only for `Authorize`. It issues **no update to
+full expected preimage, `relation = 'supersedes'`, live memory-note
+endpoints, and the namespace binding above; consumes and revalidates the
+internal authority receipt for an `Authorize` disposition; appends the
+governance decision; and reconciles the active projection with the new
+disposition. Reconciliation is defined for both prior states, so a
+classification can never leave a projection that contradicts the newest
+decision: `Authorize` on an unclassified edge inserts the projection row;
+`Authorize` on an already-governed edge fails the apply (re-authorizing live
+authority is not a meaningful operation — revoke first); `Reject` on an
+unclassified edge appends only the decision; `Reject` on an already-governed
+edge deletes the active projection row in the same transaction and appends
+an ADR-159 invalidation row (cause `revoked_by_decision`) referencing the
+displaced decision, which is thereby spent — later reauthorization requires
+a fresh decision per ADR-159 §8. It issues **no update to
 `graph_edges`** — UUID, `created_at`, `updated_at`, weight, metadata, and
 deletion state are preserved byte-for-byte. A stale UUID or preimage, a dead
 or non-memory endpoint, or changed authority rolls back with no decision row
@@ -896,8 +927,8 @@ restriction (PR #517) stands unchanged.
 
 When an approved proposal's governance-bearing `AddEdge` step reaches apply,
 the worker maps it to the `governed_link` storage primitive — not the plain
-`runtime.graph.link(...)` dispatch — passing the authority receipt obtained
-at review (A4). `governed_link` commits the edge upsert, the governance
+`runtime.graph.link(...)` dispatch — passing the re-obtained,
+binding-validated authority receipt (A4.3). `governed_link` commits the edge upsert, the governance
 decision, and the active projection row in one writer transaction, and it
 returns and stamps the actual incumbent edge UUID selected by the
 natural-key upsert, so the decision row binds the edge incarnation that
@@ -914,30 +945,57 @@ distinguish.
 
 ### A4. Endpoint-scoped reviewer authority
 
-The base ADR's "qualified reviewer" test (non-self, on the reviewer list if
-one was given) establishes that the reviewer is a _different_ actor. For
-governance-bearing changesets that is insufficient: being different is not
-being entitled (ADR-159, Context defect 2). This amendment adds, for
-governance-bearing changesets only:
+The base ADR's enforced reviewer test is non-self only:
+`require_listed_reviewer` is explicitly deferred in the base ADR, so a
+reviewer list on a proposal is today an unenforced annotation. This
+amendment does not pretend otherwise, and it does not accept the pretense
+either: **a governance-bearing proposal that names an explicit reviewer
+list is rejected at propose time** with a typed error until listed-reviewer
+enforcement lands in the base ADR — accepting a restriction nothing
+enforces manufactures false assurance exactly where authority matters most.
+Non-self establishes only that the reviewer is a _different_ actor, and
+being different is not being entitled (ADR-159, Context defect 2). This
+amendment adds, for governance-bearing changesets only:
 
-1. At `review(decision=Approve)`, after the existing self-approval check and
-   before any `ProposalReviewed` event is emitted, the handler requests an
-   endpoint-scoped `AuthorityReceipt` from the Gate/authority provider for
-   action `memory.supersede` over each superseded memory named by the
-   changeset (the `AddEdge` target, or the `expected.target_id` of a
-   classification step). Provider denial rejects the review with a typed
-   error (`ReviewerNotAuthorized { proposal_id, actor_id }`) — parallel to
-   `SelfApprovalForbidden`, before any event lands.
-2. The receipt is runtime-internal and non-serializable (ADR-159 §2). It is
-   never written into any event payload. What the event log carries is the
-   unchanged `ProposalReviewed` event; the governance decision row carries
-   `proposal_id` and the mandatory `review_event_id`, naming the reviewer as
-   `authorizer` and the apply worker's identity
-   (`system:propose-apply`) only as `applied_by`. Authority is never
-   inferred from the apply worker's system identity.
-3. At apply time the worker revalidates the receipt against the exact edge
-   preimage and current authority, or relies on a bound policy/ownership
-   revision that makes stale authority fail closed (ADR-159 §2, path 2).
+1. **Authority is checked at the dispatch Gate, not in the handler**
+   (ADR-127: handlers never authorize; the dispatch site is the sole
+   enforcement point — this amendment preserves that invariant rather than
+   amending it). When the `review` verb is dispatched with
+   `decision = Approve` against a proposal whose changeset is
+   governance-bearing, the Gate's admission check (ADR-018) evaluates
+   endpoint-scoped authority for action `memory.supersede` over each
+   superseded memory named by the changeset (the `AddEdge` target, or the
+   `expected.target_id` of a classification step). Denial refuses the
+   dispatch with a typed error
+   (`ReviewerNotAuthorized { proposal_id, actor_id }`) — parallel to
+   `SelfApprovalForbidden`, before the handler runs and before any event
+   lands. On allow, the Gate attaches the endpoint-scoped
+   `AuthorityReceipt` to the decision as an obligation (ADR-018's
+   decision/obligation interface); the handler consumes the obligation's
+   receipt and performs no authorization of its own.
+2. The receipt is runtime-internal and non-serializable (ADR-159 §2), and
+   it is **mechanically bound**: it carries the `proposal_id`, the
+   `review_event_id` it authorizes (bound when that event is minted), and a
+   digest of the complete changeset it was evaluated against, alongside the
+   action and authority subject. It is never written into any event
+   payload. What the event log carries is the unchanged `ProposalReviewed`
+   event; the governance decision row carries `proposal_id` and the
+   mandatory `review_event_id`, naming the reviewer as `authorizer` and the
+   apply worker's identity (`system:propose-apply`) only as `applied_by`.
+   Authority is never inferred from the apply worker's system identity.
+3. At apply time the worker does not rely on any receipt merely found on
+   file, and a receipt cannot be carried in memory across processes at all
+   (it is non-serializable by construction): the applying process
+   **re-obtains** the receipt from the Gate/authority provider, scoped to
+   the same action and subjects and bound to the applying proposal's
+   `proposal_id`, `review_event_id`, and changeset digest, then validates
+   that binding against the proposal being applied. A receipt whose binding
+   names any other proposal, review event, or changeset digest never
+   satisfies apply — cross-proposal reuse is structurally excluded, not
+   merely discouraged. Revalidation covers the exact edge preimage and
+   current authority; a bound policy/ownership revision that makes stale
+   authority fail closed satisfies the currency half (ADR-159 §2, path 2)
+   but never the binding half.
 4. **Self-approval is unconditionally forbidden for governance-bearing
    changesets**, regardless of `allow_self_approve`. A proposer who holds
    the authority does not need the proposal path: the owner-bounded direct
@@ -986,3 +1044,19 @@ reviewer test.
   `graph_edges` columns identical before and after an `Authorize`.
 - A multi-actor fail-closed test: with a review-only Gate, every
   governance-bearing approval is rejected.
+- A namespace-binding pair: a classification whose `expected.namespace`
+  differs from the proposal's namespace is rejected at propose time; a
+  same-namespace proposal whose live edge or either endpoint turns out to
+  carry a different namespace at apply fails the apply with zero mutation.
+- A reviewer-list rejection test: a governance-bearing proposal naming an
+  explicit reviewer list is rejected at propose time with the typed error.
+- A cross-proposal receipt test: two approved proposals targeting the same
+  memory; the receipt bound to proposal A's identity must not satisfy
+  proposal B's apply.
+- A revocation test: `Reject` applied over an actively governed edge
+  removes the projection row, appends the `revoked_by_decision`
+  invalidation row, and the displaced decision never reactivates on a
+  projection rebuild.
+- A seam test: with the Gate's authority check disabled, a
+  governance-bearing approve must fail closed rather than fall through to
+  a handler-side check — proving the handler carries none.
