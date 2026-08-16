@@ -61,6 +61,7 @@ fn base_args(db: &str, actor: Option<&str>, ops: &str, save_file: &str) -> ExecA
         save_file: Some(save_file.to_string()),
         ops_file: None,
         dry_run: false,
+        serial: false,
         atomic: false,
         atomic_max_ops: None,
         strict: true,
@@ -69,8 +70,8 @@ fn base_args(db: &str, actor: Option<&str>, ops: &str, save_file: &str) -> ExecA
 
 /// Read a `--save-file` JSONL result file back into the single op result it
 /// contains and return the list of `content` strings the `list()` call
-/// returned. Mirrors `render_list_response`'s two possible shapes (a bare
-/// array, or `{"items": [...], ...}` once a limit clamp kicks in).
+/// returned. The offset-mode list contract always uses the stable
+/// `{"items": [...], ...}` envelope.
 fn contents_from_save_file(path: &std::path::Path) -> Vec<String> {
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read save-file {}: {e}", path.display()));
@@ -80,10 +81,9 @@ fn contents_from_save_file(path: &std::path::Path) -> Vec<String> {
         .unwrap_or_else(|| panic!("save-file {} has no result line", path.display()));
     let row: serde_json::Value = serde_json::from_str(line).expect("parse result row json");
     assert_eq!(row["ok"], true, "list op must have succeeded: {row}");
-    let items = row["result"]
+    let items = row["result"]["items"]
         .as_array()
-        .or_else(|| row["result"]["items"].as_array())
-        .unwrap_or_else(|| panic!("list result must be an array or {{items: [...]}}: {row}"))
+        .unwrap_or_else(|| panic!("list result must contain an items array: {row}"))
         .clone();
     items
         .iter()

@@ -111,6 +111,8 @@ pub struct CodeSourceIngestReport {
     /// A successful ingest indexes every non-blocked entity upsert, so generic
     /// KG `search` and query-anchored `context` can read the resulting map.
     pub fts_indexed: u64,
+    /// Sorted, deduplicated languages observed in manifests or source files
+    /// accepted by at least one selected tier during this pass.
     pub languages: Vec<String>,
     /// Per-manifest / per-file failures that did not abort the pass (fail
     /// loud without silently dropping the rest of the run).
@@ -149,6 +151,13 @@ pub struct CodeSourceIngestOptions<'a> {
     /// L2 symbol/call-edge persistence tier (this module). Wire default
     /// `false` — opt-in only.
     pub enable_l2: bool,
+}
+
+fn record_observed_language(report: &mut CodeSourceIngestReport, language: &str) {
+    if !report.languages.iter().any(|observed| observed == language) {
+        report.languages.push(language.to_string());
+        report.languages.sort();
+    }
 }
 
 const IMPORT_DEPENDENCY_KIND: &str = "import";
@@ -1448,7 +1457,6 @@ pub async fn run_code_ingest(
 
     let snapshot = source_snapshot(opts.path).await;
     let mut report = CodeSourceIngestReport {
-        languages: opts.languages.iter().map(|s| s.to_string()).collect(),
         source_revision: snapshot.revision.clone(),
         l2: opts.enable_l2.then(CodeSourceIngestL2Report::default),
         ..Default::default()
@@ -1477,6 +1485,7 @@ pub async fn run_code_ingest(
         Vec::new()
     };
     for manifest in &manifests {
+        record_observed_language(&mut report, manifest.language);
         for (dependency, _kind, scope) in &manifest.dependencies {
             manifest_scopes
                 .entry((
@@ -1657,6 +1666,9 @@ async fn run_import_scan(
         return Ok(());
     }
     files.sort();
+    if !files.is_empty() {
+        record_observed_language(report, language);
+    }
 
     for file in files {
         let Some(file_dir) = file.parent() else {
@@ -2941,6 +2953,9 @@ async fn run_l2_sweep(
             skipped.display()
         ));
         report.files_dropped_without_source_path += 1;
+    }
+    if !files.is_empty() {
+        record_observed_language(report, LANGUAGE);
     }
 
     for file in files {

@@ -201,6 +201,24 @@ D4 defines. This is additive to ADR-020's CLI surface — no existing verb's beh
 and the `commit` verb is scoped to this ADR's own local, non-remote repository (D6), not to
 the project-repository-embedded `.khive/kg/` layout ADR-020 §1 otherwise describes.
 
+### Amendment (2026-08-11): reviewed apply commit boundary
+
+The tier-2 reviewed path inherits ADR-046's proposal-worker state machine and
+the atomic change-set runner's durable outcome. Once that runner reports
+`AtomicRunOutcome::Committed`, the live graph write has landed even if deferred
+index maintenance or created-record resolution subsequently fails. Such a
+failure is a reconciliation condition, not a rejected review or a failed live
+write.
+
+The reviewed proposal therefore remains `applying`; the worker emits neither
+`ProposalApplied { Failed }` nor an `applying -> approved` revert. A repeated
+worker pass must skip it rather than replaying the approved change-set. The
+operator repairs the typed post-commit stage and resumes success finalization
+from the durable state. Only failures known to precede commit, including an
+atomic rollback, use the ordinary failed/revert path. This boundary preserves
+the tier-2 audit gate without turning a derived-index or reconciliation read
+failure into a duplicate live mutation.
+
 ---
 
 ## Consequences

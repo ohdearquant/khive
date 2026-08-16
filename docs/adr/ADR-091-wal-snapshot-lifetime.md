@@ -1221,11 +1221,12 @@ process-local admission budget even when the connection is correctly in autocomm
 query acquires a permit for its blocking SQLite operation and releases it only after the statement
 is finalized and autocommit is verified. One explicit top-level deferred read transaction is
 allowed as one logical read operation: its successful `BEGIN` transfers the operation permit onto
-the handle; queries reuse it; `COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite
-reports autocommit. Immediate/exclusive starts and nested transaction controls remain rejected.
-Cancellation or handle drop destroys the connection before its retained transaction permit, so
-there is never an idle WAL snapshot outside admission. See ADR-005's 2026-08-09 amendment for the
-full raw-SQL capability contract.
+the handle and installs a backend-scoped `tx_registry` span; queries reuse both guards;
+`COMMIT`/`END` or full `ROLLBACK` releases them only after SQLite reports autocommit.
+Immediate/exclusive starts and nested transaction controls remain rejected. Cancellation or handle
+drop destroys the connection before its retained transaction permit and registry handle, so there
+is never an idle WAL snapshot outside admission or invisible to the checkpoint age sweep. See
+ADR-005's 2026-08-09 amendment for the full raw-SQL capability contract.
 
 **Checkpoint acceptance.** The integration regression
 `multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress` retains eight idle
@@ -1345,3 +1346,147 @@ threshold before observing it, so configuration-only coverage cannot mask a late
 connection reverting to the wrong posture — including the unclaimed-pool regression that the
 bounded fallback exists to prevent: unbounded WAL growth on a writable pool with no checkpoint
 owner.
+
+### 2026-08-09 amendment (Amendment 11): write-transaction external-work audit
+
+This amendment was allocated as Amendment 11 at integration; Amendments 9 and 10 record the
+checkpoint-telemetry and autocheckpoint changes merged ahead of it.
+
+**Motivation.** WAL mode admits one writer. Queue time therefore depends on both mean writer hold
+time and its variance; a filesystem call, network request, blocking wait, or expensive compute
+step inside `BEGIN IMMEDIATE` extends every competing writer's wait while remaining invisible to
+queue-side admission telemetry. The earlier inventory proved transaction lifetimes were scoped,
+but did not enumerate what actually ran inside each write scope. The audit for #1850 found one
+real violation: `FsBlobStore::transactional_orphan_sweep` performed file metadata checks and
+unbounded file deletion inside `SqlAccess::atomic_unit`.
+
+**Normative invariant.** From `BEGIN IMMEDIATE` until COMMIT/ROLLBACK, application code may execute
+SQLite statements plus bounded in-memory binding/result bookkeeping only. It MUST NOT perform
+filesystem/process/network I/O, sleep or block on a non-SQL synchronization primitive, call another
+subsystem, or perform model/embedding/unbounded computation. SQLite's own database/WAL/VFS work is
+of course part of statement execution and is not “external work” in this rule.
+
+**Complete production write-scope audit (current tree).** The owner row is the review unit; every
+production caller named in that row was inspected through its commit/rollback edge.
+
+| Transaction owner                               | Production scopes/callers                                                                                      | Work inside the transaction                                                   | Verdict                                 |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------- |
+| `run_migrations_locked` and `apply_schema_plan` | Core versioned migrations; pack service migrations                                                             | Migration DDL/DML and ledger insert                                           | SQL-only                                |
+| `WriterGuard::transaction`                      | Pack auxiliary DDL; runtime symmetric edge update; entity/note merge fallback                                  | Synchronous statement sequences over one borrowed connection                  | SQL-only                                |
+| `writer_task::drain_loop`                       | All `send`/`send_bounded` store mutations, queue-backed `SqlBridge` batches, and `atomic_unit` requests        | The request's prepared SQL statements and bounded row/result folding          | SQL-only after the blob-GC repair below |
+| `SqlBridge` manual owners                       | Standalone and pool-backed `execute_batch`; flag-off `run_manual_atomic_unit`                                  | Pre-prepared parameterized statements, commit/rollback, poisoning bookkeeping | SQL-only                                |
+| Store flag-off batch owners                     | `entity`, `note`, `event`, `graph`, `text`, `sparse`, `vectors`, and `agents` batch/upsert/delete methods      | Bounded per-item SQL loops and result counters                                | SQL-only                                |
+| Vector-store private IMMEDIATE transactions     | Vector batch upsert/delete/orphan reconciliation                                                               | sqlite-vec/ordinary table statements and bounded row binding                  | SQL-only                                |
+| Retrieval weight private IMMEDIATE transaction  | `engine_weights::apply_weight_delta_with_eta`                                                                  | One scalar read, bounded EMA arithmetic, weight upsert, and audit-row insert  | SQL-only                                |
+| Runtime/pack `AtomicUnitOp` callers             | Runtime atomic runner and ANN registry; brain fold/persist; session mirror ingest; blob recovery/claim/cleanup | DML/query statements and bounded validation/folding                           | SQL-only                                |
+| Blob physical GC (outside owner)                | `FsBlobStore::transactional_orphan_sweep`                                                                      | Root walk, metadata, advisory locking, and file deletion                      | Explicitly outside SQLite transactions  |
+
+**Blob cross-resource repair.** The sweep now prepares its file candidates before SQLite opens a
+writer transaction. The protocol first holds a process-local lock keyed by the canonical database
+path and a cross-process `<database>.khive-blob-gc.lock`, then takes the existing root locks. This
+database-scoped ownership serializes differently configured roots as well as identical roots. Once
+acquired, every pre-existing claim in that database is abandoned; after fail-closed validation it
+is removed in transactions of at most 128 rows. Recovery therefore does not depend on the mutable
+path-derived `root_key` and also covers a relocated root or an online-backup snapshot restored at a
+different database path.
+
+Candidate processing is likewise split into units of at most 128. Each short atomic unit anti-joins
+live `entities.content_ref` values and commits only that bounded set of durable `blob_gc_claims`;
+V20 entity INSERT/UPDATE triggers reject a new live reference to any claimed digest. After commit,
+the sweep deletes only that batch's files outside SQLite and removes only that batch's claims in a
+second bounded atomic unit before advancing. JSON bindings, claim-table mutations, returned rows,
+and application result folding are therefore cardinality-bounded per writer hold. A crash between
+units leaves the trigger fence durable and fail-closed; the next exclusive database owner rescans
+the filesystem and liveness evidence before recovering it. This keeps the stronger ADR-111
+liveness guarantee without retaining SQLite's single writer across external I/O or creating one
+orphan-population-sized claim transaction.
+
+`transactional_orphan_sweep_releases_sqlite_writer_before_physical_delete` pauses at the exact
+claim/physical boundary, proves an unrelated writer commits while deletion is parked, and proves a
+racing claimed reference is rejected. `transactional_orphan_sweep_bounds_each_durable_claim_batch`
+pins the 128-row active-claim peak,
+`abandoned_claim_recovery_deletes_at_most_one_batch_per_writer_hold` pins bounded recovery, and
+`transactional_orphan_sweep_recovers_claims_after_root_relocation` plus
+`transactional_orphan_sweep_recovers_claims_copied_by_database_restore` pin path-independent
+abandoned-claim recovery across both relocation and backup restore.
+`cancelling_sweep_during_delete_keeps_owner_locks_until_blocking_work_finishes` proves cancellation
+cannot release either advisory owner while already-started blocking deletion continues.
+
+**Review guard.** This table is normative and exhaustive. Any PR that adds or widens a
+`BEGIN IMMEDIATE`, `TransactionBehavior::Immediate`, `WriterGuard::transaction`, writer-task
+request body, or `SqlAccess::atomic_unit` caller MUST update the applicable row (or add one) and
+show that all inputs/external results are prepared before the transaction opens. The
+`AtomicUnitOp` trait documentation repeats this requirement because first-poll enforcement catches
+async suspension but cannot detect synchronous filesystem calls. A new site whose table entry is
+absent or whose body violates the invariant is a defect.
+
+The hold-time regression parks physical deletion indefinitely after the claim commit and gives an
+unrelated writer a 100 ms SQLite busy bound. The unrelated commit succeeds inside that bound while
+deletion is still parked; under the former one-transaction implementation it remained behind the
+parked filesystem phase and reached the busy timeout. This is the measured boundary for #1850:
+external deletion contributes zero time to SQLite's exclusive writer hold.
+
+### 2026-08-11 amendment (Amendment 12): abandoned reads release WAL snapshots
+
+Request abandonment is now an active snapshot-lifetime boundary. MCP
+`notifications/cancelled`, daemon peer EOF/reset, daemon shutdown, coordinator
+search timeout, and the general request-read deadline merge into one absolute
+read context. A SQLite read installs the common progress/interrupt guard on
+its exact connection; graph traversal contributes its own budget predicate to
+that same callback. `knowledge.compose` also checks the context between awaits,
+inside domain/atom loops, and during synchronous tokenization/BM25/scoring so a
+caught degradable backend error cannot start later reads after cancellation.
+
+Stdio EOF cancels the exact rmcp root token before rmcp starts its graceful
+drain, so each in-flight request child reaches this read context immediately
+instead of running for the drain's five-second allowance. The canonical DSL
+dispatch boundary installs the default request-read deadline for wire calls,
+daemon frames, local/operator execution, and provenance-verified scheduled
+replay. A previously installed outer deadline remains authoritative when it is
+earlier; the boundary never renews it. Detached warm, checkpoint, sweep, and
+channel-maintenance tasks do not inherit a request context unless they are an
+explicit response-owned child wrapped by the context-inheritance helper.
+
+An interrupted explicit reader transaction finalizes its cursor and rolls
+back before callback removal and permit release. If rollback or handler
+cleanup cannot prove a clean autocommit connection, that connection is closed
+rather than cached. Consequently an abandoned read cannot keep a WAL tail
+pinned after its interrupt settles; the regression establishes a real table
+snapshot, observes `wal_checkpoint(PASSIVE)` pinned before cancellation, then
+requires `log == checkpointed`, prompt sole-reader recovery, stopped VM
+progress, and no callback bleed on reuse.
+
+"Settles" is a two-stage bound, not a single grace window. `spawn_blocking`
+cannot be force-aborted once started, so the async boundary cannot prove a
+worker's connection and admission were actually released without joining the
+real worker. On grace expiry it does not detach: it escalates to a second,
+longer join bounded by `KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS`. Ordinary
+interrupted work — including a slow UDF or table-valued call that SQLite
+cannot check the interrupt flag inside of — settles within this window, and
+the caller's typed timeout is only returned once the real worker has joined,
+so admission and any WAL snapshot are provably released by the time the
+caller sees the response. Only a worker that ignores the interrupt for the
+entire grace-plus-hard-cap window (a callback/UDF that never returns) is
+detached; that worker's connection and admission are not recovered until it
+eventually exits on its own, and detachment is logged at `error` with the
+operation name so it is distinguishable from ordinary settlement. This is
+strictly narrower than "keeps a WAL tail pinned after its interrupt settles":
+it is "pinned only while genuinely hostile work has not yet settled, bounded
+by grace plus the hard cap." A cancellation arriving while a raw-SQL
+statement is still being prepared and classified — before it is known to be
+a read or a write — takes the same bounded path rather than the
+completion-preserving one: nothing has executed against SQLite yet, so
+abandoning the wait cannot strand a write mid-flight. Only a statement that
+has actually been classified as an admitted write/transaction-control
+statement and started executing is completion-preserving. Write admission and
+final hard-cap detachment arbitrate through one atomic phase: if admission wins,
+the async boundary waits without another cancellation timeout; if detachment
+wins, a later classifier returns the typed timeout before executing SQLite.
+
+Operator controls are `KHIVE_REQUEST_READ_TIMEOUT_SECS` (default 30, valid
+1–3600 seconds, invalid/zero falls back to the nonzero default),
+`KHIVE_SQLITE_INTERRUPT_GRACE_MS` (default 500, valid 10–5000 ms), and
+`KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS` (default 5000, valid 100–60000 ms, the
+second-stage join bound above). These bound read work and interrupt
+settlement only. They do not change write admission, commit, rollback,
+checkpoint, or TRUNCATE policy.

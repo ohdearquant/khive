@@ -264,6 +264,12 @@ fusion_weight = 0.5
 #   KHIVE_PID=~/.khive/khived.pid                Daemon PID file path.
 #   KHIVE_LOCK=~/.khive/khived.recovery.lock     Stale-daemon recovery lock file path.
 #   KHIVE_DRAIN_TIMEOUT_SECS=10  Seconds the daemon waits for in-flight requests before shutdown.
+#   KHIVE_REQUEST_READ_TIMEOUT_SECS=30
+#                                Absolute ceiling for request-owned reads and compose (1..=3600).
+#                                Zero, invalid, or out-of-range values use the nonzero default.
+#   KHIVE_SQLITE_INTERRUPT_GRACE_MS=500
+#                                Read-interrupt settlement window in milliseconds (10..=5000).
+#                                Does not interrupt admitted writes.
 #
 # ── SQLite storage tuning (advanced — defaults are well-chosen; change only to profile) ──
 #   An unparseable numeric value here is treated as unset (falls back to the default).

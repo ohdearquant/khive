@@ -1595,3 +1595,26 @@ Acceptance:
 3. Repeated same-repository input and changes only to `observed_at` retain stable v2 UUIDs.
 4. A v2 note exposes its schema version, repository, project UUID, and parseable deterministic v1
    UUID witness; ingest does not mutate or claim an existing v1 row.
+
+## Amendment 7 (2026-08-11): strict ingest arguments and observed languages
+
+`code.ingest` now validates its complete public argument object before any filesystem or database
+access. The closed argument set is `path`, `db`, `languages`, and `tiers`; deserialization rejects
+every unknown field by name and reports the accepted field names. This brings the code-pack tranche
+of the public verb surface into the same typo-detecting posture as the typed KG, GTD, memory, comm,
+knowledge, brain, schedule, and session handlers. Git- and blob-pack argument strictness remains a
+separate implementation tranche.
+
+The request's `languages` value remains an allow-list: omission permits every supported language,
+while an explicit array restricts discovery. The success report's `languages` field no longer
+echoes that allow-list. It is the sorted, deduplicated set actually observed by at least one selected
+tier: a discovered manifest counts for L1/L1.5, a discovered source file counts for L1.5, and an
+accepted Rust source file counts for L2. A language with no accepted manifest or source file is
+absent, and selecting no tiers reports an empty set.
+
+Acceptance:
+
+1. A valid call carrying an unknown argument fails before its target database is created, and the
+   error names both the unknown argument and the four accepted fields.
+2. An omitted language filter over a Rust-only fixture reports exactly `["rust"]`, never the full
+   supported-language allow-list.

@@ -22,37 +22,6 @@ use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 
-/// ADR-136 D1 gate 3: called immediately before a `with_writer_unmanaged`
-/// fallback so this store's two remaining direct-writer call sites
-/// (`vec_delete_subjects`, `orphan_sweep`) fail closed under strict routing
-/// instead of silently bypassing an enabled queue. Under non-strict routing
-/// this is a no-op except for a `direct_route_violation` sink row when the
-/// queue is enabled (ADR-136 D1 gate 6c) — observable, but not yet fatal.
-fn refuse_direct_route_if_strict(
-    pool: &ConnectionPool,
-    site: crate::timeout_sink::Site,
-    op: &'static str,
-) -> Result<(), StorageError> {
-    if pool.config().write_routing_strict {
-        return Err(StorageError::Pool {
-            operation: op.into(),
-            message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is available; \
-                      refusing to fall back to a direct connection"
-                .into(),
-        });
-    }
-    if pool.write_queue_active() {
-        // In-memory pools never spawn a writer task by documented design
-        // (explicit `Some(true)` degrades), so a violation row there would
-        // be noise, not signal.
-        crate::timeout_sink::emit_direct_route_violation(
-            &crate::timeout_sink::db_label(pool),
-            site,
-        );
-    }
-    Ok(())
-}
-
 /// The exact `DELETE` this store's `delete` issues, for a given vector table
 /// (ADR-099 B3 r6 structural cut — see `stores::entity`'s sibling block).
 /// `table` must already be a trusted, sanitized table name (mirrors
@@ -325,10 +294,10 @@ impl SqliteVecStore {
     ) -> Result<Self, SqliteError> {
         validate_model_key(&model_key)?;
         let table_name = format!("vec_{}", model_key);
-        // Enabled by default for file-backed pools; explicit off/degraded
-        // fallback remains possible (ADR-067 Component A, mirrors
-        // entity.rs policy): a missing writer task degrades to the legacy
-        // pool-mutex path rather than failing construction.
+        // Enabled by default for file-backed pools. Construction stays
+        // synchronous (ADR-067 Component A, mirrors entity.rs policy): a
+        // missing writer task is cached without failing construction. Every
+        // write re-resolves it and applies strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Ok(Self {
             pool,
@@ -342,12 +311,6 @@ impl SqliteVecStore {
         })
     }
 
-    fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_reader()
-            .map_err(|error| map_sqlite_err(error, "open_vec_reader"))
-    }
-
     /// Re-derive writer-task availability at write time instead of trusting
     /// only the field cached at construction (ADR-136 D1 gate 3 amendment).
     /// `self.writer_task` permanently caches `None` when this store was
@@ -355,12 +318,14 @@ impl SqliteVecStore {
     /// `Err(WriterTaskNoRuntime)`, which construction collapses via
     /// `.ok().flatten()`) — every later write, even ones running inside a
     /// runtime, would otherwise silently keep bypassing an enabled queue.
-    /// `ConnectionPool::writer_task_handle()` is a cheap `OnceCell` read once
-    /// resolved, so re-checking here costs nothing on the hot path.
-    fn current_writer_task(&self) -> Option<crate::writer_task::WriterTaskHandle> {
-        self.writer_task
-            .clone()
-            .or_else(|| self.pool.writer_task_handle().ok().flatten())
+    /// The pool helper also enforces strict fail-closed routing and preserves
+    /// a typed `WriterTaskNoRuntime` error when no runtime is available.
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<crate::writer_task::WriterTaskHandle>, StorageError> {
+        self.pool
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
     }
 
     /// Route a single-row DML-only write through the pool-wide `WriterTask`
@@ -371,17 +336,14 @@ impl SqliteVecStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
-        refuse_direct_route_if_strict(
-            &self.pool,
-            crate::timeout_sink::Site::DirectRouteVecGeneralWrite,
-            op,
-        )?;
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteVecGeneralWrite);
         self.with_writer_unmanaged(op, f).await
     }
 
@@ -409,18 +371,35 @@ impl SqliteVecStore {
         R: Send + 'static,
     {
         if self.is_file_backed {
-            let conn = self.open_standalone_reader()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Vectors, op, e))?
+            let pool = Arc::clone(&self.pool);
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Vectors,
+                op,
+                move |scope| {
+                    scope.ensure_active()?;
+                    let conn = pool
+                        .open_standalone_reader()
+                        .map_err(|error| map_sqlite_err(error, op))?;
+                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
+                },
+            )
+            .await
         } else {
             let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.reader().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Vectors,
+                op,
+                move |scope| {
+                    let mut guard = pool
+                        .reader_until(|| scope.should_stop())
+                        .map_err(|e| map_sqlite_err(e, op))?
+                        .ok_or_else(|| StorageError::Timeout {
+                            operation: op.into(),
+                        })?;
+                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
+                },
+            )
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Vectors, op, e))?
         }
     }
 
@@ -458,7 +437,7 @@ impl SqliteVecStore {
         }
 
         let failpoint_flag = current_failpoint();
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task(operation)? {
             let table_for_write = table.clone();
             let namespace_for_write = namespace.clone();
             let field_for_write = field.clone();
@@ -1043,7 +1022,7 @@ impl VectorStore for SqliteVecStore {
         // `SAVEPOINT vec_batch_record` is preserved unchanged — only the
         // OUTER BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's
         // run loop owns the enclosing transaction).
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task("vec_insert_batch")? {
             let table2 = table.clone();
             let store_embedding_model2 = store_embedding_model.clone();
             return writer_task
@@ -1129,7 +1108,7 @@ impl VectorStore for SqliteVecStore {
         // named SAVEPOINT rather than `conn.unchecked_transaction()`,
         // which would attempt a nested `BEGIN` and fail under the
         // WriterTask's already-open transaction.
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task("vec_update")? {
             let table2 = table.clone();
             let namespace2 = namespace.clone();
             let field2 = field.clone();
@@ -1395,7 +1374,7 @@ impl VectorStore for SqliteVecStore {
         // The WriterTask owns one BEGIN IMMEDIATE/COMMIT/ROLLBACK around each
         // request. Submit the complete chunk loop as one DML-only request so a
         // failure in any chunk makes the task roll back the complete input.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("vec_delete_subjects")? {
             let table_for_error = table.clone();
             return writer_task
                 .send_bounded(move |conn| {
@@ -1413,11 +1392,8 @@ impl VectorStore for SqliteVecStore {
         // outermost SAVEPOINT. `Transaction` rolls back on early DML errors and
         // also when COMMIT fails while SQLite leaves the transaction open,
         // preventing a poisoned transaction from returning to the pool.
-        refuse_direct_route_if_strict(
-            &self.pool,
-            crate::timeout_sink::Site::DirectRouteVecDeleteSubjects,
-            "vec_delete_subjects",
-        )?;
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteVecDeleteSubjects);
         let table_for_error = table.clone();
         let origin = self.pool.origin();
         self.with_writer_unmanaged("vec_delete_subjects", move |conn| {
@@ -1531,7 +1507,7 @@ impl VectorStore for SqliteVecStore {
         // IMMEDIATE` here would violate SQLite's nested-transaction rule and
         // fail with `SQLITE_ERROR: cannot start a transaction within a
         // transaction` (ADR-067 lines 271-276).
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("orphan_sweep")? {
             let table2 = table.clone();
             let ns_json2 = ns_json.clone();
             let kind_json2 = kind_json.clone();
@@ -1555,11 +1531,8 @@ impl VectorStore for SqliteVecStore {
         // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own transaction via
         // `Transaction::new_unchecked`.
-        refuse_direct_route_if_strict(
-            &self.pool,
-            crate::timeout_sink::Site::DirectRouteOrphanSweep,
-            "orphan_sweep",
-        )?;
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteOrphanSweep);
         let origin = self.pool.origin();
         self.with_writer_unmanaged("orphan_sweep", move |conn| {
             // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
@@ -4854,8 +4827,8 @@ mod write_queue_tests {
     /// `orphan_sweep_routes_through_writer_task_when_flag_enabled` above (a
     /// `writer_task_spawn_count() == 1` assertion alone is a false positive:
     /// `SqliteVecStore::new` and the setup insert already spawn/use the
-    /// task). Red-proof: reverting the `if let Some(writer_task) =
-    /// &self.writer_task` branch in `vec_delete_subjects` (forcing every
+    /// task). Red-proof: reverting the
+    /// `current_writer_task("vec_delete_subjects")` branch (forcing every
     /// call through `with_writer_unmanaged`) makes `saw_enqueued` stay
     /// `false` and this test fail — see the impl report for the exact
     /// revert/run/restore transcript.
@@ -5073,10 +5046,10 @@ mod write_queue_tests {
     /// happen with no ambient runtime, which a `#[tokio::test]` function
     /// body would not give it (the whole test body already runs on a Tokio
     /// worker thread). Red-proof: reverting `with_writer`'s
-    /// `self.current_writer_task()` check back to `&self.writer_task` makes
-    /// `saw_enqueued` stay `false` and this test fail — the write takes the
-    /// direct-connection path immediately instead of ever appearing in the
-    /// writer task's channel.
+    /// `self.current_writer_task(operation)` check back to the cached handle
+    /// makes `saw_enqueued` stay `false` and this test fail — the write takes
+    /// the direct-connection path immediately instead of ever appearing in
+    /// the writer task's channel.
     #[test]
     fn general_write_routes_through_writer_task_when_store_built_outside_runtime() {
         crate::extension::ensure_extensions_loaded();

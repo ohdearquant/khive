@@ -2815,6 +2815,67 @@ async fn traverse_progress_handler_interrupts_statement_and_is_cleared() {
     traverse_progress_seam::uninstall();
 }
 
+#[tokio::test]
+#[serial(tx_registry)]
+async fn outer_request_deadline_composes_with_graph_progress_and_work_budgets() {
+    let (_dir, store, _origin_view) = setup_file_store_with_origin_view();
+    let root = Uuid::new_v4();
+    let edges = (0..512)
+        .map(|_| make_edge(root, Uuid::new_v4(), EdgeRelation::Extends, 1.0))
+        .collect();
+    store.upsert_edges(edges).await.unwrap();
+
+    // A generous outer request deadline must not overwrite graph's own
+    // progress predicate. The graph seam remains the first cause.
+    traverse_progress_seam::install(root);
+    let graph_timeout = crate::scope_request_read_deadline(
+        std::time::Duration::from_secs(60),
+        store.traverse(TraversalRequest {
+            roots: vec![root],
+            options: TraversalOptions {
+                max_depth: 1,
+                direction: Direction::Out,
+                relations: None,
+                min_weight: None,
+                limit: Some(512),
+            },
+            include_roots: false,
+            include_properties: false,
+            execution_budget: TraversalExecutionBudget::default(),
+        }),
+    )
+    .await;
+    assert!(
+        matches!(&graph_timeout, Err(StorageError::Timeout { operation }) if operation.contains("traverse")),
+        "graph progress cause must survive the outer request guard; got {graph_timeout:?}"
+    );
+    traverse_progress_seam::uninstall();
+
+    // The same outer guard must also preserve graph's non-time work-budget
+    // classification instead of translating it to request timeout.
+    let work_limited = crate::scope_request_read_deadline(
+        std::time::Duration::from_secs(60),
+        store.traverse(TraversalRequest {
+            roots: vec![root],
+            options: TraversalOptions {
+                max_depth: 1,
+                direction: Direction::Out,
+                relations: None,
+                min_weight: None,
+                limit: Some(512),
+            },
+            include_roots: false,
+            include_properties: false,
+            execution_budget: TraversalExecutionBudget::new(3, std::time::Duration::from_secs(5)),
+        }),
+    )
+    .await;
+    assert!(
+        matches!(&work_limited, Err(StorageError::InvalidInput { message, .. }) if message.contains("work budget exceeded")),
+        "graph work-budget classification must survive the outer request guard; got {work_limited:?}"
+    );
+}
+
 // ---- multi-root == per-root decomposition equivalence tests ----
 
 /// Equivalence fixture: for a small deterministic graph, multi-root

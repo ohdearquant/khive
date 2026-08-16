@@ -58,8 +58,13 @@
 //! self-labeling about which build's counters it describes.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use khive_storage::error::StorageError;
+use khive_storage::types::StorageResult;
+use khive_storage::StorageCapability;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -560,6 +565,74 @@ pub fn collect_with_audit_append_failures(
     collect_inner(pool, build, sweep_interval, Some(audit_append_failures))
 }
 
+/// Assemble diagnostics without allowing request abandonment to leave the
+/// graph SELECT or OS holder census running detached.
+///
+/// The PASSIVE checkpoint is intentionally outside SQLite interruption: once
+/// admitted it may backfill database pages and must reach its physical
+/// completion. The following graph integrity SELECT registers the common
+/// request progress callback on that exact connection. The OS census runs as
+/// a second cooperative phase and polls a shared cancellation flag between
+/// process and fd entries.
+pub async fn collect_with_audit_append_failures_interruptibly(
+    pool: Arc<ConnectionPool>,
+    build: BuildIdentity,
+    sweep_interval: Duration,
+    audit_append_failures: u64,
+) -> StorageResult<DbDiagnostics> {
+    crate::ensure_request_read_active("db_diagnostics")?;
+    let counters = checkpoint_counters();
+    let writer_contention =
+        WriterContentionDiagnostics::snapshot(&pool, Some(audit_append_failures));
+
+    let Some(path) = pool.config().path.clone() else {
+        crate::ensure_request_read_active("db_diagnostics")?;
+        return Ok(DbDiagnostics {
+            build,
+            db_path: None,
+            wal_file: None,
+            checkpoint_counters: counters,
+            checkpoint_probe: None,
+            checkpoint_probe_error: Some(
+                "in-memory database: no WAL file and no checkpoint to probe".to_string(),
+            ),
+            writer_contention,
+            graph_edge_integrity: None,
+            graph_edge_integrity_error: Some(
+                "in-memory database: no durable graph-edge ledger to inspect".to_string(),
+            ),
+            wal_pin: WalPinAttribution::unavailable(
+                "in-memory database: no file for the OS holder census",
+            ),
+        });
+    };
+
+    let inspection_pool = Arc::clone(&pool);
+    let inspection = crate::read_cancellation::run_interruptible_read(
+        StorageCapability::Sql,
+        "db_diagnostics.sqlite",
+        move |scope| inspect_pool_interruptibly(&inspection_pool, scope),
+    )
+    .await?;
+    crate::ensure_request_read_active("db_diagnostics")?;
+    let (wal_file, wal_pin) =
+        inspect_file_state_interruptibly(path.clone(), sweep_interval).await?;
+    crate::ensure_request_read_active("db_diagnostics")?;
+
+    Ok(DbDiagnostics {
+        build,
+        db_path: Some(path.display().to_string()),
+        wal_file: Some(wal_file),
+        checkpoint_counters: counters,
+        checkpoint_probe: inspection.checkpoint_probe,
+        checkpoint_probe_error: inspection.checkpoint_probe_error,
+        writer_contention,
+        graph_edge_integrity: inspection.graph_edge_integrity,
+        graph_edge_integrity_error: inspection.graph_edge_integrity_error,
+        wal_pin,
+    })
+}
+
 fn collect_inner(
     pool: &ConnectionPool,
     build: BuildIdentity,
@@ -611,6 +684,140 @@ struct PoolInspection {
     checkpoint_probe_error: Option<String>,
     graph_edge_integrity: Option<GraphEdgeIntegrity>,
     graph_edge_integrity_error: Option<String>,
+}
+
+fn inspect_pool_interruptibly(
+    pool: &ConnectionPool,
+    scope: &crate::read_cancellation::InterruptibleReadScope,
+) -> StorageResult<PoolInspection> {
+    scope.ensure_active()?;
+    let conn = match pool.open_standalone_writer_untracked() {
+        Ok(conn) => conn,
+        Err(e) => {
+            scope.ensure_active()?;
+            let reason = format!("guarded standalone open refused: {e}");
+            return Ok(PoolInspection {
+                checkpoint_probe: None,
+                checkpoint_probe_error: Some(reason.clone()),
+                graph_edge_integrity: None,
+                graph_edge_integrity_error: Some(reason),
+            });
+        }
+    };
+    // Opening is read-only filesystem work but can block. Cancellation that
+    // arrived while it was in flight must prevent admission of the following
+    // PASSIVE checkpoint, whose backfill I/O is intentionally noninterruptible
+    // once started.
+    scope.ensure_active()?;
+
+    // PASSIVE can perform write I/O. Never install sqlite3_interrupt for it.
+    let (checkpoint_probe, checkpoint_probe_error) = match checkpoint_probe(&conn) {
+        Ok(probe) => (Some(probe), None),
+        Err(e) => (
+            None,
+            Some(format!("PRAGMA wal_checkpoint(PASSIVE) failed: {e}")),
+        ),
+    };
+    #[cfg(test)]
+    if TEST_PAUSE_AFTER_PASSIVE.load(Ordering::SeqCst) {
+        TEST_REACHED_AFTER_PASSIVE.store(true, Ordering::SeqCst);
+        while TEST_PAUSE_AFTER_PASSIVE.load(Ordering::SeqCst) && !scope.should_stop() {
+            std::thread::yield_now();
+        }
+    }
+    scope.ensure_active()?;
+
+    // Preserve ordinary diagnostic degradation while allowing the outer
+    // request cause to escape as a typed timeout.
+    let integrity = scope.run(&conn, || Ok(graph_edge_integrity(&conn)))?;
+    let (graph_edge_integrity, graph_edge_integrity_error) = match integrity {
+        Ok(integrity) => (Some(integrity), None),
+        Err(e) => (
+            None,
+            Some(format!("graph-edge integrity query failed: {e}")),
+        ),
+    };
+
+    Ok(PoolInspection {
+        checkpoint_probe,
+        checkpoint_probe_error,
+        graph_edge_integrity,
+        graph_edge_integrity_error,
+    })
+}
+
+#[cfg(test)]
+static TEST_PAUSE_AFTER_PASSIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_REACHED_AFTER_PASSIVE: AtomicBool = AtomicBool::new(false);
+
+struct StopCensusOnDrop {
+    stopped: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for StopCensusOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+async fn inspect_file_state_interruptibly(
+    path: PathBuf,
+    _sweep_interval: Duration,
+) -> StorageResult<(WalFileState, WalPinAttribution)> {
+    const OPERATION: &str = "db_diagnostics.wal_holder_census";
+    crate::ensure_request_read_active(OPERATION)?;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let worker_stopped = Arc::clone(&stopped);
+    let mut stop_on_drop = StopCensusOnDrop {
+        stopped: Arc::clone(&stopped),
+        armed: true,
+    };
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let wal_file = wal_file_state(&path);
+        if worker_stopped.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "WAL holder census cancelled",
+            ));
+        }
+        #[cfg(unix)]
+        let attribution = match crate::walpin::census_holders_until(&path, || {
+            worker_stopped.load(Ordering::SeqCst)
+        }) {
+            Ok(census) => wal_pin_attribution_from_census(census),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Err(error),
+            Err(error) => WalPinAttribution::unavailable(format!("census_holders failed: {error}")),
+        };
+        #[cfg(not(unix))]
+        let attribution = wal_pin_attribution(&path, _sweep_interval);
+        Ok((wal_file, attribution))
+    });
+
+    tokio::select! {
+        joined = &mut worker => {
+            stop_on_drop.armed = false;
+            let result = joined
+                .map_err(|error| StorageError::driver(StorageCapability::Sql, OPERATION, error))?
+                .map_err(|error| StorageError::driver(StorageCapability::Sql, OPERATION, error))?;
+            crate::ensure_request_read_active(OPERATION)?;
+            Ok(result)
+        }
+        _ = crate::wait_for_request_read_cancellation() => {
+            stopped.store(true, Ordering::SeqCst);
+            if tokio::time::timeout(crate::sqlite_interrupt_grace_from_env(), &mut worker)
+                .await
+                .is_err()
+            {
+                worker.abort();
+            }
+            stop_on_drop.armed = false;
+            Err(StorageError::Timeout { operation: OPERATION.into() })
+        }
+    }
 }
 
 /// Run the PASSIVE probe and graph-ledger reads on one guarded standalone
@@ -690,6 +897,69 @@ mod tests {
                 .expect("seed writes");
         }
         (pool, path)
+    }
+
+    #[test]
+    fn dropping_census_future_guard_requests_cooperative_stop() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let guard = StopCensusOnDrop {
+            stopped: Arc::clone(&stopped),
+            armed: true,
+        };
+
+        drop(guard);
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "dropping diagnostics while its census worker is live must stop the PID/fd walk"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn request_cancellation_after_passive_stops_before_graph_and_census() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, _) = seeded_pool(&dir);
+        let pool = Arc::new(pool);
+        TEST_REACHED_AFTER_PASSIVE.store(false, Ordering::SeqCst);
+        TEST_PAUSE_AFTER_PASSIVE.store(true, Ordering::SeqCst);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let diagnostic_pool = Arc::clone(&pool);
+        let task = tokio::spawn(crate::scope_request_read_cancellation(
+            cancel_rx,
+            async move {
+                collect_with_audit_append_failures_interruptibly(
+                    diagnostic_pool,
+                    BuildIdentity::from_env("test", None),
+                    Duration::from_secs(30),
+                    0,
+                )
+                .await
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !TEST_REACHED_AFTER_PASSIVE.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("diagnostics never completed its admitted PASSIVE phase");
+        cancel_tx.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled diagnostics did not stop promptly")
+            .expect("diagnostics task panicked");
+        TEST_PAUSE_AFTER_PASSIVE.store(false, Ordering::SeqCst);
+        assert!(matches!(result, Err(StorageError::Timeout { .. })));
+
+        let one: i64 = pool
+            .reader()
+            .expect("diagnostics returned its connection")
+            .conn()
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(one, 1);
     }
 
     #[test]

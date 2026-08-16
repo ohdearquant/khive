@@ -33,6 +33,13 @@
 //! | Recovery (`walpin` beacon/sidecar bookkeeping) | None — file-level bookkeeping (PID beacons, heartbeats) alongside the database, not a SQL connection against it | No | N/A — never acquires a database writer connection |
 //! | Top-level maintenance (`VACUUM` via `execute_script_top_level`/`WriterTaskHandle::send_top_level`) | `WriterTaskHandle`, skipping the per-request `BEGIN IMMEDIATE`/`COMMIT` wrap only | Yes | Routed through the SAME single writer owner as every other queued request — only the transaction wrap is skipped, never the queue |
 //!
+//! Store constructors may run outside Tokio and temporarily cache no handle;
+//! every store request-path write refreshes through
+//! `ConnectionPool::writer_task_for_write` at execution time. Strict routing
+//! refuses a missing handle, while the explicit compatibility fallback emits
+//! its store-specific violation at the actual direct-writer seam. The strict
+//! default itself remains gated by ADR-135 F2 / ADR-136 D2 evidence.
+//!
 //! A `direct_route_violation` sink row (`timeout_sink::emit_direct_route_violation`,
 //! ADR-136 D1 gate 6c) is emitted ONLY for the first row's degrade path — a
 //! `SqlAccess`-reachable write that bypassed an enabled queue. The other four
@@ -556,6 +563,19 @@ fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError
     StorageError::WriterTaskTerminated { request_state }
 }
 
+fn writer_task_begin_error(error: rusqlite::Error, busy_timeout: Duration) -> StorageError {
+    if crate::timeout_sink::is_busy_or_locked(&error) {
+        StorageError::WriterTaskBusy {
+            timeout_ms: u64::try_from(busy_timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    } else {
+        StorageError::Pool {
+            operation: "writer_task_begin".into(),
+            message: error.to_string(),
+        }
+    }
+}
+
 /// Sender half of the write queue. Cheaply cloneable (wraps an
 /// `mpsc::Sender`) — every migrated store that shares one writer task holds
 /// a clone of this handle.
@@ -824,6 +844,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     // ownership boundary instead.
     let conn = pool.open_standalone_writer_untracked()?;
     let acquisition_counters = pool.writer_acquisition_counters();
+    let busy_timeout = pool.config().busy_timeout;
     let origin = pool.origin();
     let backend_key = writer_db_key(pool);
     let db = crate::timeout_sink::db_label(pool);
@@ -834,6 +855,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
         origin,
         db.clone(),
         acquisition_counters,
+        busy_timeout,
     ));
     // Stored on the pool (not returned) so the handle's clone-and-share
     // contract stays untouched; see ConnectionPool::take_writer_task_join
@@ -883,6 +905,7 @@ async fn run_writer_task(
     origin: khive_storage::tx_registry::TxOrigin,
     db: String,
     acquisition_counters: Arc<WriterAcquisitionCounters>,
+    busy_timeout: Duration,
 ) {
     while let Some(request) = rx.recv().await {
         // The bounded-channel wait ends at this exact dequeue boundary.
@@ -955,10 +978,7 @@ async fn run_writer_task(
                         drop(tx_span);
                         sealed::Sealed::reply_error_after_begin(
                             request,
-                            StorageError::Pool {
-                                operation: "writer_task_begin".into(),
-                                message: e.to_string(),
-                            },
+                            writer_task_begin_error(e, busy_timeout),
                             queue_wait,
                             transaction_acquire,
                         );
@@ -1008,6 +1028,29 @@ mod tests {
     use crate::pool::PoolConfig;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
     use serial_test::serial;
+
+    #[test]
+    fn begin_error_classification_is_code_based_and_narrow() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("rendered text is irrelevant".to_string()),
+            );
+            assert!(matches!(
+                writer_task_begin_error(error, Duration::from_millis(175)),
+                StorageError::WriterTaskBusy { timeout_ms: 175 }
+            ));
+        }
+
+        let structural = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("database is locked".to_string()),
+        );
+        assert!(matches!(
+            writer_task_begin_error(structural, Duration::from_millis(175)),
+            StorageError::Pool { ref operation, .. } if operation == "writer_task_begin"
+        ));
+    }
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1221,9 +1264,9 @@ mod tests {
         assert!(
             matches!(
                 &reply,
-                Err(StorageError::Pool { operation, .. }) if operation == "writer_task_begin"
+                Err(StorageError::WriterTaskBusy { timeout_ms }) if *timeout_ms == 150
             ),
-            "expected writer_task_begin failure, got {reply:?}"
+            "expected typed retryable writer-task contention, got {reply:?}"
         );
         assert!(!op_ran.load(Ordering::SeqCst));
         assert!(
@@ -1283,10 +1326,9 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(StorageError::Pool { operation, .. }) if operation == "writer_task_begin"
+                Err(StorageError::WriterTaskBusy { timeout_ms }) if *timeout_ms == 150
             ),
-            "expected a writer_task_begin Pool error on BEGIN IMMEDIATE \
-             failure, got {result:?}"
+            "expected a typed retryable error on contended BEGIN IMMEDIATE, got {result:?}"
         );
         assert!(
             !op_ran.load(Ordering::SeqCst),
@@ -1300,14 +1342,27 @@ mod tests {
         lock_holder.conn().execute_batch("ROLLBACK").unwrap();
         drop(lock_holder);
 
+        handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id, v) VALUES (100, 'next-request')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert_after_busy".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("transient contention must not retire the writer task");
+
         let reader = pool.reader().expect("reader");
         let count: i64 = reader
             .conn()
-            .query_row("SELECT COUNT(*) FROM t WHERE id = 99", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM t WHERE id IN (99, 100)", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(
-            count, 0,
-            "no row must have landed from the request whose BEGIN IMMEDIATE failed"
+            count, 1,
+            "the failed request must not land, while the next request commits on the same task"
         );
     }
 

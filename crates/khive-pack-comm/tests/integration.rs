@@ -10,6 +10,12 @@ use khive_runtime::{
 use khive_storage::types::{SqlRow, SqlValue};
 use khive_types::Pack;
 
+fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
+    response["items"]
+        .as_array()
+        .expect("list response must contain an items array")
+}
+
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
@@ -1949,7 +1955,9 @@ async fn test_list_message_thread_id_filter() {
         .await
         .expect("list with thread_id filter succeeds");
 
-    let items = result.as_array().expect("list returns an array");
+    let items = list_items(&result);
+    // The filter must actually select rows (a vacuously empty pass proves
+    // nothing) and every returned message must carry the requested thread_id.
     assert!(
         !items.is_empty(),
         "CC-2 C1 regression: list(thread_id=X) returned no rows for a thread with a live message"
@@ -1993,7 +2001,7 @@ async fn test_list_message_direction_filter() {
         )
         .await
         .expect("list(direction=inbound) succeeds");
-    let inbound_items = inbound.as_array().expect("list returns array");
+    let inbound_items = list_items(&inbound);
     assert!(
         !inbound_items.is_empty(),
         "CC-2 C2 regression: list(direction=inbound) must return at least 1 message; got empty"
@@ -2017,7 +2025,7 @@ async fn test_list_message_direction_filter() {
         )
         .await
         .expect("list(direction=outbound) succeeds");
-    let outbound_items = outbound.as_array().expect("list returns array");
+    let outbound_items = list_items(&outbound);
     assert!(
         !outbound_items.is_empty(),
         "CC-2 C2 regression: list(direction=outbound) must return at least 1 message; got empty"
@@ -2782,7 +2790,7 @@ async fn test_list_message_finds_match_beyond_1000_backlog() {
         .await
         .expect("list(direction=inbound) succeeds");
 
-    let items = result.as_array().expect("list returns array");
+    let items = list_items(&result);
     assert_eq!(
         items.len(),
         1,
@@ -5140,7 +5148,7 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
         )
         .await
         .expect("legacy all-hex label must match exactly, not error");
-    let legacy = legacy.as_array().expect("list result array");
+    let legacy = list_items(&legacy);
     assert_eq!(
         legacy.len(),
         1,
@@ -5168,7 +5176,7 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
         )
         .await
         .expect("genuine UUID prefix must still resolve");
-    let prefixed = prefixed.as_array().expect("list result array");
+    let prefixed = list_items(&prefixed);
     assert_eq!(
         prefixed.len(),
         1,
@@ -5217,7 +5225,7 @@ async fn list_thread_prefix_resolution_ignores_non_message_notes() {
         )
         .await
         .expect("prefix resolution must ignore non-message notes");
-    let notes = result.as_array().expect("list result array");
+    let notes = list_items(&result);
     assert_eq!(
         notes.len(),
         1,
@@ -5261,7 +5269,7 @@ async fn list_thread_prefix_resolves_across_configured_visible_namespaces() {
         )
         .await
         .expect("a prefix of a thread in a visible namespace must resolve");
-    let messages = result.as_array().expect("list result array");
+    let messages = list_items(&result);
     assert_eq!(
         messages.len(),
         1,

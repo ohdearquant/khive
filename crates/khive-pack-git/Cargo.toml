@@ -26,6 +26,7 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 blake3 = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

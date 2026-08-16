@@ -72,11 +72,12 @@ def test_read_isolation_between_namespaces(
     )
 
     # list from beta must not include the alpha entity (multi-record namespace scoping survives)
-    entities_beta = khive_session.verb("list", {
+    page_beta = khive_session.verb("list", {
         "kind": "entity",
         "entity_kind": "concept",
         "namespace": ns_beta,
     })
+    entities_beta = page_beta["items"]
     ids_beta = [e["id"] for e in entities_beta]
     assert full_id not in ids_beta, (
         f"AlphaEntity must not appear in beta namespace list (multi-record scoping): {ids_beta}"

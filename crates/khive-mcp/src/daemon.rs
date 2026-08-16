@@ -3762,7 +3762,31 @@ mod tests {
             })
             .await
             .expect("local dispatch of stats() must succeed");
-        assert_eq!(resp.result.as_deref(), Some(reference_result.as_str()));
+        let mut daemon_result: serde_json::Value = serde_json::from_str(
+            resp.result
+                .as_deref()
+                .expect("daemon dispatch of stats() must return JSON"),
+        )
+        .expect("daemon stats response must be valid JSON");
+        let mut local_result: serde_json::Value = serde_json::from_str(&reference_result)
+            .expect("local stats response must be valid JSON");
+        // Usage counters are request-local. The daemon dispatch may count its
+        // own audit event before serializing while the direct reference call
+        // observes a different event boundary, so they are not an equivalence
+        // oracle for the transport round trip exercised by this test.
+        for result in [&mut daemon_result, &mut local_result] {
+            if let Some(entries) = result
+                .get_mut("results")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for entry in entries {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.remove("usage");
+                    }
+                }
+            }
+        }
+        assert_eq!(daemon_result, local_result);
         assert!(reference_result.contains("\"entities\""));
 
         // (b) ADR-096 Fork 1: a different namespace, same config_id, is no
@@ -4231,10 +4255,9 @@ mod tests {
                 first["ok"], true,
                 "list op must succeed inside daemon result: {first}"
             );
-            let rows = first["result"]
+            let rows = first["result"]["items"]
                 .as_array()
-                .or_else(|| first["result"]["items"].as_array())
-                .expect("list result must be an array or object with items");
+                .expect("list result must contain the stable items array");
             rows.iter()
                 .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
                 .collect()

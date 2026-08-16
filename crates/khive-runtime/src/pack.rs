@@ -25,6 +25,7 @@ use serde_json::Value;
 pub use khive_types::{
     EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, NoteKindSpec, NoteLifecycleSpec,
     PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -621,6 +622,23 @@ impl VerbRegistryBuilder {
                     first_idx: prev_idx,
                     second_idx: idx,
                 });
+            }
+        }
+
+        // Apply this metadata invariant to every HandlerDef, including Subhandlers. Subhandlers
+        // are not top-level MCP-callable, but their describe/help contract still cannot truthfully
+        // advertise a name rejected by every typed request parser before visibility dispatch.
+        for pack in &packs {
+            for handler in pack.handlers() {
+                for parameter in handler.params {
+                    if RESERVED_ENVELOPE_ARGS.contains(&parameter.name) {
+                        return Err(RuntimeError::ReservedEnvelopeParam {
+                            pack: pack.name().to_string(),
+                            verb: handler.name.to_string(),
+                            param: parameter.name.to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -1654,7 +1672,12 @@ impl VerbRegistry {
                 // dispatch happens to observe the queue non-empty first:
                 // an accepted provenance quirk, preferred over threading an
                 // `EventStore` handle into every synchronous
-                // `OnceLock::get_or_init` call site.
+                // `OnceLock::get_or_init` call site. The verb column is NOT
+                // inherited from that bystander dispatch: a config-lock row
+                // wearing an operation verb pollutes verb-filtered queries
+                // (e.g. per-verb receipt counts), so these rows carry their
+                // own `config.lock` pseudo-verb and remain discoverable by
+                // `EventKind::ConfigLocked`.
                 if let Some(store) = &self.event_store {
                     if crate::config_ledger::PENDING
                         .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -1663,13 +1686,14 @@ impl VerbRegistry {
                             let payload = serde_json::json!({ "key": key, "value": value });
                             let storage_event = Event::new(
                                 gate_req.namespace.as_str(),
-                                verb,
+                                "config.lock",
                                 EventKind::ConfigLocked,
                                 SubstrateKind::Event,
                                 format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                             )
                             .with_payload(payload);
-                            append_audit_event_best_effort(store, storage_event, verb).await;
+                            append_audit_event_best_effort(store, storage_event, "config.lock")
+                                .await;
                         }
                     }
                 }
@@ -3204,7 +3228,7 @@ pub fn json_type_name(v: &Value) -> &'static str {
 // require pub-exporting registry internals. Broad behavioral dispatch tests
 // live in tests/integration.rs.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ActorRef;
     use khive_types::Pack;
@@ -3406,6 +3430,51 @@ mod tests {
         }
     }
 
+    struct ReservedEnvelopeParamPack;
+
+    impl Pack for ReservedEnvelopeParamPack {
+        const NAME: &'static str = "reserved-envelope-param";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "broken.serve",
+            description: "declares a transport-owned argument",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[ParamDef {
+                name: "presentation",
+                param_type: "object",
+                required: false,
+                description: "invalid collision with the request envelope",
+            }],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for ReservedEnvelopeParamPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            unreachable!("invalid handler metadata must fail before dispatch")
+        }
+    }
+
     #[async_trait]
     impl PackRuntime for BetaPack {
         fn name(&self) -> &str {
@@ -3469,6 +3538,97 @@ mod tests {
         assert!(
             msg.contains("alpha") || msg.contains("colliding"),
             "error must name one of the conflicting packs: {msg}"
+        );
+    }
+
+    #[test]
+    fn reserved_request_envelope_param_is_boot_time_error() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(ReservedEnvelopeParamPack);
+        let error = builder
+            .build()
+            .err()
+            .expect("transport-owned parameter names must fail registry construction");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::ReservedEnvelopeParam {
+                    ref pack,
+                    ref verb,
+                    ref param,
+                } if pack == "reserved-envelope-param"
+                    && verb == "broken.serve"
+                    && param == "presentation"
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn reserved_request_envelope_param_is_boot_time_error_for_subhandler() {
+        struct ReservedEnvelopeSubhandlerParamPack;
+
+        impl Pack for ReservedEnvelopeSubhandlerParamPack {
+            const NAME: &'static str = "reserved-envelope-subhandler-param";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+                name: "broken.internal",
+                description: "declares a transport-owned argument on an internal handler",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Assertive,
+                params: &[ParamDef {
+                    name: "presentation_per_op",
+                    param_type: "string",
+                    required: false,
+                    description: "invalid collision with the request envelope",
+                }],
+            }];
+        }
+
+        #[async_trait]
+        impl PackRuntime for ReservedEnvelopeSubhandlerParamPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                unreachable!("invalid handler metadata must fail before dispatch")
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(ReservedEnvelopeSubhandlerParamPack);
+        let error = builder
+            .build()
+            .err()
+            .expect("transport-owned parameter names must fail registry construction");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::ReservedEnvelopeParam {
+                    ref pack,
+                    ref verb,
+                    ref param,
+                } if pack == "reserved-envelope-subhandler-param"
+                    && verb == "broken.internal"
+                    && param == "presentation_per_op"
+            ),
+            "unexpected error: {error:?}"
         );
     }
 
@@ -4529,6 +4689,8 @@ mod tests {
     struct CapturedEvent {
         message: Option<String>,
         audit_event: Option<String>,
+        into_id: Option<String>,
+        budget_rows: Option<u64>,
     }
 
     #[derive(Default)]
@@ -4557,7 +4719,14 @@ mod tests {
             match field.name() {
                 "message" => self.0.message = Some(cleaned),
                 "audit_event" => self.0.audit_event = Some(cleaned),
+                "into_id" => self.0.into_id = Some(cleaned),
                 _ => {}
+            }
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "budget_rows" {
+                self.0.budget_rows = Some(value);
             }
         }
     }
@@ -4596,7 +4765,23 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             let mut visitor = CapturedEventVisitor::default();
             event.record(&mut visitor);
-            self.events.lock().unwrap().push(visitor.0);
+            let captured = visitor.0;
+            // Tee the post-commit budget logs into their own append-only sink:
+            // `capture_dispatch_events` clears the main buffer, so a reader of
+            // budget events sharing that buffer would race the clear.
+            if let (Some(message), Some(into_id)) = (&captured.message, &captured.into_id) {
+                if message.ends_with("transaction materialization budget") {
+                    budget_events_sink()
+                        .lock()
+                        .unwrap()
+                        .push(CapturedBudgetLog {
+                            message: message.clone(),
+                            into_id: into_id.clone(),
+                            budget_rows: captured.budget_rows.unwrap_or(0),
+                        });
+                }
+            }
+            self.events.lock().unwrap().push(captured);
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
@@ -4613,6 +4798,32 @@ mod tests {
     /// runs at a time. The buffer is cleared at the start of each capture call.
     static GLOBAL_CAPTURE: OnceLock<Arc<StdMutex<Vec<CapturedEvent>>>> = OnceLock::new();
     static GLOBAL_INIT: Once = Once::new();
+
+    /// One captured post-commit budget log (curation merge tests).
+    #[derive(Clone)]
+    pub(crate) struct CapturedBudgetLog {
+        pub(crate) message: String,
+        pub(crate) into_id: String,
+        pub(crate) budget_rows: u64,
+    }
+
+    /// Append-only sink the subscriber tees budget logs into. Never cleared:
+    /// curation tests select their own rows by `into_id`, so stale rows from
+    /// other tests are inert rather than a pollution hazard.
+    static BUDGET_EVENTS: OnceLock<Arc<StdMutex<Vec<CapturedBudgetLog>>>> = OnceLock::new();
+
+    fn budget_events_sink() -> Arc<StdMutex<Vec<CapturedBudgetLog>>> {
+        Arc::clone(BUDGET_EVENTS.get_or_init(|| Arc::new(StdMutex::new(Vec::new()))))
+    }
+
+    /// Entry point for the curation merge tests: installs the process-global
+    /// capture subscriber (once for the whole test binary — a second
+    /// `set_global_default` elsewhere would starve one of the captures) and
+    /// returns the budget-log sink it tees into.
+    pub(crate) fn budget_log_events() -> Arc<StdMutex<Vec<CapturedBudgetLog>>> {
+        let _ = global_capture();
+        budget_events_sink()
+    }
 
     fn global_capture() -> Arc<StdMutex<Vec<CapturedEvent>>> {
         GLOBAL_INIT.call_once(|| {

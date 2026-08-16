@@ -114,7 +114,7 @@ struct SelectionInput {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PresentationInput {
+struct ExposureInput {
     #[serde(default)]
     preference_probability_shown: bool,
     #[serde(default)]
@@ -135,7 +135,7 @@ struct ServeInput {
     candidates: [CandidateInput; 2],
     selection: SelectionInput,
     #[serde(default)]
-    presentation: PresentationInput,
+    exposure: ExposureInput,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,14 +203,14 @@ pub(crate) async fn handle_serve(
     // a persisted source_rank_shown=true with absent ranks would record an
     // exposure the record cannot reproduce. Checked before any lookup or
     // hydration — it is pure input validation.
-    if input.presentation.source_rank_shown
+    if input.exposure.source_rank_shown
         && input
             .candidates
             .iter()
             .any(|candidate| candidate.source_rank.is_none())
     {
         return Err(RuntimeError::InvalidInput(
-            "moodboard.serve presentation.source_rank_shown=true requires source_rank on both \
+            "moodboard.serve exposure.source_rank_shown=true requires source_rank on both \
              candidates"
                 .to_string(),
         ));
@@ -267,7 +267,7 @@ pub(crate) async fn handle_serve(
         ));
     }
 
-    let presentation = validate_presentation(&core, token, &scope, input.presentation).await?;
+    let presentation = validate_exposure(&core, token, &scope, input.exposure).await?;
     let serve_id = Uuid::new_v4();
     let randomization = side_randomization(serve_id);
     if randomization.swap_applied {
@@ -754,11 +754,11 @@ async fn validate_asset(
     Ok(entity)
 }
 
-async fn validate_presentation(
+async fn validate_exposure(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     scope: &PreferenceScope,
-    input: PresentationInput,
+    input: ExposureInput,
 ) -> Result<PresentationProvenance, RuntimeError> {
     match (
         input.preference_probability_shown,
@@ -766,23 +766,21 @@ async fn validate_presentation(
     ) {
         (true, None) => {
             return Err(RuntimeError::InvalidInput(
-                "moodboard.serve presentation.served_preference_model_id is required when a preference probability was shown"
+                "moodboard.serve exposure.served_preference_model_id is required when a preference probability was shown"
                     .to_string(),
             ));
         }
         (false, Some(_)) => {
             return Err(RuntimeError::InvalidInput(
-                "moodboard.serve presentation.served_preference_model_id is only valid when preference_probability_shown=true"
+                "moodboard.serve exposure.served_preference_model_id is only valid when preference_probability_shown=true"
                     .to_string(),
             ));
         }
         _ => {}
     }
     let served_preference_model_id = if let Some(raw) = input.served_preference_model_id {
-        let model_id = parse_canonical_uuid(
-            &raw,
-            "moodboard.serve presentation.served_preference_model_id",
-        )?;
+        let model_id =
+            parse_canonical_uuid(&raw, "moodboard.serve exposure.served_preference_model_id")?;
         // Full bundle/provenance validation prevents a forged model id from
         // becoming trusted exposure metadata.
         let _ = load_preference_model(runtime, token, model_id, scope).await?;

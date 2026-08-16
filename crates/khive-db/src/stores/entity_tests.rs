@@ -1569,3 +1569,79 @@ async fn cursor_kind_filter_returns_records() {
         .unwrap();
     assert_eq!(offset_page.items.len(), concept_ids.len());
 }
+
+/// #1847: construction is synchronous and may happen before a Tokio runtime
+/// exists. A file-backed store must refresh its missing construction-time
+/// handle at write time; otherwise this batch silently takes the legacy
+/// pool-writer path even though the queue is enabled.
+#[test]
+fn batch_write_refreshes_writer_task_after_construction_outside_runtime() {
+    assert!(tokio::runtime::Handle::try_current().is_err());
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("entity-late-writer-task.db")),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+    }
+    let store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let writer_task = pool
+                .writer_task_handle()
+                .unwrap()
+                .expect("file-backed pool must spawn its writer task inside the runtime");
+            let (started_tx, started_rx) = oneshot::channel::<()>();
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let occupier = {
+                let writer_task = writer_task.clone();
+                tokio::spawn(async move {
+                    writer_task
+                        .send(move |_conn| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok::<(), StorageError>(())
+                        })
+                        .await
+                })
+            };
+            started_rx.await.unwrap();
+
+            let write = {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    store
+                        .upsert_entities(vec![
+                            make_entity("default", "concept", "late-a"),
+                            make_entity("default", "concept", "late-b"),
+                        ])
+                        .await
+                })
+            };
+            let mut saw_enqueued = false;
+            for _ in 0..100 {
+                if writer_task.queue_depth() >= 1 {
+                    saw_enqueued = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            release_tx.send(()).unwrap();
+            occupier.await.unwrap().unwrap();
+            write.await.unwrap().unwrap();
+            assert!(
+                saw_enqueued,
+                "batch write bypassed the queue after construction cached no runtime handle"
+            );
+        });
+}

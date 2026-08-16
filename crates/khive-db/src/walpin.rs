@@ -1063,6 +1063,16 @@ mod windows_impl {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+    #[cfg(test)]
+    std::thread_local! {
+        static OPEN_DIR_HANDLE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_dir_handle_call_count() -> usize {
+        OPEN_DIR_HANDLE_CALLS.with(std::cell::Cell::get)
+    }
+
     fn to_wide_nul(path: &Path) -> io::Result<Vec<u16>> {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         if wide.contains(&0) {
@@ -1324,6 +1334,9 @@ mod windows_impl {
     }
 
     fn open_dir_handle(dir: &Path) -> io::Result<fs::File> {
+        #[cfg(test)]
+        OPEN_DIR_HANDLE_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         lexical_prefilter(dir)?;
         let expected = fs::canonicalize(dir)?;
         let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
@@ -1463,9 +1476,9 @@ mod windows_impl {
         Ok(())
     }
 
-    pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
+    fn open_or_create_dir_handle(dir: &Path) -> io::Result<fs::File> {
         match open_dir_handle(dir) {
-            Ok(_) => Ok(()),
+            Ok(handle) => Ok(handle),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 ensure_ancestors_not_reparse(dir)?;
                 if let Err(create_error) = create_owner_only_dir(dir) {
@@ -1473,10 +1486,14 @@ mod windows_impl {
                         return Err(create_error);
                     }
                 }
-                open_dir_handle(dir).map(|_| ())
+                open_dir_handle(dir)
             }
             Err(error) => Err(error),
         }
+    }
+
+    pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
+        open_or_create_dir_handle(dir).map(|_| ())
     }
 
     fn open_relative(
@@ -1633,7 +1650,7 @@ mod windows_impl {
         tmp_name: &str,
         body: &[u8],
     ) -> io::Result<()> {
-        let dir_handle = open_dir_handle(dir)?;
+        let dir_handle = open_or_create_dir_handle(dir)?;
         remove_relative_if_exists(&dir_handle, tmp_name)?;
         let mut tmp_file = open_relative(
             &dir_handle,
@@ -1962,9 +1979,16 @@ const CENSUS_BUFFER_NEGOTIATION_ATTEMPTS: usize = 4;
 fn negotiate_buffer<T: Default + Clone>(
     size_call: impl Fn() -> std::os::raw::c_int,
     data_call: impl Fn(*mut std::os::raw::c_void, std::os::raw::c_int) -> std::os::raw::c_int,
+    should_stop: &impl Fn() -> bool,
 ) -> io::Result<(Vec<T>, bool)> {
     let item_size = std::mem::size_of::<T>();
     for attempt in 0..CENSUS_BUFFER_NEGOTIATION_ATTEMPTS {
+        if should_stop() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "WAL holder census cancelled",
+            ));
+        }
         let needed = size_call();
         if needed <= 0 {
             return Err(io::Error::last_os_error());
@@ -1998,6 +2022,14 @@ fn negotiate_buffer<T: Default + Clone>(
 /// listing, which only sees PIDs that already wrote something there.
 #[cfg(target_os = "macos")]
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
+    census_holders_until(db_path, || false)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn census_holders_until<C>(db_path: &Path, should_stop: C) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
     use std::os::raw::{c_int, c_void};
     use std::os::unix::fs::MetadataExt;
 
@@ -2006,6 +2038,13 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     const PROC_PIDFDVNODEPATHINFO: c_int = 2;
     const PROX_FDTYPE_VNODE: u32 = 1;
     const MAXPATHLEN: usize = 1024;
+
+    if should_stop() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WAL holder census cancelled",
+        ));
+    }
 
     #[repr(C)]
     #[derive(Clone, Default)]
@@ -2099,11 +2138,18 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     let (pid_buf, pid_list_truncated): (Vec<i32>, bool) = negotiate_buffer(
         || unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) },
         |buf_ptr, buf_bytes| unsafe { proc_listpids(PROC_ALL_PIDS, 0, buf_ptr, buf_bytes) },
+        &should_stop,
     )?;
 
     let mut holders = std::collections::HashSet::new();
     let mut uninspectable: Vec<u32> = Vec::new();
     for &pid in &pid_buf {
+        if should_stop() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "WAL holder census cancelled",
+            ));
+        }
         if pid <= 0 {
             continue;
         }
@@ -2114,9 +2160,13 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
             |buf_ptr, buf_bytes| unsafe {
                 proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buf_ptr, buf_bytes)
             },
+            &should_stop,
         ) {
             Ok(v) => v,
             Err(e) => {
+                if e.kind() == io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
                 // A failed sizing/listing call means either the PID exited
                 // between `proc_listpids` and here (ESRCH — positively
                 // gone, safe to skip) or the inspection itself failed (most
@@ -2137,6 +2187,12 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
             uninspectable.push(pid as u32);
         }
         for fdinfo in &fd_buf {
+            if should_stop() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "WAL holder census cancelled",
+                ));
+            }
             if fdinfo.proc_fdtype != PROX_FDTYPE_VNODE {
                 continue;
             }
@@ -2338,7 +2394,22 @@ fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
 /// the walk incomplete rather than being dropped via `.flatten()`.
 #[cfg(target_os = "linux")]
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
+    census_holders_until(db_path, || false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn census_holders_until<C>(db_path: &Path, should_stop: C) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
     use std::os::unix::fs::MetadataExt;
+
+    if should_stop() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WAL holder census cancelled",
+        ));
+    }
 
     // File-identity target, not a path target: holders are matched on
     // (device, inode) so a process that opened the database through a hard
@@ -2361,6 +2432,12 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
 
     let proc_dir = fs::read_dir("/proc")?;
     for entry_result in proc_dir {
+        if should_stop() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "WAL holder census cancelled",
+            ));
+        }
         let proc_entry = match entry_result {
             Ok(e) => e,
             Err(_) => {
@@ -2388,6 +2465,12 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
             }
         };
         for fd_result in fds {
+            if should_stop() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "WAL holder census cancelled",
+                ));
+            }
             let fd_entry = match fd_result {
                 Ok(e) => e,
                 Err(_) => {
@@ -2445,6 +2528,22 @@ pub fn census_holders(_db_path: &Path) -> io::Result<CensusResult> {
     ))
 }
 
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+pub(crate) fn census_holders_until<C>(_db_path: &Path, should_stop: C) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
+    if should_stop() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WAL holder census cancelled",
+        ));
+    }
+    Err(io_other(
+        "OS-derived holder census has no implementation on this Unix target",
+    ))
+}
+
 /// Ensure `dir` exists and is trustworthy: a real directory (never a
 /// symlink or reparse-point component), and accessible only to its owner:
 /// Unix mode `0700`, or a protected owner-only DACL on Windows. Refuses —
@@ -2476,7 +2575,6 @@ pub fn write_heartbeat(dir: &Path, heartbeat: &WalpinHeartbeat) -> io::Result<()
     }
     #[cfg(windows)]
     {
-        windows_impl::ensure_sidecar_dir(dir)?;
         windows_impl::write_atomic(dir, &target, &tmp, &body)
     }
 }
@@ -2558,7 +2656,6 @@ pub fn write_beacon(dir: &Path, beacon: &WalpinBeacon) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        windows_impl::ensure_sidecar_dir(dir)?;
         windows_impl::write_atomic(dir, &target, &tmp, &body)
     }
 }
@@ -4363,6 +4460,7 @@ mod tests {
                     (buf_bytes as usize - 4) as std::os::raw::c_int
                 }
             },
+            &|| false,
         )
         .expect("negotiation must succeed once the set stabilizes");
         assert!(
@@ -4379,9 +4477,12 @@ mod tests {
         // matter how many times negotiate_buffer retries with a larger
         // buffer — this must give up after CENSUS_BUFFER_NEGOTIATION_ATTEMPTS
         // and report `truncated = true` rather than loop forever or lie.
-        let (items, truncated) =
-            negotiate_buffer::<i32>(|| 4 as std::os::raw::c_int, |_buf_ptr, buf_bytes| buf_bytes)
-                .expect("negotiation must still return a (possibly truncated) result, not error");
+        let (items, truncated) = negotiate_buffer::<i32>(
+            || 4 as std::os::raw::c_int,
+            |_buf_ptr, buf_bytes| buf_bytes,
+            &|| false,
+        )
+        .expect("negotiation must still return a (possibly truncated) result, not error");
         assert!(
             truncated,
             "a buffer that stays exactly full across every retry must be reported truncated"
@@ -4395,6 +4496,7 @@ mod tests {
         let result = negotiate_buffer::<i32>(
             || -1 as std::os::raw::c_int,
             |_buf_ptr, buf_bytes| buf_bytes,
+            &|| false,
         );
         assert!(result.is_err(), "a non-positive size probe must error out");
     }
@@ -4755,6 +4857,26 @@ mod tests {
 
             remove_heartbeat(&dir, pid).expect("remove must succeed");
             assert!(!path.exists());
+        }
+
+        #[test]
+        fn repeated_heartbeat_write_validates_sidecar_root_once() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let first = heartbeat(pid);
+            write_heartbeat(&dir, &first).expect("initial write must create the sidecar");
+
+            let before = super::super::windows_impl::open_dir_handle_call_count();
+            let mut replacement = first;
+            replacement.oldest_tx_label = Some("replacement".to_string());
+            write_heartbeat(&dir, &replacement).expect("replacement write must succeed");
+            let validations = super::super::windows_impl::open_dir_handle_call_count() - before;
+
+            assert_eq!(
+                validations, 1,
+                "an existing sidecar root must be fully validated exactly once per record write"
+            );
         }
 
         #[test]

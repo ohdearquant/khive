@@ -131,6 +131,32 @@ async fn agent_one(
     Ok(first["result"].clone())
 }
 
+/// #1789: Agent presentation must retain the stable offset/cursor page keys
+/// even when the page is empty or terminal.
+#[tokio::test]
+async fn list_empty_pages_keep_structural_keys_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let offset_page = agent_one(&client, r#"list(kind="entity", limit=10)"#).await?;
+    assert_eq!(offset_page["items"], json!([]));
+    assert!(
+        offset_page.get("items").is_some(),
+        "empty offset page must retain items: {offset_page}"
+    );
+
+    let cursor_page = agent_one(&client, r#"list(kind="entity", limit=10, after="")"#).await?;
+    assert_eq!(cursor_page["entities"], json!([]));
+    assert!(
+        cursor_page.get("entities").is_some(),
+        "empty cursor page must retain entities: {cursor_page}"
+    );
+    assert!(
+        cursor_page.get("next_after").is_some_and(Value::is_null),
+        "terminal cursor page must retain next_after:null: {cursor_page}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServer) {
     use std::os::unix::fs::PermissionsExt;
@@ -267,7 +293,7 @@ async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advis
 
 #[cfg(unix)]
 #[tokio::test]
-async fn chmod_read_only_snapshot_default_list_keeps_array_and_sibling_audit_advisory() {
+async fn chmod_read_only_snapshot_default_list_keeps_items_envelope_and_sibling_audit_advisory() {
     use khive_mcp::tools::request::RequestParams;
 
     let (_dir, server) = seeded_read_only_snapshot_server().await;
@@ -288,19 +314,20 @@ async fn chmod_read_only_snapshot_default_list_keeps_array_and_sibling_audit_adv
 
     assert_eq!(entry["ok"], json!(true), "list must succeed: {response}");
     assert_eq!(entry["tool"], json!("list"));
-    let items = entry["result"]
+    let items = entry["result"]["items"]
         .as_array()
-        .expect("within-cap list must preserve main's bare-array result");
+        .expect("offset-mode list must always return the stable items envelope");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["name"], json!("snapshot entity"));
     assert_eq!(items[0]["id"].as_str().map(str::len), Some(8));
+    assert_eq!(entry["result"]["limit_clamped"], json!(false));
     assert_eq!(
         entry["advisories"][0]["code"],
         json!(khive_runtime::AUDIT_PERSISTENCE_SKIPPED_READ_ONLY)
     );
     assert!(
         entry["result"].get("advisories").is_none(),
-        "the transport advisory must remain outside the verb-owned array"
+        "the transport advisory must remain outside the verb-owned envelope"
     );
     assert_eq!(response["summary"]["succeeded"], json!(1));
     assert_eq!(response["status"], json!("success"));
@@ -484,9 +511,9 @@ async fn create_then_list_across_separate_request_calls() -> anyhow::Result<()> 
     .await?;
 
     let listed = ok_one(&client, r#"list(kind="entity")"#).await?;
-    let entities = listed
+    let entities = listed["items"]
         .as_array()
-        .expect("entities array (list returns array directly)");
+        .expect("entity list items envelope");
     let names: Vec<&str> = entities.iter().filter_map(|e| e["name"].as_str()).collect();
     assert!(names.contains(&"A"), "entity A missing: {names:?}");
     assert!(names.contains(&"B"), "entity B missing: {names:?}");
@@ -1019,7 +1046,9 @@ async fn event_session_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
         ),
     )
     .await?;
-    let events = first.as_array().expect("event list result");
+    let events = first["items"]
+        .as_array()
+        .expect("event list items envelope");
     assert_eq!(events.len(), 1, "session filter must select the fixture");
     let returned = events[0]["session_id"]
         .as_str()
@@ -1035,7 +1064,7 @@ async fn event_session_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(
-        second.as_array().map(Vec::len),
+        second["items"].as_array().map(Vec::len),
         Some(1),
         "the returned session_id must be accepted unchanged"
     );
@@ -1185,7 +1214,11 @@ async fn pack_schedule_without_comm_rejects_only_remind_before_persisting() -> a
     );
 
     let notes = ok_one(&client, r#"list(kind="note")"#).await?;
-    assert_eq!(notes, json!([]), "failed remind must persist no note");
+    assert_eq!(
+        notes["items"],
+        json!([]),
+        "failed remind must persist no note"
+    );
     let empty_agenda = ok_one(&client, "schedule.agenda()").await?;
     assert_eq!(empty_agenda["count"], json!(0));
 
@@ -1394,7 +1427,9 @@ async fn kg_create_note_kind_task_rejects_non_task_depends_on_before_write() -> 
 
     // And there should be no task with the supplied title — write was prevented.
     let listed = ok_one(&client, r#"list(kind="note", note_kind="task")"#).await?;
-    let notes = listed.as_array().expect("note list");
+    let notes = listed["items"]
+        .as_array()
+        .expect("note list items envelope");
     let titles: Vec<&str> = notes.iter().filter_map(|n| n["name"].as_str()).collect();
     assert!(
         !titles.contains(&"depends on entity"),
@@ -1524,7 +1559,7 @@ async fn list_with_granular_entity_kind_filters_results() -> anyhow::Result<()> 
     ok_one(&client, r#"create(kind="document", name="GranularListB")"#).await?;
 
     let listed = ok_one(&client, r#"list(kind="concept")"#).await?;
-    let arr = listed.as_array().expect("array");
+    let arr = listed["items"].as_array().expect("list items envelope");
     let names: Vec<&str> = arr.iter().filter_map(|n| n["name"].as_str()).collect();
     assert!(
         names.contains(&"GranularListA"),
@@ -1548,7 +1583,7 @@ async fn list_with_granular_task_kind_lists_only_tasks() -> anyhow::Result<()> {
     .await?;
 
     let listed = ok_one(&client, r#"list(kind="task")"#).await?;
-    let arr = listed.as_array().expect("array");
+    let arr = listed["items"].as_array().expect("list items envelope");
     let titles: Vec<&str> = arr.iter().filter_map(|n| n["name"].as_str()).collect();
     assert!(
         titles.contains(&"GranularTaskA"),
@@ -1847,6 +1882,13 @@ impl khive_types::Pack for ErrorInjectPack {
             category: VerbCategory::Assertive,
             params: &[],
         },
+        HandlerDef {
+            name: "writer_task_busy",
+            description: "returns a typed writer-task BEGIN contention error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
     ];
 }
 
@@ -1888,6 +1930,11 @@ impl PackRuntime for ErrorInjectPack {
         if verb == "write_queue_full" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriteQueueFull { timeout_ms: 175 },
+            ));
+        }
+        if verb == "writer_task_busy" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
             ));
         }
         let err = KhiveError::unavailable("downstream service offline")
@@ -2063,6 +2110,42 @@ async fn write_queue_full_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "retry_after_ms": 175,
         }),
         "the exact wire contract must preserve stage, deadline, retryability, and ADR-131:251's scope/retry_after_ms for queue saturation"
+    );
+
+    Ok(())
+}
+
+/// A writer task that exhausts SQLite's busy timeout before entering its
+/// request transaction has not invoked the operation and is therefore safe
+/// to retry. Keep that proof structured through the MCP boundary.
+#[tokio::test]
+async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_task_busy()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "writer_task_begin_busy",
+            "stage": "writer_task_begin_busy",
+            "message": "storage: writer task could not begin within 175ms because SQLite remained busy; request was not executed",
+            "retryable": true,
+            "timeout_ms": 175,
+            "capability": serde_json::Value::Null,
+            "operation": "writer_task_begin",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
+        }),
+        "BEGIN contention must remain distinguishable and safely retryable"
     );
 
     Ok(())
@@ -3904,11 +3987,10 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
     );
 
     // list(kind=proposal) without status — must return BOTH rows (open + withdrawn).
-    // The list result is a bare JSON array (same shape as other list verbs).
     let list_result = ok_one(&client, r#"list(kind="proposal")"#).await?;
-    let items = list_result
+    let items = list_result["items"]
         .as_array()
-        .expect("list(kind=proposal) must return a JSON array");
+        .expect("list(kind=proposal) must return an items envelope");
     assert!(
         items.len() >= 2,
         "list(kind=proposal) without status must include all rows (audit trail); \
@@ -3929,9 +4011,9 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
 
     // list(kind=proposal, status=open) — must return only the open one.
     let list_open = ok_one(&client, r#"list(kind="proposal", status="open")"#).await?;
-    let open_items = list_open
+    let open_items = list_open["items"]
         .as_array()
-        .expect("list(kind=proposal, status=open) must return a JSON array");
+        .expect("list(kind=proposal, status=open) must return an items envelope");
     assert!(
         open_items
             .iter()
@@ -4527,9 +4609,9 @@ async fn entity_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
     .await?;
 
     let result = ok_one(&client, r#"list(kind="entity", limit=3)"#).await?;
-    let items = result
+    let items = result["items"]
         .as_array()
-        .expect("list(kind=entity) returns array of entities");
+        .expect("list(kind=entity) returns an items envelope");
     assert!(!items.is_empty(), "list must return at least one entity");
 
     for item in items {
@@ -4762,7 +4844,9 @@ async fn send_returns_iso8601_timestamps() -> anyhow::Result<()> {
         json!(true),
         "list(kind=note) must succeed: {first}"
     );
-    let items = first["result"].as_array().expect("list returns array");
+    let items = first["result"]["items"]
+        .as_array()
+        .expect("list returns an items envelope");
     assert!(!items.is_empty(), "must have at least one message note");
     let created_at = items[0]["created_at"].as_str().unwrap_or("");
     assert!(
@@ -4883,9 +4967,9 @@ async fn proposal_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
     .await?;
 
     let result = ok_one(&client, r#"list(kind="proposal")"#).await?;
-    let proposals = result
+    let proposals = result["items"]
         .as_array()
-        .expect("list(kind=proposal) returns array");
+        .expect("list(kind=proposal) returns an items envelope");
     assert!(!proposals.is_empty(), "must have at least one proposal");
     let created_at = proposals[0]["created_at"].as_str().unwrap_or("");
     assert!(
@@ -5810,21 +5894,12 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     }
 
     fn list_ids(result: &Value) -> Vec<String> {
-        match result["result"].as_array() {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                .collect(),
-            None => match result["result"]["items"].as_array() {
-                Some(arr) => arr
-                    .iter()
-                    .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                    .collect(),
-                None => {
-                    panic!("list result must be a JSON array or object with items; got: {result}")
-                }
-            },
-        }
+        result["result"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("list result must contain an items array; got: {result}"))
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
     }
 
     // ── (a) DEFAULT CREATE: lands in "local" ─────────────────────────────────

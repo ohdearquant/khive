@@ -51,13 +51,16 @@ pub use khive_hnsw::{
 // Formal proof: khive.Retrieval.HNSW.checkpoint_correctness
 pub use hybrid::{
     fuse_search_results, fuse_search_results_checked, DualIndexConfig, DualIndexRouter,
-    DualIndexStrategy, HybridConfig, HybridSearcher, KeywordSearch, Query, Reranker, VectorSearch,
+    DualIndexStrategy, HybridConfig, HybridSearcher, IdentityReranker, KeywordSearch, Query,
+    Reranker, VectorSearch,
 };
 #[cfg(feature = "checkpoint")]
 pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
-// TODO(port-rerank): native cross-encoder reranking deferred; khive-inference not ported yet
-// #[cfg(feature = "native-rerank")]
-// pub use hybrid::{CrossEncoderScorer, NativeCrossEncoderReranker, RerankDocumentResolver};
+// Native cross-encoder scaffold (ADR-042): the scorer trait and reranker are generic
+// and carry no khive-inference dependency, so this seam ships behind `native-rerank`
+// ahead of the model port. TODO(port-rerank): khive-inference model impl still deferred.
+#[cfg(feature = "native-rerank")]
+pub use hybrid::{CrossEncoderScorer, NativeCrossEncoderReranker, RerankDocumentResolver};
 pub use metrics::{MetricEvent, MetricValue, MetricsSink, NoopSink, RecordingSink};
 #[cfg(feature = "persist")]
 pub use persist::{

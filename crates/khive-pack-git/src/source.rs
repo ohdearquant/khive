@@ -168,6 +168,39 @@ fn canonicalize_https_url(url: &str) -> String {
     s
 }
 
+/// Canonicalize the identity fallback for an accepted remote URL without
+/// mutating the URL retained in [`DigestSource::Remote`] for clone/fetch.
+/// Credential and tracking material is redacted first; only then are the
+/// path decorations that do not identify a repository (`/` and `.git`)
+/// removed. The order matters for spellings such as `.git?token=...` and
+/// `.git/?view=...`, whose suffix is not visible until the query is gone.
+/// Finally the host is lowercased (DNS is case-insensitive, so
+/// `https://Example.com/repo` and `https://example.com/repo` are the same
+/// remote) -- the path is left untouched because owner/repo segments are
+/// case-sensitive on the host and folding them risks collapsing two
+/// genuinely distinct repositories onto one anchor.
+pub(crate) fn canonical_remote_identity(url: &str) -> String {
+    let redacted = redact_repo_url(url);
+    let without_slash = redacted.trim_end_matches('/');
+    let without_git_suffix = without_slash.strip_suffix(".git").unwrap_or(without_slash);
+    lowercase_host_component(without_git_suffix)
+}
+
+/// Lowercase only the host component of a `scheme://host/path` string,
+/// leaving the scheme and path untouched. `parse_source` accepts only
+/// `https://` remotes, so `value` is always scheme-prefixed here; a value
+/// without a recognized scheme is returned unchanged.
+fn lowercase_host_component(value: &str) -> String {
+    for scheme in ["https://", "http://", "git://", "ssh://"] {
+        if let Some(rest) = value.strip_prefix(scheme) {
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(authority_end);
+            return format!("{scheme}{}{path}", authority.to_ascii_lowercase());
+        }
+    }
+    value.to_string()
+}
+
 /// Derive a credential-free `(owner, repo)` from a canonicalized
 /// `https://github.com/...` URL. Query/fragment material is stripped by the
 /// shared remote normalizer before either component can become a `gh` argv
@@ -299,13 +332,28 @@ fn strip_query_and_fragment(s: &str) -> &str {
     }
 }
 
-/// Redact credential and tracking material from a URL before it is
-/// persisted as `properties.repo_url` display metadata (ADR-088 Amendment
-/// 2): userinfo (`user[:pass]@`), the query string, and the fragment are
-/// stripped. This is for the STORED value only -- the in-memory canonical
-/// URL used for cloning/gh operations is never passed through this.
+/// Redact credential and tracking material before a remote spelling is used
+/// as stored `properties.repo_url` display metadata or as the unsluggable
+/// remote identity fallback (ADR-088 Amendment 2): userinfo (`user[:pass]@`
+/// for scheme URLs and `user@` for SCP shorthand), the query string, and the
+/// fragment are stripped. The in-memory canonical URL used for cloning/gh
+/// operations is never replaced with this value.
 pub(crate) fn redact_repo_url(url: &str) -> String {
-    let stripped = strip_query_and_fragment(url);
+    // `remote_url_to_slug` accepts boundary whitespace around recognized
+    // remote spellings. Redaction must recognize exactly those same
+    // spellings or a leading space can make normalization succeed while a
+    // credential-bearing raw value is written back unchanged. Do not trim
+    // arbitrary values: a local path is display metadata and whitespace can
+    // be part of the filesystem spelling.
+    let candidate = url.trim();
+    let recognized_remote = ["https://", "http://", "git://", "ssh://"]
+        .iter()
+        .any(|scheme| candidate.starts_with(scheme))
+        || scp_parts(candidate).is_some();
+    if !recognized_remote {
+        return url.to_string();
+    }
+    let stripped = strip_query_and_fragment(candidate);
     for scheme in ["https://", "http://", "git://", "ssh://"] {
         if let Some(rest) = stripped.strip_prefix(scheme) {
             let authority_end = rest.find('/').unwrap_or(rest.len());
@@ -316,6 +364,9 @@ pub(crate) fn redact_repo_url(url: &str) -> String {
             };
             return format!("{scheme}{authority}{path}");
         }
+    }
+    if let Some((host, path)) = scp_parts(stripped) {
+        return format!("{host}:{path}");
     }
     stripped.to_string()
 }
@@ -358,7 +409,9 @@ async fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
 /// source -- the value stored in `properties.repo_slug` and matched on by
 /// `resolve_or_create_project`.
 ///
-/// - `Remote`: the `host/owner/repo` slug of the canonical URL.
+/// - `Remote`: the `host/owner/repo` slug of the canonical URL, or its shared
+///   credential-redacted, query-free, slash/`.git`-normalized identity
+///   fallback when an accepted HTTPS source does not satisfy the slug grammar.
 /// - `Local`: the canonicalized path's configured `origin` remote, sluggified
 ///   the same way -- so a repo digested once via `https://host/owner/repo`
 ///   and once via a local clone of that same remote converge on one anchor.
@@ -374,10 +427,10 @@ pub async fn repo_identity(source: &DigestSource) -> String {
         DigestSource::Remote { canonical, .. } => {
             // An accepted URL that does not normalize (e.g. a single path
             // segment) falls back to the URL itself as identity -- but
-            // credential-redacted and stripped of query/fragment, so a
-            // token embedded in the source can never persist in `repo_slug`
-            // and query-only spelling variants converge on one identity.
-            remote_url_to_slug(canonical).unwrap_or_else(|| redact_repo_url(canonical))
+            // credential-redacted and stripped of query/fragment plus
+            // trailing slash/`.git` decorations, so secrets cannot persist
+            // in `repo_slug` and equivalent spellings converge.
+            remote_url_to_slug(canonical).unwrap_or_else(|| canonical_remote_identity(canonical))
         }
         DigestSource::Local(path) => {
             let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
@@ -646,6 +699,13 @@ mod tests {
             "https://github.com/org/repo"
         );
         assert_eq!(
+            redact_repo_url(
+                "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@github.com:org/repo.git?token=SECRET#frag"
+            ),
+            "github.com:org/repo.git",
+            "SCP-style userinfo must not survive in stored display metadata"
+        );
+        assert_eq!(
             redact_repo_url("https://github.com/org/repo"),
             "https://github.com/org/repo"
         );
@@ -738,20 +798,100 @@ mod tests {
     async fn repo_identity_unsluggable_remote_fallback_is_redacted_and_converges() {
         // A single-path-segment URL does not normalize to a slug; the raw-URL
         // identity fallback must never carry userinfo/query/fragment, and
-        // query-only spelling variants must converge on one identity.
-        let with_secret = DigestSource::Remote {
-            canonical: "https://user:tok3n@example.com/repo?token=SECRET#frag".to_string(),
-            gh_slug: None,
-        };
+        // query-only spelling variants must converge on one identity. Drive
+        // the accepted public source parser rather than constructing the
+        // enum directly so this also pins the input-surface contract.
+        let with_secret = parse_source("https://user:tok3n@example.com/repo?token=SECRET#frag")
+            .expect("accepted unsluggable HTTPS source");
         let identity = repo_identity(&with_secret).await;
         assert_eq!(identity, "https://example.com/repo");
         assert!(!identity.contains("tok3n") && !identity.contains("SECRET"));
 
-        let bare = DigestSource::Remote {
-            canonical: "https://example.com/repo".to_string(),
-            gh_slug: None,
-        };
+        let bare = parse_source("https://example.com/repo").expect("accepted bare HTTPS source");
         assert_eq!(repo_identity(&bare).await, identity);
+    }
+
+    #[tokio::test]
+    async fn repo_identity_unsluggable_remote_fallback_canonicalizes_equivalent_spellings() {
+        let spellings = [
+            "https://user:tok3n@example.com/repo",
+            "https://example.com/repo/",
+            "https://example.com/repo?view=compact",
+            "https://example.com/repo.git?token=SECRET",
+            "https://example.com/repo/?view=compact#top",
+            "https://example.com/repo.git/?view=compact",
+        ];
+        for spelling in spellings {
+            let source = parse_source(spelling).expect("accepted unsluggable HTTPS source");
+            assert_eq!(
+                repo_identity(&source).await,
+                "https://example.com/repo",
+                "equivalent fallback spelling must converge: {spelling:?}"
+            );
+        }
+
+        let source = parse_source("https://user:tok3n@example.com/repo.git?token=SECRET")
+            .expect("accepted credential-bearing HTTPS source");
+        let DigestSource::Remote { canonical, .. } = source else {
+            panic!("expected remote source");
+        };
+        assert!(
+            canonical.contains("tok3n") && canonical.contains("SECRET"),
+            "identity redaction must not mutate the in-memory clone URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_identity_unsluggable_remote_fallback_lowercases_host_only() {
+        let mixed_case_host = parse_source("https://Example.COM/Repo")
+            .expect("accepted mixed-case-host unsluggable HTTPS source");
+        let lowercase_host = parse_source("https://example.com/Repo")
+            .expect("accepted lowercase-host unsluggable HTTPS source");
+        let mixed_identity = repo_identity(&mixed_case_host).await;
+        assert_eq!(
+            mixed_identity,
+            repo_identity(&lowercase_host).await,
+            "mixed-case and lowercase host spellings of the same remote must converge"
+        );
+        assert_eq!(
+            mixed_identity, "https://example.com/Repo",
+            "host must be lowercased while path case is preserved"
+        );
+
+        let different_path = parse_source("https://example.com/OtherRepo")
+            .expect("accepted lowercase-host unsluggable HTTPS source with a different path");
+        assert_ne!(
+            repo_identity(&different_path).await,
+            mixed_identity,
+            "differing paths must not collapse onto the same anchor"
+        );
+    }
+
+    #[test]
+    fn redact_repo_url_trims_recognized_remotes_but_not_local_paths() {
+        assert_eq!(
+            redact_repo_url("  https://user:tok3n@github.com/org/repo.git?token=SECRET  "),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_repo_url("  git@github.com:org/repo.git?token=SECRET  "),
+            "github.com:org/repo.git"
+        );
+        assert_eq!(
+            redact_repo_url(" /tmp/a repo "),
+            " /tmp/a repo ",
+            "local filesystem spelling is display metadata and must not be indiscriminately trimmed"
+        );
+    }
+
+    #[test]
+    fn redact_repo_url_preserves_question_mark_in_local_path() {
+        assert_eq!(redact_repo_url("/tmp/repo?worktree"), "/tmp/repo?worktree");
+    }
+
+    #[test]
+    fn redact_repo_url_preserves_hash_in_local_path() {
+        assert_eq!(redact_repo_url("/tmp/repo#worktree"), "/tmp/repo#worktree");
     }
 
     #[test]

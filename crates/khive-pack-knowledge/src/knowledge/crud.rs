@@ -23,6 +23,25 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        Self::upsert_atoms_with_content_policy(runtime, token, params, false).await
+    }
+
+    /// Import has already validated the complete source document and must retain its
+    /// boundary whitespace. The public upsert verb keeps its established trim behavior.
+    pub(super) async fn upsert_import_atoms(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        Self::upsert_atoms_with_content_policy(runtime, token, params, true).await
+    }
+
+    async fn upsert_atoms_with_content_policy(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+        preserve_content_whitespace: bool,
+    ) -> Result<Value, RuntimeError> {
         let p: UpsertAtomsParams = deser(params)?;
         if p.chunk_size.is_some() {
             tracing::warn!(
@@ -56,7 +75,12 @@ impl KnowledgeHandlers {
                 ));
             }
 
-            let content = atom_in.content.as_deref().unwrap_or("").trim().to_string();
+            let raw_content = atom_in.content.as_deref().unwrap_or("");
+            let content = if preserve_content_whitespace {
+                raw_content.to_string()
+            } else {
+                raw_content.trim().to_string()
+            };
             validate_atom_content(&content)?;
             // Secret gate: scan all caller-supplied text and structured fields
             // before any reader/writer is acquired.
@@ -138,8 +162,13 @@ impl KnowledgeHandlers {
                     .execute(SqlStatement {
                         // Promote draft -> reviewed when this upsert finalizes the atom.
                         // Never demote an already reviewed row, and leave status
-                        // untouched when not finalizing.
-                        sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=?5, source_type=?6, finalized=?7, status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
+                        // untouched when not finalizing. finalized=COALESCE(?7, finalized)
+                        // preserves the existing flag when the caller omits it; SQLite's
+                        // `NULL = 1` evaluates to NULL (falsy), so an omitted field also
+                        // leaves the status CASE on its ELSE branch. source_uri/source_type
+                        // use the same COALESCE shape so an omitted field preserves the
+                        // existing attribution instead of clobbering it with NULL.
+                        sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=COALESCE(?5, source_uri), source_type=COALESCE(?6, source_type), finalized=COALESCE(?7, finalized), status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
                         params: vec![
                             SqlValue::Text(atom_in.name.clone()),
                             SqlValue::Text(content.clone()),
@@ -147,7 +176,7 @@ impl KnowledgeHandlers {
                             props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
                             source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
                             source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            SqlValue::Integer(atom_in.finalized.unwrap_or(false) as i64),
+                            atom_in.finalized.map_or(SqlValue::Null, |f| SqlValue::Integer(f as i64)),
                             SqlValue::Integer(now),
                             SqlValue::Text(id),
                             SqlValue::Text(ns.clone()),

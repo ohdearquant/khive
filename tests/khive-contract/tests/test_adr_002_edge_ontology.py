@@ -147,7 +147,7 @@ def test_hard_delete_cascades_incident_edges_soft_delete_preserves(
 
     # Verify edges exist before delete
     edges_before = khive_session.verb("list", {"kind": "edge", "source_id": hub["id"],
-                                               "namespace": temp_namespace})
+                                               "namespace": temp_namespace})["items"]
     assert any(e.get("id") == e1_id for e in edges_before), (
         "outbound edge from hub not listed before hard-delete"
     )
@@ -229,9 +229,10 @@ def test_annotates_requires_note_source_and_cascades_on_hard_delete(
     assert "annotates" in err.lower(), f"Error must mention 'annotates': {err!r}"
 
     # No edge must have been created
-    edges_after = khive_session.verb("list", {
+    edge_page = khive_session.verb("list", {
         "kind": "edge", "source_id": another["id"], "namespace": temp_namespace,
     })
+    edges_after = edge_page["items"]
     assert edges_after == [], (
         f"No edge should exist after rejected annotates link, got: {edges_after}"
     )

@@ -1,21 +1,7 @@
-// FILE SIZE JUSTIFICATION: operations.rs is the single coherent surface for all
-// runtime verb implementations (create, get, list, search, link, traverse, query,
-// recall, etc.). All verbs share internal helpers (namespace checks, edge validation,
-// canonical-endpoint logic) that require pub(crate) access — splitting into submodules
-// would require pub(crate) re-exports across every helper or circular dependencies.
-// Inline tests exercise those private helpers directly. Split plan: once the verb
-// surface stabilises post-retrieval-refactor, group by substrate (entity,
-// note, edge, search) into submodules under an `operations/` directory.
+// See docs/operations.md#why-this-file-is-not-split-into-submodules.
 //! High-level operations composing storage capabilities into user-facing verbs.
 //!
-//! # Fault-injection arm migration
-//!
-//! Namespace-targeted fault injection uses scoped guards. The former
-//! `arm_fts_fail`, `arm_fts_fail_many`, `arm_fts_fail_many_partial`, and
-//! `arm_vector_fail` names were removed in favor of their `_scoped` variants so
-//! stale statement-form calls fail to compile. Statement-form arming cannot be
-//! preserved because dropping the returned guard at the semicolon disarms an
-//! unconsumed injection.
+//! Fault-injection arming uses scoped guards only — see docs/operations.md#fault-injection-arm-migration.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -50,24 +36,12 @@ use crate::curation::{entity_fts_document, note_embedding_text_ref, note_fts_doc
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
-// Test-only failure injection for `create_note_inner`. Namespace-targeted so only
-// calls for the armed namespace fire, avoiding cross-test races without `#[serial]`.
-// Gated behind `cfg(any(test, feature = "fault-injection"))` so no lock acquisitions
-// or injection surface exist in production/published binaries. External integration
-// test crates enable it via a dev-dependency: khive-runtime = { ..., features = ["fault-injection"] }
+// Test-only fault-injection state; see docs/operations.md#fault-injection-static-state.
 #[cfg(test)]
 std::thread_local! {
     static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// Count-targetable vector-INSERT fault injection: when set to N (N > 0), the next N
-// vector insert calls (entity or note, single- or multi-model) succeed and the
-// (N+1)-th returns an injected error, then the counter resets to 0.
-// `thread_local!` provides per-thread isolation (`#[tokio::test]` uses a
-// current-thread runtime, so there is no thread migration mid-test), letting a
-// test fail one specific model's insert in a multi-model fan-out and giving any
-// caller whose test suite shares a default namespace a deterministic, race-free
-// injection instead of depending on `VECTOR_FAIL_NS`'s namespace match.
 #[cfg(any(test, feature = "fault-injection"))]
 std::thread_local! {
     static VECTOR_FAIL_AFTER: std::cell::Cell<Option<usize>> =
@@ -75,28 +49,14 @@ std::thread_local! {
 }
 
 /// Arm the count-targetable vector-INSERT fault: let `n` inserts succeed, then fail
-/// the next one (entity or note, single- or multi-model). Set `n = 0` to fail
-/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail_scoped`
-/// it cannot be won or disarmed by a concurrently-running test on another
-/// thread — prefer this one whenever the caller cannot guarantee it is the
-/// only test writing into the namespace it cares about.
-/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+/// the next one. See docs/operations.md#fault-injection-static-state.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail_after(n: usize) {
     VECTOR_FAIL_AFTER.with(|cell| cell.set(Some(n)));
 }
 
-// Namespace-keyed one-shot arms, not a single `Option<String>` slot:
-// `create_note_inner` and `create_entity_inner` share this flag, and a
-// single-slot design let a concurrently running test's `arm_fts_fail_scoped(other_ns)`
-// overwrite this test's armed namespace before its own create call consumed
-// it, so the intended injection silently never fired (#1095). Keying by
-// namespace fixes that at the root — arming `ns_B` inserts `ns_B` without
-// evicting `ns_A`. Process-wide (not thread-local) so a caller may arm on
-// one OS thread and run the triggering `create_note`/`create_entity` on
-// another (e.g. via `tokio::spawn` on a multi-thread runtime); the
-// check-and-remove under the mutex lock keeps exactly-once semantics even
-// under concurrent same-namespace creates.
+// Namespace-keyed one-shot arm sets — see docs/operations.md#fault-injection-static-state
+// (rationale for keying by namespace instead of a single Option<String> slot, #1095).
 #[cfg(any(test, feature = "fault-injection"))]
 type FaultArmSet = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<()>>>;
 #[cfg(any(test, feature = "fault-injection"))]
@@ -104,26 +64,20 @@ const MAX_FAULT_ARMS: usize = 64;
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-// Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
 static VECTOR_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-/// Entity-create compensation failure injection. The matching compensation
-/// skips only the entity-row delete; FTS/vector cleanup still runs so tests can
-/// inspect the exact residual state and combined error contract.
+/// Entity-create compensation failure injection; see docs/operations.md#fault-injection-static-state.
 #[cfg(any(test, feature = "fault-injection"))]
 static ENTITY_COMPENSATION_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-/// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
-/// create_note_inner and create_many tests cannot disarm each other. Namespace-keyed
-/// set (not a single `Option<String>` slot) for the same reason as `VECTOR_FAIL_NS` (#1263).
+/// `create_many` FTS failure injection, kept separate from `FTS_FAIL_NS` (#1263); see
+/// docs/operations.md#fault-injection-static-state.
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_MANY_NS: std::sync::LazyLock<FaultArmSet> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-/// FTS partial-failure injection for `create_many` — returns `Ok(BatchWriteSummary)`
-/// with `failed > 0` so that the `summary.failed > 0` rollback branch is exercised.
-/// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`. Namespace-keyed set
-/// for the same reason as `VECTOR_FAIL_NS` (#1263).
+/// `create_many` FTS partial-failure injection (exercises the `summary.failed > 0` rollback
+/// branch); see docs/operations.md#fault-injection-static-state.
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<FaultArmSet> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -618,20 +572,14 @@ fn accepted_pack_relations_for_pattern_entities(
 
 /// All `(source_kind, target_kind)` entity-kind pairs — restricted to the closed
 /// 8-kind base [`khive_types::EntityKind`] taxonomy — that accept `relation`
-/// under the composed base allowlist plus pack `EDGE_RULES`.
-///
-/// Reuses [`base_entity_rule_allows`] and [`accepted_pack_relations_for_pattern_entities`]
-/// (the pattern-side, unconstrained-`None` counterpart of the functions the live
-/// validator consults) over the closed kind set, rather than re-deriving a
-/// parallel table — issue #543 precedent, applied to GQL query-pattern hint
-/// derivation (issue #593).
-///
-/// Pack rules are skipped when `crate::pack::is_special_relation` is true
-/// (supersedes / supports / refutes): the live validator's special-relation branch
-/// (`validate_edge_relation_endpoints`, this file) resolves those relations
-/// before `pack_rule_allows` is ever reached, so a pack `EDGE_RULES` entry for
-/// one of them is never actually enforced (see `pack.rs`'s
-/// `edge_endpoint_table` doc comment for the authoritative statement of this).
+/// under the composed base allowlist plus pack `EDGE_RULES`. Reuses
+/// [`base_entity_rule_allows`] and [`accepted_pack_relations_for_pattern_entities`]
+/// over the closed kind set rather than re-deriving a parallel table (for GQL
+/// query-pattern hint derivation). Pack rules are skipped when
+/// `crate::pack::is_special_relation` is true (supersedes/supports/refutes):
+/// those relations are resolved by the live validator's special-relation branch
+/// before `pack_rule_allows` is ever reached — see `pack.rs`'s
+/// `edge_endpoint_table` doc comment.
 fn accepted_entity_kind_pairs_for_relation(
     pack_rules: &[EdgeEndpointRule],
     relation: EdgeRelation,
@@ -1046,27 +994,10 @@ fn note_graph_name(note: &Note) -> String {
         .unwrap_or_else(|| format!("[{}]", note.kind))
 }
 
-/// Collapse per-namespace `GraphPath`s from [`KhiveRuntime::traverse`] down to
-/// exactly one entry per distinct `root_id`.
-///
-/// `traverse` queries every namespace in the token's visible set
-/// independently — including namespaces that don't own the root at all,
-/// which still contribute a root-only entry when `include_roots` is set —
-/// and each of those per-namespace calls already enforces `limit` on its own
-/// results. Concatenating them naively before this function would let a root
-/// visible in N namespaces return up to N * limit nodes, would keep
-/// whichever namespace's copy of a shared node happened to arrive first
-/// (wrong depth/`via_edge` when that wasn't the shortest path, and
-/// non-BFS ordering), and would rebuild a seen-set from scratch per
-/// namespace (quadratic in namespace count).
-///
-/// This merges by `(root_id, node_id)` keeping the node's shallowest depth
-/// and the `via_edge` that produced it (first-namespace-processed wins ties
-/// at equal depth — namespace processing order is deterministic but which
-/// tied edge is "more correct" is not otherwise decidable), reorders the
-/// merged result BFS-style (ascending depth), and re-applies `limit` to the
-/// merged non-root node count so the response honors the contract each
-/// individual namespace call already tried to.
+/// Collapse per-namespace `GraphPath`s from [`KhiveRuntime::traverse`] down to exactly
+/// one entry per distinct `root_id`, merging by `(root_id, node_id)` (shallowest depth
+/// wins), BFS-ordering the result, and re-applying `limit`. See
+/// docs/operations.md#merge_traversal_paths_by_root for why naive concatenation is unsound.
 fn merge_traversal_paths_by_root(paths: Vec<GraphPath>, limit: Option<u32>) -> Vec<GraphPath> {
     let mut order: Vec<Uuid> = Vec::new();
     let mut merged: HashMap<Uuid, GraphPath> = HashMap::new();
@@ -3962,7 +3893,7 @@ impl KhiveRuntime {
         // `candidates` here would drop a high-salience note ranked just outside
         // the raw RRF cutoff before salience ever applied.
         let fuse_k = text_hits.len() + vector_hits.len();
-        let fused = crate::fusion::rrf_fuse_k(text_hits, vector_hits, RRF_K, fuse_k)?;
+        let fused = crate::fusion::rrf_fuse_k(self, text_hits, vector_hits, RRF_K, fuse_k).await?;
 
         let candidate_ids: Vec<Uuid> = fused.iter().map(|hit| hit.entity_id).collect();
         if candidate_ids.is_empty() {
@@ -4419,33 +4350,17 @@ impl KhiveRuntime {
         Ok(None)
     }
 
-    /// Hard-delete a single graph node (entity, note, or edge-as-node row)
-    /// AND purge its incident edges in ONE write transaction.
-    ///
-    /// The endpoint row delete and the incident-edge cascade used
-    /// to run as two independently-committing storage calls. A concurrent
-    /// guarded write (`upsert_edge_guarded`/`upsert_edges_guarded`) landing
-    /// between them could see the endpoint still live, insert a fresh edge
-    /// against it, and then survive the cascade that already ran — a
-    /// durably dangling edge with no second purge. Routing both statements
-    /// through one [`run_atomic_unit`] call closes the window: since every
-    /// write (this one and the guarded insert) funnels through the same
-    /// single-writer queue, a concurrent guarded write either fully commits
-    /// before this unit starts (and its edge is then swept by the purge
-    /// below, in the same transaction as the row delete) or fully commits
-    /// after this unit has already committed (and its own endpoint-existence
-    /// check then sees the endpoint gone and refuses the write) — there is
-    /// no state in which it can observe the endpoint alive with edges
-    /// already purged.
+    /// Hard-delete a single graph node (entity, note, or edge-as-node row) AND purge its
+    /// incident edges in ONE write transaction — closes a race where a concurrent guarded
+    /// write could insert a fresh edge against the endpoint between two separately
+    /// committed calls; see docs/operations.md#atomic_hard_delete_with_edge_purge.
     ///
     /// `row_statement` is the exact hard-delete `DELETE` for the target row
     /// (entity, note, or edge). Before the incident-edge purge, the same plan
     /// appends any ADR-002 lineage-loss warnings from the still-present edge
     /// rows, so the warning payload and cascade commit or roll back together.
-    /// Returns `Ok(true)` if the row was deleted,
-    /// `Ok(false)` if it no longer existed (lost a race with a concurrent
-    /// delete of the same row) — never an error for that case, matching the
-    /// non-atomic bool-returning shape callers had before this fix.
+    /// Returns `Ok(true)` if the row was deleted, `Ok(false)` if it no longer
+    /// existed (lost a race with a concurrent delete of the same row).
     async fn atomic_hard_delete_with_edge_purge(
         &self,
         row_statement: SqlStatement,
@@ -5062,12 +4977,9 @@ impl KhiveRuntime {
     pub const EDGE_LIST_MAX_LIMIT: u32 = 1000;
 
     /// List edges matching `filter`, paging by `offset`. `limit` is capped at
-    /// [`Self::EDGE_LIST_MAX_LIMIT`]; defaults to 100.
-    ///
-    /// `offset` pages through the full matching set (previously hard-coded to
-    /// 0, so every page returned the same first rows). For
-    /// O(1)-at-depth walks over large edge populations, prefer
-    /// [`Self::list_edges_after`] instead of paging offset deep.
+    /// [`Self::EDGE_LIST_MAX_LIMIT`]; defaults to 100. For O(1)-at-depth walks
+    /// over large edge populations, prefer [`Self::list_edges_after`] instead
+    /// of paging offset deep.
     pub async fn list_edges(
         &self,
         token: &NamespaceToken,
@@ -5075,7 +4987,7 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Edge>> {
-        let limit = limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT);
+        let limit = limit.min(Self::EDGE_LIST_MAX_LIMIT);
         let visible = token.visible_namespaces();
 
         // Common case: a single visible namespace — page directly against the
@@ -5271,17 +5183,8 @@ impl KhiveRuntime {
     /// Returns `Ok(Some(existing_id))` when a canonical conflict was absorbed (the
     /// requested edge was deleted, the existing canonical row left untouched per
     /// ADR-039 DO NOTHING), or `Ok(None)` when the requested edge was updated in
-    /// place.
-    ///
-    /// DML text is the single source of truth shared with the atomic
-    /// `prepare_update_edge` symmetric branch:
-    /// [`khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] /
-    /// `EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL` /
-    /// `EDGE_SYMMETRIC_UPDATE_INPLACE_SQL` — this function binds them against
-    /// `rusqlite::params!` (it runs inside an existing transaction on a
-    /// borrowed `&rusqlite::Connection`), the atomic path binds the same text
-    /// via `SqlValue` plan params; see the constants' doc comment in
-    /// `khive-db` for why a single bridge type isn't used for both.
+    /// place. Shares its DML text with the atomic `prepare_update_edge` symmetric
+    /// branch — see docs/operations.md#update_edge_symmetric_dml.
     #[allow(clippy::too_many_arguments)]
     fn update_edge_symmetric_dml(
         conn: &rusqlite::Connection,
@@ -6582,15 +6485,10 @@ mod tests {
         assert!((updated.weight - 0.5).abs() < 0.001);
     }
 
-    /// Regression test: `update_edge_symmetric_dml` previously stored
-    /// `updated_at` via `chrono::Utc::now().timestamp()` (SECONDS) while every
-    /// other `graph_edges` write path (`edge_upsert_statement`,
-    /// `edge_soft_delete_statement`) uses `timestamp_micros()`: a genuine
-    /// pre-existing bug, found while unifying this raw-SQL path with the
-    /// atomic builder (which already used `timestamp_micros()` correctly)
-    /// onto the shared `EDGE_SYMMETRIC_*_SQL` text. A seconds value misread as
-    /// microseconds round-trips to a date a few minutes after the Unix epoch,
-    /// not "now".
+    /// `updated_at` on this path must use `timestamp_micros()`, matching every other
+    /// `graph_edges` write path (`edge_upsert_statement`, `edge_soft_delete_statement`);
+    /// a seconds value misread as microseconds round-trips to a date a few minutes
+    /// after the Unix epoch, not "now".
     #[tokio::test]
     async fn update_edge_symmetric_relation_stores_microsecond_updated_at() {
         let rt = rt();
@@ -9251,21 +9149,12 @@ mod tests {
     }
 
     // ---- file-backed, both write-queue configs ----
-    //
-    // The six tests above run against `KhiveRuntime::memory()` and race
-    // delete against the guarded write via `tokio::join!` with no explicit
-    // ordering control, so the scheduler could run them fully sequentially
-    // on one thread without ever exercising real interleaving, and neither
-    // the file-backed storage path nor `write_queue_enabled: Some(true)`
-    // (`KHIVE_WRITE_QUEUE=1`, the `WriterTask`-routed write path in
-    // `SqlGraphStore`) is covered at all. The four tests below close both
-    // gaps: file-backed databases, one run with the writer queue off
-    // (default) and one with it on, each provably forcing the guarded write
-    // to land on one specific side of the delete — fully committed before
-    // the delete starts (swept by the delete's cascade) and attempted only
-    // after the delete has already committed (refused by the guard) — via
-    // plain `.await` sequencing rather than a race whose outcome the test
-    // does not control.
+    // The six tests above race delete against the guarded write via `tokio::join!` with
+    // no ordering control, so the scheduler could run them fully sequentially without
+    // exercising real interleaving, and neither the file-backed storage path nor
+    // `write_queue_enabled: Some(true)` (`KHIVE_WRITE_QUEUE=1`) is covered. The four
+    // tests below force the guarded write to land on one specific side of the delete via
+    // plain `.await` sequencing instead of an uncontrolled race.
 
     fn file_backed_runtime(
         dir: &tempfile::TempDir,
@@ -10014,7 +9903,6 @@ mod tests {
 
     // ---- supersedes same-substrate contract ----
 
-    // Headline regression: note→note supersedes must succeed (was wrongly rejected before this fix).
     #[tokio::test]
     async fn link_supersedes_note_to_note_succeeds() {
         let rt = rt();
@@ -10448,7 +10336,6 @@ mod tests {
         );
     }
 
-    // Sanity: annotates note→edge still succeeds (unchanged path not broken by this fix).
     #[tokio::test]
     async fn link_annotates_note_to_edge_still_succeeds_after_fix() {
         let rt = rt();
@@ -12508,12 +12395,9 @@ mod tests {
         );
     }
 
-    // ── Traversal across namespace labels now succeeds ────────────────────────
-    //
-    // Previously, traverse with ns_b token + ns_a root was silently empty
-    // because substrate_exists_in_ns → get_entity rejected cross-namespace lookups.
-    // Now: get_entity finds any entity by UUID; traverse finds the root and
-    // returns paths scoped to the graph store's namespace filter for ns_b.
+    // get_entity finds any entity by UUID; traverse finds the root and returns paths
+    // scoped to the graph store's namespace filter for ns_b, even when the token's
+    // namespace differs from the root's.
     #[tokio::test]
     async fn traverse_cross_namespace_root_is_accepted() {
         use khive_storage::types::TraversalOptions;

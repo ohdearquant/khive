@@ -420,7 +420,7 @@ verb; `exec` has no special-casing for any verb name; it forwards the DSL string
 pack owns it, exactly like the MCP `request` tool:
 
 ```bash
-kkernel exec 'knowledge.import(path="/path/to/corpus.jsonl", format="ndjson")' --db ~/.khive/khive.db
+kkernel exec 'knowledge.import(path="/path/to/atlas-markdown", format="atlas_md")' --db ~/.khive/khive.db
 kkernel exec 'stats()' --config /absolute/path/to/config.toml
 ```
 
@@ -586,7 +586,15 @@ failure list and use `--strict` when any failed op must produce a non-zero exit.
 against an idle daemon or in a maintenance window. A plan-level rollback prints
 `atomic.committed=false` but currently exits zero even with `--strict`; inspect that field rather
 than relying on process status. Admissibility, prepare, and atomic-unit seam errors instead exit
-non-zero before printing an atomic result envelope. For combined non-atomic
+non-zero before printing an atomic result envelope. A deferred reindex or result-rendering failure
+after commit is different: it exits zero with `atomic.committed=true`,
+`atomic.status="committed_degraded"`, and `atomic.retryable=false`; repair or re-read as directed by
+the typed `atomic.degradations` stage, and do not replay the durable mutation. With atomic
+`--save-file`, a successful manifest preserves that entire `atomic` block. A sink write, flush, or
+rename failure after commit prints the full envelope with
+`atomic.degradations[].stage="save_file_publish"` and `atomic.retryable=false`, then exits non-zero;
+the exit reports file-publication failure, while `atomic.committed=true` remains authoritative and
+forbids replay. For combined non-atomic
 `--ops-file --save-file`, file publication is atomic but database chunks commit incrementally.
 Every exit after dispatch prints a reconciliation manifest: success uses the ordinary shape; a
 failure before the manifest is finalized uses `status="aborted"`, lists confirmed

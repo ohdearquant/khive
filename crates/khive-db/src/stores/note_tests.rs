@@ -1943,3 +1943,79 @@ async fn upsert_note_reports_configured_write_queue_admission_deadline() {
         "a queue-rejected note write must never execute after capacity returns"
     );
 }
+
+/// #1847: the transaction-owning note path must not trust a `None` writer
+/// handle cached while the store was constructed outside Tokio. The queue
+/// depth makes the routing assertion independent of SQLite lock timing.
+#[test]
+fn transactional_write_refreshes_writer_task_after_construction_outside_runtime() {
+    assert!(tokio::runtime::Handle::try_current().is_err());
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("note-late-writer-task.db")),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    let store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let writer_task = pool
+                .writer_task_handle()
+                .unwrap()
+                .expect("file-backed pool must spawn its writer task inside the runtime");
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let occupier = {
+                let writer_task = writer_task.clone();
+                tokio::spawn(async move {
+                    writer_task
+                        .send(move |_conn| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok::<(), StorageError>(())
+                        })
+                        .await
+                })
+            };
+            started_rx.await.unwrap();
+
+            let write = {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    store
+                        .upsert_note(make_note(
+                            "default",
+                            "observation",
+                            "late transactional write",
+                        ))
+                        .await
+                })
+            };
+            let mut saw_enqueued = false;
+            for _ in 0..100 {
+                if writer_task.queue_depth() >= 1 {
+                    saw_enqueued = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            release_tx.send(()).unwrap();
+            occupier.await.unwrap().unwrap();
+            write.await.unwrap().unwrap();
+            assert!(
+                saw_enqueued,
+                "transactional note write bypassed the queue after construction cached no handle"
+            );
+        });
+}

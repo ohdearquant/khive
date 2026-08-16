@@ -147,6 +147,7 @@ above remains the historical pre-consolidation record.
 |     V17 | ADR-142 / #1700    | agents_ddl                         | shipped |
 |     V18 | #1479              | ann_consumer_pending               | shipped |
 |     V19 | #1649              | list_cursor_backfill_repair        | shipped |
+|     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
@@ -183,6 +184,10 @@ above remains the historical pre-consolidation record.
 > **V19 record (2026-08-08, #1649)**: `list_cursor_backfill_repair` repairs the
 > known V13/V14 list-cursor divergence and normalizes those two ledger names.
 > No other divergence is repairable by inference.
+
+> **V20 record (2026-08-09, ADR-091 / #1850)**: `blob_gc_claims` adds the
+> durable entity-write fence used by bounded transactional filesystem-blob GC.
+> The migration version is independent of ADR-091's amendment number.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 

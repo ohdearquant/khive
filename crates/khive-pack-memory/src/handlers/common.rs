@@ -148,10 +148,13 @@ pub(super) async fn embed_query_model(
     let handle = tokio::runtime::Handle::current();
     let model_name_blk = model_name.clone();
     let query_blk = query.clone();
-    let v = tokio::task::spawn_blocking(move || {
-        handle.block_on(runtime.embed_query_with_model(&model_name_blk, &query_blk))
-    })
-    .await
+    let v = khive_storage::await_request_read_phase(
+        "memory.recall.embedding",
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(runtime.embed_query_with_model(&model_name_blk, &query_blk))
+        }),
+    )
+    .await?
     .map_err(|e| RuntimeError::Internal(format!("recall embed task panicked: {e}")))??;
     cache.put(&model_name, &query, v.clone());
     Ok((model_name, v))
@@ -165,12 +168,14 @@ type NamedEmbedResult = (String, Result<(String, Vec<f32>), RuntimeError>);
 pub(super) fn collect_embed_results(
     named_results: Vec<NamedEmbedResult>,
 ) -> Result<Vec<(String, Vec<f32>)>, RuntimeError> {
+    khive_storage::ensure_request_read_active("memory.recall")?;
     let mut oks = Vec::with_capacity(named_results.len());
     let mut failures = Vec::new();
     for (model_name, result) in named_results {
         match result {
             Ok(pair) => oks.push(pair),
             Err(e) => {
+                khive_storage::ensure_request_read_active("memory.recall")?;
                 tracing::warn!(
                     model = %model_name,
                     error = %e,
@@ -718,6 +723,7 @@ impl MemoryPack {
         token: &NamespaceToken,
         query: &str,
     ) -> Result<Vec<String>, RuntimeError> {
+        khive_storage::ensure_request_read_active("memory.recall")?;
         let store = self.runtime.entities(token)?;
         let namespace = token.namespace().as_str();
 
@@ -739,11 +745,14 @@ impl MemoryPack {
                 },
             )
             .await?;
-        Ok(page
+        khive_storage::ensure_request_read_active("memory.recall")?;
+        let names = page
             .items
             .into_iter()
             .map(|e| e.name.to_lowercase())
-            .collect())
+            .collect();
+        khive_storage::ensure_request_read_active("memory.recall")?;
+        Ok(names)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -757,6 +766,7 @@ impl MemoryPack {
         cjk_fts_bypass: bool,
         fts_gather: &crate::config::RecallFtsGatherConfig,
     ) -> Result<Vec<TextSearchHit>, RuntimeError> {
+        khive_storage::ensure_request_read_active("memory.recall")?;
         let terms = recall_text_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -798,6 +808,7 @@ impl MemoryPack {
                 .map_err(RuntimeError::from)
         };
 
+        khive_storage::ensure_request_read_active("memory.recall")?;
         let mut hits = fts_text_leg_or_err(fts_result, "collect_recall_text_hits", query)?;
         hits.sort_by_key(|h| h.rank);
         hits.truncate(candidate_limit as usize);
@@ -807,6 +818,7 @@ impl MemoryPack {
                 plog_n(call_id, "fts", t.elapsed().as_micros(), hits.len());
             }
         }
+        khive_storage::ensure_request_read_active("memory.recall")?;
         Ok(hits)
     }
 
@@ -816,6 +828,7 @@ impl MemoryPack {
         token: &NamespaceToken,
         opts: RecallCandidateParams<'_>,
     ) -> Result<RecallCandidateSet, RuntimeError> {
+        khive_storage::ensure_request_read_active("memory.recall")?;
         let RecallCandidateParams {
             candidate_limit,
             embedding_model,
@@ -857,6 +870,7 @@ impl MemoryPack {
             },
         );
         let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+        khive_storage::ensure_request_read_active("memory.recall")?;
         Ok(RecallCandidateSet {
             namespace: primary_ns,
             text_hits,
@@ -878,6 +892,7 @@ impl MemoryPack {
         ns: &str,
         opts: RecallVectorCandidateParams<'_>,
     ) -> Result<RecallVectorCandidateResult, RuntimeError> {
+        khive_storage::ensure_request_read_active("memory.recall")?;
         let RecallVectorCandidateParams {
             candidate_limit,
             embedding_model,
@@ -920,6 +935,7 @@ impl MemoryPack {
                         query.to_string(),
                     )
                     .await;
+                    khive_storage::ensure_request_read_active("memory.recall")?;
                     match result {
                         Ok(pair) => vec![pair],
                         Err(e) => {
@@ -946,6 +962,7 @@ impl MemoryPack {
                         query.to_string(),
                     );
                     let (r0, r1) = tokio::join!(f0, f1);
+                    khive_storage::ensure_request_read_active("memory.recall")?;
                     collect_embed_results(vec![(m0, r0), (m1, r1)])?
                 }
                 _ => {
@@ -955,16 +972,37 @@ impl MemoryPack {
                         let cache = self.query_cache.clone();
                         let q = query.to_string();
                         let name_for_result = model_name.clone();
-                        handles.push(tokio::spawn(async move {
-                            (
-                                name_for_result,
-                                embed_query_model(rt, cache, model_name, q).await,
-                            )
-                        }));
+                        handles.push(tokio::spawn(khive_storage::inherit_request_read_context(
+                            async move {
+                                (
+                                    name_for_result,
+                                    embed_query_model(rt, cache, model_name, q).await,
+                                )
+                            },
+                        )));
                     }
                     let mut named_results = Vec::with_capacity(handles.len());
-                    for h in handles {
-                        let pair = h.await.map_err(|e| {
+                    while !handles.is_empty() {
+                        let mut handle = handles.remove(0);
+                        let joined = match khive_storage::await_request_read_phase(
+                            "memory.recall",
+                            &mut handle,
+                        )
+                        .await
+                        {
+                            Ok(joined) => joined,
+                            Err(error) => {
+                                handle.abort();
+                                for sibling in handles {
+                                    sibling.abort();
+                                }
+                                return Err(error.into());
+                            }
+                        };
+                        let pair = joined.map_err(|e| {
+                            for sibling in &handles {
+                                sibling.abort();
+                            }
                             RuntimeError::Internal(format!("recall embed task panicked: {e}"))
                         })?;
                         named_results.push(pair);
@@ -1007,6 +1045,7 @@ impl MemoryPack {
                         ann_ready_timeout_ms,
                     )
                     .await?;
+                    khive_storage::ensure_request_read_active("memory.recall")?;
                     vec![r]
                 }
                 2 => {
@@ -1040,6 +1079,7 @@ impl MemoryPack {
                         ann_ready_timeout_ms,
                     );
                     let (r0, r1) = tokio::join!(f0, f1);
+                    khive_storage::ensure_request_read_active("memory.recall")?;
                     vec![r0?, r1?]
                 }
                 _ => {
@@ -1050,26 +1090,47 @@ impl MemoryPack {
                         let token_owned = token.clone();
                         let ns_owned = ns.to_string();
                         let visible_owned = visible_namespaces.clone();
-                        handles.push(tokio::spawn(async move {
-                            collect_model_ann_hits(
-                                &rt,
-                                &ann_shared,
-                                &token_owned,
-                                &ns_owned,
-                                &visible_owned,
-                                model_name,
-                                vec,
-                                candidate_limit,
-                                ann_fetch_limit,
-                                ann_overfetch_max_rounds,
-                                ann_ready_timeout_ms,
-                            )
-                            .await
-                        }));
+                        handles.push(tokio::spawn(khive_storage::inherit_request_read_context(
+                            async move {
+                                collect_model_ann_hits(
+                                    &rt,
+                                    &ann_shared,
+                                    &token_owned,
+                                    &ns_owned,
+                                    &visible_owned,
+                                    model_name,
+                                    vec,
+                                    candidate_limit,
+                                    ann_fetch_limit,
+                                    ann_overfetch_max_rounds,
+                                    ann_ready_timeout_ms,
+                                )
+                                .await
+                            },
+                        )));
                     }
                     let mut out = Vec::with_capacity(handles.len());
-                    for h in handles {
-                        let r = h.await.map_err(|e| {
+                    while !handles.is_empty() {
+                        let mut handle = handles.remove(0);
+                        let joined = match khive_storage::await_request_read_phase(
+                            "memory.recall",
+                            &mut handle,
+                        )
+                        .await
+                        {
+                            Ok(joined) => joined,
+                            Err(error) => {
+                                handle.abort();
+                                for sibling in handles {
+                                    sibling.abort();
+                                }
+                                return Err(error.into());
+                            }
+                        };
+                        let r = joined.map_err(|e| {
+                            for sibling in &handles {
+                                sibling.abort();
+                            }
                             RuntimeError::Internal(format!("recall ann task panicked: {e}"))
                         })??;
                         out.push(r);
@@ -1109,6 +1170,7 @@ impl MemoryPack {
             results
         };
 
+        khive_storage::ensure_request_read_active("memory.recall")?;
         Ok(RecallVectorCandidateResult {
             vector_hits_per_model,
             ann_degraded,
@@ -1121,6 +1183,7 @@ impl MemoryPack {
         token: &NamespaceToken,
         candidates: &RecallCandidateSet,
     ) -> Result<(HashSet<Uuid>, HashMap<Uuid, khive_storage::note::Note>), RuntimeError> {
+        khive_storage::ensure_request_read_active("memory.recall")?;
         let all_vector_hits = candidates.all_vector_hits();
         let candidate_ids: Vec<Uuid> = {
             let mut seen = HashSet::new();
@@ -1140,6 +1203,7 @@ impl MemoryPack {
 
         let note_store = self.runtime.notes(token)?;
         let batch = note_store.get_notes_batch(&candidate_ids).await?;
+        khive_storage::ensure_request_read_active("memory.recall")?;
         let mut memory_ids = HashSet::new();
         let mut notes_by_id = HashMap::new();
         let visible_set: std::collections::HashSet<&str> = candidates
@@ -1148,7 +1212,10 @@ impl MemoryPack {
             .map(String::as_str)
             .collect();
         let now_micros = chrono::Utc::now().timestamp_micros();
-        for note in batch {
+        for (index, note) in batch.into_iter().enumerate() {
+            if index.is_multiple_of(64) {
+                khive_storage::ensure_request_read_active("memory.recall")?;
+            }
             // Post-filter: ANN over-fetch may include rows from outside the caller's
             // visible namespace set. Drop them here where the note row carries its namespace.
             // Also exclude memories whose expires_at is in the past (view-layer expiry).
@@ -1163,6 +1230,7 @@ impl MemoryPack {
             }
         }
 
+        khive_storage::ensure_request_read_active("memory.recall")?;
         Ok((memory_ids, notes_by_id))
     }
 }
@@ -1199,7 +1267,8 @@ pub(super) async fn collect_model_ann_hits(
     ann_ready_timeout_ms: u64,
 ) -> Result<PerModelAnnHits, RuntimeError> {
     let degrade_name = model_name.clone();
-    match collect_model_ann_hits_inner(
+    khive_storage::ensure_request_read_active("memory.recall")?;
+    let result = collect_model_ann_hits_inner(
         runtime,
         ann,
         token,
@@ -1212,8 +1281,9 @@ pub(super) async fn collect_model_ann_hits(
         ann_overfetch_max_rounds,
         ann_ready_timeout_ms,
     )
-    .await
-    {
+    .await;
+    khive_storage::ensure_request_read_active("memory.recall")?;
+    match result {
         Ok(hits) => Ok(hits),
         Err(e) => {
             tracing::warn!(
@@ -1259,6 +1329,7 @@ async fn collect_model_ann_hits_inner(
     ann_overfetch_max_rounds: usize,
     ann_ready_timeout_ms: u64,
 ) -> Result<PerModelAnnHits, RuntimeError> {
+    khive_storage::ensure_request_read_active("memory.recall")?;
     let key = AnnKey::new(&model_name);
 
     // Global ANN search widens only when namespace post-filtering leaves too few hits.
@@ -1266,13 +1337,16 @@ async fn collect_model_ann_hits_inner(
     // replacement; only a genuine miss waits for ensure. Durable epoch checking adds
     // cross-process reindex visibility beyond in-process generations.
     ann::maybe_check_durable_epoch(runtime, ann, &key).await;
+    khive_storage::ensure_request_read_active("memory.recall")?;
     let cache_fresh = ann::is_current(ann, &key).await;
     // ADR-118: candidates and the bridge's fresh-tail watermark are captured
     // together from `search_loaded_with_seq`'s single lock acquisition (never
     // paired via a separate later read — see the merge below).
     let search_result = ann::search_loaded_with_seq(ann, &key, &vec, ann_fetch_limit).await;
+    khive_storage::ensure_request_read_active("memory.recall")?;
     if !cache_fresh && matches!(search_result, Ok(Some(_))) {
         ann::ensure_ann_background(runtime, token, ann, &model_name).await;
+        khive_storage::ensure_request_read_active("memory.recall")?;
     }
     // Bound genuine-miss readiness, but never drop the build itself: a tracked task
     // owns ensure and its phase span while this request races only the result channel.
@@ -1305,11 +1379,14 @@ async fn collect_model_ann_hits_inner(
                 .await;
                 let _ = done_tx.send(result);
             });
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(ann_ready_timeout_ms),
-                done_rx,
+            match khive_storage::await_request_read_phase(
+                "memory.recall",
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(ann_ready_timeout_ms),
+                    done_rx,
+                ),
             )
-            .await
+            .await?
             {
                 Ok(Ok(Ok(status))) => {
                     tracing::debug!(
@@ -1318,7 +1395,10 @@ async fn collect_model_ann_hits_inner(
                         namespace = %ns,
                         "memory ANN ensured on recall miss"
                     );
-                    ann::search_loaded_with_seq(ann, &key, &vec, ann_fetch_limit).await?
+                    let searched =
+                        ann::search_loaded_with_seq(ann, &key, &vec, ann_fetch_limit).await?;
+                    khive_storage::ensure_request_read_active("memory.recall")?;
+                    searched
                 }
                 Ok(Ok(Err(e))) => return Err(e),
                 Ok(Err(_sender_dropped)) => {
@@ -1360,6 +1440,7 @@ async fn collect_model_ann_hits_inner(
             }
         }
         Err(e) => {
+            khive_storage::ensure_request_read_active("memory.recall")?;
             tracing::warn!(
                 error = %e,
                 namespace = %ns,
@@ -1367,6 +1448,7 @@ async fn collect_model_ann_hits_inner(
                 "memory ANN search failed; falling back to exact sqlite-vec"
             );
             ann::clear_key(ann, &key).await;
+            khive_storage::ensure_request_read_active("memory.recall")?;
             None
         }
     };
@@ -1376,33 +1458,31 @@ async fn collect_model_ann_hits_inner(
         // wait. Rather than replace it with an O(corpus) exact scan, ADR-118
         // §3's second tier guarantees visibility of the newest
         // rebuild-threshold-sized suffix of writes while FTS covers the rest.
-        let tail_ops =
-            match ann::fresh_tail_leg(runtime, ann, &key, &model_name, &vec, ann_fetch_limit, None)
-                .await
-            {
-                ann::FreshTailOutcome::Ops(ops) => ops,
-                // A `Replace` cannot arise on this tier (no serving bridge,
-                // so no watermark mismatch to re-resolve), but if one ever
-                // does, its degradation disclosure must not be dropped.
-                ann::FreshTailOutcome::Replace(_, reason) => {
-                    if let Some(reason) = reason {
-                        degrade_reason = format!(
-                            "{degrade_reason}; fresh-tail re-resolution degraded: {reason}"
-                        );
-                    }
-                    Vec::new()
-                }
-                // #1477: the capped exact leg sat out too — this is a second,
-                // exceptional degradation on top of the already-degraded
-                // ANN-not-ready path. Fold its failure-site reason into the
-                // one already surfaced rather than silently discarding it,
-                // so a caller sees why fresh-tail visibility was also lost.
-                ann::FreshTailOutcome::Skipped(reason) => {
+        let tail_outcome =
+            ann::fresh_tail_leg(runtime, ann, &key, &model_name, &vec, ann_fetch_limit, None).await;
+        khive_storage::ensure_request_read_active("memory.recall")?;
+        let tail_ops = match tail_outcome {
+            ann::FreshTailOutcome::Ops(ops) => ops,
+            // A `Replace` cannot arise on this tier (no serving bridge,
+            // so no watermark mismatch to re-resolve), but if one ever
+            // does, its degradation disclosure must not be dropped.
+            ann::FreshTailOutcome::Replace(_, reason) => {
+                if let Some(reason) = reason {
                     degrade_reason =
-                        format!("{degrade_reason}; fresh-tail leg also skipped: {reason}");
-                    Vec::new()
+                        format!("{degrade_reason}; fresh-tail re-resolution degraded: {reason}");
                 }
-            };
+                Vec::new()
+            }
+            // #1477: the capped exact leg sat out too — this is a second,
+            // exceptional degradation on top of the already-degraded
+            // ANN-not-ready path. Fold its failure-site reason into the
+            // one already surfaced rather than silently discarding it,
+            // so a caller sees why fresh-tail visibility was also lost.
+            ann::FreshTailOutcome::Skipped(reason) => {
+                degrade_reason = format!("{degrade_reason}; fresh-tail leg also skipped: {reason}");
+                Vec::new()
+            }
+        };
         let merged = ann::merge_fresh_tail(Vec::new(), &vec, tail_ops);
         let hits: Vec<VectorSearchHit> = merged
             .into_iter()
@@ -1442,7 +1522,9 @@ async fn collect_model_ann_hits_inner(
         let visible_set: HashSet<&str> = visible_namespaces.iter().map(String::as_str).collect();
 
         // Empty namespace metadata is conservative; a visible-only set skips retry.
-        let index_has_non_visible = match ann::index_namespace_set(ann, &key).await {
+        let index_namespaces = ann::index_namespace_set(ann, &key).await;
+        khive_storage::ensure_request_read_active("memory.recall")?;
+        let index_has_non_visible = match index_namespaces {
             Some(index_ns) if !index_ns.is_empty() => {
                 !index_ns.iter().all(|ns| visible_set.contains(ns.as_str()))
             }
@@ -1458,6 +1540,7 @@ async fn collect_model_ann_hits_inner(
         // Visible-only indexes incur no hydration or extra ANN searches here.
         if index_has_non_visible {
             for _round in 1..ann_overfetch_max_rounds {
+                khive_storage::ensure_request_read_active("memory.recall")?;
                 let corpus_exhausted = best_raw.len() < current_fetch_limit;
                 if corpus_exhausted {
                     break;
@@ -1465,6 +1548,7 @@ async fn collect_model_ann_hits_inner(
                 // Count visible-namespace survivors via a lightweight note batch fetch.
                 let candidate_ids: Vec<Uuid> = best_raw.iter().map(|(id, _)| *id).collect();
                 let notes = note_store.get_notes_batch(&candidate_ids).await?;
+                khive_storage::ensure_request_read_active("memory.recall")?;
                 let visible_count = notes
                     .iter()
                     .filter(|n| {
@@ -1489,9 +1573,9 @@ async fn collect_model_ann_hits_inner(
                 // ADR-118: re-pair candidates and watermark from this same
                 // wider search (never keep the earlier round's watermark
                 // against these new candidates).
-                if let Ok(Some((wider, wider_seq))) =
-                    ann::search_loaded_with_seq(ann, &key, &vec, current_fetch_limit).await
-                {
+                let wider = ann::search_loaded_with_seq(ann, &key, &vec, current_fetch_limit).await;
+                khive_storage::ensure_request_read_active("memory.recall")?;
+                if let Ok(Some((wider, wider_seq))) = wider {
                     best_raw = wider;
                     best_seq = wider_seq;
                 } else {
@@ -1515,6 +1599,7 @@ async fn collect_model_ann_hits_inner(
             Some(best_seq),
         )
         .await;
+        khive_storage::ensure_request_read_active("memory.recall")?;
         // #1477: an exceptional fresh-tail skip (disabled, registration/registry
         // failure, reader/snapshot failure, or tail-fetch failure — never an
         // ordinary "no tail rows" outcome, which comes back as `Ops(vec![])`)
@@ -1564,6 +1649,7 @@ async fn collect_model_ann_hits_inner(
     let store = runtime.vectors_for_model(token, &model_name)?;
     let mut all_hits: Vec<VectorSearchHit> = Vec::new();
     for search_ns in visible_namespaces {
+        khive_storage::ensure_request_read_active("memory.recall")?;
         let ns_hits = store
             .search(VectorSearchRequest {
                 query_vectors: vec![vec.clone()],
@@ -1575,6 +1661,7 @@ async fn collect_model_ann_hits_inner(
                 backend_hints: None,
             })
             .await?;
+        khive_storage::ensure_request_read_active("memory.recall")?;
         all_hits.extend(ns_hits);
     }
     // Merge + re-rank by score descending.
@@ -1583,6 +1670,7 @@ async fn collect_model_ann_hits_inner(
     for (idx, hit) in all_hits.iter_mut().enumerate() {
         hit.rank = (idx + 1) as u32;
     }
+    khive_storage::ensure_request_read_active("memory.recall")?;
     Ok(PerModelAnnHits {
         model_name,
         hits: all_hits,
@@ -1590,4 +1678,36 @@ async fn collect_model_ann_hits_inner(
         degraded_reason: None,
         used_sqlite_vec_fallback: true,
     })
+}
+
+#[cfg(test)]
+mod request_cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_embedding_failure_cannot_degrade_to_a_healthy_engine() {
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+        let result = khive_storage::scope_request_read_cancellation(cancel_rx, async {
+            collect_embed_results(vec![
+                (
+                    "failed".to_string(),
+                    Err(RuntimeError::Internal(
+                        "ordinary engine failure".to_string(),
+                    )),
+                ),
+                (
+                    "healthy".to_string(),
+                    Ok(("healthy".to_string(), vec![1.0, 0.0])),
+                ),
+            ])
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Storage(
+                khive_storage::error::StorageError::Timeout { .. }
+            ))
+        ));
+    }
 }

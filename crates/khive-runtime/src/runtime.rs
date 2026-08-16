@@ -3,6 +3,7 @@
 //! `RuntimeConfig`, `BackendId`, `NamespaceToken`, and embedding model helpers
 //! live in `super::config` and are re-exported from here.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
@@ -222,6 +223,17 @@ pub struct KhiveRuntime {
     /// filesystem default, because many callers (unit tests, `memory()`) use
     /// an in-memory backend with no blob root configured at all.
     blob_store: Arc<RwLock<Option<Arc<dyn khive_storage::BlobStore>>>>,
+    /// Pack-registered custom fusion executors (ADR-012), keyed by the name
+    /// carried in `FusionStrategy::Custom { name, .. }`.
+    ///
+    /// Unlike `entity_type_validator`/`note_mutation_hook` (single-occupancy —
+    /// one pack owns the slot), multiple packs each register their own named
+    /// strategy under this shared map, so it is keyed rather than a bare
+    /// `Option`. Empty until a pack calls
+    /// [`register_fusion_strategy`](Self::register_fusion_strategy); an
+    /// unregistered `Custom` name at dispatch time is
+    /// `RuntimeError::UnknownFusionStrategy`, never a silent fallback.
+    fusion_executors: Arc<RwLock<HashMap<String, Arc<dyn crate::fusion::FusionExecutor>>>>,
 }
 
 impl KhiveRuntime {
@@ -264,6 +276,7 @@ impl KhiveRuntime {
             note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
+            fusion_executors: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -296,6 +309,7 @@ impl KhiveRuntime {
             note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
+            fusion_executors: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -331,6 +345,7 @@ impl KhiveRuntime {
             note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
+            fusion_executors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -392,6 +407,7 @@ impl KhiveRuntime {
                     note_write_validator: self.note_write_validator.clone(),
                     pack_owned_note_kinds: self.pack_owned_note_kinds.clone(),
                     blob_store: self.blob_store.clone(),
+                    fusion_executors: self.fusion_executors.clone(),
                 }
             }
         }
@@ -494,16 +510,14 @@ impl KhiveRuntime {
         let build =
             khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
 
-        tokio::task::spawn_blocking(move || {
-            khive_db::diagnostics::collect_with_audit_append_failures(
-                &pool,
-                build,
-                interval,
-                crate::pack::audit_append_failure_count(),
-            )
-        })
+        khive_db::diagnostics::collect_with_audit_append_failures_interruptibly(
+            pool,
+            build,
+            interval,
+            crate::pack::audit_append_failure_count(),
+        )
         .await
-        .map_err(|e| RuntimeError::Internal(format!("db_diagnostics: spawn_blocking join: {e}")))
+        .map_err(RuntimeError::from)
     }
 
     // ---- Store accessors (token-scoped) ----
@@ -1054,6 +1068,46 @@ impl KhiveRuntime {
     /// escape hatch with no properties-derivation contract of their own; a
     /// caller reaching storage directly is expected to have already decided
     /// what `properties` to write.
+    /// Register a pack-defined custom fusion strategy under `name` (ADR-012).
+    ///
+    /// Unlike `install_entity_type_validator`/`install_note_mutation_hook`,
+    /// this slot is keyed rather than single-occupancy: multiple packs each
+    /// register their own named strategy, and a second registration under an
+    /// already-used `name` replaces the first. Looked up by
+    /// `FusionStrategy::Custom { name, .. }` at the hybrid-search dispatch
+    /// boundary in `crate::fusion`; an unregistered name fails closed with
+    /// `RuntimeError::UnknownFusionStrategy` rather than silently falling
+    /// back to RRF.
+    pub fn register_fusion_strategy(
+        &self,
+        name: impl Into<String>,
+        executor: Arc<dyn crate::fusion::FusionExecutor>,
+    ) {
+        if let Ok(mut guard) = self.fusion_executors.write() {
+            guard.insert(name.into(), executor);
+        }
+    }
+
+    /// Resolve a registered custom fusion executor by name.
+    ///
+    /// Returns `RuntimeError::UnknownFusionStrategy` when no pack has
+    /// registered `name` — callers must invoke this before any
+    /// empty-input/zero-limit short circuit so a misconfigured name errors
+    /// on every call, including zero-result ones.
+    pub(crate) fn fusion_executor(
+        &self,
+        name: &str,
+    ) -> RuntimeResult<Arc<dyn crate::fusion::FusionExecutor>> {
+        let guard = self
+            .fusion_executors
+            .read()
+            .map_err(|_| RuntimeError::Internal("fusion executor registry lock poisoned".into()))?;
+        guard
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RuntimeError::UnknownFusionStrategy(name.to_string()))
+    }
+
     pub fn install_note_write_validator(&self, f: NoteWriteValidatorFn) {
         if let Ok(mut guard) = self.note_write_validator.write() {
             *guard = Some(f);

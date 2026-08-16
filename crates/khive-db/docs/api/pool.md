@@ -47,6 +47,29 @@ writer task would let concurrent migrated stores over the same pool spawn
 independent writer connections that contend with each other at `BEGIN
 IMMEDIATE`, defeating the point of ADR-067 Component A.
 
+## `ConnectionPool::writer_task_for_write` — write-time store routing (#1847)
+
+Store construction is synchronous and can happen before a Tokio runtime is
+entered. A constructor may therefore cache no writer-task handle even though a
+later write runs inside a runtime where the pool can spawn (or retrieve) its
+single task. Every SQLite-backed store resolves through
+`writer_task_for_write` at the write seam, including transaction-owning and
+batch entry points, so a construction-time `None` is never a permanent routing
+decision.
+
+When `write_routing_strict` is enabled, a missing handle fails closed: a
+missing runtime preserves `StorageError::WriterTaskNoRuntime`, while an
+explicitly disabled or degraded queue returns a typed `StorageError::Pool`
+naming the operation. In compatibility mode, a caller may use its legacy
+standalone/pool-mutex writer only after this lookup returns `None`; that exact
+fallback emits a store-specific `direct_route_violation` when the file-backed
+queue is enabled.
+
+This routing hardening does **not** flip the strict-mode default. ADR-135 F2
+and ADR-136 D2 still require production A/B evidence and a release gate before
+`write_routing_strict` can become the default; until that evidence is accepted,
+`KHIVE_WRITE_ROUTING=strict` remains opt-in.
+
 ## Test coverage notes
 
 ### `writer_guard_transaction_registers_during_closure_only`
@@ -84,8 +107,12 @@ Cached read-only handles admit one explicit top-level deferred read transaction:
 `BEGIN`, `BEGIN TRANSACTION`, and `BEGIN DEFERRED [TRANSACTION]` retain the
 opening operation's reader permit, subsequent queries reuse it, and
 `COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite returns to
-autocommit. Immediate/exclusive starts, `START`, nested `BEGIN`, `SAVEPOINT`,
-`RELEASE`, and `ROLLBACK ... TO` are rejected with
+autocommit. The same successful `BEGIN` registers a backend-scoped
+`sql_bridge_cached_read_transaction` span in `tx_registry`; queries and
+rejected nested controls retain it, and terminal control, cancellation,
+cleanup, or handle drop deregisters it only after the SQLite snapshot ends.
+Immediate/exclusive starts, `START`, nested `BEGIN`, `SAVEPOINT`, `RELEASE`,
+and `ROLLBACK ... TO` are rejected with
 `StorageError::InvalidInput`; `execute_batch` still rejects every transaction
 control form. A terminal statement that fails while SQLite remains in the
 transaction keeps the permit, allowing a later full rollback or safe handle
@@ -137,10 +164,32 @@ standalone writer. A live `writer()` handle therefore makes such an
 do not hold a boxed writer handle across an `atomic_unit()` call on the same
 pool — drop the handle first. With the write queue enabled, `atomic_unit`
 runs inside the writer task instead and never touches this budget.
-The cached-reader admission state does not apply to a standalone
-read-write writer: its handle-scoped writer permit remains held across the
-whole manual transaction, including reader-supertrait calls within that
-transaction, while each such read additionally uses an active-reader permit.
+The cached-reader admission state does not apply to a standalone read-write
+writer: its handle-scoped writer permit remains held across the whole manual
+transaction, including reader-supertrait calls within that transaction, while
+each such read additionally uses an active-reader permit.
+
+### Request cancellation (supersedes detached-natural-completion wording)
+
+Request-owned reads install an exact-connection interrupt handle plus the one
+connection-global progress callback. Cancellation and the absolute request
+deadline stop SQLite VM work; the connection and active permit remain owned
+until the worker stops (or remain inside the detached worker after the bounded
+interrupt-settlement window), so live SQLite state is never returned early.
+An interrupted explicit read transaction is rolled back before reuse; rollback
+or callback cleanup failure closes/replaces the connection. A subsequent
+borrower therefore sees neither the old handler nor its WAL snapshot.
+Reader-pool and cached-reader semaphore admission poll the same latched signal
+in bounded slices. Cancellation before checkout therefore returns promptly and
+the closure refuses to execute when a connection later becomes available; an
+already-admitted statement still follows the classification rules below.
+
+Prepared-statement classification is authoritative: only
+`Statement::readonly()` statements outside transaction control register.
+DML-with-RETURNING, transaction control, `execute_batch`, atomic units, and
+all admitted writes run without request-read interruption and return their real
+completion result. Recorded cancellation translates only a causal
+`SQLITE_INTERRUPT`; unrelated driver failures retain their original error.
 
 When the write queue is enabled, `writer()` is queue-first (ADR-136 D1
 gate 1): it opens no standalone connection and holds no writer permit, and

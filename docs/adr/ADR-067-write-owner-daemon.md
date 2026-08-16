@@ -806,3 +806,21 @@ a transaction is retired, queued requests are failed as `NotStarted`, and no
 top-level request is allowed to run. This pre-dispatch check is load-bearing:
 top-level requests skip `BEGIN IMMEDIATE` and would otherwise execute inside a
 stale transaction left by the prior failure.
+
+## Amendment 4 (2026-08-11): Retry-safe writer-lock contention
+
+A failed writer-task `BEGIN IMMEDIATE` is classified by SQLite result code.
+`SQLITE_BUSY` and `SQLITE_LOCKED` return
+`StorageError::WriterTaskBusy { timeout_ms }`, where `timeout_ms` is the
+connection's configured busy timeout. The queue already accepted the request,
+but the operation closure never ran, so retrying that one failed operation
+cannot duplicate a write. The writer task remains live and serves the next
+request normally.
+
+MCP carries this proof as `writer_task_begin_busy` with `retryable: true` and
+`operation: "writer_task_begin"`. It must not use the ADR-131
+`writer_admission` scope or queue-admission retry hint, because those fields
+mean the queue never accepted the request. Non-busy/non-locked BEGIN failures
+remain generic pool errors. `comm.send` preserves this typed retryable result
+without adding an outbound delivery probe: `comm.delivered` remains reserved
+for `SideEffectsUnknown`, where a write may already have committed.
