@@ -12,14 +12,16 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
-use khive_storage::blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};
+use khive_storage::blob::{
+    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES,
+};
 use khive_storage::error::StorageError;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue, StorageResult};
 use khive_storage::{AtomicUnitOp, SqlAccess, StorageCapability};
@@ -280,6 +282,157 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
         }
     }
     fs::remove_file(shard2.join(hex))
+}
+
+/// Open one blob leaf without following any root/shard/leaf symlink and
+/// return the single handle that must remain the authority for metadata,
+/// bounded bytes, and digest verification.
+#[cfg(unix)]
+fn open_blob_shard_file_no_follow(
+    root: &Path,
+    content_ref: &ContentRef,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let hex = content_ref.as_str();
+    let root_dir = open_dir_no_follow(root)?;
+    let shard1_dir = openat_dir_no_follow(root_dir.as_raw_fd(), &hex[0..2])?;
+    let shard2_dir = openat_dir_no_follow(shard1_dir.as_raw_fd(), &hex[2..4])?;
+    let c_name = std::ffi::CString::new(hex)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    // O_NONBLOCK keeps a planted FIFO/device-like entry from hanging the
+    // worker before fstat can reject it; it does not alter regular-file I/O.
+    // O_NOFOLLOW rejects a symlink leaf, while the two openat directory
+    // handles above pin and verify every intermediate component.
+    let fd = unsafe {
+        libc::openat(
+            shard2_dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is newly returned and uniquely owned here.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to read a blob leaf that is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_blob_shard_file_no_follow(
+    root: &Path,
+    content_ref: &ContentRef,
+) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FINAL_PATH_FLAGS: u32 = 0x0;
+
+    fn open_dir_pinned_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+        let dir = OpenOptions::new()
+            .read(true)
+            // Omitting FILE_SHARE_DELETE pins this checked component against
+            // rename/removal until the leaf is open and verified.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let file_type = dir.metadata()?.file_type();
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to read a blob through non-directory or reparse-point component: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(dir)
+    }
+
+    fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<PathBuf> {
+        let mut buf: Vec<u16> = vec![0; 512];
+        loop {
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle() as _,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    FINAL_PATH_FLAGS,
+                )
+            };
+            if len == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let len = len as usize;
+            if len <= buf.len() {
+                buf.truncate(len);
+                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+            }
+            buf.resize(len, 0);
+        }
+    }
+
+    let hex = content_ref.as_str();
+    let shard1 = root.join(&hex[0..2]);
+    let shard2 = shard1.join(&hex[2..4]);
+    let root_pin = open_dir_pinned_no_follow(root)?;
+    let _shard1_pin = open_dir_pinned_no_follow(&shard1)?;
+    let _shard2_pin = open_dir_pinned_no_follow(&shard2)?;
+    let expected = final_path_by_handle(&root_pin)?
+        .join(&hex[0..2])
+        .join(&hex[2..4])
+        .join(hex);
+
+    let target = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(shard2.join(hex))?;
+    let file_type = target.metadata()?.file_type();
+    if file_type.is_symlink() || !file_type.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to read a blob leaf that is not a regular file",
+        ));
+    }
+    let resolved = final_path_by_handle(&target)?;
+    if resolved != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing blob read: handle resolved outside the verified blob root (expected {}, resolved {})",
+                expected.display(),
+                resolved.display()
+            ),
+        ));
+    }
+    Ok(target)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_blob_shard_file_no_follow(
+    _root: &Path,
+    _content_ref: &ContentRef,
+) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "bounded verified blob reads require handle-relative no-follow file APIs",
+    ))
 }
 
 #[cfg(unix)]
@@ -1252,6 +1405,10 @@ impl FsBlobStore {
     /// reads while remaining side-effect free; mutation is fenced by the
     /// runtime's read-only wrapper.
     pub fn open_existing(root: PathBuf, floor_bytes: u64) -> Result<Self, SqliteError> {
+        // Preserve existing support for configured symlink spellings without
+        // carrying that mutable indirection into handle-relative reads. The
+        // bounded reader deliberately opens its stored root with NOFOLLOW.
+        let root = root.canonicalize()?;
         let metadata = fs::metadata(&root)?;
         if !metadata.is_dir() {
             return Err(SqliteError::InvalidData(format!(
@@ -1347,6 +1504,103 @@ impl BlobStore for FsBlobStore {
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Blob, "get", e))?
+    }
+
+    async fn get_bounded_verified(
+        &self,
+        content_ref: &ContentRef,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>> {
+        // Argument validation is deliberately outside `spawn_blocking`: an
+        // invalid portable-envelope request must fail before any backend work
+        // is scheduled or the filesystem is touched (ADR-160 D2).
+        if max_bytes > MAX_BLOB_WHOLE_BYTES {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Blob,
+                operation: "get_bounded_verified".into(),
+                message: format!(
+                    "max_bytes {max_bytes} exceeds the {MAX_BLOB_WHOLE_BYTES}-byte portable whole-buffer envelope"
+                ),
+            });
+        }
+
+        let root = self.root.clone();
+        let content_ref = content_ref.clone();
+        #[cfg(test)]
+        let read_hook = bounded_read_sync_hook::take(&root);
+        tokio::task::spawn_blocking(move || {
+            // Open exactly once. Both metadata and bytes below come from this
+            // no-follow handle, so replacing the path after open cannot
+            // switch the integrity authority underneath the read.
+            let mut file = open_blob_shard_file_no_follow(&root, &content_ref).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StorageError::NotFound {
+                        capability: StorageCapability::Blob,
+                        resource: "blob",
+                        key: content_ref.to_string(),
+                    }
+                } else if e.kind() == std::io::ErrorKind::Unsupported {
+                    StorageError::Unsupported {
+                        capability: StorageCapability::Blob,
+                        operation: "get_bounded_verified".into(),
+                        message: e.to_string(),
+                    }
+                } else {
+                    map_io_err(e, "get_bounded_verified.open")
+                }
+            })?;
+
+            let metadata_bytes = file
+                .metadata()
+                .map_err(|e| map_io_err(e, "get_bounded_verified.metadata"))?
+                .len();
+            #[cfg(test)]
+            if let Some(hook) = &read_hook {
+                let _ = hook.reached.send(());
+                let _ = hook.release.recv();
+            }
+            if metadata_bytes > max_bytes {
+                return Err(StorageError::BlobTooLarge {
+                    content_ref,
+                    max_bytes,
+                    observed_at_least: metadata_bytes,
+                });
+            }
+
+            // Read at most one sentinel byte beyond the caller's limit. The
+            // +1 is safe because max_bytes was already bounded to 64 MiB.
+            let mut bytes = Vec::with_capacity(metadata_bytes as usize);
+            (&mut file)
+                .take(max_bytes + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| map_io_err(e, "get_bounded_verified.read"))?;
+            let actual_bytes = bytes.len() as u64;
+            if actual_bytes > max_bytes {
+                return Err(StorageError::BlobTooLarge {
+                    content_ref,
+                    max_bytes,
+                    observed_at_least: actual_bytes,
+                });
+            }
+            if metadata_bytes != actual_bytes {
+                return Err(StorageError::BlobSizeMismatch {
+                    content_ref,
+                    metadata_bytes,
+                    actual_bytes,
+                });
+            }
+
+            let actual = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+            if actual != content_ref {
+                return Err(StorageError::BlobDigestMismatch {
+                    expected: content_ref,
+                    actual,
+                });
+            }
+            Ok(bytes)
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Blob, "get_bounded_verified", e))?
     }
 
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool> {
@@ -1670,6 +1924,55 @@ mod sync_hook {
     }
 }
 
+/// Test-only pause after a bounded read has opened its authoritative handle
+/// and captured handle metadata, but before its first byte read. This makes
+/// append/truncate/path-replacement races deterministic without timing sleeps
+/// and is deliberately separate from the put/GC lock hook above.
+#[cfg(test)]
+mod bounded_read_sync_hook {
+    use std::collections::{HashMap, VecDeque};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub(super) reached: Sender<()>,
+        pub(super) release: Receiver<()>,
+    }
+
+    fn registry() -> &'static StdMutex<HashMap<PathBuf, VecDeque<Hook>>> {
+        static REGISTRY: OnceLock<StdMutex<HashMap<PathBuf, VecDeque<Hook>>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(root: &Path) -> (Receiver<()>, Sender<()>) {
+        let canonical = root
+            .canonicalize()
+            .expect("root must exist before installing a bounded-read hook");
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(canonical)
+            .or_default()
+            .push_back(Hook {
+                reached: reached_tx,
+                release: release_rx,
+            });
+        (reached_rx, release_tx)
+    }
+
+    pub(super) fn take(root: &Path) -> Option<Hook> {
+        let canonical = root.canonicalize().ok()?;
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&canonical)
+            .and_then(VecDeque::pop_front)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1815,6 +2118,243 @@ mod tests {
         let content_ref = store.put(bytes.clone()).await.unwrap();
         let fetched = store.get(&content_ref).await.unwrap();
         assert_eq!(fetched, bytes);
+    }
+
+    #[tokio::test]
+    async fn bounded_verified_get_accepts_exact_and_portable_maximum_limits() {
+        let (_dir, store) = store(0);
+        let bytes = b"bounded fs blob".to_vec();
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_bounded_verified(&content_ref, bytes.len() as u64)
+                .await
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            store
+                .get_bounded_verified(&content_ref, MAX_BLOB_WHOLE_BYTES)
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_verified_get_resolves_a_configured_symlink_root_once() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("blob-target");
+        fs::create_dir(&target).unwrap();
+        let configured = dir.path().join("blob-configured");
+        symlink(&target, &configured).unwrap();
+
+        let store = FsBlobStore::new(configured, 0).unwrap();
+        assert_eq!(store.root(), target.canonicalize().unwrap());
+        let bytes = b"symlink-configured root".to_vec();
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+        assert_eq!(
+            store
+                .get_bounded_verified(&content_ref, bytes.len() as u64)
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_verified_get_rejects_same_size_digest_corruption() {
+        let (_dir, store) = store(0);
+        let expected_bytes = b"expected".to_vec();
+        let actual_bytes = b"mutated!".to_vec();
+        let expected = store.put(expected_bytes).await.unwrap();
+        let actual = ContentRef::from_digest_bytes(blake3::hash(&actual_bytes).as_bytes());
+        fs::write(shard_path(store.root(), &expected), actual_bytes).unwrap();
+
+        let err = store.get_bounded_verified(&expected, 8).await.unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobDigestMismatch {
+                expected: ref got_expected,
+                actual: ref got_actual,
+            } if got_expected == &expected && got_actual == &actual
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_verified_get_stops_at_max_plus_one_after_file_growth() {
+        let (_dir, store) = store(0);
+        let store = Arc::new(store);
+        let content_ref = store.put(b"abcd".to_vec()).await.unwrap();
+        let path = shard_path(store.root(), &content_ref);
+        let (reached, release) = bounded_read_sync_hook::install(store.root());
+
+        let read_store = Arc::clone(&store);
+        let read_ref = content_ref.clone();
+        let read = tokio::spawn(async move { read_store.get_bounded_verified(&read_ref, 4).await });
+        assert!(
+            recv_blocking(reached).await,
+            "read must reach the metadata seam"
+        );
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"efgh-poison-tail").unwrap();
+        writer.flush().unwrap();
+        release.send(()).unwrap();
+
+        let err = read.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobTooLarge {
+                content_ref: ref got,
+                max_bytes: 4,
+                observed_at_least: 5,
+            } if got == &content_ref
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_verified_get_reports_growth_within_limit_as_size_mismatch() {
+        let (_dir, store) = store(0);
+        let store = Arc::new(store);
+        let content_ref = store.put(b"abcd".to_vec()).await.unwrap();
+        let path = shard_path(store.root(), &content_ref);
+        let (reached, release) = bounded_read_sync_hook::install(store.root());
+
+        let read_store = Arc::clone(&store);
+        let read_ref = content_ref.clone();
+        let read = tokio::spawn(async move { read_store.get_bounded_verified(&read_ref, 8).await });
+        assert!(
+            recv_blocking(reached).await,
+            "read must reach the metadata seam"
+        );
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"ef").unwrap();
+        writer.flush().unwrap();
+        release.send(()).unwrap();
+
+        let err = read.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobSizeMismatch {
+                content_ref: ref got,
+                metadata_bytes: 4,
+                actual_bytes: 6,
+            } if got == &content_ref
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_verified_get_reports_truncation_as_size_mismatch() {
+        let (_dir, store) = store(0);
+        let store = Arc::new(store);
+        let content_ref = store.put(b"abcd".to_vec()).await.unwrap();
+        let path = shard_path(store.root(), &content_ref);
+        let (reached, release) = bounded_read_sync_hook::install(store.root());
+
+        let read_store = Arc::clone(&store);
+        let read_ref = content_ref.clone();
+        let read = tokio::spawn(async move { read_store.get_bounded_verified(&read_ref, 4).await });
+        assert!(
+            recv_blocking(reached).await,
+            "read must reach the metadata seam"
+        );
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"abc").unwrap();
+        writer.flush().unwrap();
+        release.send(()).unwrap();
+
+        let err = read.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobSizeMismatch {
+                content_ref: ref got,
+                metadata_bytes: 4,
+                actual_bytes: 3,
+            } if got == &content_ref
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_verified_get_keeps_the_opened_inode_when_the_path_is_replaced() {
+        let (_dir, store) = store(0);
+        let store = Arc::new(store);
+        let original = b"original".to_vec();
+        let replacement = b"replaced".to_vec();
+        let content_ref = store.put(original.clone()).await.unwrap();
+        let path = shard_path(store.root(), &content_ref);
+        let moved_path = path.with_extension("opened-inode");
+        let max_bytes = original.len() as u64;
+        let (reached, release) = bounded_read_sync_hook::install(store.root());
+
+        let read_store = Arc::clone(&store);
+        let read_ref = content_ref.clone();
+        let read =
+            tokio::spawn(
+                async move { read_store.get_bounded_verified(&read_ref, max_bytes).await },
+            );
+        assert!(
+            recv_blocking(reached).await,
+            "read must reach the metadata seam"
+        );
+        fs::rename(&path, &moved_path).unwrap();
+        fs::write(&path, replacement).unwrap();
+        release.send(()).unwrap();
+
+        assert_eq!(read.await.unwrap().unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_verified_get_refuses_a_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0).unwrap();
+        let outside_bytes = b"outside but digest matching".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&outside_bytes).as_bytes());
+        let outside = dir.path().join("outside");
+        fs::write(&outside, &outside_bytes).unwrap();
+        let leaf = shard_path(store.root(), &content_ref);
+        fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        symlink(&outside, &leaf).unwrap();
+
+        let err = store
+            .get_bounded_verified(&content_ref, outside_bytes.len() as u64)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Driver { .. }), "got {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_verified_get_refuses_a_symlinked_shard_component() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0).unwrap();
+        let outside_bytes = b"outside through shard link".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&outside_bytes).as_bytes());
+        let hex = content_ref.as_str();
+        let outside_shard1 = dir.path().join("outside-shard1");
+        let outside_shard2 = outside_shard1.join(&hex[2..4]);
+        fs::create_dir_all(&outside_shard2).unwrap();
+        fs::write(outside_shard2.join(hex), &outside_bytes).unwrap();
+        symlink(&outside_shard1, store.root().join(&hex[0..2])).unwrap();
+
+        let err = store
+            .get_bounded_verified(&content_ref, outside_bytes.len() as u64)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Driver { .. }), "got {err:?}");
     }
 
     #[tokio::test]

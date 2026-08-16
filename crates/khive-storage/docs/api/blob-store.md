@@ -31,6 +31,26 @@ to the same bytes.
 vector instead of pulling in the `blake3` crate, since khive-storage has zero
 heavy dependencies (ADR-005).
 
+## `BlobStore::get_bounded_verified`
+
+Whole-buffer reads declare an actual-byte maximum and use the required
+`get_bounded_verified(content_ref, max_bytes)` backend primitive. The maximum
+may be zero and cannot exceed `MAX_BLOB_WHOLE_BYTES` (64 MiB); larger objects
+require a future streaming contract. There is deliberately no default built
+from `size()` plus `get()`: metadata can provide an early refusal and an
+integrity witness, but cannot bound or authenticate a later read.
+
+A backend returns bytes only after the authoritative object reaches EOF at or
+below the declared limit, its opened-handle/GET metadata agrees with the final
+length, and BLAKE3 of those bytes equals the requested `ContentRef`. Failures
+are ordered: invalid maximum, not found, `BlobTooLarge`,
+`BlobSizeMismatch`, then `BlobDigestMismatch`. No partial or digest-mismatched
+buffer reaches the caller.
+
+The legacy unbounded `get` remains temporarily during ADR-160's staged consumer
+migration. It is not an implementation primitive for bounded reads and is
+removed with the final migrated consumer in Phase 3.
+
 ## `BlobStore::delete` — concurrency hazard
 
 `delete` performs an unconditional physical removal with **no coordination

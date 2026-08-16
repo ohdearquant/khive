@@ -130,6 +130,16 @@ impl BlobStore for ReadOnlyBlobStore {
         self.inner.get(content_ref).await
     }
 
+    async fn get_bounded_verified(
+        &self,
+        content_ref: &ContentRef,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>> {
+        self.inner
+            .get_bounded_verified(content_ref, max_bytes)
+            .await
+    }
+
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool> {
         self.inner.exists(content_ref).await
     }
@@ -163,8 +173,58 @@ mod tests {
     use super::*;
     use crate::engine_config::StorageSectionConfig;
 
+    #[derive(Debug, Default)]
+    struct RecordingReadStore {
+        bounded_call: std::sync::Mutex<Option<(ContentRef, u64)>>,
+    }
+
+    #[async_trait]
+    impl BlobStore for RecordingReadStore {
+        async fn put(&self, _bytes: Vec<u8>) -> StorageResult<ContentRef> {
+            panic!("put is not used by the read-only delegation test")
+        }
+
+        async fn get(&self, _content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
+            panic!("legacy get must not service a bounded read")
+        }
+
+        async fn get_bounded_verified(
+            &self,
+            content_ref: &ContentRef,
+            max_bytes: u64,
+        ) -> StorageResult<Vec<u8>> {
+            *self.bounded_call.lock().unwrap() = Some((content_ref.clone(), max_bytes));
+            Ok(b"verified".to_vec())
+        }
+
+        async fn exists(&self, _content_ref: &ContentRef) -> StorageResult<bool> {
+            Ok(true)
+        }
+
+        async fn size(&self, _content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+            Ok(Some(8))
+        }
+
+        async fn delete(&self, _content_ref: &ContentRef) -> StorageResult<bool> {
+            panic!("delete is not used by the read-only delegation test")
+        }
+    }
+
     fn memory_backend() -> StorageBackend {
         StorageBackend::memory().expect("memory backend should create")
+    }
+
+    #[tokio::test]
+    async fn read_only_store_delegates_the_bounded_verified_read_unchanged() {
+        let inner = Arc::new(RecordingReadStore::default());
+        let store = ReadOnlyBlobStore {
+            inner: Arc::clone(&inner) as Arc<dyn BlobStore>,
+        };
+        let content_ref = ContentRef::from_hex("a".repeat(64)).unwrap();
+
+        let bytes = store.get_bounded_verified(&content_ref, 17).await.unwrap();
+        assert_eq!(bytes, b"verified");
+        assert_eq!(*inner.bounded_call.lock().unwrap(), Some((content_ref, 17)));
     }
 
     #[test]

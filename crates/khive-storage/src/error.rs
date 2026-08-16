@@ -6,6 +6,7 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::blob::ContentRef;
 use crate::capability::StorageCapability;
 
 /// What is known about one request when its single-writer execution seam
@@ -74,6 +75,38 @@ pub enum StorageError {
         capability: StorageCapability,
         operation: Cow<'static, str>,
         message: String,
+    },
+
+    /// The authoritative object is larger than the caller's declared
+    /// whole-buffer limit. `observed_at_least` is either opened-object
+    /// metadata used for early refusal or the running byte count that first
+    /// crossed the limit; metadata is not treated as the actual-byte bound.
+    #[error(
+        "blob {content_ref} exceeds the {max_bytes}-byte read limit (observed at least {observed_at_least} bytes)"
+    )]
+    BlobTooLarge {
+        content_ref: ContentRef,
+        max_bytes: u64,
+        observed_at_least: u64,
+    },
+
+    /// The complete bounded body disagreed with metadata obtained from the
+    /// same opened object / GET response.
+    #[error(
+        "blob {content_ref} metadata reports {metadata_bytes} bytes but the complete body contains {actual_bytes} bytes"
+    )]
+    BlobSizeMismatch {
+        content_ref: ContentRef,
+        metadata_bytes: u64,
+        actual_bytes: u64,
+    },
+
+    /// The complete, size-consistent bounded body did not hash to the
+    /// requested content-addressed reference.
+    #[error("blob digest mismatch: expected {expected}, computed {actual}")]
+    BlobDigestMismatch {
+        expected: ContentRef,
+        actual: ContentRef,
     },
 
     #[error("pool failure during {operation}: {message}")]
@@ -193,6 +226,9 @@ impl StorageError {
             | Self::IndexMaintenance { capability, .. }
             | Self::Driver { capability, .. }
             | Self::CapacityFloor { capability, .. } => Some(*capability),
+            Self::BlobTooLarge { .. }
+            | Self::BlobSizeMismatch { .. }
+            | Self::BlobDigestMismatch { .. } => Some(StorageCapability::Blob),
             Self::Pool { .. }
             | Self::Timeout { .. }
             | Self::Transaction { .. }
@@ -350,6 +386,33 @@ mod tests {
                 error.to_string(),
                 format!("writer task terminated (request_state={request_state})")
             );
+        }
+    }
+
+    #[test]
+    fn blob_integrity_errors_are_blob_scoped_and_not_retryable() {
+        let requested = crate::blob::ContentRef::from_hex("a".repeat(64)).unwrap();
+        let actual = crate::blob::ContentRef::from_hex("b".repeat(64)).unwrap();
+        let errors = [
+            StorageError::BlobTooLarge {
+                content_ref: requested.clone(),
+                max_bytes: 8,
+                observed_at_least: 9,
+            },
+            StorageError::BlobSizeMismatch {
+                content_ref: requested.clone(),
+                metadata_bytes: 7,
+                actual_bytes: 8,
+            },
+            StorageError::BlobDigestMismatch {
+                expected: requested,
+                actual,
+            },
+        ];
+
+        for error in errors {
+            assert_eq!(error.capability(), Some(StorageCapability::Blob));
+            assert!(!error.is_retryable());
         }
     }
 

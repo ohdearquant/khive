@@ -660,6 +660,11 @@ jobs:
       # Keep this still-new lane fast; widen alongside the `cargo check` step above.
       - name: khive-db walpin Windows FFI tests
         run: cargo test -p khive-db --lib walpin
+      # ADR-160 Phase 1: compile-only coverage cannot validate the Windows
+      # no-reparse, handle-pinned bounded blob read. Keep this lane focused on
+      # one normal-path test until the broader Windows suite is affordable.
+      - name: khive-db bounded blob read Windows test
+        run: cargo test -p khive-db --lib bounded_verified_get_accepts_exact_and_portable_maximum_limits
 
   coverage-ratchet:
     name: Coverage ratchet
