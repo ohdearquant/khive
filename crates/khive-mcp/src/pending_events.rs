@@ -11,7 +11,9 @@
 //!
 //! Full design rationale (module placement, invocation-mode tradeoffs,
 //! namespace-isolation and missed-event-policy background) lives in
-//! `crates/khive-mcp/docs/pending-events.md`.
+//! `crates/khive-mcp/docs/pending-events.md`; the drain's API-level contract
+//! rationale (the `rt`/`server` pair) lives in
+//! `crates/khive-mcp/docs/api/pending-events.md`.
 //!
 //! ## Invocation modes
 //!

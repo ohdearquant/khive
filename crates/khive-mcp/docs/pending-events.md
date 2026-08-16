@@ -5,7 +5,9 @@ backs `kkernel exec --pending-events` (one-shot) and the daemon-resident tick
 (ADR-106, `schedule_tick_loop`). See the module-level rustdoc for the
 callable contract (invocation modes, namespace isolation, repeat
 advancement, missed-event policy); this document carries the narrative and
-history behind those contracts.
+history behind those contracts. The drain's API-level contract rationale
+(the `rt`/`server` pair, claim/finalize semantics) lives in the sibling
+[`api/pending-events.md`](api/pending-events.md).
 
 ## Why this module lives in `khive-mcp`, not `kkernel`
 

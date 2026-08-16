@@ -2826,7 +2826,7 @@ fn validate_v2_structural(
         )));
     }
 
-    // INVARIANT (graph.rs:96-98): reverse_adj[v] == { u | v ∈ adjacency[u] }. A
+    // INVARIANT (graph.rs:173-182): reverse_adj[v] == { u | v ∈ adjacency[u] }. A
     // checksum-valid but writer-bugged lifecycle segment can satisfy parse_lifecycle's
     // per-list shape checks while still violating this — a false in-neighbor corrupts
     // Wolverine delete-repair.

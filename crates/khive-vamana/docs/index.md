@@ -55,7 +55,7 @@ incumbent at all, and the repair checkpoint is allowed to publish.
 check `load_v2_fast` applies to a v2 checkpoint (config validation, `read_graph`'s
 degree/neighbor/medoid bounds, exact vectors.bin byte-length match, `parse_lifecycle`'s
 bounds checks, bidirectional `reverse_adj` consistency via the invariant at
-`graph.rs:96-98` — `reverse_adj[v] == { u | v ∈ adjacency[u] }` — and, when present,
+`graph.rs:173-182` — `reverse_adj[v] == { u | v ∈ adjacency[u] }` — and, when present,
 `codes.bin`'s magic/shape/finite-codec checks). Replicating the loader's checks here, not
 just the checksum, keeps "guard-valid" and "loader-loadable" the same statement; letting
 them diverge for any segment (including `codes.bin`, which the guard used to check by hash
