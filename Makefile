@@ -6,9 +6,40 @@ FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,b
 LOCAL_VERB_FLOOR := 90
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
-LOCAL_VERIFY_STAMP := $(LOCAL_BUILD_RECEIPT).verified
+FLEET_ARTIFACT ?=
+# Every variable below can be overridden on the command line (`make VAR=...`)
+# and plain `:=`/`?=` loses to command-line assignments. Make performs no
+# shell escaping on `$(VAR)`, so a caller-controlled value spliced directly
+# into a recipe's shell text (e.g. `$(LOCAL_VERB_FLOOR)`) could break out of
+# a quoted argument and run as shell code. Capture the caller's literal value
+# before make can expand any `$` bytes, then pass it to the recipe through
+# the environment instead of shell source — recipes read `$$<VAR>_VALUE`,
+# never `$(VAR)`. `FULL_PACKS` and `LOCAL_VERB_FLOOR` are additionally gated
+# by `validate-make-inputs` so a hostile value is rejected before it reaches
+# a shell at all; the path/tool variables (LOCAL_BUILD_RECEIPT, CARGO) need no
+# character allowlist — the env-value pass alone removes the shell-parse
+# surface — but must never be re-spliced as `$(VAR)` into recipe shell text.
+# The verification stamp path is likewise never a `:=` derivation — it is
+# `"$${LOCAL_BUILD_RECEIPT_VALUE}.verified"`, computed by the shell at recipe
+# time from the already-captured env value, so a literal `$` in the receipt
+# path is inert data and no `$(shell ...)` payload can run during parsing.
+override FLEET_ARTIFACT_VALUE := $(value FLEET_ARTIFACT)
+unexport FLEET_ARTIFACT
+export FLEET_ARTIFACT_VALUE
+override FULL_PACKS_VALUE := $(value FULL_PACKS)
+unexport FULL_PACKS
+export FULL_PACKS_VALUE
+override LOCAL_VERB_FLOOR_VALUE := $(value LOCAL_VERB_FLOOR)
+unexport LOCAL_VERB_FLOOR
+export LOCAL_VERB_FLOOR_VALUE
+override LOCAL_BUILD_RECEIPT_VALUE := $(value LOCAL_BUILD_RECEIPT)
+unexport LOCAL_BUILD_RECEIPT
+export LOCAL_BUILD_RECEIPT_VALUE
+override CARGO_VALUE := $(value CARGO)
+unexport CARGO
+export CARGO_VALUE
 
-.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check
 
 check:
 	cd crates && cargo check --workspace
@@ -36,18 +67,56 @@ build:
 build-local:
 	@echo "==> Building kkernel (release, channel-email, channel-telegram)..."
 	@python3 scripts/build_local_artifact.py \
-		--cargo "$(CARGO)" \
+		--cargo "$$CARGO_VALUE" \
 		--manifest-path crates/Cargo.toml \
 		--package kkernel \
 		--features channel-email,channel-telegram \
-		--receipt "$(LOCAL_BUILD_RECEIPT)"
+		--receipt "$$LOCAL_BUILD_RECEIPT_VALUE"
 
-verify-local-artifact: build-local
+# Reject a FULL_PACKS/LOCAL_VERB_FLOOR value (from the Makefile default or a
+# caller override) that contains anything outside its allowlisted character
+# class. Every recipe below reads the sanitized value from the `*_VALUE`
+# shell environment variables, never via a raw `$(FULL_PACKS)` /
+# `$(LOCAL_VERB_FLOOR)` splice, so this gate is what stands between a
+# hostile override and a shell.
+validate-make-inputs:
+	@case "$$FULL_PACKS_VALUE" in \
+		"") echo "==> ERROR: FULL_PACKS is empty" >&2; exit 1 ;; \
+		*[!A-Za-z0-9_,-]*) echo "==> ERROR: FULL_PACKS contains characters outside the allowed [A-Za-z0-9_,-] set: $$FULL_PACKS_VALUE" >&2; exit 1 ;; \
+	esac
+	@case "$$LOCAL_VERB_FLOOR_VALUE" in \
+		"") echo "==> ERROR: LOCAL_VERB_FLOOR is empty" >&2; exit 1 ;; \
+		*[!0-9]*) echo "==> ERROR: LOCAL_VERB_FLOOR must contain digits only: $$LOCAL_VERB_FLOOR_VALUE" >&2; exit 1 ;; \
+	esac
+
+verify-local-artifact: validate-make-inputs build-local
 	@python3 scripts/verify_local_artifact.py \
-		--build-receipt "$(LOCAL_BUILD_RECEIPT)" \
-		--packs "$(FULL_PACKS)" \
-		--min-verbs "$(LOCAL_VERB_FLOOR)" \
-		--stamp "$(LOCAL_VERIFY_STAMP)"
+		--build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE" \
+		--packs "$$FULL_PACKS_VALUE" \
+		--min-verbs "$$LOCAL_VERB_FLOOR_VALUE" \
+		--stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified"
+
+# Build and verify the release artifact without installing it or interrupting
+# the serving daemon. This compatibility name makes the build-only safety gate
+# discoverable independently of the local-install recipe.
+fleet-build: verify-local-artifact
+
+# Re-run the verification probe without rebuilding. By default this checks the
+# exact Cargo artifact named by the current build receipt. Set FLEET_ARTIFACT to
+# check any executable directly, including the installed kkernel binary:
+#   make fleet-check FLEET_ARTIFACT="$HOME/.cargo/bin/kkernel"
+fleet-check: validate-make-inputs
+	@if [ -n "$$FLEET_ARTIFACT_VALUE" ]; then \
+		python3 scripts/verify_local_artifact.py \
+			--artifact "$$FLEET_ARTIFACT_VALUE" \
+			--packs "$$FULL_PACKS_VALUE" \
+			--min-verbs "$$LOCAL_VERB_FLOOR_VALUE"; \
+	else \
+		python3 scripts/verify_local_artifact.py \
+			--build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE" \
+			--packs "$$FULL_PACKS_VALUE" \
+			--min-verbs "$$LOCAL_VERB_FLOOR_VALUE"; \
+	fi
 
 clean:
 	cd crates && cargo clean
@@ -92,9 +161,9 @@ hold-time-gate:
 
 local: verify-local-artifact
 	@if ! VERIFIED_ASSIGNMENTS=$$(python3 scripts/verify_local_artifact.py \
-	  --build-receipt "$(LOCAL_BUILD_RECEIPT)" \
-	  --inspect-stamp "$(LOCAL_VERIFY_STAMP)" \
-	  --min-verbs "$(LOCAL_VERB_FLOOR)"); then \
+	  --build-receipt "$$LOCAL_BUILD_RECEIPT_VALUE" \
+	  --inspect-stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified" \
+	  --min-verbs "$$LOCAL_VERB_FLOOR_VALUE"); then \
 	  exit 1; \
 	fi; \
 	if ! eval "$$VERIFIED_ASSIGNMENTS"; then \
@@ -127,8 +196,8 @@ local: verify-local-artifact
 	echo "==> Re-verifying the SIGNED artifact (codesign rewrites the file, so the pre-sign verification does not cover the bytes that get installed)..."; \
 	if ! python3 scripts/verify_local_artifact.py \
 	  --artifact "$$DEST.new" \
-	  --packs "$(FULL_PACKS)" \
-	  --min-verbs "$(LOCAL_VERB_FLOOR)" >/dev/null; then \
+	  --packs "$$FULL_PACKS_VALUE" \
+	  --min-verbs "$$LOCAL_VERB_FLOOR_VALUE" >/dev/null; then \
 	  echo "==> ERROR: signed artifact failed verification — refusing to install"; \
 	  rm -f "$$DEST.new"; \
 	  exit 1; \
