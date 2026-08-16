@@ -174,6 +174,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-155](ADR-155-pack-artifact-ingest-blobstore.md)                    | Pack Artifact Ingest over BlobStore                                                                        |
 | [ADR-156](ADR-156-named-vector-restart-durability.md)                   | Named-Vector Search Restart and Durability Semantics                                                       |
 | [ADR-157](ADR-157-supersession-chain-canonicalization.md)               | Canonicalize Verified Supersession Chains Before Memory Recall Scoring                                     |
+| [ADR-158](ADR-158-cargo-source-role-projections.md)                     | Cargo Source-Role Projections for Repository Showcase                                                      |
 | [ADR-159](ADR-159-edge-governance-provenance.md)                        | Durable Edge-Governance Provenance for Supersession Canonicalization                                       |
 | [ADR-160](ADR-160-shared-pack-infrastructure.md)                        | Shared Pack Infrastructure Program                                                                         |
 
