@@ -1139,3 +1139,14 @@ reviewer test.
   natural-key upsert selects an actively governed incumbent fails the
   apply with the stale-preimage contract, appends no decision row, and
   leaves the incumbent's projection row untouched.
+- A recursion pair on the A1 classification: a proposal whose only
+  governance-bearing step is nested at depth two or more —
+  `Compound([Compound([AddEdge{supersedes, …}])])` — is treated as
+  governance-bearing by every propose-time and review-time check: the
+  propose-time rejection shapes fire on the nested form, and a
+  provider-denied reviewer's approve is refused exactly as for the flat
+  form. Mutation control on the same pair: a classifier restricted to the
+  outer variant (any shallow, non-recursive evaluation) must redden both
+  halves — the nested proposal is admitted at propose time and the denied
+  reviewer's approve lands — proving the recursive evaluation of A1 is
+  load-bearing rather than incidental.

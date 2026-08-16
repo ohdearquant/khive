@@ -1,6 +1,6 @@
 # ADR-159: Durable Edge-Governance Provenance for Supersession Canonicalization
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-08-15
 **Depends on**: ADR-002 (edge ontology), ADR-007 (namespace), ADR-013 (note kinds), ADR-014 (curation), ADR-017 (pack standard), ADR-018 (authorization gate), ADR-039 (note merge), ADR-046 (event-sourced proposals), ADR-055 (epistemic edges)
 **Consumed by**: ADR-157 (supersession chain canonicalization, in flight), a forthcoming ADR-046 amendment
@@ -550,6 +550,18 @@ recorded in § Context.)
 - Per-store activation test: activating governance on one store leaves a
   second store's state untouched and its edges ungoverned.
 - Query-plan and latency gates from the measurements above.
+- Invalidation-write mutation control: with the invalidation triggers
+  present and well-formed as far as the activation gate can observe, no-op
+  only the invalidation-row append (marker deletion retained), state the
+  expected reddened arms before the run, and re-run the rebuild and
+  same-key-resurrection arms. Both must fail by the spent decision
+  reactivating — not by an activation-gate refusal, which would leave the
+  rebuild-path assertion unreachable rather than falsified. The fixture
+  must isolate the ledger as the sole resurrection defense: the recurred
+  preimage satisfies the preimage and liveness rechecks by construction
+  (§3, same-key resurrection), so the append is load-bearing exactly
+  where every other mechanism passes, and an arm that stays green under
+  this mutant is measuring one of the other mechanisms instead.
 
 ## Implementation fences
 
