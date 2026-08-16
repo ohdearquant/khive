@@ -109,6 +109,15 @@ pub enum ProposalChangeset {
     MergeEntities { into: Uuid, from: Uuid },
     /// Supersede an entity with another (sets `supersedes` edge).
     SupersedeEntity { old: Uuid, new: Uuid },
+    /// Classify an EXISTING memory-supersession edge's governance in place.
+    /// Added by the 2026-08-16 amendment (see §Amendment below); the storage
+    /// contract is ADR-159 §5. Never mutates `graph_edges`.
+    ClassifyExistingEdgeGovernance {
+        edge_id: Uuid,
+        expected: ExpectedEdgePreimage,
+        disposition: GovernanceDisposition,
+        reason_code: Option<String>,
+    },
     /// Compound: an ordered sequence of the above, applied atomically.
     /// NOTE: as of PR #517, only single-step Compound is accepted at propose-time
     /// and legacy-apply-time — see "Compound changeset semantics (Fix 4)" below.
@@ -823,3 +832,157 @@ Failures before a committed outcome is observed retain the existing contract:
 emit `ProposalApplied { Failed }` and best-effort revert to `approved`. A
 rolled-back atomic unit is therefore retryable under the proposal workflow; a
 committed unit with incomplete post-processing is not.
+
+## Amendment (2026-08-16): edge-governance authority for memory supersession
+
+**Depends on**: ADR-159 (edge-governance provenance — storage shape, stamping
+paths, closure predicate). **Consumed by**: ADR-157 (supersession chain
+canonicalization). This amendment lands after ADR-159 and implements the two
+contracts ADR-159 delegates to this ADR: endpoint-scoped reviewer authority on
+the reviewed stamping path, and the in-place classification primitive for
+migrating existing edges.
+
+### A1. Governance-bearing changesets (definition)
+
+A changeset step is **governance-bearing** when it is either:
+
+- `AddEdge` with `relation = supersedes` whose source and target are both
+  live notes of kind `memory` in the proposal's namespace; or
+- `ClassifyExistingEdgeGovernance` (any target).
+
+All other steps — including `SupersedeEntity` (entity-level supersession) and
+`AddEdge` for any other relation or endpoint pair — are unaffected by this
+amendment and keep the base ADR's review and apply semantics unchanged.
+
+### A2. New changeset arm: `ClassifyExistingEdgeGovernance`
+
+```rust
+ClassifyExistingEdgeGovernance {
+    edge_id:     Uuid,
+    expected:    ExpectedEdgePreimage,   // namespace, source_id, target_id,
+                                         // relation, deleted_at: must be null
+    disposition: GovernanceDisposition,  // Authorize | Reject
+    reason_code: Option<String>,         // bounded vocabulary
+}
+```
+
+The payload may request a classification and supply the expected preimage. It
+may **not** name the authorizer, authority scope, review event, timestamp, or
+policy revision — those are stamped by the review/apply runtime, never
+deserialized from proposal JSON (ADR-159 §5). `deny_unknown_fields` applies;
+a payload carrying any authority-shaped field is rejected at propose time.
+
+Apply dispatches to the storage primitive
+`classify_existing_edge_governance`, which in one write transaction: selects
+the edge by UUID including current liveness; requires exact equality with the
+full expected preimage, `relation = 'supersedes'`, and live memory-note
+endpoints; consumes and revalidates the internal authority receipt for an
+`Authorize` disposition; appends the governance decision; and inserts the
+active projection row only for `Authorize`. It issues **no update to
+`graph_edges`** — UUID, `created_at`, `updated_at`, weight, metadata, and
+deletion state are preserved byte-for-byte. A stale UUID or preimage, a dead
+or non-memory endpoint, or changed authority rolls back with no decision row
+and no graph mutation, and the apply emits
+`ProposalApplied { Failed { error: "stale: edge preimage changed since proposal" } }`
+with the standard pre-commit revert to `approved`. The base ADR's
+last-writer-wins stale-target default (§9, Fix 6) explicitly does **not**
+apply to this arm: the preimage check is mandatory, not an optional
+versioning knob.
+
+`ClassifyExistingEdgeGovernance` is a single step; the multi-step `Compound`
+restriction (PR #517) stands unchanged.
+
+### A3. Reviewed governed apply for new supersession edges
+
+When an approved proposal's governance-bearing `AddEdge` step reaches apply,
+the worker maps it to the `governed_link` storage primitive — not the plain
+`runtime.graph.link(...)` dispatch — passing the authority receipt obtained
+at review (A4). `governed_link` commits the edge upsert, the governance
+decision, and the active projection row in one writer transaction, and it
+returns and stamps the actual incumbent edge UUID selected by the
+natural-key upsert, so the decision row binds the edge incarnation that
+really exists rather than the one the proposer imagined. On any receipt
+revalidation failure at apply time the transaction rolls back and the apply
+fails with the same stale-preimage contract as A2.
+
+A governance-bearing `AddEdge` in a proposal that is applied WITHOUT a valid
+receipt on file (for example, a deployment that disabled the authority
+provider between review and apply) must fail the apply; it must not degrade
+to a plain ungoverned `link`. Degrading silently would make the proposal
+path mint exactly the ungoverned-but-approved edges ADR-159 exists to
+distinguish.
+
+### A4. Endpoint-scoped reviewer authority
+
+The base ADR's "qualified reviewer" test (non-self, on the reviewer list if
+one was given) establishes that the reviewer is a _different_ actor. For
+governance-bearing changesets that is insufficient: being different is not
+being entitled (ADR-159, Context defect 2). This amendment adds, for
+governance-bearing changesets only:
+
+1. At `review(decision=Approve)`, after the existing self-approval check and
+   before any `ProposalReviewed` event is emitted, the handler requests an
+   endpoint-scoped `AuthorityReceipt` from the Gate/authority provider for
+   action `memory.supersede` over each superseded memory named by the
+   changeset (the `AddEdge` target, or the `expected.target_id` of a
+   classification step). Provider denial rejects the review with a typed
+   error (`ReviewerNotAuthorized { proposal_id, actor_id }`) — parallel to
+   `SelfApprovalForbidden`, before any event lands.
+2. The receipt is runtime-internal and non-serializable (ADR-159 §2). It is
+   never written into any event payload. What the event log carries is the
+   unchanged `ProposalReviewed` event; the governance decision row carries
+   `proposal_id` and the mandatory `review_event_id`, naming the reviewer as
+   `authorizer` and the apply worker's identity
+   (`system:propose-apply`) only as `applied_by`. Authority is never
+   inferred from the apply worker's system identity.
+3. At apply time the worker revalidates the receipt against the exact edge
+   preimage and current authority, or relies on a bound policy/ownership
+   revision that makes stale authority fail closed (ADR-159 §2, path 2).
+4. **Self-approval is unconditionally forbidden for governance-bearing
+   changesets**, regardless of `allow_self_approve`. A proposer who holds
+   the authority does not need the proposal path: the owner-bounded direct
+   write (ADR-159 §2, path 1) is that actor's route. The reviewed path
+   exists precisely for the cross-actor case, so it always requires a
+   second actor.
+
+Authority-provider modes follow ADR-159 §7. In **single-principal** mode the
+provider attests the deployment's single authority; migration-era
+classifications authorize `via = migration_review` under it. In
+**multi-actor** mode a real endpoint-authority provider is required; a
+deployment whose Gate can answer only "may review" must reject every
+governance-bearing approval — fail closed, not fall back to the base ADR's
+reviewer test.
+
+### A5. What this amendment does not change
+
+- Review, apply, threshold, and self-approve semantics for every
+  non-governance-bearing changeset are byte-for-byte the base ADR's.
+- The proposal event kinds, payload shapes (beyond the one new closed enum
+  arm), projection table, `applying` CAS contract, and the 2026-07-31 /
+  2026-08-11 amendment semantics are unchanged. `governed_link` and
+  `classify_existing_edge_governance` are single write transactions, so the
+  `AtomicRunOutcome::Committed` reconciliation boundary applies to them
+  unmodified.
+- No governance field is added to any wire result. Whether an edge is
+  governed is observable only through ADR-159's serving behavior and
+  diagnostics, not through the proposal API.
+
+### A6. Verification (before dependent implementation merges)
+
+- A propose-time test proving a `ClassifyExistingEdgeGovernance` payload
+  carrying an authorizer-shaped field is rejected.
+- A review-time pair: an authorized reviewer's approve lands; a
+  provider-denied reviewer receives `ReviewerNotAuthorized` and no
+  `ProposalReviewed` event exists afterward.
+- A self-approve test proving `allow_self_approve = true` does not admit a
+  governance-bearing approval.
+- An apply-time stale-preimage test: mutate the target edge between approve
+  and apply, assert `ProposalApplied { Failed }`, zero graph mutation, and
+  byte-identical edge row.
+- A no-degrade test: a governance-bearing `AddEdge` applied with the
+  authority provider disabled fails; assert no ungoverned edge was created
+  by the apply path.
+- A byte-preservation test on `classify_existing_edge_governance`: all
+  `graph_edges` columns identical before and after an `Authorize`.
+- A multi-actor fail-closed test: with a review-only Gate, every
+  governance-bearing approval is rejected.
