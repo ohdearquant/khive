@@ -69,13 +69,25 @@ Because a parent must be an existing record at the moment its child is admitted,
 child is a new record, the lineage relation is acyclic by construction: the table is a
 forest, with direct-caller spawns as roots.
 
-**Idempotent replay is lineage-stable.** A repeated `agent.spawn` that passes the ADR-142
-replay rule returns the original record [ADR-142 §1, lifecycle table, spawn row], and
-therefore the original `parent_agent_id`; the replay lookup neither re-derives nor rewrites
-parentage. The spawn fingerprint is unchanged by this ADR: parentage is derived context, not
-a spawn argument, so it is not part of the compared content — two spawns with identical
-arguments from different parents are different admissions with different resolved contexts
-and distinct records, exactly as they already are for `owner_actor`.
+**Resolved parentage enters replay identity.** ADR-142's replay identity is the pair
+(resolved actor, idempotency key), with argument identity judged by `spawn_fingerprint` over
+exactly `{provider, task, provider_session_id, checkpoint_session_id}` [ADR-142 §1,
+lifecycle table, spawn row; "Persistent process record"]. Parent context appears in neither,
+so without amendment the following arm is silently wrong: one owner reuses one key string
+with identical arguments from two spawn sites — first agent-issued under a parent, then
+directly — and the second admission replay-matches, returning the original record with the
+first site's `parent_agent_id`; the second caller receives a lineage it never had. This ADR
+therefore amends the fingerprint's compared content: the canonical serialization gains the
+runtime-resolved `parent_agent_id` as one additional field, included when a parent was
+resolved and omitted entirely when the spawn is direct, digested with the rest at first
+acceptance and never recomputed. A repeat whose pair matches and whose arguments are
+identical but whose resolved parent context differs now fails the fingerprint comparison and
+is a validation error — the same outcome ADR-142 already assigns to a matching pair with
+different arguments — while a repeat matching in pair, arguments, and resolved parent
+returns the original record with its original, correct lineage. The added field is
+runtime-resolved context, never a caller argument, so the no-supplied-parent rule above is
+unaffected. The two-site arm described here is an acceptance fixture for any implementation
+of this ADR.
 
 **Depth is bounded.** The runtime enforces a configured maximum `lineage_depth` at spawn
 admission; a spawn that would exceed it is a per-operation validation error naming the limit
@@ -156,6 +168,22 @@ subtree does. A spawn admitted on a record's behalf after that record reached `t
 an illegal-transition error on the spawning dispatch [ADR-142 §1], so a killed parent cannot
 refill its subtree while the walk proceeds.
 
+The admission-time set is not the whole story, and the cascade must not pretend it is: a
+descendant that is still live during the walk — resolved into the set but not yet reached —
+can itself spawn between set resolution and its own kill, and that child is outside the
+resolved set. The cascade therefore repeats resolution-and-kill: after the walk completes,
+the runtime re-resolves the target's descendants, kills any non-terminal record the
+re-resolution finds (under the same per-record authorization), and repeats until a
+re-resolution finds no non-terminal descendant or a bounded pass count is reached. The
+operation's result carries `subtree_terminal`: true only when the final re-resolution found
+no non-terminal descendant, false otherwise, with every surviving record named. Per-record
+outcomes enumerate every record every pass reached, attributed to its pass. A cascade can
+therefore never report clean while a record spawned during the cascade survives — a caller
+that reads `subtree_terminal=false` knows the subtree is not dead and exactly which records
+remain. The concurrent-spawn arm — a mid-walk descendant spawning a child that the
+admission-time set does not contain — is an acceptance fixture for any implementation of
+this ADR.
+
 The subtree kill is per-record, not transactional: each record's kill succeeds or fails by
 ADR-142's own rules (an already-`terminal` descendant is a no-op, exactly as in the
 single-record case), and the operation's result enumerates per-record outcomes — killed,
@@ -183,9 +211,10 @@ with each operation's own admission rules intact.
 
 The spawn audit event gains the resolved `parent_agent_id` (or its absence) alongside the
 attribution it already carries, so the audit trail records the same forest the table does. A
-`descendants=true` kill emits one audit event for the cascade decision — naming the root and
-the resolved descendant set at admission — plus the per-record kill events the individual
-transitions already produce. Lineage in the audit plane is thereby reconstructable from
+`descendants=true` kill emits one audit event per resolution pass — naming the root, the
+pass, and that pass's resolved descendant set — plus the per-record kill events the
+individual transitions already produce, and a closing event carrying the final
+`subtree_terminal` value with any surviving records named. Lineage in the audit plane is thereby reconstructable from
 events alone, without reading the table.
 
 ## Non-goals
