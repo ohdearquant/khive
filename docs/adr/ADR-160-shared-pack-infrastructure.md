@@ -1,6 +1,6 @@
 # ADR-160: Shared Pack Infrastructure Program
 
-**Status**: proposed\
+**Status**: accepted\
 **Date**: 2026-08-16\
 **Authors**: khive maintainers\
 **Depends on**:
