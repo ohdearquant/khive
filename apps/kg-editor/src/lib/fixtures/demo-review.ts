@@ -1,6 +1,6 @@
 import type { ReviewBundle } from "@/lib/review-bundle";
 
-export const atlasReviewFixture: ReviewBundle = {
+export const demoReviewFixture: ReviewBundle = {
   schema_version: "khive.review.v1",
   review_kind: "pull_request",
   generated_at: "2026-08-07T17:26:00Z",
@@ -566,7 +566,7 @@ export const atlasReviewFixture: ReviewBundle = {
         id: "436254d4",
         score: 0.853,
         memory_type: "semantic",
-        content: "Build the KG editor local-first with Atlas as the driving committer and make growth reviewable, diffable, and revertible.",
+        content: "Build the KG editor local-first with the curator persona as the driving committer and make growth reviewable, diffable, and revertible.",
       },
       {
         id: "b07f238e",

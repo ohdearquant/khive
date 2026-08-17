@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
 import { Studio } from "@/components/studio";
-import { atlasReviewFixture } from "@/lib/fixtures/atlas-review";
+import { demoReviewFixture } from "@/lib/fixtures/demo-review";
 import { REVIEW_IMPORT_MAX_BYTES, type ReviewBundle, type ReviewReport } from "@/lib/review-bundle";
 
 const zeroPageCases = [
@@ -39,7 +39,7 @@ const zeroPageCases = [
 
 describe("KG Studio", () => {
   it("makes the no-write and unavailable capability boundary visible", () => {
-    render(<Studio initialBundle={atlasReviewFixture} />);
+    render(<Studio initialBundle={demoReviewFixture} />);
 
     expect(screen.getByText("Demo data · no writes")).toBeVisible();
     expect(screen.getByText("WASM unavailable")).toBeVisible();
@@ -48,7 +48,7 @@ describe("KG Studio", () => {
 
   it("renders an actionable shared empty state for filtered graph changes", async () => {
     const user = userEvent.setup();
-    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
 
     await user.type(screen.getByPlaceholderText("Filter entities, edges, tiers…"), "nothing-matches-this");
 
@@ -60,7 +60,7 @@ describe("KG Studio", () => {
   });
 
   it.each(zeroPageCases)("renders $name zero pages through one actionable empty state", async ({ view, empty }) => {
-    const bundle = structuredClone(atlasReviewFixture);
+    const bundle = structuredClone(demoReviewFixture);
     empty(bundle);
     const user = userEvent.setup();
     const { container } = render(<Studio initialBundle={bundle} />);
@@ -74,7 +74,7 @@ describe("KG Studio", () => {
   });
 
   it("renders Studio page bounds as the shared truncated state", () => {
-    const bundle = structuredClone(atlasReviewFixture);
+    const bundle = structuredClone(demoReviewFixture);
     bundle.changes.truncated = true;
     bundle.changes.next_cursor = "next-page";
     const { container } = render(<Studio initialBundle={bundle} />);
@@ -89,7 +89,7 @@ describe("KG Studio", () => {
     ["truncated", { truncated: true, next_cursor: null }],
     ["next cursor", { truncated: false, next_cursor: "next-page" }],
   ] as const)("does not mislabel a zero-item %s page as known-empty", (_name, incomplete) => {
-    const bundle = structuredClone(atlasReviewFixture);
+    const bundle = structuredClone(demoReviewFixture);
     bundle.changes.items = [];
     bundle.changes.truncated = incomplete.truncated;
     bundle.changes.next_cursor = incomplete.next_cursor;
@@ -107,7 +107,7 @@ describe("KG Studio", () => {
     ["truncated", { truncated: true, next_cursor: null }],
     ["next cursor", { truncated: false, next_cursor: "next-page" }],
   ] as const)("does not render the checks success hero for a zero-item %s page", async (_name, incomplete) => {
-    const bundle = structuredClone(atlasReviewFixture);
+    const bundle = structuredClone(demoReviewFixture);
     bundle.checks.items = [];
     bundle.checks.truncated = incomplete.truncated;
     bundle.checks.next_cursor = incomplete.next_cursor;
@@ -124,7 +124,7 @@ describe("KG Studio", () => {
 
   it("navigates from semantic diff to the affected graph", async () => {
     const user = userEvent.setup();
-    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
 
     await user.click(screen.getAllByRole("button", { name: /affected graph/i })[0]);
     expect(screen.getByRole("heading", { name: "Affected subgraph" })).toBeVisible();
@@ -143,7 +143,7 @@ describe("KG Studio", () => {
 
   it("makes graph edges addressable with a shared selection and contextual inspector", async () => {
     const user = userEvent.setup();
-    render(<Studio initialBundle={atlasReviewFixture} />);
+    render(<Studio initialBundle={demoReviewFixture} />);
 
     await user.click(screen.getAllByRole("button", { name: /affected graph/i })[0]);
     const edgeSummaryRegion = screen.getByRole("region", { name: "Affected graph relationships" });
@@ -159,7 +159,7 @@ describe("KG Studio", () => {
 
   it("dispatches retrieval note kinds through the note legend", async () => {
     const user = userEvent.setup();
-    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
 
     await user.click(screen.getAllByRole("button", { name: /Khive context/i })[0]);
     expect(container.querySelector('[data-kind="observation"]')).toHaveTextContent("Observation");
@@ -169,7 +169,7 @@ describe("KG Studio", () => {
   it("uses explicit entity_kind in core review operation lists", async () => {
     const user = userEvent.setup();
     const operation = {
-      ...atlasReviewFixture.change_set.operations[0],
+      ...demoReviewFixture.change_set.operations[0],
       after: { kind: "entity", entity_kind: "concept", name: "Canonical concept" },
     };
     const report: ReviewReport = {
@@ -186,23 +186,23 @@ describe("KG Studio", () => {
         persistence: false,
         unavailable_actions: ["apply", "commit", "push", "publish", "persist_review"],
       },
-      change_set: { envelope: atlasReviewFixture.change_set.envelope, operations: [operation] },
+      change_set: { envelope: demoReviewFixture.change_set.envelope, operations: [operation] },
       tier_summary: {
-        ...atlasReviewFixture.tier_summary,
+        ...demoReviewFixture.tier_summary,
         operations: 1,
         tier_1: 1,
         tier_2: 0,
         highest_tier: "tier_1",
         requires_independent_review: false,
       },
-      validation: atlasReviewFixture.validation,
+      validation: demoReviewFixture.validation,
       findings: [],
-      review_gate: atlasReviewFixture.review_gate,
+      review_gate: demoReviewFixture.review_gate,
     };
     const serialized = JSON.stringify(report);
     const imported = new File([serialized], "core-review.json", { type: "application/json" });
     Object.defineProperty(imported, "text", { value: () => Promise.resolve(serialized) });
-    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
 
     await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, imported);
 
@@ -212,7 +212,7 @@ describe("KG Studio", () => {
 
   it("refuses same-family approval and records no approval state", async () => {
     const user = userEvent.setup();
-    render(<Studio initialBundle={atlasReviewFixture} />);
+    render(<Studio initialBundle={demoReviewFixture} />);
 
     await user.click(screen.getByRole("button", { name: /Approve locally/i }));
 
@@ -224,7 +224,7 @@ describe("KG Studio", () => {
 
   it("clears a local approval when reviewer-family eligibility changes", async () => {
     const user = userEvent.setup();
-    render(<Studio initialBundle={atlasReviewFixture} />);
+    render(<Studio initialBundle={demoReviewFixture} />);
 
     const reviewer = screen.getByRole("combobox", { name: "Reviewer model family" });
     await user.selectOptions(reviewer, "family:independent-reasoner");
@@ -237,7 +237,7 @@ describe("KG Studio", () => {
 
   it("rejects an oversized review bundle before reading it", async () => {
     const user = userEvent.setup();
-    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
     const input = container.querySelector<HTMLInputElement>('input[type="file"]');
     expect(input).not.toBeNull();
 
@@ -257,7 +257,7 @@ describe("KG Studio", () => {
 
   it("resets local conversation notes when the imported review identity changes", async () => {
     const user = userEvent.setup();
-    const { container } = render(<Studio initialBundle={atlasReviewFixture} />);
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
 
     await user.click(screen.getAllByRole("button", { name: /^Activity/i })[0]);
     await user.type(screen.getByRole("textbox", { name: "Review comment" }), "Only for review 184");
@@ -265,10 +265,10 @@ describe("KG Studio", () => {
     expect(screen.getByText("Only for review 184")).toBeVisible();
 
     const nextBundle = {
-      ...atlasReviewFixture,
-      repository: { ...atlasReviewFixture.repository, head_sha: "1".repeat(40) },
+      ...demoReviewFixture,
+      repository: { ...demoReviewFixture.repository, head_sha: "1".repeat(40) },
       pull_request: {
-        ...atlasReviewFixture.pull_request,
+        ...demoReviewFixture.pull_request,
         number: 185,
         head_sha: "1".repeat(40),
       },
