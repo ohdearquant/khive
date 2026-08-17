@@ -474,6 +474,10 @@ pub struct VerbRegistryBuilder {
     /// with a synthetic `EventView` describing the outcome and carrying no
     /// observations. Opt-in: when None, no overhead is incurred.
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
+    /// ADR-133 audit-batch config override, applied when `build()` lazily
+    /// constructs the batch seam from `event_store`. `None` uses
+    /// `AuditBatchConfig::default()`.
+    audit_batch_config: Option<crate::audit_batch::AuditBatchConfig>,
 }
 
 impl VerbRegistryBuilder {
@@ -489,6 +493,7 @@ impl VerbRegistryBuilder {
             event_store: None,
             audit_store_read_only: false,
             dispatch_hook: None,
+            audit_batch_config: None,
         }
     }
 
@@ -718,6 +723,17 @@ impl VerbRegistryBuilder {
             .map(|h| h.name)
             .collect();
 
+        // ADR-133: incidental audit writes route through one batch seam per
+        // configured `EventStore` instead of taking a writer-task
+        // acquisition per dispatch. No store configured (tracing-only or
+        // read-only-audit registries) means no seam to construct.
+        let audit_batch = self.event_store.clone().map(|store| {
+            crate::audit_batch::AuditBatch::new(
+                store,
+                self.audit_batch_config.clone().unwrap_or_default(),
+            )
+        });
+
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
             resolvers: Arc::new(self.resolvers),
@@ -730,6 +746,7 @@ impl VerbRegistryBuilder {
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
+            audit_batch,
         })
     }
 }
@@ -921,6 +938,11 @@ pub struct VerbRegistry {
     /// across every clone of this registry via the `Arc`, so admissions made
     /// by one dispatch are visible to the next on the same warm daemon.
     reference_ring: Arc<crate::reference_ring::ReferenceRing>,
+    /// ADR-133 audit-batch seam. `None` exactly when `event_store` is
+    /// `None` — no store configured means no seam to construct, and every
+    /// audit call site falls back to its pre-ADR-133 tracing-only/no-op
+    /// path.
+    audit_batch: Option<Arc<crate::audit_batch::AuditBatch>>,
 }
 
 /// Result of an operation handled outside normal pack dispatch, paired with
@@ -1246,6 +1268,23 @@ impl VerbRegistry {
         self.event_store.clone()
     }
 
+    /// Stop admitting new audit rows and wait for every already-accepted row
+    /// to reach a terminal state (ADR-133).
+    ///
+    /// A no-op returning `Ok(())` when no `EventStore` — and therefore no
+    /// audit-batch seam — is configured. Callers that own this registry's
+    /// shutdown sequence should call this before tearing down the writer or
+    /// database so no accepted audit row is silently dropped mid-flight.
+    pub async fn shutdown_audit_batch(
+        &self,
+    ) -> Result<(), crate::audit_batch::AuditTerminalReason> {
+        use crate::audit_batch::AuditBatchControl;
+        match &self.audit_batch {
+            Some(audit_batch) => audit_batch.close_and_drain().await,
+            None => Ok(()),
+        }
+    }
+
     /// Advisory for a dispatch whose configured audit sink is read-only.
     ///
     /// The MCP transport places this beside successful per-operation results;
@@ -1426,7 +1465,14 @@ impl VerbRegistry {
                             EventOutcome::Denied,
                             Some(crate::cost_unit::base_resource_payload(request_id)),
                         );
-                        append_audit_event_best_effort(store, event, verb).await;
+                        append_audit_event_best_effort(
+                            self.audit_batch.as_ref(),
+                            store,
+                            event,
+                            verb,
+                            crate::audit_batch::AuditProducer::GateDenied,
+                        )
+                        .await;
                     }
                     return Err(RuntimeError::PermissionDenied {
                         verb: verb.to_string(),
@@ -1464,6 +1510,7 @@ impl VerbRegistry {
             };
             let outcome = persist_git_digest_receipt(
                 self.event_store.as_ref(),
+                self.audit_batch.as_ref(),
                 &gate_req,
                 deferred_audit.as_ref(),
                 &mut receipt_result,
@@ -1570,7 +1617,13 @@ impl VerbRegistry {
             )
             .with_duration_us(duration_us),
         };
-        append_audit_event_best_effort(store, event, verb).await;
+        let producer = if result.is_ok() {
+            crate::audit_batch::AuditProducer::DispatchSucceeded
+        } else {
+            crate::audit_batch::AuditProducer::DispatchFailed
+        };
+        append_audit_event_best_effort(self.audit_batch.as_ref(), store, event, verb, producer)
+            .await;
     }
 
     fn gate_request_with_identity(
@@ -1692,8 +1745,14 @@ impl VerbRegistry {
                                 format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                             )
                             .with_payload(payload);
-                            append_audit_event_best_effort(store, storage_event, "config.lock")
-                                .await;
+                            append_audit_event_best_effort(
+                                self.audit_batch.as_ref(),
+                                store,
+                                storage_event,
+                                "config.lock",
+                                crate::audit_batch::AuditProducer::ConfigLocked,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1730,7 +1789,14 @@ impl VerbRegistry {
                             EventOutcome::Denied,
                             Some(crate::cost_unit::base_resource_payload(request_id)),
                         );
-                        append_audit_event_best_effort(store, storage_event, verb).await;
+                        append_audit_event_best_effort(
+                            self.audit_batch.as_ref(),
+                            store,
+                            storage_event,
+                            verb,
+                            crate::audit_batch::AuditProducer::GateDenied,
+                        )
+                        .await;
                     }
                 }
 
@@ -1866,6 +1932,7 @@ impl VerbRegistry {
                     Some(
                         persist_git_digest_receipt(
                             self.event_store.as_ref(),
+                            self.audit_batch.as_ref(),
                             &gate_req,
                             deferred_audit.as_ref(),
                             &mut result,
@@ -1928,8 +1995,14 @@ impl VerbRegistry {
                                         .with_payload(payload)
                                         .with_payload_schema_version(2)
                                         .with_duration_us(dispatch_us);
-                                        append_audit_event_best_effort(store, storage_event, verb)
-                                            .await;
+                                        append_audit_event_best_effort(
+                                            self.audit_batch.as_ref(),
+                                            store,
+                                            storage_event,
+                                            verb,
+                                            crate::audit_batch::AuditProducer::DispatchSucceeded,
+                                        )
+                                        .await;
                                     }
                                     None => {
                                         tracing::warn!(
@@ -1944,8 +2017,14 @@ impl VerbRegistry {
                                             Some(resource),
                                         )
                                         .with_duration_us(dispatch_us);
-                                        append_audit_event_best_effort(store, storage_event, verb)
-                                            .await;
+                                        append_audit_event_best_effort(
+                                            self.audit_batch.as_ref(),
+                                            store,
+                                            storage_event,
+                                            verb,
+                                            crate::audit_batch::AuditProducer::DispatchSucceeded,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -1985,10 +2064,22 @@ impl VerbRegistry {
                                         Some(crate::cost_unit::base_resource_payload(request_id)),
                                     ),
                                 };
+                                let producer = if result.is_ok() {
+                                    crate::audit_batch::AuditProducer::DispatchSucceeded
+                                } else {
+                                    crate::audit_batch::AuditProducer::DispatchFailed
+                                };
                                 let storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
-                                append_audit_event_best_effort(store, storage_event, verb).await;
+                                append_audit_event_best_effort(
+                                    self.audit_batch.as_ref(),
+                                    store,
+                                    storage_event,
+                                    verb,
+                                    producer,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -2110,7 +2201,14 @@ impl VerbRegistry {
                     EventOutcome::Error,
                     Some(crate::cost_unit::base_resource_payload(request_id)),
                 );
-                append_audit_event_best_effort(store, storage_event, verb).await;
+                append_audit_event_best_effort(
+                    self.audit_batch.as_ref(),
+                    store,
+                    storage_event,
+                    verb,
+                    crate::audit_batch::AuditProducer::UnknownVerb,
+                )
+                .await;
             }
         }
 
@@ -3017,6 +3115,7 @@ enum GitDigestReceiptOutcome {
 /// explicitly warns that ingest writes may already have committed.
 async fn persist_git_digest_receipt(
     store: Option<&Arc<dyn EventStore>>,
+    audit_batch: Option<&Arc<crate::audit_batch::AuditBatch>>,
     gate_req: &GateRequest,
     audit: Option<&AuditEvent>,
     result: &mut Result<Value, RuntimeError>,
@@ -3105,7 +3204,26 @@ async fn persist_git_digest_receipt(
     payload_object.insert("result".to_string(), report.clone());
     event.payload = payload;
 
-    if let Err(store_err) = store.append_event(event).await {
+    // Strict path (ADR-133): a git.digest success receipt must still commit
+    // exactly once before the caller can see success, so this row waits on
+    // its generation's commit through the batch seam rather than
+    // best-effort — the batching only changes whether it shares a writer
+    // acquisition with concurrent rows, never whether it is durable before
+    // the caller observes success.
+    let submit_result = if let Some(audit_batch) = audit_batch {
+        use crate::audit_batch::AuditBatchControl;
+        audit_batch
+            .submit(crate::audit_batch::PreparedAuditRow {
+                event,
+                producer: crate::audit_batch::AuditProducer::GitDigestReceipt,
+            })
+            .await
+            .map(|_outcome| ())
+            .map_err(|reason| format!("{reason:?}"))
+    } else {
+        store.append_event(event).await.map_err(|e| e.to_string())
+    };
+    if let Err(store_err) = submit_result {
         AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
             verb = "git.digest",
@@ -3125,7 +3243,38 @@ async fn persist_git_digest_receipt(
 /// fail the verb call it is auditing. `git.digest` success receipts use the
 /// strict helper above instead. Every swallowed failure increments the
 /// process-wide diagnostics counter above.
-async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Event, verb: &str) {
+///
+/// ADR-133: when the registry has an audit-batch seam configured (it is
+/// whenever `store` is), the row routes through
+/// [`crate::audit_batch::AuditBatchControl::submit`] instead of taking its
+/// own writer-task acquisition — concurrent producers collapse onto one
+/// commit per generation. `audit_batch: None` (a `VerbRegistry` predating
+/// the seam, or constructed without going through the builder) falls back to
+/// the pre-ADR-133 direct append.
+async fn append_audit_event_best_effort(
+    audit_batch: Option<&Arc<crate::audit_batch::AuditBatch>>,
+    store: &Arc<dyn EventStore>,
+    event: Event,
+    verb: &str,
+    producer: crate::audit_batch::AuditProducer,
+) {
+    use crate::audit_batch::AuditBatchControl;
+
+    if let Some(audit_batch) = audit_batch {
+        if let Err(reason) = audit_batch
+            .submit(crate::audit_batch::PreparedAuditRow { event, producer })
+            .await
+        {
+            AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                verb,
+                reason = ?reason,
+                "audit event batch submission failed (non-fatal)"
+            );
+        }
+        return;
+    }
+
     if let Err(store_err) = store.append_event(event).await {
         AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
@@ -5104,6 +5253,39 @@ pub(crate) mod tests {
         }
         async fn count_events(&self, _filter: EventFilter) -> khive_storage::StorageResult<u64> {
             Ok(self.events.lock().unwrap().len() as u64)
+        }
+
+        fn preflight_event(&self, _event: &Event) -> khive_storage::StorageResult<()> {
+            Ok(())
+        }
+
+        async fn append_events_idempotent(
+            &self,
+            events: Vec<Event>,
+        ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
+        {
+            if self.fail_appends {
+                return Err(khive_storage::StorageError::Internal(
+                    "injected audit append failure".to_string(),
+                ));
+            }
+            let mut store = self.events.lock().unwrap();
+            let mut rows = Vec::with_capacity(events.len());
+            for event in events {
+                if let Some(existing) = store.iter().find(|e| e.id == event.id) {
+                    if *existing == event {
+                        rows.push(
+                            khive_storage::event::EventAppendDisposition::AlreadyPresentIdentical,
+                        );
+                    } else {
+                        rows.push(khive_storage::event::EventAppendDisposition::IdentityConflict);
+                    }
+                } else {
+                    store.push(event);
+                    rows.push(khive_storage::event::EventAppendDisposition::Inserted);
+                }
+            }
+            Ok(khive_storage::event::IdempotentEventBatchResult { rows })
         }
     }
 
