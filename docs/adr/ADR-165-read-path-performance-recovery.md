@@ -135,6 +135,12 @@ new standalone-read call site is a reviewable event, not a default.
 
 Contract:
 
+- This slice deliberately changes the failure mode under saturation: a read that
+  previously succeeded slowly through standalone-connection churn now fails fast at
+  the pool-checkout timeout. That is the intended trade — bounded, observable
+  failure instead of unbounded degradation that also starves the writer — and a
+  checkout timeout under load is this contract working, not a regression to fix by
+  reintroducing a standalone fallback.
 - Pool capacity and checkout timeout keep their existing envs. Pool exhaustion returns
   the existing timeout error and MUST NOT fall back to a standalone open — a fallback
   would reintroduce the connection churn under exactly the load that makes it harmful,
