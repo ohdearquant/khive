@@ -13,6 +13,9 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
   bounded, digest-verified whole-blob reads. Its non-cloneable `VerifiedBlob`
   keeps admission until callers finish using the borrowed bytes, and tracked
   supervisors keep native work visible to daemon drain after request cancellation
+- **Role-keyed attachments** — main-backend-only record metadata over `ContentRef`,
+  atomic entity-plus-role publication, compatibility `content_ref` projection,
+  and transactional hard-delete cleanup
 - **`VerbRegistry` / `VerbRegistryBuilder`** — registers packs (`PackRuntime` impls),
   an authorization `Gate`, an actor identity, and dispatches verbs by name
 - **`PackRuntime` trait** — the object-safe runtime counterpart to `khive-types::Pack`;
@@ -37,8 +40,9 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use khive_types::namespace::Namespace;
 
-// In-memory runtime (tests); production callers set RuntimeConfig::db_path or
-// use KhiveRuntime::from_backend with a pre-built StorageBackend.
+// In-memory runtime (tests and pure local embedding). Production callers use
+// khive-mcp/kkernel's async host builders so legacy V21 attachment cutover is
+// completed before any runtime is exposed.
 let runtime = KhiveRuntime::new(RuntimeConfig::default())?;
 
 // Every read/write is scoped by a NamespaceToken minted through the configured Gate.
@@ -46,6 +50,28 @@ let token = runtime.authorize(Namespace::local())?;
 let entities = runtime.entities(&token)?; // Arc<dyn khive_storage::EntityStore>
 let graph = runtime.graph(&token)?; // Arc<dyn khive_storage::GraphStore>
 ```
+
+`KhiveRuntime::new` is suitable for fresh, exact-current, and in-memory
+databases. It deliberately refuses a legacy V20 database that needs verified
+application-assisted migration. Official production boot uses the async
+`khive_mcp::serve::build_single_backend_runtime` or multi-backend builders and
+then `KhiveRuntime::from_prepared_backend`. The infallible `from_backend`
+constructor is a low-level assembly seam whose caller must already have
+completed V21; it is not a migration or serving entrypoint.
+
+Before any Phase-4b builder is deployed, the Phase-4a GC compatibility build
+must converge on every process sharing the database/blob root and all pre-Phase-4a
+processes must be drained. Phase 4a leaves V20 schema/data unchanged and only
+fail-closes transactional GC unless the database is exact completed V21.
+Every Phase-4a application-serving/read-write process must also be quiesced for
+cutover, or proven unable to access the database. Only a GC-only worker has
+narrow completed-V21 compatibility; start Phase-4b serving after exact-current
+topology validation.
+
+Artifact publication uses `create_entity_with_attachments`; the former
+single-column `create_entity_with_content_ref` seam is removed. Packs assigned
+to a secondary database must call `runtime.core().attachments()` because only
+the canonical main database participates in blob GC liveness.
 
 Packs are composed through the builder, not `KhiveRuntime` directly:
 

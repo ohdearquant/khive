@@ -5,7 +5,8 @@
 **Authors**: khive maintainers\
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds the required
 backend-enforced bounded-and-verified BlobStore read while leaving admission and lifecycle policy
-in runtime, and binds vector operations to a complete embedding-space identity on acceptance.
+in runtime, binds vector operations to a complete embedding-space identity, and implements
+ADR-121's attachment capability/current ten-capability surface on acceptance.
 
 ## Context
 
@@ -35,7 +36,7 @@ The constraints on `khive-storage`:
 
 ## Decision
 
-### Eight capability traits
+### Original eight capability traits
 
 ```rust
 pub trait SqlAccess: Send + Sync + 'static {
@@ -132,6 +133,19 @@ pub trait TextSearch: Send + Sync + 'static {
 
 `SqlAccess` decomposes into `SqlReader`, `SqlWriter`, and `SqlTransaction` subtypes to
 enforce read/write/transactional boundaries at the type level.
+
+### Amendment: BlobStore and AttachmentStore extend the surface to ten
+
+ADR-111 added the ninth capability, `BlobStore`, for content-addressed bytes. ADR-121 and
+ADR-160 Phase 4 add the tenth, `AttachmentStore`, for role-keyed `ContentRef` metadata owned by
+entity or note records. `AttachmentStore` provides upsert, exact role lookup, stable listing, and
+role deletion. `EntityStore::upsert_entity_with_attachments` is the atomic entity-plus-initial-
+roles seam and has a conservative `Unsupported` default so existing third-party entity-store
+implementations remain valid.
+
+The trait remains placement-blind: it does not know which database is canonical. Runtime/host
+boot routes attachments to main/core and prevents a secondary backend from becoming invisible
+blob liveness.
 
 `EntityStore` is separate from `NoteStore` because Entity and Note are different substrates
 (ADR-004) with different field sets, lifecycle rules, and validation paths.
@@ -263,7 +277,7 @@ pub enum CoordinatorError {
 
 ### StorageCapability: one variant per trait
 
-`StorageCapability` maps exactly to the eight capability traits. Each variant corresponds
+`StorageCapability` maps exactly to the ten capability traits. Each variant corresponds
 to a real trait. No placeholders.
 
 ```rust
@@ -276,6 +290,8 @@ pub enum StorageCapability {
     Vectors,
     Sparse,
     Text,
+    Blob,
+    Attachments,
 }
 ```
 
@@ -340,11 +356,11 @@ is the backend's choice.
 
 | Belongs in `khive-storage`                                               | Does NOT belong in `khive-storage`               |
 | ------------------------------------------------------------------------ | ------------------------------------------------ |
-| Eight capability traits                                                  | `StorageProfile` / `PlacementRole`               |
+| Ten capability traits                                                    | `StorageProfile` / `PlacementRole`               |
 | Storage-facing record types (`Note`, `Entity`, `Edge`, `Event`)          | `BackendId` / `BackendHandle`                    |
 | Pagination / result types (`Page`, `PageRequest`, `BatchWriteSummary`)   | ATTACH schema aliases (`SqlScope`)               |
 | Single-backend `StorageError`                                            | `CoordinatorError` / federation errors           |
-| `StorageCapability` enum (8 variants)                                    | `CoordinatorStore` / `StorageCoordinator` trait  |
+| `StorageCapability` enum (10 variants)                                   | `CoordinatorStore` / `StorageCoordinator` trait  |
 | Mechanical default methods                                               | Policy default methods (quota, retention)        |
 | Filter types (`EntityFilter`, `EdgeFilter`, `EventFilter`, `TextFilter`) | `registered_kinds()` / kind discovery            |
 | Shared types (`SqlValue`, `SqlRow`, `VectorSearchHit`, `TextSearchHit`)  | Placement / routing logic                        |
@@ -382,20 +398,22 @@ depend on `rusqlite`, `sqlite-vec`, and FTS5 headers. The crate has zero heavy d
 dependencies: capability traits, shared values, and request execution context remain
 backend-neutral. Backend crates bring their own dependencies.
 
-### Why eight traits (not fewer)?
+### Why the original eight traits (and later additions) stay separate
 
 Each trait maps to a substrate or index capability with distinct operation shapes:
 
-| Trait         | Record type    | Key operations                    | Why separate                                           |
-| ------------- | -------------- | --------------------------------- | ------------------------------------------------------ |
-| `NoteStore`   | `Note`         | CRUD, kind filter, temporal query | Temporal/cognitive substrate                           |
-| `EntityStore` | `Entity`       | CRUD, kind+type filter            | Graph node substrate                                   |
-| `GraphStore`  | `Edge`         | Link CRUD, neighbors, traversal   | Graph link operations                                  |
-| `EventStore`  | `Event`        | Append-only, no update/delete     | Audit substrate                                        |
-| `VectorStore` | `VectorRecord` | Insert, search, rebuild           | Dense vector index (single or multi-vector per record) |
-| `SparseStore` | `SparseRecord` | Insert, search                    | Sparse vector index                                    |
-| `TextSearch`  | `TextDocument` | Upsert, search, stats             | Full-text index                                        |
-| `SqlAccess`   | `SqlRow`       | Raw SQL, transactions             | Escape hatch                                           |
+| Trait             | Record type    | Key operations                    | Why separate                                           |
+| ----------------- | -------------- | --------------------------------- | ------------------------------------------------------ |
+| `NoteStore`       | `Note`         | CRUD, kind filter, temporal query | Temporal/cognitive substrate                           |
+| `EntityStore`     | `Entity`       | CRUD, kind+type filter            | Graph node substrate                                   |
+| `GraphStore`      | `Edge`         | Link CRUD, neighbors, traversal   | Graph link operations                                  |
+| `EventStore`      | `Event`        | Append-only, no update/delete     | Audit substrate                                        |
+| `VectorStore`     | `VectorRecord` | Insert, search, rebuild           | Dense vector index (single or multi-vector per record) |
+| `SparseStore`     | `SparseRecord` | Insert, search                    | Sparse vector index                                    |
+| `TextSearch`      | `TextDocument` | Upsert, search, stats             | Full-text index                                        |
+| `SqlAccess`       | `SqlRow`       | Raw SQL, transactions             | Escape hatch                                           |
+| `BlobStore`       | opaque bytes   | CAS put/read/stat/delete/GC       | Backend object I/O and integrity                       |
+| `AttachmentStore` | metadata       | role-keyed CRUD                   | Record-owned blob liveness without graph edges         |
 
 Collapsing EntityStore into NoteStore would merge two substrates with different field sets
 (`entity_type` vs `salience`/`decay_factor`), different validation paths
@@ -439,8 +457,8 @@ is the natural representation.
 
 ### Negative
 
-- Eight traits is more implementation surface per backend. Each backend crate implements
-  eight traits plus `SqlReader`/`SqlWriter`/`SqlTransaction`.
+- Ten traits is more implementation surface per full backend. Each backend implements only the
+  capabilities it advertises; optional/default seams remain conservative.
 - `Arc<dyn Trait>` precludes compile-time specialization inside the runtime. Backends
   that could benefit from monomorphization (e.g., a hot-path HNSW search) must absorb
   the virtual dispatch cost.
@@ -452,10 +470,10 @@ is the natural representation.
 
 ## Implementation
 
-- `crates/khive-storage/src/lib.rs`: re-exports all eight traits plus shared types.
+- `crates/khive-storage/src/lib.rs`: re-exports all ten traits plus shared types.
 - One source file per trait: `sql.rs`, `note.rs`, `entity.rs`, `graph.rs`, `event.rs`,
-  `vectors.rs`, `sparse.rs`, `text.rs`.
-- `capability.rs`: `StorageCapability` enum (8 variants).
+  `vectors.rs`, `sparse.rs`, `text.rs`, `blob.rs`, `attachment.rs`.
+- `capability.rs`: `StorageCapability` enum (10 variants).
 - `error.rs`: `StorageError` with `StorageCapability` discriminant.
 - `types.rs`: shared types (`SqlRow`, `SqlValue`, `Page`, `BatchWriteSummary`, filter
   types, hit types).

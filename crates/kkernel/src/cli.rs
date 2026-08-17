@@ -19,7 +19,10 @@ use crate::{
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
     engine, exec, git_ingest, kg, pack_introspect, reindex, repo, sync, vector,
 };
-use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
+use khive_runtime::{
+    runtime_config_from_khive_config, BackendId, BackendKind, KhiveConfig, KhiveRuntime,
+    RuntimeConfig,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -120,8 +123,12 @@ enum DbCommand {
 #[derive(clap::Parser, Debug)]
 struct DbMigrateArgs {
     /// Database path (defaults to `~/.khive/khive.db`).
-    #[arg(long)]
-    db: Option<PathBuf>,
+    #[arg(long, env = "KHIVE_DB")]
+    db: Option<String>,
+
+    /// Explicit khive config path (otherwise use normal discovery).
+    #[arg(long, env = "KHIVE_CONFIG")]
+    config: Option<PathBuf>,
 
     /// Target a specific backend by name.
     #[arg(long)]
@@ -143,8 +150,16 @@ struct DbMigrateArgs {
 #[derive(clap::Parser, Debug)]
 struct DbCheckArgs {
     /// Database path (defaults to `~/.khive/khive.db`).
+    #[arg(long, env = "KHIVE_DB")]
+    db: Option<String>,
+
+    /// Explicit khive config path (otherwise use normal discovery).
+    #[arg(long, env = "KHIVE_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Target a specific backend by name.
     #[arg(long)]
-    db: Option<PathBuf>,
+    backend: Option<String>,
 
     /// Exit nonzero if any backend is behind the current schema version.
     #[arg(long)]
@@ -382,7 +397,8 @@ pub async fn cli_main() -> Result<()> {
                         &khive_cfg,
                         a.db.as_deref(),
                         db_anchor.as_deref(),
-                    )?;
+                    )
+                    .await?;
 
                 khive_mcp::serve::serve_server(
                     server,
@@ -458,7 +474,7 @@ fn resolve_command(exec: Option<String>, command: Option<Command>) -> Command {
 /// See `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`
 /// for why this is the one place that assembles the coordinator inputs.
 #[cfg(test)]
-fn build_multi_backend_server_with_coordinator(
+async fn build_multi_backend_server_with_coordinator(
     base_cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
@@ -474,9 +490,10 @@ fn build_multi_backend_server_with_coordinator(
         cli_db_override,
         db_anchor.as_deref(),
     )
+    .await
 }
 
-fn build_multi_backend_server_with_coordinator_and_db_anchor(
+async fn build_multi_backend_server_with_coordinator_and_db_anchor(
     base_cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
@@ -487,7 +504,8 @@ fn build_multi_backend_server_with_coordinator_and_db_anchor(
         khive_cfg,
         cli_db_override,
         db_anchor,
-    )?;
+    )
+    .await?;
 
     let schedule_rt = multi
         .per_pack_runtimes
@@ -526,57 +544,113 @@ async fn cmd_db(cmd: DbCommand) -> Result<()> {
     }
 }
 
-async fn cmd_db_migrate(args: DbMigrateArgs) -> Result<()> {
-    // KhiveRuntime::new() runs run_migrations() internally.
-    // Constructing the runtime is therefore sufficient to apply all pending migrations.
-    let mut cfg = RuntimeConfig::default();
-    if let Some(ref db) = args.db {
-        cfg.db_path = Some(db.clone());
-    }
+struct DbCommandContext {
+    base_config: RuntimeConfig,
+    khive_config: KhiveConfig,
+    cli_db_override: Option<String>,
+}
 
+fn resolve_db_command_context(
+    db: Option<&str>,
+    config: Option<&std::path::Path>,
+) -> Result<DbCommandContext> {
+    let discovery_anchor = khive_mcp::serve::config_discovery_db_anchor(db);
+    let loaded =
+        KhiveConfig::load_with_home_fallback_and_source(config, discovery_anchor.as_deref())
+            .context("load database-command khive config")?;
+    let config_source = loaded.as_ref().map(|(_, source)| source.as_path());
+    let khive_config = loaded
+        .as_ref()
+        .map(|(config, _)| config.clone())
+        .unwrap_or_default();
+    khive_mcp::serve::reject_conflicting_db_override_with_source(
+        db,
+        &khive_config.backends,
+        config_source,
+    )?;
+
+    let mut base_config = RuntimeConfig::default();
+    base_config.db_path = khive_runtime::resolve_db_anchor(db);
+    base_config = runtime_config_from_khive_config(&khive_config, base_config);
+    // Schema administration never needs to instantiate an embedding model or
+    // register packs. Blob hydration remains configured because verified V20
+    // moodboard evidence may be part of the cutover.
+    base_config.embedding_model = None;
+    base_config.additional_embedding_models.clear();
+    base_config.packs.clear();
+
+    Ok(DbCommandContext {
+        base_config,
+        khive_config,
+        cli_db_override: db.map(str::to_owned),
+    })
+}
+
+async fn cmd_db_migrate(args: DbMigrateArgs) -> Result<()> {
     if args.dry_run || args.check {
         // For dry-run / --check, query the current schema version without writing.
         return cmd_db_check(DbCheckArgs {
             db: args.db,
+            config: args.config,
+            backend: args.backend,
             strict: args.check,
             human: args.human,
         })
         .await;
     }
 
-    let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let latest = khive_db::MIGRATIONS.len() as u32;
+    let context = resolve_db_command_context(args.db.as_deref(), args.config.as_deref())?;
 
-    // Query the applied version to report what was done.
-    let sql = rt.sql();
-    let mut reader = sql
-        .reader()
-        .await
-        .context("open SQL reader after migration")?;
-    use khive_storage::types::{SqlStatement, SqlValue};
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations".into(),
-            params: vec![],
-            label: Some("db_migrate_version".into()),
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let applied: u32 = rows
-        .first()
-        .and_then(|r| match r.get("COALESCE(MAX(version), 0)") {
-            Some(SqlValue::Integer(v)) => Some(*v as u32),
-            _ => None,
-        })
-        .unwrap_or(latest);
+    // V21 is application-assisted: after the ordinary V1-V20 schema prefix,
+    // the host must install bounded blob hydration, authenticate any legacy
+    // moodboard bundle/network evidence, and only then finalize attachment-only
+    // liveness. Reuse the same async choke point as MCP/exec boot so the admin
+    // command cannot strand an incomplete database or bypass the GC fence.
+    let statuses = khive_mcp::serve::migrate_configured_storage_topology(
+        context.base_config,
+        &context.khive_config,
+        context.cli_db_override.as_deref(),
+        args.backend.as_deref(),
+    )
+    .await
+    .context("migrate configured storage topology through the attachment cutover")?;
+    let latest = khive_db::MIGRATIONS
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or(0);
+    let current = statuses
+        .iter()
+        .all(|status| status.applied_version == latest);
 
     if args.human {
-        println!("schema migrated: version {applied} of {latest} (current)");
+        for status in &statuses {
+            let role = if status.prerequisite {
+                " prerequisite"
+            } else {
+                ""
+            };
+            println!(
+                "{}: V{} of V{} (current{role})",
+                status.backend, status.applied_version, latest
+            );
+        }
     } else {
+        let backends = statuses
+            .iter()
+            .map(|status| {
+                serde_json::json!({
+                    "backend": status.backend,
+                    "applied_version": status.applied_version,
+                    "latest_version": latest,
+                    "current": status.applied_version == latest,
+                    "prerequisite": status.prerequisite,
+                })
+            })
+            .collect::<Vec<_>>();
         let json = serde_json::json!({
-            "applied_version": applied,
             "latest_version": latest,
-            "current": applied == latest,
+            "current": current,
+            "backends": backends,
         });
         println!("{}", serde_json::to_string(&json).expect("serialize"));
     }
@@ -584,64 +658,134 @@ async fn cmd_db_migrate(args: DbMigrateArgs) -> Result<()> {
 }
 
 async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
-    let latest = khive_db::MIGRATIONS.len() as u32;
+    let context = resolve_db_command_context(args.db.as_deref(), args.config.as_deref())?;
+    let latest = khive_db::MIGRATIONS
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or(0);
+    let force_memory = context.cli_db_override.as_deref() == Some(":memory:");
 
-    // A schema check must never mutate the database. Resolve the effective path
-    // and read `_schema_migrations` read-only — opening through a runtime would
-    // run migrations and bring an out-of-date database current before reporting,
-    // masking the pending state this command exists to detect.
-    let resolved: Option<PathBuf> = match args.db {
-        Some(p) => Some(p),
-        None => std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".khive/khive.db")),
-    };
-
-    // An absent file is an un-migrated database (version 0); do not create it.
-    let current_version: u32 = match resolved {
-        Some(ref p) if p.exists() => {
-            khive_db::inspect_schema_version(p).map_err(|e| anyhow::anyhow!("{e}"))?
-        }
-        _ => 0,
-    };
-
-    let is_current = current_version == latest;
-    // A version beyond the latest known migration is a stale ledger: the database
-    // predates the consolidated V1 baseline (ADR-015) or was written by a newer
-    // build. Report it rather than treating it as current.
-    let ahead = current_version > latest;
-
-    if args.human {
-        let state = if ahead {
-            "ahead — predates the consolidated baseline (ADR-015) or written by a newer build; recreate it"
-        } else if is_current {
-            "current"
-        } else {
-            "behind — run: kkernel db migrate"
-        };
-        println!("main:    V{current_version} ({state})");
+    let mut targets = Vec::new();
+    if context.khive_config.backends.is_empty() {
+        khive_mcp::serve::configured_storage_check_targets(
+            &context.khive_config,
+            context.cli_db_override.as_deref(),
+            args.backend.as_deref(),
+        )?;
+        targets.push((BackendId::MAIN.to_string(), context.base_config.db_path));
     } else {
-        let json = serde_json::json!({
-            "current_version": current_version,
-            "latest_version": latest,
-            "current": is_current,
-            "ahead": ahead,
-            "pending": latest.saturating_sub(current_version),
-        });
-        println!("{}", serde_json::to_string(&json).expect("serialize"));
+        let planned_names = khive_mcp::serve::configured_storage_check_targets(
+            &context.khive_config,
+            context.cli_db_override.as_deref(),
+            args.backend.as_deref(),
+        )?;
+        for backend_name in planned_names {
+            let backend = context
+                .khive_config
+                .backends
+                .iter()
+                .find(|backend| backend.name == backend_name)
+                .expect("the shared topology planner returned a configured backend");
+            let path = if force_memory || backend.kind == BackendKind::Memory {
+                None
+            } else {
+                Some(khive_runtime::expand_tilde(
+                    backend.path.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "backend {:?}: sqlite backend requires a `path` field",
+                            backend.name
+                        )
+                    })?,
+                ))
+            };
+            targets.push((backend.name.clone(), path));
+        }
     }
 
-    if args.strict && !is_current {
-        if ahead {
-            anyhow::bail!(
-                "schema version {current_version} is ahead of the latest known migration {latest} — \
-                 this database predates the consolidated baseline (ADR-015) or was written by a newer \
-                 build; recreate it from the current schema"
-            );
+    let mut reports = Vec::with_capacity(targets.len());
+    for (backend, path) in targets {
+        let (current_version, validation_error) = match path.as_deref() {
+            Some(path) if path.exists() => {
+                let version = khive_db::inspect_schema_version(path)
+                    .map_err(|error| anyhow::anyhow!("backend {backend}: {error}"))?;
+                let validation_error = if version == latest {
+                    khive_db::inspect_schema_is_current(path)
+                        .err()
+                        .map(|error| error.to_string())
+                } else {
+                    None
+                };
+                (version, validation_error)
+            }
+            _ => (0, None),
+        };
+        let ahead = current_version > latest;
+        let is_current = current_version == latest && validation_error.is_none();
+        reports.push((
+            backend,
+            current_version,
+            is_current,
+            ahead,
+            validation_error,
+        ));
+    }
+
+    if args.human {
+        for (backend, current_version, is_current, ahead, validation_error) in &reports {
+            let state = if let Some(error) = validation_error {
+                format!("invalid current-schema state — {error}")
+            } else if *ahead {
+                "ahead — incompatible with this build".to_string()
+            } else if *is_current {
+                "current".to_string()
+            } else {
+                "behind — run: kkernel db migrate".to_string()
+            };
+            println!("{backend}: V{current_version} ({state})");
         }
+    } else {
+        let backends = reports
+            .iter()
+            .map(
+                |(backend, current_version, is_current, ahead, validation_error)| {
+                    serde_json::json!({
+                        "backend": backend,
+                        "current_version": current_version,
+                        "latest_version": latest,
+                        "current": is_current,
+                        "ahead": ahead,
+                        "pending": latest.saturating_sub(*current_version),
+                        "validation_error": validation_error,
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "current": reports.iter().all(|(_, _, current, _, _)| *current),
+                "latest_version": latest,
+                "backends": backends,
+            }))
+            .expect("serialize")
+        );
+    }
+
+    if args.strict && reports.iter().any(|(_, _, current, _, _)| !current) {
+        let summary = reports
+            .iter()
+            .filter(|(_, _, current, _, _)| !current)
+            .map(|(backend, version, _, _, validation_error)| {
+                validation_error
+                    .as_ref()
+                    .map(|error| format!("{backend}: V{version}, {error}"))
+                    .unwrap_or_else(|| format!("{backend}: V{version}"))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
         anyhow::bail!(
-            "schema is behind: V{current_version} applied, V{latest} is current — \
-             run `kkernel db migrate` to bring the schema up to date"
+            "schema topology is not current ({summary}); V{latest} with a complete canonical \
+             attachment cutover is required"
         );
     }
     Ok(())
@@ -835,6 +979,96 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    fn write_empty_config(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("empty-khive.toml");
+        std::fs::write(&path, "").expect("write empty config");
+        path
+    }
+
+    fn create_v20_fixture(
+        path: &std::path::Path,
+        legacy: Option<(&str, Option<i64>)>,
+    ) -> Option<khive_storage::ContentRef> {
+        use khive_db::migrations::{ATTACHMENT_CUTOVER_VERSION, MIGRATIONS};
+
+        let backend = khive_db::StorageBackend::sqlite(path).expect("open V20 fixture backend");
+        let mut writer = backend
+            .pool()
+            .try_writer()
+            .expect("open V20 fixture writer");
+        let conn = writer.conn_mut();
+        conn.execute_batch(
+            "CREATE TABLE _schema_migrations (\
+                 version INTEGER PRIMARY KEY, \
+                 name TEXT NOT NULL, \
+                 applied_at INTEGER NOT NULL\
+             ) STRICT;",
+        )
+        .expect("create V20 ledger");
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+        {
+            let tx = conn.transaction().expect("begin V20 migration");
+            tx.execute_batch(migration.up)
+                .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
+            tx.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                 VALUES (?1, ?2, ?3)",
+                (
+                    migration.version,
+                    migration.name,
+                    i64::from(migration.version),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
+            tx.commit().expect("commit V20 migration");
+        }
+
+        legacy.map(|(entity_type, deleted_at)| {
+            let content_ref =
+                khive_storage::ContentRef::from_hex("a".repeat(64)).expect("canonical legacy ref");
+            conn.execute(
+                "INSERT INTO entities (\
+                     id, namespace, kind, entity_type, name, tags, created_at, updated_at, \
+                     deleted_at, content_ref\
+                 ) VALUES (?1, 'local', 'artifact', ?2, 'legacy fixture', '[]', 1, 1, ?3, ?4)",
+                (
+                    uuid::Uuid::new_v4().to_string(),
+                    entity_type,
+                    deleted_at,
+                    content_ref.as_str(),
+                ),
+            )
+            .expect("insert legacy entity");
+            content_ref
+        })
+    }
+
+    fn write_topology_config(
+        dir: &std::path::Path,
+        main: &std::path::Path,
+        secondary: Option<(&str, &std::path::Path)>,
+    ) -> PathBuf {
+        let path = dir.join("topology.toml");
+        let mut config = format!(
+            "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = {:?}\n",
+            main.display().to_string()
+        );
+        if let Some((name, secondary)) = secondary {
+            config.push_str(&format!(
+                "\n[[backends]]\nname = {name:?}\nkind = \"sqlite\"\npath = {:?}\n",
+                secondary.display().to_string()
+            ));
+        }
+        config.push_str(&format!(
+            "\n[storage.blob]\nbackend = \"fs\"\nroot = {:?}\nfloor_bytes = 0\n",
+            dir.join("blobs").display().to_string()
+        ));
+        std::fs::write(&path, config).expect("write topology config");
+        path
+    }
+
     #[test]
     fn version_surfaces_share_the_compiled_provenance() {
         let command = Args::command();
@@ -859,9 +1093,12 @@ mod tests {
     async fn db_check_does_not_create_missing_file() {
         let tmp = TempDir::new().expect("temp dir");
         let path = tmp.path().join("missing.db");
+        let config = write_empty_config(tmp.path());
         assert!(!path.exists());
         cmd_db_check(DbCheckArgs {
-            db: Some(path.clone()),
+            db: Some(path.display().to_string()),
+            config: Some(config),
+            backend: None,
             strict: false,
             human: false,
         })
@@ -961,8 +1198,10 @@ mod tests {
     async fn db_check_does_not_mutate_existing_db() {
         let tmp = TempDir::new().expect("temp dir");
         let path = tmp.path().join("real.db");
+        let config = write_empty_config(tmp.path());
         cmd_db_migrate(DbMigrateArgs {
-            db: Some(path.clone()),
+            db: Some(path.display().to_string()),
+            config: Some(config.clone()),
             backend: None,
             dry_run: false,
             check: false,
@@ -992,7 +1231,9 @@ mod tests {
         let before = std::fs::read(&path).expect("read db before check");
         // strict passes only when the db is already current — proves the read sees V1.
         cmd_db_check(DbCheckArgs {
-            db: Some(path.clone()),
+            db: Some(path.display().to_string()),
+            config: Some(config),
+            backend: None,
             strict: true,
             human: false,
         })
@@ -1000,6 +1241,356 @@ mod tests {
         .expect("db check passes on a current db");
         let after = std::fs::read(&path).expect("read db after check");
         assert_eq!(before, after, "db check must not mutate the database");
+    }
+
+    #[tokio::test]
+    async fn db_check_strict_rejects_noncanonical_v21_without_mutating_it() {
+        let tmp = TempDir::new().expect("temp dir");
+        let path = tmp.path().join("corrupt-v21.db");
+        let config = write_empty_config(tmp.path());
+        let backend = khive_db::StorageBackend::sqlite(&path).expect("open fixture backend");
+        backend
+            .prepare_core_schema()
+            .expect("prepare canonical V21");
+        {
+            let mut writer = backend.pool().try_writer().expect("tamper V21 fixture");
+            writer
+                .conn_mut()
+                .execute("DELETE FROM attachment_cutover_state", [])
+                .expect("remove completion marker");
+            writer
+                .conn_mut()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("checkpoint tampered fixture");
+        }
+        drop(backend);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().unwrap().to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().unwrap().join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).unwrap();
+                }
+            }
+        }
+        let before = std::fs::read(&path).expect("read corrupt fixture");
+
+        let error = cmd_db_check(DbCheckArgs {
+            db: Some(path.display().to_string()),
+            config: Some(config),
+            backend: None,
+            strict: true,
+            human: false,
+        })
+        .await
+        .expect_err("MAX(version)=21 cannot hide missing physical cutover state");
+        assert!(
+            error.to_string().contains("attachment cutover"),
+            "unexpected strict-check error: {error:#}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read fixture after check"),
+            "strict validation must remain read-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_check_main_includes_every_secondary_prerequisite() {
+        let tmp = TempDir::new().expect("temp dir");
+        let main = tmp.path().join("main.db");
+        let secondary = tmp.path().join("secondary.db");
+        let main_backend = khive_db::StorageBackend::sqlite(&main).expect("open main fixture");
+        main_backend
+            .prepare_core_schema()
+            .expect("prepare current main fixture");
+        drop(main_backend);
+        create_v20_fixture(&secondary, None);
+        let config =
+            write_topology_config(tmp.path(), &main, Some(("secondary", secondary.as_path())));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&main, &secondary] {
+                for suffix in ["-wal", "-shm"] {
+                    let mut name = path.file_name().unwrap().to_os_string();
+                    name.push(suffix);
+                    let sidecar = path.parent().unwrap().join(name);
+                    if sidecar.exists() {
+                        let mut permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+                        permissions.set_mode(0o444);
+                        std::fs::set_permissions(&sidecar, permissions).unwrap();
+                    }
+                }
+            }
+        }
+
+        let error = cmd_db_check(DbCheckArgs {
+            db: None,
+            config: Some(config),
+            backend: Some(BackendId::MAIN.to_string()),
+            strict: true,
+            human: false,
+        })
+        .await
+        .expect_err("a current main cannot hide a behind secondary prerequisite");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("secondary"), "{rendered}");
+        assert!(rendered.contains("V20"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn db_migrate_runs_the_application_assisted_v21_cutover() {
+        use khive_db::migrations::{ATTACHMENT_CUTOVER_VERSION, MIGRATIONS};
+        use khive_db::StorageBackend;
+        use khive_storage::ContentRef;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let path = tmp.path().join("legacy-v20.db");
+        let config = write_empty_config(tmp.path());
+        let entity_id = uuid::Uuid::new_v4();
+        let content_ref = ContentRef::from_hex("a".repeat(64)).expect("canonical fixture ref");
+
+        let backend = StorageBackend::sqlite(&path).expect("open V20 fixture backend");
+        {
+            let mut writer = backend.pool().try_writer().expect("V20 fixture writer");
+            let conn = writer.conn_mut();
+            conn.execute_batch(
+                "CREATE TABLE _schema_migrations (\
+                     version INTEGER PRIMARY KEY, \
+                     name TEXT NOT NULL, \
+                     applied_at INTEGER NOT NULL\
+                 ) STRICT;",
+            )
+            .expect("create V20 migration ledger");
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+            {
+                let tx = conn.transaction().expect("begin V20 fixture migration");
+                tx.execute_batch(migration.up)
+                    .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
+                tx.execute(
+                    "INSERT INTO _schema_migrations (version, name, applied_at) \
+                     VALUES (?1, ?2, ?3)",
+                    (
+                        migration.version,
+                        migration.name,
+                        i64::from(migration.version),
+                    ),
+                )
+                .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
+                tx.commit().expect("commit V20 fixture migration");
+            }
+            conn.execute(
+                "INSERT INTO entities (\
+                     id, namespace, kind, entity_type, name, tags, created_at, updated_at, \
+                     content_ref\
+                 ) VALUES (?1, 'local', 'artifact', 'visual_asset', 'legacy visual', '[]', \
+                     1, 1, ?2)",
+                (entity_id.to_string(), content_ref.as_str()),
+            )
+            .expect("insert legacy attachment-bearing entity");
+        }
+        drop(backend);
+
+        cmd_db_migrate(DbMigrateArgs {
+            db: Some(path.display().to_string()),
+            config: Some(config),
+            backend: None,
+            dry_run: false,
+            check: false,
+            human: false,
+        })
+        .await
+        .expect("admin migrate must coordinate V21 rather than stop at V20");
+
+        let migrated = StorageBackend::sqlite(&path).expect("reopen migrated database");
+        assert_eq!(
+            migrated.prepare_core_schema().unwrap(),
+            ATTACHMENT_CUTOVER_VERSION
+        );
+        let attachment = migrated
+            .attachments()
+            .expect("V21 attachment store")
+            .get_attachment(entity_id, "content")
+            .await
+            .unwrap()
+            .expect("legacy content role must be backfilled");
+        assert_eq!(attachment.content_ref, content_ref);
+    }
+
+    #[tokio::test]
+    async fn db_migrate_preflights_soft_deleted_secondary_before_advancing_main() {
+        use khive_db::migrations::{
+            attachment_cutover_status, read_schema_version, AttachmentCutoverStatus,
+            ATTACHMENT_CUTOVER_VERSION,
+        };
+
+        let tmp = TempDir::new().expect("temp dir");
+        let main = tmp.path().join("main.db");
+        let secondary = tmp.path().join("secondary.db");
+        create_v20_fixture(&main, None);
+        create_v20_fixture(&secondary, Some(("visual_asset", Some(9))));
+        let config =
+            write_topology_config(tmp.path(), &main, Some(("secondary", secondary.as_path())));
+
+        let error = cmd_db_migrate(DbMigrateArgs {
+            db: None,
+            config: Some(config.clone()),
+            backend: None,
+            dry_run: false,
+            check: false,
+            human: false,
+        })
+        .await
+        .expect_err("secondary liveness must block main cutover");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("secondary"), "{rendered}");
+
+        let main_backend =
+            khive_db::StorageBackend::sqlite(&main).expect("inspect blocked main backend");
+        let main_conn = main_backend.pool().reader().expect("inspect blocked main");
+        assert_eq!(
+            read_schema_version(main_conn.conn()).unwrap(),
+            ATTACHMENT_CUTOVER_VERSION - 1,
+            "main must remain V20 when secondary inventory fails"
+        );
+        assert_eq!(
+            attachment_cutover_status(main_conn.conn()).unwrap(),
+            AttachmentCutoverStatus::Pending
+        );
+        drop(main_conn);
+        drop(main_backend);
+
+        let secondary_backend =
+            khive_db::StorageBackend::sqlite(&secondary).expect("curate blocked secondary");
+        secondary_backend
+            .pool()
+            .try_writer()
+            .expect("secondary writer")
+            .conn_mut()
+            .execute("UPDATE entities SET content_ref = NULL", [])
+            .expect("relocate legacy secondary attachment authority");
+        drop(secondary_backend);
+
+        cmd_db_migrate(DbMigrateArgs {
+            db: None,
+            config: Some(config),
+            backend: None,
+            dry_run: false,
+            check: false,
+            human: false,
+        })
+        .await
+        .expect("curated topology must complete secondary then main");
+        for path in [&secondary, &main] {
+            let backend =
+                khive_db::StorageBackend::sqlite(path).expect("inspect completed topology backend");
+            let conn = backend.pool().reader().expect("inspect completed topology");
+            assert_eq!(
+                read_schema_version(conn.conn()).unwrap(),
+                ATTACHMENT_CUTOVER_VERSION
+            );
+            assert_eq!(
+                attachment_cutover_status(conn.conn()).unwrap(),
+                AttachmentCutoverStatus::Complete
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn db_migrate_named_secondary_does_not_advance_main() {
+        use khive_db::migrations::{read_schema_version, ATTACHMENT_CUTOVER_VERSION};
+
+        let tmp = TempDir::new().expect("temp dir");
+        let main = tmp.path().join("main.db");
+        let secondary = tmp.path().join("secondary.db");
+        create_v20_fixture(&main, None);
+        create_v20_fixture(&secondary, None);
+        let config =
+            write_topology_config(tmp.path(), &main, Some(("secondary", secondary.as_path())));
+
+        cmd_db_migrate(DbMigrateArgs {
+            db: None,
+            config: Some(config),
+            backend: Some("secondary".to_string()),
+            dry_run: false,
+            check: false,
+            human: false,
+        })
+        .await
+        .expect("named empty secondary migration");
+
+        let main_backend = khive_db::StorageBackend::sqlite(&main).unwrap();
+        let secondary_backend = khive_db::StorageBackend::sqlite(&secondary).unwrap();
+        let main_conn = main_backend.pool().reader().unwrap();
+        let secondary_conn = secondary_backend.pool().reader().unwrap();
+        assert_eq!(
+            read_schema_version(main_conn.conn()).unwrap(),
+            ATTACHMENT_CUTOVER_VERSION - 1
+        );
+        assert_eq!(
+            read_schema_version(secondary_conn.conn()).unwrap(),
+            ATTACHMENT_CUTOVER_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn db_migrate_unknown_backend_creates_no_database() {
+        let tmp = TempDir::new().expect("temp dir");
+        let main = tmp.path().join("missing-main.db");
+        let secondary = tmp.path().join("missing-secondary.db");
+        let config =
+            write_topology_config(tmp.path(), &main, Some(("secondary", secondary.as_path())));
+
+        let error = cmd_db_migrate(DbMigrateArgs {
+            db: None,
+            config: Some(config),
+            backend: Some("missing".to_string()),
+            dry_run: false,
+            check: false,
+            human: false,
+        })
+        .await
+        .expect_err("unknown selector must fail before opening topology");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("unknown backend"), "{rendered}");
+        assert!(!main.exists());
+        assert!(!secondary.exists());
+    }
+
+    #[tokio::test]
+    async fn db_migrate_one_declared_main_uses_its_configured_path() {
+        use khive_db::migrations::{read_schema_version, ATTACHMENT_CUTOVER_VERSION};
+
+        let tmp = TempDir::new().expect("temp dir");
+        let main = tmp.path().join("declared-main.db");
+        create_v20_fixture(&main, None);
+        let config = write_topology_config(tmp.path(), &main, None);
+
+        cmd_db_migrate(DbMigrateArgs {
+            db: None,
+            config: Some(config),
+            backend: None,
+            dry_run: false,
+            check: false,
+            human: false,
+        })
+        .await
+        .expect("one declared main must use topology path");
+        let backend = khive_db::StorageBackend::sqlite(&main).unwrap();
+        let conn = backend.pool().reader().unwrap();
+        assert_eq!(
+            read_schema_version(conn.conn()).unwrap(),
+            ATTACHMENT_CUTOVER_VERSION
+        );
     }
 
     // --- `-e` quick-shot shortcut for `exec` ---
@@ -1169,9 +1760,9 @@ mod tests {
 
     /// File-backed main: both boot paths must agree on every `WiringSurface`
     /// field — in particular, both must wire a checkpoint pool (#601/#604).
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn multi_backend_boot_paths_share_identical_wiring_surface_file_backed() {
+    async fn multi_backend_boot_paths_share_identical_wiring_surface_file_backed() {
         let dir = TempDir::new().expect("temp dir");
         let main_path = dir.path().join("main.db");
         let khive_cfg =
@@ -1182,6 +1773,7 @@ mod tests {
             &khive_cfg,
             None,
         )
+        .await
         .expect("plain multi-backend boot must succeed");
 
         let (coordinator_server, _schedule_rt) = build_multi_backend_server_with_coordinator(
@@ -1189,6 +1781,7 @@ mod tests {
             &khive_cfg,
             None,
         )
+        .await
         .expect("kkernel coordinator-attached multi-backend boot must succeed");
 
         let plain_surface = khive_mcp::serve::WiringSurface::capture(&plain_server);
@@ -1207,9 +1800,9 @@ mod tests {
 
     /// In-memory main: both paths must agree that no checkpoint pool is wired
     /// (checkpoint_once must never run on a non-WAL connection).
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn multi_backend_boot_paths_share_identical_wiring_surface_in_memory() {
+    async fn multi_backend_boot_paths_share_identical_wiring_surface_in_memory() {
         let khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
 
         let plain_server = khive_mcp::serve::build_server_multi_backend(
@@ -1217,6 +1810,7 @@ mod tests {
             &khive_cfg,
             None,
         )
+        .await
         .expect("plain multi-backend boot must succeed");
 
         let (coordinator_server, _schedule_rt) = build_multi_backend_server_with_coordinator(
@@ -1224,6 +1818,7 @@ mod tests {
             &khive_cfg,
             None,
         )
+        .await
         .expect("kkernel coordinator-attached multi-backend boot must succeed");
 
         let plain_surface = khive_mcp::serve::WiringSurface::capture(&plain_server);
@@ -1242,9 +1837,9 @@ mod tests {
 
     /// #613 non-vacuous output-format parity check — see
     /// `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn multi_backend_boot_paths_share_identical_non_default_output_format() {
+    async fn multi_backend_boot_paths_share_identical_non_default_output_format() {
         // RAII guard: snapshots KHIVE_OUTPUT_FORMAT, clears it, and restores the
         // original value (or leaves it removed) on drop — including on panic, so
         // a failing assertion or an unexpected constructor error never leaks the
@@ -1282,6 +1877,7 @@ mod tests {
             &khive_cfg,
             None,
         )
+        .await
         .expect("plain multi-backend boot must succeed");
 
         let (coordinator_server, _schedule_rt) = build_multi_backend_server_with_coordinator(
@@ -1289,6 +1885,7 @@ mod tests {
             &khive_cfg,
             None,
         )
+        .await
         .expect("kkernel coordinator-attached multi-backend boot must succeed");
 
         let plain_surface = khive_mcp::serve::WiringSurface::capture(&plain_server);
@@ -1313,8 +1910,8 @@ mod tests {
 
     /// db-anchor consistency guard applies at the coordinator choke point too —
     /// see `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
-    #[test]
-    fn coordinator_boundary_rejects_diverging_db_path() {
+    #[tokio::test]
+    async fn coordinator_boundary_rejects_diverging_db_path() {
         let args_db = "/tmp/khive-coordinator-guard-real.db";
         let wrong_path = std::path::PathBuf::from("/tmp/khive-coordinator-guard-wrong.db");
 
@@ -1330,7 +1927,8 @@ mod tests {
             &khive_cfg,
             Some(args_db),
             db_anchor.as_deref(),
-        );
+        )
+        .await;
 
         let err = match result {
             Ok(_) => panic!(
@@ -1354,9 +1952,9 @@ mod tests {
 
     /// Regression for #720 — see
     /// `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn coordinator_boot_uses_anchor_captured_by_runtime_config() {
+    async fn coordinator_boot_uses_anchor_captured_by_runtime_config() {
         struct HomeGuard(Option<std::ffi::OsString>);
 
         impl Drop for HomeGuard {
@@ -1406,7 +2004,8 @@ mod tests {
             &khive_cfg,
             None,
             db_anchor.as_deref(),
-        );
+        )
+        .await;
         if let Err(error) = result {
             panic!(
                 "coordinator-attached construction must retain the anchor captured by \
@@ -1464,6 +2063,7 @@ mod tests {
 
         let (server, _schedule_rt) =
             build_multi_backend_server_with_coordinator(base_cfg, &khive_cfg, None)
+                .await
                 .expect("coordinator-attached multi-backend boot must succeed");
 
         let dispatch = |ops: String| {

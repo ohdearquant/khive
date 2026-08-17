@@ -64,8 +64,9 @@ NoteStore     ───┤        + expansion
 SqlAccess     ───┘        + reranking
 ```
 
-Of the eight capability traits in ADR-005, seven participate in retrieval. `EventStore`
-is the exception — it is audit/observability, not retrieval.
+Of ADR-005's original eight capability traits, seven participate in ranked retrieval.
+`EventStore` is audit/observability; the later `BlobStore` and `AttachmentStore` capabilities
+provide bytes/liveness and likewise do not become ranking signals.
 
 ### Five retrieval primitives
 
@@ -544,7 +545,8 @@ tree, benchmark suite, and dependency surface (`lattice-embed`). ADR-012 is now 
 ## References
 
 - ADR-003: System Architecture — SubstrateCoordinator owns cross-backend fan-out.
-- ADR-005: Storage Capability Traits — the eight traits retrieval composes from.
+- ADR-005: Storage Capability Traits — the seven ranked-retrieval capabilities and their
+  non-ranking Event/Blob/Attachment siblings.
 - ADR-006: Deterministic Scoring — `DeterministicScore`, RRF K=60.
 - ADR-008: Query Layer Separation — graph query language (`GQL`/`SPARQL`) is a separate
   surface; retrieval composes raw storage capabilities, not query strings.

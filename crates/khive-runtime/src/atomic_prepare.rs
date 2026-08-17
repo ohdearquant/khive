@@ -20,7 +20,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_storage::types::SqlValue;
-use khive_storage::{EdgeRelation, SqlStatement};
+use khive_storage::{AttachmentSubstrate, EdgeRelation, SqlStatement};
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
@@ -37,6 +37,7 @@ use crate::operations::{
 };
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+use khive_db::stores::attachment::delete_record_attachments_statement;
 use khive_db::stores::entity::{
     entity_hard_delete_statement, entity_soft_delete_statement, entity_upsert_statement,
 };
@@ -1114,10 +1115,19 @@ pub async fn prepare_delete(
             // khive-db's own `SqlEntityStore::delete_entity` calls — no DML
             // text is hand-duplicated here.
             let mut statements = if hard {
-                vec![PlanStatement {
-                    statement: entity_hard_delete_statement(id),
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                }]
+                vec![
+                    PlanStatement {
+                        statement: delete_record_attachments_statement(
+                            id,
+                            AttachmentSubstrate::Entity,
+                        ),
+                        guard: None,
+                    },
+                    PlanStatement {
+                        statement: entity_hard_delete_statement(id),
+                        guard: Some(AffectedRowGuard::exactly(1)),
+                    },
+                ]
             } else {
                 let deleted_at = chrono::Utc::now().timestamp_micros();
                 vec![PlanStatement {
@@ -1199,10 +1209,19 @@ pub async fn prepare_delete(
             // `note_hard_delete_statement` are the SAME khive-db builders
             // khive-db's own `SqlNoteStore::delete_note` calls.
             let mut statements = if hard {
-                vec![PlanStatement {
-                    statement: note_hard_delete_statement(id),
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                }]
+                vec![
+                    PlanStatement {
+                        statement: delete_record_attachments_statement(
+                            id,
+                            AttachmentSubstrate::Note,
+                        ),
+                        guard: None,
+                    },
+                    PlanStatement {
+                        statement: note_hard_delete_statement(id),
+                        guard: Some(AffectedRowGuard::exactly(1)),
+                    },
+                ]
             } else {
                 let deleted_at = chrono::Utc::now().timestamp_micros();
                 vec![PlanStatement {

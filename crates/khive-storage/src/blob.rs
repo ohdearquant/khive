@@ -120,8 +120,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// rationale.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BlobOrphanSweepConfig {
-    /// Content refs currently referenced by at least one live row somewhere
-    /// in the system, as of when the caller assembled this set. Anything
+    /// Content refs currently referenced by at least one committed record
+    /// attachment, as of when the caller assembled this set. Anything
     /// this backend stores that is NOT in this set is treated as orphaned
     /// and deleted (or reported, in `dry_run` mode) — including a
     /// `content_ref` that becomes live after this snapshot was taken.
@@ -143,8 +143,8 @@ pub struct BlobOrphanSweepResult {
     pub would_delete: u64,
     /// Objects with zero live references that were left alone because they
     /// are still inside their publish grace period — recently written and
-    /// not yet orphaned, just not yet referenced by an entity. Reported in
-    /// both modes; never counted in `would_delete` or `deleted`.
+    /// not yet orphaned, just not yet referenced by a record attachment.
+    /// Reported in both modes; never counted in `would_delete` or `deleted`.
     pub grace_period_skipped: u64,
 }
 
@@ -201,9 +201,9 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
     /// Unconditional physical removal with **no coordination against any
-    /// entity that might reference `content_ref`**. Safe to call only when
-    /// the caller has independently quiesced whatever writer could attach a
-    /// new `content_ref` to an entity for the duration of the call — this
+    /// record attachment that might reference `content_ref`**. Safe to call
+    /// only when the caller has independently quiesced whatever writer could
+    /// attach a new `content_ref` to a record for the duration of the call — this
     /// trait does not detect or prevent a race. Offline-maintenance-only.
     /// See `crates/khive-storage/docs/api/blob-store.md`.
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool>;
@@ -218,7 +218,7 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     ///
     /// `config.live_refs` is a **snapshot**; a `content_ref` that becomes
     /// newly live between the snapshot and the sweep is deleted anyway.
-    /// **Callers MUST quiesce entity writes** for the duration of
+    /// **Callers MUST quiesce attachment writes** for the duration of
     /// snapshot-plus-sweep. See `crates/khive-storage/docs/api/blob-store.md`
     /// for the race repro. Concurrent callers must use
     /// [`Self::transactional_orphan_sweep`] instead.
@@ -234,19 +234,19 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
         })
     }
 
-    /// Select live entity references and sweep orphaned blobs behind a
+    /// Select live attachment references and sweep orphaned blobs behind a
     /// database-coordinated, bounded claim protocol.
     ///
     /// Unlike [`Self::orphan_sweep`], this operation obtains liveness itself
     /// from `sql`; callers do not assemble a stale snapshot. `sql` must be the
-    /// same database capability used for the entity writes that own these
-    /// references. Implementations must also ensure an object published after
+    /// canonical database capability used for the attachment writes that own
+    /// these references. Implementations must also ensure an object published after
     /// the sweep's candidate set is captured cannot be mistaken for an orphan,
     /// including when it is published between selecting live references and
     /// physical deletion. Implementations must not perform filesystem or
     /// other external I/O while holding the database writer transaction;
     /// durable claims/triggers or an equivalently fail-closed fence must keep
-    /// entity writes safe after each short transaction commits. Claim/result
+    /// attachment writes safe after each short transaction commits. Claim/result
     /// materialization and cleanup must have an explicit per-transaction
     /// cardinality bound rather than scale one writer hold with the complete
     /// object population. A file-backed `sql` implementation must expose its
@@ -258,8 +258,24 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// Backends that cannot provide both guarantees return
     /// `StorageError::Unsupported`.
     ///
-    /// Publishing a blob and committing the entity write that references it
-    /// are two separate client steps; nothing serializes them against this
+    /// The shipped filesystem implementation additionally fail-closes on the
+    /// database's liveness epoch. It accepts only an exact completed V21 state
+    /// (ledger and completed marker, attachment claim fences present, legacy
+    /// entity column/index/triggers absent). V20, pending, incomplete, and
+    /// malformed states fail closed in both dry-run and destructive modes before
+    /// filesystem or claim mutation. Ordinary epoch mismatch is `Unsupported`;
+    /// malformed schema/evidence may retain its specific validation/driver
+    /// error. This is the Phase-4a GC compatibility gate: Phase 4a changes no
+    /// schema or data. Every older process sharing the database/blob root must
+    /// be drained before Phase 4b
+    /// performs the attachment backfill and legacy-column drop. Phase-4a
+    /// application readers/writers must also be quiesced during cutover; only a
+    /// GC-only worker has narrow compatibility with exact completed V21. Callers
+    /// must not fall back to [`Self::orphan_sweep`] or [`Self::delete`] when this
+    /// gate refuses.
+    ///
+    /// Publishing a blob and committing the record attachment that references
+    /// it are two separate client steps; nothing serializes them against this
     /// sweep. Implementations must therefore also give a just-published,
     /// not-yet-referenced object a bounded grace period before treating it as
     /// an orphan (the filesystem backend does this via file age). A client

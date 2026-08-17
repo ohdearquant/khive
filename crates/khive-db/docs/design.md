@@ -28,6 +28,28 @@
   production `_schema_migrations` table and must not change.
 - V20 adds durable `blob_gc_claims` plus entity INSERT/UPDATE trigger fences
   for ADR-091 Amendment 9's external-I/O-free transactional blob sweep.
+- After the separately released Phase-4a GC gate has converged fleet-wide and
+  every pre-Phase-4a process is drained, quiesce every Phase-4a application
+  reader/writer before Phase 4b/V21 stages role-keyed attachments under the
+  canonical database GC owner. A GC-only Phase-4a worker's completed-V21
+  compatibility is not general serving compatibility. Phase 4b
+  authenticates application-owned roles through the async host coordinator,
+  then atomically switches liveness/fences to attachments and drops
+  `entities.content_ref`. Pending/incomplete state never enables GC, and the
+  Phase-4b service fleet starts only after exact-current topology validation.
+
+### Attachments and Blob Liveness (ADR-111, ADR-121, ADR-160)
+
+- `stores/attachment.rs` implements `AttachmentStore`; entity role `content`
+  is projected into the compatibility `Entity.content_ref` response field.
+- Entity-plus-initial-attachments publication and entity/note hard-delete
+  cleanup are transactional. Soft deletion retains attachment liveness.
+- Transactional filesystem blob GC validates every attachment/claim ref,
+  anti-joins all attachment rows, and relies on attachment INSERT/UPDATE claim
+  fences. Its Phase-4a epoch gate accepts only an exact completed V21
+  ledger/marker/fence/schema combination; V20 and pending, incomplete, or
+  malformed states refuse dry-run and destructive sweep before filesystem or
+  claim mutation.
 
 ### Pack Standard — Pack-Auxiliary Schema (ADR-017)
 
@@ -129,7 +151,8 @@ process/advisory owner lock makes every pre-existing claim safely recoverable
 even after root relocation or database restore. Candidate recovery, claim,
 physical deletion, and cleanup proceed in batches of at most 128. Each claim
 and cleanup transaction is SQL-only and commits before filesystem deletion;
-entity triggers reject claimed references in every released-writer interval.
+attachment INSERT/UPDATE triggers reject claimed references in every
+released-writer interval.
 
 ## Consistency Notes
 

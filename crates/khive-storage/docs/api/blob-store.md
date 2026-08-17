@@ -55,11 +55,11 @@ raw store access is for metadata, mutation, and maintenance paths only.
 ## `BlobStore::delete` — concurrency hazard
 
 `delete` performs an unconditional physical removal with **no coordination
-against any entity that might reference `content_ref`**. It is safe to call
+against any record attachment that might reference `content_ref`**. It is safe to call
 only when the caller has independently ensured — outside this trait,
-typically by quiescing whatever writer could attach a new `content_ref` to an
-entity — that nothing live references `content_ref` for the duration of the
-call. A caller that races an entity write against a `delete` can dangle a
+typically by quiescing whatever writer could attach a new `content_ref` to a
+record — that nothing live references `content_ref` for the duration of the
+call. A caller that races an attachment write against a `delete` can dangle a
 live reference; this trait does not detect or prevent that.
 
 ## `BlobStore::orphan_sweep` — concurrency hazard
@@ -69,7 +69,7 @@ operation, not an MCP verb, mirroring `VectorStore::orphan_sweep`'s CLI-only
 precedent (ADR-044). `BlobStore` has no visibility into SQL substrates
 (ADR-005 constraint 4: a trait instance talks to exactly one backend), so it
 cannot itself discover which content refs are still referenced by, e.g., the
-`entities.content_ref` column — the caller assembles `BlobOrphanSweepConfig.live_refs`
+`attachments.content_ref` column — the caller assembles `BlobOrphanSweepConfig.live_refs`
 and passes it in.
 
 `live_refs` is a **snapshot** the caller assembled before the call.
@@ -78,7 +78,7 @@ between when that snapshot was taken and when the sweep runs; such a
 reference is deleted anyway (see `khive-db`'s
 `orphan_sweep_race_demonstrates_the_documented_quiescence_requirement` test,
 which reproduces exactly this). This trait provides no transactional
-coordination with an entity writer. **Callers MUST quiesce entity writes**
+coordination with an attachment writer. **Callers MUST quiesce attachment writes**
 (nothing may create a new `content_ref` reference) for the duration of
 snapshot-plus-sweep — a maintenance window, a single-writer admin CLI
 invocation with no live traffic, or equivalent.
@@ -92,8 +92,8 @@ database owner makes all pre-existing claims abandoned, including claims copied
 by a backup or left under a relocated root; validated abandoned rows are removed
 in batches of at most 128. Candidates then pass through bounded claim, physical
 delete, and cleanup batches of the same maximum size. Each short
-`SqlAccess::atomic_unit` anti-joins live entity references and commits durable
-`blob_gc_claims`; entity INSERT/UPDATE triggers reject a new live reference to a
+`SqlAccess::atomic_unit` anti-joins every attachment row and commits durable
+`blob_gc_claims`; attachment INSERT/UPDATE triggers reject a new live reference to a
 claimed digest. Physical deletion runs outside SQLite while both owner/root locks
 remain held, followed by a bounded SQL-only cleanup. A crash after claim commit
 leaves the fence durable and fail-closed; the next exclusive database owner
@@ -103,6 +103,32 @@ after release, `put` rechecks the target and republishes bytes removed as an
 orphan before returning the `ContentRef`. Direct filesystem mutation does not
 participate in the advisory-lock protocol. Backends that cannot provide both
 coordination boundaries return `Unsupported`.
+
+### Schema epoch gate and the two-release V21 rollout
+
+The shipped filesystem implementation selects SQL liveness only after proving
+one exact completed V21 epoch: the V21 ledger row is uniquely present and latest,
+the cutover marker is complete, the attachment/claim tables and attachment claim
+triggers are present, and the legacy entity column/index/triggers are absent. It
+then validates stored evidence and exercises both attachment claim triggers
+before it can delete. V20, pending, incomplete, and malformed combinations fail
+closed in both dry-run and destructive modes before filesystem or claim
+mutation. Ordinary epoch mismatch is `StorageError::Unsupported`; malformed
+schema or evidence may retain its more specific validation/driver error.
+
+This gate ships first as **Phase 4a**. That compatibility release leaves V20
+schema and data untouched: no attachments, backfill, dual-read/write, or V21
+ledger entry. Every process and scheduled job sharing the database/blob root
+must converge on Phase 4a or newer, and every pre-Phase-4a process must be
+drained and prevented from restarting, before **Phase 4b** may perform the
+attachment backfill, fence swap, and legacy-column drop. Every Phase-4a
+application-serving/read-write process must also be quiesced, or proven unable
+to access the database, during cutover. A Phase-4a GC-only worker can safely
+recognize exact completed V21, but that narrow property is not general entity
+reader/writer compatibility. Start Phase-4b serving only after exact-current
+topology validation. Transactional GC is intentionally unavailable while Phase
+4a operates on V20; do not bypass the pause with caller-snapshot `orphan_sweep`
+or unconditional `delete`.
 
 The original `orphan_sweep` remains an offline-maintenance API for callers that
 already have a trusted `live_refs` snapshot. It intentionally retains its

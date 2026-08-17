@@ -338,13 +338,53 @@ kkernel exec 'knowledge.index(ids=["my-slug", "<uuid>"])' --db ~/.khive/khive.db
 ## `kkernel db` — schema lifecycle
 
 ```bash
-kkernel db check --db ~/.khive/khive.db --human     # report current vs latest version
-kkernel db check --strict                            # exit nonzero if behind
-kkernel db migrate --db ~/.khive/khive.db            # apply pending migrations
-kkernel db migrate --dry-run                         # show pending without applying
+kkernel db check --config ~/.khive/khive.toml --human # report configured topology
+kkernel db check --backend archive --strict           # inspect one configured backend
+kkernel db migrate --config ~/.khive/khive.toml       # secondaries, then main
+kkernel db migrate --backend archive                  # migrate one named secondary
+kkernel db migrate --dry-run                          # read-only topology check
 ```
 
 The consolidated baseline is a single migration (V1, from `khive-db/sql/schema.sql`).
+Both commands load an explicit `--config`/`KHIVE_CONFIG` or use normal khive
+config discovery. With declared `[[backends]]`, omitting `--backend` targets the full
+configured set and `--backend <name>` is an active selector. Migration
+deduplicates physical aliases and prepares every distinct secondary before
+canonical `main`; selecting `main` keeps those prerequisites, while selecting a
+non-main secondary advances only that empty attachment-authority target. With no
+declared topology, the implicit target is `main` at `--db`/`KHIVE_DB` or the
+default `~/.khive/khive.db`. A concrete DB override may not conflict with a
+declared main path.
+
+The database admin path is core-only: it does not register packs, instantiate
+embedding models, or apply pack-auxiliary DDL. It still resolves the configured
+BlobStore and bounded hydrator when legacy V20 moodboard evidence must be
+authenticated. `db check` and migrate's `--dry-run`/`--check` modes never open a
+runtime or mutate the database; absent files report V0. They reuse migration's
+target planner, so selecting `main` or its SQLite alias includes every secondary
+prerequisite, while an independent secondary remains a single target.
+
+Before either command opens a database, the planner rejects physical SQLite
+aliases that disagree on `read_only`; a named target cannot bypass that topology
+check. `--db :memory:` changes every configured name into a distinct ephemeral
+backend, so only the literal `main` name carries main's prerequisite plan in that
+mode. Migration output marks `prerequisite` by physical backend identity: every
+alias of the selected main is a target, not a prerequisite.
+
+A legacy V20 database with blob-bearing entities uses the same boot-gated V21
+coordinator as MCP startup: it backfills role-keyed attachments, verifies any
+legacy moodboard bundle/event/FANN evidence through bounded hydration, switches
+GC liveness and claim fences, and only then drops `entities.content_ref`.
+`kkernel db migrate` waits for that cutover and fails without exposing an
+incomplete runtime when evidence or blob storage is unavailable.
+A Phase-4b binary must not be allowed to start this cutover until the Phase-4a
+GC compatibility build has converged across the fleet and every pre-Phase-4a
+process sharing the database/blob root has been drained. Every Phase-4a
+application-serving/read-write process must then be quiesced or proven unable
+to touch the database for cutover; only a GC-only worker has narrow
+compatibility with completed V21. Start the Phase-4b serving fleet only after
+`db check --strict` reports the planned topology exact-current. See
+`docs/operations.md` for the two-release runbook.
 A database whose `_schema_migrations` version is **ahead** of the latest known
 migration is rejected at open time — it predates the consolidation or was written by a
 newer build. Recreate it from the current schema; in-place downgrade is unsupported.

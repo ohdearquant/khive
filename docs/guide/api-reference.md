@@ -300,7 +300,7 @@ rows actually returned, and treat an incomplete empty page as non-resumable with
 filter or a larger effective limit.
 
 Row shape (each item in the offset or cursor envelope) depends on `kind`.
-For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
+For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full public record shape**
 for that substrate, listed below in its **verbose** form (the shape returned with
 `presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).
 This is the key difference from `search` and `neighbors` below, which both return narrow
@@ -318,6 +318,8 @@ compacted to a relative or minute-truncated form; and `salience`/`decay_factor` 
 
 - **`kind="entity"`**: `{id, namespace, kind, entity_type, name, description, properties, tags,
   created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref}`.
+  `content_ref`, when present, is the compatibility projection of attachment role `content`;
+  entities no longer store a writable same-named column.
   `created_at`/`updated_at`/`deleted_at` are ISO-8601 strings (the store keeps them as
   epoch-microseconds internally; the handler converts before returning).
 - **`kind="note"`**: `{id, namespace, kind, status, name, content, salience, decay_factor,

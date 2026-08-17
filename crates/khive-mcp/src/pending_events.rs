@@ -464,7 +464,7 @@ pub async fn run_pending_events_with_config(
     // emitting the documented JSON refusal envelope. Every other build
     // failure keeps the generic "pending-events: build server" provenance.
     let (server, schedule_rt) =
-        match crate::serve::build_server_with_explicit_namespace(&args, ns, true, false) {
+        match crate::serve::build_server_with_explicit_namespace(&args, ns, true, false).await {
             Ok(built) => built,
             Err(error) => {
                 if error
@@ -7000,9 +7000,9 @@ mod tests {
     /// `actor_explicit`, tripping the "genuinely explicit actor tier
     /// requesting anonymous" branch in `resolve_runtime_config` and silently
     /// discarding the configured `[actor] id`.
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
+    async fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -7032,6 +7032,7 @@ mod tests {
         // (`actor_explicit: false`).
         let (_server, schedule_rt) =
             crate::serve::build_server_with_explicit_namespace(&args, ns, true, false)
+                .await
                 .expect("build_server_with_explicit_namespace must succeed");
         let rt = schedule_rt.expect("\"schedule\" pack is in the default pack set");
         assert_eq!(
@@ -7049,9 +7050,9 @@ mod tests {
     /// present namespace value really does mean "the operator typed
     /// --namespace". This documents why `run_pending_events` must not reuse
     /// that entry point for a synthesized, non-CLI-parsed namespace default.
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
+    async fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -7075,8 +7076,9 @@ mod tests {
             resumed_generation: None,
         };
 
-        let (_server, schedule_rt) =
-            crate::serve::build_server(&args).expect("build_server must succeed");
+        let (_server, schedule_rt) = crate::serve::build_server(&args)
+            .await
+            .expect("build_server must succeed");
         let rt = schedule_rt.expect("\"schedule\" pack is in the default pack set");
         assert_eq!(
             rt.config().actor_id,

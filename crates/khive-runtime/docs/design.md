@@ -33,10 +33,31 @@
 - A tracked supervisor owns admitted backend work. Request cancellation drops
   only the waiter, while capacity remains charged until native work ends; daemon
   drain observes the supervisor through ADR-119 background-task accounting
-- Raw store access remains temporarily available for mutation, stat, existence,
-  and compatibility with the still-unmigrated whole-buffer readers. ADR-160
-  Phase 3 routes those production reads through `BlobHydrator` and removes the
-  raw read surface
+- Raw store access is limited to mutation, stat, existence, delete, and
+  maintenance. Production whole-buffer reads route through `BlobHydrator`; the
+  unbounded raw read surface was removed in ADR-160 Phase 3
+
+### Role-Keyed Attachments and V21 Cutover (ADR-121, ADR-160 D4)
+
+- Phase 4a separately ships the transactional-GC compatibility gate without
+  changing V20 schema/data. Phase-4b runtime builders may cut over only after
+  that build converges fleet-wide and every pre-Phase-4a process sharing the
+  database/blob root is drained. Every Phase-4a application reader/writer must
+  also be quiesced or unable to access the database during cutover; only a
+  GC-only worker has narrow completed-V21 compatibility. Phase-4b serving
+  starts after exact-current topology validation
+- `Entity.content_ref` is a compatibility read projection of attachment role
+  `content`; entity writes do not persist a same-named column
+- `create_entity_with_attachments` verifies every referenced blob, then commits
+  the entity and all initial roles in one backend transaction
+- `KhiveRuntime::attachments()` is accepted only on backend `main`. A pack bound
+  to a secondary backend routes record-plus-attachment work through `core()`
+- Hard entity/note deletion removes attachment rows in the same transaction;
+  soft deletion retains them as recoverable liveness anchors
+- Direct `KhiveRuntime::new` may finish an empty V21 migration, but refuses a
+  legacy application-assisted cutover. Production hosts use
+  `from_prepared_backend` only after the async boot coordinator has authenticated
+  legacy pack evidence and completed V21
 
 ### Namespace Strategy (Rev 6) (ADR-007)
 
@@ -56,9 +77,17 @@
 ### Multi-Backend Deployment (ADR-009, ADR-028)
 
 - `BackendId` identifies a named backend in multi-backend deployments; single-backend uses `"main"`
-- `KhiveRuntime::from_backend` is the preferred boot path for multi-backend deployments
+- Official multi-backend host boot coordinates schema/V21 first, then uses the
+  low-level backend assembly seam; unchecked `from_backend` is not itself a
+  migration or serving entrypoint
+- The host prepares and inventories every secondary before enabling V21 on
+  main; any secondary attachment liveness blocks boot because main is the sole
+  SQL authority visible to transactional blob GC
 - Cross-backend `merge_entity` is unsupported in v1; both entities must reside on the same backend
-- `db_path` and `embedding_model` on `RuntimeConfig` are deprecated in favour of the external-backend path
+- `RuntimeConfig::db_path` remains the database input to the supported async
+  single-backend host builder. `embedding_model` remains the compatibility
+  primary-model shorthand beside `EmbedderRegistry`; neither field makes direct
+  `from_backend` assembly a supported production boot path
 
 ### KG Versioning / Portability (ADR-010)
 
@@ -218,5 +247,5 @@
 ## Consistency Notes
 
 - `validation.rs` line 112 references `ADR-020` (git-native write path) in relation to `GraphPatch`. The git-native write path is out of scope for the v0.2 validation cluster; this is accurate documentation of a deferred feature, not a discrepancy.
-- `RuntimeConfig::db_path` and `RuntimeConfig::embedding_model` are documented as deprecated (in favour of `from_backend` and `EmbedderRegistry`) but remain in place for backward compatibility with tests and single-binary deployments. They should be removed when all callers migrate to the external-backend boot path.
+- `RuntimeConfig::db_path` remains the database input to the supported async khive-mcp/kkernel host builders and to current-schema tests. Direct `from_backend` assembly is a low-level, already-prepared-backend seam; production boot coordinates V21 first and may use `from_prepared_backend`. `embedding_model` remains the primary-model shorthand beside `EmbedderRegistry`.
 - `PackRuntime::register_embedders` hook docs reference "ADR-031 extension" — this is the pack-extensible embedder hook added alongside ADR-031, not a separate ADR. The name is stable.

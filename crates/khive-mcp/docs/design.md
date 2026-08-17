@@ -40,6 +40,29 @@ decisions and rationale.
 - `register_embedders` is called on every pack after the registry is built so
   custom embedding providers are available before the first `remember`/`recall`.
 
+### Attachment Cutover Boot Gate (ADR-121, ADR-160 D4)
+
+- Phase-4b host boot assumes the mandatory deployment gate has already passed:
+  the separately released Phase-4a GC epoch gate has converged everywhere that
+  shares the database/blob root, and every pre-Phase-4a process has been drained
+  and restart-fenced. Every Phase-4a application-serving/read-write process is
+  also quiesced or unable to access the database during cutover. Phase 4a itself
+  leaves V20 schema/data untouched; only its GC-only worker is narrowly
+  compatible with exact completed V21.
+- Single- and multi-backend constructors are async host choke points. They keep
+  serving closed until the coordinated V21 attachment migration is complete.
+- Multi-backend boot opens and deduplicates all databases, prepares and
+  inventories secondaries first, and only then prepares main. Any legacy or
+  current attachment row on a secondary is an actionable boot error.
+- Main cutover resolves one shared `BlobHydrator`, acquires the same canonical
+  database ownership used by transactional blob GC, stages legacy `content`
+  roles, authenticates every moodboard bundle/event/FANN pair even when that
+  pack is disabled, publishes `fann-network`, and finalizes V21.
+- Pending/incomplete state is durable and resumable. No runtime, request, or GC
+  surface is exposed until finalization drops `entities.content_ref` and installs
+  attachment-only claim fences. The Phase-4b serving fleet starts only after
+  exact-current topology validation.
+
 ### Dynamic Pack Loading (ADR-027)
 
 - `builtin_pack_names()` is sourced from `PackRegistry::discovered_names()` so

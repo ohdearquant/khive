@@ -12,6 +12,7 @@ pub mod handlers;
 mod model;
 mod pack;
 mod preference;
+mod preference_artifact;
 mod preference_handlers;
 mod preprocess;
 pub mod vocab;
@@ -20,6 +21,11 @@ use khive_runtime::KhiveRuntime;
 use khive_types::{EntityTypeDef, HandlerDef, Pack};
 
 use model::VisionModelState;
+
+pub use preference_artifact::{
+    legacy_preference_model_count, verify_legacy_preference_attachments,
+    VerifiedModelNetworkAttachment,
+};
 
 pub(crate) const PACK_NAME: &str = "moodboard";
 

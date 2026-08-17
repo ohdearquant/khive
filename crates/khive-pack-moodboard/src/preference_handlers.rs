@@ -14,17 +14,21 @@ use khive_runtime::{
 use khive_storage::blob::ContentRef;
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
-use khive_storage::{BlobStore, Entity};
+use khive_storage::{AttachmentSubstrate, BlobStore, Entity, NewAttachment};
 use khive_types::{EdgeRelation, EventKind, EventOutcome, SubstrateKind};
 
 use crate::preference::{
-    deserialize_fann, feature_schema_id, feature_schema_response, is_lower_hex_64, predict,
-    prepare_training_data, sha256_hex, train_model, validate_features, validate_loaded_bundle,
-    validate_reason_code, JudgmentChoice, JudgmentRecord, ModelBundle, PreferenceScope,
-    PresentationProvenance, RandomizationProvenance, ReasonCode, ResultOccurrence,
-    SelectionProvenance, ServeRecord, TrainedModel, FEATURE_COUNT, FEATURE_SCHEMA_VERSION,
-    JUDGMENT_SCHEMA_VERSION, MAX_TRAINING_EVENTS, MODEL_BUNDLE_SCHEMA_VERSION,
-    PREFERENCE_RESPONSE_SCHEMA_VERSION, RANDOMIZATION_REVISION, SERVE_SCHEMA_VERSION,
+    feature_schema_id, feature_schema_response, is_lower_hex_64, predict, prepare_training_data,
+    sha256_hex, train_model, validate_features, validate_loaded_bundle, validate_reason_code,
+    JudgmentChoice, JudgmentRecord, ModelBundle, PreferenceScope, PresentationProvenance,
+    RandomizationProvenance, ReasonCode, ResultOccurrence, SelectionProvenance, ServeRecord,
+    TrainedModel, FEATURE_COUNT, FEATURE_SCHEMA_VERSION, JUDGMENT_SCHEMA_VERSION,
+    MAX_TRAINING_EVENTS, MODEL_BUNDLE_SCHEMA_VERSION, PREFERENCE_RESPONSE_SCHEMA_VERSION,
+    RANDOMIZATION_REVISION, SERVE_SCHEMA_VERSION,
+};
+use crate::preference_artifact::{
+    model_event_id, validate_model_event_evidence, verify_preference_bundle_evidence,
+    verify_preference_network,
 };
 use crate::MoodboardPack;
 
@@ -36,7 +40,6 @@ const MAX_RESPONSE_MS: u64 = 3_600_000;
 // These UUIDv5 namespaces and their name framing are persistent wire identity.
 // ADR-149 freezes both values; golden tests below prevent accidental drift.
 const JUDGMENT_UUID_NAMESPACE: Uuid = Uuid::from_u128(0x8fc4_55de_533c_5d1d_9228_09b8_1ef1_8e33);
-const MODEL_EVENT_UUID_NAMESPACE: Uuid = Uuid::from_u128(0x1dc2_337e_b200_5bd1_824f_2653_1164_5c16);
 static JUDGMENT_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 static MODEL_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 const TRAIN_CONCURRENCY: usize = 1;
@@ -396,6 +399,12 @@ pub(crate) async fn handle_train_preference(
             "serialize moodboard preference model bundle: {error}"
         ))
     })?;
+    let bundle_size = u64::try_from(bundle_bytes.len()).map_err(|_| {
+        RuntimeError::Internal("moodboard preference bundle size exceeds u64".to_string())
+    })?;
+    let network_size = u64::try_from(trained.network_bytes.len()).map_err(|_| {
+        RuntimeError::Internal("moodboard preference network size exceeds u64".to_string())
+    })?;
     let bundle_sha256 = sha256_hex(&bundle_bytes);
     let bundle_content_ref = blob_store.put(bundle_bytes).await?;
 
@@ -408,6 +417,9 @@ pub(crate) async fn handle_train_preference(
         &trained.bundle,
         &bundle_content_ref,
         &bundle_sha256,
+        bundle_size,
+        &network_content_ref,
+        network_size,
     )
     .await?;
     core.link(
@@ -429,7 +441,7 @@ pub(crate) async fn handle_train_preference(
         &scope,
         &bundle_content_ref,
         &bundle_sha256,
-        &trained.bundle.fann.network_content_ref,
+        &network_content_ref,
         &trained.bundle.fann.network_sha256,
     )
     .await?;
@@ -1210,9 +1222,12 @@ async fn find_model_by_content_ref(
     let mut reader = runtime.sql().reader().await?;
     let row = reader
         .query_row(SqlStatement {
-            sql: "SELECT id FROM entities WHERE namespace = ?1 AND kind = 'artifact' \
-                  AND entity_type = 'moodboard_model' AND content_ref = ?2 \
-                  AND deleted_at IS NULL ORDER BY created_at, id LIMIT 1"
+            sql: "SELECT e.id FROM entities e \
+                  JOIN attachments a ON a.record_uuid = e.id \
+                    AND a.substrate = 'entity' AND a.role = 'content' \
+                  WHERE e.namespace = ?1 AND e.kind = 'artifact' \
+                  AND e.entity_type = 'moodboard_model' AND a.content_ref = ?2 \
+                  AND e.deleted_at IS NULL ORDER BY e.created_at, e.id LIMIT 1"
                 .to_string(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
@@ -1247,8 +1262,29 @@ async fn find_or_create_model(
     bundle: &ModelBundle,
     bundle_content_ref: &ContentRef,
     bundle_sha256: &str,
+    bundle_size: u64,
+    network_content_ref: &ContentRef,
+    network_size: u64,
 ) -> Result<(Entity, bool), RuntimeError> {
     if let Some(existing) = find_model_by_content_ref(runtime, token, bundle_content_ref).await? {
+        let attachment = runtime
+            .attachments()?
+            .get_attachment(existing.id, "fann-network")
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "moodboard preference model {} has no fann-network attachment",
+                    existing.id
+                ))
+            })?;
+        if attachment.substrate != AttachmentSubstrate::Entity
+            || attachment.content_ref != *network_content_ref
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "moodboard preference model {} fann-network attachment disagrees with its authenticated bundle",
+                existing.id
+            )));
+        }
         return Ok((existing, false));
     }
     let properties = json!({
@@ -1267,7 +1303,7 @@ async fn find_or_create_model(
         "network_sha256": bundle.fann.network_sha256,
     });
     let model = runtime
-        .create_entity_with_content_ref(
+        .create_entity_with_attachments(
             token,
             "artifact",
             Some("moodboard_model"),
@@ -1279,18 +1315,23 @@ async fn find_or_create_model(
                 "preference_model".to_string(),
                 "experimental".to_string(),
             ],
-            bundle_content_ref,
+            vec![
+                NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: bundle_content_ref.clone(),
+                    media_type: Some("application/json".to_string()),
+                    size_bytes: Some(bundle_size),
+                },
+                NewAttachment {
+                    role: "fann-network".to_string(),
+                    content_ref: network_content_ref.clone(),
+                    media_type: Some("application/octet-stream".to_string()),
+                    size_bytes: Some(network_size),
+                },
+            ],
         )
         .await?;
     Ok((model, true))
-}
-
-fn model_event_id(model_id: Uuid, bundle_content_ref: &ContentRef) -> Uuid {
-    let mut name = Vec::with_capacity(16 + 1 + 64);
-    name.extend_from_slice(model_id.as_bytes());
-    name.push(0);
-    name.extend_from_slice(bundle_content_ref.as_str().as_bytes());
-    Uuid::new_v5(&MODEL_EVENT_UUID_NAMESPACE, &name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1301,7 +1342,7 @@ async fn ensure_model_event(
     scope: &PreferenceScope,
     bundle_content_ref: &ContentRef,
     bundle_sha256: &str,
-    network_content_ref: &str,
+    network_content_ref: &ContentRef,
     network_sha256: &str,
 ) -> Result<(), RuntimeError> {
     let event_id = model_event_id(model.id, bundle_content_ref);
@@ -1316,9 +1357,9 @@ async fn ensure_model_event(
     });
     let store = runtime.events(token)?;
     if let Some(existing) = store.get_event(event_id).await? {
-        return validate_model_event(
+        return validate_model_event_evidence(
             &existing,
-            token,
+            &model.namespace,
             model.id,
             scope,
             bundle_content_ref,
@@ -1342,9 +1383,9 @@ async fn ensure_model_event(
     match store.append_event(event).await {
         Ok(()) => Ok(()),
         Err(first_error) => match store.get_event(event_id).await? {
-            Some(existing) => validate_model_event(
+            Some(existing) => validate_model_event_evidence(
                 &existing,
-                token,
+                &model.namespace,
                 model.id,
                 scope,
                 bundle_content_ref,
@@ -1355,44 +1396,6 @@ async fn ensure_model_event(
             None => Err(first_error.into()),
         },
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_model_event(
-    event: &Event,
-    token: &NamespaceToken,
-    model_id: Uuid,
-    scope: &PreferenceScope,
-    bundle_content_ref: &ContentRef,
-    bundle_sha256: &str,
-    network_content_ref: &str,
-    network_sha256: &str,
-) -> Result<(), RuntimeError> {
-    let expected = json!({
-        "schema_version": MODEL_BUNDLE_SCHEMA_VERSION,
-        "preference_model_id": model_id,
-        "model_content_ref": bundle_content_ref,
-        "model_fingerprint": bundle_sha256,
-        "network_content_ref": network_content_ref,
-        "network_sha256": network_sha256,
-        "scope": scope,
-    });
-    if event.id != model_event_id(model_id, bundle_content_ref)
-        || !has_success_entity_envelope(event, token)
-        || event.verb != MODEL_RECORD_VERB
-        || event.kind != EventKind::Audit
-        || event.actor != actor_label(token)
-        || event.target_id != Some(model_id)
-        || event.aggregate_kind.as_deref() != Some("moodboard_model")
-        || event.aggregate_id != Some(model_id)
-        || event.payload_schema_version != 1
-        || event.payload != expected
-    {
-        return Err(RuntimeError::InvalidInput(format!(
-            "moodboard preference model {model_id} lacks matching immutable pack provenance"
-        )));
-    }
-    Ok(())
 }
 
 async fn load_preference_model(
@@ -1413,38 +1416,6 @@ async fn load_preference_model(
         ))
     })?;
     let bundle_content_ref = parse_content_ref(raw_ref, "moodboard model content_ref")?;
-    let hydrator = require_blob_hydrator(runtime)?;
-    let bundle_blob = hydrator
-        .hydrate_verified(&bundle_content_ref, MAX_MODEL_BLOB_BYTES)
-        .await?;
-    let bundle_sha256 = sha256_hex(bundle_blob.bytes());
-    let bundle: ModelBundle = serde_json::from_slice(bundle_blob.bytes()).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "moodboard preference model {model_id} bundle is corrupt: {error}"
-        ))
-    })?;
-    validate_loaded_bundle(&bundle)?;
-    if &bundle.scope != expected_scope {
-        return Err(RuntimeError::InvalidInput(format!(
-            "moodboard preference model {model_id} has the wrong board, actor, descriptor, or feature-schema scope"
-        )));
-    }
-    validate_entity_model_properties(&entity, &bundle, &bundle_sha256)?;
-    let network_content_ref = parse_content_ref(
-        &bundle.fann.network_content_ref,
-        "moodboard model network_content_ref",
-    )?;
-    drop(bundle_blob);
-    let network_blob = hydrator
-        .hydrate_verified(&network_content_ref, MAX_MODEL_BLOB_BYTES)
-        .await?;
-    if sha256_hex(network_blob.bytes()) != bundle.fann.network_sha256 {
-        return Err(RuntimeError::InvalidInput(format!(
-            "moodboard preference model {model_id} FANN SHA-256 does not match its bundle"
-        )));
-    }
-    let network = deserialize_fann(network_blob.bytes())?;
-    drop(network_blob);
     let event_id = model_event_id(model_id, &bundle_content_ref);
     let event = runtime
         .events(token)?
@@ -1455,21 +1426,52 @@ async fn load_preference_model(
                 "moodboard preference model {model_id} has no immutable pack provenance event"
             ))
         })?;
-    validate_model_event(
-        &event,
-        token,
+    let hydrator = require_blob_hydrator(runtime)?;
+    let bundle_blob = hydrator
+        .hydrate_verified(&bundle_content_ref, MAX_MODEL_BLOB_BYTES)
+        .await?;
+    let verified = verify_preference_bundle_evidence(
         model_id,
-        &bundle.scope,
+        &entity.namespace,
         &bundle_content_ref,
-        &bundle_sha256,
-        &bundle.fann.network_content_ref,
-        &bundle.fann.network_sha256,
+        bundle_blob.bytes(),
+        &event,
     )?;
+    drop(bundle_blob);
+    let network_attachment = runtime
+        .attachments()?
+        .get_attachment(model_id, "fann-network")
+        .await?
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "moodboard preference model {model_id} has no fann-network attachment"
+            ))
+        })?;
+    if network_attachment.record_uuid != model_id
+        || network_attachment.substrate != AttachmentSubstrate::Entity
+        || network_attachment.role != "fann-network"
+        || network_attachment.content_ref != verified.network_ref
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard preference model {model_id} fann-network attachment disagrees with its authenticated bundle"
+        )));
+    }
+    let network_blob = hydrator
+        .hydrate_verified(&verified.network_ref, MAX_MODEL_BLOB_BYTES)
+        .await?;
+    let network = verify_preference_network(&verified, network_blob.bytes())?;
+    drop(network_blob);
+    if &verified.bundle.scope != expected_scope {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard preference model {model_id} has the wrong board, actor, descriptor, or feature-schema scope"
+        )));
+    }
+    validate_entity_model_properties(&entity, &verified.bundle, &verified.bundle_sha256)?;
     Ok(LoadedPreferenceModel {
         entity,
         bundle_content_ref,
-        bundle_sha256,
-        bundle,
+        bundle_sha256: verified.bundle_sha256,
+        bundle: verified.bundle,
         network,
     })
 }
@@ -1535,11 +1537,16 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
+    use khive_db::migrations::{AttachmentCutoverStatus, ATTACHMENT_CUTOVER_VERSION, MIGRATIONS};
+    use khive_db::stores::blob::acquire_database_gc_owner;
     use khive_db::stores::blob::FsBlobStore;
+    use khive_db::StorageBackend;
     use khive_runtime::{BackendId, Namespace, RuntimeConfig};
+    use khive_storage::Attachment;
 
     use super::*;
     use crate::preference::{
@@ -1591,8 +1598,8 @@ mod tests {
         }
     }
 
-    fn persistent_runtime(db_path: &Path, actor_id: &str) -> KhiveRuntime {
-        KhiveRuntime::new(RuntimeConfig {
+    fn persistent_runtime_config(db_path: &Path, actor_id: &str) -> RuntimeConfig {
+        RuntimeConfig {
             git_write: Default::default(),
             db_path: Some(db_path.to_path_buf()),
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
@@ -1606,8 +1613,46 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some(actor_id.to_string()),
-        })
-        .expect("persistent runtime")
+        }
+    }
+
+    fn persistent_runtime(db_path: &Path, actor_id: &str) -> KhiveRuntime {
+        KhiveRuntime::new(persistent_runtime_config(db_path, actor_id)).expect("persistent runtime")
+    }
+
+    fn canonical_v20_backend(db_path: &Path) -> Arc<StorageBackend> {
+        let backend = Arc::new(StorageBackend::sqlite(db_path).expect("V20 fixture backend"));
+        let mut writer = backend.pool().try_writer().expect("V20 fixture writer");
+        let conn = writer.conn_mut();
+        conn.execute_batch(
+            "CREATE TABLE _schema_migrations (\
+                 version INTEGER PRIMARY KEY, \
+                 name TEXT NOT NULL, \
+                 applied_at INTEGER NOT NULL\
+             ) STRICT;",
+        )
+        .expect("create V20 fixture migration ledger");
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+        {
+            let tx = conn.transaction().expect("begin V20 fixture migration");
+            tx.execute_batch(migration.up)
+                .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
+            tx.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                 VALUES (?1, ?2, ?3)",
+                (
+                    migration.version,
+                    migration.name,
+                    i64::from(migration.version),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
+            tx.commit().expect("commit V20 fixture migration");
+        }
+        drop(writer);
+        backend
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1662,7 +1707,7 @@ mod tests {
             .await
             .unwrap();
         let asset = runtime
-            .create_entity_with_content_ref(
+            .create_entity_with_attachments(
                 &token,
                 "artifact",
                 Some("visual_asset"),
@@ -1670,7 +1715,12 @@ mod tests {
                 None,
                 None,
                 vec![],
-                &content_ref,
+                vec![NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: content_ref.clone(),
+                    media_type: Some("image/png".to_string()),
+                    size_bytes: Some(32),
+                }],
             )
             .await
             .unwrap();
@@ -1885,7 +1935,9 @@ mod tests {
             descriptor_fingerprint: "b".repeat(64),
             feature_schema_id: feature_schema_id().to_string(),
         };
-        let (_, network_bytes) = materialize_fann(&[0.25; FEATURE_COUNT]).unwrap();
+        let (network, network_bytes) = materialize_fann(&[0.25; FEATURE_COUNT]).unwrap();
+        let (_, expected_probability) =
+            predict(&network, 1.25, &[0.9; FEATURE_COUNT], &[0.1; FEATURE_COUNT]).unwrap();
         let network_content_ref = blob_store.put(network_bytes.clone()).await.unwrap();
         let split_counts = BTreeMap::from([
             (
@@ -1977,6 +2029,7 @@ mod tests {
         };
         validate_loaded_bundle(&bundle).unwrap();
         let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
+        let bundle_size = u64::try_from(bundle_bytes.len()).unwrap();
         let bundle_sha256 = sha256_hex(&bundle_bytes);
         let bundle_content_ref = blob_store.put(bundle_bytes).await.unwrap();
         let (entity, created) = find_or_create_model(
@@ -1986,6 +2039,9 @@ mod tests {
             &bundle,
             &bundle_content_ref,
             &bundle_sha256,
+            bundle_size,
+            &network_content_ref,
+            u64::try_from(network_bytes.len()).unwrap(),
         )
         .await
         .unwrap();
@@ -1997,7 +2053,7 @@ mod tests {
             &scope,
             &bundle_content_ref,
             &bundle_sha256,
-            &bundle.fann.network_content_ref,
+            &network_content_ref,
             &bundle.fann.network_sha256,
         )
         .await
@@ -2009,7 +2065,7 @@ mod tests {
 
         let restarted = persistent_runtime(&db_path, "alice");
         let recording_store = Arc::new(RecordingBoundedStore {
-            inner: Arc::new(FsBlobStore::new(blob_root, 0).unwrap()),
+            inner: Arc::new(FsBlobStore::new(blob_root.clone(), 0).unwrap()),
             calls: Mutex::new(Vec::new()),
         });
         restarted
@@ -2026,7 +2082,10 @@ mod tests {
             &[0.1; FEATURE_COUNT],
         )
         .unwrap();
-        assert!(probability > 0.5);
+        assert_eq!(
+            probability, expected_probability,
+            "attachment-backed restart must reconstruct the exact prior FANN prediction"
+        );
         assert_eq!(
             *recording_store.calls.lock().unwrap(),
             vec![
@@ -2036,11 +2095,185 @@ mod tests {
             "bundle and network must each enter shared bounded hydration at the 1 MiB pack cap"
         );
 
-        let mut wrong_scope = scope;
+        let mut wrong_scope = scope.clone();
         wrong_scope.board_id = "f".repeat(64);
         let error = load_preference_model(&restarted, &restarted_token, model_id, &wrong_scope)
             .await
             .expect_err("wrong identity must fail closed");
         assert!(error.to_string().contains("wrong board"));
+
+        let published_event = restarted
+            .events(&restarted_token)
+            .unwrap()
+            .get_event(model_event_id(model_id, &bundle_content_ref))
+            .await
+            .unwrap()
+            .expect("published model event");
+        let legacy_db_path = temp.path().join("legacy-v20.db");
+        let legacy_backend = canonical_v20_backend(&legacy_db_path);
+        {
+            let writer = legacy_backend
+                .pool()
+                .try_writer()
+                .expect("legacy fixture writer");
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO entities (\
+                         id, namespace, kind, entity_type, name, description, properties, tags, \
+                         created_at, updated_at, deleted_at, merged_into, merge_event_id, \
+                         content_ref\
+                     ) VALUES (\
+                         ?1, 'local', 'artifact', 'moodboard_model', 'legacy preference model', \
+                         NULL, ?2, '[]', ?3, ?3, NULL, NULL, NULL, ?4\
+                     )",
+                    (
+                        model_id.to_string(),
+                        entity
+                            .properties
+                            .as_ref()
+                            .expect("model property mirror")
+                            .to_string(),
+                        entity.created_at,
+                        bundle_content_ref.to_string(),
+                    ),
+                )
+                .expect("insert pre-V21 legacy model");
+        }
+        legacy_backend
+            .events_for_namespace("local")
+            .unwrap()
+            .append_event(published_event)
+            .await
+            .expect("insert immutable legacy model event");
+
+        let legacy_sql = legacy_backend.sql();
+        let owner = acquire_database_gc_owner(legacy_sql.as_ref())
+            .await
+            .expect("acquire legacy database GC owner");
+        legacy_backend
+            .stage_attachment_cutover(&owner)
+            .expect("stage real V21 cutover");
+        assert_eq!(
+            legacy_backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Incomplete
+        );
+        assert_eq!(
+            crate::legacy_preference_model_count(legacy_sql.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
+        let shared_hydrator = restarted.blob_hydrator().expect("shared restart hydrator");
+        let verified = crate::verify_legacy_preference_attachments(
+            legacy_sql.as_ref(),
+            shared_hydrator.as_ref(),
+        )
+        .await
+        .expect("verify real pre-V21 model evidence");
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].model_id, model_id);
+        assert_eq!(verified[0].network_content_ref, network_content_ref);
+        let verified_attachments = verified
+            .into_iter()
+            .map(|verified| Attachment {
+                record_uuid: verified.model_id,
+                substrate: AttachmentSubstrate::Entity,
+                role: "fann-network".to_string(),
+                content_ref: verified.network_content_ref,
+                media_type: Some("application/octet-stream".to_string()),
+                size_bytes: Some(verified.size_bytes),
+                created_at: entity.created_at,
+            })
+            .collect::<Vec<_>>();
+        legacy_backend
+            .apply_verified_attachments(&owner, &verified_attachments)
+            .expect("apply verified fann-network role");
+        legacy_backend
+            .finalize_attachment_cutover(&owner)
+            .expect("finalize real V21 cutover");
+        assert_eq!(
+            legacy_backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Complete
+        );
+        drop(owner);
+
+        let sweep_store = Arc::new(
+            FsBlobStore::new(blob_root, 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let migrated = KhiveRuntime::from_prepared_backend(
+            Arc::clone(&legacy_backend),
+            persistent_runtime_config(&legacy_db_path, "alice"),
+        )
+        .expect("runtime over finalized V21 database");
+        migrated
+            .install_blob_store(sweep_store.clone())
+            .expect("install migrated blob store");
+        let migrated_token = migrated.authorize(Namespace::local()).unwrap();
+        let migrated_model = load_preference_model(&migrated, &migrated_token, model_id, &scope)
+            .await
+            .expect("load migrated model");
+        let (_, migrated_probability) = predict(
+            &migrated_model.network,
+            migrated_model.bundle.calibration.temperature,
+            &[0.9; FEATURE_COUNT],
+            &[0.1; FEATURE_COUNT],
+        )
+        .unwrap();
+        assert_eq!(migrated_probability, expected_probability);
+
+        let orphan_ref = sweep_store
+            .put(b"unreferenced migration regression object".to_vec())
+            .await
+            .unwrap();
+        let sweep = sweep_store
+            .transactional_orphan_sweep(legacy_sql.as_ref(), false)
+            .await
+            .expect("attachment-only GC after V21 finalization");
+        assert_eq!(sweep.deleted, 1, "the control orphan proves GC executed");
+        assert!(!sweep_store.exists(&orphan_ref).await.unwrap());
+        assert!(sweep_store.exists(&bundle_content_ref).await.unwrap());
+        assert!(sweep_store.exists(&network_content_ref).await.unwrap());
+        let after_gc = load_preference_model(&migrated, &migrated_token, model_id, &scope)
+            .await
+            .expect("load migrated model after attachment-only GC");
+        let (_, after_gc_probability) = predict(
+            &after_gc.network,
+            after_gc.bundle.calibration.temperature,
+            &[0.9; FEATURE_COUNT],
+            &[0.1; FEATURE_COUNT],
+        )
+        .unwrap();
+        assert_eq!(after_gc_probability, expected_probability);
+
+        let wrong_network_ref = ContentRef::from_hex("f".repeat(64)).unwrap();
+        restarted
+            .attachments()
+            .unwrap()
+            .upsert_attachment(Attachment {
+                record_uuid: model_id,
+                substrate: AttachmentSubstrate::Entity,
+                role: "fann-network".to_string(),
+                content_ref: wrong_network_ref,
+                media_type: Some("application/octet-stream".to_string()),
+                size_bytes: Some(u64::try_from(network_bytes.len()).unwrap()),
+                created_at: entity.created_at,
+            })
+            .await
+            .unwrap();
+        recording_store.calls.lock().unwrap().clear();
+        let error = load_preference_model(&restarted, &restarted_token, model_id, &scope)
+            .await
+            .expect_err("attachment disagreement must fail before network hydration");
+        assert!(error
+            .to_string()
+            .contains("fann-network attachment disagrees"));
+        assert_eq!(
+            *recording_store.calls.lock().unwrap(),
+            vec![(bundle_content_ref, MAX_MODEL_BLOB_BYTES)],
+            "an unauthenticated attachment reference must never reach the hydrator"
+        );
     }
 }

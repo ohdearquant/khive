@@ -842,15 +842,15 @@ impl Drop for BackgroundTaskGuard {
     }
 }
 
-/// Spawn a fire-and-forget background task that daemon shutdown's `drain()`
-/// waits for, instead of a bare `tokio::spawn` that a SIGTERM can abort
-/// mid-flight with no trace. Only the enqueue (an atomic increment) is
-/// synchronous on the caller's path — the future itself still runs fully
-/// off-path, unawaited. The decrement happens via `BackgroundTaskGuard`'s
-/// `Drop`, so a panic inside `fut` still restores the count.
-pub fn track_background_task<F>(fut: F)
+/// Spawn a task that daemon shutdown's `drain()` waits for and return its join
+/// handle. Retaining the handle lets boot coordinators form an explicit barrier;
+/// dropping it deliberately detaches the task while the background counter still
+/// keeps daemon drain aware of its lifetime. The decrement happens via
+/// `BackgroundTaskGuard`'s `Drop`, including panic and cancellation paths.
+pub fn spawn_tracked_task<F, T>(fut: F) -> tokio::task::JoinHandle<T>
 where
-    F: std::future::Future<Output = ()> + Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
 {
     background_tasks().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let guard = BackgroundTaskGuard {
@@ -858,8 +858,19 @@ where
     };
     tokio::spawn(async move {
         let _guard = guard;
-        fut.await;
-    });
+        fut.await
+    })
+}
+
+/// Spawn a fire-and-forget task through [`spawn_tracked_task`].
+///
+/// Callers that need a boot or shutdown barrier should retain and await the
+/// returned handle from [`spawn_tracked_task`] instead of detaching it here.
+pub fn track_background_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    drop(spawn_tracked_task(fut));
 }
 
 /// Current count of in-flight tasks started via [`track_background_task`].

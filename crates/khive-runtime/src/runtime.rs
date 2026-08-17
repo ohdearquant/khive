@@ -12,7 +12,7 @@ use khive_gate::AllowAllGate;
 use khive_gate::GateRequest;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{
-    EntityStore, Event, EventStore, GraphStore, NoteStore, SqlAccess, VectorStore,
+    AttachmentStore, EntityStore, Event, EventStore, GraphStore, NoteStore, SqlAccess, VectorStore,
 };
 use khive_types::{EdgeEndpointRule, EventKind, Namespace, SubstrateKind};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
@@ -238,10 +238,13 @@ impl KhiveRuntime {
     /// Create a new runtime with the given config.
     ///
     /// The config's `db_path` is used to open or create the SQLite backend.
-    /// For the preferred boot path in multi-backend deployments, use
-    /// [`from_backend`](Self::from_backend) instead.
+    /// This direct constructor is intended for fresh/current single-backend
+    /// databases and tests. Production and multi-backend hosts must use the
+    /// async khive-mcp/kkernel builders so secondary inventory and any
+    /// application-assisted V21 cutover complete before serving. The
+    /// [`from_backend`](Self::from_backend) seam is likewise only for an
+    /// already-prepared backend.
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let backend = match &config.db_path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -254,28 +257,20 @@ impl KhiveRuntime {
         // Writable backends migrate before handlers touch the DB. A detected
         // read-only snapshot is validated at the current schema version without
         // attempting migration DDL.
-        backend.prepare_core_schema()?;
+        let schema_version = backend.prepare_core_schema()?;
+        if schema_version < khive_db::migrations::ATTACHMENT_CUTOVER_VERSION {
+            return Err(khive_db::SqliteError::InvalidData(
+                "database requires the host application-assisted V21 attachment cutover; \
+                 start through khive-mcp/kkernel boot instead of constructing KhiveRuntime \
+                 directly"
+                    .into(),
+            )
+            .into());
+        }
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;
         }
-        let (registry, default_embedder_name) = build_embedder_registry(&config);
-        Ok(Self {
-            backend: Arc::new(backend),
-            core_backend: None,
-            config,
-            ann_fresh_tail_enabled,
-            embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
-            default_embedder_name,
-            edge_rules: Arc::new(RwLock::new(Vec::new())),
-            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
-            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
-            entity_type_validator: Arc::new(RwLock::new(None)),
-            note_mutation_hook: Arc::new(RwLock::new(None)),
-            note_write_validator: Arc::new(RwLock::new(None)),
-            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
-            blob_hydrator: Arc::new(OnceLock::new()),
-            fusion_executors: Arc::new(RwLock::new(HashMap::new())),
-        })
+        Ok(Self::assemble_from_backend(Arc::new(backend), config))
     }
 
     /// Open a runtime for read-only inspection (no model registration, no DB creation).
@@ -285,48 +280,61 @@ impl KhiveRuntime {
     /// or configured-model registration writes are attempted. A `None` path
     /// retains the historical ephemeral in-memory behavior for tests.
     pub fn new_readonly(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let backend = match &config.db_path {
             Some(path) => StorageBackend::sqlite_read_only(path)?,
             None => StorageBackend::memory()?,
         };
         backend.prepare_core_schema()?;
-        let (registry, default_embedder_name) = build_embedder_registry(&config);
-        Ok(Self {
-            backend: Arc::new(backend),
-            core_backend: None,
-            config,
-            ann_fresh_tail_enabled,
-            embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
-            default_embedder_name,
-            edge_rules: Arc::new(RwLock::new(Vec::new())),
-            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
-            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
-            entity_type_validator: Arc::new(RwLock::new(None)),
-            note_mutation_hook: Arc::new(RwLock::new(None)),
-            note_write_validator: Arc::new(RwLock::new(None)),
-            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
-            blob_hydrator: Arc::new(OnceLock::new()),
-            fusion_executors: Arc::new(RwLock::new(HashMap::new())),
-        })
+        Ok(Self::assemble_from_backend(Arc::new(backend), config))
     }
 
     /// Construct a runtime from an already-opened backend.
     ///
-    /// This is the preferred constructor for multi-backend deployments. The caller
-    /// (boot path in `kkernel` or `khive-mcp`) opens each backend from `khive.toml`,
-    /// then constructs a `KhiveRuntime` per pack using this method.
+    /// This is a low-level, infallible assembly seam for already-prepared
+    /// multi-backend deployments. It does not inspect or migrate the V21
+    /// attachment-cutover state. Production hosts must first run the async
+    /// kkernel/khive-mcp coordinator and must not expose a server over a
+    /// pending or incomplete backend. Prefer [`Self::from_prepared_backend`]
+    /// when constructing one fallible host runtime.
     ///
     /// The returned runtime has `db_path = None` and `embedding_model = None`; all
     /// storage access is through the provided `backend`. Set `backend_id` and
     /// `default_namespace` via the config builder pattern if non-defaults are needed.
     pub fn from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
-        let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         if !backend.is_read_only() {
             if let Err(err) = register_configured_embedding_models(&backend, &config) {
                 tracing::warn!(error = %err, "failed to register configured embedding models");
             }
         }
+        Self::assemble_from_backend(backend, config)
+    }
+
+    /// Construct a single-backend runtime after a host boot coordinator has
+    /// completed schema preparation and any application-assisted cutover.
+    ///
+    /// Unlike [`Self::from_backend`], configured embedding-model registration
+    /// is fallible here, preserving [`Self::new`]'s single-backend startup
+    /// semantics. This method never runs migrations itself.
+    pub fn from_prepared_backend(
+        backend: Arc<StorageBackend>,
+        config: RuntimeConfig,
+    ) -> RuntimeResult<Self> {
+        if backend.attachment_cutover_status()?
+            != khive_db::migrations::AttachmentCutoverStatus::Complete
+        {
+            return Err(khive_db::SqliteError::InvalidData(
+                "from_prepared_backend requires a complete V21 attachment cutover".into(),
+            )
+            .into());
+        }
+        if !backend.is_read_only() {
+            register_configured_embedding_models(&backend, &config)?;
+        }
+        Ok(Self::assemble_from_backend(backend, config))
+    }
+
+    fn assemble_from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+        let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Self {
             backend,
@@ -539,6 +547,22 @@ impl KhiveRuntime {
         Ok(self
             .backend
             .notes_for_namespace(token.namespace().as_str())?)
+    }
+
+    /// Return the role-keyed attachment substrate on the canonical main backend.
+    ///
+    /// Attachment rows are the process-shared BlobStore's sole SQL liveness
+    /// authority. A runtime bound directly to a secondary pack backend must call
+    /// [`Self::core`] first; accepting a secondary mutation here would create a
+    /// reference that the main-database GC sweep cannot see or fence.
+    pub fn attachments(&self) -> RuntimeResult<Arc<dyn AttachmentStore>> {
+        if self.config.backend_id.as_str() != BackendId::MAIN {
+            return Err(RuntimeError::InvalidInput(format!(
+                "attachments are owned by the canonical main backend; runtime backend {:?} must route through KhiveRuntime::core()",
+                self.config.backend_id.as_str()
+            )));
+        }
+        Ok(self.backend.attachments()?)
     }
 
     /// Get an EventStore scoped to the token's namespace.
@@ -2607,6 +2631,84 @@ mod tests {
             rt_secondary.core().backend_id().as_str(),
             BackendId::MAIN,
             "core() on a secondary runtime must return a main-bound handle"
+        );
+    }
+
+    #[test]
+    fn attachment_store_rejects_secondary_handle_and_accepts_its_core_projection() {
+        let main_arc = migrated_memory_backend();
+        let secondary_arc = migrated_memory_backend();
+        let rt_secondary = KhiveRuntime::from_backend(secondary_arc, secondary_config())
+            .with_core_backend(main_arc);
+
+        let error = match rt_secondary.attachments() {
+            Ok(_) => panic!("a secondary runtime must not expose attachment mutation"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RuntimeError::InvalidInput(_)));
+        assert!(
+            error.to_string().contains("canonical main backend"),
+            "secondary refusal must explain the liveness authority: {error}"
+        );
+        rt_secondary
+            .core()
+            .attachments()
+            .expect("core projection must expose the main attachment store");
+    }
+
+    #[tokio::test]
+    async fn record_plus_attachment_publication_rejects_a_secondary_runtime() {
+        use khive_storage::{BlobStore as _, NewAttachment};
+
+        let main_arc = migrated_memory_backend();
+        let secondary_arc = migrated_memory_backend();
+        let rt_secondary =
+            KhiveRuntime::from_backend(Arc::clone(&secondary_arc), secondary_config())
+                .with_core_backend(Arc::clone(&main_arc));
+        let blob_root = tempfile::tempdir().expect("blob root");
+        let blob_store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+                .expect("blob store"),
+        );
+        let content_ref = blob_store.put(b"secondary-ref".to_vec()).await.unwrap();
+        rt_secondary
+            .install_blob_store(blob_store.clone())
+            .expect("shared blob store");
+        let token = rt_secondary.authorize(Namespace::local()).unwrap();
+
+        let error = rt_secondary
+            .create_entity_with_attachments(
+                &token,
+                "artifact",
+                Some("visual_asset"),
+                "must route through core",
+                None,
+                None,
+                vec![],
+                vec![NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: content_ref.clone(),
+                    media_type: None,
+                    size_bytes: Some(13),
+                }],
+            )
+            .await
+            .expect_err("secondary attachment publication must fail closed");
+        assert!(error.to_string().contains("canonical main backend"));
+        assert!(rt_secondary
+            .list_entities(&token, None, None, 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(rt_secondary
+            .core()
+            .list_entities(&token, None, None, 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            blob_store.exists(&content_ref).await.unwrap(),
+            "refusal must not mutate the already-published object"
         );
     }
 

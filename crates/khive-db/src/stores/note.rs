@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
+use khive_storage::attachment::AttachmentSubstrate;
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
 use khive_storage::types::{
@@ -18,6 +19,7 @@ use khive_storage::StorageCapability;
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
+use crate::stores::attachment::delete_record_attachments_statement;
 use crate::writer_task::{execute_wrapped_transaction, WriterTaskHandle};
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
@@ -1226,11 +1228,20 @@ impl NoteStore for SqlNoteStore {
                 .await
             }
             DeleteMode::Hard => {
-                let statement = note_hard_delete_statement(id);
-                self.with_writer("delete_note_hard", move |conn| {
-                    let mut stmt = conn.prepare(&statement.sql)?;
-                    bind_params(&mut stmt, &statement.params)?;
-                    Ok(stmt.raw_execute()? > 0)
+                let note_statement = note_hard_delete_statement(id);
+                let attachment_statement =
+                    delete_record_attachments_statement(id, AttachmentSubstrate::Note);
+                self.with_writer_tx("delete_note_hard", move |conn| {
+                    let mut note_stmt = conn.prepare(&note_statement.sql)?;
+                    bind_params(&mut note_stmt, &note_statement.params)?;
+                    let deleted = note_stmt.raw_execute()? > 0;
+                    drop(note_stmt);
+                    if deleted {
+                        let mut attachment_stmt = conn.prepare(&attachment_statement.sql)?;
+                        bind_params(&mut attachment_stmt, &attachment_statement.params)?;
+                        attachment_stmt.raw_execute()?;
+                    }
+                    Ok(deleted)
                 })
                 .await
             }
