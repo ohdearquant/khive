@@ -13784,3 +13784,83 @@ async fn query_page_size_validation_alias_and_hard_cap_are_explicit() {
         .expect("legacy limit alias remains accepted");
     assert_eq!(legacy.get("page_size").and_then(Value::as_u64), Some(7));
 }
+
+// ---- db_diagnostics: ADR-133 D8 additive writer-contention fields ----
+
+#[tokio::test]
+async fn db_diagnostics_runtime_audit_fields_are_additive() {
+    let pack = pack();
+
+    let report = pack
+        .dispatch("db_diagnostics", json!({}))
+        .await
+        .expect("db_diagnostics must succeed against an in-memory backend");
+
+    let writer_contention = report
+        .get("writer_contention")
+        .expect("writer_contention section must be present");
+
+    // Pool-sourced counters (ADR-133 D8): always concrete integers, never
+    // Option, regardless of whether the caller is the runtime or a direct
+    // khive-db user — they come straight off the pool.
+    for field in [
+        "writer_task_request_failures",
+        "writer_task_side_effects_unknown",
+    ] {
+        let value = writer_contention.get(field).unwrap_or_else(|| {
+            panic!("writer_contention.{field} must be present in the wire payload")
+        });
+        assert!(
+            value.is_u64(),
+            "writer_contention.{field} must serialize as a plain non-negative integer, got {value:?}"
+        );
+    }
+
+    // Legacy field: population is unchanged by this additive change. Every
+    // dispatch through the runtime supplies its process-wide swallowed-audit
+    // count, so this remains a concrete number with no unavailable reason —
+    // exactly today's behavior, unperturbed by the new fields.
+    assert!(
+        writer_contention
+            .get("audit_append_failures")
+            .is_some_and(Value::is_u64),
+        "audit_append_failures must retain its existing store-operation population semantics: \
+         {writer_contention:?}"
+    );
+    assert!(writer_contention
+        .get("audit_append_failures_unavailable_reason")
+        .map(Value::is_null)
+        .unwrap_or(false));
+
+    // Runtime audit-batch fields (ADR-133 D8 wire additions): additive and,
+    // with no audit-batch control registered yet, unavailable with a reason
+    // rather than a silently fabricated value.
+    for (field, reason_field) in [
+        (
+            "audit_batch_flush_failures",
+            "audit_batch_flush_failures_unavailable_reason",
+        ),
+        (
+            "audit_degraded_rows",
+            "audit_degraded_rows_unavailable_reason",
+        ),
+        ("audit_degraded", "audit_degraded_unavailable_reason"),
+    ] {
+        assert!(
+            writer_contention
+                .get(field)
+                .map(Value::is_null)
+                .unwrap_or(false),
+            "writer_contention.{field} must be null until an audit-batch control is wired: \
+             {writer_contention:?}"
+        );
+        assert!(
+            writer_contention
+                .get(reason_field)
+                .and_then(Value::as_str)
+                .is_some(),
+            "writer_contention.{reason_field} must explain the unavailable field: \
+             {writer_contention:?}"
+        );
+    }
+}

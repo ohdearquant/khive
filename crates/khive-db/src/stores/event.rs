@@ -13,7 +13,10 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
-use khive_storage::event::{Event, EventFilter, EventObservation, ObservationRole, ReferentKind};
+use khive_storage::event::{
+    Event, EventAppendDisposition, EventFilter, EventObservation, IdempotentEventBatchResult,
+    ObservationRole, ReferentKind,
+};
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest, SqlStatement, SqlValue};
 use khive_storage::EventStore;
 use khive_storage::SqlWriter;
@@ -202,6 +205,32 @@ fn kind_from_str(s: &str) -> Result<EventKind, rusqlite::Error> {
     })
 }
 
+fn referent_kind_from_str(s: &str) -> Result<ReferentKind, rusqlite::Error> {
+    match s {
+        "entity" => Ok(ReferentKind::Entity),
+        "note" => Ok(ReferentKind::Note),
+        other => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown ReferentKind: {other}").into(),
+        )),
+    }
+}
+
+fn observation_role_from_str(s: &str) -> Result<ObservationRole, rusqlite::Error> {
+    match s {
+        "candidate" => Ok(ObservationRole::Candidate),
+        "selected" => Ok(ObservationRole::Selected),
+        "target" => Ok(ObservationRole::Target),
+        "signal" => Ok(ObservationRole::Signal),
+        other => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown ObservationRole: {other}").into(),
+        )),
+    }
+}
+
 fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
     Uuid::parse_str(s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -363,6 +392,104 @@ fn batch_append_events_dml(
         failed: 0,
         first_error: String::new(),
     })
+}
+
+fn fetch_event_by_id(
+    conn: &rusqlite::Connection,
+    id: Uuid,
+) -> Result<Option<Event>, rusqlite::Error> {
+    let id_str = id.to_string();
+    let mut stmt = conn.prepare(
+        "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                payload_schema_version, profile_state_version, duration_us, target_id, \
+                session_id, aggregate_kind, aggregate_id, created_at \
+         FROM events WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![id_str])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(read_event(row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Fetch `event_id`'s persisted observation projection in the same order it
+/// was written: `event_observations`'s primary key is `(event_id, role,
+/// position)`, and every `decode_*_observations` builder emits one role
+/// group at a time in a fixed sequence that sorts identically by `role`
+/// text, so `ORDER BY role, position` reproduces the original emission
+/// order without a separate sequence column.
+fn fetch_event_observations(
+    conn: &rusqlite::Connection,
+    event_id: Uuid,
+) -> Result<Vec<EventObservation>, rusqlite::Error> {
+    let id_str = event_id.to_string();
+    let mut stmt = conn.prepare(
+        "SELECT event_id, entity_id, referent_kind, role, position \
+         FROM event_observations WHERE event_id = ?1 ORDER BY role, position",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![id_str], |row| {
+        let event_id: String = row.get(0)?;
+        let entity_id: String = row.get(1)?;
+        let referent_kind: String = row.get(2)?;
+        let role: String = row.get(3)?;
+        let position: i64 = row.get(4)?;
+        Ok((event_id, entity_id, referent_kind, role, position))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (event_id, entity_id, referent_kind, role, position) = row?;
+        let position_u32: u32 = position.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Integer,
+                format!("position {position} out of u32 range").into(),
+            )
+        })?;
+        out.push(EventObservation {
+            event_id: parse_uuid(&event_id)?,
+            entity_id: parse_uuid(&entity_id)?,
+            referent_kind: referent_kind_from_str(&referent_kind)?,
+            role: observation_role_from_str(&role)?,
+            position: position_u32,
+        });
+    }
+    Ok(out)
+}
+
+/// DML-only idempotent batch loop shared by both the writer-task-routed and
+/// standalone-transaction `append_events_idempotent` paths, mirroring
+/// [`batch_append_events_dml`]'s split. A row whose id is unseen is
+/// inserted; a row whose id already exists is compared column-for-column
+/// plus its ordered observation projection against the submitted event —
+/// exact equality reports `AlreadyPresentIdentical` and skips the write,
+/// any mismatch reports `IdentityConflict` and skips the write for that row
+/// alone. A genuine store failure on a fresh insert still aborts the whole
+/// batch via `Err`, matching `append_events`'s all-or-nothing contract; only
+/// identity comparison is per-row.
+fn idempotent_batch_dml(
+    conn: &rusqlite::Connection,
+    events: &[Event],
+) -> Result<IdempotentEventBatchResult, rusqlite::Error> {
+    let mut rows = Vec::with_capacity(events.len());
+    for event in events {
+        match fetch_event_by_id(conn, event.id)? {
+            None => {
+                insert_event_with_observations(conn, event)?;
+                rows.push(EventAppendDisposition::Inserted);
+            }
+            Some(existing) => {
+                let existing_observations = fetch_event_observations(conn, event.id)?;
+                let submitted_observations = decode_event_observations(event)?;
+                if existing == *event && existing_observations == submitted_observations {
+                    rows.push(EventAppendDisposition::AlreadyPresentIdentical);
+                } else {
+                    rows.push(EventAppendDisposition::IdentityConflict);
+                }
+            }
+        }
+    }
+    Ok(IdempotentEventBatchResult { rows })
 }
 
 /// Pure statement builder (ADR-099 B3 r6 structural cut): the exact
@@ -1205,6 +1332,47 @@ impl EventStore for SqlEventStore {
                 params.iter().map(|p| p.as_ref()).collect();
             let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
             Ok(count as u64)
+        })
+        .await
+    }
+
+    fn preflight_event(&self, event: &Event) -> Result<(), StorageError> {
+        event_insert_statements(event)
+            .map(|_| ())
+            .map_err(|e| map_err(e, "preflight_event"))
+    }
+
+    async fn append_events_idempotent(
+        &self,
+        events: Vec<Event>,
+    ) -> Result<IdempotentEventBatchResult, StorageError> {
+        if let Some(writer_task) = self.current_writer_task("append_events_idempotent")? {
+            return writer_task
+                .send_bounded(move |conn| {
+                    idempotent_batch_dml(conn, &events)
+                        .map_err(|e| map_err(e, "append_events_idempotent"))
+                })
+                .await;
+        }
+
+        let origin = self.pool.origin();
+        self.with_writer("append_events_idempotent", move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("event_append_idempotent".to_string()),
+                origin,
+            );
+
+            let result = match idempotent_batch_dml(conn, &events) {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            };
+
+            conn.execute_batch("COMMIT")?;
+            Ok(result)
         })
         .await
     }

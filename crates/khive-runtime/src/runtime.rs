@@ -510,11 +510,16 @@ impl KhiveRuntime {
         let build =
             khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
 
-        khive_db::diagnostics::collect_with_audit_append_failures_interruptibly(
+        // No audit-batch control is registered with this runtime instance
+        // yet, so the batch-health fields report unavailable with a reason —
+        // the same pattern `audit_append_failures` uses for a direct
+        // `khive-db` caller.
+        khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
             pool,
             build,
             interval,
             crate::pack::audit_append_failure_count(),
+            None,
         )
         .await
         .map_err(RuntimeError::from)
