@@ -324,6 +324,24 @@ function combinedAttentionMetric(
       .join("; ") || "One or more attention analyses were not produced.";
     return unavailableMetric(labels, reason);
   }
+  const truncated = metrics.filter((metric) => metric.status === "truncated");
+  if (truncated.length > 0) {
+    const reason = truncated
+      .map((metric) => metric.reason)
+      .filter(Boolean)
+      .join("; ") ||
+      "One or more attention analyses returned a truncated page.";
+    return {
+      shown,
+      total: null,
+      bound: shown,
+      status: "truncated",
+      reason,
+      summary: `${shown} signals from available analyses; ${labels.truncated}: ${reason}`,
+      detail:
+        "Each signal carries its own capability-owned row coverage and export bound.",
+    };
+  }
   return {
     shown,
     total: shown,
