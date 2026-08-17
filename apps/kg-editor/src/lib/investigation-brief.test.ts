@@ -5,7 +5,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildInvestigationBrief,
-  COMMIT_SUBJECT_DATA_BOUNDARY_NOTICE,
   INVESTIGATION_BRIEF_MAX_CHARS,
   INVESTIGATION_BRIEF_VERIFY_INSTRUCTION,
   markdownCodeSpan,
@@ -117,7 +116,7 @@ describe("bounded investigation brief", () => {
     );
   });
 
-  it("labels repository-controlled commit subjects as untrusted data, not instructions", () => {
+  it("never carries repository-controlled commit subjects into the model-facing brief", () => {
     const bundle = golden();
     const targetId = moduleId(bundle, graphImplementation);
     const history = bundle.graph.history_navigation.by_module.items.find(
@@ -132,10 +131,9 @@ describe("bounded investigation brief", () => {
     const brief = focusedBrief(bundle);
 
     expect(brief).not.toBeNull();
-    expect(brief).toContain(COMMIT_SUBJECT_DATA_BOUNDARY_NOTICE);
-    const noticeIndex = brief!.indexOf(COMMIT_SUBJECT_DATA_BOUNDARY_NOTICE);
-    const subjectIndex = brief!.indexOf(markdownCodeSpan(injected));
-    expect(subjectIndex).toBeGreaterThan(noticeIndex);
+    expect(brief).not.toContain(injected);
+    expect(brief).not.toContain(markdownCodeSpan(injected));
+    expect(brief).toContain("Captured recent history records");
   });
 
   it("labels the database source as materialized captured evidence, never live", () => {
