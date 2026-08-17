@@ -183,8 +183,8 @@ function pageEvidence(
       | { status: "available"; value: number }
       | { status: "unavailable"; reason: string };
     bound: { kind: "all" | "top_n"; max_items: number; order: string };
-    truncated: boolean;
     next_cursor?: string | null;
+    truncated: boolean;
     disclosure: {
       status: "complete" | "truncated" | "unavailable";
       reason?: string | null;
@@ -195,14 +195,18 @@ function pageEvidence(
   const total = page.total_count.status === "available"
     ? `${page.total_count.value} declared`
     : `total ${labels.unavailable}`;
-  const reasonSuffix = page.disclosure.reason
-    ? `: ${page.disclosure.reason}`
-    : "";
-  const status = page.disclosure.status === "unavailable"
-    ? `${labels.unavailable}${reasonSuffix}`
-    : page.disclosure.status === "truncated" || page.next_cursor != null
-    ? `${labels.truncated}${reasonSuffix}`
-    : "complete";
+  const hasUnseenPage = page.next_cursor != null &&
+    page.disclosure.status === "complete";
+  const disclosureStatus = hasUnseenPage ? "truncated" : page.disclosure.status;
+  const reason = page.disclosure.reason ??
+    (hasUnseenPage
+      ? "Additional items are available beyond this page."
+      : null);
+  const status = disclosureStatus === "complete"
+    ? "complete"
+    : `${
+      disclosureStatus === "truncated" ? labels.truncated : labels.unavailable
+    }${reason ? `: ${reason}` : ""}`;
   return {
     label,
     value: `${page.items.length} present, ${total}; ${status}`,
