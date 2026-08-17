@@ -41,6 +41,9 @@ describe("structure hidden-coupling lens", () => {
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, null),
       limit: 20,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
     expect(rootLens.capturedVisiblePairCount).toBe(10);
     expect(rootLens.pairs).toHaveLength(10);
@@ -54,6 +57,9 @@ describe("structure hidden-coupling lens", () => {
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, databasePackage!.id),
       limit: 20,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
 
     expect(databaseLens.capturedVisiblePairCount).toBe(70);
@@ -82,10 +88,38 @@ describe("structure hidden-coupling lens", () => {
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, null),
       limit: 20,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
 
     expect(lens.coverage).toBe("truncated");
     expect(lens.coverageReason).toContain("continuation cursor");
+  });
+
+  it("treats an unavailable analysis as unavailable even when the captured page looks complete", () => {
+    const bundle = golden();
+    const pairPage = {
+      ...bundle.aggregates.hidden_coupling.data,
+      truncated: false,
+      next_cursor: null,
+      disclosure: { status: "complete" as const },
+    };
+    const lens = buildStructureCouplingLens({
+      pairPage,
+      structureEdgePage: bundle.graph.structure_edges,
+      visibleModuleIds: visibleModuleIds(bundle, null),
+      limit: 20,
+      analysisStatus: "unavailable",
+      analysisUnavailableReason: "hidden-coupling analysis was not run",
+    });
+
+    expect(lens.coverage).toBe("unavailable");
+    expect(lens.coverageReason).toBe("hidden-coupling analysis was not run");
+    expect(lens.pairs).toHaveLength(0);
+    expect(lens.capturedVisiblePairCount).toBe(0);
+    expect(lens.capturedPairCount).toBe(0);
+    expect(lens.declaredPairCount).toBeNull();
   });
 
   it("never turns incomplete structure evidence into an absence claim", () => {
@@ -107,6 +141,9 @@ describe("structure hidden-coupling lens", () => {
       structureEdgePage,
       visibleModuleIds: visibleModuleIds(bundle, databasePackage.id),
       limit: 20,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
 
     expect(lens.pairs).toHaveLength(20);
@@ -143,6 +180,9 @@ describe("structure hidden-coupling lens", () => {
         pair.right_module_id,
       ]),
       limit: 1,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
 
     expect(lens.pairs[0]).toMatchObject({

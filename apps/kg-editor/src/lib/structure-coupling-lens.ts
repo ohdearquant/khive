@@ -3,6 +3,7 @@ import type { RepoBundle } from "@/lib/repo-bundle";
 const pairSeparator = "\u0000";
 
 type CouplingPage = RepoBundle["aggregates"]["hidden_coupling"]["data"];
+type CouplingAnalysisStatus = RepoBundle["aggregates"]["hidden_coupling"]["meta"]["status"];
 type StructureEdgePage = RepoBundle["graph"]["structure_edges"];
 
 export type CouplingDependencyEvidence = "present" | "absent" | "unknown";
@@ -37,13 +38,18 @@ export function buildStructureCouplingLens({
   structureEdgePage,
   visibleModuleIds,
   limit,
+  analysisStatus,
+  analysisUnavailableReason,
 }: Readonly<{
   pairPage: CouplingPage;
   structureEdgePage: StructureEdgePage;
   visibleModuleIds: ReadonlySet<string>;
   limit: number;
+  analysisStatus: CouplingAnalysisStatus;
+  analysisUnavailableReason?: string | null;
 }>): StructureCouplingLens {
   const boundedLimit = Math.max(0, Math.floor(limit));
+  const analysisUnavailable = analysisStatus === "unavailable";
   const structureEvidenceComplete =
     structureEdgePage.disclosure.status === "complete" &&
     !structureEdgePage.truncated &&
@@ -53,7 +59,7 @@ export function buildStructureCouplingLens({
       .filter((edge) => edge.relation === "depends_on")
       .map((edge) => undirectedPairKey(edge.source, edge.target)),
   );
-  const visiblePairs = pairPage.items
+  const visiblePairs = analysisUnavailable ? [] : pairPage.items
     .filter((pair) =>
       visibleModuleIds.has(pair.left_module_id) &&
       visibleModuleIds.has(pair.right_module_id)
@@ -64,7 +70,8 @@ export function buildStructureCouplingLens({
       left.left_module_id.localeCompare(right.left_module_id) ||
       left.right_module_id.localeCompare(right.right_module_id)
     );
-  const pairEvidenceUnavailable = pairPage.disclosure.status === "unavailable";
+  const pairEvidenceUnavailable = analysisUnavailable ||
+    pairPage.disclosure.status === "unavailable";
   const pairEvidenceIncomplete = !pairEvidenceUnavailable &&
     (pairPage.disclosure.status === "truncated" ||
       pairPage.truncated ||
@@ -75,7 +82,10 @@ export function buildStructureCouplingLens({
     ? "truncated"
     : "complete";
   const coverageReason = pairPage.disclosure.reason ??
-    (pairPage.next_cursor != null
+    (analysisUnavailable
+      ? (analysisUnavailableReason ??
+        "The hidden-coupling analysis is unavailable.")
+      : pairPage.next_cursor != null
       ? "The captured hidden-coupling page has a continuation cursor."
       : pairPage.truncated
       ? "The captured hidden-coupling page is truncated."
@@ -96,10 +106,12 @@ export function buildStructureCouplingLens({
       };
     }),
     capturedVisiblePairCount: visiblePairs.length,
-    capturedPairCount: pairPage.items.length,
-    declaredPairCount: pairPage.total_count.status === "available"
-      ? pairPage.total_count.value
-      : null,
+    capturedPairCount: analysisUnavailable ? 0 : pairPage.items.length,
+    declaredPairCount: analysisUnavailable ? null : (
+      pairPage.total_count.status === "available"
+        ? pairPage.total_count.value
+        : null
+    ),
     coverage,
     coverageReason,
     dependencyCoverageReason: structureEvidenceComplete
