@@ -212,8 +212,7 @@ impl StorageBackend {
     /// the snapshot to be at this build's exact latest schema version.
     pub fn prepare_core_schema(&self) -> Result<u32, SqliteError> {
         if self.is_read_only() {
-            let reader = self.pool.reader()?;
-            crate::migrations::validate_schema_is_current(reader.conn())
+            self.validate_core_schema_is_current()
         } else {
             let latest = crate::migrations::MIGRATIONS
                 .last()
@@ -237,6 +236,17 @@ impl StorageBackend {
             let mut writer = self.pool.try_writer()?;
             crate::migrations::run_migrations_with_database_gc_owner(writer.conn_mut(), &owner)
         }
+    }
+
+    /// Require the exact canonical current core schema without applying
+    /// migrations or creating migration-owner sidecars.
+    ///
+    /// Host coordinators use this query-only fence immediately before low-level
+    /// runtime assembly so a completed older application-assisted cutover is
+    /// not mistaken for this binary's fully prepared schema.
+    pub fn validate_core_schema_is_current(&self) -> Result<u32, SqliteError> {
+        let reader = self.pool.reader()?;
+        crate::migrations::validate_schema_is_current(reader.conn())
     }
 
     /// Inspect the coordinated V21 attachment cutover state.

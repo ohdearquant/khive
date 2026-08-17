@@ -250,14 +250,7 @@ impl KhiveRuntime {
         backend: Arc<StorageBackend>,
         config: RuntimeConfig,
     ) -> RuntimeResult<Self> {
-        if backend.attachment_cutover_status()?
-            != khive_db::migrations::AttachmentCutoverStatus::Complete
-        {
-            return Err(khive_db::SqliteError::InvalidData(
-                "from_prepared_backend requires a complete V21 attachment cutover".into(),
-            )
-            .into());
-        }
+        backend.validate_core_schema_is_current()?;
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;
         }
@@ -1509,6 +1502,43 @@ mod tests {
     fn memory_runtime_creates_successfully() {
         let rt = KhiveRuntime::memory().expect("memory runtime should create");
         assert!(rt.config().db_path.is_none());
+    }
+
+    #[test]
+    fn from_prepared_backend_rejects_a_complete_but_behind_core_schema() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let path = directory.path().join("complete-v21-behind-v22.db");
+        let mut connection = rusqlite::Connection::open(&path).expect("open fixture database");
+        assert_eq!(
+            khive_db::migrations::run_migrations(&mut connection).expect("migrate through V22"),
+            khive_db::migrations::EMBEDDING_SPACE_SHADOW_VERSION
+        );
+        connection
+            .execute_batch(
+                "DROP TABLE _embedding_models_v22_shadow; \
+                 DROP TABLE _embedding_model_legacy_provenance; \
+                 DROP TABLE _embedding_space_cutover_state; \
+                 DELETE FROM _schema_migrations WHERE version = 22;",
+            )
+            .expect("restore a physically valid completed V21 fixture");
+        drop(connection);
+
+        let backend = Arc::new(StorageBackend::sqlite(&path).expect("open behind backend"));
+        assert_eq!(
+            backend.attachment_cutover_status().unwrap(),
+            khive_db::migrations::AttachmentCutoverStatus::Complete
+        );
+        let error =
+            match KhiveRuntime::from_prepared_backend(backend, RuntimeConfig::no_embeddings()) {
+                Ok(_) => panic!("the low-level assembly seam must require exact current schema"),
+                Err(error) => error,
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("behind the latest known migration"),
+            "unexpected behind-schema diagnostic: {error}"
+        );
     }
 
     #[tokio::test]

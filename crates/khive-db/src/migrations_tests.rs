@@ -867,10 +867,11 @@ fn v4_creates_consolidated_fts_tables() {
 #[test]
 fn rejects_pre_consolidation_ledger() {
     let mut conn = open_memory();
-    // Simulate a database carrying the old, pre-consolidation V1..V22 ledger.
+    // Simulate a database carrying a ledger newer than this build. V22 is now
+    // canonical, so the synthetic foreign row must sit beyond it.
     conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
     conn.execute(
-        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (22, 'legacy', 0)",
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (23, 'legacy', 0)",
         [],
     )
     .unwrap();
@@ -2442,7 +2443,10 @@ fn v21_legacy_refs_remain_pending_until_explicit_stage_and_finalize() {
 #[test]
 fn v21_empty_database_fast_path_is_atomic_and_complete() {
     let mut conn = open_memory();
-    assert_eq!(run_migrations(&mut conn).unwrap(), 21);
+    assert_eq!(
+        run_migrations(&mut conn).unwrap(),
+        EMBEDDING_SPACE_SHADOW_VERSION
+    );
     assert_eq!(
         attachment_cutover_status(&conn).unwrap(),
         AttachmentCutoverStatus::Complete
@@ -2584,4 +2588,761 @@ fn v21_finalize_revalidates_model_coverage_and_attachment_claim_fences() {
         )
         .expect_err("an attachment cannot acquire a claimed digest");
     assert!(insert_error.to_string().contains("active blob sweep"));
+}
+
+// ── V22: dormant embedding-space registry shadow (ADR-160 D6) ─────────────────
+
+const V22_MIGRATION_NAME: &str = "embedding_space_shadow_stage";
+const V22_SHADOW_TABLE: &str = "_embedding_models_v22_shadow";
+const V22_PROVENANCE_TABLE: &str = "_embedding_model_legacy_provenance";
+const V22_STATE_TABLE: &str = "_embedding_space_cutover_state";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LegacyEmbeddingModelFixture {
+    id: Vec<u8>,
+    engine_name: String,
+    model_id: String,
+    key_version: String,
+    dim: i64,
+    output_dim: Option<i64>,
+    status: String,
+    activated_at: Option<i64>,
+    superseded_at: Option<i64>,
+    superseded_by: Option<Vec<u8>>,
+    canonical_key: Vec<u8>,
+    created_at: i64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct StagedEmbeddingModelRow {
+    id: Vec<u8>,
+    lineage_slot: String,
+    space_key: String,
+    identity_protocol: String,
+    identity_fingerprint: Vec<u8>,
+    model_name: String,
+    dimensions: i64,
+    status: String,
+    activated_at: Option<i64>,
+    superseded_at: Option<i64>,
+    superseded_by: Option<Vec<u8>>,
+    created_at: i64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct LegacyEmbeddingProvenanceRow {
+    id: Vec<u8>,
+    engine_name: String,
+    model_id: String,
+    key_version: String,
+    dim: i64,
+    output_dim: Option<i64>,
+    canonical_key: Vec<u8>,
+    pre_migration_status: String,
+}
+
+fn completed_v21_database() -> Connection {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, ATTACHMENT_CUTOVER_VERSION - 1);
+    stage_attachment_cutover(&mut conn).expect("stage empty V21 fixture");
+    finalize_attachment_cutover(&mut conn).expect("complete empty V21 fixture");
+    assert_eq!(
+        read_schema_version(&conn).unwrap(),
+        ATTACHMENT_CUTOVER_VERSION
+    );
+    conn
+}
+
+fn record_synthetic_v22_ledger(conn: &Connection) {
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+        rusqlite::params![EMBEDDING_SPACE_SHADOW_VERSION, V22_MIGRATION_NAME],
+    )
+    .expect("record synthetic V22 ledger row");
+}
+
+fn minilm_legacy_fixture() -> LegacyEmbeddingModelFixture {
+    LegacyEmbeddingModelFixture {
+        id: vec![0x11; 16],
+        engine_name: "default".to_string(),
+        model_id: "all-minilm-l6-v2".to_string(),
+        key_version: "v2".to_string(),
+        dim: 384,
+        output_dim: None,
+        status: "active".to_string(),
+        activated_at: Some(100),
+        superseded_at: None,
+        superseded_by: None,
+        canonical_key: vec![0xa1; 32],
+        created_at: 90,
+    }
+}
+
+fn qwen_legacy_fixture() -> LegacyEmbeddingModelFixture {
+    LegacyEmbeddingModelFixture {
+        id: vec![0x22; 16],
+        engine_name: "primary".to_string(),
+        model_id: "qwen3-embedding-4b".to_string(),
+        key_version: "v3".to_string(),
+        dim: 2_560,
+        output_dim: Some(1_024),
+        status: "superseded".to_string(),
+        activated_at: Some(200),
+        superseded_at: Some(300),
+        superseded_by: Some(vec![0x33; 16]),
+        canonical_key: vec![0xb2; 32],
+        created_at: 190,
+    }
+}
+
+fn insert_legacy_embedding_model(conn: &Connection, fixture: &LegacyEmbeddingModelFixture) {
+    conn.execute(
+        "INSERT INTO _embedding_models \
+         (id, engine_name, model_id, key_version, dim, output_dim, status, activated_at, \
+          superseded_at, superseded_by, canonical_key, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            fixture.id,
+            fixture.engine_name,
+            fixture.model_id,
+            fixture.key_version,
+            fixture.dim,
+            fixture.output_dim,
+            fixture.status,
+            fixture.activated_at,
+            fixture.superseded_at,
+            fixture.superseded_by,
+            fixture.canonical_key,
+            fixture.created_at,
+        ],
+    )
+    .expect("insert legacy embedding-model fixture");
+}
+
+fn insert_archived_legacy_embedding_models(
+    conn: &mut Connection,
+    count: usize,
+    canonical_key_bytes: usize,
+) {
+    let transaction = conn.transaction().expect("begin bulk legacy fixture");
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO _embedding_models \
+                 (id, engine_name, model_id, key_version, dim, output_dim, status, \
+                  canonical_key, created_at) \
+                 VALUES (?1, 'bulk', 'bulk-model', 'v1', 384, NULL, 'archived', ?2, 0)",
+            )
+            .expect("prepare bulk legacy insert");
+        for index in 0..count {
+            let index_bytes = u64::try_from(index).unwrap().to_be_bytes();
+            let mut id = [0_u8; 16];
+            id[8..].copy_from_slice(&index_bytes);
+            let mut canonical_key = vec![0_u8; canonical_key_bytes.max(index_bytes.len())];
+            canonical_key[..index_bytes.len()].copy_from_slice(&index_bytes);
+            insert
+                .execute(rusqlite::params![id.as_slice(), canonical_key])
+                .expect("insert bulk legacy row");
+        }
+    }
+    transaction.commit().expect("commit bulk legacy fixture");
+}
+
+fn table_column_names(conn: &Connection, table: &str) -> Vec<String> {
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+        .expect("prepare table-column query");
+    statement
+        .query_map([table], |row| row.get(0))
+        .expect("query table columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect table columns")
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len() % 2, 0, "hex fixture must contain full bytes");
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("ASCII hex fixture");
+            u8::from_str_radix(pair, 16).expect("valid hex fixture")
+        })
+        .collect()
+}
+
+fn sha256(bytes: &[u8]) -> Vec<u8> {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).to_vec()
+}
+
+fn read_staged_embedding_model(conn: &Connection, id: &[u8]) -> StagedEmbeddingModelRow {
+    conn.query_row(
+        "SELECT id, lineage_slot, space_key, identity_protocol, identity_fingerprint, \
+                model_name, dimensions, status, activated_at, superseded_at, superseded_by, \
+                created_at \
+         FROM _embedding_models_v22_shadow WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(StagedEmbeddingModelRow {
+                id: row.get(0)?,
+                lineage_slot: row.get(1)?,
+                space_key: row.get(2)?,
+                identity_protocol: row.get(3)?,
+                identity_fingerprint: row.get(4)?,
+                model_name: row.get(5)?,
+                dimensions: row.get(6)?,
+                status: row.get(7)?,
+                activated_at: row.get(8)?,
+                superseded_at: row.get(9)?,
+                superseded_by: row.get(10)?,
+                created_at: row.get(11)?,
+            })
+        },
+    )
+    .expect("read staged embedding-model row")
+}
+
+fn read_legacy_embedding_provenance(conn: &Connection, id: &[u8]) -> LegacyEmbeddingProvenanceRow {
+    conn.query_row(
+        "SELECT id, engine_name, model_id, key_version, dim, output_dim, canonical_key, \
+                pre_migration_status \
+         FROM _embedding_model_legacy_provenance WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(LegacyEmbeddingProvenanceRow {
+                id: row.get(0)?,
+                engine_name: row.get(1)?,
+                model_id: row.get(2)?,
+                key_version: row.get(3)?,
+                dim: row.get(4)?,
+                output_dim: row.get(5)?,
+                canonical_key: row.get(6)?,
+                pre_migration_status: row.get(7)?,
+            })
+        },
+    )
+    .expect("read legacy embedding-model provenance")
+}
+
+fn assert_v22_stage_rolled_back(conn: &mut Connection, expected_diagnostic: &str) {
+    let error = run_migrations(conn).expect_err("invalid legacy identity must abort V22");
+    let message = error.to_string();
+    assert!(
+        message.contains(expected_diagnostic),
+        "V22 diagnostic must contain {expected_diagnostic:?}, got: {message}"
+    );
+    assert_eq!(
+        read_schema_version(conn).unwrap(),
+        ATTACHMENT_CUTOVER_VERSION,
+        "failed V22 must leave V21 authoritative"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM _schema_migrations WHERE version = ?1",
+            [EMBEDDING_SPACE_SHADOW_VERSION],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0,
+        "failed V22 must not publish its ledger row"
+    );
+    for table in [V22_SHADOW_TABLE, V22_PROVENANCE_TABLE, V22_STATE_TABLE] {
+        assert!(
+            !table_exists(conn, table),
+            "failed V22 must roll back newly-created table {table}"
+        );
+    }
+}
+
+#[test]
+fn completed_v21_remains_valid_at_synthetic_v22() {
+    let conn = completed_v21_database();
+    record_synthetic_v22_ledger(&conn);
+
+    assert_eq!(
+        attachment_cutover_status(&conn).expect("V21 completion remains valid after V22"),
+        AttachmentCutoverStatus::Complete
+    );
+}
+
+#[test]
+fn v22_current_validation_rejects_a_missing_v21_completion_marker() {
+    let mut conn = open_memory();
+    assert_eq!(
+        run_migrations(&mut conn).expect("migrate valid V22 fixture"),
+        EMBEDDING_SPACE_SHADOW_VERSION
+    );
+    conn.execute("DROP TABLE attachment_cutover_state", [])
+        .unwrap();
+
+    let error = validate_schema_is_current(&conn)
+        .expect_err("current-schema validation must not hide a missing V21 marker at V22");
+    assert!(
+        error.to_string().contains("marker is absent"),
+        "unexpected diagnostic: {error}"
+    );
+}
+
+#[test]
+fn v22_current_validation_revalidates_completed_v21_physical_schema() {
+    let mut conn = open_memory();
+    assert_eq!(
+        run_migrations(&mut conn).expect("migrate valid V22 fixture"),
+        EMBEDDING_SPACE_SHADOW_VERSION
+    );
+    conn.execute("DROP TRIGGER attachments_reject_claimed_blob_insert", [])
+        .unwrap();
+
+    let error = validate_schema_is_current(&conn)
+        .expect_err("current-schema validation must revalidate V21 physical state at V22");
+    assert!(
+        error
+            .to_string()
+            .contains("attachments_reject_claimed_blob_insert"),
+        "diagnostic must identify the missing V21 object: {error}"
+    );
+}
+
+#[test]
+fn v22_upgrade_revalidates_v21_physical_schema_before_staging() {
+    let mut conn = completed_v21_database();
+    conn.execute("DROP TRIGGER attachments_reject_claimed_blob_insert", [])
+        .unwrap();
+
+    assert_v22_stage_rolled_back(&mut conn, "attachments_reject_claimed_blob_insert");
+}
+
+#[test]
+fn v22_current_validation_requires_the_dormant_shadow_stage() {
+    let mut missing_index = open_memory();
+    run_migrations(&mut missing_index).expect("migrate missing-index fixture");
+    missing_index
+        .execute(
+            "DROP INDEX idx_embedding_models_v22_shadow_lineage_status",
+            [],
+        )
+        .unwrap();
+    let missing_error = validate_schema_is_current(&missing_index)
+        .expect_err("a V22 ledger must not hide a missing shadow index");
+    assert!(
+        missing_error
+            .to_string()
+            .contains("idx_embedding_models_v22_shadow_lineage_status"),
+        "diagnostic must identify the missing V22 object: {missing_error}"
+    );
+
+    let mut wrong_state = open_memory();
+    run_migrations(&mut wrong_state).expect("migrate wrong-state fixture");
+    wrong_state
+        .execute(
+            "UPDATE _embedding_space_cutover_state \
+             SET state = 'unstaged', staged_at = NULL",
+            [],
+        )
+        .unwrap();
+    let state_error = validate_schema_is_current(&wrong_state)
+        .expect_err("V22 current validation must require a completed dormant stage");
+    assert!(
+        state_error.to_string().contains("legacy_staged"),
+        "diagnostic must name the required dormant state: {state_error}"
+    );
+}
+
+#[test]
+fn v22_fresh_migration_creates_only_dormant_shadow_state() {
+    let mut conn = open_memory();
+    assert_eq!(
+        run_migrations(&mut conn).expect("fresh migration through V22"),
+        EMBEDDING_SPACE_SHADOW_VERSION
+    );
+    assert_eq!(
+        validate_schema_is_current(&conn).expect("complete V22 validates read-only"),
+        EMBEDDING_SPACE_SHADOW_VERSION
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT name FROM _schema_migrations WHERE version = ?1",
+            [EMBEDDING_SPACE_SHADOW_VERSION],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        V22_MIGRATION_NAME
+    );
+
+    assert_eq!(
+        table_column_names(&conn, V22_SHADOW_TABLE),
+        [
+            "id",
+            "lineage_slot",
+            "space_key",
+            "identity_protocol",
+            "identity_fingerprint",
+            "model_name",
+            "dimensions",
+            "status",
+            "activated_at",
+            "superseded_at",
+            "superseded_by",
+            "created_at",
+        ]
+    );
+    assert_eq!(
+        table_column_names(&conn, V22_PROVENANCE_TABLE),
+        [
+            "id",
+            "engine_name",
+            "model_id",
+            "key_version",
+            "dim",
+            "output_dim",
+            "canonical_key",
+            "pre_migration_status",
+        ]
+    );
+    assert_eq!(
+        table_column_names(&conn, V22_STATE_TABLE),
+        ["singleton", "state", "staged_at", "completed_at"]
+    );
+    assert!(index_exists(
+        &conn,
+        "idx_embedding_models_v22_shadow_one_active"
+    ));
+    assert!(index_exists(
+        &conn,
+        "idx_embedding_models_v22_shadow_lineage_status"
+    ));
+
+    let (state, staged_at, completed_at): (String, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT state, staged_at, completed_at \
+             FROM _embedding_space_cutover_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "legacy_staged");
+    assert!(staged_at.is_some(), "successful V22 records its stage time");
+    assert_eq!(completed_at, None, "V22 must not publish a cutover");
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM _embedding_models_v22_shadow",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM _embedding_model_legacy_provenance",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn v22_legacy_mapping_pins_two_complete_goldens() {
+    let mut conn = completed_v21_database();
+    let minilm = minilm_legacy_fixture();
+    let qwen = qwen_legacy_fixture();
+    insert_legacy_embedding_model(&conn, &minilm);
+    insert_legacy_embedding_model(&conn, &qwen);
+    assert_eq!(
+        LEGACY_EMBEDDING_IDENTITY_PROTOCOL,
+        "khive.legacy-embedding-space.v1"
+    );
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("stage valid legacy rows"),
+        EMBEDDING_SPACE_SHADOW_VERSION
+    );
+
+    let minilm_preimage = hex_bytes(
+        "6b686976652e6c65676163792d656d62656464696e672d73706163652e763100\
+         0000000764656661756c7400000010616c6c2d6d696e696c6d2d6c362d7632\
+         0000000276320000018000",
+    );
+    let minilm_digest =
+        hex_bytes("d2914e3806c1df27d7f64935dc8adceb0d9a3124531075637f677a862a3bd9cf");
+    assert_eq!(sha256(&minilm_preimage), minilm_digest);
+    let minilm_identity = legacy_embedding_space_identity(
+        &minilm.engine_name,
+        &minilm.model_id,
+        &minilm.key_version,
+        u32::try_from(minilm.dim).unwrap(),
+        minilm.output_dim.map(|value| u32::try_from(value).unwrap()),
+    )
+    .expect("valid MiniLM legacy identity");
+    assert_eq!(
+        minilm_identity.space_key().as_str(),
+        "legacy_d2914e3806c1df27d7f64935dc8adceb0d9a3124531075637f677a862a3bd9cf_384"
+    );
+    assert_eq!(
+        minilm_identity.protocol().as_str(),
+        LEGACY_EMBEDDING_IDENTITY_PROTOCOL
+    );
+    assert_eq!(minilm_identity.fingerprint().as_slice(), minilm_digest);
+    assert_eq!(minilm_identity.model_name(), "all-minilm-l6-v2");
+    assert_eq!(minilm_identity.dimensions().get(), 384);
+    assert_eq!(
+        read_staged_embedding_model(&conn, &minilm.id),
+        StagedEmbeddingModelRow {
+            id: minilm.id.clone(),
+            lineage_slot: "default".to_string(),
+            space_key: minilm_identity.space_key().to_string(),
+            identity_protocol: LEGACY_EMBEDDING_IDENTITY_PROTOCOL.to_string(),
+            identity_fingerprint: minilm_digest,
+            model_name: "all-minilm-l6-v2".to_string(),
+            dimensions: 384,
+            status: "active".to_string(),
+            activated_at: Some(100),
+            superseded_at: None,
+            superseded_by: None,
+            created_at: 90,
+        }
+    );
+    assert_eq!(
+        read_legacy_embedding_provenance(&conn, &minilm.id),
+        LegacyEmbeddingProvenanceRow {
+            id: minilm.id.clone(),
+            engine_name: "default".to_string(),
+            model_id: "all-minilm-l6-v2".to_string(),
+            key_version: "v2".to_string(),
+            dim: 384,
+            output_dim: None,
+            canonical_key: vec![0xa1; 32],
+            pre_migration_status: "active".to_string(),
+        }
+    );
+
+    let qwen_preimage = hex_bytes(
+        "6b686976652e6c65676163792d656d62656464696e672d73706163652e763100\
+         000000077072696d617279000000127177656e332d656d62656464696e672d3462\
+         00000002763300000a000100000400",
+    );
+    let qwen_digest = hex_bytes("a25e53e4485d1fae571cb5f1a15bf763c281a77097e2a273b36998b69d5e3a55");
+    assert_eq!(sha256(&qwen_preimage), qwen_digest);
+    let qwen_identity = legacy_embedding_space_identity(
+        &qwen.engine_name,
+        &qwen.model_id,
+        &qwen.key_version,
+        u32::try_from(qwen.dim).unwrap(),
+        qwen.output_dim.map(|value| u32::try_from(value).unwrap()),
+    )
+    .expect("valid Qwen legacy identity");
+    assert_eq!(
+        qwen_identity.space_key().as_str(),
+        "legacy_a25e53e4485d1fae571cb5f1a15bf763c281a77097e2a273b36998b69d5e3a55_1024"
+    );
+    assert_eq!(
+        qwen_identity.protocol().as_str(),
+        LEGACY_EMBEDDING_IDENTITY_PROTOCOL
+    );
+    assert_eq!(qwen_identity.fingerprint().as_slice(), qwen_digest);
+    assert_eq!(qwen_identity.model_name(), "qwen3-embedding-4b");
+    assert_eq!(qwen_identity.dimensions().get(), 1_024);
+    assert_eq!(
+        read_staged_embedding_model(&conn, &qwen.id),
+        StagedEmbeddingModelRow {
+            id: qwen.id.clone(),
+            lineage_slot: "primary".to_string(),
+            space_key: qwen_identity.space_key().to_string(),
+            identity_protocol: LEGACY_EMBEDDING_IDENTITY_PROTOCOL.to_string(),
+            identity_fingerprint: qwen_digest,
+            model_name: "qwen3-embedding-4b".to_string(),
+            dimensions: 1_024,
+            status: "superseded".to_string(),
+            activated_at: Some(200),
+            superseded_at: Some(300),
+            superseded_by: Some(vec![0x33; 16]),
+            created_at: 190,
+        }
+    );
+    assert_eq!(
+        read_legacy_embedding_provenance(&conn, &qwen.id),
+        LegacyEmbeddingProvenanceRow {
+            id: qwen.id.clone(),
+            engine_name: "primary".to_string(),
+            model_id: "qwen3-embedding-4b".to_string(),
+            key_version: "v3".to_string(),
+            dim: 2_560,
+            output_dim: Some(1_024),
+            canonical_key: vec![0xb2; 32],
+            pre_migration_status: "superseded".to_string(),
+        }
+    );
+}
+
+#[test]
+fn v22_invalid_effective_dimensions_roll_back_atomically() {
+    for (dim, output_dim) in [(0, None), (384, Some(8_193))] {
+        let mut conn = completed_v21_database();
+        let mut fixture = minilm_legacy_fixture();
+        fixture.dim = dim;
+        fixture.output_dim = output_dim;
+        insert_legacy_embedding_model(&conn, &fixture);
+        assert_v22_stage_rolled_back(&mut conn, "dimensions");
+    }
+}
+
+#[test]
+fn v22_invalid_legacy_model_label_rolls_back_atomically() {
+    let mut conn = completed_v21_database();
+    let mut fixture = minilm_legacy_fixture();
+    fixture.model_id = " model-with-surrounding-space ".to_string();
+    insert_legacy_embedding_model(&conn, &fixture);
+
+    assert_v22_stage_rolled_back(&mut conn, "model name");
+}
+
+#[test]
+fn v22_oversized_legacy_text_refuses_before_materialization() {
+    let mut conn = completed_v21_database();
+    let mut fixture = minilm_legacy_fixture();
+    fixture.engine_name = "e".repeat(usize::try_from(MAX_LEGACY_EMBEDDING_TEXT_BYTES).unwrap() + 1);
+    insert_legacy_embedding_model(&conn, &fixture);
+
+    assert_v22_stage_rolled_back(&mut conn, "engine_name");
+}
+
+#[test]
+fn v22_over_cardinality_legacy_registry_rolls_back_atomically() {
+    let mut conn = completed_v21_database();
+    insert_archived_legacy_embedding_models(&mut conn, MAX_LEGACY_EMBEDDING_REGISTRY_ROWS + 1, 8);
+
+    assert_v22_stage_rolled_back(&mut conn, "more than the V22 staging limit");
+}
+
+#[test]
+fn v22_aggregate_stage_budget_is_checked_before_writes() {
+    let mut total = MAX_LEGACY_EMBEDDING_STAGE_BYTES - 1;
+    let error = add_legacy_stage_bytes(1, &mut total, "fixture", 2, 1)
+        .expect_err("aggregate staging bytes must be bounded before V22 writes");
+    assert!(
+        error.to_string().contains("staging payload above"),
+        "unexpected aggregate-budget diagnostic: {error}"
+    );
+    assert_eq!(
+        total,
+        MAX_LEGACY_EMBEDDING_STAGE_BYTES - 1,
+        "a rejected charge must not mutate the accumulated budget"
+    );
+}
+
+#[test]
+fn v22_wrong_legacy_sqlite_type_rolls_back_atomically() {
+    let mut conn = completed_v21_database();
+    conn.execute(
+        "INSERT INTO _embedding_models \
+         (id, engine_name, model_id, key_version, dim, output_dim, status, canonical_key, \
+          created_at) \
+         VALUES (?1, 'default', 'all-minilm-l6-v2', 'v2', ?2, NULL, 'active', ?3, 90)",
+        rusqlite::params![vec![0x44_u8; 16], vec![0x01_u8, 0x80], vec![0xc4_u8; 32]],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT typeof(dim) FROM _embedding_models WHERE id = ?1",
+            [vec![0x44; 16]],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "blob",
+        "fixture must bypass INTEGER affinity rather than becoming a valid integer"
+    );
+
+    assert_v22_stage_rolled_back(&mut conn, "dim");
+}
+
+#[test]
+fn v22_duplicate_derived_space_key_rolls_back_atomically() {
+    let mut conn = completed_v21_database();
+    let active = minilm_legacy_fixture();
+    let mut historical_duplicate = active.clone();
+    historical_duplicate.id = vec![0x55; 16];
+    historical_duplicate.status = "archived".to_string();
+    historical_duplicate.activated_at = None;
+    historical_duplicate.canonical_key = vec![0xd5; 32];
+    insert_legacy_embedding_model(&conn, &active);
+    insert_legacy_embedding_model(&conn, &historical_duplicate);
+
+    assert_v22_stage_rolled_back(&mut conn, "space_key");
+}
+
+#[test]
+fn v22_shadow_does_not_change_canonical_registry_serving() {
+    let mut conn = completed_v21_database();
+    let fixture = minilm_legacy_fixture();
+    insert_legacy_embedding_model(&conn, &fixture);
+    let canonical_columns_before = table_column_names(&conn, "_embedding_models");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("stage legacy identity"),
+        EMBEDDING_SPACE_SHADOW_VERSION
+    );
+    assert_eq!(
+        table_column_names(&conn, "_embedding_models"),
+        canonical_columns_before,
+        "V22 must not replace or reshape the serving registry"
+    );
+    assert_eq!(
+        canonical_columns_before,
+        [
+            "id",
+            "engine_name",
+            "model_id",
+            "key_version",
+            "dim",
+            "output_dim",
+            "status",
+            "activated_at",
+            "superseded_at",
+            "superseded_by",
+            "canonical_key",
+            "created_at",
+        ]
+    );
+
+    conn.execute(
+        "UPDATE _embedding_models_v22_shadow \
+         SET lineage_slot = 'shadow-only-slot', model_name = 'shadow-only-model', \
+             dimensions = 1, status = 'archived' \
+         WHERE id = ?1",
+        [fixture.id.as_slice()],
+    )
+    .unwrap();
+
+    let served = query_embedding_models_conn(&conn, Some("default")).unwrap();
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].engine_name, "default");
+    assert_eq!(served[0].model_id, "all-minilm-l6-v2");
+    assert_eq!(served[0].key_version, "v2");
+    assert_eq!(served[0].dimensions, 384);
+    assert_eq!(served[0].status, "active");
+    assert_eq!(served[0].activated_at, Some(100));
+    assert_eq!(served[0].superseded_at, None);
+    assert!(
+        query_embedding_models_conn(&conn, Some("shadow-only-slot"))
+            .unwrap()
+            .is_empty(),
+        "the dormant shadow must not participate in serving lookups"
+    );
+
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM _embedding_models \
+             WHERE id = ?1 AND engine_name = 'default' AND model_id = 'all-minilm-l6-v2' \
+               AND key_version = 'v2' AND dim = 384 AND output_dim IS NULL \
+               AND status = 'active' AND activated_at = 100 AND superseded_at IS NULL \
+               AND superseded_by IS NULL AND canonical_key = ?2 AND created_at = 90",
+            rusqlite::params![fixture.id, vec![0xa1_u8; 32]],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1,
+        "dormant shadow mutation must not alter any canonical serving column"
+    );
 }

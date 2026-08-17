@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Core migration V22, `embedding_space_shadow_stage`, adds dormant
+  embedding-registry shadow, exact legacy-tuple provenance, and cutover-state
+  tables without changing the live registry or vector-serving paths (ADR-160
+  D6 Phase 7a).
 - `khive_storage::EmbeddingSpaceIdentity`, a validated immutable physical-vector
   fence derived from a protocol-owned fingerprint and dimensions (ADR-160 D6).
 - ADR-149 Moodboard pairwise preference learning: actor-attributed randomized
@@ -28,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The V20 attachment coordinator now completes V21 and advances through dormant
+  V22 before returning; prepared runtime assembly requires exact-current V22.
+  V22 preflights bounded legacy-registry staging before DDL. Transactional
+  filesystem blob GC admits only V21 or canonical
+  `(22, "embedding_space_shadow_stage")` after revalidating V21, and refuses a
+  foreign V22 or unknown V23-or-later epoch before root work. Older exact-V21
+  Phase4a binaries safely refuse V22.
 - Pack-owned vector consumers replace `khive_runtime::NamedVectorIdentity` and
   `vectors_for_named_identity` with `khive_storage::EmbeddingSpaceIdentity` and
   `vectors_for_embedding_space`; the source-breaking replacement intentionally

@@ -84,14 +84,14 @@ snapshot-plus-sweep — a maintenance window, a single-writer admin CLI
 invocation with no live traffic, or equivalent.
 
 A DB-coordinated sweep is available separately as
-`BlobStore::transactional_orphan_sweep`. The Phase4a filesystem implementation
-first performs a read-only schema-epoch gate. Both `dry_run` and destructive
-calls are supported only when the database proves the named objects and epoch
-markers of the exact completed V21 attachment cutover: the complete marker and
-V21 ledger row, the attachment and claim tables/indexes, attachment
-INSERT/UPDATE claim fences, and no legacy entity content-ref
-column/index/triggers. V20, pending, incomplete, missing-required-object,
-retained-legacy, and ahead-of-V21 epochs return typed
+`BlobStore::transactional_orphan_sweep`. The filesystem implementation first
+performs a read-only schema-epoch gate. Both `dry_run` and destructive calls are
+supported only for exact V21 or canonical `(22, "embedding_space_shadow_stage")`, and only when the
+database proves the named objects and markers of the completed V21 attachment
+cutover: the complete marker and V21 ledger row, the attachment and claim
+tables/indexes, attachment INSERT/UPDATE claim fences, and no legacy entity
+content-ref column/index/triggers. V20, pending, incomplete,
+missing-required-object, retained-legacy, and unknown V23-or-later epochs return typed
 `StorageError::Unsupported` before waiting for the blob-root lock, walking
 files, or recovering abandoned claims.
 
@@ -120,12 +120,12 @@ coordination and epoch guarantees return `Unsupported`.
 
 ### Schema epoch gate and the two-release V21 rollout
 
-The shipped filesystem implementation selects SQL liveness only after proving
-one exact completed V21 epoch: the V21 ledger row is uniquely present and latest,
-the cutover marker is complete, the required attachment/claim objects and
-attachment claim triggers are present, and the legacy entity
-column/index/triggers are absent. Known non-admitted epochs—V20, pending,
-incomplete, missing-required-object, retained-legacy, or ahead-of-V21—return
+The original Phase4a filesystem implementation selects SQL liveness only after
+proving one exact completed V21 epoch: the V21 ledger row is uniquely present
+and latest, the cutover marker is complete, the required attachment/claim
+objects and attachment claim triggers are present, and the legacy entity
+column/index/triggers are absent. Its known non-admitted epochs—V20, pending,
+incomplete, missing-required-object, retained-legacy, or ahead of V21—return
 `StorageError::Unsupported` in both modes before root locking, filesystem
 walking, or abandoned-claim cleanup. Malformed stored evidence or a
 nonfunctional named fence may retain a more specific validation, storage, or
@@ -146,6 +146,16 @@ reader/writer compatibility. Start Phase-4b serving only after exact-current
 topology validation. Transactional GC is intentionally unavailable while Phase
 4a operates on V20; do not bypass the pause with caller-snapshot `orphan_sweep`
 or unconditional `delete`.
+
+The current binary adds one narrow epoch qualification without changing that
+V21 physical contract. V22, `embedding_space_shadow_stage`, contains only
+dormant embedding-registry shadow/provenance/state and leaves attachment
+liveness unchanged, so the current GC gate accepts V21 through canonical V22 after
+revalidating all completed-V21 evidence and functional fences. It refuses an
+unknown V23 or later before root locking or filesystem work. An older Phase4a
+binary sees V22 as ahead and refuses it, which remains safe. V22 does not make
+that older binary suitable for serving, and it does not complete ADR-160 Phase
+7's provider/vector cutover.
 
 The original `orphan_sweep` remains an offline-maintenance API for callers that
 already have a trusted `live_refs` snapshot. It intentionally retains its

@@ -818,7 +818,8 @@ fn invalid_content_ref(message: String) -> StorageError {
 }
 
 /// Whether this database carries the complete V21 attachment-only GC fencing
-/// set and durable completed cutover marker.
+/// set and durable completed cutover marker in a schema epoch this binary
+/// knows preserves that liveness contract.
 ///
 /// `transactional_orphan_sweep` is reachable from any `SqlAccess` a caller
 /// hands it, including a `StorageBackend` constructed directly (e.g.
@@ -886,11 +887,24 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
                         AND cutover.state = 'complete' \
                         AND cutover.completed_at IS NOT NULL \
                         AND (SELECT COUNT(*) FROM _schema_migrations \
-                             WHERE version = 21 \
+                             WHERE version = ?1 \
                                AND name = 'attachments_first_class') = 1 \
-                        AND (SELECT MAX(version) FROM _schema_migrations) = 21"
-                    .to_string(),
-                params: vec![],
+                        AND ( \
+                            (SELECT MAX(version) FROM _schema_migrations) = ?1 \
+                            OR ( \
+                                (SELECT MAX(version) FROM _schema_migrations) = ?2 \
+                                AND (SELECT COUNT(*) FROM _schema_migrations \
+                                     WHERE version = ?2 AND name = ?3) = 1 \
+                            ) \
+                        )"
+                .to_string(),
+                params: vec![
+                    SqlValue::Integer(i64::from(crate::migrations::ATTACHMENT_CUTOVER_VERSION)),
+                    SqlValue::Integer(i64::from(crate::migrations::EMBEDDING_SPACE_SHADOW_VERSION)),
+                    SqlValue::Text(
+                        crate::migrations::EMBEDDING_SPACE_SHADOW_MIGRATION_NAME.to_string(),
+                    ),
+                ],
                 label: Some("blob_gc_cutover_complete".to_string()),
             })
             .await?,
@@ -2237,7 +2251,11 @@ mod tests {
     /// instead of retaining Phase 4a's synthetic future-schema fixture.
     fn prepare_completed_v21_gc_fixture(conn: &mut rusqlite::Connection) {
         let version = crate::run_migrations(conn).expect("prepare canonical completed V21");
-        assert_eq!(version, 21, "empty fixture must take the V21 fast path");
+        assert_eq!(
+            version,
+            crate::migrations::EMBEDDING_SPACE_SHADOW_VERSION,
+            "empty fixture must complete V21 and every later dormant migration"
+        );
     }
 
     #[tokio::test]
@@ -2278,6 +2296,60 @@ mod tests {
         assert!(!blob_gc_fencing_complete(backend.sql().as_ref())
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn completed_v22_gc_gate_refuses_an_unknown_future_schema_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO _schema_migrations (version, name, applied_at) \
+                     VALUES (?1, 'future_unknown', 0)",
+                    [i64::from(
+                        crate::migrations::EMBEDDING_SPACE_SHADOW_VERSION + 1,
+                    )],
+                )
+                .unwrap();
+        }
+
+        assert!(
+            !blob_gc_fencing_complete(backend.sql().as_ref())
+                .await
+                .unwrap(),
+            "known additive V22 is safe, but this binary must refuse an unknown V23+ epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_v22_gc_gate_refuses_a_foreign_v22_ledger_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer
+                .conn()
+                .execute(
+                    "UPDATE _schema_migrations SET name = 'foreign_shadow_stage' \
+                     WHERE version = ?1",
+                    [i64::from(crate::migrations::EMBEDDING_SPACE_SHADOW_VERSION)],
+                )
+                .unwrap();
+        }
+
+        assert!(
+            !blob_gc_fencing_complete(backend.sql().as_ref())
+                .await
+                .unwrap(),
+            "a numeric V22 is not known-safe unless its canonical ledger name also matches"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use khive_db::migrations::AttachmentCutoverStatus;
+use khive_db::migrations::{AttachmentCutoverStatus, EMBEDDING_SPACE_SHADOW_VERSION};
 use khive_runtime::{BlobHydrator, StorageBackend};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{Attachment, AttachmentSubstrate};
@@ -95,6 +95,29 @@ async fn cutover_status(backend: Arc<StorageBackend>) -> anyhow::Result<Attachme
         .await
         .context("attachment cutover status task panicked")?
         .context("inspect attachment cutover status")
+}
+
+/// Advance ordinary migrations after V21 releases the database GC owner.
+///
+/// The caller must explicitly drop its `DatabaseGcOwnerGuard` before
+/// awaiting this helper: `StorageBackend::prepare_core_schema` acquires that
+/// same per-database owner before V22 and the guard is deliberately
+/// non-reentrant. This helper remains inside the outer ADR-119 tracked task so
+/// cancellation cannot detach the post-V21 schema advance from boot.
+async fn advance_to_embedding_space_shadow(backend: Arc<StorageBackend>) -> anyhow::Result<()> {
+    let version = tokio::task::spawn_blocking(move || backend.prepare_core_schema())
+        .await
+        .context("post-V21 V22 schema-advance task panicked")?
+        .context("advance ordinary schema to the dormant V22 embedding-space shadow")?;
+    if version != EMBEDDING_SPACE_SHADOW_VERSION {
+        anyhow::bail!(
+            "post-V21 ordinary schema advance returned V{version}, expected exact V{}; \
+             inspect the core migration ledger and V22 embedding-space shadow tables before \
+             retrying boot",
+            EMBEDDING_SPACE_SHADOW_VERSION
+        );
+    }
+    Ok(())
 }
 
 /// Reject attachment evidence on a non-main database before the main database
@@ -213,8 +236,13 @@ async fn coordinate_attachment_cutover_inner(
         .context("V21 stage-1 blocking task panicked")??;
         if already_complete {
             if let Some(backend_name) = mode.secondary_name() {
-                require_secondary_attachment_empty(backend, backend_name).await?;
+                require_secondary_attachment_empty(Arc::clone(&backend), backend_name).await?;
             }
+            // A sibling completed V21 while this task waited for ownership.
+            // Release the non-reentrant guard before ordinary migration tries
+            // to acquire the same owner for V22.
+            drop(owner);
+            advance_to_embedding_space_shadow(backend).await?;
             return Ok(());
         }
 
@@ -271,24 +299,30 @@ async fn coordinate_attachment_cutover_inner(
             })
             .collect::<Vec<_>>();
 
-        tokio::task::spawn_blocking(move || {
+        let (backend, owner) = tokio::task::spawn_blocking(move || {
             backend
                 .apply_verified_attachments(&owner, &attachments)
                 .context("atomically apply verified pack-owned attachments")?;
             backend
                 .finalize_attachment_cutover(&owner)
                 .context("finalize V21 attachment/GC cutover")?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>((backend, owner))
         })
         .await
         .context("V21 finalization blocking task panicked")??;
+
+        // `prepare_core_schema` acquires this same guard before applying V22.
+        // Make the ownership boundary explicit rather than relying on a
+        // temporary's drop order and deadlocking on a reentrant acquisition.
+        drop(owner);
+        advance_to_embedding_space_shadow(backend).await?;
 
         Ok::<_, anyhow::Error>(())
     });
 
     handle
         .await
-        .context("tracked V21 attachment migrator panicked")??;
+        .context("tracked V21/V22 schema coordinator panicked")??;
     Ok(())
 }
 
@@ -354,7 +388,9 @@ pub(crate) fn create_v20_database_fixture(
 
 #[cfg(test)]
 mod tests {
-    use khive_db::migrations::ATTACHMENT_CUTOVER_VERSION;
+    use khive_db::migrations::{
+        validate_schema_is_current, ATTACHMENT_CUTOVER_VERSION, EMBEDDING_SPACE_SHADOW_VERSION,
+    };
     use khive_db::stores::blob::FsBlobStore;
     use khive_storage::BlobStore as _;
 
@@ -398,6 +434,162 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_columns, 0, "final V21 must drop the legacy column");
+    }
+
+    #[tokio::test]
+    async fn v20_legacy_ref_coordinator_reaches_v22_shadow_before_return() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("legacy-through-shadow.db");
+        create_v20_database_fixture(&db_path, "visual_asset", None);
+        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+
+        assert_eq!(
+            backend.prepare_core_schema().unwrap(),
+            ATTACHMENT_CUTOVER_VERSION - 1,
+            "canonical legacy evidence must stop ordinary migration at V20"
+        );
+        coordinate_attachment_cutover(Arc::clone(&backend), None)
+            .await
+            .expect("the coordinator must finish V21 and continue through dormant V22");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            validate_schema_is_current(&conn).unwrap(),
+            EMBEDDING_SPACE_SHADOW_VERSION,
+            "the coordinator must not return with a writable database stranded at V21"
+        );
+        for table in [
+            "_embedding_models_v22_shadow",
+            "_embedding_model_legacy_provenance",
+            "_embedding_space_cutover_state",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) = 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "V22 must materialize dormant shadow table {table}");
+        }
+        let shadow_state = conn
+            .query_row(
+                "SELECT state, staged_at IS NOT NULL, completed_at IS NULL \
+                 FROM _embedding_space_cutover_state",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(shadow_state, ("legacy_staged".to_string(), true, true));
+    }
+
+    #[tokio::test]
+    async fn exact_current_v22_coordinator_does_not_repeat_shadow_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("exact-current-shadow.db");
+        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        assert_eq!(
+            backend.prepare_core_schema().unwrap(),
+            EMBEDDING_SPACE_SHADOW_VERSION
+        );
+
+        let observer = rusqlite::Connection::open(&db_path).unwrap();
+        let data_version_before: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        let stage_before = observer
+            .query_row(
+                "SELECT state, staged_at, completed_at \
+                 FROM _embedding_space_cutover_state",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let ledger_rows_before: i64 = observer
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = ?1",
+                [i64::from(EMBEDDING_SPACE_SHADOW_VERSION)],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        coordinate_attachment_cutover(backend, None)
+            .await
+            .expect("an exact-current database must take the query-only fast path");
+
+        let data_version_after: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        let stage_after = observer
+            .query_row(
+                "SELECT state, staged_at, completed_at \
+                 FROM _embedding_space_cutover_state",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let ledger_rows_after: i64 = observer
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = ?1",
+                [i64::from(EMBEDDING_SPACE_SHADOW_VERSION)],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(data_version_after, data_version_before);
+        assert_eq!(stage_after, stage_before);
+        assert_eq!(ledger_rows_before, 1);
+        assert_eq!(ledger_rows_after, ledger_rows_before);
+    }
+
+    #[tokio::test]
+    async fn incomplete_v21_resumes_through_v22_before_coordinator_returns() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("incomplete-through-shadow.db");
+        create_v20_database_fixture(&db_path, "visual_asset", None);
+        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        assert_eq!(
+            backend.prepare_core_schema().unwrap(),
+            ATTACHMENT_CUTOVER_VERSION - 1
+        );
+
+        let owner = khive_db::stores::blob::acquire_database_gc_owner(backend.sql().as_ref())
+            .await
+            .unwrap();
+        backend.stage_attachment_cutover(&owner).unwrap();
+        drop(owner);
+        assert_eq!(
+            backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Incomplete
+        );
+
+        coordinate_attachment_cutover(backend, None)
+            .await
+            .expect("an interrupted V21 must finalize and advance ordinary V22 before return");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            validate_schema_is_current(&conn).unwrap(),
+            EMBEDDING_SPACE_SHADOW_VERSION
+        );
     }
 
     #[tokio::test]
@@ -475,11 +667,21 @@ mod tests {
         test_sync::clear();
         drop(owner);
 
-        first.await.unwrap().unwrap();
-        second.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        })
+        .await
+        .expect("both coordinators must release the V21 owner before re-entering for V22");
         assert_eq!(
             backend.attachment_cutover_status().unwrap(),
             AttachmentCutoverStatus::Complete
+        );
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            validate_schema_is_current(&conn).unwrap(),
+            EMBEDDING_SPACE_SHADOW_VERSION,
+            "the under-owner sibling-complete path must also await ordinary V22"
         );
     }
 

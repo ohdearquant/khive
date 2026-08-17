@@ -3,14 +3,14 @@
 **Status**: accepted
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
-accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch proposed
-2026-08-16 by ADR-160)
+accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch accepted
+2026-08-16 by ADR-160; known-safe V22 epoch qualification implemented 2026-08-17)
 **Authors**: khive maintainers
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which requires
+**Amended by**: accepted [ADR-160](ADR-160-shared-pack-infrastructure.md), which requires
 backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and implements
 ADR-121's attachment-only liveness and claim fences through a Phase-4a GC compatibility release,
 mandatory fleet convergence/drain plus application-service quiescence, and boot-gated Phase-4b V21
-cutover on acceptance.
+cutover.
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (trait-only capability
@@ -325,6 +325,18 @@ worker is safe on exact completed V21, but that narrow property is not general s
 compatibility. Start the Phase-4b service fleet only after exact-current topology validation. This
 intentionally pauses transactional GC on V20 during the compatibility epoch; operators must budget
 capacity rather than weaken the fence.
+
+**Known-safe V22 qualification (implemented 2026-08-17, ADR-160 Phase 7a).** The Phase-4a
+paragraphs above remain the historical contract of that independently released binary: it accepts
+only exact completed V21. The current binary retains completed V21 as the physical liveness fence
+but admits transactional GC when the latest ledger is exact V21 or canonical
+`(22, "embedding_space_shadow_stage")`.
+V22 (`embedding_space_shadow_stage`) only records dormant embedding-registry shadow/provenance
+state; it does not change attachments, claims, liveness, or any live registry/provider/vector/ANN/
+cache/log path. Every sweep still revalidates the complete V21 marker, schema, and functional claim
+fences. A foreign same-number V22 or unknown V23-or-later epoch is refused before root locking, filesystem walking, or
+abandoned-claim recovery. An older Phase-4a binary presented with V22 likewise treats it as ahead
+of its exact-V21 contract and refuses GC, so the downgrade direction remains fail closed.
 
 This yields two concurrency guarantees pinned by tests. A blob published after candidate capture
 is not in the sweep set and survives. A committed attachment reference cannot appear between the
@@ -796,9 +808,10 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
   `crates/khive-mcp/src/serve.rs` — config-aware blob-store selection and boot wiring from PR #1054;
   no provider type enters `khive-storage`.
 - `crates/khive-storage/src/blob.rs` and `crates/khive-db/src/stores/blob.rs` — provider-neutral
-  transactional sweep contract and filesystem implementation; the Phase-4a epoch gate refuses V20
-  and every incomplete/malformed V21 combination in both modes, while exact completed V21
-  anti-joins `attachments` and validates attachment/claim refs.
+  transactional sweep contract and filesystem implementation; the current epoch gate refuses V20,
+  every incomplete/malformed V21 combination, and unknown V23-or-later schemas in both modes. It
+  admits only the known-safe V21..=V22 range after revalidating completed V21, then anti-joins
+  `attachments` and validates attachment/claim refs.
 - `crates/khive-db/sql/010-entities-content-ref.sql` — historical V10 column introduced by this
   ADR; V21 removes it after backfill.
 - `crates/khive-db/sql/021-attachments-stage.sql` and
