@@ -25,6 +25,11 @@ describe("repository showcase", () => {
     window.history.replaceState(null, "", "/");
   });
 
+  // Measured at ~5.5s under the default parallel worker pool (vs. ~1.6s run
+  // in isolation) — the interaction sequence below (typed search, two view
+  // switches, a popstate restore) is CPU-bound by jsdom render cost, not by
+  // an unmemoized computation, so it needs headroom under worker contention
+  // rather than a code fix.
   it("restores and traverses a shareable module and analysis location", async () => {
     const bundle = golden();
     const pool = bundle.graph.modules.items.find((module) =>
@@ -106,7 +111,7 @@ describe("repository showcase", () => {
       `Restored ${bundle.capability.views.dependency_topology.label} for ${pool.source_path}.`,
     );
     expect(pushState).toHaveBeenCalledTimes(2);
-  });
+  }, 15_000);
 
   it("keeps stale and missing deep-link evidence explicit and recoverable", async () => {
     const bundle = golden();
