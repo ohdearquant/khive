@@ -53,23 +53,24 @@ activity necessarily observes a plane that already accounts for the previous gen
 in-flight records.
 
 **Attribution: the runtime is the principal, the record is the subject.** ADR-162 §2 binds an
-event's attributed principal to the actor the dispatch seam resolved _for the operation that
-caused it_, and states that for process-lifecycle events the process identity is a subject
-rather than an authenticated actor. The operation here is the boot scan. No owner dispatch
-caused it, and `owner_actor` did nothing: stamping that actor as the principal would make a
+event's attributed principal to the principal the runtime resolved _for the work that caused
+it_, and states that for process-lifecycle events the process identity is a subject rather
+than an authenticated actor. The operation here is the boot scan. No owner dispatch caused
+it, and `owner_actor` did nothing: stamping that actor as the principal would make a
 per-actor view of the plane count operations the actor never performed.
 
-These events therefore attribute to the runtime's own system actor, and this ADR states the
-small extension ADR-162 §2 currently lacks: **for a runtime-initiated operation — one the
-runtime performs on its own behalf rather than in service of a caller's dispatch — the
-attributed principal is the runtime's system actor.** The boot scan is the first such
-operation to reach the plane; the rule is written generally because it will not be the last.
-This is an extension of §2's causal rule to a case §2 does not enumerate, not an amendment
-to it: the principal is still the actor resolved for the causing operation.
+These events therefore attribute to the runtime's own system actor. That is an instance of
+§2's rule rather than an extension of it: §2 resolves a dispatched actor where a dispatch
+caused the work and a runtime principal where the runtime's own work did, and the boot scan
+is the second kind. What this ADR adds is the specific principal for this specific case:
+**for a runtime-initiated operation — one the runtime performs on its own behalf rather than
+in service of a caller's dispatch — the attributed principal is the runtime's system actor.**
+The boot scan is the first restart-boundary operation to reach the plane; the rule is written
+generally because it will not be the last.
 
 The record's identity rides as subject data, never as the principal: `agent_id`,
 `owner_actor` (as the terminated work's owner, so a per-owner reconstruction still finds it),
-and lineage context per ADR-161 §5, so a reader rebuilding a terminated tree from events
+and the lineage context ADR-161 fixes, so a reader rebuilding a terminated tree from events
 alone sees a forest terminate rather than a set of unrelated records.
 
 ### 2. The boot boundary is a pair of events, not one
@@ -126,9 +127,10 @@ confidence.
 
 This ADR governs the runtime-owned plane and the records the ADR-142 boot scan owns. Work
 records maintained by layers above the runtime — an orchestration engine's run journal, a
-review tool's per-round artifact — are outside it: ADR-162 §1 already classes those as
-convenience mirrors, and the legibility of a mirror is its owner's contract, not the
-kernel's. That boundary is deliberate and is the reason this ADR does not attempt a general
+review tool's per-pass artifact — are outside it. ADR-162 §1 already settles their standing
+two ways: a layer's view of work the runtime did see is a convenience mirror, and work that
+never reached the runtime produces nothing on the plane to be authoritative about. Either
+way the legibility of such a record is its owner's contract, not the kernel's. That boundary is deliberate and is the reason this ADR does not attempt a general
 "every log must be restart-legible" rule it has no authority to enforce.
 
 ## Non-goals
