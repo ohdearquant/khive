@@ -22,6 +22,7 @@ use khive_storage::event::{EventAppendDisposition, IdempotentEventBatchResult};
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
 use khive_storage::{
     Event, EventFilter, EventStore, StorageCapability, StorageError, StorageResult,
+    WriterTaskRequestState,
 };
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 use serial_test::serial;
@@ -30,6 +31,11 @@ struct FakeStore {
     fail_next: AtomicUsize,
     calls: AtomicU64,
     rows: Mutex<Vec<Event>>,
+    /// Armed once: the next `append_events_idempotent` call commits its rows
+    /// (visible in `rows` afterward) but reports the ambiguous
+    /// `SideEffectsUnknown` writer state instead of `Ok`, simulating a commit
+    /// whose acknowledgement was lost (ADR-133 acceptance criterion 7).
+    ambiguous_ack_once: std::sync::atomic::AtomicBool,
 }
 
 impl FakeStore {
@@ -38,6 +44,7 @@ impl FakeStore {
             fail_next: AtomicUsize::new(0),
             calls: AtomicU64::new(0),
             rows: Mutex::new(Vec::new()),
+            ambiguous_ack_once: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -92,6 +99,9 @@ impl EventStore for FakeStore {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
             return Err(StorageError::WriterTaskBusy { timeout_ms: 1 });
         }
+        let ambiguous = self
+            .ambiguous_ack_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
         let mut rows = self.rows.lock();
         let mut dispositions = Vec::with_capacity(events.len());
         for event in events {
@@ -106,7 +116,21 @@ impl EventStore for FakeStore {
                 dispositions.push(EventAppendDisposition::Inserted);
             }
         }
+        if ambiguous {
+            // The rows above are already committed (visible in `rows`), but
+            // the caller's acknowledgement is lost — exactly the fixture
+            // ADR-133 acceptance criterion 7 requires: a commit that
+            // succeeds in the store while the driver observes ambiguity and
+            // must retry rather than duplicate.
+            return Err(StorageError::WriterTaskTerminated {
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+            });
+        }
         Ok(IdempotentEventBatchResult { rows: dispositions })
+    }
+
+    fn supports_idempotent_audit_batch(&self) -> bool {
+        true
     }
 }
 
@@ -514,4 +538,46 @@ async fn identity_conflict_reported_per_row_and_isolated() {
         })
         .await;
     assert_eq!(result, Err(AuditTerminalReason::IdentityConflict));
+}
+
+/// ADR-133 acceptance criterion 7: an ambiguous commit acknowledgement
+/// followed by a retry persists exactly one accounting-bearing record. The
+/// fixture injects the ambiguity itself (the store commits, then reports
+/// `SideEffectsUnknown`) rather than a clean pre-write failure, since a
+/// clean failure is the easy case and cannot duplicate a row.
+#[serial]
+#[tokio::test]
+async fn d1c_ambiguous_ack_retry_persists_exactly_one_accounting_row() {
+    let store = FakeStore::new();
+    store.ambiguous_ack_once.store(true, Ordering::SeqCst);
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let event = mk_event("kg.create");
+    let event_id = event.id;
+
+    let result = batch
+        .submit(PreparedAuditRow {
+            event,
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+
+    // The retry replays the identical row against a store that already
+    // holds it, so the accounting consumer sees a fresh commit's twin
+    // (`AlreadyPresentIdentical`), not a second row.
+    assert_eq!(result, Ok(AuditCommitOutcome::AlreadyPresentIdentical));
+    assert_eq!(
+        store
+            .rows
+            .lock()
+            .iter()
+            .filter(|e| e.id == event_id)
+            .count(),
+        1,
+        "the ambiguous commit followed by retry must persist exactly one row, not zero or two"
+    );
+    assert_eq!(
+        store.calls.load(Ordering::SeqCst),
+        2,
+        "one ambiguous attempt, then one retry that observes the row already committed"
+    );
 }
