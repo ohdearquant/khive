@@ -3,7 +3,8 @@
 **Status**: accepted\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers
-**Amended by**: [ADR-062](ADR-062-fts-ann-consolidation.md), which adds schema version 4.
+**Amended by**: [ADR-062](ADR-062-fts-ann-consolidation.md), which adds schema version 4;
+[ADR-160](ADR-160-shared-pack-infrastructure.md), which governs coordinated V21 and dormant V22.
 
 ## Context
 
@@ -149,6 +150,7 @@ above remains the historical pre-consolidation record.
 |     V19 | #1649              | list_cursor_backfill_repair        | shipped |
 |     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
 |     V21 | ADR-121 / ADR-160  | attachments_first_class            | shipped |
+|     V22 | ADR-160 D6         | embedding_space_shadow_stage       | shipped |
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
@@ -199,6 +201,20 @@ above remains the historical pre-consolidation record.
 > inserted only in the final transaction that swaps claim fences and drops
 > `entities.content_ref`.
 
+> **V22 record (2026-08-17, ADR-160 D6 Phase 7a)**:
+> `embedding_space_shadow_stage` is an additive, dormant migration. It creates
+> `_embedding_models_v22_shadow`, `_embedding_model_legacy_provenance`, and
+> `_embedding_space_cutover_state`; maps every valid legacy registry tuple to
+> exact `khive.legacy-embedding-space.v1` provenance; and records
+> `legacy_staged`. The existing `_embedding_models` table remains the live
+> serving registry. V22 does not change provider registration, vector rows or
+> tables, ANN state, caches, pending logs, replay watermarks, or reopen lookup.
+> It is staging for a later coordinated rebuild/cutover, not completion of
+> ADR-160 Phase 7.
+> A metadata-only preflight bounds the legacy registry at 4,096 rows, individual
+> identity/provenance values, and a 16 MiB weighted staging payload before V22
+> materializes legacy values or creates any shadow object.
+
 > **Phase 4a compatibility record (2026-08-16, ADR-111 / ADR-160)**: the
 > separately deployed GC compatibility epoch gate does not add attachments,
 > backfill data, dual-read or dual-write, or record V21. It leaves every V20
@@ -241,6 +257,30 @@ The current implementation has these boundaries:
   hydration when legacy V20 application evidence requires it. `db check`
   remains read-only and reports the targeted ledger state without constructing
   a runtime or completing V21.
+
+### 2026-08-17 implementation qualification — dormant V22 follow-through
+
+This qualification preserves V21's attachment cutover and the original Phase-4a rollout record;
+it describes the next live schema epoch rather than redefining that history.
+
+- Completed V21 attachment schema, marker, ledger row, and claim fences remain
+  the physical blob-liveness prerequisite at V22. Exact-current validation
+  rechecks that V21 state for every recognized version at or above V21, then
+  validates V22's dormant shadow objects and `legacy_staged` singleton.
+- A legacy V20 host coordinator does not return immediately after recording
+  V21. It releases the non-reentrant database-GC owner, applies ordinary V22,
+  and returns only after exact-current V22 validation. An interrupted V21
+  resumes through the same boundary.
+- This binary's filesystem transactional GC admits only the closed, known-safe
+  epoch range V21 through canonical `(22, "embedding_space_shadow_stage")`, while still requiring the complete V21 physical
+  fence. V22 is safe because it does not change attachment liveness. An unknown
+  V23 or later epoch is refused before root locking, filesystem walking, or
+  abandoned-claim recovery. Conversely, the older Phase-4a binary sees V22 as
+  ahead of its exact-V21 contract and refuses GC, which is safe fail-closed
+  behavior rather than mixed-version support.
+- Low-level prepared-runtime construction requires this binary's exact current
+  schema. A physically complete V21 database is valid attachment history but is
+  behind V22 and cannot be served through that seam.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
@@ -559,20 +599,21 @@ own concurrency model.
 
 Pool-level coordination (`ConnectionPool` in `khive-db`) ensures that each
 migration transaction owns the writer. The async host coordinator completes
-schema/V21 work before it exposes service connections; the explicit
+schema/V21/V22 work before it exposes service connections; the explicit
 `kkernel db migrate` command likewise runs its planned target set to completion
 before returning.
 
 ### Schema diagnostics
 
 `kkernel db check` reports every targeted backend's schema ledger and validates
-an exact current V21 state without applying changes:
+the exact current V22 state, including its completed V21 physical prerequisite,
+without applying changes:
 
 ```text
 $ kkernel db check
-main:    V21 (current)
-lore:    V20 (behind: V21 pending)
-archive: V21 (current)
+main:    V22 (current)
+lore:    V20 (behind: V21 pending; V22 follows)
+archive: V21 (behind: V22 pending)
 ```
 
 `kkernel db check --strict` exits nonzero if any planned target is behind,
@@ -637,6 +678,8 @@ Migrations are operationally significant and never run because an agent invoked
 a pack verb. The trusted host owns them before it exposes dispatch. V21 further
 requires an explicit coordinator that retains GC ownership, authenticates
 application evidence, and fails startup rather than serving a partial state.
+After V21 releases that ownership, the same tracked coordinator advances the
+ordinary dormant V22 stage before returning.
 
 Operators who need preflight control can still run config-aware
 `kkernel db check --strict` and `kkernel db migrate` in CI/CD, a maintenance
@@ -657,16 +700,16 @@ the codebase's migration set is global, but applied state is per-file.
 
 ## Alternatives Considered
 
-| Alternative                                      | Why rejected                                                                                             |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| `PRAGMA user_version` only                       | No audit trail, no names, no migration history.                                                          |
-| `CREATE TABLE IF NOT EXISTS` only                | Cannot evolve schema (no ALTER), no ordering, no audit.                                                  |
-| External migration tool (sqlx-migrate, refinery) | Heavy dependency; sqlx doesn't fit the trait-only model; we already wrote this.                          |
-| Down migrations + reversal                       | Doubles maintenance; snapshots cover the use case.                                                       |
-| Uncoordinated eager migration at startup         | Operationally dangerous; current host boot uses an explicit ordered coordinator and durable V21 staging. |
-| Single global version across all backends        | Breaks under multi-file federation with independent backend lifecycles.                                  |
-| Pack-owned versioned migrations in v1            | Adds machinery for an unproven case; pack tables work via idempotent CREATE IF NOT EXISTS.               |
-| All migrations in one transaction                | A single failure rolls back all prior migrations; wasted work and recovery confusion.                    |
+| Alternative                                      | Why rejected                                                                                                 |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `PRAGMA user_version` only                       | No audit trail, no names, no migration history.                                                              |
+| `CREATE TABLE IF NOT EXISTS` only                | Cannot evolve schema (no ALTER), no ordering, no audit.                                                      |
+| External migration tool (sqlx-migrate, refinery) | Heavy dependency; sqlx doesn't fit the trait-only model; we already wrote this.                              |
+| Down migrations + reversal                       | Doubles maintenance; snapshots cover the use case.                                                           |
+| Uncoordinated eager migration at startup         | Operationally dangerous; current host boot uses an explicit ordered coordinator and durable V21/V22 staging. |
+| Single global version across all backends        | Breaks under multi-file federation with independent backend lifecycles.                                      |
+| Pack-owned versioned migrations in v1            | Adds machinery for an unproven case; pack tables work via idempotent CREATE IF NOT EXISTS.                   |
+| All migrations in one transaction                | A single failure rolls back all prior migrations; wasted work and recovery confusion.                        |
 
 ## Consequences
 
@@ -688,7 +731,8 @@ the codebase's migration set is global, but applied state is per-file.
   Mitigated: ADR-010 versioning is the rollback story; the dev path is drop+remigrate.
 - Starting a newer production host may perform schema writes before serving.
   Mitigated: the async coordinator fails closed, V21 staging is durable and
-  resumable, and `kkernel db check --strict` remains available for CI preflight.
+  resumable, dormant V22 is atomic, and `kkernel db check --strict` remains
+  available for CI preflight.
 - Pack tables can't evolve through `ALTER` in v1.
   Mitigated: deferred until a concrete pack use case justifies the machinery.
 - A buggy migration can lock progress until fixed and shipped as a new version.
@@ -703,7 +747,8 @@ the codebase's migration set is global, but applied state is per-file.
 - `_schema_migrations` table is created lazily on first `run_migrations` call;
   it is not part of V1.
 - Writable file-backed and in-memory host boot both apply the ordinary prefix;
-  an empty database can take V21's atomic zero-reference fast path.
+  an empty database can take V21's atomic zero-reference fast path and continue
+  directly to dormant V22.
 
 ## Implementation
 
@@ -715,7 +760,8 @@ the codebase's migration set is global, but applied state is per-file.
   - `MIGRATIONS: &[VersionedMigration]` — contiguous, append-only.
   - `run_migrations(conn)` — applies the ordinary prefix in order and completes
     V21 only for the zero-reference fast path; legacy V20 returns at V20 for
-    host-assisted continuation.
+    host-assisted continuation. Once V21 is complete, ordinary migration applies
+    dormant V22 atomically.
   - `MIGRATION_TRACKING_TABLE` DDL for `_schema_migrations`.
 - `scripts/lint-sql.sh`:
   - Executes every `crates/**/*.sql` against an in-memory SQLite database and
@@ -730,7 +776,8 @@ the codebase's migration set is global, but applied state is per-file.
   - File-backed `KhiveRuntime::new(config)` accepts fresh/current state and
     refuses legacy application-assisted V21. MCP/kkernel async host builders
     coordinate it and construct through `from_prepared_backend` only after
-    durable completion.
+    durable V21 completion and exact-current V22 validation. The low-level
+    prepared seam never treats completed-but-behind V21 as current.
 - `khive-storage::Pack` trait (ADR-017, Pack Standard): adds `fn schema_plan(&self) ->
   SchemaPlan` for pack-auxiliary tables. Applied during pack registration.
 

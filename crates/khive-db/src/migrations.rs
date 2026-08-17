@@ -7,7 +7,9 @@
 //!   migration pipeline for the core tables.
 
 use khive_storage::blob::ContentRef;
+use khive_storage::EmbeddingSpaceIdentity;
 use rusqlite::{Connection, OptionalExtension};
+use sha2::Digest as _;
 use std::path::PathBuf;
 
 use crate::error::SqliteError;
@@ -148,8 +150,36 @@ const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-stage.sql");
 
 const V21_ATTACHMENT_FENCES_UP: &str = include_str!("../sql/021-attachments-claim-fences.sql");
 
+const V22_UP: &str = include_str!("../sql/022-embedding-space-shadow-stage.sql");
+
 /// Core schema version reserved for ADR-121's attachments-first cutover.
 pub const ATTACHMENT_CUTOVER_VERSION: u32 = 21;
+
+/// Core schema version for ADR-160's dormant embedding-registry shadow stage.
+///
+/// V22 records only legacy identity provenance and an invisible candidate
+/// registry. The canonical registry and every serving/vector/ANN path remain
+/// authoritative until a later coordinated cutover.
+pub const EMBEDDING_SPACE_SHADOW_VERSION: u32 = 22;
+
+/// Canonical ledger name for the dormant embedding-registry shadow stage.
+pub const EMBEDDING_SPACE_SHADOW_MIGRATION_NAME: &str = "embedding_space_shadow_stage";
+
+/// Frozen protocol for exact, non-serving identities derived from legacy
+/// `_embedding_models` tuples.
+pub const LEGACY_EMBEDDING_IDENTITY_PROTOCOL: &str = "khive.legacy-embedding-space.v1";
+
+// V22 runs under one IMMEDIATE migration transaction and the database-GC
+// owner. Legacy registry rows predate structural size constraints, so bound
+// both individual values and aggregate staging work before allocating or
+// copying their payloads. The live registry normally contains only a handful
+// of rows; these ceilings are intentionally generous for valid installations.
+const MAX_LEGACY_EMBEDDING_REGISTRY_ROWS: usize = 4_096;
+const MAX_LEGACY_EMBEDDING_TEXT_BYTES: u64 = 4_096;
+const MAX_LEGACY_EMBEDDING_MODEL_BYTES: u64 = 512;
+const MAX_LEGACY_EMBEDDING_CANONICAL_KEY_BYTES: u64 = 65_536;
+const MAX_LEGACY_EMBEDDING_STAGE_BYTES: u64 = 16 * 1024 * 1024;
+const LEGACY_EMBEDDING_FIXED_STAGE_BYTES_PER_ROW: u64 = 512;
 
 /// DDL for the `ann_write_log` delta table.
 ///
@@ -296,6 +326,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         // the ledger entry self-describing for migration inspection tooling.
         up: V21_STAGE_UP,
     },
+    VersionedMigration {
+        version: EMBEDDING_SPACE_SHADOW_VERSION,
+        name: EMBEDDING_SPACE_SHADOW_MIGRATION_NAME,
+        up: V22_UP,
+    },
 ];
 
 /// Durable state of ADR-121's boot-gated, two-stage attachment cutover.
@@ -390,6 +425,42 @@ fn validate_complete_attachment_schema(conn: &Connection) -> Result<(), SqliteEr
     Ok(())
 }
 
+fn validate_embedding_space_shadow_stage(conn: &Connection) -> Result<(), SqliteError> {
+    for (object_type, name) in [
+        ("table", "_embedding_models_v22_shadow"),
+        ("table", "_embedding_model_legacy_provenance"),
+        ("table", "_embedding_space_cutover_state"),
+        ("index", "idx_embedding_models_v22_shadow_one_active"),
+        ("index", "idx_embedding_models_v22_shadow_lineage_status"),
+    ] {
+        if !schema_object_exists(conn, object_type, name)? {
+            return Err(SqliteError::InvalidData(format!(
+                "V22 embedding-space shadow stage is missing {object_type} {name:?}"
+            )));
+        }
+    }
+
+    let state: Option<(String, Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT state, staged_at, completed_at \
+             FROM _embedding_space_cutover_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    match state {
+        Some((state, Some(_), None)) if state == "legacy_staged" => Ok(()),
+        Some((state, staged_at, completed_at)) => Err(SqliteError::InvalidData(format!(
+            "V22 embedding-space shadow must be legacy_staged with staged_at and no \
+             completed_at, got state={state:?}, staged_at={staged_at:?}, \
+             completed_at={completed_at:?}"
+        ))),
+        None => Err(SqliteError::InvalidData(
+            "V22 embedding-space shadow state is missing its singleton row".into(),
+        )),
+    }
+}
+
 /// Inspect the coordinated V21 state without mutating the connection.
 ///
 /// The marker and migration ledger form one state machine. Impossible pairs
@@ -432,12 +503,12 @@ pub fn attachment_cutover_status(
             }
         }
         Some((state, Some(_))) if state == "complete" => {
-            if version == ATTACHMENT_CUTOVER_VERSION {
+            if version >= ATTACHMENT_CUTOVER_VERSION {
                 validate_complete_attachment_schema(conn)?;
                 Ok(AttachmentCutoverStatus::Complete)
             } else {
                 Err(SqliteError::InvalidData(format!(
-                    "attachment cutover is complete but schema ledger is at V{version}, expected V{ATTACHMENT_CUTOVER_VERSION}"
+                    "attachment cutover is complete but schema ledger is at V{version}, expected at least V{ATTACHMENT_CUTOVER_VERSION}"
                 )))
             }
         }
@@ -821,6 +892,387 @@ pub fn finalize_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteEr
     Ok(())
 }
 
+fn legacy_u32(field: &str, value: i64) -> Result<u32, SqliteError> {
+    u32::try_from(value).map_err(|_| {
+        SqliteError::InvalidData(format!(
+            "legacy _embedding_models.{field} value {value} is outside the u32 range"
+        ))
+    })
+}
+
+fn invalid_legacy_registry(rowid: i64, message: impl std::fmt::Display) -> SqliteError {
+    SqliteError::InvalidData(format!("legacy _embedding_models rowid {rowid} {message}"))
+}
+
+fn require_legacy_sqlite_type(
+    rowid: i64,
+    field: &str,
+    actual: &str,
+    allowed: &[&str],
+) -> Result<(), SqliteError> {
+    if allowed.contains(&actual) {
+        Ok(())
+    } else {
+        Err(invalid_legacy_registry(
+            rowid,
+            format_args!(
+                "field {field:?} has SQLite type {actual:?}; expected {}",
+                allowed.join(" or ")
+            ),
+        ))
+    }
+}
+
+fn bounded_legacy_length(
+    rowid: i64,
+    field: &str,
+    raw_length: i64,
+    maximum: u64,
+) -> Result<u64, SqliteError> {
+    let length = u64::try_from(raw_length).map_err(|_| {
+        invalid_legacy_registry(
+            rowid,
+            format_args!("field {field:?} reported invalid byte length {raw_length}"),
+        )
+    })?;
+    if length > maximum {
+        return Err(invalid_legacy_registry(
+            rowid,
+            format_args!("field {field:?} is {length} bytes; the V22 staging limit is {maximum}"),
+        ));
+    }
+    Ok(length)
+}
+
+fn add_legacy_stage_bytes(
+    rowid: i64,
+    total: &mut u64,
+    field: &str,
+    bytes: u64,
+    copies: u64,
+) -> Result<(), SqliteError> {
+    let staged = bytes
+        .checked_mul(copies)
+        .and_then(|value| total.checked_add(value))
+        .ok_or_else(|| {
+            invalid_legacy_registry(rowid, "overflows the V22 staging-byte accounting")
+        })?;
+    if staged > MAX_LEGACY_EMBEDDING_STAGE_BYTES {
+        return Err(invalid_legacy_registry(
+            rowid,
+            format_args!(
+                "would raise bounded V22 staging payload above \
+                 {MAX_LEGACY_EMBEDDING_STAGE_BYTES} bytes while accounting field {field:?}"
+            ),
+        ));
+    }
+    *total = staged;
+    Ok(())
+}
+
+/// Validate legacy row types and byte budgets without materializing any
+/// attacker-sized TEXT or BLOB value in Rust.
+fn preflight_legacy_embedding_registry(conn: &Connection) -> Result<(), SqliteError> {
+    let mut statement = conn.prepare(
+        "SELECT rowid, \
+                typeof(id), octet_length(id), \
+                typeof(engine_name), octet_length(engine_name), \
+                typeof(model_id), octet_length(model_id), \
+                typeof(key_version), octet_length(key_version), \
+                typeof(dim), typeof(output_dim), \
+                typeof(status), octet_length(status), \
+                typeof(activated_at), typeof(superseded_at), \
+                typeof(superseded_by), COALESCE(octet_length(superseded_by), 0), \
+                typeof(canonical_key), octet_length(canonical_key), \
+                typeof(created_at) \
+         FROM _embedding_models ORDER BY rowid LIMIT ?1",
+    )?;
+    let inspection_limit = i64::try_from(MAX_LEGACY_EMBEDDING_REGISTRY_ROWS + 1)
+        .expect("legacy registry row ceiling fits i64");
+    let mut rows = statement.query([inspection_limit])?;
+    let mut rows_seen = 0_usize;
+    let mut staged_bytes = 0_u64;
+
+    while let Some(row) = rows.next()? {
+        rows_seen += 1;
+        if rows_seen > MAX_LEGACY_EMBEDDING_REGISTRY_ROWS {
+            return Err(SqliteError::InvalidData(format!(
+                "legacy _embedding_models contains more than the V22 staging limit of \
+                 {MAX_LEGACY_EMBEDDING_REGISTRY_ROWS} rows"
+            )));
+        }
+
+        let rowid: i64 = row.get(0)?;
+        let id_type: String = row.get(1)?;
+        let id_length = bounded_legacy_length(rowid, "id", row.get(2)?, 16)?;
+        require_legacy_sqlite_type(rowid, "id", &id_type, &["blob"])?;
+        if id_length != 16 {
+            return Err(invalid_legacy_registry(
+                rowid,
+                format_args!("field \"id\" must contain exactly 16 bytes, got {id_length}"),
+            ));
+        }
+
+        let engine_type: String = row.get(3)?;
+        require_legacy_sqlite_type(rowid, "engine_name", &engine_type, &["text"])?;
+        let engine_length = bounded_legacy_length(
+            rowid,
+            "engine_name",
+            row.get(4)?,
+            MAX_LEGACY_EMBEDDING_TEXT_BYTES,
+        )?;
+
+        let model_type: String = row.get(5)?;
+        require_legacy_sqlite_type(rowid, "model_id", &model_type, &["text"])?;
+        let model_length = bounded_legacy_length(
+            rowid,
+            "model_id",
+            row.get(6)?,
+            MAX_LEGACY_EMBEDDING_MODEL_BYTES,
+        )?;
+
+        let key_version_type: String = row.get(7)?;
+        require_legacy_sqlite_type(rowid, "key_version", &key_version_type, &["text"])?;
+        let key_version_length = bounded_legacy_length(
+            rowid,
+            "key_version",
+            row.get(8)?,
+            MAX_LEGACY_EMBEDDING_TEXT_BYTES,
+        )?;
+
+        let dim_type: String = row.get(9)?;
+        require_legacy_sqlite_type(rowid, "dim", &dim_type, &["integer"])?;
+        let output_dim_type: String = row.get(10)?;
+        require_legacy_sqlite_type(rowid, "output_dim", &output_dim_type, &["null", "integer"])?;
+
+        let status_type: String = row.get(11)?;
+        require_legacy_sqlite_type(rowid, "status", &status_type, &["text"])?;
+        let status_length = bounded_legacy_length(rowid, "status", row.get(12)?, 16)?;
+
+        let activated_type: String = row.get(13)?;
+        require_legacy_sqlite_type(rowid, "activated_at", &activated_type, &["null", "integer"])?;
+        let superseded_type: String = row.get(14)?;
+        require_legacy_sqlite_type(
+            rowid,
+            "superseded_at",
+            &superseded_type,
+            &["null", "integer"],
+        )?;
+        let superseded_by_type: String = row.get(15)?;
+        require_legacy_sqlite_type(
+            rowid,
+            "superseded_by",
+            &superseded_by_type,
+            &["null", "blob"],
+        )?;
+        let superseded_by_length = bounded_legacy_length(rowid, "superseded_by", row.get(16)?, 16)?;
+        if superseded_by_type == "blob" && superseded_by_length != 16 {
+            return Err(invalid_legacy_registry(
+                rowid,
+                format_args!(
+                    "field \"superseded_by\" must contain exactly 16 bytes when present, \
+                     got {superseded_by_length}"
+                ),
+            ));
+        }
+
+        let canonical_key_type: String = row.get(17)?;
+        require_legacy_sqlite_type(rowid, "canonical_key", &canonical_key_type, &["blob"])?;
+        let canonical_key_length = bounded_legacy_length(
+            rowid,
+            "canonical_key",
+            row.get(18)?,
+            MAX_LEGACY_EMBEDDING_CANONICAL_KEY_BYTES,
+        )?;
+        let created_at_type: String = row.get(19)?;
+        require_legacy_sqlite_type(rowid, "created_at", &created_at_type, &["integer"])?;
+
+        add_legacy_stage_bytes(
+            rowid,
+            &mut staged_bytes,
+            "fixed generated fields",
+            LEGACY_EMBEDDING_FIXED_STAGE_BYTES_PER_ROW,
+            1,
+        )?;
+        add_legacy_stage_bytes(rowid, &mut staged_bytes, "id", id_length, 2)?;
+        add_legacy_stage_bytes(rowid, &mut staged_bytes, "engine_name", engine_length, 2)?;
+        add_legacy_stage_bytes(rowid, &mut staged_bytes, "model_id", model_length, 2)?;
+        add_legacy_stage_bytes(
+            rowid,
+            &mut staged_bytes,
+            "key_version",
+            key_version_length,
+            1,
+        )?;
+        add_legacy_stage_bytes(rowid, &mut staged_bytes, "status", status_length, 2)?;
+        add_legacy_stage_bytes(
+            rowid,
+            &mut staged_bytes,
+            "superseded_by",
+            superseded_by_length,
+            1,
+        )?;
+        add_legacy_stage_bytes(
+            rowid,
+            &mut staged_bytes,
+            "canonical_key",
+            canonical_key_length,
+            1,
+        )?;
+    }
+    Ok(())
+}
+
+fn hash_legacy_text(
+    hasher: &mut sha2::Sha256,
+    field: &str,
+    value: &str,
+) -> Result<(), SqliteError> {
+    let length = u32::try_from(value.len()).map_err(|_| {
+        SqliteError::InvalidData(format!(
+            "legacy _embedding_models.{field} exceeds the u32 length-framing limit"
+        ))
+    })?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(value.as_bytes());
+    Ok(())
+}
+
+/// Derive ADR-160's exact, non-serving identity for one legacy registry tuple.
+///
+/// This identity is provenance only: it explicitly does not certify that any
+/// current provider emits equivalent vectors, and V22 never opens a physical
+/// vector table from the resulting key.
+fn legacy_embedding_space_identity(
+    engine_name: &str,
+    model_id: &str,
+    key_version: &str,
+    dim: u32,
+    output_dim: Option<u32>,
+) -> Result<EmbeddingSpaceIdentity, SqliteError> {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(LEGACY_EMBEDDING_IDENTITY_PROTOCOL.as_bytes());
+    hasher.update([0]);
+    hash_legacy_text(&mut hasher, "engine_name", engine_name)?;
+    hash_legacy_text(&mut hasher, "model_id", model_id)?;
+    hash_legacy_text(&mut hasher, "key_version", key_version)?;
+    hasher.update(dim.to_be_bytes());
+    match output_dim {
+        None => hasher.update([0]),
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+    }
+    let fingerprint: [u8; 32] = hasher.finalize().into();
+    let dimensions = output_dim.unwrap_or(dim);
+    EmbeddingSpaceIdentity::new(
+        "legacy",
+        LEGACY_EMBEDDING_IDENTITY_PROTOCOL,
+        fingerprint,
+        model_id,
+        dimensions,
+    )
+    .map_err(|error| {
+        SqliteError::InvalidData(format!(
+            "invalid legacy embedding identity for engine {engine_name:?}: {error}"
+        ))
+    })
+}
+
+fn stage_embedding_space_shadow(conn: &Connection, now: i64) -> Result<(), SqliteError> {
+    if attachment_cutover_status(conn)? != AttachmentCutoverStatus::Complete {
+        return Err(SqliteError::InvalidData(
+            "V22 embedding-space shadow requires a physically complete V21 attachment cutover"
+                .into(),
+        ));
+    }
+    preflight_legacy_embedding_registry(conn)?;
+    conn.execute_batch(V22_UP)?;
+
+    // Stream one legacy row at a time. Registry cardinality is normally tiny,
+    // but the migration must not materialize an attacker-sized table in RAM.
+    let mut statement = conn.prepare(
+        "SELECT rowid, engine_name, model_id, key_version, dim, output_dim, status \
+         FROM _embedding_models ORDER BY rowid",
+    )?;
+    let mut provenance_insert = conn.prepare(
+        "INSERT INTO _embedding_model_legacy_provenance \
+         (id, engine_name, model_id, key_version, dim, output_dim, canonical_key, \
+          pre_migration_status) \
+         SELECT id, engine_name, model_id, key_version, dim, output_dim, canonical_key, status \
+         FROM _embedding_models WHERE rowid = ?1",
+    )?;
+    let mut shadow_insert = conn.prepare(
+        "INSERT INTO _embedding_models_v22_shadow \
+         (id, lineage_slot, space_key, identity_protocol, identity_fingerprint, \
+          model_name, dimensions, status, activated_at, superseded_at, superseded_by, \
+          created_at) \
+         SELECT id, ?2, ?3, ?4, ?5, ?6, ?7, status, activated_at, superseded_at, \
+                superseded_by, created_at \
+         FROM _embedding_models WHERE rowid = ?1",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let rowid: i64 = row.get(0)?;
+        let engine_name: String = row.get(1)?;
+        let model_id: String = row.get(2)?;
+        let key_version: String = row.get(3)?;
+        let dim_raw: i64 = row.get(4)?;
+        let output_dim_raw: Option<i64> = row.get(5)?;
+        let status: String = row.get(6)?;
+        if !matches!(
+            status.as_str(),
+            "pending" | "active" | "superseded" | "archived"
+        ) {
+            return Err(invalid_legacy_registry(
+                rowid,
+                "field \"status\" is not a recognized lifecycle value",
+            ));
+        }
+        let dim = legacy_u32("dim", dim_raw)?;
+        let output_dim = output_dim_raw
+            .map(|value| legacy_u32("output_dim", value))
+            .transpose()?;
+        let identity = legacy_embedding_space_identity(
+            &engine_name,
+            &model_id,
+            &key_version,
+            dim,
+            output_dim,
+        )?;
+
+        provenance_insert.execute([rowid])?;
+        shadow_insert.execute(rusqlite::params![
+            rowid,
+            engine_name,
+            identity.space_key().as_str(),
+            identity.protocol().as_str(),
+            identity.fingerprint().as_slice(),
+            model_id,
+            i64::from(identity.dimensions().get()),
+        ])?;
+    }
+    drop(rows);
+    drop(statement);
+    drop(provenance_insert);
+    drop(shadow_insert);
+
+    let updated = conn.execute(
+        "UPDATE _embedding_space_cutover_state \
+         SET state = 'legacy_staged', staged_at = ?1 \
+         WHERE singleton = 1 AND state = 'unstaged' AND staged_at IS NULL \
+           AND completed_at IS NULL",
+        [now],
+    )?;
+    if updated != 1 {
+        return Err(SqliteError::InvalidData(
+            "V22 embedding-space shadow stage did not own one unstaged singleton".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Read the ordered migration ledger prefix without interpreting its rows.
 fn read_applied_migration_ledger(
     conn: &Connection,
@@ -1000,12 +1452,15 @@ pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError>
     // must not accept a history that ordinary boot would reject merely because
     // it cannot repair it in place.
     validate_applied_migration_ledger(conn, current_version)?;
-    if current_version == ATTACHMENT_CUTOVER_VERSION
+    if current_version >= ATTACHMENT_CUTOVER_VERSION
         && attachment_cutover_status(conn)? != AttachmentCutoverStatus::Complete
     {
         return Err(SqliteError::InvalidData(
             "read-only database has not completed the V21 attachment cutover".into(),
         ));
+    }
+    if current_version >= EMBEDDING_SPACE_SHADOW_VERSION {
+        validate_embedding_space_shadow_stage(conn)?;
     }
 
     Ok(current_version)
@@ -1318,6 +1773,12 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                     version: migration.version,
                     error: e.to_string(),
                 }
+            })?;
+        } else if migration.version == EMBEDDING_SPACE_SHADOW_VERSION {
+            let now = chrono::Utc::now().timestamp_micros();
+            stage_embedding_space_shadow(&tx, now).map_err(|error| SqliteError::Migration {
+                version: migration.version,
+                error: error.to_string(),
             })?;
         } else {
             tx.execute_batch(migration.up)

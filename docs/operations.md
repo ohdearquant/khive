@@ -51,6 +51,9 @@ on their surface. The v1 implementation builds a synthetic single-backend regist
 creates the SQLite file, and applies ordinary pending migrations. It may complete V21 only for an
 empty/fresh attachment state; a legacy V20 database requiring authenticated application backfill
 fails and must use the async MCP/kkernel host coordinator.
+After V21 is complete, ordinary migration advances to dormant V22 before runtime assembly. The
+low-level prepared-runtime seam requires this binary's exact current schema; completed V21 alone is
+now behind and is not serveable through that seam.
 So `kkernel backend list` (and `info`) can create/open/migrate the default runtime database
 (`~/.khive/khive.db`) today, on a machine where that file is absent or stale, purely as a side
 effect of listing backends.
@@ -583,6 +586,22 @@ Phase4b migration/serving support is a follow-up and is not present in the Phase
 positive completed-V21 Phase4a GC regression exists to prove the compatibility fence itself; it is
 not an operator command or authorization to keep Phase4a application traffic live during cutover.
 
+#### Current binary: dormant V22 after the V21 cutover
+
+The historical Phase4a release above still accepts only exact completed V21. The current binary's
+latest core migration is V22, `embedding_space_shadow_stage`. It adds only dormant embedding-model
+shadow, legacy-provenance, and cutover-state tables; `_embedding_models` remains authoritative and
+provider/vector/ANN/cache/log serving behavior does not change. This is a staging slice, not a
+completed ADR-160 Phase 7 text-vector cutover.
+
+Because V22 leaves attachment liveness unchanged, current transactional filesystem GC accepts only
+V21 or canonical `(22, "embedding_space_shadow_stage")`, always after revalidating the completed
+V21 marker, physical schema, and functional claim fences. It refuses V20 and incomplete/malformed
+V21 as before, and refuses a foreign V22 or unknown V23-or-later epoch before root locking,
+filesystem walking, or abandoned-claim recovery. An
+old Phase4a binary pointed at V22 also refuses because V22 is ahead of its exact-V21 contract; that
+fail-closed refusal is safe, but it does not make the old binary application-serving compatible.
+
 ### `db migrate` / `db check`
 
 ```bash
@@ -596,7 +615,8 @@ configured topology and `--backend <name>` selects a declared backend. Migration
 deduplicates physical aliases, inventories and advances every distinct secondary
 before canonical `main`, then conditionally resolves bounded hydration when
 legacy V20 moodboard evidence must be authenticated and finalizes the resumable
-V21 attachment/GC cutover. Exact-current paths and migrations without legacy
+V21 attachment/GC cutover. After releasing the database-GC owner, it advances
+ordinary migration through dormant V22 before returning. Exact-current paths and migrations without legacy
 moodboard model evidence do not resolve a BlobStore. Selecting a non-main
 secondary advances only that empty-authority target; selecting `main` (or a
 physical alias of it) retains all secondary prerequisites. With no declared
@@ -626,7 +646,7 @@ literal name `main` carries main's prerequisite plan. Migration result rows mark
 targets, while physically distinct secondaries are prerequisites.
 
 `--strict` turns behind, ahead-of-build, or an invalid exact-current schema
-(including an inconsistent V21 marker/fence state) into a nonzero exit via
+(including an inconsistent V21 marker/fence state or invalid V22 shadow state) into a nonzero exit via
 `anyhow::bail!`.
 
 #### V21 two-release rollout (mandatory)
@@ -660,10 +680,12 @@ shipping the GC gate and column drop as one fleet rollout is unsafe.
    secondaries first; any recoverable attachment authority there blocks main.
    Main then stages/backfills, verifies pack-owned evidence, swaps liveness and
    claim fences, drops `entities.content_ref`, and records V21 atomically at
-   finalization. A normal Phase-4b host boot can start the same migration, so
+   finalization. It then releases GC ownership and advances dormant V22 before
+   returning. A normal Phase-4b host boot can start the same migration, so
    keep the serving fleet stopped and use the controlled admin path for cutover.
 6. Run `kkernel db check --config <path> --strict --human` and require every
-   planned target to report the exact current schema before starting the
+   planned target to report exact current V22, including valid completed-V21
+   physical fences and `legacy_staged` V22 state, before starting the
    Phase-4b serving fleet. A pending, incomplete, or malformed marker remains
    fail-closed for serving and GC; curate the reported evidence and rerun the
    coordinator rather than bypassing it.

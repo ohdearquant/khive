@@ -73,6 +73,16 @@ zero-reference database may complete it atomically inside `run_migrations`; a
 legacy V20 database stops at V20 and requires the async MCP/kkernel host
 coordinator to hold the blob-GC owner, stage attachments, authenticate pack-owned
 roles, and finalize. The V21 ledger row is written only in that final transaction.
+The coordinator then releases GC ownership and applies ordinary V22
+(`embedding_space_shadow_stage`) before returning. Low-level prepared-runtime
+construction requires exact current V22; a completed V21 database is physically
+valid attachment history but is behind this binary.
+
+V22 creates only `_embedding_models_v22_shadow`,
+`_embedding_model_legacy_provenance`, and `_embedding_space_cutover_state`. It
+records exact legacy tuple provenance and `legacy_staged` state while the old
+`_embedding_models` table remains authoritative. It does not switch providers,
+vector/ANN/cache/log identity, copy vectors, or complete ADR-160 Phase 7.
 
 Phase 4b may run only after the separately shipped Phase-4a transactional-GC
 epoch gate has converged across every process sharing the database/blob root and
@@ -82,6 +92,11 @@ dry-run and destructive modes; it does not create or backfill attachments.
 Before cutover, also quiesce every Phase-4a application reader/writer or prove
 it cannot access the database. Only a GC-only worker has narrow completed-V21
 compatibility; start Phase-4b serving after exact-current topology validation.
+The current filesystem GC gate admits only V21 or canonical
+`(22, "embedding_space_shadow_stage")` after revalidating the complete V21
+physical fence. Foreign V22 and unknown V23-or-later schemas fail closed before
+root/filesystem work; an older exact-V21 Phase-4a binary also
+safely refuses V22 as ahead of its contract.
 
 ## Vector storage
 

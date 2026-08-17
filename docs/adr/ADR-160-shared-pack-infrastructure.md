@@ -1,6 +1,6 @@
 # ADR-160: Shared Pack Infrastructure Program
 
-**Status**: proposed\
+**Status**: accepted\
 **Date**: 2026-08-16\
 **Authors**: khive maintainers\
 **Depends on**:
@@ -41,7 +41,7 @@
   Lattice while preserving byte/event identities, and anchor the existing FANN object under
   ADR-121 role `"fann-network"` with authenticated cross-checks
 
-**Supersedes**: [ADR-155](ADR-155-pack-artifact-ingest-blobstore.md) in full on acceptance.\
+**Supersedes**: [ADR-155](ADR-155-pack-artifact-ingest-blobstore.md) in full.\
 **Related**: proposed [ADR-156](ADR-156-named-vector-restart-durability.md), whose restart and
 honest-underfill concerns remain useful but whose identity and materialization assumptions must be
 rebased on this record before ratification.
@@ -595,6 +595,37 @@ does not dual-read or fuse cosine scores across different identities.
 `NamedVectorIdentity` and sanitized-name-derived physical keys are deleted in the same program.
 There is no alias or compatibility constructor.
 
+#### 2026-08-17 implementation qualification — V22 dormant shadow stage
+
+The first independently safe slice of Phase 7 has shipped as core migration V22,
+`embedding_space_shadow_stage`. V22 creates `_embedding_models_v22_shadow`,
+`_embedding_model_legacy_provenance`, and `_embedding_space_cutover_state`; validates and maps each
+legacy tuple through the exact `khive.legacy-embedding-space.v1` digest; preserves every legacy
+registry lifecycle field and the opaque source tuple; and commits the singleton as
+`legacy_staged`. Invalid dimensions, model labels, SQLite types, or duplicate derived keys roll the
+whole migration back with no V22 ledger row or partial shadow schema.
+
+Before creating the shadow schema, V22 performs a metadata-only resource preflight. It accepts at
+most 4,096 legacy rows, bounds `engine_name` and `key_version` at 4,096 bytes, `model_id` at 512
+bytes, and opaque `canonical_key` at 65,536 bytes, requires UUID-shaped 16-byte identifiers, and
+caps the weighted copied/generated staging payload at 16 MiB. Over-limit evidence fails atomically
+before any legacy TEXT/BLOB is materialized in Rust or any V22 DDL is written.
+
+This is deliberately dormant. `_embedding_models` remains the sole live registry, and no provider,
+vector table or row, ANN segment/snapshot, cache, pending log, replay watermark, or reopen lookup
+reads the V22 shadow or a staged `legacy_...` key. V22 neither relabels old vectors nor performs the
+provider-bound rebuild, parity validation, lifecycle transition, or atomic publication required by
+the rest of Phase 7. The desired cutover contract above remains normative and unimplemented.
+
+V21's completed attachment marker, schema, and claim fences remain the physical blob-liveness
+foundation. A legacy V20 coordinator now completes V21, releases the database-GC owner, advances
+ordinary migration through V22, and verifies exact current state before it returns or constructs a
+prepared runtime. The current filesystem GC implementation admits only the recognized safe schema
+range V21 through the canonical `(22, "embedding_space_shadow_stage")` ledger row after
+revalidating the complete V21 fence; a foreign same-number row and every V23-or-later epoch fail
+closed before root locking or filesystem work. The older Phase-4a binary still accepts exact V21
+only, so it sees V22 as ahead and safely refuses GC.
+
 ### D7 — Pairwise numerical fitting moves literally to lattice-tune
 
 The deterministic numerical portion of ADR-149 moves to the existing `lattice-tune` crate under a
@@ -923,6 +954,10 @@ Each phase, including each named Phase-4 subphase, lands in a reviewable PR/rele
 rollback boundary. No later phase is required to make an earlier merged phase safe. Removal of the
 old path occurs in the same subphase that closes its last consumer.
 
+As of 2026-08-17, V22 is only the additive dormant-staging slice described in the D6 implementation
+qualification. It is a rollback boundary within item 7, not evidence that the text-vector cutover
+or Phase 7 as a whole is complete.
+
 ## Required verification
 
 ### Blob and runtime resource safety
@@ -1019,6 +1054,12 @@ old path occurs in the same subphase that closes its last consumer.
 
 ### Embedding identity and migration
 
+- V22 is present in the canonical ledger as `embedding_space_shadow_stage`; fresh and completed-V21
+  upgrades produce only dormant shadow/provenance/state objects while `_embedding_models` remains
+  serving-authoritative.
+- Completed V21 remains physically valid at V22 and is revalidated by exact-current checks. The
+  legacy V20 coordinator reaches V22 before return; low-level prepared runtime assembly refuses a
+  completed-but-behind V21 database.
 - Moodboard canonical descriptor bytes, fingerprint, model key, response, and table selection are
   exact goldens.
 - Every registered identity protocol ships a field-mutation matrix proving that changing each of

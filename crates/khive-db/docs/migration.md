@@ -27,6 +27,22 @@ the async host acquires the database GC owner, records durable `Incomplete`,
 authenticates pack-owned blob roles, and records V21 only in the exclusive
 final transaction. Restart resumes this state before serving or GC.
 
+After V21 completes, V22 (`embedding_space_shadow_stage`) is an ordinary
+single-transaction follow-through. It creates a dormant target-registry shadow,
+preserves every legacy `_embedding_models` tuple in explicit provenance, derives
+the frozen legacy identity, and records `legacy_staged` together with its V22
+ledger row. Any invalid row or collision rolls back the DDL, copied provenance,
+state, and ledger atomically. A legacy V20 coordinator releases the GC owner
+after V21 and reaches exact-current V22 before returning. Low-level
+prepared-runtime construction refuses a completed-but-behind V21 database.
+Before DDL, a metadata-only preflight caps the legacy source at 4,096 rows,
+4,096-byte engine/key-version fields, a 512-byte model label, a 65,536-byte
+opaque canonical key, and 16 MiB of weighted staging payload.
+
+V22 does not replace the canonical `_embedding_models` table or alter provider,
+vector, ANN, cache, pending-log, watermark, or reopen behavior. It is dormant
+staging for a later rebuild/cutover, not completion of ADR-160 Phase 7.
+
 Phase 4b has an operational prerequisite that is not encoded in the V20 ledger.
 Phase 4a first ships only the transactional-GC epoch gate: it leaves V20 schema
 and data untouched, and refuses V20 or any incomplete/malformed V21 state in
@@ -37,6 +53,12 @@ read/write processes must also be quiesced, or proven unable to access the
 database, during cutover; only a GC-only Phase-4a worker is compatible with
 exact completed V21. Phase-4b serving starts after exact-current topology
 validation.
+
+That paragraph records the original Phase-4a release. The current binary's GC
+gate also recognizes canonical `(22, "embedding_space_shadow_stage")` as a known-safe epoch because V21's attachment
+liveness contract is unchanged. It admits only V21..=V22 after physically
+revalidating V21; unknown V23-or-later epochs fail closed before root/filesystem
+work. An old Phase-4a binary sees V22 as ahead and safely refuses GC.
 
 ## Version numbering
 
@@ -85,6 +107,10 @@ V1 baseline at v0.2.8. The live post-consolidation sequence is:
 - **V21 (Phase 4b)**: Adds first-class attachments, backfills role `content`,
   switches blob GC claim fences to attachment writes, and drops
   `entities.content_ref` after verified application backfill.
+- **V22 (ADR-160 D6 Phase 7a)**: Adds dormant embedding-registry shadow,
+  exact legacy provenance, and cutover-state tables; maps valid legacy tuples
+  to frozen `legacy_...` identities and records `legacy_staged`. The live
+  registry and all vector-serving paths remain unchanged.
 
 The historical pre-consolidation allocation table remains in ADR-015 for
 provenance; its version numbers do not describe the live migration array.

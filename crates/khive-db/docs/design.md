@@ -17,8 +17,8 @@
 
 ### Schema Migration System (ADR-015)
 
-- `migrations.rs` contains all versioned DDL in a single file — splitting
-  across files would make migration sequencing harder to verify.
+- `migrations.rs` owns the contiguous version/name ledger and includes each
+  migration's DDL from a numbered file under `sql/`.
 - Migrations are forward-only, applied in version order, each in its own
   transaction. V1 is immutable.
 - Legacy `ServiceSchemaPlan`/`apply_schema_plan` API preserved for
@@ -37,6 +37,12 @@
   then atomically switches liveness/fences to attachments and drops
   `entities.content_ref`. Pending/incomplete state never enables GC, and the
   Phase-4b service fleet starts only after exact-current topology validation.
+- V22 (`embedding_space_shadow_stage`) is an additive, dormant registry stage.
+  It preserves exact legacy tuple provenance in dedicated tables and records
+  `legacy_staged`, but leaves `_embedding_models` and every provider/vector/ANN/
+  cache/log path live and unchanged. The V20 coordinator advances through V22
+  after completing V21 and before returning. Prepared-runtime assembly requires
+  exact current V22 rather than merely a completed V21 marker.
 
 ### Attachments and Blob Liveness (ADR-111, ADR-121, ADR-160)
 
@@ -46,10 +52,13 @@
   cleanup are transactional. Soft deletion retains attachment liveness.
 - Transactional filesystem blob GC validates every attachment/claim ref,
   anti-joins all attachment rows, and relies on attachment INSERT/UPDATE claim
-  fences. Its Phase-4a epoch gate accepts only an exact completed V21
-  ledger/marker/fence/schema combination; V20 and pending, incomplete, or
-  malformed states refuse dry-run and destructive sweep before filesystem or
-  claim mutation.
+  fences. The current epoch gate admits only V21 or canonical
+  `(22, "embedding_space_shadow_stage")`
+  after revalidating the exact completed-V21 ledger/marker/fence/schema
+  combination; V20, pending/incomplete/malformed V21, foreign V22, and unknown V23-or-later
+  states refuse dry-run and destructive sweep before root/filesystem or claim
+  mutation. The older Phase-4a binary safely refuses V22 as ahead of its exact
+  V21 contract.
 
 ### Pack Standard — Pack-Auxiliary Schema (ADR-017)
 
@@ -75,6 +84,11 @@
 - V16 adds `embedding_model` column to regular `vec_*` tables; V17 performs
   a preserving rebuild of vec0 virtual tables to add the same column without
   data loss.
+- Live V22 stages ADR-160 D6's target registry shape in
+  `_embedding_models_v22_shadow` and preserves the complete legacy source tuple
+  in `_embedding_model_legacy_provenance`. The shadow is intentionally not a
+  serving API: no vector or ANN object is relabeled, rebuilt, or selected from
+  it, and the later provider-bound atomic cutover remains unimplemented.
 
 ### Old-Schema Vec0 Detection (ADR-044)
 
@@ -164,4 +178,4 @@ released-writer interval.
   `embedding_coverage: 0.0` regardless of actual indexed vector count. This is
   a known lie in the stats implementation, not a data issue.
 
-Last reviewed: 2026-08-09
+Last reviewed: 2026-08-17

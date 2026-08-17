@@ -259,23 +259,30 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// `StorageError::Unsupported`.
     ///
     /// The filesystem implementation is schema-epoch gated and supports both
-    /// report-only and destructive modes only when `sql` proves the exact
-    /// completed V21 attachment cutover: durable complete marker and ledger
-    /// row, attachment table/indexes and INSERT/UPDATE claim fences, and
-    /// absence of every legacy entity reference column/index/fence. V20,
-    /// pending, incomplete, missing-required-object, retained-legacy, and
-    /// ahead-of-V21 epochs return typed `Unsupported` before root locking,
-    /// filesystem walking, or abandoned-claim cleanup. Malformed stored
+    /// report-only and destructive modes only for a closed set of schema
+    /// epochs this binary knows preserve the completed V21 attachment cutover.
+    /// It always proves the durable V21 complete marker and ledger row,
+    /// attachment table/indexes and INSERT/UPDATE claim fences, and absence of
+    /// every legacy entity reference column/index/fence. This binary admits V21
+    /// through dormant V22; V20, pending, incomplete, missing-required-object,
+    /// retained-legacy, and unknown V23-or-later epochs return typed
+    /// `Unsupported` before root locking, filesystem walking, or
+    /// abandoned-claim cleanup. Malformed stored
     /// evidence or a nonfunctional named fence fails closed with its validation,
     /// storage, or typed `Unsupported` error before claim cleanup or deletion.
     /// Once admitted, every attachment role is live; soft deletion alone does
     /// not make its blob collectible.
     ///
-    /// This is the Phase-4a GC compatibility gate. Phase 4a changes no schema or
-    /// data. Every older process sharing the database/blob root must be drained
-    /// before Phase 4b performs the attachment backfill and legacy-column drop.
-    /// Phase-4a application readers/writers must also be quiesced during cutover;
-    /// only a GC-only worker has narrow compatibility with exact completed V21.
+    /// The original Phase-4a GC compatibility gate changes no schema or data
+    /// and accepts exact completed V21 only. Every older process sharing the
+    /// database/blob root must be drained before Phase 4b performs the
+    /// attachment backfill and legacy-column drop. Phase-4a application
+    /// readers/writers must also be quiesced during cutover; only a GC-only
+    /// worker has narrow compatibility with exact completed V21. An older
+    /// Phase-4a worker presented with V22 safely refuses it as ahead. Current
+    /// Canonical `(22, "embedding_space_shadow_stage")` only adds dormant
+    /// embedding-registry staging and does not relax the
+    /// V21 physical liveness fence.
     /// Callers must not fall back to [`Self::orphan_sweep`] or [`Self::delete`]
     /// when this gate refuses.
     ///
