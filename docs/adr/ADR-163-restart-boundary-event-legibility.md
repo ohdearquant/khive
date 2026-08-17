@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-16
-- **Succeeds:** ADR-162 (open question raised, not closed, by the ownership skeleton)
+- **Extends:** ADR-162 (answers a question the ownership skeleton raises and does not close; ADR-162 is not replaced)
 - **Depends on:** ADR-142, ADR-162, ADR-022
 
 ## Context
@@ -52,26 +52,53 @@ scan, before the runtime serves new requests, so a reader who observes any post-
 activity necessarily observes a plane that already accounts for the previous generation's
 in-flight records.
 
-The event's attribution follows ADR-162 §2 unchanged: it attributes to the terminated
-record's own `owner_actor`, because the event is a fact about that record's work, not about
-the operator or the boot process. Lineage context accompanies it per ADR-161 §5, so a reader
-reconstructing a terminated tree from events alone sees the whole forest terminate rather
-than a set of unrelated records.
+**Attribution: the runtime is the principal, the record is the subject.** ADR-162 §2 binds an
+event's attributed principal to the actor the dispatch seam resolved _for the operation that
+caused it_, and states that for process-lifecycle events the process identity is a subject
+rather than an authenticated actor. The operation here is the boot scan. No owner dispatch
+caused it, and `owner_actor` did nothing: stamping that actor as the principal would make a
+per-actor view of the plane count operations the actor never performed.
 
-### 2. The boot boundary is itself an event
+These events therefore attribute to the runtime's own system actor, and this ADR states the
+small extension ADR-162 §2 currently lacks: **for a runtime-initiated operation — one the
+runtime performs on its own behalf rather than in service of a caller's dispatch — the
+attributed principal is the runtime's system actor.** The boot scan is the first such
+operation to reach the plane; the rule is written generally because it will not be the last.
+This is an extension of §2's causal rule to a case §2 does not enumerate, not an amendment
+to it: the principal is still the actor resolved for the causing operation.
 
-The scan emits one boot-boundary event before the per-record events, carrying a boot
-identifier, the scan's start time, and the count of non-terminal records the scan found.
-Two properties follow, and both are the point:
+The record's identity rides as subject data, never as the principal: `agent_id`,
+`owner_actor` (as the terminated work's owner, so a per-owner reconstruction still finds it),
+and lineage context per ADR-161 §5, so a reader rebuilding a terminated tree from events
+alone sees a forest terminate rather than a set of unrelated records.
 
-- **A reader can bound the generation.** Every event before the boundary belongs to a
-  previous generation of the process; every event after it belongs to this one. Without the
-  boundary, a reader comparing timestamps must infer the restart from a gap, and a gap is
-  not evidence — a quiet system produces gaps too.
-- **A reader can detect an incomplete accounting.** The declared count is comparable against
-  the terminal events that follow it. When they disagree, the plane says so rather than
-  reading as a complete accounting of a smaller set. This is the same complete-versus-
-  incomplete discriminant the substrate applies to retrieval, applied to a boot generation.
+### 2. The boot boundary is a pair of events, not one
+
+The plane is append-only, so a single boundary event cannot both precede the per-record
+events and report how many of them were written. The scan therefore frames its work with two
+events sharing one boot identifier:
+
+- an **opening** event, emitted before any per-record event, carrying the boot identifier,
+  the scan's start time, and the count of non-terminal records the scan found;
+- a **closing** event, emitted after the per-record events and before the runtime serves new
+  requests, carrying the count terminated and the count of terminal events successfully
+  emitted.
+
+Three properties follow, and each is a reading the plane could not previously support:
+
+- **A reader can bound the generation.** Every event before the opening belongs to a previous
+  generation of the process; every event after it belongs to this one. Without the pair, a
+  reader comparing timestamps must infer the restart from a gap, and a gap is not evidence —
+  a quiet system produces identical gaps.
+- **A reader can detect an incomplete accounting.** The opening's found-count is comparable
+  against the closing's emitted-count. When they disagree, the plane says so rather than
+  reading as a complete accounting of a smaller set. This is the complete-versus-incomplete
+  discriminant the substrate applies to retrieval, applied to a boot generation.
+- **A reader can detect an interrupted scan.** An opening with no closing means the scan
+  itself did not finish — a state that, with a single boundary event in either position, is
+  indistinguishable from a scan that found nothing or from one whose boundary was never
+  written. The pair makes the scan's own liveness legible on the same terms it makes the
+  records' liveness legible, which is the property this ADR is about.
 
 ### 3. Write posture: decoupled from the transition, never silent
 
@@ -84,13 +111,16 @@ logging outage able to leave live-looking records behind, which is the failure t
 exists to prevent, inverted.
 
 But a failed append is not permitted to be silent, because silence is precisely the encoding
-this ADR removes. When per-record emission fails, the runtime records the failure in the
-boot-boundary event's own accounting — the boundary states how many records the scan
-terminated and how many terminal events it successfully emitted — so a reader comparing the
-two sees an incomplete generation rather than a complete-looking one. When the boundary event
-itself cannot be written, the runtime emits a degraded marker at the next successful plane
-write and logs the failure at the host; a generation whose boundary is unknown must read as
-unknown.
+this ADR removes. When per-record emission fails, the failure surfaces in the closing event's
+accounting: the opening declares what the scan found, the closing declares what it terminated
+and what it managed to emit, and a reader comparing them sees an incomplete generation rather
+than a complete-looking one. When a boundary event itself cannot be written, the runtime logs
+the failure at the host and emits a degraded marker at the next successful plane write; a
+generation missing either half of its pair reads as unknown, never as clean. Note the
+asymmetry this produces and why it is the right one: a missing closing event degrades a
+generation to unknown, while a missing opening leaves per-record terminal events that are
+individually still legible — the pair fails toward less information, never toward false
+confidence.
 
 ### 4. Scope
 
@@ -121,8 +151,9 @@ kernel's. That boundary is deliberate and is the reason this ADR does not attemp
   and most common case where that happened.
 - Boot generations become bounded and countable, so an incomplete accounting is visible as
   incomplete — the temporal analogue of the retrieval discriminant.
-- The cost is bounded and proportional: one event per terminated record plus one per boot,
-  emitted on a path that already walks every one of those records.
+- The cost is bounded and proportional: one event per terminated record plus two per boot
+  (the opening and closing of §2), emitted on a path that already walks every one of those
+  records.
 
 ## Alternatives considered
 
@@ -145,9 +176,18 @@ Rejected. It would let an event-store outage block or reverse termination, leavi
 that look live after their processes are gone — the exact defect inverted. §3 keeps the
 transition authoritative and makes the plane's own gaps self-declaring instead.
 
-### Emit only the boundary event, without per-record events
+### Emit only the boundary events, without per-record events
 
-Rejected. The boundary alone tells a reader that a restart happened but not which records
+Rejected. The boundary pair alone tells a reader that a restart happened but not which records
 died in it, so a reader following one record still sees unexplained silence. The per-record
-events are what make the individual history legible; the boundary is what makes the set
+events are what make the individual history legible; the boundary pair is what makes the set
 countable.
+
+### A single boundary event instead of an opening/closing pair
+
+Rejected on append-only mechanics. A single event placed before the per-record emissions
+cannot report how many of them succeeded, since they have not happened; placed after them, it
+cannot bound the generation for a reader who arrives mid-scan, and an interrupted scan becomes
+indistinguishable from one that found nothing. Either single-event placement forces the
+implementer to silently drop one of this ADR's two required readings (§2). The pair costs one
+additional event per boot.
