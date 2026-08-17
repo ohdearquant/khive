@@ -1376,6 +1376,10 @@ impl EventStore for SqlEventStore {
         })
         .await
     }
+
+    fn supports_idempotent_audit_batch(&self) -> bool {
+        true
+    }
 }
 
 // =============================================================================

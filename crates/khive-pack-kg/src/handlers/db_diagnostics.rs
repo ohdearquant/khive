@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use khive_runtime::{NamespaceToken, RuntimeError};
+use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 
 use super::common::{deser, DbDiagnosticsParams};
 use crate::KgPack;
@@ -17,13 +17,22 @@ impl KgPack {
     /// namespace. Not write-free: the PASSIVE probe may backfill WAL frames
     /// (normal checkpoint I/O) — it never changes logical state, escalates to
     /// TRUNCATE, or deletes sidecar evidence.
+    ///
+    /// ADR-133: `registry` is the seam that actually owns the audit-batch
+    /// control, so its `audit_batch_metrics()` feeds the batch-health
+    /// counters instead of leaving them permanently unavailable (a bare
+    /// `KhiveRuntime` has no reachable handle to the registry built over it).
     pub(crate) async fn handle_db_diagnostics(
         &self,
         _token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let _p: DbDiagnosticsParams = deser(params)?;
-        let report = self.runtime.db_diagnostics().await?;
+        let report = self
+            .runtime
+            .db_diagnostics_with_audit_metrics(registry.audit_batch_metrics())
+            .await?;
         serde_json::to_value(&report)
             .map_err(|e| RuntimeError::Internal(format!("db_diagnostics: serialize: {e}")))
     }

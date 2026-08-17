@@ -287,6 +287,14 @@ pub enum RuntimeError {
     #[error("internal: {0}")]
     Internal(String),
 
+    /// An `EventStore` was configured via `with_event_store` but does not
+    /// implement ADR-133's `preflight_event`/`append_events_idempotent`
+    /// pair (`EventStore::supports_idempotent_audit_batch` reports
+    /// `false`). Raised at `build()` time rather than left to fail every
+    /// audited dispatch silently.
+    #[error("audit batch incompatible event store: {0}")]
+    IncompatibleEventStore(String),
+
     #[error("guarded edge write refused: {0}")]
     GuardedWriteFailed(GuardedWriteFailure),
 
@@ -497,6 +505,7 @@ impl RuntimeError {
             Self::WriteBudgetExceeded { .. } => "WriteBudgetExceeded",
             Self::SecretDetected(_) => "SecretDetected",
             Self::DeadlineExceeded { .. } => "DeadlineExceeded",
+            Self::IncompatibleEventStore(_) => "IncompatibleEventStore",
         }
     }
 

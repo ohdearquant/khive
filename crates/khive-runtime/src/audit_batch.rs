@@ -142,6 +142,16 @@ pub enum AuditCommitOutcome {
     AlreadyPresentIdentical,
 }
 
+/// Production-visible snapshot of [`AuditBatch::health_metrics`]. See there
+/// for field semantics; mirrors `khive_db::diagnostics::RuntimeAuditBatchMetrics`
+/// one-for-one so the registry owner can convert without loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditBatchHealthMetrics {
+    pub flush_failures: u64,
+    pub degraded_rows: u64,
+    pub degraded: bool,
+}
+
 /// Tunables for the batch seam. Defaults are conservative; every field is
 /// exercised by at least one mechanism test.
 #[derive(Debug, Clone)]
@@ -425,6 +435,19 @@ impl AuditBatch {
             config: Arc::new(config),
             supervisor: Mutex::new(None),
         })
+    }
+
+    /// Process-lifetime audit-batch health counters, for the registry/
+    /// runtime owner to feed into `db_diagnostics` (D8's operator surface).
+    /// Unlike [`test_internals::AuditBatchSnapshot::metrics_snapshot`],
+    /// which is test-only, this is always available.
+    pub fn health_metrics(&self) -> AuditBatchHealthMetrics {
+        let state = self.inner.state.lock();
+        AuditBatchHealthMetrics {
+            flush_failures: state.flush_failures,
+            degraded_rows: state.degraded_rows,
+            degraded: state.degraded,
+        }
     }
 
     fn spawn_supervisor_if_idle(&self) {

@@ -265,4 +265,18 @@ pub trait EventStore: Send + Sync + 'static {
             message: "this EventStore backend does not implement append_events_idempotent".into(),
         })
     }
+
+    /// Whether this backend implements `preflight_event` and
+    /// `append_events_idempotent` for real, rather than inheriting their
+    /// `Unsupported`-returning defaults above.
+    ///
+    /// A caller that builds an ADR-133 audit-batch seam over a backend that
+    /// answers `false` here would have every audited row rejected at
+    /// preflight while the dispatch it audits still reports success — the
+    /// exact silent-loss failure mode the batch exists to prevent. Defaults
+    /// to `false` so an unmodified legacy backend is caught at registry
+    /// build time instead of appearing healthy.
+    fn supports_idempotent_audit_batch(&self) -> bool {
+        false
+    }
 }
