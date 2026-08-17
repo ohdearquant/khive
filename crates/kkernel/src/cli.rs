@@ -569,9 +569,11 @@ fn resolve_db_command_context(
         config_source,
     )?;
 
-    let mut base_config = RuntimeConfig::default();
-    base_config.db_path = khive_runtime::resolve_db_anchor(db);
-    base_config = runtime_config_from_khive_config(&khive_config, base_config);
+    let base_config = RuntimeConfig {
+        db_path: khive_runtime::resolve_db_anchor(db),
+        ..RuntimeConfig::default()
+    };
+    let mut base_config = runtime_config_from_khive_config(&khive_config, base_config);
     // Schema administration never needs to instantiate an embedding model or
     // register packs. Blob hydration remains configured because verified V20
     // moodboard evidence may be part of the cutover.

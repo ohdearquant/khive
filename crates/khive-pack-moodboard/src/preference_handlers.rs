@@ -1255,6 +1255,7 @@ async fn find_model_by_content_ref(
     runtime.get_entity(token, id).await.map(Some)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn find_or_create_model(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
