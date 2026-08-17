@@ -123,7 +123,74 @@ generation to unknown, while a missing opening leaves per-record terminal events
 individually still legible — the pair fails toward less information, never toward false
 confidence.
 
-### 4. Scope
+**A scan that runs after an interrupted one is a new generation, and the interrupted one's
+record is kept.** A crash during the boot scan is followed by another restart, which is the
+case this ADR is most about, so the behaviour is stated here rather than left to an
+implementer. The second scan mints its own `boot_id` (§4) and emits its own pair. It does not
+adopt, repair, retract, or close the abandoned generation's opening.
+
+Idempotency is per record, not per generation: a record already `terminal` is not transitioned
+again and emits no second `RecordTerminatedAtRestart`. So the second scan's `records_found`
+legitimately excludes what the first already terminated, and the two generations' counts are
+read per generation rather than summed — a reader adding them across `boot_id` values is asking
+a question the counts do not answer.
+
+The abandoned opening therefore stays permanently unclosed, and that is the intended outcome
+rather than residue to be cleaned up later. It is a true statement that a scan began and did
+not finish. Closing it retroactively, or folding its records into the successor's counts, would
+manufacture exactly the complete-looking accounting of a smaller set that §2 exists to make
+impossible.
+
+### 4. The event contract: kinds, payloads, boot identity, and audience
+
+ADR-094 and ADR-103 each named their `EventKind` variants and payload fields in the deciding
+document rather than leaving them to the implementation. The enum is closed, and two
+implementers reading the same prose about "a terminal event" otherwise produce incompatible
+kinds. This ADR follows that precedent for its three events.
+
+**Kinds.** Three additive `EventKind` variants: `RestartScanOpened`,
+`RecordTerminatedAtRestart`, `RestartScanClosed`. Additive to the closed enum in the style
+ADR-094 established, and governed from here by ADR-162 §3's versioned-and-additive rule — never
+removed, never repurposed, no payload field redefined.
+
+**Payloads.**
+
+```jsonc
+// EventKind::RestartScanOpened
+{ "boot_id": "...", "scan_started_at_us": 0, "records_found": 0 }
+
+// EventKind::RecordTerminatedAtRestart
+{ "boot_id": "...", "agent_id": "...", "owner_actor": "...", "terminal_reason": "host_restart" }
+
+// EventKind::RestartScanClosed
+{ "boot_id": "...", "records_terminated": 0, "events_emitted": 0, "scan_completed_at_us": 0 }
+```
+
+`records_found` on the opening against `events_emitted` on the closing is the
+incomplete-accounting comparison of §2. Both counts ride their own events so the comparison
+needs no join against the record table, which matters because that table is the thing a reader
+consulting the plane is trying not to have to read.
+
+**Boot identity.** `boot_id` is a UUID minted once per scan, before the opening event, and
+carried unchanged by all three kinds; a reader groups a generation by equality on this field
+alone. It is deliberately **not** derived from host boot time: a derived identifier collides
+across two scans that fall inside one clock granularity, and the re-entry rule in §3 depends on
+exactly those two scans being distinguishable.
+
+**Namespace and audience.** These events are facts about the runtime's own work rather than any
+caller's, and they are attributed to the runtime's system actor per §1. They are written under
+the namespace the runtime uses for its own work, never under a caller's.
+
+One consequence follows, and is stated here rather than left to be discovered. ADR-022 §2
+forces the caller's namespace into every event query, so a caller reading from a different
+namespace does not see these events at all. The generation-bounding property of §2 is therefore
+available to a reader of the runtime's own namespace, not universally. That scope is correct —
+a caller has no standing to enumerate another namespace's restart history — but it means any
+surface wanting to offer restart legibility to callers must project it deliberately. The query
+surface will not deliver it, and a design assuming otherwise fails silently, returning an empty
+generation rather than an error.
+
+### 5. Scope
 
 This ADR governs the runtime-owned plane and the records the ADR-142 boot scan owns. Work
 records maintained by layers above the runtime — an orchestration engine's run journal, a
@@ -143,6 +210,13 @@ way the legibility of such a record is its owner's contract, not the kernel's. T
 - **No new query surface.** The events are read through ADR-022's existing surface.
 - **No retention policy.** How long boundary events live is the plane's retention question,
   not this ADR's.
+- **No self-containment, and no acceptance ahead of its dependency.** This ADR extends
+  ADR-162's ownership and attribution rules and states its requirements in their terms, so it
+  is not self-contained by construction and must not be accepted before ADR-162 is. A reader
+  who finds the ADR-162 references in §1 and §4 unresolvable in a checkout that does not carry
+  ADR-162 has located the sequencing constraint rather than a defect in either document; the
+  same reading applies to the lineage context in §1, which resolves when the owning
+  process-model decision lands. The ADR-022 and ADR-142 references resolve today.
 
 ## Consequences
 
