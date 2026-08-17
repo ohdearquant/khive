@@ -500,11 +500,13 @@ function StructureGraph({
   ]);
   const couplingLens = useMemo(() =>
     buildStructureCouplingLens({
+      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage: graph.structure_edges,
       visibleModuleIds: visibleIds,
       limit: UI_COUPLING_EDGE_LIMIT,
     }), [
+    bundle.aggregates.hidden_coupling.meta.status,
     bundle.aggregates.hidden_coupling.data,
     graph.structure_edges,
     visibleIds,

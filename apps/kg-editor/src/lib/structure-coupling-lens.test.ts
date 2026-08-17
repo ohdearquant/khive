@@ -37,6 +37,7 @@ describe("structure hidden-coupling lens", () => {
   it("selects a deterministic bounded visible slice from the real snapshot", () => {
     const bundle = golden();
     const rootLens = buildStructureCouplingLens({
+      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, null),
@@ -50,6 +51,7 @@ describe("structure hidden-coupling lens", () => {
     );
     expect(databasePackage).toBeDefined();
     const databaseLens = buildStructureCouplingLens({
+      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, databasePackage!.id),
@@ -78,6 +80,7 @@ describe("structure hidden-coupling lens", () => {
       },
     };
     const lens = buildStructureCouplingLens({
+      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, null),
@@ -103,6 +106,7 @@ describe("structure hidden-coupling lens", () => {
       },
     };
     const lens = buildStructureCouplingLens({
+      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage,
       visibleModuleIds: visibleModuleIds(bundle, databasePackage.id),
@@ -136,6 +140,7 @@ describe("structure hidden-coupling lens", () => {
     };
     const bundle = parseRepoBundle(draft);
     const lens = buildStructureCouplingLens({
+      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: new Set([
@@ -150,5 +155,20 @@ describe("structure hidden-coupling lens", () => {
       rightModuleId: pair.right_module_id,
       dependencyEvidence: "present",
     });
+  });
+
+  it("suppresses overlays when the aggregate declares itself unavailable, even with captured rows still present", () => {
+    const bundle = golden();
+    const lens = buildStructureCouplingLens({
+      aggregateStatus: "unavailable",
+      pairPage: bundle.aggregates.hidden_coupling.data,
+      structureEdgePage: bundle.graph.structure_edges,
+      visibleModuleIds: visibleModuleIds(bundle, null),
+      limit: 20,
+    });
+
+    expect(bundle.aggregates.hidden_coupling.data.items.length).toBeGreaterThan(0);
+    expect(lens.pairs).toHaveLength(0);
+    expect(lens.coverage).toBe("unavailable");
   });
 });

@@ -4,6 +4,7 @@ const pairSeparator = "\u0000";
 
 type CouplingPage = RepoBundle["aggregates"]["hidden_coupling"]["data"];
 type StructureEdgePage = RepoBundle["graph"]["structure_edges"];
+type AggregateStatus = RepoBundle["aggregates"]["hidden_coupling"]["meta"]["status"];
 
 export type CouplingDependencyEvidence = "present" | "absent" | "unknown";
 
@@ -33,11 +34,13 @@ function undirectedPairKey(left: string, right: string): string {
 }
 
 export function buildStructureCouplingLens({
+  aggregateStatus,
   pairPage,
   structureEdgePage,
   visibleModuleIds,
   limit,
 }: Readonly<{
+  aggregateStatus: AggregateStatus;
   pairPage: CouplingPage;
   structureEdgePage: StructureEdgePage;
   visibleModuleIds: ReadonlySet<string>;
@@ -64,7 +67,8 @@ export function buildStructureCouplingLens({
       left.left_module_id.localeCompare(right.left_module_id) ||
       left.right_module_id.localeCompare(right.right_module_id)
     );
-  const pairEvidenceUnavailable = pairPage.disclosure.status === "unavailable";
+  const pairEvidenceUnavailable = aggregateStatus === "unavailable" ||
+    pairPage.disclosure.status === "unavailable";
   const pairEvidenceIncomplete = !pairEvidenceUnavailable &&
     (pairPage.disclosure.status === "truncated" ||
       pairPage.truncated ||
@@ -82,7 +86,7 @@ export function buildStructureCouplingLens({
       : null);
 
   return {
-    pairs: visiblePairs.slice(0, boundedLimit).map((pair) => {
+    pairs: pairEvidenceUnavailable ? [] : visiblePairs.slice(0, boundedLimit).map((pair) => {
       const key = undirectedPairKey(pair.left_module_id, pair.right_module_id);
       return {
         key,
