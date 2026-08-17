@@ -8,7 +8,10 @@
 //! Hybrid search and ranking with deterministic scoring for khive.
 //!
 //! Combines HNSW vector search, BM25 keyword search, and RRF fusion into a unified
-//! retrieval layer. All scores use `DeterministicScore` for cross-platform consistency.
+//! retrieval layer. Crate-owned scoring and ranking calculations use
+//! `DeterministicScore` for cross-platform consistency. Ranked-prefix materialization
+//! treats its caller-owned score payload as opaque and validates only the supplied
+//! total-order key.
 //! See `docs/architecture.md` for module layout, design principles, ID bridging
 //! strategies, and trait composition guide.
 
@@ -20,6 +23,7 @@ pub mod adapters;
 pub mod error;
 pub mod eval;
 pub mod hybrid;
+pub mod materialization;
 pub mod metrics;
 #[cfg(feature = "persist")]
 pub mod persist;
@@ -47,6 +51,13 @@ pub use khive_fusion::{
 pub use khive_hnsw::{
     DistanceMetric, HnswCheckpointConfig, HnswConfig, HnswIndex, HnswSearchContext, HnswSnapshot,
     NodeId, RebuildStats, TombstoneStats,
+};
+pub use materialization::{
+    materialize_ranked_prefix, DropCounts, DropDiagnostic, DropReason, MaterializationDecision,
+    MaterializationError, MaterializationLimitError, MaterializationLimits, MaterializedItem,
+    MaterializedPrefix, RankedCandidate, MAX_MATERIALIZATION_CANDIDATES,
+    MAX_MATERIALIZATION_DIAGNOSTICS, MAX_MATERIALIZATION_DROP_REASONS,
+    MAX_MATERIALIZATION_LOADER_BATCH, MAX_MATERIALIZATION_OUTPUTS,
 };
 // Formal proof: khive.Retrieval.HNSW.checkpoint_correctness
 pub use hybrid::{

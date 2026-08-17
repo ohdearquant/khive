@@ -1,6 +1,8 @@
 //! Moodboard verb handlers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -9,7 +11,13 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use khive_fusion::union_fusion;
+use khive_retrieval::{
+    materialize_ranked_prefix, DropReason, MaterializationDecision, MaterializationError,
+    MaterializationLimits, MaterializedItem, MaterializedPrefix, RankedCandidate,
+};
 use khive_runtime::{BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_score::DeterministicScore;
 use khive_storage::blob::ContentRef;
 use khive_storage::types::{
     SqlStatement, SqlValue, VectorIndexKind, VectorSearchHit, VectorSearchRequest,
@@ -26,6 +34,7 @@ const VISUAL_FIELD: &str = "visual.descriptor";
 const DEFAULT_TOP_K: u32 = 20;
 const MAX_TOP_K: u32 = 100;
 const MAX_CANDIDATE_MULTIPLIER: u32 = 4;
+const MAX_MOODBOARD_CANDIDATES: usize = (MAX_TOP_K * MAX_CANDIDATE_MULTIPLIER + 1) as usize;
 static INGEST_CONTENT_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 
 pub(crate) async fn handle_model(
@@ -150,57 +159,247 @@ async fn materialize_hits(
     raw_hits: Vec<VectorSearchHit>,
     top_k: u32,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let mut hits = Vec::with_capacity(top_k as usize);
-    let authorized_namespaces: BTreeSet<&str> = token
-        .visible_namespaces()
-        .iter()
-        .map(|namespace| namespace.as_str())
-        .collect();
-    for hit in raw_hits {
-        let score = validated_cosine_score(&hit)?;
-        if hit.subject_id == query_asset_id || hits.len() == top_k as usize {
-            continue;
-        }
-        let candidate = match runtime.get_entity(token, hit.subject_id).await {
-            Ok(candidate) => candidate,
-            Err(error) if is_stale_candidate_error(&error) => continue,
-            Err(error) => return Err(error),
-        };
-        if !authorized_namespaces.contains(candidate.namespace.as_str())
-            || candidate.kind != "artifact"
-            || candidate.entity_type.as_deref() != Some("visual_asset")
-        {
-            continue;
-        }
-        let Some(candidate_ref) = candidate.content_ref else {
-            continue;
-        };
-        let Ok(candidate_ref) = ContentRef::from_hex(candidate_ref) else {
-            continue;
-        };
-        if !blob_store.exists(&candidate_ref).await? {
-            continue;
-        }
-        hits.push(json!({
-            "asset_id": candidate.id.to_string(),
-            "score": score,
-            "rank": hits.len() + 1,
-            "name": candidate.name,
-            "content_ref": candidate_ref.to_string(),
-        }));
-    }
-    Ok(hits)
+    let materialized = materialize_hits_with_diagnostics(
+        runtime,
+        token,
+        blob_store,
+        query_asset_id,
+        raw_hits,
+        top_k,
+    )
+    .await?;
+    Ok(materialized
+        .accepted
+        .into_iter()
+        .map(|item| item.output)
+        .collect())
 }
 
+#[cfg(test)]
 fn validated_cosine_score(hit: &VectorSearchHit) -> Result<f64, RuntimeError> {
-    let score = hit.score.to_f64();
+    validated_cosine_score_value(hit.subject_id, hit.score)
+}
+
+fn validated_cosine_score_value(
+    subject_id: Uuid,
+    deterministic_score: DeterministicScore,
+) -> Result<f64, RuntimeError> {
+    let score = deterministic_score.to_f64();
     if !score.is_finite() || !(-1.0..=1.0).contains(&score) {
         return Err(RuntimeError::Internal(format!(
             "moodboard vector backend returned invalid cosine score {score} for {} (expected finite [-1,1])",
-            hit.subject_id
+            subject_id
         )));
     }
     Ok(score)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoodboardDropReason {
+    SelfHit,
+    StaleEntity,
+    OutsideVisibleScope,
+    WrongKind,
+    WrongSubtype,
+    MissingContentAttachment,
+    MalformedContentRef,
+    MissingBlob,
+}
+
+impl DropReason for MoodboardDropReason {
+    const ALL: &'static [Self] = &[
+        Self::SelfHit,
+        Self::StaleEntity,
+        Self::OutsideVisibleScope,
+        Self::WrongKind,
+        Self::WrongSubtype,
+        Self::MissingContentAttachment,
+        Self::MalformedContentRef,
+        Self::MissingBlob,
+    ];
+
+    fn ordinal(self) -> usize {
+        match self {
+            Self::SelfHit => 0,
+            Self::StaleEntity => 1,
+            Self::OutsideVisibleScope => 2,
+            Self::WrongKind => 3,
+            Self::WrongSubtype => 4,
+            Self::MissingContentAttachment => 5,
+            Self::MalformedContentRef => 6,
+            Self::MissingBlob => 7,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MoodboardCandidateRow {
+    Drop(MoodboardDropReason),
+    Keep {
+        asset_id: Uuid,
+        name: String,
+        content_ref: ContentRef,
+    },
+}
+
+type MoodboardMaterializedHits =
+    MaterializedPrefix<Uuid, DeterministicScore, Value, MoodboardDropReason>;
+
+async fn materialize_hits_with_diagnostics(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    blob_store: &dyn BlobStore,
+    query_asset_id: Uuid,
+    raw_hits: Vec<VectorSearchHit>,
+    top_k: u32,
+) -> Result<MoodboardMaterializedHits, RuntimeError> {
+    let loader_batch_size = NonZeroUsize::new(1).expect("one is non-zero");
+    let limits = MaterializationLimits::try_new(
+        MAX_MOODBOARD_CANDIDATES,
+        loader_batch_size,
+        MAX_TOP_K as usize,
+        MAX_MOODBOARD_CANDIDATES,
+    )
+    .map_err(|error| {
+        RuntimeError::Internal(format!(
+            "moodboard materialization limits violate the shared v1 envelope: {error}"
+        ))
+    })?;
+    let authorized_namespaces: BTreeSet<String> = token
+        .visible_namespaces()
+        .iter()
+        .map(|namespace| namespace.as_str().to_string())
+        .collect();
+    let candidates = raw_hits
+        .into_iter()
+        .map(|hit| RankedCandidate {
+            key: hit.subject_id,
+            score: hit.score,
+        })
+        .collect();
+
+    let materialized = materialize_ranked_prefix(
+        candidates,
+        top_k as usize,
+        loader_batch_size,
+        limits,
+        |candidate| (Reverse(candidate.score), candidate.key),
+        |candidate| {
+            validated_cosine_score_value(candidate.key, candidate.score)?;
+            Ok(())
+        },
+        |keys| {
+            load_moodboard_candidate_batch(
+                runtime,
+                token,
+                blob_store,
+                query_asset_id,
+                &authorized_namespaces,
+                keys,
+            )
+        },
+        |_, row| match row {
+            Some(MoodboardCandidateRow::Drop(reason)) => MaterializationDecision::Drop(reason),
+            Some(MoodboardCandidateRow::Keep {
+                asset_id,
+                name,
+                content_ref,
+            }) => MaterializationDecision::Keep((asset_id, name, content_ref)),
+            None => MaterializationDecision::Drop(MoodboardDropReason::StaleEntity),
+        },
+    )
+    .await
+    .map_err(map_moodboard_materialization_error)?;
+
+    let accepted = materialized
+        .accepted
+        .into_iter()
+        .map(|item| {
+            let (asset_id, name, content_ref) = item.output;
+            let output = json!({
+                "asset_id": asset_id.to_string(),
+                "score": item.candidate.score.to_f64(),
+                "rank": item.rank,
+                "name": name,
+                "content_ref": content_ref.to_string(),
+            });
+            MaterializedItem {
+                candidate: item.candidate,
+                rank: item.rank,
+                output,
+            }
+        })
+        .collect();
+
+    Ok(MaterializedPrefix {
+        accepted,
+        drop_counts: materialized.drop_counts,
+        diagnostic_details: materialized.diagnostic_details,
+        diagnostics_truncated: materialized.diagnostics_truncated,
+    })
+}
+
+async fn load_moodboard_candidate_batch(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    blob_store: &dyn BlobStore,
+    query_asset_id: Uuid,
+    authorized_namespaces: &BTreeSet<String>,
+    keys: Vec<Uuid>,
+) -> Result<Vec<(Uuid, MoodboardCandidateRow)>, RuntimeError> {
+    let [subject_id] = keys.as_slice() else {
+        return Err(RuntimeError::Internal(format!(
+            "moodboard materialization expected a one-row loader batch, got {}",
+            keys.len()
+        )));
+    };
+    let subject_id = *subject_id;
+    if subject_id == query_asset_id {
+        return Ok(vec![(
+            subject_id,
+            MoodboardCandidateRow::Drop(MoodboardDropReason::SelfHit),
+        )]);
+    }
+
+    let candidate = match runtime.get_entity(token, subject_id).await {
+        Ok(candidate) => candidate,
+        Err(error) if is_stale_candidate_error(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let row = if !authorized_namespaces.contains(candidate.namespace.as_str()) {
+        MoodboardCandidateRow::Drop(MoodboardDropReason::OutsideVisibleScope)
+    } else if candidate.kind != "artifact" {
+        MoodboardCandidateRow::Drop(MoodboardDropReason::WrongKind)
+    } else if candidate.entity_type.as_deref() != Some("visual_asset") {
+        MoodboardCandidateRow::Drop(MoodboardDropReason::WrongSubtype)
+    } else if let Some(candidate_ref) = candidate.content_ref.as_deref() {
+        match ContentRef::from_hex(candidate_ref) {
+            Ok(candidate_ref) => {
+                if blob_store.exists(&candidate_ref).await? {
+                    MoodboardCandidateRow::Keep {
+                        asset_id: candidate.id,
+                        name: candidate.name,
+                        content_ref: candidate_ref,
+                    }
+                } else {
+                    MoodboardCandidateRow::Drop(MoodboardDropReason::MissingBlob)
+                }
+            }
+            Err(_) => MoodboardCandidateRow::Drop(MoodboardDropReason::MalformedContentRef),
+        }
+    } else {
+        MoodboardCandidateRow::Drop(MoodboardDropReason::MissingContentAttachment)
+    };
+    Ok(vec![(subject_id, row)])
+}
+
+fn map_moodboard_materialization_error(error: MaterializationError<RuntimeError>) -> RuntimeError {
+    match error {
+        MaterializationError::Caller(error) => error,
+        structural => RuntimeError::Internal(format!(
+            "moodboard ranked materialization invariant failed: {structural}"
+        )),
+    }
 }
 
 fn is_stale_candidate_error(error: &RuntimeError) -> bool {
@@ -570,7 +769,7 @@ async fn search_embedding(
         .iter()
         .map(|namespace| namespace.as_str().to_string())
         .collect();
-    let mut merged = BTreeMap::<Uuid, VectorSearchHit>::new();
+    let mut namespace_hits = Vec::with_capacity(namespaces.len());
     for namespace in namespaces {
         let request = VectorSearchRequest {
             query_vectors: vec![embedding.to_vec()],
@@ -584,33 +783,34 @@ async fn search_embedding(
         request
             .validate()
             .map_err(|error| RuntimeError::Internal(format!("moodboard vector query: {error}")))?;
-        for hit in store.search(request).await? {
-            match merged.entry(hit.subject_id) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(hit);
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry)
-                    if hit.score > entry.get().score =>
-                {
-                    entry.insert(hit);
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
+        namespace_hits.push(store.search(request).await?);
     }
+    Ok(merge_namespace_hits(namespace_hits, top_k))
+}
 
-    let mut hits: Vec<_> = merged.into_values().collect();
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.subject_id.cmp(&right.subject_id))
-    });
-    hits.truncate(top_k as usize);
-    for (index, hit) in hits.iter_mut().enumerate() {
-        hit.rank = u32::try_from(index + 1).expect("top_k is bounded to u32");
-    }
-    Ok(hits)
+fn merge_namespace_hits(
+    namespace_hits: Vec<Vec<VectorSearchHit>>,
+    top_k: u32,
+) -> Vec<VectorSearchHit> {
+    union_fusion(
+        namespace_hits
+            .into_iter()
+            .map(|hits| {
+                hits.into_iter()
+                    .map(|hit| (hit.subject_id, hit.score))
+                    .collect()
+            })
+            .collect(),
+    )
+    .into_iter()
+    .take(top_k as usize)
+    .enumerate()
+    .map(|(index, (subject_id, score))| VectorSearchHit {
+        subject_id,
+        score,
+        rank: u32::try_from(index + 1).expect("top_k is bounded to u32"),
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -671,6 +871,122 @@ mod tests {
 
         async fn delete(&self, _content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
             panic!("delete is not used by the search ordering test")
+        }
+    }
+
+    #[derive(Debug)]
+    struct CandidateProbeStore {
+        present: BTreeSet<String>,
+        fail_on: Option<String>,
+        exists_calls: AtomicUsize,
+    }
+
+    impl CandidateProbeStore {
+        fn new(present: impl IntoIterator<Item = ContentRef>) -> Self {
+            Self {
+                present: present
+                    .into_iter()
+                    .map(|content_ref| content_ref.to_string())
+                    .collect(),
+                fail_on: None,
+                exists_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn failing(content_ref: &ContentRef) -> Self {
+            Self {
+                present: BTreeSet::new(),
+                fail_on: Some(content_ref.to_string()),
+                exists_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn exists_calls(&self) -> usize {
+            self.exists_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobStore for CandidateProbeStore {
+        async fn put(&self, _bytes: Vec<u8>) -> khive_storage::StorageResult<ContentRef> {
+            panic!("put is not used by candidate materialization tests")
+        }
+
+        async fn get_bounded_verified(
+            &self,
+            _content_ref: &ContentRef,
+            _max_bytes: u64,
+        ) -> khive_storage::StorageResult<Vec<u8>> {
+            panic!("candidate materialization must not hydrate blob bytes")
+        }
+
+        async fn exists(&self, content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
+            self.exists_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_on.as_deref() == Some(content_ref.as_str()) {
+                return Err(khive_storage::StorageError::Timeout {
+                    operation: "moodboard_candidate_exists_failure".into(),
+                });
+            }
+            Ok(self.present.contains(content_ref.as_str()))
+        }
+
+        async fn size(
+            &self,
+            _content_ref: &ContentRef,
+        ) -> khive_storage::StorageResult<Option<u64>> {
+            panic!("candidate materialization must not preflight blob size")
+        }
+
+        async fn delete(&self, _content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
+            panic!("delete is not used by candidate materialization tests")
+        }
+    }
+
+    fn vector_hit(subject_id: Uuid, raw_score: i64, rank: u32) -> VectorSearchHit {
+        serde_json::from_value(json!({
+            "subject_id": subject_id,
+            "score": raw_score,
+            "rank": rank,
+        }))
+        .expect("valid vector hit fixture")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_candidate_entity(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: Uuid,
+        namespace: &str,
+        kind: &str,
+        entity_type: Option<&str>,
+        name: &str,
+        content_ref: Option<ContentRef>,
+    ) {
+        let mut entity = Entity::new(namespace, kind, name)
+            .with_entity_type(entity_type.map(ToString::to_string));
+        entity.id = id;
+        let created_at = entity.created_at;
+        runtime
+            .entities(token)
+            .expect("entity store")
+            .upsert_entity(entity)
+            .await
+            .expect("candidate entity");
+        if let Some(content_ref) = content_ref {
+            runtime
+                .attachments()
+                .expect("attachment store")
+                .upsert_attachment(Attachment {
+                    record_uuid: id,
+                    substrate: AttachmentSubstrate::Entity,
+                    role: "content".to_string(),
+                    content_ref,
+                    media_type: Some("image/png".to_string()),
+                    size_bytes: Some(1),
+                    created_at,
+                })
+                .await
+                .expect("candidate content attachment");
         }
     }
 
@@ -856,6 +1172,357 @@ mod tests {
         assert!(!is_stale_candidate_error(&RuntimeError::Internal(
             "backend fault".to_string()
         )));
+    }
+
+    #[test]
+    fn namespace_union_merge_keeps_max_score_canonical_ties_and_global_limit() {
+        let duplicate = Uuid::from_u128(1);
+        let lower_tie_id = Uuid::from_u128(2);
+        let higher_tie_id = Uuid::from_u128(3);
+        let truncated = Uuid::from_u128(4);
+
+        let merged = merge_namespace_hits(
+            vec![
+                vec![
+                    vector_hit(duplicate, 1_700_000_000, 1),
+                    vector_hit(higher_tie_id, 3_400_000_000, 2),
+                ],
+                vec![
+                    vector_hit(duplicate, 4_000_000_000, 1),
+                    vector_hit(lower_tie_id, 3_400_000_000, 2),
+                    vector_hit(truncated, 3_000_000_000, 3),
+                ],
+            ],
+            3,
+        );
+
+        assert_eq!(
+            merged.iter().map(|hit| hit.subject_id).collect::<Vec<_>>(),
+            vec![duplicate, lower_tie_id, higher_tie_id]
+        );
+        assert_eq!(merged[0].score.to_raw(), 4_000_000_000);
+        assert_eq!(
+            merged.iter().map(|hit| hit.rank).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn ranked_materialization_self_hit_never_probes_blob() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let query_id = Uuid::from_u128(10);
+        let live_id = Uuid::from_u128(11);
+        let live_ref = ContentRef::from_hex("a".repeat(64)).unwrap();
+        insert_candidate_entity(
+            &runtime,
+            &token,
+            live_id,
+            token.namespace().as_str(),
+            "artifact",
+            Some("visual_asset"),
+            "live",
+            Some(live_ref.clone()),
+        )
+        .await;
+        let blob_store = CandidateProbeStore::new([live_ref]);
+
+        let result = materialize_hits_with_diagnostics(
+            &runtime,
+            &token,
+            &blob_store,
+            query_id,
+            vec![
+                vector_hit(query_id, 4_000_000_000, 1),
+                vector_hit(live_id, 3_000_000_000, 2),
+            ],
+            1,
+        )
+        .await
+        .expect("self exclusion followed by live hit");
+
+        assert_eq!(result.accepted.len(), 1);
+        assert_eq!(result.accepted[0].output["asset_id"], live_id.to_string());
+        assert_eq!(
+            result.drop_counts.count(MoodboardDropReason::SelfHit),
+            Some(1)
+        );
+        assert_eq!(
+            blob_store.exists_calls(),
+            1,
+            "self-hit must not consume a blob metadata probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn ranked_materialization_validates_post_k_tail_without_blob_io() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let live_id = Uuid::from_u128(20);
+        let tail_id = Uuid::from_u128(21);
+        let live_ref = ContentRef::from_hex("a".repeat(64)).unwrap();
+        let tail_ref = ContentRef::from_hex("b".repeat(64)).unwrap();
+        insert_candidate_entity(
+            &runtime,
+            &token,
+            live_id,
+            token.namespace().as_str(),
+            "artifact",
+            Some("visual_asset"),
+            "live",
+            Some(live_ref.clone()),
+        )
+        .await;
+        insert_candidate_entity(
+            &runtime,
+            &token,
+            tail_id,
+            token.namespace().as_str(),
+            "artifact",
+            Some("visual_asset"),
+            "tail",
+            Some(tail_ref.clone()),
+        )
+        .await;
+        let blob_store = CandidateProbeStore::new([live_ref, tail_ref]);
+
+        let error = materialize_hits_with_diagnostics(
+            &runtime,
+            &token,
+            &blob_store,
+            Uuid::from_u128(22),
+            vec![
+                vector_hit(live_id, 4_000_000_000, 1),
+                vector_hit(tail_id, -8_589_934_592, 2),
+            ],
+            1,
+        )
+        .await
+        .expect_err("invalid tail score remains fatal after K accepted hits");
+
+        assert!(error
+            .to_string()
+            .contains("moodboard vector backend returned invalid cosine score"));
+        assert_eq!(
+            blob_store.exists_calls(),
+            1,
+            "post-K tail validation must perform no loader or blob I/O"
+        );
+    }
+
+    #[tokio::test]
+    async fn ranked_materialization_loader_error_precedes_later_invalid_score() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let failing_id = Uuid::from_u128(30);
+        let tail_id = Uuid::from_u128(31);
+        let failing_ref = ContentRef::from_hex("c".repeat(64)).unwrap();
+        insert_candidate_entity(
+            &runtime,
+            &token,
+            failing_id,
+            token.namespace().as_str(),
+            "artifact",
+            Some("visual_asset"),
+            "failing",
+            Some(failing_ref.clone()),
+        )
+        .await;
+        let blob_store = CandidateProbeStore::failing(&failing_ref);
+
+        let error = materialize_hits_with_diagnostics(
+            &runtime,
+            &token,
+            &blob_store,
+            Uuid::from_u128(32),
+            vec![
+                vector_hit(failing_id, 4_000_000_000, 1),
+                vector_hit(tail_id, -8_589_934_592, 2),
+            ],
+            1,
+        )
+        .await
+        .expect_err("the earlier loader error must win");
+
+        match error {
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { operation }) => {
+                assert_eq!(operation.as_ref(), "moodboard_candidate_exists_failure");
+            }
+            other => panic!("expected the original typed storage error, got {other:?}"),
+        }
+        assert_eq!(blob_store.exists_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn ranked_materialization_counts_typed_drops_and_honestly_underfills() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let query_id = Uuid::from_u128(40);
+        let stale_id = Uuid::from_u128(41);
+        let wrong_scope_id = Uuid::from_u128(42);
+        let wrong_kind_id = Uuid::from_u128(43);
+        let wrong_subtype_id = Uuid::from_u128(44);
+        let missing_role_id = Uuid::from_u128(45);
+        let missing_blob_id = Uuid::from_u128(46);
+        let live_id = Uuid::from_u128(47);
+        let deleted_id = Uuid::from_u128(48);
+        let malformed_ref_id = Uuid::from_u128(49);
+        let missing_blob_ref = ContentRef::from_hex("d".repeat(64)).unwrap();
+        let live_ref = ContentRef::from_hex("e".repeat(64)).unwrap();
+        let deleted_ref = ContentRef::from_hex("f".repeat(64)).unwrap();
+        let malformed_placeholder_ref = ContentRef::from_hex("0".repeat(64)).unwrap();
+
+        for (id, namespace, kind, entity_type, name, content_ref) in [
+            (
+                wrong_scope_id,
+                "lambda:hidden",
+                "artifact",
+                Some("visual_asset"),
+                "wrong scope",
+                Some(ContentRef::from_hex("1".repeat(64)).unwrap()),
+            ),
+            (
+                wrong_kind_id,
+                token.namespace().as_str(),
+                "document",
+                Some("visual_asset"),
+                "wrong kind",
+                Some(ContentRef::from_hex("2".repeat(64)).unwrap()),
+            ),
+            (
+                wrong_subtype_id,
+                token.namespace().as_str(),
+                "artifact",
+                Some("moodboard"),
+                "wrong subtype",
+                Some(ContentRef::from_hex("3".repeat(64)).unwrap()),
+            ),
+            (
+                missing_role_id,
+                token.namespace().as_str(),
+                "artifact",
+                Some("visual_asset"),
+                "missing role",
+                None,
+            ),
+            (
+                missing_blob_id,
+                token.namespace().as_str(),
+                "artifact",
+                Some("visual_asset"),
+                "missing blob",
+                Some(missing_blob_ref.clone()),
+            ),
+            (
+                live_id,
+                token.namespace().as_str(),
+                "artifact",
+                Some("visual_asset"),
+                "live",
+                Some(live_ref.clone()),
+            ),
+            (
+                deleted_id,
+                token.namespace().as_str(),
+                "artifact",
+                Some("visual_asset"),
+                "soft deleted",
+                Some(deleted_ref),
+            ),
+            (
+                malformed_ref_id,
+                token.namespace().as_str(),
+                "artifact",
+                Some("visual_asset"),
+                "malformed compatibility projection",
+                Some(malformed_placeholder_ref),
+            ),
+        ] {
+            insert_candidate_entity(
+                &runtime,
+                &token,
+                id,
+                namespace,
+                kind,
+                entity_type,
+                name,
+                content_ref,
+            )
+            .await;
+        }
+        assert!(runtime
+            .delete_entity(&token, deleted_id, false)
+            .await
+            .expect("soft delete candidate"));
+        let mut writer = runtime.sql().writer().await.expect("SQL writer");
+        writer
+            .execute_script(format!(
+                "PRAGMA ignore_check_constraints = ON; \
+                 UPDATE attachments SET content_ref = 'malformed' \
+                 WHERE record_uuid = '{malformed_ref_id}' AND role = 'content'; \
+                 PRAGMA ignore_check_constraints = OFF;"
+            ))
+            .await
+            .expect("inject malformed compatibility projection");
+        drop(writer);
+        let blob_store = CandidateProbeStore::new([live_ref.clone()]);
+        let live_score_raw = 1_000_000_000;
+
+        let result = materialize_hits_with_diagnostics(
+            &runtime,
+            &token,
+            &blob_store,
+            query_id,
+            vec![
+                vector_hit(query_id, 4_000_000_000, 1),
+                vector_hit(stale_id, 3_800_000_000, 2),
+                vector_hit(deleted_id, 3_600_000_000, 3),
+                vector_hit(wrong_scope_id, 3_400_000_000, 4),
+                vector_hit(wrong_kind_id, 3_200_000_000, 5),
+                vector_hit(wrong_subtype_id, 3_000_000_000, 6),
+                vector_hit(missing_role_id, 2_800_000_000, 7),
+                vector_hit(malformed_ref_id, 2_600_000_000, 8),
+                vector_hit(missing_blob_id, 2_400_000_000, 9),
+                vector_hit(live_id, live_score_raw, 10),
+            ],
+            2,
+        )
+        .await
+        .expect("drops are non-fatal and candidate exhaustion honestly underfills");
+
+        assert_eq!(result.accepted.len(), 1);
+        assert_eq!(result.accepted[0].rank, 1);
+        assert_eq!(
+            result.accepted[0].output,
+            json!({
+                "asset_id": live_id.to_string(),
+                "score": live_score_raw as f64 / 4_294_967_296.0,
+                "rank": 1,
+                "name": "live",
+                "content_ref": live_ref.to_string(),
+            })
+        );
+        assert_eq!(
+            result.drop_counts.count(MoodboardDropReason::StaleEntity),
+            Some(2)
+        );
+        for reason in [
+            MoodboardDropReason::SelfHit,
+            MoodboardDropReason::OutsideVisibleScope,
+            MoodboardDropReason::WrongKind,
+            MoodboardDropReason::WrongSubtype,
+            MoodboardDropReason::MissingContentAttachment,
+            MoodboardDropReason::MalformedContentRef,
+            MoodboardDropReason::MissingBlob,
+        ] {
+            assert_eq!(result.drop_counts.count(reason), Some(1), "{reason:?}");
+        }
+        assert_eq!(result.drop_counts.total(), 9);
+        assert_eq!(
+            blob_store.exists_calls(),
+            2,
+            "only otherwise eligible candidates may probe blob metadata"
+        );
     }
 
     #[tokio::test]

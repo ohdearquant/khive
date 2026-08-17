@@ -12,11 +12,14 @@
 
 ### ADR-006: Deterministic Scoring
 
-- All scores in this crate use `DeterministicScore` from `khive-score` (i64 fixed-point).
-- `DeterministicScore::from_f64` is the only entry point for converting f64 similarity
-  scores; callers must not bypass this.
+- All crate-owned scoring and ranking calculations use `DeterministicScore` from `khive-score`
+  (i64 fixed-point).
+- `DeterministicScore::from_f64` is the only entry point for converting f64 similarity scores into
+  those calculations; callers must not bypass this.
 - This guarantees cross-platform ranking identity (x86_64, ARM64, WASM) and enables
   `Ord` + `Hash` on ranked results.
+- Ranked-prefix materialization treats its caller-owned `Score` as opaque and validates only the
+  caller-supplied total-order key; the caller remains responsible for ADR-006 compliance.
 
 ### Retrieval as Composition of Storage-Capability Signals (ADR-012)
 
@@ -39,6 +42,16 @@
 - Feature flags in this crate deviate from ADR-030 defaults: `checkpoint`, `persist`,
   `embed`, and `storage-adapters` are not default-on. This deviation is tracked pending
   an ADR-030 amendment.
+
+### Policy-free ranked materialization (proposed ADR-160)
+
+- `materialize_ranked_prefix` is unconditional base-crate API, not a storage-adapter feature.
+- It owns bounded iteration, keyed batch correlation, stable compact ranks, truncation, and typed
+  drop counts/details only.
+- Callers own validation, I/O, eligibility, missing-row policy, projections, and fatal errors. The
+  generic caller error is preserved without conversion to `RetrievalError` or a string.
+- Namespace scope remains caller eligibility and is not promoted into a by-ID authorization wall.
+- This implementation may be reviewed as a draft, but must not merge until ADR-160 is ratified.
 
 ## Consistency Notes
 

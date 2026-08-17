@@ -2,27 +2,29 @@
 
 **Scope**: Hybrid search and ranking primitives for the khive knowledge graph runtime.
 Combines HNSW vector search, BM25 keyword search, and RRF/weighted/union fusion into a
-single retrieval layer with deterministic scoring throughout. Designed to compose with
-`khive-runtime` via storage-capability traits and the pack-dispatch surface.
+single retrieval layer with deterministic crate-owned scoring. Designed to compose with
+`khive-runtime` via storage-capability traits and the pack-dispatch surface; policy-free
+materialization treats caller-owned score payloads as opaque.
 
-**Last reviewed**: 2026-06-06
+**Last reviewed**: 2026-08-17
 
 ## Module layout
 
-| Module                 | Purpose                                                                       |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| `src/adapters/`        | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
-| `src/error.rs`         | `RetrievalError` enum and `Result` alias                                      |
-| `src/eval/`            | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
-| `src/hybrid/`          | `HybridSearcher`, `DualIndexRouter`, `HybridConfig`, `Query`                  |
-| `src/metrics/`         | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
-| `src/persist/`         | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |
-| `src/policy/`          | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
-| `src/query_ir.rs`      | `QueryNode` IR tree; composable, serialisable query plans                     |
-| `src/replay/`          | Temporal replay and drift metrics (feature `persist`)                         |
-| `src/search_config.rs` | Per-call `SearchConfig` for recall/compose search phase                       |
-| `src/timeout.rs`       | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
-| `src/weights/`         | Per-atom weight loading for replay (feature `persist`)                        |
+| Module                   | Purpose                                                                       |
+| ------------------------ | ----------------------------------------------------------------------------- |
+| `src/adapters/`          | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
+| `src/error.rs`           | `RetrievalError` enum and `Result` alias                                      |
+| `src/eval/`              | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
+| `src/hybrid/`            | `HybridSearcher`, `DualIndexRouter`, `HybridConfig`, `Query`                  |
+| `src/materialization.rs` | Bounded ranked-prefix correlation, compaction, and typed diagnostics          |
+| `src/metrics/`           | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
+| `src/persist/`           | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |
+| `src/policy/`            | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
+| `src/query_ir.rs`        | `QueryNode` IR tree; composable, serialisable query plans                     |
+| `src/replay/`            | Temporal replay and drift metrics (feature `persist`)                         |
+| `src/search_config.rs`   | Per-call `SearchConfig` for recall/compose search phase                       |
+| `src/timeout.rs`         | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
+| `src/weights/`           | Per-atom weight loading for replay (feature `persist`)                        |
 
 ## Tests and benchmarks
 
@@ -34,14 +36,18 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 
 ### Deterministic scoring (ADR-006)
 
-All scores use `DeterministicScore` from `khive-score` (i64 fixed-point). This gives:
+All crate-owned scoring and ranking calculations use `DeterministicScore` from `khive-score`
+(i64 fixed-point). This gives:
 
 - Cross-platform identical rankings (x86_64, ARM64, WASM)
 - `Ord` implementation (sortable, usable in `BTreeSet`)
 - `Hash` implementation (cacheable)
 
-ADR-006 is the normative contract for score representation. Do not introduce raw `f32`/`f64`
-scores in the ranked-result layer without conversion through `DeterministicScore`.
+ADR-006 is the normative contract for crate-owned score representation. Do not introduce raw
+`f32`/`f64` scores into those calculations without conversion through `DeterministicScore`.
+The policy-free materialization controller is representation-generic: it never computes or
+compares `Score`, and instead validates the strictly increasing caller-supplied `OrderKey`.
+Consumers remain responsible for satisfying ADR-006 before that seam.
 
 ### Index composition (ADR-012)
 
@@ -52,6 +58,15 @@ is the crate that materialises that composition. The `VectorSearch`, `KeywordSea
 - Implementors provide only the traits they support.
 - `HybridSearcher` is blanket-implemented for types that provide both `VectorSearch` and
   `KeywordSearch`.
+
+### Ranked-prefix materialization (proposed ADR-160)
+
+`materialize_ranked_prefix` accepts a bounded, unique, already total-ordered candidate list. It
+validates the complete ordering before caller I/O, correlates arbitrary-order keyed loader rows,
+and owns only stable compaction, output truncation, and bounded typed diagnostics. The loader and
+classifier remain caller policy; this module has no runtime, Gate, namespace, record, or blob
+dependency. See [`docs/api/materialization.md`](api/materialization.md) for the callback and error
+contract. The amendment remains draft-gated until ADR-160 is ratified.
 
 ### Feature flag policy (ADR-030)
 
@@ -82,6 +97,8 @@ below the runtime trust boundary.
    must not produce scores by direct arithmetic on `DeterministicScore` internals.
 3. All public timeout functions propagate `RetrievalError::QueryTimeout` on elapsed deadline;
    they never silently swallow the timeout error.
+4. Ranked-prefix materialization never loads after the Kth accepted output; it still validates the
+   remaining candidate tail and never classifies unused rows from the already-returned K batch.
 
 ## Failure modes
 

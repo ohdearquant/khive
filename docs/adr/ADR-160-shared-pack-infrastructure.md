@@ -998,6 +998,9 @@ old path occurs in the same subphase that closes its last consumer.
   liveness fixture proves every blob survives.
 - Same-byte reuse preserves moodboard's current namespace/subtype scope without claiming durable
   global uniqueness.
+
+#### Phase 5 ranked materialization
+
 - Arbitrarily ordered, missing, and duplicate loader rows produce deterministic diagnostics and
   output.
 - In a multi-row loader batch, classification stops at the Kth `Keep`; later already-loaded rows

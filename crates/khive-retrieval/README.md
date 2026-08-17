@@ -1,8 +1,9 @@
 # khive-retrieval
 
 Hybrid retrieval composer combining HNSW vector search, BM25 keyword search,
-rank fusion, and optional graph/cross-encoder reranking, with deterministic
-scoring throughout.
+rank fusion, and optional graph/cross-encoder reranking. Crate-owned scoring
+and ranking calculations use deterministic scores throughout; ranked-prefix
+materialization treats caller-owned score payloads as opaque.
 
 ## Features
 
@@ -19,6 +20,9 @@ scoring throughout.
   configurable auto-switch threshold
 - **Timeout/cancellation wrappers** — `search_with_timeout`,
   `search_with_deadline`, `search_with_cancellation` around any search future
+- **`materialize_ranked_prefix`** — policy-free, bounded correlation and stable
+  compaction for an already total-ordered candidate prefix; callers retain all
+  record-loading, eligibility, and error policy
 - **Feature-gated extensions** — see Configuration below
 
 ## Usage
@@ -85,7 +89,10 @@ Governing ADRs:
 [ADR-012](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-012-retrieval-composition.md)
 (the still-live high-level composition contract), and
 [ADR-031](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-031-multi-engine-retrieval.md)
-(multi-engine embedder registry and pack fan-out this crate composes with).
+(multi-engine embedder registry and pack fan-out this crate composes with), and
+[ADR-160](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-160-shared-pack-infrastructure.md)
+(the proposed ranked-prefix materialization amendment; implementation remains draft-gated until
+ratification).
 
 ## License
 

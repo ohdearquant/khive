@@ -112,6 +112,10 @@ an identity-bound Lattice descriptor, and performs exact descriptor-space retrie
 `moodboard.model`, `moodboard.ingest`, and `moodboard.search`.
 The original raster is anchored under attachment role `content`; existing `content_ref` response
 fields project that role and do not correspond to an entity database column.
+Search merges per-visible-namespace results through `khive-fusion::union_fusion` and materializes
+the already ranked prefix through `khive-retrieval`. It retains the one-shot `4 * top_k + 1`
+candidate request, one-row loader batches, score validation across the supplied tail, and honest
+underfill; record eligibility and blob-existence policy remain moodboard-owned.
 
 ADR-149 adds explicit interaction learning through `moodboard.serve`, `moodboard.judge`,
 `moodboard.train_preference`, and `moodboard.preference`. These four verbs require a canonically
