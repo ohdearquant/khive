@@ -1,4 +1,5 @@
 import {
+  authorizeShowcaseRequest,
   configuredShowcaseAnalysis,
   loadMaterializedShowcaseAnalysis,
   type MaterializedShowcaseAnalysis,
@@ -19,6 +20,7 @@ type AnalysisLoader = (
   id: string,
   registry: ShowcaseAnalysisRegistry,
 ) => Promise<Pick<MaterializedShowcaseAnalysis, "bytes" | "etag">>;
+type RequestAuthorizer = (request: Request) => boolean;
 
 const responseHeaders = {
   "cache-control": "private, no-store",
@@ -28,13 +30,17 @@ const responseHeaders = {
 export function createShowcaseAnalysisGet(
   loadRegistry: RegistryLoader = resolveShowcaseAnalysisRegistry,
   loadAnalysis: AnalysisLoader = loadMaterializedShowcaseAnalysis,
+  authorize: RequestAuthorizer = authorizeShowcaseRequest,
 ) {
   return async function get(
-    _request: Request,
+    request: Request,
     context: RouteContext,
   ): Promise<Response> {
     const { id } = await context.params;
     try {
+      if (!authorize(request)) {
+        throw new ShowcaseAnalysisError("NOT_CONFIGURED");
+      }
       const registry = await loadRegistry();
       if (!configuredShowcaseAnalysis(id, registry)) {
         throw new ShowcaseAnalysisError("NOT_CONFIGURED");
@@ -64,9 +70,13 @@ export function createShowcaseAnalysisGet(
 
 export function createShowcaseAnalysisCatalogGet(
   loadRegistry: RegistryLoader = resolveShowcaseAnalysisRegistry,
+  authorize: RequestAuthorizer = authorizeShowcaseRequest,
 ) {
-  return async function get(): Promise<Response> {
+  return async function get(request: Request): Promise<Response> {
     try {
+      if (!authorize(request)) {
+        throw new ShowcaseAnalysisError("NOT_CONFIGURED");
+      }
       const registry = await loadRegistry();
       const entries = registry.entries
         .map(({ analysis_id, canonical_url }) => ({

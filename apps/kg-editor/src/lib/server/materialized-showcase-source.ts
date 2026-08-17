@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
 import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
@@ -143,6 +143,34 @@ export function configuredShowcaseAnalysis(
 ): ShowcaseAnalysisCatalogEntry | undefined {
   if (!analysisIdPattern.test(id)) return undefined;
   return registry.entries.find((entry) => entry.analysis_id === id);
+}
+
+const bearerTokenPattern = /^Bearer\s+(\S+)$/i;
+
+function constantTimeTokenEquals(provided: string, expected: string): boolean {
+  const providedDigest = createHash("sha256").update(provided).digest();
+  const expectedDigest = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(providedDigest, expectedDigest);
+}
+
+/**
+ * The report and catalog routes expose a server-private materialization;
+ * without this check any network caller could read it. A configured token
+ * is required and requests must present it via a `Bearer` Authorization
+ * header, compared in constant time. An absent or empty configured token
+ * fails closed: every request is rejected rather than left unauthenticated.
+ */
+export function authorizeShowcaseRequest(
+  request: Request,
+  environment: Environment = process.env,
+): boolean {
+  const configuredToken = environment.KHIVE_SHOWCASE_ACCESS_TOKEN?.trim();
+  if (!configuredToken) return false;
+  const header = request.headers.get("authorization");
+  if (!header) return false;
+  const match = bearerTokenPattern.exec(header.trim());
+  if (!match) return false;
+  return constantTimeTokenEquals(match[1], configuredToken);
 }
 
 function isContainedPath(root: string, candidate: string): boolean {

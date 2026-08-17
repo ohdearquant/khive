@@ -367,3 +367,16 @@ and closed `khive.repo.v1` validation, it normalizes
 A mismatch is `ANALYSIS_INVALID`; neither URL nor a private path is reflected in the
 error. Request-time clone, export, SQLite access, process execution, directory scanning,
 and arbitrary URL ingest remain forbidden.
+
+## Amendment 3 — Bearer-token authorization on the snapshot routes (2026-08-17)
+
+Amendments 1 and 2 kept the report and catalog server-private by never accepting
+browser-supplied paths, but neither route authenticated the caller: any network
+principal that could reach the Next.js server could read a configured snapshot.
+`KHIVE_SHOWCASE_ACCESS_TOKEN` closes this gap. Both `GET /api/showcase/analyses` and
+`GET /api/showcase/analyses/[id]` now require a request header
+`Authorization: Bearer <token>` matching the configured secret, compared with a
+constant-time digest comparison. An absent, malformed, or mismatched credential, and an
+unset or blank `KHIVE_SHOWCASE_ACCESS_TOKEN`, all return the same sanitized 404 used for
+an unconfigured catalog — the failure mode stays indistinguishable from "not
+configured," consistent with the sanitized-error posture in Amendments 1 and 2.
