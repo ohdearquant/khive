@@ -143,7 +143,7 @@ pub struct BlobOrphanSweepResult {
     pub would_delete: u64,
     /// Objects with zero live references that were left alone because they
     /// are still inside their publish grace period — recently written and
-    /// not yet orphaned, just not yet referenced by an entity. Reported in
+    /// not yet orphaned, just not yet committed to the SQL liveness authority. Reported in
     /// both modes; never counted in `would_delete` or `deleted`.
     pub grace_period_skipped: u64,
 }
@@ -201,9 +201,9 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
     /// Unconditional physical removal with **no coordination against any
-    /// entity that might reference `content_ref`**. Safe to call only when
-    /// the caller has independently quiesced whatever writer could attach a
-    /// new `content_ref` to an entity for the duration of the call — this
+    /// record or attachment that might reference `content_ref`**. Safe to call only when
+    /// the caller has independently quiesced every writer that could commit a
+    /// new SQL liveness reference for the duration of the call — this
     /// trait does not detect or prevent a race. Offline-maintenance-only.
     /// See `crates/khive-storage/docs/api/blob-store.md`.
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool>;
@@ -218,7 +218,7 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     ///
     /// `config.live_refs` is a **snapshot**; a `content_ref` that becomes
     /// newly live between the snapshot and the sweep is deleted anyway.
-    /// **Callers MUST quiesce entity writes** for the duration of
+    /// **Callers MUST quiesce reference writes** for the duration of
     /// snapshot-plus-sweep. See `crates/khive-storage/docs/api/blob-store.md`
     /// for the race repro. Concurrent callers must use
     /// [`Self::transactional_orphan_sweep`] instead.
@@ -234,19 +234,19 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
         })
     }
 
-    /// Select live entity references and sweep orphaned blobs behind a
+    /// Select canonical SQL liveness references and sweep orphaned blobs behind a
     /// database-coordinated, bounded claim protocol.
     ///
     /// Unlike [`Self::orphan_sweep`], this operation obtains liveness itself
     /// from `sql`; callers do not assemble a stale snapshot. `sql` must be the
-    /// same database capability used for the entity writes that own these
+    /// canonical main database capability used for the writes that own these
     /// references. Implementations must also ensure an object published after
     /// the sweep's candidate set is captured cannot be mistaken for an orphan,
     /// including when it is published between selecting live references and
     /// physical deletion. Implementations must not perform filesystem or
     /// other external I/O while holding the database writer transaction;
     /// durable claims/triggers or an equivalently fail-closed fence must keep
-    /// entity writes safe after each short transaction commits. Claim/result
+    /// liveness writes safe after each short transaction commits. Claim/result
     /// materialization and cleanup must have an explicit per-transaction
     /// cardinality bound rather than scale one writer hold with the complete
     /// object population. A file-backed `sql` implementation must expose its
@@ -258,7 +258,21 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// Backends that cannot provide both guarantees return
     /// `StorageError::Unsupported`.
     ///
-    /// Publishing a blob and committing the entity write that references it
+    /// The filesystem implementation is schema-epoch gated and supports both
+    /// report-only and destructive modes only when `sql` proves the exact
+    /// completed V21 attachment cutover: durable complete marker and ledger
+    /// row, attachment table/indexes and INSERT/UPDATE claim fences, and
+    /// absence of every legacy entity reference column/index/fence. V20,
+    /// pending, incomplete, missing-required-object, retained-legacy, and
+    /// ahead-of-V21 epochs return typed `Unsupported` before root locking,
+    /// filesystem walking, or abandoned-claim cleanup. Malformed stored
+    /// evidence or a nonfunctional named fence fails closed with its validation,
+    /// storage, or typed `Unsupported` error before claim cleanup or deletion.
+    /// Once admitted, every attachment role is live; soft deletion alone does
+    /// not make its blob collectible. This GC compatibility does not imply that
+    /// a Phase4a application reader or writer can serve a V21 database.
+    ///
+    /// Publishing a blob and committing the attachment write that references it
     /// are two separate client steps; nothing serializes them against this
     /// sweep. Implementations must therefore also give a just-published,
     /// not-yet-referenced object a bounded grace period before treating it as
