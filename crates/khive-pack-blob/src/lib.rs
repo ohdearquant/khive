@@ -1,13 +1,12 @@
 //! Blob verb pack — thin MCP verbs over the existing `BlobStore` CAS.
 //!
-//! Phase 1 of the blob-consumer surface: three verbs — `blob.put`, `blob.get`,
-//! `blob.stat` — mapped directly onto `khive_storage::BlobStore::{put,get,size}`
-//! (`blob.stat` maps to `size`, not `exists`/`get`: it answers existence and
-//! size from one call without ever hydrating the object's bytes). This pack adds no
-//! entity/note kind, no schema, and no storage backend of its own; it only
-//! exposes the pre-existing content-addressed store on the MCP `request`
-//! surface. Physical `delete`/`orphan_sweep` stay admin-only (ADR-111 §8)
-//! and are deliberately not verbs here.
+//! Three verbs — `blob.put`, `blob.get`, and `blob.stat` — expose the installed
+//! content-addressed service. `put` and `stat` use the raw store's mutation and
+//! metadata capabilities; `get` enters the paired runtime `BlobHydrator` for
+//! backend-verified, shared-admission whole-buffer reads. This pack adds no
+//! entity/note kind, schema, or storage backend of its own. Physical
+//! `delete`/`orphan_sweep` stay admin-only (ADR-111 §8) and are deliberately
+//! not verbs here.
 
 pub mod handlers;
 mod pack;

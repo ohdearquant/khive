@@ -2170,13 +2170,6 @@ mod tests {
             panic!("put is not used by the hydration drain test")
         }
 
-        async fn get(
-            &self,
-            _content_ref: &khive_storage::ContentRef,
-        ) -> khive_storage::StorageResult<Vec<u8>> {
-            panic!("legacy get must not service hydration")
-        }
-
         async fn get_bounded_verified(
             &self,
             _content_ref: &khive_storage::ContentRef,

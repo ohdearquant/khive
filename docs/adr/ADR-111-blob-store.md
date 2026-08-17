@@ -94,8 +94,13 @@ hand-rolled (7 lines, tested against BLAKE3's own published test vector for `BLA
 #[async_trait]
 pub trait BlobStore: Send + Sync + 'static {
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef>;
-    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>>;
+    async fn get_bounded_verified(
+        &self,
+        content_ref: &ContentRef,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>>;
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool>;
+    async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>>;
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool>;
     async fn orphan_sweep(
         &self,
@@ -104,10 +109,12 @@ pub trait BlobStore: Send + Sync + 'static {
 }
 ```
 
-`get` returns `StorageError::NotFound` (capability `Blob`) for an absent reference. `delete`
-returns `Ok(false)` (not an error) when nothing existed to remove — deleting an absent object is
-not a failure. `orphan_sweep` defaults to `StorageError::Unsupported`, following `VectorStore`'s
-precedent (ADR-044): a backend opts in by overriding it.
+As amended by ADR-160, `get_bounded_verified` is the only whole-buffer read and returns
+`StorageError::NotFound` (capability `Blob`) for an absent reference. It enforces the caller's
+actual-byte maximum and authenticates BLAKE3 before returning bytes. `delete` returns `Ok(false)`
+(not an error) when nothing existed to remove — deleting an absent object is not a failure.
+`orphan_sweep` defaults to `StorageError::Unsupported`, following `VectorStore`'s precedent
+(ADR-044): a backend opts in by overriding it.
 
 ### 4. `FsBlobStore` — the filesystem backend (`khive-db`)
 
@@ -458,14 +465,14 @@ ADR's physical-deletion and orphan-reclamation contract.
 
 ### Trait method mapping
 
-| `BlobStore` method     | S3-compatible operation                                   | Required behavior                                                                                                                                                                                                                 |
-| ---------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `put(bytes)`           | Client-side BLAKE3, `HEAD`, then conditional `PUT Object` | Compute `ContentRef` before network I/O. An existing key is the dedup no-op. A missing key is created with `If-None-Match: *`; a concurrent precondition failure means an identical writer won and is returned as success.        |
-| `get(content_ref)`     | `GET Object`                                              | Return exact bytes. A missing key maps to `StorageError::NotFound` with capability `Blob`, resource `blob`, and the content ref as key.                                                                                           |
-| `exists(content_ref)`  | `HEAD Object`                                             | Success is `true`; not-found is `false`. Authorization, timeout, and transport failures remain errors and must not masquerade as absence.                                                                                         |
-| `delete(content_ref)`  | `HEAD Object`, then `DELETE Object`                       | Under the required quiescence, an absent HEAD returns `false`; a present HEAD followed by successful deletion returns `true`. The HEAD is necessary because S3 DELETE is idempotent and does not reliably report prior existence. |
-| `size(content_ref)`    | `HEAD Object`                                             | Returns `Some(size)` from the HEAD response's content length, or `None` when the HEAD reports the key absent. See Amendment 3.                                                                                                    |
-| `orphan_sweep(config)` | Paginated `ListObjectsV2`, diff, bounded deletes          | List only the configured prefix, process no more than 1,000 keys per page, validate the exact shard/key form, compare to `live_refs`, and retain only page-sized remote state. Dry-run never deletes.                             |
+| `BlobStore` method                             | S3-compatible operation                                   | Required behavior                                                                                                                                                                                                                                              |
+| ---------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `put(bytes)`                                   | Client-side BLAKE3, `HEAD`, then conditional `PUT Object` | Compute `ContentRef` before network I/O. An existing key is the dedup no-op. A missing key is created with `If-None-Match: *`; a concurrent precondition failure means an identical writer won and is returned as success.                                     |
+| `get_bounded_verified(content_ref, max_bytes)` | One `GET Object`                                          | Enforce the caller limit while streaming, require response metadata to match final length, and authenticate BLAKE3 before returning bytes. A missing key maps to `StorageError::NotFound` with capability `Blob`, resource `blob`, and the content ref as key. |
+| `exists(content_ref)`                          | `HEAD Object`                                             | Success is `true`; not-found is `false`. Authorization, timeout, and transport failures remain errors and must not masquerade as absence.                                                                                                                      |
+| `delete(content_ref)`                          | `HEAD Object`, then `DELETE Object`                       | Under the required quiescence, an absent HEAD returns `false`; a present HEAD followed by successful deletion returns `true`. The HEAD is necessary because S3 DELETE is idempotent and does not reliably report prior existence.                              |
+| `size(content_ref)`                            | `HEAD Object`                                             | Returns `Some(size)` from the HEAD response's content length, or `None` when the HEAD reports the key absent. See Amendment 3.                                                                                                                                 |
+| `orphan_sweep(config)`                         | Paginated `ListObjectsV2`, diff, bounded deletes          | List only the configured prefix, process no more than 1,000 keys per page, validate the exact shard/key form, compare to `live_refs`, and retain only page-sized remote state. Dry-run never deletes.                                                          |
 
 `orphan_sweep` continues until the provider returns no continuation token. Delete request size and
 concurrency are bounded; the implementation does not materialize the full remote listing. A normal
@@ -501,14 +508,14 @@ race-free “capacity remaining after this write” check, so `S3BlobStore` perf
 A provider quota or capacity refusal is surfaced from the failed PUT and is never mapped to
 `StorageError::CapacityFloor`.
 
-| HTTP/client failure                                                                                                                              | `StorageError` mapping                                              |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| GET or HEAD not-found                                                                                                                            | `NotFound` for `get`; `false` for `exists` and the pre-delete check |
-| Expected conditional-create already-exists/precondition failure                                                                                  | Successful dedup for `put`                                          |
-| Request deadline or transport timeout                                                                                                            | `Timeout { operation }`                                             |
-| Invalid bucket, endpoint, region, prefix, or incomplete credential environment                                                                   | Startup/config error; `InvalidInput` if discovered at method scope  |
-| Unexpected provider conflict                                                                                                                     | `Conflict { capability: Blob, operation, message }`                 |
-| Authorization/signature rejection, TLS/DNS/connect failure, exhausted transient response, quota/capacity refusal, or malformed protocol response | `Driver { capability: Blob, operation, source }`                    |
+| HTTP/client failure                                                                                                                              | `StorageError` mapping                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| GET or HEAD not-found                                                                                                                            | `NotFound` for `get_bounded_verified`; `false` for `exists` and the pre-delete check |
+| Expected conditional-create already-exists/precondition failure                                                                                  | Successful dedup for `put`                                                           |
+| Request deadline or transport timeout                                                                                                            | `Timeout { operation }`                                                              |
+| Invalid bucket, endpoint, region, prefix, or incomplete credential environment                                                                   | Startup/config error; `InvalidInput` if discovered at method scope                   |
+| Unexpected provider conflict                                                                                                                     | `Conflict { capability: Blob, operation, message }`                                  |
+| Authorization/signature rejection, TLS/DNS/connect failure, exhausted transient response, quota/capacity refusal, or malformed protocol response | `Driver { capability: Blob, operation, source }`                                     |
 
 The S3 client applies bounded exponential backoff with jitter to replay-safe requests and the
 idempotent content-addressed PUT. Transient `429` and `5xx` responses are retried within that budget;
@@ -535,12 +542,12 @@ and is unrelated to this ADR's S3 backend. There is no re-derived hard budget ye
 size-delta reviews for this and future backends must compare against a freshly measured `main`
 binary, not the old 18 MB figure.
 
-The existing whole-buffer trait is accepted for S3 v1 up to 64 MiB per object. `put` rejects a
-larger buffer with `InvalidInput`; `get` checks returned object metadata before collecting a larger
-response. Consumers must enforce the same ceiling before reading a source into memory. A streaming
-amendment covering both upload and download, hash finalization, replay, multipart abort, and retry
-semantics is required before khive supports larger blobs or concurrent traffic whose measured peak
-memory violates a supported deployment envelope.
+The bounded whole-buffer trait is accepted for S3 v1 up to 64 MiB per object. `put` rejects a
+larger buffer with `InvalidInput`; `get_bounded_verified` checks both returned metadata and actual
+streamed bytes, then authenticates the complete body. Production consumers additionally enter
+through runtime weighted admission. A streaming amendment covering upload and download, hash
+finalization, replay, multipart abort, and retry semantics is required before khive supports larger
+blobs or traffic whose measured peak memory violates a supported deployment envelope.
 
 CI uses three layers:
 
@@ -622,18 +629,18 @@ Amendment 2). Both implementations map a not-found response to `Ok(None)`, not a
 `S3BlobStore`), and a metadata-only size accessor is meaningful for either backend, so there is
 no principled default to fall back on.
 
-Downstream, the `blob.stat` verb handler now answers directly from `size` and no longer reads
-or digest-verifies the object; digest verification remains on the `blob.get` read path, where
-the bytes are already fetched to serve. `blob.get` also calls `size` before hydrating, and
-rejects an object exceeding its hydration ceiling before any bytes are read.
+Downstream, the `blob.stat` verb handler answers directly from `size` and never reads or
+digest-verifies the object. As amended by ADR-160, `blob.get` performs its whole-buffer read through
+the shared runtime hydrator and the backend verifies the digest before bytes reach the handler;
+`size` remains a cheap preflight for response/range refusal, not the hydration authority.
 
 ### Consequences
 
 - `BlobStore` implementers must provide a metadata-only size accessor; both implementations
   in this crate already have direct access to the required information (`stat`/`HEAD`).
 - `blob.stat` no longer reports whether a stored object's bytes match its own `ContentRef`
-  (the `corrupt` field is removed); that check happens on `blob.get`, the only verb that
-  actually reads the bytes.
+  (the `corrupt` field is removed); the bounded verified read used by `blob.get` performs that
+  check.
 - No schema, wire-format, or `ContentRef` change; this amendment is additive to the trait
   surface only.
 

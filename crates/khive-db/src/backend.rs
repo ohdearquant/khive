@@ -1446,7 +1446,13 @@ mod tests {
         let store = backend.blob_store(None, Some(0)).unwrap();
         let bytes = b"backend-level blob roundtrip".to_vec();
         let content_ref = store.put(bytes.clone()).await.unwrap();
-        assert_eq!(store.get(&content_ref).await.unwrap(), bytes);
+        assert_eq!(
+            store
+                .get_bounded_verified(&content_ref, bytes.len() as u64)
+                .await
+                .unwrap(),
+            bytes
+        );
     }
 
     #[test]

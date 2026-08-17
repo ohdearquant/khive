@@ -37,7 +37,7 @@ Whole-buffer reads declare an actual-byte maximum and use the required
 `get_bounded_verified(content_ref, max_bytes)` backend primitive. The maximum
 may be zero and cannot exceed `MAX_BLOB_WHOLE_BYTES` (64 MiB); larger objects
 require a future streaming contract. There is deliberately no default built
-from `size()` plus `get()`: metadata can provide an early refusal and an
+from `size()` plus another read: metadata can provide an early refusal and an
 integrity witness, but cannot bound or authenticate a later read.
 
 A backend returns bytes only after the authoritative object reaches EOF at or
@@ -47,9 +47,10 @@ are ordered: invalid maximum, not found, `BlobTooLarge`,
 `BlobSizeMismatch`, then `BlobDigestMismatch`. No partial or digest-mismatched
 buffer reaches the caller.
 
-The legacy unbounded `get` remains temporarily during ADR-160's staged consumer
-migration. It is not an implementation primitive for bounded reads and is
-removed with the final migrated consumer in Phase 3.
+Public unbounded whole-buffer reads do not exist. Production consumers enter
+through the runtime `BlobHydrator`, which pairs this backend-enforced operation
+with shared weighted admission and cancellation-safe supervision; pack-facing
+raw store access is for metadata, mutation, and maintenance paths only.
 
 ## `BlobStore::delete` — concurrency hazard
 

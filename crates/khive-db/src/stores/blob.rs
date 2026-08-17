@@ -1486,26 +1486,6 @@ impl BlobStore for FsBlobStore {
         .map_err(|e| StorageError::driver(StorageCapability::Blob, "put", e))?
     }
 
-    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-        let path = shard_path(&self.root, content_ref);
-        let key = content_ref.to_string();
-        tokio::task::spawn_blocking(move || {
-            fs::read(&path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    StorageError::NotFound {
-                        capability: StorageCapability::Blob,
-                        resource: "blob",
-                        key,
-                    }
-                } else {
-                    map_io_err(e, "get")
-                }
-            })
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Blob, "get", e))?
-    }
-
     async fn get_bounded_verified(
         &self,
         content_ref: &ContentRef,
@@ -2112,11 +2092,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_get_roundtrip() {
+    async fn put_bounded_get_roundtrip() {
         let (_dir, store) = store(0);
         let bytes = b"hello blob store".to_vec();
         let content_ref = store.put(bytes.clone()).await.unwrap();
-        let fetched = store.get(&content_ref).await.unwrap();
+        let fetched = store
+            .get_bounded_verified(&content_ref, bytes.len() as u64)
+            .await
+            .unwrap();
         assert_eq!(fetched, bytes);
     }
 
@@ -2373,7 +2356,13 @@ mod tests {
         let first = store.put(bytes.clone()).await.unwrap();
         let second = store.put(bytes.clone()).await.unwrap();
         assert_eq!(first, second);
-        assert_eq!(store.get(&first).await.unwrap(), bytes);
+        assert_eq!(
+            store
+                .get_bounded_verified(&first, bytes.len() as u64)
+                .await
+                .unwrap(),
+            bytes
+        );
     }
 
     #[tokio::test]
@@ -2413,10 +2402,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_missing_content_ref_returns_not_found() {
+    async fn bounded_get_missing_content_ref_returns_not_found() {
         let (_dir, store) = store(0);
         let missing = ContentRef::from_hex("e".repeat(64)).unwrap();
-        let err = store.get(&missing).await.unwrap_err();
+        let err = store
+            .get_bounded_verified(&missing, MAX_BLOB_WHOLE_BYTES)
+            .await
+            .unwrap_err();
         assert!(matches!(err, StorageError::NotFound { .. }));
     }
 

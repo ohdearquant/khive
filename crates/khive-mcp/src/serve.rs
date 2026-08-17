@@ -5657,7 +5657,7 @@ region = "us-east-1"
         {
             Ok(content_ref) => {
                 let round_tripped = installed
-                    .get(&content_ref)
+                    .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
                     .await
                     .expect("fs-default store must serve back what it just accepted");
                 assert_eq!(

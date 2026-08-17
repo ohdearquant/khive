@@ -85,10 +85,13 @@ The immutable learning scope is the tuple:
 After Gate authorization, `board_entity_id` must resolve by globally unique UUID to a live
 `artifact/moodboard` whose `properties.board_id` equals the supplied 64-lowercase-hex fingerprint.
 Occurrence asset IDs likewise resolve globally to live `artifact/visual_asset` entities whose
-attached `content_ref` equals the supplied live BlobStore reference. Handlers perform no inline
-entity-namespace equality checks, per ADR-007 Rev 6. The scope namespace remains immutable event
-and training attribution, not a by-ID visibility boundary. Descriptor fingerprints and report
-digests are 64-lowercase-hex SHA-256 strings.
+attached `content_ref` equals the supplied live BlobStore reference. Serve and preference
+occurrence eligibility checks that entity/reference identity and `BlobStore::exists` only; it does
+not hydrate candidate bytes. Integrity is enforced when bytes are actually consumed: ADR-148
+search verifies its source image, while this ADR verifies the preference bundle and FANN network
+on model load. Handlers perform no inline entity-namespace equality checks, per ADR-007 Rev 6. The
+scope namespace remains immutable event and training attribution, not a by-ID visibility boundary.
+Descriptor fingerprints and report digests are 64-lowercase-hex SHA-256 strings.
 
 ### D3 — Explicit serve and judgment provenance
 
@@ -257,8 +260,10 @@ scored occurrences. It returns:
 The probability is conditional on a decisive human judgment. It is not a conformal p-value, a
 retrieval score, or a board-coherence statistic. Although the frozen input vector includes an
 upstream `style_conformal_p`, the learned output does not replace or merge with that evidence.
-Wrong actor, namespace, board, descriptor, schema, asset/content identity, corrupt bytes,
-non-finite input, or uncalibrated model fails closed; there is no fallback score.
+Wrong actor, namespace, board, descriptor, schema, asset/content identity, a missing candidate
+object, corrupt preference bundle or FANN network bytes, non-finite input, or an uncalibrated model
+fails closed; there is no fallback score. Candidate occurrence validation remains metadata-only as
+specified in D2.
 
 ### D8 — Deferred learning layers
 
