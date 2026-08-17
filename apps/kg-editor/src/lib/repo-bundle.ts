@@ -546,6 +546,46 @@ export const repoBundleSchema = z.strictObject({
       context.addIssue({ code: "custom", path: ["capability", "views", key, "status"], message: "view capability status must match aggregate analysis status" });
     }
   }
+  const singleDataPageKeys = [
+    "hotspot_quadrant",
+    "hidden_coupling",
+    "structure_treemap",
+    "api_surface",
+  ] as const;
+  for (const key of singleDataPageKeys) {
+    const aggregate = bundle.aggregates[key];
+    if (
+      aggregate.meta.status === "unavailable" &&
+      aggregate.data.disclosure.status !== "unavailable"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["aggregates", key, "data", "disclosure", "status"],
+        message: "an unavailable aggregate analysis cannot retain a disclosed data page",
+      });
+    }
+  }
+  if (bundle.aggregates.dependency_topology.meta.status === "unavailable") {
+    for (const pageKey of ["modules", "cycles"] as const) {
+      if (bundle.aggregates.dependency_topology[pageKey].disclosure.status !== "unavailable") {
+        context.addIssue({
+          code: "custom",
+          path: ["aggregates", "dependency_topology", pageKey, "disclosure", "status"],
+          message: "an unavailable aggregate analysis cannot retain a disclosed data page",
+        });
+      }
+    }
+  }
+  if (
+    bundle.aggregates.ownership.meta.status === "unavailable" &&
+    bundle.aggregates.ownership.modules.disclosure.status !== "unavailable"
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["aggregates", "ownership", "modules", "disclosure", "status"],
+      message: "an unavailable aggregate analysis cannot retain a disclosed data page",
+    });
+  }
 });
 
 export type RepoBundle = z.infer<typeof repoBundleSchema>;

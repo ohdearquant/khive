@@ -284,7 +284,8 @@ export function buildInvestigationBrief({
       `Captured module revision does not match the recorded snapshot SHA (${mismatchedModule.source_path}).`,
     );
   }
-  const focusedPair = focusedPairKey
+  const focusedPair = focusedPairKey &&
+      bundle.aggregates.hidden_coupling.meta.status === "available"
     ? bundle.aggregates.hidden_coupling.data.items.find((pair) =>
       structureCouplingPairKey(pair.left_module_id, pair.right_module_id) ===
         focusedPairKey

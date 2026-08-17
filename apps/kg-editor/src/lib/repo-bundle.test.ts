@@ -102,6 +102,27 @@ describe("khive.repo.v1 browser contract", () => {
     expect(repoBundleSchema.safeParse(value).success).toBe(true);
   });
 
+  it("rejects an unavailable hidden-coupling analysis that still discloses pair rows", () => {
+    const value = goldenValue() as {
+      aggregates: {
+        hidden_coupling: {
+          meta: { status: string; unavailable_reason?: string };
+          data: { items: unknown[] };
+        };
+      };
+      capability: { views: { hidden_coupling: { status: string; unavailable_reason?: string } } };
+    };
+    expect(value.aggregates.hidden_coupling.data.items.length).toBeGreaterThan(0);
+    value.aggregates.hidden_coupling.meta.status = "unavailable";
+    value.aggregates.hidden_coupling.meta.unavailable_reason = "analysis was not produced";
+    value.capability.views.hidden_coupling.status = "unavailable";
+    value.capability.views.hidden_coupling.unavailable_reason = "analysis was not produced";
+    // data.items/disclosure are left untouched — an unavailable aggregate must
+    // not be able to retain a disclosed page of rows for lenses to consume.
+
+    expect(repoBundleSchema.safeParse(value).success).toBe(false);
+  });
+
   it("also validates the golden against the normative JSON Schema", () => {
     const ajv = new Ajv2020({ allErrors: true, strict: false });
     addFormats(ajv);
