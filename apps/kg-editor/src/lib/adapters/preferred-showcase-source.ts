@@ -2,6 +2,7 @@ import {
   loadStaticShowcaseBundle,
   parseBoundedShowcaseResponse,
   type ShowcaseFetch,
+  type ShowcaseResponse,
 } from "@/lib/adapters/static-showcase-source";
 import type { RepoBundle } from "@/lib/repo-bundle";
 import {
@@ -30,53 +31,64 @@ export async function loadPreferredShowcaseBundle(
     };
   }
 
-  const endpoint = `/api/showcase/analyses/${entry.analysisId}`;
-  const response = await fetchBundle(endpoint, {
-    cache: "no-store",
-    credentials: "same-origin",
-    redirect: "error",
-  });
-
-  if (response.status === 404) {
-    return {
-      bundle: await loadStaticShowcaseBundle(entry, fetchBundle),
-      source: "curated-static-fallback",
-    };
+  const dbBundle = await tryLoadDbSnapshotBundle(entry, fetchBundle);
+  if (dbBundle) {
+    return { bundle: dbBundle, source: "khive-db-snapshot" };
   }
+
+  return {
+    bundle: await loadStaticShowcaseBundle(entry, fetchBundle),
+    source: "curated-static-fallback",
+  };
+}
+
+// The DB snapshot is a progressive enhancement over the static asset: any
+// failure on this path (network, status, provenance, schema, or identity)
+// must fall back to the static render rather than fail the page.
+async function tryLoadDbSnapshotBundle(
+  entry: ShowcaseRegistryEntry,
+  fetchBundle: ShowcaseFetch,
+): Promise<RepoBundle | null> {
+  const endpoint = `/api/showcase/analyses/${entry.analysisId}`;
+  let response: ShowcaseResponse;
+  try {
+    response = await fetchBundle(endpoint, {
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
+    });
+  } catch {
+    return null;
+  }
+
   if (!response.ok) {
-    throw new Error(
-      `Database snapshot could not be loaded (HTTP ${response.status}).`,
-    );
+    return null;
   }
   if (
     response.headers.get("x-khive-analysis-source") !== "khive-db-snapshot" ||
     response.headers.get("x-khive-analysis-id") !== entry.analysisId
   ) {
-    throw new Error(
-      "Database snapshot provenance did not match the curated registry.",
-    );
+    return null;
   }
 
-  const bundle = await parseBoundedShowcaseResponse(
-    response,
-    "Database snapshot",
-  );
-  const expectedRepository = normalizeRepositoryUrl(entry.canonicalUrl);
-  const actualRepository = normalizeRepositoryUrl(
-    bundle.meta.repository.canonical_url,
-  );
-  if (
-    !expectedRepository.ok ||
-    !actualRepository.ok ||
-    actualRepository.value !== expectedRepository.value
-  ) {
-    throw new Error(
-      "Database snapshot repository identity did not match the curated registry.",
+  try {
+    const bundle = await parseBoundedShowcaseResponse(
+      response,
+      "Database snapshot",
     );
+    const expectedRepository = normalizeRepositoryUrl(entry.canonicalUrl);
+    const actualRepository = normalizeRepositoryUrl(
+      bundle.meta.repository.canonical_url,
+    );
+    if (
+      !expectedRepository.ok ||
+      !actualRepository.ok ||
+      actualRepository.value !== expectedRepository.value
+    ) {
+      return null;
+    }
+    return bundle;
+  } catch {
+    return null;
   }
-
-  return {
-    bundle,
-    source: "khive-db-snapshot",
-  };
 }

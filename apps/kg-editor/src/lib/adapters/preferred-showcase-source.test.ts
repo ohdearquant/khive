@@ -72,42 +72,147 @@ describe("preferred showcase source", () => {
     );
   });
 
-  it("does not hide an invalid or unavailable DB snapshot behind stale static data", async () => {
-    const fetchBundle = vi.fn(async () => response(new Uint8Array(), 503));
-
-    await expect(
-      loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
-    ).rejects.toThrow(/database snapshot.*503/i);
-    expect(fetchBundle).toHaveBeenCalledOnce();
-  });
-
-  it("rejects a successful response without the configured snapshot identity", async () => {
-    const fetchBundle = vi.fn(async () =>
-      response(golden, 200, {
-        "x-khive-analysis-id": "other",
-        "x-khive-analysis-source": "khive-db-snapshot",
-      })
+  it("falls back to the static asset when the DB snapshot service errors", async () => {
+    const fetchBundle = vi.fn(async (input: string) =>
+      input.startsWith("/api/")
+        ? response(new Uint8Array(), 503)
+        : response(golden, 200)
     );
 
-    await expect(
-      loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
-    ).rejects.toThrow(/provenance/i);
+    const result = await loadPreferredShowcaseBundle(
+      SHOWCASE_REGISTRY[0],
+      fetchBundle,
+    );
+
+    expect(result.source).toBe("curated-static-fallback");
+    expect(result.bundle.schema_version).toBe("khive.repo.v1");
+    expect(fetchBundle).toHaveBeenCalledTimes(2);
   });
 
-  it("rejects a valid snapshot for a different repository", async () => {
+  it("falls back to the static asset when the fetch rejects at the network level", async () => {
+    const fetchBundle = vi.fn(async (input: string) => {
+      if (input.startsWith("/api/")) {
+        throw new TypeError("Failed to fetch");
+      }
+      return response(golden, 200);
+    });
+
+    const result = await loadPreferredShowcaseBundle(
+      SHOWCASE_REGISTRY[0],
+      fetchBundle,
+    );
+
+    expect(result.source).toBe("curated-static-fallback");
+    expect(result.bundle.schema_version).toBe("khive.repo.v1");
+    expect(fetchBundle).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the static asset when the DB snapshot body is invalid", async () => {
+    const invalid = new TextEncoder().encode("not json");
+    const fetchBundle = vi.fn(async (input: string) =>
+      input.startsWith("/api/")
+        ? response(invalid, 200, {
+          "x-khive-analysis-id": "khive",
+          "x-khive-analysis-source": "khive-db-snapshot",
+        })
+        : response(golden, 200)
+    );
+
+    const result = await loadPreferredShowcaseBundle(
+      SHOWCASE_REGISTRY[0],
+      fetchBundle,
+    );
+
+    expect(result.source).toBe("curated-static-fallback");
+    expect(result.bundle.schema_version).toBe("khive.repo.v1");
+    expect(fetchBundle).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the static asset when the DB snapshot body exceeds the browser limit", async () => {
+    const oversized = new Uint8Array(9 * 1024 * 1024);
+    const fetchBundle = vi.fn(async (input: string) =>
+      input.startsWith("/api/")
+        ? response(oversized, 200, {
+          "x-khive-analysis-id": "khive",
+          "x-khive-analysis-source": "khive-db-snapshot",
+        })
+        : response(golden, 200)
+    );
+
+    const result = await loadPreferredShowcaseBundle(
+      SHOWCASE_REGISTRY[0],
+      fetchBundle,
+    );
+
+    expect(result.source).toBe("curated-static-fallback");
+    expect(result.bundle.schema_version).toBe("khive.repo.v1");
+    expect(fetchBundle).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the static asset when the DB snapshot response lacks the configured provenance identity", async () => {
+    const fetchBundle = vi.fn(async (input: string) =>
+      input.startsWith("/api/")
+        ? response(golden, 200, {
+          "x-khive-analysis-id": "other",
+          "x-khive-analysis-source": "khive-db-snapshot",
+        })
+        : response(golden, 200)
+    );
+
+    const result = await loadPreferredShowcaseBundle(
+      SHOWCASE_REGISTRY[0],
+      fetchBundle,
+    );
+
+    expect(result.source).toBe("curated-static-fallback");
+    expect(result.bundle.schema_version).toBe("khive.repo.v1");
+    expect(fetchBundle).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the static asset when a valid snapshot is for a different repository", async () => {
     const wrongRepository = JSON.parse(golden.toString("utf8"));
     wrongRepository.meta.repository.canonical_url =
       "https://github.com/example/not-khive";
-    const fetchBundle = vi.fn(async () =>
-      response(Buffer.from(JSON.stringify(wrongRepository)), 200, {
-        "x-khive-analysis-id": "khive",
-        "x-khive-analysis-source": "khive-db-snapshot",
-      })
+    const fetchBundle = vi.fn(async (input: string) =>
+      input.startsWith("/api/")
+        ? response(Buffer.from(JSON.stringify(wrongRepository)), 200, {
+          "x-khive-analysis-id": "khive",
+          "x-khive-analysis-source": "khive-db-snapshot",
+        })
+        : response(golden, 200)
     );
 
-    await expect(
-      loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
-    ).rejects.toThrow(/repository identity/i);
-    expect(fetchBundle).toHaveBeenCalledOnce();
+    const result = await loadPreferredShowcaseBundle(
+      SHOWCASE_REGISTRY[0],
+      fetchBundle,
+    );
+
+    expect(result.source).toBe("curated-static-fallback");
+    expect(result.bundle.schema_version).toBe("khive.repo.v1");
+    expect(fetchBundle).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not surface an unhandled rejection or thrown error when every DB snapshot failure mode falls back", async () => {
+    const failureModes: Array<() => Promise<ReturnType<typeof response>>> = [
+      () => Promise.reject(new TypeError("network down")),
+      () => Promise.resolve(response(new Uint8Array(), 500)),
+      () =>
+        Promise.resolve(
+          response(new TextEncoder().encode("{"), 200, {
+            "x-khive-analysis-id": "khive",
+            "x-khive-analysis-source": "khive-db-snapshot",
+          }),
+        ),
+    ];
+
+    for (const failureMode of failureModes) {
+      const fetchBundle = vi.fn(async (input: string) =>
+        input.startsWith("/api/") ? failureMode() : response(golden, 200)
+      );
+
+      await expect(
+        loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle),
+      ).resolves.toMatchObject({ source: "curated-static-fallback" });
+    }
   });
 });
