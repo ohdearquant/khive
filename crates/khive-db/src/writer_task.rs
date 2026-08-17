@@ -976,9 +976,22 @@ async fn run_writer_task(
                         // it before waking the caller for the same reply-side
                         // lifecycle guarantee as successful requests (#1790).
                         drop(tx_span);
+                        // Count the refusal the caller is about to be told
+                        // about. Classify by matching the value the shared
+                        // classifier returned, never by re-testing `e`: a
+                        // second copy of the busy rule here could drift from
+                        // the error actually replied, and the counter would
+                        // then disagree with the caller's own experience.
+                        let begin_error = writer_task_begin_error(e, busy_timeout);
+                        match &begin_error {
+                            StorageError::WriterTaskBusy { .. } => {
+                                acquisition_counters.record_writer_task_begin_busy()
+                            }
+                            _ => acquisition_counters.record_writer_task_begin_error(),
+                        }
                         sealed::Sealed::reply_error_after_begin(
                             request,
-                            writer_task_begin_error(e, busy_timeout),
+                            begin_error,
                             queue_wait,
                             transaction_acquire,
                         );
@@ -1363,6 +1376,99 @@ mod tests {
         assert_eq!(
             count, 1,
             "the failed request must not land, while the next request commits on the same task"
+        );
+    }
+
+    // `#[serial(tx_registry)]`: same rationale as
+    // `begin_immediate_failure_replies_error_without_running_op`.
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn contended_begin_increments_its_own_failure_counter() {
+        // Real contention, same construction as the test above: a refused
+        // write must be COUNTED, not merely reported to its caller. Before
+        // this counter, `db_diagnostics` showed a clean writer while requests
+        // were being refused after a full busy timeout, so an operator could
+        // not distinguish this daemon from one that had never refused a write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_busy_counter.db");
+        let cfg = PoolConfig {
+            path: Some(path.clone()),
+            busy_timeout: Duration::from_millis(150),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+
+        let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+
+        let before = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            before.writer_task_begin_busy, 0,
+            "baseline: nothing has been refused yet"
+        );
+
+        let lock_holder = pool.try_writer().unwrap();
+        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let result = handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await;
+        assert!(
+            matches!(&result, Err(StorageError::WriterTaskBusy { .. })),
+            "precondition: the request must actually be refused busy, got {result:?}"
+        );
+
+        let after = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            after.writer_task_begin_busy, 1,
+            "the refusal the caller was told about must appear in the counters"
+        );
+        assert_eq!(
+            after.writer_task_begin_errors, 0,
+            "a busy refusal must not be counted as a non-busy BEGIN error"
+        );
+        assert_eq!(
+            after.timeouts, before.timeouts,
+            "a writer-task BEGIN refusal must not be mislabeled as a pool-mutex \
+             checkout timeout — separate ADR-135 F6 stages, separate counters"
+        );
+
+        // Discriminating arm: a SUCCEEDING request must not move the failure
+        // counter. Without this the assertion above would also pass against a
+        // counter that simply counted every request.
+        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+        drop(lock_holder);
+        handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id) VALUES (2)", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert_after_busy".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("the writer task survives transient contention");
+
+        let settled = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            settled.writer_task_begin_busy, 1,
+            "a successful request must leave the refusal counter untouched"
+        );
+        assert!(
+            settled.writer_task_acquisitions > after.writer_task_acquisitions,
+            "and it must still register as a success"
         );
     }
 
