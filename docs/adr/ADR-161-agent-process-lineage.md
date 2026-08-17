@@ -324,7 +324,9 @@ with a published default. Total records visited by a single enumeration or by on
 is capped independently of `limit` by `lineage_visit_limit`, because a walk can visit far more
 records than it returns once filters and authorization are applied; exceeding it is a
 per-operation error naming the bound, never a silently short answer — a truncated-looking
-success here would be indistinguishable from a small tree. Cascade passes are capped by
+success here would be indistinguishable from a small tree. (For a cascading kill that has
+already terminated records, this rule is refined below: the error arm applies only while
+nothing has been destroyed.) Cascade passes are capped by
 `cascade_pass_limit`, as §4 already requires, and a cascade that exhausts it returns
 `subtree_terminal: false` with the survivors it knows about rather than looping.
 
@@ -339,10 +341,22 @@ takes no `limit`.** Adding one would be wrong: a cascade that killed records and
 its own report would leave the caller unable to name what it just terminated, which is the
 failure §4 exists to prevent. Its output is instead bounded by construction — per-record
 outcomes are emitted only for records the walk actually reached, and the walk is capped by
-`lineage_visit_limit` per pass and `cascade_pass_limit` passes. A tree large enough to threaten
-the result size therefore fails as a per-operation error at the visit bound before any kill is
-issued, rather than returning a partial report. This is the one operation in this section whose
-output bound is derived rather than parameterized, and it is derived deliberately.
+`lineage_visit_limit` per pass and `cascade_pass_limit` passes. This is the one operation in this
+section whose output bound is derived rather than parameterized, and it is derived deliberately.
+
+**Which bound exhaustion is an error depends on whether any kill has issued, and this is
+normative.** On the first pass the visit bound is reached before the cascade has terminated
+anything, so exhausting it is a per-operation error naming the bound and nothing has been
+destroyed. From the second pass onward the cascade has already issued kills — the tree grew
+under it, which is the case §4's re-resolution exists to handle — and failing the operation there
+would discard the caller's only record of what it just terminated. So a visit-bound exhaustion on
+any pass after the first returns a result rather than an error: `subtree_terminal: false`, the
+per-record outcomes accumulated so far, and the same bounded-stop reporting that
+`cascade_pass_limit` exhaustion already produces. The audit plane retains the per-record events
+either way, but the audit plane is not the caller's, and a caller that has destroyed processes
+must be told which ones. This arm — a concurrently growing tree exhausting the visit bound after
+pass-1 kills have issued — is an acceptance fixture for any implementation of this ADR, beside
+the concurrent-spawn arm above.
 
 Audit volume follows from these and needs no separate cap: one event per pass plus one per
 record reached, both already bounded above. What does need saying is that the bounds are
@@ -413,9 +427,11 @@ Two consequences are normative. First, the structural-set audit events defined h
 emitted onto the caller-facing events surface until that surface can express an operator-only
 audience; until then an implementation emits them to the operator audit sink only, and a
 runtime that cannot distinguish the two sinks does not implement this section. Second, the
-audience requirement belongs to the event plane rather than to this ADR: ADR-162 governs event
-classes, payload discipline, and audience, and this section is a consumer of that contract. The
-requirement is recorded here so that the prerequisite is visible at the point of use, and this
+capability belongs at the plane level rather than in this ADR. No current event-plane decision
+carries an audience dimension — ADR-162 governs event classes by attribution, additivity, and
+write posture, and does not speak to who may read a class — so declaring one is follow-up work
+that this section is a prerequisite consumer of rather than an existing contract it can cite.
+The requirement is recorded here so the prerequisite is visible at the point of use, and this
 ADR does not create a path from an operation result to an audit record.
 
 Lineage in the audit plane is thereby reconstructable from events alone, without reading the
