@@ -215,11 +215,11 @@ pub fn resolve_blob_store(
 
 /// Resolve the configured store for one pack runtime's effective access mode.
 ///
-/// A read-only runtime retains `get`/`exists`/`size` against an already-present
-/// fs root (or a configured S3 store), but boot never creates the default fs
-/// root and the wrapper rejects every physical mutator. The mode belongs to the
-/// runtime assigned to the `blob` pack; a mixed topology must not infer it from
-/// the main audit backend.
+/// A read-only runtime retains bounded verified reads plus `exists`/`size`
+/// against an already-present fs root (or a configured S3 store), but boot
+/// never creates the default fs root and the wrapper rejects every physical
+/// mutator. The mode belongs to the runtime assigned to the `blob` pack; a
+/// mixed topology must not infer it from the main audit backend.
 pub fn resolve_blob_store_for_mode(
     cfg: &KhiveConfig,
     backend: &StorageBackend,
@@ -279,10 +279,6 @@ impl BlobStore for ReadOnlyBlobStore {
         Err(Self::mutation_error("put"))
     }
 
-    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-        self.inner.get(content_ref).await
-    }
-
     async fn get_bounded_verified(
         &self,
         content_ref: &ContentRef,
@@ -336,10 +332,6 @@ mod tests {
     impl BlobStore for RecordingReadStore {
         async fn put(&self, _bytes: Vec<u8>) -> StorageResult<ContentRef> {
             panic!("put is not used by the read-only delegation test")
-        }
-
-        async fn get(&self, _content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-            panic!("legacy get must not service a bounded read")
         }
 
         async fn get_bounded_verified(
@@ -473,10 +465,6 @@ mod tests {
     impl BlobStore for HydrationReadStore {
         async fn put(&self, _bytes: Vec<u8>) -> StorageResult<ContentRef> {
             panic!("put is not used by hydrator tests")
-        }
-
-        async fn get(&self, _content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-            panic!("legacy get must not service hydration")
         }
 
         async fn get_bounded_verified(

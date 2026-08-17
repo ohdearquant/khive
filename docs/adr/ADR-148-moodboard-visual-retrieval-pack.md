@@ -242,17 +242,16 @@ semaphore: `KHIVE_MOODBOARD_INFERENCE_CONCURRENCY` defaults to 1 and must be an 
 preventing one parallel ops-file chunk from launching unbounded Qwen activation memory.
 The owned semaphore permit is moved into the blocking inference closure, so cancellation of an
 awaiting request cannot release capacity while native Lattice inference is still running.
-Raster byte decode and governed preprocessing have a separate pack-owned single-permit gate,
-acquired before base64 decode or BlobStore hydration and held until the original byte buffer and
-large decoded intermediates have been consumed/dropped. This bounds the ordinary 100-op parallel
-chunk to one active 64 MiB source / 256 MiB decoder allocation pipeline while still allowing the
-small governed rendition to queue for inference. Cold ingest completes verified model loading
-before acquiring this gate or decoding caller bytes, preserving the pre-publication identity fence
-without retaining a large raster across Qwen construction. Search releases the gate after its
-original bytes and decode intermediates are gone, before a possible cold model load. Search first
-reads `BlobStore::size` and rejects
-a missing or over-64-MiB source before hydration, then rechecks the returned byte length and BLAKE3
-digest so imported/repointed assets and backend races cannot bypass the ingest ceiling.
+Raster byte decode and governed preprocessing have a separate pack-owned single-permit gate. Ingest
+acquires it before caller base64 decode; search first obtains a backend-verified source through the
+shared runtime `BlobHydrator`, then acquires the preprocessing gate before raster decode and
+normalization. Search retains the `VerifiedBlob` lease while it waits for and executes preprocessing,
+and releases both the raw lease and preprocessing permit after the governed rendition is owned. This
+keeps shared raw-byte admission separate from the decoded-raster allocation bound, while still
+limiting the ordinary 100-op parallel chunk to one active decoder pipeline. Cold ingest completes
+verified model loading before acquiring the gate or decoding caller bytes, preserving the
+pre-publication identity fence without retaining a large raster across Qwen construction. Search
+releases the gate before a possible cold model load.
 
 ### D6 — Exact local cosine retrieval
 

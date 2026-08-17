@@ -2,13 +2,64 @@
 //! through the `VerbRegistry` dispatch path, mirroring
 //! `khive-pack-template/tests/integration.rs`.
 
+use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use khive_db::stores::blob::FsBlobStore;
 use khive_pack_blob::BlobPack;
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
-use khive_storage::BlobStore;
+use khive_storage::{BlobStore, ContentRef, StorageError, StorageResult};
 use khive_types::Pack;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct BoundedOnlyBlobStore {
+    bytes: Vec<u8>,
+    content_ref: ContentRef,
+    bounded_calls: AtomicUsize,
+}
+
+impl BoundedOnlyBlobStore {
+    fn new(bytes: Vec<u8>) -> Self {
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        Self {
+            bytes,
+            content_ref,
+            bounded_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl BlobStore for BoundedOnlyBlobStore {
+    async fn put(&self, _bytes: Vec<u8>) -> StorageResult<ContentRef> {
+        Err(StorageError::Internal("put is not used".to_string()))
+    }
+
+    async fn get_bounded_verified(
+        &self,
+        content_ref: &ContentRef,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>> {
+        self.bounded_calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(content_ref, &self.content_ref);
+        assert_eq!(max_bytes, khive_storage::MAX_BLOB_WHOLE_BYTES);
+        Ok(self.bytes.clone())
+    }
+
+    async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool> {
+        Ok(content_ref == &self.content_ref)
+    }
+
+    async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        Ok((content_ref == &self.content_ref).then_some(self.bytes.len() as u64))
+    }
+
+    async fn delete(&self, _content_ref: &ContentRef) -> StorageResult<bool> {
+        Err(StorageError::Internal("delete is not used".to_string()))
+    }
+}
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -84,6 +135,33 @@ async fn put_stat_get_round_trips_and_put_is_idempotent() {
         .expect("valid base64");
     assert_eq!(round_tripped, payload);
     assert_eq!(get["size"], payload.len());
+}
+
+#[tokio::test]
+async fn get_uses_the_runtime_hydrator_instead_of_unbounded_store_get() {
+    let bytes = b"runtime-owned verified hydration".to_vec();
+    let store = Arc::new(BoundedOnlyBlobStore::new(bytes.clone()));
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    runtime
+        .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+        .expect("install blob store");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(BlobPack::new(runtime));
+    let registry = builder.build().expect("registry builds");
+
+    let get = registry
+        .dispatch(
+            "blob.get",
+            serde_json::json!({ "content_ref": store.content_ref.to_string() }),
+        )
+        .await
+        .expect("blob.get must use bounded verified hydration");
+
+    assert_eq!(
+        BASE64.decode(get["bytes"].as_str().unwrap()).unwrap(),
+        bytes
+    );
+    assert_eq!(store.bounded_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

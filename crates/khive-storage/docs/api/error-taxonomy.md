@@ -71,13 +71,12 @@ fail-closed outcomes of `BlobStore::get_bounded_verified`. All three report
 default. Their owned `ContentRef` fields preserve validated content-addressed
 identity; no raw or malformed digest string enters the backend contract.
 
-This addition is intentionally Rust source-breaking: `BlobStore` gains a
-required method with no default, and `StorageError` is a public enum without
-`#[non_exhaustive]`. Downstream implementations must provide
-`get_bounded_verified`; exhaustive error matches must add arms for all three
-new variants. The existing `get` method remains available during the staged
-ADR-160 migration and is removed only after every production consumer moves to
-the bounded runtime path.
+This addition is intentionally Rust source-breaking: `BlobStore` requires
+`get_bounded_verified` with no default and no longer exposes an unbounded
+whole-buffer `get`; `StorageError` is also a public enum without
+`#[non_exhaustive]`. Downstream implementations must provide the bounded
+method, remove any obsolete trait `get` implementation, and add arms for all
+three new error variants in exhaustive matches.
 
 `BlobTooLarge.observed_at_least` is a lower bound, not always a verified final
 size. It may come from same-object metadata that caused an early refusal or

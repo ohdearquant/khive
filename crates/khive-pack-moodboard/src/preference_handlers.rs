@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use uuid::{Uuid, Version};
 
-use khive_runtime::{actor_is_unattributed, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{
+    actor_is_unattributed, BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError,
+};
 use khive_storage::blob::ContentRef;
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
@@ -226,12 +228,6 @@ pub(crate) async fn handle_serve(
         &input.descriptor,
     );
 
-    // Candidate hydration (bounded source-blob read + BLAKE3 verify inside
-    // validate_asset) rides the pack-wide preprocessing gate exactly like the
-    // ingest and search paths: without it, concurrent serve calls could each
-    // hydrate two source blobs with no concurrency bound. The blob pack's own
-    // hydration semaphore is private to that crate and unreachable here.
-    let hydration_permit = pack.model_state().acquire_preprocessing_permit().await?;
     let mut validated = Vec::with_capacity(2);
     for (index, candidate) in input.candidates.into_iter().enumerate() {
         debug_assert_eq!(candidate.state, CandidateState::Scored);
@@ -257,7 +253,6 @@ pub(crate) async fn handle_serve(
             features: candidate.features,
         });
     }
-    drop(hydration_permit);
     if validated[0].asset_id == validated[1].asset_id
         || validated[0].content_ref == validated[1].content_ref
     {
@@ -497,15 +492,10 @@ pub(crate) async fn handle_preference(
     validate_board(&core, token, board_entity_id, &input.board_id).await?;
     let scope = scope_from_input(token, board_entity_id, input.board_id, &input.descriptor);
 
-    // Same gate as handle_serve: candidate hydration inside
-    // validate_inference_candidate rides the pack-wide preprocessing gate so
-    // concurrent preference calls cannot hydrate source blobs unboundedly.
-    let hydration_permit = pack.model_state().acquire_preprocessing_permit().await?;
     let (left_asset_id, left_content_ref) =
         validate_inference_candidate(&core, token, &input.left, "left").await?;
     let (right_asset_id, right_content_ref) =
         validate_inference_candidate(&core, token, &input.right, "right").await?;
-    drop(hydration_permit);
     if left_asset_id == right_asset_id || left_content_ref == right_content_ref {
         return Err(RuntimeError::InvalidInput(
             "moodboard.preference requires two distinct asset identities".to_string(),
@@ -740,17 +730,11 @@ async fn validate_asset(
         )));
     }
     let blob_store = require_blob_store(runtime)?;
-    // ADR-149: corrupt candidate bytes fail closed. Existence alone would admit
-    // a corrupted object stored under a valid ref, so the bytes are read within
-    // the source-blob bound and BLAKE3-verified before any inference sees them.
-    crate::handlers::read_bounded_source_blob(blob_store.as_ref(), expected_ref)
-        .await
-        .map_err(|error| match error {
-            RuntimeError::NotFound(_) => RuntimeError::InvalidInput(format!(
-                "moodboard asset {asset_id} references a missing BlobStore object"
-            )),
-            other => other,
-        })?;
+    if !blob_store.exists(expected_ref).await? {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard asset {asset_id} references a missing BlobStore object"
+        )));
+    }
     Ok(entity)
 }
 
@@ -1197,6 +1181,14 @@ fn require_blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, Runt
     })
 }
 
+fn require_blob_hydrator(runtime: &KhiveRuntime) -> Result<Arc<BlobHydrator>, RuntimeError> {
+    runtime.blob_hydrator().ok_or_else(|| {
+        RuntimeError::Unconfigured(
+            "moodboard preference learning requires an installed BlobStore".to_string(),
+        )
+    })
+}
+
 fn content_ref_stripe(content_ref: &ContentRef) -> usize {
     let bytes = content_ref.as_str().as_bytes();
     usize::from(hex_nibble(bytes[0])) * 16 + usize::from(hex_nibble(bytes[1]))
@@ -1403,35 +1395,6 @@ fn validate_model_event(
     Ok(())
 }
 
-async fn read_verified_blob(
-    store: &dyn BlobStore,
-    content_ref: &ContentRef,
-    label: &str,
-) -> Result<Vec<u8>, RuntimeError> {
-    let size = store
-        .size(content_ref)
-        .await?
-        .ok_or_else(|| RuntimeError::NotFound(format!("{label} {content_ref}")))?;
-    if size > MAX_MODEL_BLOB_BYTES {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{label} {content_ref} is {size} bytes, exceeding the {MAX_MODEL_BLOB_BYTES}-byte model ceiling"
-        )));
-    }
-    let bytes = store.get(content_ref).await?;
-    if bytes.len() as u64 != size || bytes.len() as u64 > MAX_MODEL_BLOB_BYTES {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{label} {content_ref} changed size or exceeded its preflight bound"
-        )));
-    }
-    let actual = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
-    if &actual != content_ref {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{label} {content_ref} failed BLAKE3 content verification"
-        )));
-    }
-    Ok(bytes)
-}
-
 async fn load_preference_model(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1450,15 +1413,12 @@ async fn load_preference_model(
         ))
     })?;
     let bundle_content_ref = parse_content_ref(raw_ref, "moodboard model content_ref")?;
-    let blob_store = require_blob_store(runtime)?;
-    let bundle_bytes = read_verified_blob(
-        blob_store.as_ref(),
-        &bundle_content_ref,
-        "moodboard model bundle",
-    )
-    .await?;
-    let bundle_sha256 = sha256_hex(&bundle_bytes);
-    let bundle: ModelBundle = serde_json::from_slice(&bundle_bytes).map_err(|error| {
+    let hydrator = require_blob_hydrator(runtime)?;
+    let bundle_blob = hydrator
+        .hydrate_verified(&bundle_content_ref, MAX_MODEL_BLOB_BYTES)
+        .await?;
+    let bundle_sha256 = sha256_hex(bundle_blob.bytes());
+    let bundle: ModelBundle = serde_json::from_slice(bundle_blob.bytes()).map_err(|error| {
         RuntimeError::InvalidInput(format!(
             "moodboard preference model {model_id} bundle is corrupt: {error}"
         ))
@@ -1474,18 +1434,17 @@ async fn load_preference_model(
         &bundle.fann.network_content_ref,
         "moodboard model network_content_ref",
     )?;
-    let network_bytes = read_verified_blob(
-        blob_store.as_ref(),
-        &network_content_ref,
-        "moodboard FANN network",
-    )
-    .await?;
-    if sha256_hex(&network_bytes) != bundle.fann.network_sha256 {
+    drop(bundle_blob);
+    let network_blob = hydrator
+        .hydrate_verified(&network_content_ref, MAX_MODEL_BLOB_BYTES)
+        .await?;
+    if sha256_hex(network_blob.bytes()) != bundle.fann.network_sha256 {
         return Err(RuntimeError::InvalidInput(format!(
             "moodboard preference model {model_id} FANN SHA-256 does not match its bundle"
         )));
     }
-    let network = deserialize_fann(&network_bytes)?;
+    let network = deserialize_fann(network_blob.bytes())?;
+    drop(network_blob);
     let event_id = model_event_id(model_id, &bundle_content_ref);
     let event = runtime
         .events(token)?
@@ -1575,7 +1534,7 @@ async fn validate_inference_candidate(
 mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
@@ -1589,6 +1548,48 @@ mod tests {
         FEATURE_SCHEMA_CANONICAL_JSON, MODEL_FAMILY, OPTIMIZER_BACKTRACKING_IDENTITY,
         PAIR_SPLIT_REVISION, TIE_BAND_RULE_IDENTITY, TRAINING_REVISION,
     };
+
+    #[derive(Debug)]
+    struct RecordingBoundedStore {
+        inner: Arc<FsBlobStore>,
+        calls: Mutex<Vec<(ContentRef, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for RecordingBoundedStore {
+        async fn put(&self, bytes: Vec<u8>) -> khive_storage::StorageResult<ContentRef> {
+            self.inner.put(bytes).await
+        }
+
+        async fn get_bounded_verified(
+            &self,
+            content_ref: &ContentRef,
+            max_bytes: u64,
+        ) -> khive_storage::StorageResult<Vec<u8>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((content_ref.clone(), max_bytes));
+            self.inner
+                .get_bounded_verified(content_ref, max_bytes)
+                .await
+        }
+
+        async fn exists(&self, content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
+            self.inner.exists(content_ref).await
+        }
+
+        async fn size(
+            &self,
+            _content_ref: &ContentRef,
+        ) -> khive_storage::StorageResult<Option<u64>> {
+            panic!("preference hydration must not compose size with a read")
+        }
+
+        async fn delete(&self, content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
+            self.inner.delete(content_ref).await
+        }
+    }
 
     fn persistent_runtime(db_path: &Path, actor_id: &str) -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {
@@ -1646,7 +1647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_asset_rejects_corrupted_blob_bytes() {
+    async fn validate_asset_keeps_candidate_checks_metadata_only() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("state.db");
         let blob_root = temp.path().join("blobs");
@@ -1675,17 +1676,13 @@ mod tests {
             .unwrap();
         validate_asset(&runtime, &token, asset.id, &content_ref)
             .await
-            .expect("intact candidate bytes must validate");
+            .expect("present candidate must validate");
         let hex = content_ref.as_str();
         let object_path = blob_root.join(&hex[0..2]).join(&hex[2..4]).join(hex);
         std::fs::write(&object_path, b"corrupted candidate bytes").unwrap();
-        let error = validate_asset(&runtime, &token, asset.id, &content_ref)
+        validate_asset(&runtime, &token, asset.id, &content_ref)
             .await
-            .expect_err("corrupted candidate bytes must fail closed before inference");
-        assert!(
-            error.to_string().contains("BLAKE3"),
-            "corruption must surface as digest verification failure: {error}"
-        );
+            .expect("candidate eligibility must use metadata-only existence, not hydrate bytes");
     }
 
     fn valid_serve_record() -> ServeRecord {
@@ -2011,8 +2008,12 @@ mod tests {
         drop(blob_store);
 
         let restarted = persistent_runtime(&db_path, "alice");
+        let recording_store = Arc::new(RecordingBoundedStore {
+            inner: Arc::new(FsBlobStore::new(blob_root, 0).unwrap()),
+            calls: Mutex::new(Vec::new()),
+        });
         restarted
-            .install_blob_store(Arc::new(FsBlobStore::new(blob_root, 0).unwrap()))
+            .install_blob_store(Arc::clone(&recording_store) as Arc<dyn BlobStore>)
             .expect("install blob store");
         let restarted_token = restarted.authorize(Namespace::local()).unwrap();
         let loaded = load_preference_model(&restarted, &restarted_token, model_id, &scope)
@@ -2026,6 +2027,14 @@ mod tests {
         )
         .unwrap();
         assert!(probability > 0.5);
+        assert_eq!(
+            *recording_store.calls.lock().unwrap(),
+            vec![
+                (bundle_content_ref.clone(), MAX_MODEL_BLOB_BYTES),
+                (network_content_ref.clone(), MAX_MODEL_BLOB_BYTES),
+            ],
+            "bundle and network must each enter shared bounded hydration at the 1 MiB pack cap"
+        );
 
         let mut wrong_scope = scope;
         wrong_scope.board_id = "f".repeat(64);

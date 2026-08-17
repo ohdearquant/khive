@@ -56,15 +56,6 @@ impl BlobStore for FixtureBlobStore {
         Ok(content_ref)
     }
 
-    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-        self.objects
-            .lock()
-            .unwrap()
-            .get(content_ref)
-            .map(|(_, body)| body.clone())
-            .ok_or_else(|| Self::not_found(content_ref))
-    }
-
     async fn get_bounded_verified(
         &self,
         content_ref: &ContentRef,
@@ -174,9 +165,6 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
         Some(bytes.len() as u64)
     );
 
-    let round_tripped = store.get(&ref_a).await.expect("get");
-    assert_eq!(round_tripped, bytes);
-
     // ADR-160 D2: the required whole-buffer read succeeds exactly at the
     // caller's actual-byte limit and returns only digest-verified bytes.
     let verified = store
@@ -224,10 +212,9 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
         }) if observed_at_least >= 1
     ));
 
-    // A content ref that was never written does not exist and 404s on get.
+    // A content ref that was never written does not exist and refuses a read.
     let never_written = ContentRef::from_digest_bytes(&[0xAB; 32]);
     assert!(!store.exists(&never_written).await.expect("exists (absent)"));
-    assert!(store.get(&never_written).await.is_err());
     assert!(matches!(
         store
             .get_bounded_verified(&never_written, MAX_BLOB_WHOLE_BYTES)
