@@ -727,6 +727,67 @@ describe("bounded coupling comparison", () => {
     );
   });
 
+  it("does not turn a truncated module page into an unavailable comparison when an SCC member is outside it", () => {
+    const bundle = golden();
+    const endpoint = moduleByPath(bundle, graphImplementation);
+    bundle.aggregates.dependency_topology.modules.items.find((row) =>
+      row.module_id === endpoint.id
+    )!.cycle_ids = ["focused-cycle-with-uncaptured-member"];
+    bundle.aggregates.dependency_topology.cycles.items.push({
+      id: "focused-cycle-with-uncaptured-member",
+      module_ids: [endpoint.id, "uncaptured-module"],
+    });
+    if (
+      bundle.aggregates.dependency_topology.cycles.total_count.status ===
+        "available"
+    ) {
+      bundle.aggregates.dependency_topology.cycles.total_count.value += 1;
+    }
+    bundle.graph.modules.truncated = true;
+    bundle.graph.modules.next_cursor = "next-module-page";
+    bundle.graph.modules.disclosure = {
+      status: "truncated",
+      reason: "module page reached its bound",
+    };
+
+    const result = comparison(bundle);
+
+    expect(result.status).toBe("available");
+    if (result.status !== "available") return;
+    expect(result.value.endpoints[0].scc).toMatchObject({
+      state: "present",
+      items: [],
+      boundary: {
+        status: "truncated",
+        reason: expect.stringMatching(/module page reached its bound/i),
+      },
+    });
+  });
+
+  it("still fails closed when a complete module page omits a referenced SCC member", () => {
+    const bundle = golden();
+    const endpoint = moduleByPath(bundle, graphImplementation);
+    bundle.aggregates.dependency_topology.modules.items.find((row) =>
+      row.module_id === endpoint.id
+    )!.cycle_ids = ["focused-cycle-with-missing-complete-member"];
+    bundle.aggregates.dependency_topology.cycles.items.push({
+      id: "focused-cycle-with-missing-complete-member",
+      module_ids: [endpoint.id, "missing-complete-module"],
+    });
+    if (
+      bundle.aggregates.dependency_topology.cycles.total_count.status ===
+        "available"
+    ) {
+      bundle.aggregates.dependency_topology.cycles.total_count.value += 1;
+    }
+
+    expect(comparison(bundle)).toMatchObject({
+      status: "unavailable",
+      code: "referenced_module_missing",
+      reason: expect.stringContaining("missing-complete-module"),
+    });
+  });
+
   it("makes shared commits unknown when complete evidence contradicts the producer count", () => {
     const bundle = golden();
     const left = moduleByPath(bundle, graphImplementation);

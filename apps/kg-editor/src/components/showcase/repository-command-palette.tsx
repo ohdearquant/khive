@@ -1,7 +1,7 @@
 "use client";
 
 import { Copy, Search, X } from "@/icons";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import styles from "@/components/showcase/repository-command-palette.module.css";
@@ -128,7 +128,7 @@ export function RepositoryCommandPalette({
       : bundle.capability.labels.truncated
   }${modulePage.disclosure.reason ? `: ${modulePage.disclosure.reason}` : ""}`;
 
-  function openPalette(source?: HTMLElement | null) {
+  const openPalette = useCallback((source?: HTMLElement | null) => {
     returnFocusRef.current = source ??
       (document.activeElement instanceof HTMLElement
         ? document.activeElement
@@ -141,9 +141,9 @@ export function RepositoryCommandPalette({
         document.body,
     );
     setOpen(true);
-  }
+  }, []);
 
-  function closePalette(restoreFocus = true) {
+  const closePalette = useCallback((restoreFocus = true) => {
     setOpen(false);
     setQuery("");
     setHighlightedIndex(0);
@@ -152,7 +152,7 @@ export function RepositoryCommandPalette({
         if (returnFocusRef.current?.isConnected) returnFocusRef.current.focus();
       });
     }
-  }
+  }, []);
 
   function execute(command: PaletteCommand | undefined) {
     if (!command) return;
@@ -186,7 +186,7 @@ export function RepositoryCommandPalette({
     }
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  });
+  }, [open, closePalette, openPalette]);
 
   useEffect(() => {
     if (open) inputRef.current?.focus();

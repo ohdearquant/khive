@@ -183,6 +183,7 @@ function pageEvidence(
       | { status: "available"; value: number }
       | { status: "unavailable"; reason: string };
     bound: { kind: "all" | "top_n"; max_items: number; order: string };
+    next_cursor?: string | null;
     truncated: boolean;
     disclosure: {
       status: "complete" | "truncated" | "unavailable";
@@ -194,12 +195,17 @@ function pageEvidence(
   const total = page.total_count.status === "available"
     ? `${page.total_count.value} declared`
     : `total ${labels.unavailable}`;
-  const status = page.disclosure.status === "complete"
+  const effectiveStatus: "complete" | "truncated" | "unavailable" =
+    page.disclosure.status === "unavailable"
+      ? "unavailable"
+      : page.truncated || page.next_cursor != null ||
+          page.disclosure.status === "truncated"
+      ? "truncated"
+      : "complete";
+  const status = effectiveStatus === "complete"
     ? "complete"
     : `${
-      page.disclosure.status === "truncated"
-        ? labels.truncated
-        : labels.unavailable
+      effectiveStatus === "truncated" ? labels.truncated : labels.unavailable
     }${
       page.disclosure.reason ? `: ${page.disclosure.reason}` : ""
     }`;
@@ -323,6 +329,24 @@ function combinedAttentionMetric(
       .filter(Boolean)
       .join("; ") || "One or more attention analyses were not produced.";
     return unavailableMetric(labels, reason);
+  }
+  const truncated = metrics.filter((metric) => metric.status === "truncated");
+  if (truncated.length > 0) {
+    const reason = truncated
+      .map((metric) => metric.reason)
+      .filter(Boolean)
+      .join("; ") ||
+      "One or more attention analyses are truncated; unseen rows may contain additional signals.";
+    return {
+      shown,
+      total: null,
+      bound: shown,
+      status: "truncated",
+      reason,
+      summary: `${shown} signals from available analyses; ${labels.truncated}`,
+      detail:
+        "Each signal carries its own capability-owned row coverage and export bound.",
+    };
   }
   return {
     shown,

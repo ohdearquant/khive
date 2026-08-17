@@ -419,6 +419,7 @@ function buildScc(
   }
   const moduleStatus = pageStatus(analysis.modules);
   const cycleStatus = pageStatus(analysis.cycles);
+  const graphModuleStatus = pageStatus(bundle.graph.modules);
   const cycleIds = topologyRow?.cycle_ids ?? [];
   const cycleById = new Map(analysis.cycles.items.map((cycle) => [
     cycle.id,
@@ -429,33 +430,46 @@ function buildScc(
     candidate.id,
     candidate,
   ]));
+  const unresolvedModuleIds = new Set<string>();
   for (const cycleId of cycleIds) {
     const row = cycleById.get(cycleId);
     if (!row) continue;
-    const modules = row.module_ids.map((moduleId) => {
+    const modules: RepoModule[] = [];
+    let unresolved = false;
+    for (const moduleId of row.module_ids) {
       const referenced = moduleById.get(moduleId);
       if (!referenced) {
-        throw new BuildFailure(
-          "referenced_module_missing",
-          `SCC ${cycleId} references a module outside the captured module page (${moduleId}).`,
-        );
+        unresolvedModuleIds.add(moduleId);
+        unresolved = true;
+        continue;
       }
       assertRevision(referenced);
-      return referenced;
-    });
+      modules.push(referenced);
+    }
+    if (unresolved) continue;
     resolved.push({ row, modules });
+  }
+  if (unresolvedModuleIds.size > 0 && graphModuleStatus === "complete") {
+    throw new BuildFailure(
+      "referenced_module_missing",
+      `SCC evidence references a module outside the complete captured module page (${
+        [...unresolvedModuleIds].sort(compareText).join(", ")
+      }).`,
+    );
   }
   const missingCycleCount = cycleIds.length - resolved.length;
   const sourceReason = combineReasons(
     pageReason(analysis.modules),
     pageReason(analysis.cycles),
+    unresolvedModuleIds.size > 0 ? pageReason(bundle.graph.modules) : null,
     missingCycleCount > 0
-      ? `${missingCycleCount} declared SCC record${missingCycleCount === 1 ? " is" : "s are"} outside the captured cycle page.`
+      ? `${missingCycleCount} declared SCC record${missingCycleCount === 1 ? " is" : "s are"} outside the captured cycle or module page.`
       : null,
   );
   const sourceStatus = weakestStatus([
     moduleStatus,
     cycleStatus,
+    graphModuleStatus,
     missingCycleCount > 0 ? "truncated" : "complete",
   ]);
   const items = resolved

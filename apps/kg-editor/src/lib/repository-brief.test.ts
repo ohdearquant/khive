@@ -165,6 +165,36 @@ describe("repository triage model", () => {
     });
   });
 
+  it("discloses truncated attention evidence instead of reporting no supported signal", () => {
+    const truncated = structuredClone(bundle);
+    const truncateEmpty = (page: {
+      items: unknown[];
+      truncated: boolean;
+      next_cursor?: string | null;
+      disclosure: { status: string; reason?: string | null };
+    }) => {
+      page.items = [];
+      page.truncated = true;
+      page.next_cursor = "next-page";
+      page.disclosure = {
+        status: "truncated",
+        reason: "attention analysis was capped before evidence rows were emitted",
+      };
+    };
+    truncateEmpty(truncated.aggregates.hotspot_quadrant.data);
+    truncateEmpty(truncated.aggregates.dependency_topology.cycles);
+    truncateEmpty(truncated.aggregates.hidden_coupling.data);
+    truncateEmpty(truncated.aggregates.ownership.modules);
+
+    const brief = buildRepositoryBrief(truncated);
+
+    expect(brief.attentionSignals).toEqual([]);
+    expect(brief.attentionState.status).toBe("truncated");
+    expect(brief.attentionState.reason).toContain(
+      "attention analysis was capped before evidence rows were emitted",
+    );
+  });
+
   it("does not fabricate recommendations from zero-evidence rows or cycle order", () => {
     const quiet = structuredClone(bundle);
     quiet.aggregates.hotspot_quadrant.data.items = quiet.aggregates
