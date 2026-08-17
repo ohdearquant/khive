@@ -550,6 +550,39 @@ none of its flags do anything yet.
 
 ## 4. Maintenance
 
+### Blob-GC attachment rollout: Phase4a before Phase4b
+
+Phase4a is a compatibility release, not the attachment migration. It leaves the database at V20:
+it does not create `attachments`, register or run V21, backfill records, change pack/runtime
+readers or writers, or drop `entities.content_ref`. Its filesystem
+`transactional_orphan_sweep` intentionally returns typed `Unsupported` for both report-only and
+destructive calls on V20, pending/incomplete V21, missing required objects, retained legacy
+objects, or a schema newer than the exact V21 contract. Malformed schema/evidence or nonfunctional
+named fences also fail closed, using the applicable validation, storage, or typed `Unsupported`
+error before claim cleanup or deletion. Do not bypass a refusal with caller-snapshot
+`orphan_sweep`; that API requires deployment-wide reference-write quiescence and cannot account
+for the moodboard FANN object missing from V20 SQL liveness.
+
+Use this two-release rollout order:
+
+1. Back up the canonical main database and inventory every process that can open it or the shared
+   blob root, including daemons, one-shot admin jobs, and independently supervised replicas.
+2. Drain every pre-Phase4a process. Install a restart fence (deployment revision pin, disabled old
+   unit, or equivalent) so an older binary cannot return and run V20 transactional GC.
+3. Deploy Phase4a everywhere while the database remains V20. A typed V20 GC refusal in either mode
+   is the expected safe state. Phase4a `db migrate` still knows only the V20 prefix and does not
+   perform the attachment cutover.
+4. Before introducing Phase4b, quiesce every Phase4a application reader and writer. Only the
+   Phase4a GC implementation can interpret an exact completed V21 attachment epoch; its serving,
+   pack, runtime, and ordinary migration paths remain V20 consumers. Do not perform a rolling
+   Phase4a/Phase4b serving cutover against one database.
+5. Run the future Phase4b boot-gated migration only with Phase4b tooling, keep serving closed until
+   its durable marker is complete, and then admit only Phase4b-or-newer application processes.
+
+Phase4b migration/serving support is a follow-up and is not present in the Phase4a release. The
+positive completed-V21 Phase4a GC regression exists to prove the compatibility fence itself; it is
+not an operator command or authorization to keep Phase4a application traffic live during cutover.
+
 ### `db migrate` / `db check`
 
 ```bash

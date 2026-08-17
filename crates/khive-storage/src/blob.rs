@@ -201,9 +201,9 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
     /// Unconditional physical removal with **no coordination against any
-    /// record attachment that might reference `content_ref`**. Safe to call
-    /// only when the caller has independently quiesced whatever writer could
-    /// attach a new `content_ref` to a record for the duration of the call — this
+    /// record or attachment that might reference `content_ref`**. Safe to call only when
+    /// the caller has independently quiesced every writer that could commit a
+    /// new SQL liveness reference for the duration of the call — this
     /// trait does not detect or prevent a race. Offline-maintenance-only.
     /// See `crates/khive-storage/docs/api/blob-store.md`.
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool>;
@@ -239,8 +239,8 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     ///
     /// Unlike [`Self::orphan_sweep`], this operation obtains liveness itself
     /// from `sql`; callers do not assemble a stale snapshot. `sql` must be the
-    /// canonical database capability used for the attachment writes that own
-    /// these references. Implementations must also ensure an object published after
+    /// canonical main database capability used for the attachment writes that own
+    /// references. Implementations must also ensure an object published after
     /// the sweep's candidate set is captured cannot be mistaken for an orphan,
     /// including when it is published between selecting live references and
     /// physical deletion. Implementations must not perform filesystem or
@@ -258,24 +258,29 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// Backends that cannot provide both guarantees return
     /// `StorageError::Unsupported`.
     ///
-    /// The shipped filesystem implementation additionally fail-closes on the
-    /// database's liveness epoch. It accepts only an exact completed V21 state
-    /// (ledger and completed marker, attachment claim fences present, legacy
-    /// entity column/index/triggers absent). V20, pending, incomplete, and
-    /// malformed states fail closed in both dry-run and destructive modes before
-    /// filesystem or claim mutation. Ordinary epoch mismatch is `Unsupported`;
-    /// malformed schema/evidence may retain its specific validation/driver
-    /// error. This is the Phase-4a GC compatibility gate: Phase 4a changes no
-    /// schema or data. Every older process sharing the database/blob root must
-    /// be drained before Phase 4b
-    /// performs the attachment backfill and legacy-column drop. Phase-4a
-    /// application readers/writers must also be quiesced during cutover; only a
-    /// GC-only worker has narrow compatibility with exact completed V21. Callers
-    /// must not fall back to [`Self::orphan_sweep`] or [`Self::delete`] when this
-    /// gate refuses.
+    /// The filesystem implementation is schema-epoch gated and supports both
+    /// report-only and destructive modes only when `sql` proves the exact
+    /// completed V21 attachment cutover: durable complete marker and ledger
+    /// row, attachment table/indexes and INSERT/UPDATE claim fences, and
+    /// absence of every legacy entity reference column/index/fence. V20,
+    /// pending, incomplete, missing-required-object, retained-legacy, and
+    /// ahead-of-V21 epochs return typed `Unsupported` before root locking,
+    /// filesystem walking, or abandoned-claim cleanup. Malformed stored
+    /// evidence or a nonfunctional named fence fails closed with its validation,
+    /// storage, or typed `Unsupported` error before claim cleanup or deletion.
+    /// Once admitted, every attachment role is live; soft deletion alone does
+    /// not make its blob collectible.
     ///
-    /// Publishing a blob and committing the record attachment that references
-    /// it are two separate client steps; nothing serializes them against this
+    /// This is the Phase-4a GC compatibility gate. Phase 4a changes no schema or
+    /// data. Every older process sharing the database/blob root must be drained
+    /// before Phase 4b performs the attachment backfill and legacy-column drop.
+    /// Phase-4a application readers/writers must also be quiesced during cutover;
+    /// only a GC-only worker has narrow compatibility with exact completed V21.
+    /// Callers must not fall back to [`Self::orphan_sweep`] or [`Self::delete`]
+    /// when this gate refuses.
+    ///
+    /// Publishing a blob and committing the attachment write that references it
+    /// are two separate client steps; nothing serializes them against this
     /// sweep. Implementations must therefore also give a just-published,
     /// not-yet-referenced object a bounded grace period before treating it as
     /// an orphan (the filesystem backend does this via file age). A client

@@ -916,9 +916,6 @@ fn unsupported_blob_gc_epoch() -> StorageError {
 const BLOB_GC_FENCE_PROBE_REF: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-const BLOB_GC_FENCE_PROBE_SEED_REF: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
-
 /// The RAISE(ABORT) message both V21 attachment fencing triggers carry. The probe
 /// requires the rejection to be OUR fence, not an incidental failure.
 const BLOB_GC_FENCE_TRIGGER_MESSAGE: &str = "content_ref is reserved by an active blob sweep";
@@ -1007,6 +1004,45 @@ async fn blob_gc_fence_probe_with_ids(
                 }
             }
 
+            // The UPDATE arm needs a valid, initially unclaimed reference.
+            // Select it under this same writer transaction instead of using a
+            // fixed sentinel that a recoverable abandoned claim could fence
+            // forever. Eight fresh candidates keep collision handling bounded;
+            // no candidate means a safe, retryable refusal.
+            let seed_ref = writer
+                .query_row(SqlStatement {
+                    sql: "WITH RECURSIVE candidates(attempt, content_ref) AS ( \
+                              SELECT 1, lower(hex(randomblob(32))) \
+                              UNION ALL \
+                              SELECT attempt + 1, lower(hex(randomblob(32))) \
+                              FROM candidates WHERE attempt < 8 \
+                          ) \
+                          SELECT candidate.content_ref FROM candidates AS candidate \
+                          WHERE candidate.content_ref <> ?1 \
+                            AND NOT EXISTS ( \
+                                SELECT 1 FROM blob_gc_claims \
+                                WHERE content_ref = candidate.content_ref \
+                            ) \
+                          LIMIT 1"
+                        .to_string(),
+                    params: vec![SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string())],
+                    label: Some("blob_gc_fence_probe_select_seed".to_string()),
+                })
+                .await?
+                .and_then(|row| row.columns.first().map(|column| column.value.clone()));
+            let seed_ref = match seed_ref {
+                Some(SqlValue::Text(seed_ref)) => seed_ref,
+                _ => {
+                    return Err(StorageError::Unsupported {
+                        capability: StorageCapability::Blob,
+                        operation: "transactional_orphan_sweep".into(),
+                        message: "the blob GC fence probe could not select an unclaimed \
+                                  canonical seed; refusing deletion so a later sweep can retry"
+                            .into(),
+                    });
+                }
+            };
+
             writer
                 .execute(SqlStatement {
                     sql: "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
@@ -1041,10 +1077,7 @@ async fn blob_gc_fence_probe_with_ids(
                           (record_uuid, substrate, role, content_ref, created_at) \
                           VALUES (?1, 'entity', 'content', ?2, 0)"
                         .to_string(),
-                    params: vec![
-                        SqlValue::Text(update_id.clone()),
-                        SqlValue::Text(BLOB_GC_FENCE_PROBE_SEED_REF.to_string()),
-                    ],
+                    params: vec![SqlValue::Text(update_id.clone()), SqlValue::Text(seed_ref)],
                     label: Some("blob_gc_fence_probe_update_arm_seed".to_string()),
                 })
                 .await?;
@@ -1098,7 +1131,7 @@ async fn blob_gc_fence_probe_with_ids(
                 capability: StorageCapability::Blob,
                 operation: "transactional_orphan_sweep".into(),
                 message: format!(
-                    "the V20 fencing triggers exist by name but did not reject a claimed \
+                    "the V21 fencing triggers exist by name but did not reject a claimed \
                      content_ref on the attachment {arm} path; refusing unfenced deletion"
                 ),
             }),
@@ -1862,12 +1895,13 @@ impl BlobStore for FsBlobStore {
     // callers with an unusually slow publish path should widen the grace
     // period (`FsBlobStore::with_orphan_sweep_grace`) accordingly.
     //
-    // Cross-resource ordering (#1850): database/root ownership and filesystem
-    // walk/metadata happen before SQL. Bounded SQL-only units recover abandoned
-    // rows and commit at most 128 fresh claims whose attachment triggers fence new
+    // Cross-resource ordering (#1850): canonical database ownership precedes
+    // the epoch/evidence/fence checks and abandoned-claim recovery, then root
+    // ownership precedes filesystem walk/metadata. Later bounded SQL-only
+    // units commit at most 128 fresh claims whose attachment triggers fence new
     // live references; physical deletion happens after each COMMIT; a second
-    // bounded SQL-only unit releases that batch. Owner/root locks span all
-    // phases, but SQLite's single writer never spans external I/O.
+    // bounded SQL-only unit releases that batch. Database/root owners span the
+    // destructive phases, but SQLite's single writer never spans external I/O.
     async fn transactional_orphan_sweep(
         &self,
         sql: &dyn SqlAccess,
@@ -1935,7 +1969,6 @@ impl BlobStore for FsBlobStore {
             )
         })??;
         let root_key = blob_root_key(&canonical_root);
-
         let mut write_guards = write_guards;
         let mut result = prepared.result;
         let mut delete_error = None;
@@ -2175,6 +2208,76 @@ mod tests {
             .unwrap()
             .with_orphan_sweep_grace(Duration::ZERO);
         (dir, store)
+    }
+
+    /// Build the exact historical V20 prefix without invoking the V21
+    /// zero-reference fast path in [`crate::run_migrations`].
+    fn prepare_v20_gc_fixture(conn: &mut rusqlite::Connection) {
+        conn.execute_batch(include_str!("../../sql/schema-migrations-table.sql"))
+            .expect("create migration ledger");
+        for migration in crate::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 20)
+        {
+            let tx = conn.transaction().expect("begin historical migration");
+            tx.execute_batch(migration.up)
+                .expect("apply historical migration body");
+            tx.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                 VALUES (?1, ?2, 0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .expect("record historical migration");
+            tx.commit().expect("commit historical migration");
+        }
+    }
+
+    /// Build the canonical completed V21 schema used by transactional-GC
+    /// tests. Phase 4b owns the real cutover now, so tests exercise its schema
+    /// instead of retaining Phase 4a's synthetic future-schema fixture.
+    fn prepare_completed_v21_gc_fixture(conn: &mut rusqlite::Connection) {
+        let version = crate::run_migrations(conn).expect("prepare canonical completed V21");
+        assert_eq!(version, 21, "empty fixture must take the V21 fast path");
+    }
+
+    #[tokio::test]
+    async fn completed_v21_gc_gate_requires_new_indexes_and_absent_legacy_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+        assert!(blob_gc_fencing_complete(backend.sql().as_ref())
+            .await
+            .unwrap());
+
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("DROP INDEX idx_attachments_content_ref")
+                .unwrap();
+        }
+        assert!(!blob_gc_fencing_complete(backend.sql().as_ref())
+            .await
+            .unwrap());
+
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE INDEX idx_attachments_content_ref \
+                         ON attachments(content_ref); \
+                     ALTER TABLE entities ADD COLUMN content_ref TEXT",
+                )
+                .unwrap();
+        }
+        assert!(!blob_gc_fencing_complete(backend.sql().as_ref())
+            .await
+            .unwrap());
     }
 
     #[test]
@@ -2979,11 +3082,232 @@ mod tests {
         );
     }
 
+    /// Rollout compatibility fence: the Phase-3 binary's V20 schema cannot
+    /// represent a moodboard model's nested FANN network as SQL liveness.
+    /// Both report-only and destructive transactional sweeps must therefore
+    /// refuse before taking the root lock or mutating abandoned claims.
+    #[tokio::test]
+    async fn transactional_orphan_sweep_refuses_v20_before_root_or_claim_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_v20_gc_fixture(writer.conn_mut());
+        }
+
+        let root = dir.path().join("blobs");
+        let store = Arc::new(
+            FsBlobStore::new(root, 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let bundle = store.put(b"legacy model bundle".to_vec()).await.unwrap();
+        let network = store.put(b"legacy FANN network".to_vec()).await.unwrap();
+        let orphan = store.put(b"ordinary old orphan".to_vec()).await.unwrap();
+        let abandoned_ref = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, entity_type, name, tags, created_at, updated_at, \
+                      content_ref) \
+                     VALUES ('legacy-model', 'local', 'artifact', 'moodboard_model', \
+                             'legacy model', '[]', 1, 1, ?1)",
+                    [bundle.as_str()],
+                )
+                .unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                     VALUES ('abandoned-before-compat', ?1, 1)",
+                    [abandoned_ref],
+                )
+                .unwrap();
+        }
+
+        // If the compatibility gate is below the root lock, the call parks
+        // here and the timeout fails. A correct V20 refusal never waits for it.
+        let _root_guard = store.write_lock.clone().lock_owned().await;
+        for dry_run in [true, false] {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                store.transactional_orphan_sweep(backend.sql().as_ref(), dry_run),
+            )
+            .await
+            .expect("V20 refusal must happen before waiting for the held root lock");
+            let error = outcome.expect_err("V20 transactional sweep must be disabled");
+            match error {
+                StorageError::Unsupported {
+                    capability: StorageCapability::Blob,
+                    operation,
+                    message,
+                } => {
+                    assert_eq!(operation, "transactional_orphan_sweep");
+                    assert!(
+                        message.contains("complete V21 attachment cutover"),
+                        "unexpected compatibility diagnostic: {message}"
+                    );
+                }
+                other => panic!("expected typed Unsupported refusal, got {other:?}"),
+            }
+        }
+
+        let reader = backend.pool().reader().unwrap();
+        let abandoned: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM blob_gc_claims \
+                 WHERE root_key = 'abandoned-before-compat' AND content_ref = ?1",
+                [abandoned_ref],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(abandoned, 1, "V20 refusal must not clean abandoned claims");
+        drop(reader);
+        assert!(store.exists(&bundle).await.unwrap());
+        assert!(store.exists(&network).await.unwrap());
+        assert!(store.exists(&orphan).await.unwrap());
+    }
+
+    /// The durable marker is authoritative, not the mere presence of V21
+    /// tables, triggers, or even a ledger row. An interrupted/inconsistent
+    /// cutover remains non-sweepable for both modes and is rejected before
+    /// the root wait or abandoned-claim recovery.
+    #[tokio::test]
+    async fn transactional_orphan_sweep_refuses_incomplete_v21_marker_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        let abandoned_ref = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer
+                .conn_mut()
+                .execute(
+                    "UPDATE attachment_cutover_state \
+                     SET state = 'incomplete', completed_at = NULL \
+                     WHERE singleton = 1",
+                    [],
+                )
+                .unwrap();
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                     VALUES ('abandoned-incomplete-v21', ?1, 1)",
+                    [abandoned_ref],
+                )
+                .unwrap();
+        }
+
+        let store = Arc::new(
+            FsBlobStore::new(dir.path().join("blobs"), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let orphan = store.put(b"incomplete V21 orphan".to_vec()).await.unwrap();
+        let _root_guard = store.write_lock.clone().lock_owned().await;
+
+        for dry_run in [true, false] {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                store.transactional_orphan_sweep(backend.sql().as_ref(), dry_run),
+            )
+            .await
+            .expect("incomplete V21 must refuse before waiting for the root lock");
+            assert!(
+                matches!(outcome, Err(StorageError::Unsupported { .. })),
+                "incomplete V21 must return typed Unsupported: {outcome:?}"
+            );
+        }
+
+        let remaining: i64 = backend
+            .pool()
+            .reader()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM blob_gc_claims \
+                 WHERE root_key = 'abandoned-incomplete-v21' AND content_ref = ?1",
+                [abandoned_ref],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1, "refusal must not recover abandoned claims");
+        assert!(store.exists(&orphan).await.unwrap());
+    }
+
+    /// A Phase-4a binary can remain in a mixed fleet after a newer binary has
+    /// atomically completed V21. It must then use every attachment role as
+    /// liveness, including a moodboard FANN network, and delete only the true
+    /// orphan.
+    #[tokio::test]
+    async fn transactional_orphan_sweep_accepts_completed_v21_attachment_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::ZERO);
+        let bundle = store.put(b"V21 model bundle".to_vec()).await.unwrap();
+        let network = store.put(b"V21 FANN network".to_vec()).await.unwrap();
+        let orphan = store.put(b"V21 true orphan".to_vec()).await.unwrap();
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, entity_type, name, tags, created_at, updated_at) \
+                     VALUES ('model', 'local', 'artifact', 'moodboard_model', \
+                             'model', '[]', 1, 1)",
+                    [],
+                )
+                .unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO attachments \
+                     (record_uuid, substrate, role, content_ref, created_at) \
+                     VALUES ('model', 'entity', 'content', ?1, 1), \
+                            ('model', 'entity', 'fann-network', ?2, 1)",
+                    rusqlite::params![bundle.as_str(), network.as_str()],
+                )
+                .unwrap();
+        }
+
+        let dry_run = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), true)
+            .await
+            .expect("completed V21 dry run must be supported");
+        assert_eq!(dry_run.would_delete, 1);
+        assert_eq!(dry_run.deleted, 0);
+
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .expect("completed V21 destructive sweep must be supported");
+        assert_eq!(result.deleted, 1);
+        assert!(store.exists(&bundle).await.unwrap());
+        assert!(store.exists(&network).await.unwrap());
+        assert!(!store.exists(&orphan).await.unwrap());
+    }
+
     /// A `StorageBackend` constructed directly and never run through the
     /// versioned migration ledger (`run_migrations`/`prepare_core_schema`) —
     /// only the ad hoc, idempotent `entities` DDL a plain `entities()` call
-    /// applies — has no `blob_gc_claims` table and no entity fencing
-    /// triggers. Without that fence a reference committed between liveness
+    /// applies — has no completed V21 marker, attachment liveness table, or
+    /// attachment fencing triggers. Without that set a reference committed between liveness
     /// selection and physical deletion would dangle, so the trait contract
     /// requires `StorageError::Unsupported` here rather than an unfenced
     /// sweep, and every candidate must survive.
@@ -3080,10 +3404,20 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
             writer
                 .conn_mut()
                 .execute_batch("DROP TRIGGER attachments_reject_claimed_blob_update")
+                .unwrap();
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                     VALUES ('abandoned-partial-fence', \
+                             'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', \
+                             1)",
+                    [],
+                )
                 .unwrap();
         }
 
@@ -3096,10 +3430,15 @@ mod tests {
         let orphan = store.put(b"partial-fence orphan".to_vec()).await.unwrap();
 
         let sql = backend.sql();
-        let error = store
-            .transactional_orphan_sweep(sql.as_ref(), false)
-            .await
-            .expect_err("sweep must refuse when any V21 fencing trigger is missing");
+        let root_guard = store.write_lock.clone().lock_owned().await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.transactional_orphan_sweep(sql.as_ref(), false),
+        )
+        .await
+        .expect("an incomplete V21 fence must refuse before the root wait")
+        .expect_err("sweep must refuse when any V21 fencing trigger is missing");
+        drop(root_guard);
         assert!(
             matches!(error, StorageError::Unsupported { .. }),
             "expected StorageError::Unsupported, got {error:?}"
@@ -3108,6 +3447,19 @@ mod tests {
             store.exists(&orphan).await.unwrap(),
             "a refused sweep must not have deleted anything"
         );
+        let remaining: i64 = backend
+            .pool()
+            .reader()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM blob_gc_claims \
+                 WHERE root_key = 'abandoned-partial-fence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1, "a refused sweep must not recover claims");
     }
 
     /// The gate must verify the fence FUNCTIONS, not that three names exist
@@ -3122,7 +3474,7 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
             writer
                 .conn_mut()
                 .execute_batch(
@@ -3182,7 +3534,7 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
             writer
                 .conn_mut()
                 .execute(
@@ -3231,7 +3583,7 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
             // entities_seq rows intentionally survive entity hard deletion, so
             // an id can collide with the ledger alone — no entities row left
             // for the guard to trip on.
@@ -3280,7 +3632,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             survivors, 1,
-            "the retained ledger row must survive the attachment probe"
+            "the retained entity ledger row must survive the attachment probe"
         );
     }
 
@@ -3291,7 +3643,7 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let root = dir.path().join("blobs");
         let store = std::sync::Arc::new(
@@ -3346,7 +3698,7 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let root = dir.path().join("blobs");
         let store = std::sync::Arc::new(
@@ -3443,7 +3795,7 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let root = dir.path().join("blobs");
         let store = std::sync::Arc::new(
@@ -3524,7 +3876,7 @@ mod tests {
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let root = dir.path().join("blobs");
         let store = FsBlobStore::new(root.clone(), 0)
@@ -3535,22 +3887,29 @@ mod tests {
         let canonical_root = root.canonicalize().unwrap();
         let root_key = blob_root_key(&canonical_root);
         let absent_ref = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let former_probe_seed = "1111111111111111111111111111111111111111111111111111111111111111";
         {
             let writer = backend.pool().writer().unwrap();
             writer
                 .conn()
                 .execute(
                     "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
-                     VALUES (?1, ?2, 1), (?1, ?3, 1)",
-                    rusqlite::params![root_key, content_ref.as_str(), absent_ref],
+                     VALUES (?1, ?2, 1), (?1, ?3, 1), (?1, ?4, 1)",
+                    rusqlite::params![
+                        root_key,
+                        content_ref.as_str(),
+                        absent_ref,
+                        former_probe_seed
+                    ],
                 )
                 .unwrap();
         }
 
         // A publisher that recovered after the claiming process crashed
-        // refreshes the digest's grace witness before its entity write. The
-        // next sweep must clear both this protected claim and the claim whose
-        // file was already removed, never resume deletion blindly.
+        // refreshes the digest's grace witness before its attachment write. The
+        // next sweep must clear this protected claim, the claim whose file was
+        // already removed, and the former fixed probe seed without letting a
+        // healthy attachment fence block abandoned-claim recovery forever.
         assert_eq!(store.put(bytes).await.unwrap(), content_ref);
         let result = store
             .transactional_orphan_sweep(backend.sql().as_ref(), false)
@@ -3581,7 +3940,7 @@ mod tests {
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
 
         let old_root = dir.path().join("old-blobs");
@@ -3645,7 +4004,7 @@ mod tests {
         {
             let source = crate::StorageBackend::sqlite(&source_path).unwrap();
             let mut writer = source.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
             writer
                 .conn()
                 .execute(
@@ -3691,7 +4050,7 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let root = dir.path().join("blobs");
         let store = std::sync::Arc::new(
@@ -3780,7 +4139,7 @@ mod tests {
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let root = dir.path().join("blobs");
         let store = FsBlobStore::new(root.clone(), 0)
@@ -3846,6 +4205,20 @@ mod tests {
             remaining, 1,
             "corrupt claim evidence is not silently erased"
         );
+        let probe_residue: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM blob_gc_claims \
+                         WHERE root_key GLOB '__fence_probe-*') \
+                      + (SELECT COUNT(*) FROM attachments \
+                         WHERE record_uuid GLOB '__blob-gc-fence-probe-*')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            probe_residue, 0,
+            "invalid evidence must abort before the functional fence probe"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3855,7 +4228,7 @@ mod tests {
         let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let root = dir.path().join("blobs");
         let store = std::sync::Arc::new(
@@ -3920,7 +4293,7 @@ mod tests {
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let store = FsBlobStore::new(dir.path().join("blobs"), 0)
             .unwrap()
@@ -3980,7 +4353,7 @@ mod tests {
     ) {
         // The exact two-step client protocol hazard: `put` completes and
         // releases its write lock (step 1) while the attachment write that will
-        // *later* commit a reference to this blob (step 2) has not
+        // *later* commit a `content_ref` to this blob (step 2) has not
         // happened yet -- nothing in this store's locking serializes the
         // two, because they are separate calls the client makes with an
         // arbitrary gap in between. A sweep that lands in that gap must not
@@ -3988,27 +4361,27 @@ mod tests {
         // purely because the referencing write hasn't landed, not because
         // it is actually orphaned. Without the publish-grace window this
         // reproduces khive#1313's dangling-reference defect: the blob file
-        // is deleted here, and the still-pending entity write below would
+        // is deleted here, and the still-pending attachment write below would
         // commit a `content_ref` to nothing.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         // Default (non-zero) grace period -- this test exercises exactly
         // what it exists to protect.
         let store = FsBlobStore::new(dir.path().join("blobs"), 0).unwrap();
 
-        // Step 1: put completes, lock released. No entity anywhere
+        // Step 1: put completes, lock released. No attachment anywhere
         // references this blob yet.
         let blob = store
             .put(b"published, reference not yet committed".to_vec())
             .await
             .unwrap();
 
-        // A sweep runs in the gap before step 2 (the entity write) happens.
+        // A sweep runs in the gap before step 2 (the attachment write) happens.
         let result = store
             .transactional_orphan_sweep(backend.sql().as_ref(), false)
             .await
@@ -4028,7 +4401,7 @@ mod tests {
             "a blob still inside its publish grace period must survive the sweep"
         );
 
-        // Step 2 now lands: the attachment write commits content_ref to the
+        // Step 2 now lands: the record-plus-attachment write commits content_ref to the
         // still-present blob.
         {
             let writer = backend.pool().writer().unwrap();
@@ -4036,8 +4409,8 @@ mod tests {
                 .conn()
                 .execute(
                     "INSERT INTO entities \
-                     (id, namespace, kind, name, tags, created_at, updated_at) \
-                     VALUES ('e1', 'local', 'document', 'e1', '[]', 1, 1)",
+                     (id, namespace, kind, name, tags, created_at, updated_at, deleted_at) \
+                     VALUES ('e1', 'local', 'document', 'e1', '[]', 1, 1, NULL)",
                     [],
                 )
                 .unwrap();
@@ -4047,7 +4420,7 @@ mod tests {
                     "INSERT INTO attachments \
                      (record_uuid, substrate, role, content_ref, created_at) \
                      VALUES ('e1', 'entity', 'content', ?1, 1)",
-                    rusqlite::params![blob.as_str()],
+                    [blob.as_str()],
                 )
                 .unwrap();
         }
@@ -4069,7 +4442,7 @@ mod tests {
         // touching the file at all -- so a stale, already-orphaned blob
         // re-published by an identical `put` kept its OLD mtime, bypassed
         // the publish-grace check, and a transactional sweep landing in the
-        // gap before the caller's follow-up entity write could delete it
+        // gap before the caller's follow-up attachment write could delete it
         // out from under that write (khive#1313). This reproduces the
         // race end to end and proves the mtime refresh closes it.
         let dir = tempfile::tempdir().unwrap();
@@ -4077,7 +4450,7 @@ mod tests {
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let store = FsBlobStore::new(dir.path().join("blobs"), 0)
             .unwrap()
@@ -4097,12 +4470,12 @@ mod tests {
             .set_modified(old_mtime)
             .unwrap();
 
-        // A deduplicating put republishes the identical bytes. No entity
+        // A deduplicating put republishes the identical bytes. No attachment
         // anywhere references this blob yet.
         let second = store.put(bytes).await.unwrap();
         assert_eq!(first, second);
 
-        // The sweep lands in the gap before the follow-up entity write --
+        // The sweep lands in the gap before the follow-up attachment write --
         // the refreshed mtime must keep it inside the grace window.
         let result = store
             .transactional_orphan_sweep(backend.sql().as_ref(), false)
@@ -4119,15 +4492,15 @@ mod tests {
         );
         assert!(store.exists(&first).await.unwrap());
 
-        // The caller's follow-up attachment write now lands.
+        // The caller's follow-up record-plus-attachment write now lands.
         {
             let writer = backend.pool().writer().unwrap();
             writer
                 .conn()
                 .execute(
                     "INSERT INTO entities \
-                     (id, namespace, kind, name, tags, created_at, updated_at) \
-                     VALUES ('e1', 'local', 'document', 'e1', '[]', 1, 1)",
+                     (id, namespace, kind, name, tags, created_at, updated_at, deleted_at) \
+                     VALUES ('e1', 'local', 'document', 'e1', '[]', 1, 1, NULL)",
                     [],
                 )
                 .unwrap();
@@ -4137,7 +4510,7 @@ mod tests {
                     "INSERT INTO attachments \
                      (record_uuid, substrate, role, content_ref, created_at) \
                      VALUES ('e1', 'entity', 'content', ?1, 1)",
-                    rusqlite::params![first.as_str()],
+                    [first.as_str()],
                 )
                 .unwrap();
         }
@@ -4193,7 +4566,7 @@ mod tests {
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
         }
         let store = FsBlobStore::new(dir.path().join("blobs"), 0)
             .unwrap()

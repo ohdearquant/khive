@@ -3,7 +3,8 @@
 **Status**: accepted
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
-accepted 2026-07-17; Amendment 4 accepted 2026-07-19)
+accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch proposed
+2026-08-16 by ADR-160)
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which requires
 backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and implements
@@ -279,32 +280,41 @@ attachment writer:
 
 Run those two methods only when writes that could create a new `content_ref` reference are
 quiesced. `BlobStore::transactional_orphan_sweep(sql, dry_run)`, added by PR #1313, is the live-
-traffic alternative for backends that can coordinate both stores. The filesystem implementation:
+traffic alternative for backends that can coordinate both stores.
 
-1. acquires a canonical-database in-process lock and `<database>.khive-blob-gc.lock`, then the
-   canonical-root in-process and advisory write locks, and captures the complete blob candidate
-   set while publishers are excluded;
-2. outside SQLite, evaluates file age and prepares the complete candidate set;
-3. after validating durable evidence, removes claims abandoned by the previous database owner in
-   SQL-only transactions of at most 128 rows; ownership, not the mutable path-derived `root_key`,
-   makes root relocation and restored-backup recovery safe;
+**Attachment-cutover compatibility epoch (amended 2026-08-16, Phase4a).** The filesystem
+implementation no longer sweeps against V20 entity liveness. Both report-only and destructive
+calls first require the named objects and markers of the exact completed V21 attachment epoch: the
+durable complete marker and V21 ledger row; attachment and claim tables/indexes; attachment
+INSERT/UPDATE claim fences; and no legacy `entities.content_ref` column, index, or triggers. V20,
+pending, incomplete, missing-required-object, retained-legacy, and ahead-of-V21 epochs return typed
+`StorageError::Unsupported` before root locking, filesystem walking, or abandoned-claim cleanup.
+Malformed table/evidence reads fail with their validation or storage error, and a nonfunctional
+named fence returns typed `Unsupported`; all fail closed before claim cleanup or deletion.
+`dry_run` does not weaken this contract.
+
+Once admitted, the filesystem implementation:
+
+1. acquires database/root ownership, captures the complete blob candidate set while publishers are
+   excluded, and evaluates file age outside SQLite's writer transaction;
+2. rechecks the completed epoch under ownership, validates every attachment and claim reference,
+   and then proves the attachment INSERT/UPDATE fences function before any abandoned-claim cleanup;
+3. removes validated claims abandoned by the previous database owner in SQL-only transactions of
+   at most 128 rows; ownership, not the mutable path-derived `root_key`, makes root relocation and
+   restored-backup recovery safe;
 4. for each candidate batch of at most 128, enters a short, SQL-only `SqlAccess::atomic_unit`
-   (`BEGIN IMMEDIATE` on SQLite), selects distinct references from attachments, and
-   durably claims only absent candidates in `blob_gc_claims`;
+   (`BEGIN IMMEDIATE` on SQLite), anti-joins every `attachments.content_ref` role, and durably
+   claims only absent candidates in `blob_gc_claims`;
 5. after that transaction commits, deletes only the claimed batch while retaining database/root
-   ownership; attachment INSERT/UPDATE triggers reject a newly live reference to any active claim; and
+   ownership;
+   attachment INSERT/UPDATE triggers reject a newly live reference to any active claim; and
 6. removes that bounded claim batch in a second short SQL-only atomic unit before advancing, then
    releases all locks after the final batch.
 
-**GC compatibility epoch gate (proposed ADR-160 Phase 4a).** Before the V21 schema implementation is
-released, the filesystem transactional sweep ships separately with an exact schema-epoch gate.
-Phase 4a makes no schema or data change: it does not create attachments, backfill, dual-read,
-dual-write, or record V21. The sweep accepts attachment liveness only when the V21 ledger row and
-latest version, completed cutover marker, attachment claim fences, and removal of the legacy entity
-column/index/triggers all agree. V20, pending, incomplete, and malformed combinations fail closed
-in both dry-run and destructive modes before filesystem or claim mutation. Ordinary epoch mismatch
-is `Unsupported`; malformed schema or evidence may retain its more specific validation/driver error.
-Callers must not fall back to caller-snapshot `orphan_sweep` or unconditional `delete`.
+**Two-release rollout (proposed ADR-160 Phase 4a → Phase 4b).** The epoch gate above ships first as
+Phase 4a and makes no schema or data change: it does not create attachments, register or execute
+V21, backfill, dual-read, dual-write, or drop the legacy column. Callers must not fall back to
+caller-snapshot `orphan_sweep` or unconditional `delete` while the gate refuses.
 
 Every process and scheduled job that can share the database/blob root must converge on the
 Phase-4a-or-newer gate, and every pre-Phase-4a process must be drained and restart-fenced, before a
@@ -320,20 +330,20 @@ This yields two concurrency guarantees pinned by tests. A blob published after c
 is not in the sweep set and survives. A committed attachment reference cannot appear between the
 liveness query and physical deletion: SQLite's writer lock covers the anti-join plus claim commit,
 then the durable trigger fence covers the external deletion phase without monopolizing SQLite's
-single writer. Invalid stored `content_ref` or claim values fail closed rather than making the
-sweep delete against an incomplete live set. A crash after claim commit leaves a durable
-fail-closed row; the next exclusive database owner rescans the current root and liveness state,
-clears abandoned claims in bounded units, and freshly claims any still-eligible work. At no point
-does one writer transaction bind, mutate, or return more than 128 candidates, bounding claim-table
-and WAL work per writer hold.
+single writer. Invalid stored attachment or claim refs fail closed before the functional probe,
+claim recovery, or deletion. A crash after claim commit leaves a durable fail-closed row; the next
+exclusive database owner rescans the current root and liveness state, clears abandoned claims in
+bounded units, and freshly claims any still-eligible work. At no point does one writer transaction
+bind, mutate, or return more than 128 candidates, bounding claim-table and WAL work per writer hold.
 
-The guarantee still has a bounded publish gap. `put(bytes)` and the later attachment write that stores
-its returned reference are separate client steps, outside one shared transaction. A candidate with
-no committed reference is therefore protected by file age: `FsBlobStore` defaults to a one-hour
-grace period, treats an unknown age as protected, and refreshes the mtime on a deduplicated `put`.
-A client whose put-to-reference gap exceeds the configured grace remains exposed to deletion.
-Tests cover a fresh unreferenced publish, deduplicated republication, zero-grace behavior, and
-deletion after grace expiry; the warning is not weakened beyond that evidence.
+The guarantee still has a bounded publish gap. `put(bytes)` and the later attachment write that
+stores its returned reference are separate client steps, outside one shared transaction. A
+candidate with no committed reference is therefore protected by file age: `FsBlobStore` defaults
+to a one-hour grace period, treats an unknown age as protected, and refreshes the mtime on a
+deduplicated `put`. A client whose put-to-reference gap exceeds the configured grace remains
+exposed to deletion. Tests cover a fresh unreferenced publish, deduplicated republication,
+zero-grace behavior, and deletion after grace expiry; the warning is not weakened beyond that
+evidence.
 
 `S3BlobStore` does not override `transactional_orphan_sweep` and returns `Unsupported`; its
 caller-snapshot `orphan_sweep` has no publish-grace accounting and remains offline-maintenance-

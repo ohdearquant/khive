@@ -278,12 +278,15 @@ locks are not extracted by this program.
 
 Attachment migration is ADR-121's coordinated cutover, but its destructive Phase 4b is preceded by
 one separately released compatibility epoch. **Phase 4a is only the GC compatibility epoch gate.**
-It leaves V20 schema and data byte-for-byte in their existing shape: it does not create
-attachments, backfill, dual-read, dual-write, or record V21. Instead, transactional filesystem-blob
-GC recognizes exactly two safe outcomes: an exact completed V21 ledger/marker/fence/schema epoch
-uses attachment liveness; every V20, pending, incomplete, or malformed epoch refuses both dry-run
-and destructive sweep before filesystem or claim mutation. There is no fallback to the
-caller-snapshot sweep or unconditional delete.
+It leaves V20 schema and data byte-for-byte in their existing shape: it adds no attachment table,
+migration, backfill, pack writer, runtime reader, dual-read/write path, V21 ledger row, or column
+drop. Its filesystem transactional GC admits report-only and destructive sweeps only for an exact
+completed V21 epoch, using every attachment role as liveness and exercising the attachment
+INSERT/UPDATE claim fences. V20, pending, incomplete, missing-required-object, retained-legacy, and
+ahead-of-V21 epochs return typed `Unsupported` before root locking, filesystem walking, or
+abandoned-claim cleanup. Malformed schema/evidence and nonfunctional named fences also fail closed
+before claim cleanup or deletion, though their validation/probe may occur after ownership and the
+filesystem walk. There is no fallback to caller-snapshot sweep or unconditional delete.
 
 Phase 4a must converge on every process that can share the database/blob root, and every
 pre-Phase-4a process must then be drained and prevented from restarting, before any Phase-4b binary
@@ -316,11 +319,22 @@ corrupt evidence aborts the cutover for operator curation rather than guessing o
 invalidating a recoverable model.
 
 Because schema preparation currently precedes BlobStore installation, Phase 4b is a boot-gated,
-resumable two-stage migration within its one implementation release:
+resumable two-stage migration in the second implementation release. It may begin only after this
+release sequence:
+
+1. Deploy Phase 4a everywhere that can share the database/blob root while the database remains V20;
+   prove convergence, drain every remaining pre-Phase-4a process, and install a restart fence.
+2. Confirm Phase-4a transactional GC returns typed `Unsupported` in both modes on V20. This is the
+   intended compatibility state, not a reason to bypass the gate with caller-snapshot GC.
+3. Before Phase 4b changes the database, quiesce every Phase-4a application reader and writer, or
+   prove it cannot access the database. Only the GC implementation understands an exact completed
+   V21 epoch; Phase-4a serving code remains a V20 consumer and cannot coexist with the column drop.
+
+Phase 4b then performs the coordinated boot work:
 
 1. Before recording any incomplete state, boot acquires ADR-111's same canonical-database GC
    ownership (in-process plus advisory lock), waiting for any incumbent transactional sweep, and
-   retains it through finalization. A versioned main-database migration then creates `attachments`,
+   retains it through finalization. A versioned main-database migration creates `attachments`,
    backfills legacy `"content"` rows, and records an incomplete migration state while retaining the
    old column and old GC fence.
 2. Before packs, requests, or GC start, boot installs the one shared BlobStore and `BlobHydrator`,
@@ -336,17 +350,18 @@ The Phase-4b cutover migration is registered in the versioned schema ledger but 
 coordinator after GC ownership is acquired; it is not executed eagerly by the unconditional backend
 constructor. Blob-independent schema work may still run at ordinary backend open.
 
-A crash in either stage resumes from durable state; it never opens a serving or sweep window over
-the intermediate dual representation. Every daemon and administrative sweep entrypoint refuses to
-run while the durable migration marker is incomplete; restart reacquires GC ownership before
-resuming. The final schema contains no trigger or query that names the dropped entity column.
-Attachment publication racing an active `blob_gc_claims` row is rejected by the same durable fence
-that ADR-111 currently applies to entity publication.
+A Phase4b crash in either stage must resume from durable state and never open a serving or sweep
+window over the intermediate dual representation. Phase4a GC already refuses an incomplete marker;
+Phase4b daemon and administrative entrypoints must also refuse serving or sweeping until restart
+reacquires GC ownership and completes the cutover. The final schema contains no trigger or query
+that names the dropped entity column. Attachment publication racing an active `blob_gc_claims` row
+is rejected by the attachment fence.
 
-The migrated sweep validates every distinct `attachments.content_ref` and
-`blob_gc_claims.content_ref` as canonical `ContentRef` values before it commits any new claim or
-physical deletion. Corrupt liveness or claim evidence aborts the sweep with every blob preserved;
-moving the anti-join must not drop ADR-111's fail-closed value validation.
+The attachment-only sweep validates every distinct `attachments.content_ref` and
+`blob_gc_claims.content_ref` as canonical `ContentRef` values before the functional fence probe,
+abandoned-claim cleanup, any new claim, or physical deletion. Corrupt liveness or claim evidence
+aborts the sweep with every blob preserved; moving the anti-join must not drop ADR-111's fail-closed
+value validation.
 
 ADR-155's two generic pack obligations remain in force after this record supersedes it: a verb that
 requires an absent BlobStore fails closed with a typed unconfigured-capability error and never falls
@@ -873,9 +888,9 @@ The implementation sequence is normative:
 
    - **Phase 4a — GC compatibility epoch.** In an independently deployable release, make
      transactional filesystem-blob GC select liveness only after it proves the exact completed V21
-     epoch. V20, pending, incomplete, and malformed epochs refuse dry-run and destructive sweep
-     before filesystem or claim mutation. Phase 4a performs no attachment DDL, backfill,
-     dual-read/write, or V21 ledger write.
+     epoch. Known non-admitted epochs refuse both modes before root locking, filesystem walking, or
+     abandoned-claim cleanup; malformed evidence and nonfunctional fences fail before cleanup or
+     deletion. Phase 4a performs no attachment DDL, backfill, dual-read/write, or V21 ledger write.
    - **Fleet convergence, drain, and service quiescence.** Deploy Phase 4a everywhere that can share
      the database or blob root; record binary-fleet convergence, drain every pre-Phase-4a process
      and scheduled job, and prevent old binaries from restarting. Before cutover, also drain every
@@ -938,20 +953,29 @@ old path occurs in the same subphase that closes its last consumer.
 
 ### Attachments and ranked materialization
 
-- Phase-4a tests prove exact V20, pending, incomplete, and malformed epoch fixtures refuse both
-  dry-run and destructive transactional sweep before filesystem or claim mutation; no caller-
-  snapshot sweep or unconditional delete is invoked as a fallback.
-- The same Phase-4a binary recognizes a self-consistent completed V21 only when the exact ledger
-  row/latest version, completed marker, attachment/claim tables and attachment claim triggers, and
-  absence of the legacy column/index/triggers all agree; it then anti-joins attachment liveness and
-  exercises the claim fence before deletion.
+#### Phase 4a GC compatibility
+
+- On an exact V20 database, both report-only and destructive transactional sweeps return typed
+  `Unsupported` before waiting for the root lock; every blob and abandoned claim remains unchanged.
+- Missing/malformed V21 objects, a pending or incomplete marker, a wrong/ahead ledger, retained
+  legacy column/index/fences, and same-named no-op attachment fences all fail closed.
+- On a synthetic exact completed V21 epoch, a Phase4a sweep treats every attachment role as live:
+  the moodboard preference bundle and its `"fann-network"` object survive while a true orphan is
+  reported/deleted.
+- Non-canonical attachment or GC-claim evidence aborts before the functional probe, abandoned-claim
+  cleanup, new claims, or deletion; a former probe-seed claim remains recoverable.
+- Rollout evidence proves every pre-Phase4a binary is drained and restart-fenced before Phase4a is
+  fleet-wide. Before Phase4b, every Phase4a application reader/writer is quiesced; the completed-V21
+  GC test is not evidence that Phase4a serving is mixed-schema compatible.
+
+#### Phase 4b attachment cutover
+
 - Release evidence proves every process and scheduled job sharing the database/blob root runs the
-  Phase-4a-or-newer gate, and all pre-Phase-4a processes are drained and restart-fenced before the
-  first Phase-4b migration. It separately proves that every Phase-4a application-serving/read-write
-  process is quiesced (or cannot access the database) throughout cutover and that the Phase-4b fleet
-  starts only after exact-current topology validation. A mixed-fleet test/runbook rehearsal proves
-  Phase 4b cannot be entered on elapsed time or partial rollout alone; any surviving Phase-4a
-  process is GC-only, not a schema-compatible entity server.
+  Phase-4a-or-newer gate, all pre-Phase-4a processes are drained and restart-fenced, and every
+  Phase-4a application-serving/read-write process is quiesced (or cannot access the database)
+  throughout cutover. A mixed-fleet rehearsal proves elapsed time or partial rollout is
+  insufficient; any surviving Phase-4a process is GC-only, not a schema-compatible entity server.
+- Exact-current validation covers the planned topology before the Phase-4b serving fleet starts.
 - Original bytes publish and resolve through role `"content"`; existing wire content refs are
   unchanged.
 - Preference bundle and FANN network attachments both remain live under GC, and a disagreement

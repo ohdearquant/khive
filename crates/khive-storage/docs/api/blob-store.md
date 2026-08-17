@@ -55,11 +55,11 @@ raw store access is for metadata, mutation, and maintenance paths only.
 ## `BlobStore::delete` — concurrency hazard
 
 `delete` performs an unconditional physical removal with **no coordination
-against any record attachment that might reference `content_ref`**. It is safe to call
+against any record or attachment that might reference `content_ref`**. It is safe to call
 only when the caller has independently ensured — outside this trait,
-typically by quiescing whatever writer could attach a new `content_ref` to a
-record — that nothing live references `content_ref` for the duration of the
-call. A caller that races an attachment write against a `delete` can dangle a
+typically by quiescing every writer that could commit a new SQL liveness
+reference — that nothing live references `content_ref` for the duration of the
+call. A caller that races a reference write against a `delete` can dangle a
 live reference; this trait does not detect or prevent that.
 
 ## `BlobStore::orphan_sweep` — concurrency hazard
@@ -84,37 +84,54 @@ snapshot-plus-sweep — a maintenance window, a single-writer admin CLI
 invocation with no live traffic, or equivalent.
 
 A DB-coordinated sweep is available separately as
-`BlobStore::transactional_orphan_sweep`. The filesystem implementation acquires
-a database-scoped process mutex and `<database>.khive-blob-gc.lock` before the
-same root-local locks as `put`, captures the complete candidate set, and
-classifies file age before opening SQLite's writer transaction. Acquiring the
-database owner makes all pre-existing claims abandoned, including claims copied
-by a backup or left under a relocated root; validated abandoned rows are removed
-in batches of at most 128. Candidates then pass through bounded claim, physical
-delete, and cleanup batches of the same maximum size. Each short
-`SqlAccess::atomic_unit` anti-joins every attachment row and commits durable
-`blob_gc_claims`; attachment INSERT/UPDATE triggers reject a new live reference to a
-claimed digest. Physical deletion runs outside SQLite while both owner/root locks
-remain held, followed by a bounded SQL-only cleanup. A crash after claim commit
-leaves the fence durable and fail-closed; the next exclusive database owner
+`BlobStore::transactional_orphan_sweep`. The Phase4a filesystem implementation
+first performs a read-only schema-epoch gate. Both `dry_run` and destructive
+calls are supported only when the database proves the named objects and epoch
+markers of the exact completed V21 attachment cutover: the complete marker and
+V21 ledger row, the attachment and claim tables/indexes, attachment
+INSERT/UPDATE claim fences, and no legacy entity content-ref
+column/index/triggers. V20, pending, incomplete, missing-required-object,
+retained-legacy, and ahead-of-V21 epochs return typed
+`StorageError::Unsupported` before waiting for the blob-root lock, walking
+files, or recovering abandoned claims.
+
+After that gate, the filesystem implementation acquires database/root ownership,
+captures the complete candidate set, and classifies file age outside SQLite's
+writer transaction. Ownership consists of a database-scoped process mutex,
+`<database>.khive-blob-gc.lock`, and the same root-local locks as `put`. It
+revalidates the epoch under ownership and validates every attachment and claim
+reference before the functional fence probe. Malformed
+stored evidence returns its validation error, and a malformed schema or
+nonfunctional named fence returns its storage or typed `Unsupported` error;
+every such path fails closed before claim recovery or deletion. The sweep then
+removes validated abandoned rows—including claims copied by a backup or left
+under a relocated root—in batches of at most 128. Each short
+`SqlAccess::atomic_unit` anti-joins every `attachments.content_ref` role and
+commits durable `blob_gc_claims`; attachment INSERT/UPDATE triggers reject a new
+live reference to a claimed digest. Physical deletion runs outside SQLite while
+database/root ownership remains held, followed by bounded SQL-only cleanup. A crash after
+claim commit leaves the fence durable and fail-closed; the next exclusive owner
 rescans rather than resuming deletion blindly. A filesystem publisher in
 another process that begins while the sweep holds the advisory root lock waits;
 after release, `put` rechecks the target and republishes bytes removed as an
 orphan before returning the `ContentRef`. Direct filesystem mutation does not
-participate in the advisory-lock protocol. Backends that cannot provide both
-coordination boundaries return `Unsupported`.
+participate in the advisory-lock protocol. Backends that cannot provide the
+coordination and epoch guarantees return `Unsupported`.
 
 ### Schema epoch gate and the two-release V21 rollout
 
 The shipped filesystem implementation selects SQL liveness only after proving
 one exact completed V21 epoch: the V21 ledger row is uniquely present and latest,
-the cutover marker is complete, the attachment/claim tables and attachment claim
-triggers are present, and the legacy entity column/index/triggers are absent. It
-then validates stored evidence and exercises both attachment claim triggers
-before it can delete. V20, pending, incomplete, and malformed combinations fail
-closed in both dry-run and destructive modes before filesystem or claim
-mutation. Ordinary epoch mismatch is `StorageError::Unsupported`; malformed
-schema or evidence may retain its more specific validation/driver error.
+the cutover marker is complete, the required attachment/claim objects and
+attachment claim triggers are present, and the legacy entity
+column/index/triggers are absent. Known non-admitted epochs—V20, pending,
+incomplete, missing-required-object, retained-legacy, or ahead-of-V21—return
+`StorageError::Unsupported` in both modes before root locking, filesystem
+walking, or abandoned-claim cleanup. Malformed stored evidence or a
+nonfunctional named fence may retain a more specific validation, storage, or
+typed `Unsupported` error after ownership/candidate capture, but still fails
+closed before claim recovery or deletion. Once admitted, every attachment role
+is live and both attachment claim triggers are exercised before deletion.
 
 This gate ships first as **Phase 4a**. That compatibility release leaves V20
 schema and data untouched: no attachments, backfill, dual-read/write, or V21
