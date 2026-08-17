@@ -25,18 +25,10 @@ describe("repository showcase", () => {
     window.history.replaceState(null, "", "/");
   });
 
-  // Measured at ~5.5s under the default parallel worker pool (vs. ~1.6s run
-  // in isolation) — the interaction sequence below (typed search, two view
-  // switches, a popstate restore) is CPU-bound by jsdom render cost, not by
-  // an unmemoized computation, so it needs headroom under worker contention
-  // rather than a code fix.
-  it("restores and traverses a shareable module and analysis location", async () => {
+  it("restores a shareable module and analysis location from a direct deep link", async () => {
     const bundle = golden();
     const pool = bundle.graph.modules.items.find((module) =>
       module.source_path.endsWith("khive-db/src/pool.rs")
-    )!;
-    const writer = bundle.graph.modules.items.find((module) =>
-      module.source_path.endsWith("khive-db/src/writer_task.rs")
     )!;
     const direct = repositoryLocationUrl(new URL(window.location.href), {
       repository: bundle.meta.repository.canonical_url,
@@ -45,7 +37,6 @@ describe("repository showcase", () => {
       view: "dependency_topology",
     });
     window.history.replaceState(null, "", direct);
-    const user = userEvent.setup();
     const { container } = render(<RepoShowcase bundle={bundle} />);
 
     const inspector = within(
@@ -66,10 +57,23 @@ describe("repository showcase", () => {
     });
     expect(breadcrumb).toHaveTextContent(`${bundle.meta.repository.owner}/${bundle.meta.repository.name}`);
     expect(breadcrumb).toHaveTextContent(pool.source_path);
+  });
 
+  it("navigates to a module found via search and updates the URL", async () => {
+    const bundle = golden();
+    const writer = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/writer_task.rs")
+    )!;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = within(
+      container.querySelector<HTMLElement>("[data-repository-triage]")!,
+    ).getByRole("complementary", { name: "Module evidence" });
     const pushState = vi.spyOn(window.history, "pushState");
+    pushState.mockClear();
+
     const search = screen.getByRole("searchbox", { name: "Find a module or path" });
-    await user.type(search, writer.source_path);
+    await user.type(search, "writer_task.rs");
     await user.click(within(screen.getByLabelText("Module search results"))
       .getByRole("button", { name: `Inspect ${writer.source_path}` }));
     await waitFor(() =>
@@ -81,6 +85,31 @@ describe("repository showcase", () => {
       writer.source_path,
     );
     expect(pushState).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches the active analysis view via the location controller, ignoring a duplicate click", async () => {
+    const bundle = golden();
+    const writer = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/writer_task.rs")
+    )!;
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: writer.source_path,
+      view: "dependency_topology",
+    });
+    window.history.replaceState(null, "", direct);
+    const user = userEvent.setup();
+    render(<RepoShowcase bundle={bundle} />);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", {
+          name: bundle.capability.views.dependency_topology.label,
+        }),
+      ).toHaveAttribute("aria-current", "page")
+    );
+    const pushState = vi.spyOn(window.history, "pushState");
+    pushState.mockClear();
 
     const hiddenCoupling = screen.getByRole("button", {
       name: bundle.capability.views.hidden_coupling.label,
@@ -89,10 +118,44 @@ describe("repository showcase", () => {
     expect(new URL(window.location.href).searchParams.get("view")).toBe(
       "hidden_coupling",
     );
-    expect(pushState).toHaveBeenCalledTimes(2);
+    expect(pushState).toHaveBeenCalledTimes(1);
     await user.click(hiddenCoupling);
-    expect(pushState).toHaveBeenCalledTimes(2);
+    expect(pushState).toHaveBeenCalledTimes(1);
+  });
 
+  it("restores investigation state on browser back navigation without pushing new history", async () => {
+    const bundle = golden();
+    const pool = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/pool.rs")
+    )!;
+    const writer = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/writer_task.rs")
+    )!;
+    const start = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: writer.source_path,
+      view: "hidden_coupling",
+    });
+    window.history.replaceState(null, "", start);
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = within(
+      container.querySelector<HTMLElement>("[data-repository-triage]")!,
+    ).getByRole("complementary", { name: "Module evidence" });
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(
+        writer.source_path,
+      )
+    );
+    const pushState = vi.spyOn(window.history, "pushState");
+    pushState.mockClear();
+
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: pool.source_path,
+      view: "dependency_topology",
+    });
     window.history.replaceState(null, "", direct);
     window.dispatchEvent(new PopStateEvent("popstate"));
     await waitFor(() =>
@@ -110,8 +173,8 @@ describe("repository showcase", () => {
     ).toHaveTextContent(
       `Restored ${bundle.capability.views.dependency_topology.label} for ${pool.source_path}.`,
     );
-    expect(pushState).toHaveBeenCalledTimes(2);
-  }, 15_000);
+    expect(pushState).not.toHaveBeenCalled();
+  });
 
   it("keeps stale and missing deep-link evidence explicit and recoverable", async () => {
     const bundle = golden();
