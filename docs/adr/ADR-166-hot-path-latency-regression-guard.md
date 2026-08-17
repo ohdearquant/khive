@@ -52,33 +52,48 @@ every PR; timed trend measurement informs but never gates.
 ### D1 — Mechanism invariants: per-PR, deterministic, gating
 
 A dedicated integration-test suite (`hot_path_guard`) runs the canonical read verbs
-against a seeded file-backed store and asserts counter deltas from `db_diagnostics`
-before/after each operation. The suite is ordinary `cargo test` — no timing, no
-statistics, no machine dependence — and a violated invariant fails CI like any other
-test.
+against a seeded file-backed store and asserts counter deltas before/after each
+operation. The suite is ordinary `cargo test` — no timing, no statistics, no machine
+dependence — and a violated invariant fails CI like any other test.
+
+**Counter prerequisites.** `db_diagnostics` today exposes writer-side counters only
+(pooled/standalone/writer-task acquisitions, begin-refusal counters, checkpoint/WAL
+state). Every counter an invariant reads that does not exist yet is a named
+deliverable of the ADR-165 slice that owns the invariant, landing before or with
+that slice: standalone-reader opens and pooled-reader checkouts (Slice 2), ANN-route
+vs fallback serve counts for the note-search consumer (Slice 3), per-backend
+dispatch counts by requested kind at the coordinator (Slice 4), and candidate
+hydration row count per operation (Slice 3, hydration seam). An invariant whose
+counter has not landed is expected-fail, never silently green.
 
 Initial invariant set (each lands with the ADR-165 slice that makes it true; until
 that slice merges, the invariant is present but marked expected-fail so the suite
 documents the known-bad state instead of hiding it):
 
-| Invariant | Property asserted                                                                                                                                                                                                                                                     | Guards          |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
-| G1        | One `memory.recall` performs 0 synchronous writer-task acquisitions on its request path (post ADR-133 D1/D7: the dispatch may wait on a shared batch commit, but acquisition-counter delta attributable to the recall itself is bounded by the batch, not per-target) | ADR-165 Slice 1 |
-| G2        | One `search` / `memory.recall` performs 0 standalone reader opens (pooled counter carries the traffic)                                                                                                                                                                | ADR-165 Slice 2 |
-| G3        | On a store with installed ANN graphs, `search`'s vector leg is ANN-served; full-scan fallback count is 0                                                                                                                                                              | ADR-165 Slice 3 |
-| G4        | A `kind=note` search dispatches 0 operations to a registered backend that declares it does not serve notes                                                                                                                                                            | ADR-165 Slice 4 |
-| G5        | A read verb on the seeded corpus touches a bounded row population: candidate hydration row count ≤ the documented overfetch bound for the requested limit                                                                                                             | overfetch creep |
+| Invariant | Property asserted                                                                                                                                                                                                                                                                                        | Guards          |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| G1        | One `memory.recall` performs no per-target writer-task acquisition and at most ONE writer-task acquisition for the shared batch carrying its rows (ADR-133 D1/D7 semantics: the batch may also carry other dispatches' rows; attribution is to the batch, asserted after the harness quiescence barrier) | ADR-165 Slice 1 |
+| G2        | One `search` / `memory.recall` performs 0 standalone-reader opens (pooled-reader checkout counter carries the traffic)                                                                                                                                                                                   | ADR-165 Slice 2 |
+| G3        | On a store with installed ANN graphs, a note-substrate `search`'s vector leg is ANN-served; full-scan fallback count is 0                                                                                                                                                                                | ADR-165 Slice 3 |
+| G4        | A `kind=note` search dispatches 0 operations to a registered backend whose declaration excludes notes                                                                                                                                                                                                    | ADR-165 Slice 4 |
+| G5        | Candidate hydration row count per read verb ≤ the per-arm overfetch constant documented at the retrieval seam times the number of arms (today: `limit x 4` per arm, two arms), measured at the hydration seam                                                                                            | ADR-165 Slice 3 |
 
 Suite contract:
 
 - **Counters, not clocks.** An invariant may count acquisitions, opens, dispatches,
   routes, rows, and bytes. It may not assert a duration.
-- **The counter must be attributable.** Each assertion isolates its operation (single
-  in-process runtime, no concurrent traffic) so a delta belongs to the asserted
-  operation alone. Where a background task contributes (ANN maintenance, batch
-  flushes), the invariant either drains it first or asserts on a counter the
-  background path does not touch — the guard must not intermittently fail from its
-  own harness concurrency.
+- **The counter must be attributable, and "no concurrent traffic" is not enough.**
+  Read verbs launch detached background work (`memory.recall`'s serve-ledger and
+  event task via `track_background_task`; ANN maintenance; batch flushes), so a
+  before/after snapshot around the verb call alone can race that work in either
+  direction. Each assertion therefore runs on a single in-process runtime with no
+  concurrent traffic AND takes its after-snapshot only past a **quiescence
+  barrier**: the harness drains host-tracked background tasks (the same
+  tracked-task seam the daemon's shutdown drain uses) before reading counters. An
+  invariant over work the barrier cannot drain is redesigned onto a counter the
+  background path does not touch, or split into a separate deterministic assertion
+  — the guard must not intermittently pass or fail from its own harness
+  concurrency.
 - **New hot-path mechanisms add an invariant in the same PR.** A change that
   introduces a new class of work on `search`/`recall`/`get` (a new per-dispatch write,
   a new fan-out target, a new retrieval pass) must extend the suite with the counter
@@ -106,14 +121,25 @@ noise floor for that execution.
   invariants green means a mechanism class is missing from D1, and the issue's job is
   to name it and add the invariant.
 
-### D3 — The budget is versioned with the code
+### D3 — The budget and thresholds are versioned with the code
 
-The per-verb latency budgets (currently: unified verb 10-15 ms; `search` and
-`memory.recall` server-side p50 at the seeded reference scale) live in a checked-in
-budget file read by the trend lane, not in prose. Changing a budget is a reviewed
-diff with the measurement that justifies it — a budget that only exists in
-documentation regresses by being forgotten, which is how the 10-15 ms budget and a
-5-second reality coexisted without any instrument noticing.
+A checked-in trend-configuration file, read by the D2 lane, defines every normative
+value D2 references — none may live only in prose or in an implementer's judgment:
+
+- per-metric latency budget (initially: unified verb 10-15 ms; `search` and
+  `memory.recall` server-side p50 at the seeded reference scale);
+- `noise_ceiling`: the maximum A/A spread (as a ratio) under which a run may report
+  a measurement; above it the run reports UNMEASURED;
+- `breach_multiplier`: the factor over baseline that, sustained across 3
+  consecutive measured runs, files the D2 issue;
+- baseline provenance and update policy: the baseline is the median of the last N
+  accepted measured runs on the same runner class, recorded in the tracked
+  history; it updates automatically as measured runs accept, while the BUDGET
+  changes only by reviewed diff carrying the measurement that justifies it.
+
+A budget that only exists in documentation regresses by being forgotten, which is
+how the 10-15 ms budget and a 5-second reality coexisted without any instrument
+noticing.
 
 ## Consequences
 
