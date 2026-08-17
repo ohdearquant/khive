@@ -114,13 +114,33 @@ as a four-field digest: the runtime records which form each fingerprint was comp
 a repeat against a pre-existing record compares under that record's own form, omitting the
 parent field entirely rather than comparing a five-field digest against a four-field one. Such
 a comparison can only ever mismatch, which would turn every legitimate replay of an existing
-record into a validation error at the moment this ADR ships. The two forms coexist; the
-four-field form is closed to new records once the runtime implements this ADR, and no migration
-of existing digests is required or permitted.
+record into a validation error at the moment this ADR ships.
 
-This is an amendment to an ADR-142 contract and is labelled as one rather than described as
-purely additive: the change is scoped to `spawn_fingerprint`'s compared content and its
-versioning, and every other ADR-142 contract is untouched.
+**The recorded form is a version, not an inference from the serialized content, and the two must
+not be conflated.** The agent table gains `spawn_fingerprint_version`, an immutable small integer
+written at first acceptance beside the digest: `1` for the four-field form, `2` for the form
+defined here. Comparison reads the stored version first and serializes the candidate under that
+version, so the version is what selects the encoding — never a guess from the digest, which is
+opaque, and never a guess from whether a parent was resolved, which is a property of the repeat
+rather than of the record.
+
+This distinction is load-bearing for direct spawns, and without it this section contradicts
+itself. A direct spawn under version 2 omits `parent_agent_id` entirely, so its serialized bytes
+are identical to a version-1 serialization of the same arguments. It is nonetheless a version-2
+record and is stamped `2`. What is closed to new records is the version-1 **stamp**, not the
+byte pattern: a record admitted after the runtime implements this ADR is always version 2,
+whether or not a parent was resolved. Reading "the four-field form is closed" as a statement
+about content would leave a new direct spawn with no admissible form at all, which is not the
+rule. Existing digests keep their `1` and no migration of them is required or permitted; a
+record with no stored version predates this ADR and reads as `1`.
+
+This is an amendment to two ADR-142 contracts and is labelled as one rather than described as
+purely additive. The first is `spawn_fingerprint`'s compared content and its versioning. The
+second is the agent table's column list [ADR-142 §1], which gains `spawn_fingerprint_version`
+here and `parent_agent_id` and `lineage_depth` in §1 above; all three are additive columns that
+change no existing column's meaning, nullability, or immutability. Naming the table amendment
+explicitly matters because a version discriminant that lived only in prose would be exactly the
+unpersisted form this section rejects. Every other ADR-142 contract is untouched.
 
 **Depth is bounded.** The runtime enforces a configured maximum `lineage_depth` at spawn
 admission; a spawn that would exceed it is a per-operation validation error naming the limit
@@ -191,10 +211,14 @@ and gate rules as the existing five [ADR-142 §1; ADR-023]:
   numeric offset is not enough here: the agent table is written concurrently with the reads,
   so an offset into a set that gains and loses rows between calls silently skips records and
   repeats others, and a caller paging to exhaustion has no way to notice either. Both verbs
-  therefore enumerate in a total, stable order — ascending `(created_at, agent_id)`, with
+  therefore enumerate in a total, stable order — ascending `(spawned_at, agent_id)`, with
   `agent_id` breaking ties so the order is total even for records admitted in the same
   instant — and `agent.descendants` applies that order within each depth level, preserving
-  breadth-first traversal across pages. A truncated result carries `next_cursor`, an opaque
+  breadth-first traversal across pages. `spawned_at` is named deliberately: it is the agent
+  table's own admission timestamp [ADR-142 §1, agent-table column list], and the table carries
+  no `created_at`. A cursor contract naming a column the table does not have is unimplementable,
+  so the sort key is stated here as a column reference rather than as a generic convention.
+  A truncated result carries `next_cursor`, an opaque
   token encoding the position in that order; passing it back as `cursor` resumes immediately
   after the last returned record. `next_cursor` is present exactly when `complete` is false,
   and absent exactly when it is true, so the two fields cannot disagree.
@@ -249,8 +273,20 @@ against that structural set. What the caller is told is then filtered:
 
 The asymmetry is deliberate and runs one way only: authorization can subtract from what a caller
 is _told_, never from what `subtree_terminal` is _computed over_. A caller can always trust
-`subtree_terminal: true` to mean the subtree is dead, and can never derive the existence of a
-record it could not have observed directly. An implementation that filters the traversal rather
+`subtree_terminal: true` to mean the subtree is dead.
+
+**`undisclosed_survivors` is a deliberate one-bit disclosure, and stating it as zero disclosure
+would be false.** The field tells a caller that at least one record it may not observe survived,
+which is by definition information about a record it could not have observed directly. The
+disclosure is bounded to exactly that bit: no id, no depth, no parentage, and no cardinality, so
+a caller learns that its cascade did not fully clean up and learns nothing that distinguishes one
+hidden subtree from another. It is disclosed rather than withheld because the alternative is
+worse in the direction that matters — a caller told only `subtree_terminal: false` with an empty
+outcome list cannot tell a fully-cleaned subtree from one with survivors it may not see, and
+would reasonably read the empty list as success. An implementation may not widen this bit into a
+count, and may not omit it to claim a stronger property than the operation provides.
+
+An implementation that filters the traversal rather
 than the output satisfies §3's disclosure rule and breaks this one, which is why the two walks
 are stated separately here rather than shared. Parent-first is deliberate: a coordinator that is still
 running can spawn replacements for workers killed under it, so the spawner stops before its
@@ -266,11 +302,15 @@ the runtime re-resolves the target's descendants, kills any non-terminal record 
 re-resolution finds (under the same per-record authorization), and repeats until a
 re-resolution finds no non-terminal descendant or a bounded pass count is reached. The
 operation's result carries `subtree_terminal`: true only when the final re-resolution found
-no non-terminal descendant, false otherwise, with every surviving record named. Per-record
-outcomes enumerate every record every pass reached, attributed to its pass. A cascade can
-therefore never report clean while a record spawned during the cascade survives — a caller
-that reads `subtree_terminal=false` knows the subtree is not dead and exactly which records
-remain. The concurrent-spawn arm — a mid-walk descendant spawning a child that the
+no non-terminal descendant, false otherwise. Naming of survivors follows the visibility rule
+above without exception: every surviving record **the caller may observe** is named, and a
+survivor the caller may not observe contributes to `subtree_terminal: false` and to
+`undisclosed_survivors` only. Per-record outcomes enumerate every record every pass reached
+**that the caller may observe**, attributed to its pass. A cascade can therefore never report
+clean while a record spawned during the cascade survives — `subtree_terminal` is computed over
+the structural set, so concurrent spawns cannot hide in the authorization gap — while a caller
+reading `subtree_terminal=false` learns which of the survivors it is entitled to see, not
+necessarily all of them. The concurrent-spawn arm — a mid-walk descendant spawning a child that the
 admission-time set does not contain — is an acceptance fixture for any implementation of
 this ADR.
 
@@ -281,12 +321,28 @@ resource-exhaustion surface reachable by any caller who can spawn. Four bounds a
 Depth is capped at spawn admission, so no tree exceeds the configured maximum `lineage_depth`.
 Output per call is capped by `limit`, whose own maximum is an operator configuration parameter
 with a published default. Total records visited by a single enumeration or by one cascade pass
-is capped independently of `limit`, because a walk can visit far more records than it returns
-once filters and authorization are applied; exceeding it is a per-operation error naming the
-bound, never a silently short answer — a truncated-looking success here would be
-indistinguishable from a small tree. Cascade passes are capped at a bounded count, as §4
-already requires, and a cascade that exhausts it returns `subtree_terminal: false` with the
-survivors it knows about rather than looping.
+is capped independently of `limit` by `lineage_visit_limit`, because a walk can visit far more
+records than it returns once filters and authorization are applied; exceeding it is a
+per-operation error naming the bound, never a silently short answer — a truncated-looking
+success here would be indistinguishable from a small tree. Cascade passes are capped by
+`cascade_pass_limit`, as §4 already requires, and a cascade that exhausts it returns
+`subtree_terminal: false` with the survivors it knows about rather than looping.
+
+Both are operator configuration parameters with published defaults, on the same footing as
+`lineage_depth` and the `limit` maximum: the existence of each bound is normative here, its
+value is not. They are named because an unnamed bound cannot be configured, audited, or cited
+in the error that reports it, and all four bounds are stated together so that an implementation
+can be checked against a closed list rather than against prose.
+
+**`agent.kill` with `descendants=true` needs its output bound stated explicitly, because it
+takes no `limit`.** Adding one would be wrong: a cascade that killed records and then truncated
+its own report would leave the caller unable to name what it just terminated, which is the
+failure §4 exists to prevent. Its output is instead bounded by construction — per-record
+outcomes are emitted only for records the walk actually reached, and the walk is capped by
+`lineage_visit_limit` per pass and `cascade_pass_limit` passes. A tree large enough to threaten
+the result size therefore fails as a per-operation error at the visit bound before any kill is
+issued, rather than returning a partial report. This is the one operation in this section whose
+output bound is derived rather than parameterized, and it is derived deliberately.
 
 Audit volume follows from these and needs no separate cap: one event per pass plus one per
 record reached, both already bounded above. What does need saying is that the bounds are
@@ -339,9 +395,28 @@ than the requesting caller's, and an audit trail that recorded only what the cal
 to see would be unable to answer the question it exists to answer — which records the runtime
 actually killed. The two planes therefore carry different sets by design, and an implementation
 must not "fix" the difference by narrowing the audit event to the caller's view or by widening
-the operation result to the audit's. Where the audit plane is readable by a caller-facing
-surface, that surface applies its own per-record authorization on read; this ADR does not create
-a path from an operation result to an audit record.
+the operation result to the audit's.
+
+**That difference is only safe behind an operator-only audience, and the event plane does not
+provide one today. This is a prerequisite of this section, not an assumption it may make.** The
+caller-facing events query surface authorizes by namespace and by nothing else: the handler
+forces the caller's namespace into the filter and match-all resolves to `WHERE namespace = ?`
+[ADR-022 §2, "Namespace isolation"]. It applies no per-record predicate to event payload
+content. So an event whose payload carries the structural descendant set is readable in full by
+any caller sharing its namespace — and the delegation boundary described above is exactly the
+case where callers share a namespace while holding per-record authority over different subsets
+of it. Emitting the structural set onto that plane as it stands would route around §4's
+visibility rule by a second path — the visibility rule would hold on the operation result and
+be defeated on the event, which is the same disclosure with an extra hop.
+
+Two consequences are normative. First, the structural-set audit events defined here may not be
+emitted onto the caller-facing events surface until that surface can express an operator-only
+audience; until then an implementation emits them to the operator audit sink only, and a
+runtime that cannot distinguish the two sinks does not implement this section. Second, the
+audience requirement belongs to the event plane rather than to this ADR: ADR-162 governs event
+classes, payload discipline, and audience, and this section is a consumer of that contract. The
+requirement is recorded here so that the prerequisite is visible at the point of use, and this
+ADR does not create a path from an operation result to an audit record.
 
 Lineage in the audit plane is thereby reconstructable from events alone, without reading the
 table — subject to the audit sink actually retaining them, which is a property of the sink and
