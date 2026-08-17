@@ -178,15 +178,16 @@ export function repositoryLocationUrl(
   base: URL,
   location: RepositoryLocation,
 ): URL {
-  const url = new URL(base);
+  const url = new URL(base.origin + base.pathname);
+  const values: Record<LocationParameter, string | null> = {
+    repo: location.repository,
+    at: location.snapshotSha,
+    module: location.modulePath,
+    view: location.view,
+  };
   for (const parameter of LOCATION_PARAMETERS) {
-    url.searchParams.delete(parameter);
+    const value = values[parameter];
+    if (value) url.searchParams.append(parameter, value);
   }
-  if (location.repository) url.searchParams.append("repo", location.repository);
-  if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
-  if (location.modulePath) {
-    url.searchParams.append("module", location.modulePath);
-  }
-  if (location.view) url.searchParams.append("view", location.view);
   return url;
 }
