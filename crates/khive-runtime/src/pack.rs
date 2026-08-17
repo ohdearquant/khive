@@ -1215,15 +1215,24 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 ///
 /// A full UUID demonstrates the caller already knows the specific record, so
 /// it resolves the same way everywhere regardless of namespace. A short hex
-/// prefix is a *resolution* — a search — scoped to the caller's own
-/// namespace like any other search: it can match nothing, or match
-/// ambiguously, across a namespace the caller doesn't share. This is why
-/// some verbs accept a prefix and others require a full UUID: the asymmetry
-/// tracks whether the operation can assume the caller's namespace, not an
-/// inconsistency between verbs.
+/// prefix is a *resolution* — a search — which can match nothing, match
+/// exactly one record, or match ambiguously. Ambiguity is an error in every
+/// case: UUIDs are globally unique, so two distinct rows sharing a prefix
+/// always require caller disambiguation.
+///
+/// Resolution scope follows the verb, and the by-ID verbs do **not** scope to
+/// the caller's namespace. `get`, `update`, `delete` and `merge` resolve a
+/// prefix through `resolve_prefix_unfiltered`, which applies no namespace
+/// predicate at all, so their prefix path matches their already-unfiltered
+/// full-UUID path (ADR-007 Rev 6: by-ID access is namespace-agnostic, and the
+/// Gate — not storage-layer filtering — is the authorization seam). Verbs that
+/// resolve through the scoped path instead search the caller's primary
+/// namespace only.
 const ID_PARAM_CONTRACT: &str = "ID contract: a full UUID is namespace-agnostic (the caller \
-    already knows the specific record). A short hex prefix is a namespace-scoped resolution — \
-    a search — and may match nothing, or match ambiguously, outside the caller's own namespace.";
+    already knows the specific record). A short hex prefix is a resolution — a search — which \
+    may match nothing, or match ambiguously. On the by-ID verbs (get/update/delete/merge) \
+    prefix resolution applies no namespace filter, matching their already-unfiltered full-UUID \
+    path; authorization is the Gate's seam, not resolution's.";
 
 impl VerbRegistry {
     /// This registry's construction-baked default namespace.
@@ -8154,8 +8163,16 @@ mod help_tests {
     /// "uuid"` parameter's description, so the full-UUID-vs-short-prefix
     /// rule is stated once (here) and inherited by every verb, rather than
     /// requiring each `HandlerDef` to paste its own explanation. The
-    /// contract must explain what a prefix *is* (a namespace-scoped
-    /// resolution), not just which verbs happen to accept one.
+    /// contract must explain what a prefix *is* (a resolution whose scope
+    /// follows the verb, unfiltered on the by-ID verbs), not just which verbs
+    /// happen to accept one.
+    ///
+    /// The namespace assertion below is deliberately specific. It first
+    /// asserted only `description.contains("namespace")`, which passes
+    /// identically whether the contract says prefix resolution *is* or *is
+    /// not* namespace-scoped — so it passed while the contract stated the
+    /// opposite of what the by-ID verbs do. A test that cannot separate the
+    /// two readings protects neither.
     #[tokio::test]
     async fn test_help_true_uuid_param_carries_shared_id_contract() {
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -8182,11 +8199,19 @@ mod help_tests {
             description.contains("UUID of the record to fetch"),
             "shared contract must be appended, not replace, the verb-specific text; got: {description}"
         );
-        // ...and the shared contract must explain what a prefix IS (a
-        // namespace-scoped resolution), not just restate "must be a UUID".
+        // ...and the shared contract must state the ACTUAL by-ID rule, in a
+        // form that separates it from its negation. Must-match and
+        // must-not-match together: either arm alone still admits a contract
+        // that merely mentions namespaces without committing to a rule.
         assert!(
-            description.contains("namespace"),
-            "id contract must explain the namespace-scoping rule; got: {description}"
+            description.contains("no namespace filter"),
+            "id contract must state that by-ID prefix resolution applies NO namespace filter \
+             (ADR-007 Rev 6, `resolve_prefix_unfiltered`); got: {description}"
+        );
+        assert!(
+            !description.contains("namespace-scoped resolution"),
+            "id contract must not claim prefix resolution is namespace-scoped — get/update/\
+             delete/merge resolve prefixes unfiltered; got: {description}"
         );
         assert!(
             description.to_ascii_lowercase().contains("prefix"),
