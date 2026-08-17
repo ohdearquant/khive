@@ -263,10 +263,14 @@ Contract:
 
 - The four slices remove, respectively: writer-queue inheritance on reads (Slice 1),
   per-read connection setup plus WAL-pinning churn — which also shrinks the writer's
-  own starvation, compounding Slice 1 (Slice 2), the ~580 MB-per-query scan (Slice 3),
-  and cross-backend waste plus the structural obstacle to store splitting (Slice 4).
-- Slice 3 makes `search` results boundedly stale in the same way recall already is.
-  The staleness bound is the ADR-118 fresh-tail contract, not a new one.
+  own starvation, compounding Slice 1 (Slice 2), the ~580 MB-per-query scan for the
+  note-substrate `search` vector leg (Slice 3), and cross-backend waste plus the
+  structural obstacle to store splitting (Slice 4). Entity search is outside Slice 3:
+  it continues to pay the shared-table scan and keeps its current same-snapshot
+  freshness contract; recovering it is future work under a separate decision.
+- Slice 3 makes note-substrate `search` results boundedly stale in the same way
+  recall already is. The staleness bound is the ADR-118 fresh-tail contract, not a
+  new one. Entity search freshness is unchanged.
 - Risk concentrates in Slice 2 (connection lifecycle) and Slice 3 (ranking parity).
   Both carry route/counter observability so a production anomaly is attributable to
   the slice that caused it, and both are revertible by routing flags at their seam.

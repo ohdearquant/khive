@@ -76,7 +76,16 @@ documents the known-bad state instead of hiding it):
 | G2        | One `search` / `memory.recall` performs 0 standalone-reader opens (pooled-reader checkout counter carries the traffic)                                                                                                                                                                                   | ADR-165 Slice 2 |
 | G3        | On a store with installed ANN graphs, a note-substrate `search`'s vector leg is ANN-served; full-scan fallback count is 0                                                                                                                                                                                | ADR-165 Slice 3 |
 | G4        | A `kind=note` search dispatches 0 operations to a registered backend whose declaration excludes notes                                                                                                                                                                                                    | ADR-165 Slice 4 |
-| G5        | Candidate hydration row count per read verb ≤ the per-arm overfetch constant documented at the retrieval seam times the number of arms (today: `limit x 4` per arm, two arms), measured at the hydration seam                                                                                            | ADR-165 Slice 3 |
+| G5        | A note-substrate `search` hydrates no more candidate rows than the documented per-arm overfetch times the number of arms (today: `limit x 4` per arm, two arms) plus the registered ANN consumer's fresh-tail contribution, measured at the hydration seam after fusion and fresh-tail merge             | ADR-165 Slice 3 |
+
+G5 is scoped to the note-substrate `search` union deliberately. `memory.recall`'s
+hydration is governed by different, configured terms — a per-model ANN candidate
+floor of `max(k x 4, k + 32)`, multi-round candidate widening up to a further
+factor of four, and fresh-tail merge additions — so the search constant is not its
+bound, and a green G5 says nothing about recall. Recall's hydration invariant lands
+as a separate entry once Slice 3's hydration counter exists, expressed against
+those configured terms rather than the search constant, so the asserted bound and
+the configuration that produces it cannot drift apart silently.
 
 Suite contract:
 
@@ -123,19 +132,29 @@ noise floor for that execution.
 
 ### D3 — The budget and thresholds are versioned with the code
 
-A checked-in trend-configuration file, read by the D2 lane, defines every normative
-value D2 references — none may live only in prose or in an implementer's judgment:
+A checked-in trend-configuration file — `bench/trend-config.toml`, read by the D2
+lane — defines every normative value D2 references; none may live only in prose or
+in an implementer's judgment:
 
 - per-metric latency budget (initially: unified verb 10-15 ms; `search` and
   `memory.recall` server-side p50 at the seeded reference scale);
-- `noise_ceiling`: the maximum A/A spread (as a ratio) under which a run may report
-  a measurement; above it the run reports UNMEASURED;
-- `breach_multiplier`: the factor over baseline that, sustained across 3
-  consecutive measured runs, files the D2 issue;
-- baseline provenance and update policy: the baseline is the median of the last N
-  accepted measured runs on the same runner class, recorded in the tracked
-  history; it updates automatically as measured runs accept, while the BUDGET
-  changes only by reviewed diff carrying the measurement that justifies it.
+- `noise_ceiling` (initial value `1.15`): the maximum A/A spread ratio under which
+  a run may report a measurement; above it the run reports UNMEASURED;
+- `breach_multiplier` (initial value `1.5`): the factor over baseline that,
+  sustained across 3 consecutive measured runs, files the D2 issue;
+- `baseline_window` (initial value `7`): the baseline is the median of the last
+  `baseline_window` accepted measured runs on the same runner class, recorded in
+  the tracked history; it updates automatically as measured runs accept, while the
+  BUDGET changes only by reviewed diff carrying the measurement that justifies it;
+- bootstrap and runner-class matching: each history entry records its runner class
+  (os, arch, runner label), and the baseline is computed only over entries of the
+  same class. With fewer than `baseline_window` but at least 3 accepted same-class
+  runs, the median of what exists serves as an interim baseline; below 3 the lane
+  reports BASELINE-PENDING and files no breach. A runner-class change starts a
+  fresh window rather than comparing across classes.
+
+The initial values above seed the file; after that, the file is the single source
+and this ADR's numbers are historical.
 
 A budget that only exists in documentation regresses by being forgotten, which is
 how the 10-15 ms budget and a 5-second reality coexisted without any instrument
