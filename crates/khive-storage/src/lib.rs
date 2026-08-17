@@ -1,11 +1,13 @@
 //! Storage capability traits: `SqlAccess`, `VectorStore`, `TextSearch`,
 //! `GraphStore`, `NoteStore`, `EntityStore`, `EventStore`, `SparseStore`,
-//! `BlobStore`, and `AttachmentStore`.
+//! `BlobStore`, and `AttachmentStore`. Backend-neutral value contracts also
+//! include the immutable [`EmbeddingSpaceIdentity`] physical-vector fence.
 
 pub mod agent;
 pub mod attachment;
 pub mod blob;
 pub mod capability;
+pub mod embedding_space;
 pub mod entity;
 pub mod error;
 pub mod event;
@@ -27,6 +29,9 @@ pub use blob::{
     BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES,
 };
 pub use capability::StorageCapability;
+pub use embedding_space::{
+    EmbeddingProtocol, EmbeddingSpaceIdentity, EmbeddingSpaceIdentityError, EmbeddingSpaceKey,
+};
 pub use entity::{Entity, EntityFilter, EntityStore};
 pub use error::{StorageError, WriterTaskRequestState};
 

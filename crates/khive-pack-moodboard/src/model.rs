@@ -8,7 +8,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
-use khive_runtime::{NamedVectorIdentity, RuntimeError};
+use khive_runtime::RuntimeError;
+use khive_storage::EmbeddingSpaceIdentity;
 
 pub(crate) const MODEL_NAME: &str = "qwen3.5-vlm-pooled-visual";
 pub(crate) const PROMPT: &str =
@@ -103,9 +104,12 @@ impl DescriptorIdentity {
             dimensions,
             normalization: "l2",
         };
-        let canonical = canonical_json_bytes(&core)?;
-        let fingerprint = sha256_hex(&canonical);
-        let model_key = format!("moodboard_{fingerprint}_{dimensions}");
+        Self::from_core(core)
+    }
+
+    fn from_core(core: DescriptorCore) -> Result<Self, RuntimeError> {
+        let (identity, fingerprint) = embedding_identity_for_core(&core)?;
+        let model_key = identity.space_key().to_string();
         Ok(Self {
             schema_version: core.schema_version,
             model_key,
@@ -122,12 +126,37 @@ impl DescriptorIdentity {
         })
     }
 
-    pub(crate) fn vector_identity(&self) -> Result<NamedVectorIdentity, RuntimeError> {
-        NamedVectorIdentity::new(
-            self.model_key.clone(),
-            self.model_name.to_string(),
-            self.dimensions,
-        )
+    fn core(&self) -> DescriptorCore {
+        DescriptorCore {
+            schema_version: self.schema_version,
+            model_name: self.model_name,
+            model_revision: self.model_revision.clone(),
+            checkpoint_sha256: self.checkpoint_sha256.clone(),
+            inference: self.inference.clone(),
+            preprocessing: self.preprocessing.clone(),
+            prompt: self.prompt.clone(),
+            pooling: self.pooling,
+            dimensions: self.dimensions,
+            normalization: self.normalization,
+        }
+    }
+
+    pub(crate) fn vector_identity(&self) -> Result<EmbeddingSpaceIdentity, RuntimeError> {
+        let (identity, fingerprint) = embedding_identity_for_core(&self.core())?;
+        if self.fingerprint != fingerprint {
+            return Err(RuntimeError::InvalidInput(format!(
+                "moodboard descriptor fingerprint {:?} does not match its canonical identity {fingerprint:?}",
+                self.fingerprint
+            )));
+        }
+        if self.model_key != identity.space_key().as_str() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "moodboard descriptor model_key {:?} does not match its derived embedding space {:?}",
+                self.model_key,
+                identity.space_key().as_str()
+            )));
+        }
+        Ok(identity)
     }
 
     #[cfg(test)]
@@ -137,9 +166,35 @@ impl DescriptorIdentity {
     }
 }
 
+fn embedding_identity_for_core(
+    core: &DescriptorCore,
+) -> Result<(EmbeddingSpaceIdentity, String), RuntimeError> {
+    let canonical = canonical_json_bytes(core)?;
+    let fingerprint_bytes = sha256_digest(&canonical);
+    let fingerprint = lowercase_hex(&fingerprint_bytes);
+    let dimensions = u32::try_from(core.dimensions).map_err(|_| {
+        RuntimeError::InvalidInput(format!(
+            "moodboard descriptor dimensions exceed u32: {}",
+            core.dimensions
+        ))
+    })?;
+    let identity = EmbeddingSpaceIdentity::new(
+        "moodboard",
+        core.schema_version,
+        fingerprint_bytes,
+        core.model_name,
+        dimensions,
+    )
+    .map_err(|error| {
+        RuntimeError::InvalidInput(format!("invalid moodboard embedding identity: {error}"))
+    })?;
+    Ok((identity, fingerprint))
+}
+
 pub(crate) struct LoadedVisionModel {
     model: VisionEmbeddingModel,
     descriptor: DescriptorIdentity,
+    embedding_identity: EmbeddingSpaceIdentity,
     // Lattice may retain memory maps into the checkpoint. Keep the private,
     // attested snapshot alive until the model itself is dropped.
     _checkpoint: Arc<PreparedCheckpoint>,
@@ -148,6 +203,10 @@ pub(crate) struct LoadedVisionModel {
 impl LoadedVisionModel {
     pub(crate) fn descriptor(&self) -> &DescriptorIdentity {
         &self.descriptor
+    }
+
+    pub(crate) fn embedding_identity(&self) -> &EmbeddingSpaceIdentity {
+        &self.embedding_identity
     }
 
     fn embed_with_prompt(&self, image_png: &[u8], prompt: &str) -> Result<Vec<f32>, RuntimeError> {
@@ -475,9 +534,12 @@ fn load_prepared_checkpoint(
         }
         Ok(model)
     })?;
+    let descriptor = checkpoint.descriptor.clone();
+    let embedding_identity = descriptor.vector_identity()?;
     Ok(LoadedVisionModel {
         model,
-        descriptor: checkpoint.descriptor.clone(),
+        descriptor,
+        embedding_identity,
         _checkpoint: checkpoint,
     })
 }
@@ -1113,11 +1175,13 @@ fn metadata_is_checkpoint_link(metadata: &std::fs::Metadata) -> bool {
 }
 
 fn required_env(name: &str) -> Result<String, RuntimeError> {
+    const MAX_VALUE_BYTES: usize = 4096;
+
     let value = std::env::var(name)
         .map_err(|_| RuntimeError::Unconfigured(format!("{name} must be set for moodboard")))?;
-    if value.trim().is_empty() || value.trim() != value {
+    if value.is_empty() || value.len() > MAX_VALUE_BYTES || value.trim() != value {
         return Err(RuntimeError::Unconfigured(format!(
-            "{name} must be non-empty with no surrounding whitespace"
+            "{name} must be 1..={MAX_VALUE_BYTES} bytes with no surrounding whitespace"
         )));
     }
     Ok(value)
@@ -1162,12 +1226,21 @@ fn validate_sha256(name: &str, value: &str) -> Result<(), RuntimeError> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    lowercase_hex(&sha256_digest(bytes))
+}
+
+fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    out
+    output
 }
 
 fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, RuntimeError> {
@@ -1231,6 +1304,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use khive_runtime::KhiveRuntime;
+    use khive_storage::types::{SqlStatement, SqlValue};
+    use khive_types::Namespace;
 
     use super::*;
 
@@ -1242,7 +1318,17 @@ mod tests {
         assert_eq!(left.fingerprint.len(), 64);
         assert_eq!(left.model_key, format!("moodboard_{}_4", left.fingerprint));
 
-        let value = serde_json::to_value(left).unwrap();
+        let identity = left.vector_identity().expect("shared identity");
+        assert_eq!(identity.space_key().as_str(), left.model_key);
+        assert_eq!(identity.protocol().as_str(), SCHEMA_VERSION);
+        assert_eq!(identity.model_name(), MODEL_NAME);
+        assert_eq!(identity.dimensions().get(), 4);
+        assert_eq!(
+            identity.fingerprint(),
+            &sha256_digest(&canonical_json_bytes(&left.core()).unwrap())
+        );
+
+        let value = serde_json::to_value(&left).unwrap();
         let object = value.as_object().unwrap();
         assert_eq!(object.len(), 12);
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
@@ -1252,7 +1338,94 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_fingerprint_matches_cross_language_golden() {
+    fn every_visual_protocol_field_mutation_changes_the_embedding_space() {
+        let baseline = DescriptorIdentity::fixture(4).core();
+        let baseline_identity = embedding_identity_for_core(&baseline)
+            .expect("baseline identity")
+            .0;
+        let baseline_key = baseline_identity.space_key().clone();
+        let baseline_fingerprint = *baseline_identity.fingerprint();
+
+        macro_rules! assert_mutation_changes_key {
+            ($name:literal, $mutate:expr) => {{
+                let mut mutated = baseline.clone();
+                let mutate: fn(&mut DescriptorCore) = $mutate;
+                mutate(&mut mutated);
+                let mutated_identity = embedding_identity_for_core(&mutated).expect($name).0;
+                let mutated_key = mutated_identity.space_key().clone();
+                assert_ne!(
+                    baseline_fingerprint,
+                    *mutated_identity.fingerprint(),
+                    "{} must change the fingerprint",
+                    $name
+                );
+                assert_ne!(baseline_key, mutated_key, "{} must change the key", $name);
+            }};
+        }
+
+        assert_mutation_changes_key!("schema_version", |core| {
+            core.schema_version = "moodboard.visual-descriptor.v2";
+        });
+        assert_mutation_changes_key!("model_name", |core| {
+            core.model_name = "different-visual-model";
+        });
+        assert_mutation_changes_key!("model_revision", |core| {
+            core.model_revision.push_str("-changed");
+        });
+        assert_mutation_changes_key!("checkpoint_sha256", |core| {
+            core.checkpoint_sha256 = "b".repeat(64);
+        });
+        assert_mutation_changes_key!("inference.provider", |core| {
+            core.inference.provider = "different-provider";
+        });
+        assert_mutation_changes_key!("inference.version", |core| {
+            core.inference.version = "0.9.1";
+        });
+        assert_mutation_changes_key!("preprocessing.revision", |core| {
+            core.preprocessing.revision = "different-preprocessing";
+        });
+        assert_mutation_changes_key!("preprocessing.max_side", |core| {
+            core.preprocessing.max_side += 1;
+        });
+        assert_mutation_changes_key!("preprocessing.alignment", |core| {
+            core.preprocessing.alignment /= 2;
+        });
+        assert_mutation_changes_key!("preprocessing.matte_rgb", |core| {
+            core.preprocessing.matte_rgb[0] ^= 1;
+        });
+        assert_mutation_changes_key!("preprocessing.resample", |core| {
+            core.preprocessing.resample = "nearest";
+        });
+        assert_mutation_changes_key!("prompt.revision", |core| {
+            core.prompt.revision = "different-prompt";
+        });
+        assert_mutation_changes_key!("prompt.sha256", |core| {
+            core.prompt.sha256 = "b".repeat(64);
+        });
+        assert_mutation_changes_key!("pooling", |core| {
+            core.pooling = "cls";
+        });
+        assert_mutation_changes_key!("dimensions", |core| {
+            core.dimensions += 1;
+        });
+        assert_mutation_changes_key!("normalization", |core| {
+            core.normalization = "none";
+        });
+    }
+
+    #[test]
+    fn descriptor_rejects_stored_fingerprint_or_key_drift() {
+        let mut bad_fingerprint = DescriptorIdentity::fixture(4);
+        bad_fingerprint.fingerprint = "0".repeat(64);
+        assert!(bad_fingerprint.vector_identity().is_err());
+
+        let mut bad_key = DescriptorIdentity::fixture(4);
+        bad_key.model_key.push_str("_other");
+        assert!(bad_key.vector_identity().is_err());
+    }
+
+    #[tokio::test]
+    async fn descriptor_fingerprint_response_and_table_match_cross_language_golden() {
         let core = DescriptorCore {
             schema_version: SCHEMA_VERSION,
             model_name: MODEL_NAME,
@@ -1277,7 +1450,25 @@ mod tests {
             dimensions: 4,
             normalization: "l2",
         };
-        let fingerprint = sha256_hex(&canonical_json_bytes(&core).unwrap());
+        let descriptor = DescriptorIdentity::from_core(core.clone()).unwrap();
+        let canonical = canonical_json_bytes(&core).unwrap();
+        assert_eq!(
+            canonical,
+            concat!(
+                "{\"checkpoint_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+                "\"dimensions\":4,",
+                "\"inference\":{\"provider\":\"lattice-embed\",\"version\":\"0.9.0\"},",
+                "\"model_name\":\"qwen3.5-vlm-pooled-visual\",",
+                "\"model_revision\":\"weights-r1\",",
+                "\"normalization\":\"l2\",",
+                "\"pooling\":\"mean_visual_tokens\",",
+                "\"preprocessing\":{\"alignment\":32,\"matte_rgb\":[128,128,128],\"max_side\":448,\"resample\":\"lanczos3\",\"revision\":\"moodboard-qwen35-srgb-pad32-max448-v1\"},",
+                "\"prompt\":{\"revision\":\"moodboard-style-retrieval-v1\",\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\"},",
+                "\"schema_version\":\"moodboard.visual-descriptor.v1\"}"
+            )
+            .as_bytes()
+        );
+        let fingerprint = sha256_hex(&canonical);
         assert_eq!(
             fingerprint,
             "b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5"
@@ -1286,6 +1477,44 @@ mod tests {
             format!("moodboard_{fingerprint}_4"),
             "moodboard_b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5_4"
         );
+        assert_eq!(
+            serde_json::to_string(&descriptor).unwrap(),
+            concat!(
+                "{\"schema_version\":\"moodboard.visual-descriptor.v1\",",
+                "\"model_key\":\"moodboard_b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5_4\",",
+                "\"model_name\":\"qwen3.5-vlm-pooled-visual\",",
+                "\"model_revision\":\"weights-r1\",",
+                "\"checkpoint_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+                "\"inference\":{\"provider\":\"lattice-embed\",\"version\":\"0.9.0\"},",
+                "\"preprocessing\":{\"revision\":\"moodboard-qwen35-srgb-pad32-max448-v1\",\"max_side\":448,\"alignment\":32,\"matte_rgb\":[128,128,128],\"resample\":\"lanczos3\"},",
+                "\"prompt\":{\"revision\":\"moodboard-style-retrieval-v1\",\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\"},",
+                "\"pooling\":\"mean_visual_tokens\",\"dimensions\":4,\"normalization\":\"l2\",",
+                "\"fingerprint\":\"b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5\"}"
+            )
+        );
+
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let identity = descriptor.vector_identity().expect("shared identity");
+        runtime
+            .vectors_for_embedding_space(&token, &identity)
+            .await
+            .expect("open exact golden space");
+        let expected_table = format!("vec_{}", descriptor.model_key);
+        let mut reader = runtime.sql().reader().await.expect("sql reader");
+        let stored_table = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?1"
+                    .to_string(),
+                params: vec![SqlValue::Text(expected_table.clone())],
+                label: Some("moodboard_golden_embedding_table".to_string()),
+            })
+            .await
+            .expect("query golden table");
+        match stored_table {
+            Some(SqlValue::Text(table)) => assert_eq!(table, expected_table),
+            other => panic!("unexpected golden table query result: {other:?}"),
+        }
 
         let production_prompt =
             DescriptorIdentity::build("weights-r1".to_string(), "1".repeat(64), 4).unwrap();

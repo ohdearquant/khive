@@ -1,7 +1,8 @@
 # khive-storage Design
 
-Function-specific technical reference docs (error taxonomy, blob store, attachments,
-transaction registry) live in [`docs/api/`](api/). This document covers
+Function-specific technical reference docs (error taxonomy, blob store,
+attachments, embedding-space identity, transaction registry) live in
+[`docs/api/`](api/). This document covers
 design rationale and ADR compliance.
 
 ## Scope
@@ -56,6 +57,15 @@ Non-default gather options return `StorageError::Unsupported` on backends that d
 not override the method. Term-level document-frequency statistics are exposed via
 `term_stats`, also optional (`Unsupported` by default).
 
+### [ADR-160: Shared Pack Infrastructure](../../../docs/adr/ADR-160-shared-pack-infrastructure.md)
+
+`EmbeddingSpaceIdentity` is the immutable backend-neutral fence for a physical
+vector space. It stores the governed protocol and fingerprint, display model
+label, and validated dimensions while deriving the only usable
+`EmbeddingSpaceKey`. It owns no model-specific canonicalization policy and
+contains no namespace. Phase 6 migrates the pack-owned moodboard space; the
+text-provider registry and ANN persistence cutover remain atomic Phase 7 work.
+
 ### [ADR-041: Event Provenance Projection — Hybrid Log + Graph Edges](../../../docs/adr/ADR-041-event-provenance-projection.md) / [ADR-044: Vector Store Extensions — Capabilities, Metadata Filter, Batched Search, Update, Orphan Sweep](../../../docs/adr/ADR-044-vector-store-extensions.md)
 
 `VectorStoreCapabilities` is returned by `VectorStore::capabilities()` and
@@ -77,29 +87,31 @@ Key design constraints:
 
 ## Modules
 
-| Module                                      | Purpose                                                                     |
-| ------------------------------------------- | --------------------------------------------------------------------------- |
-| [`src/attachment.rs`](../src/attachment.rs) | role-keyed attachment types and `AttachmentStore`                           |
-| [`src/blob.rs`](../src/blob.rs)             | `ContentRef`, bounded read contract, and `BlobStore`                        |
-| [`src/capability.rs`](../src/capability.rs) | `StorageCapability` enum                                                    |
-| [`src/entity.rs`](../src/entity.rs)         | `Entity`, `EntityFilter`, `EntityStore`                                     |
-| [`src/error.rs`](../src/error.rs)           | `StorageError`                                                              |
-| [`src/event.rs`](../src/event.rs)           | `Event`, `EventFilter`, `EventStore`                                        |
-| [`src/graph.rs`](../src/graph.rs)           | `GraphStore`                                                                |
-| [`src/note.rs`](../src/note.rs)             | `Note`, `NoteFilter`, `NoteStore`                                           |
-| [`src/sparse.rs`](../src/sparse.rs)         | `SparseStore`                                                               |
-| [`src/sql.rs`](../src/sql.rs)               | `SqlAccess`, `SqlReader`, `SqlWriter`, `AtomicUnitOp`                       |
-| [`src/text.rs`](../src/text.rs)             | `TextSearch`                                                                |
-| [`src/types/`](../src/types/)               | Shared types split by domain (vector, text, graph, sparse, sql, pagination) |
-| [`src/vectors.rs`](../src/vectors.rs)       | `VectorStore`                                                               |
+| Module                                                | Purpose                                                                     |
+| ----------------------------------------------------- | --------------------------------------------------------------------------- |
+| [`src/attachment.rs`](../src/attachment.rs)           | role-keyed attachment types and `AttachmentStore`                           |
+| [`src/blob.rs`](../src/blob.rs)                       | `ContentRef`, bounded read contract, and `BlobStore`                        |
+| [`src/capability.rs`](../src/capability.rs)           | `StorageCapability` enum                                                    |
+| [`src/entity.rs`](../src/entity.rs)                   | `Entity`, `EntityFilter`, `EntityStore`                                     |
+| [`src/embedding_space.rs`](../src/embedding_space.rs) | complete immutable vector-space identity and derived key                    |
+| [`src/error.rs`](../src/error.rs)                     | `StorageError`                                                              |
+| [`src/event.rs`](../src/event.rs)                     | `Event`, `EventFilter`, `EventStore`                                        |
+| [`src/graph.rs`](../src/graph.rs)                     | `GraphStore`                                                                |
+| [`src/note.rs`](../src/note.rs)                       | `Note`, `NoteFilter`, `NoteStore`                                           |
+| [`src/sparse.rs`](../src/sparse.rs)                   | `SparseStore`                                                               |
+| [`src/sql.rs`](../src/sql.rs)                         | `SqlAccess`, `SqlReader`, `SqlWriter`, `AtomicUnitOp`                       |
+| [`src/text.rs`](../src/text.rs)                       | `TextSearch`                                                                |
+| [`src/types/`](../src/types/)                         | Shared types split by domain (vector, text, graph, sparse, sql, pagination) |
+| [`src/vectors.rs`](../src/vectors.rs)                 | `VectorStore`                                                               |
 
 ## Tests
 
-| Path                                                              | Coverage                                                                                                           |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| [`tests/attachment_contract.rs`](../tests/attachment_contract.rs) | attachment validation and stable substrate wire values                                                             |
-| [`tests/compliance.rs`](../tests/compliance.rs)                   | Validate() invariant tests for `VectorSearchRequest`, `SparseVector`, `EdgeFilter`; vector filter compliance suite |
-| [`tests/vectors.rs`](../tests/vectors.rs)                         | `VectorStore` default-impl behavior: capabilities, batch, update, orphan sweep                                     |
+| Path                                                                        | Coverage                                                                                                           |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| [`tests/attachment_contract.rs`](../tests/attachment_contract.rs)           | attachment validation and stable substrate wire values                                                             |
+| [`tests/compliance.rs`](../tests/compliance.rs)                             | Validate() invariant tests for `VectorSearchRequest`, `SparseVector`, `EdgeFilter`; vector filter compliance suite |
+| [`tests/embedding_space_identity.rs`](../tests/embedding_space_identity.rs) | identity derivation, typed validation boundaries, key ceiling                                                      |
+| [`tests/vectors.rs`](../tests/vectors.rs)                                   | `VectorStore` default-impl behavior: capabilities, batch, update, orphan sweep                                     |
 
 ## Invariants
 
@@ -107,6 +119,8 @@ Key design constraints:
 - `SparseVector`: indices and values must be equal length, indices strictly
   increasing, all values finite.
 - `VectorSearchRequest`: query_vectors non-empty, top_k > 0, all values finite.
+- `EmbeddingSpaceIdentity`: physical key is derived from prefix, fingerprint,
+  and dimensions; callers cannot inject an independent key.
 - `EdgeFilter`: weight bounds must be finite and min <= max.
 - Attachment roles are non-empty and contain no control characters; optional
   sizes fit SQLite's signed integer envelope.

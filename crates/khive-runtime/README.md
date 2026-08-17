@@ -16,6 +16,11 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
 - **Role-keyed attachments** — main-backend-only record metadata over `ContentRef`,
   atomic entity-plus-role publication, compatibility `content_ref` projection,
   and transactional hard-delete cleanup
+- **Complete pack-owned embedding-space binding** — consumers of
+  `vectors_for_embedding_space` pass the immutable
+  `khive_storage::EmbeddingSpaceIdentity`; that seam derives no table from a
+  display model name and verifies existing geometry/model metadata. The text
+  provider cutover remains ADR-160 Phase 7
 - **`VerbRegistry` / `VerbRegistryBuilder`** — registers packs (`PackRuntime` impls),
   an authorization `Gate`, an actor identity, and dispatches verbs by name
 - **`PackRuntime` trait** — the object-safe runtime counterpart to `khive-types::Pack`;

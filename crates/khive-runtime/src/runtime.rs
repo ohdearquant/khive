@@ -12,7 +12,8 @@ use khive_gate::AllowAllGate;
 use khive_gate::GateRequest;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{
-    AttachmentStore, EntityStore, Event, EventStore, GraphStore, NoteStore, SqlAccess, VectorStore,
+    AttachmentStore, EmbeddingSpaceIdentity, EntityStore, Event, EventStore, GraphStore, NoteStore,
+    SqlAccess, VectorStore,
 };
 use khive_types::{EdgeEndpointRule, EventKind, Namespace, SubstrateKind};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
@@ -63,76 +64,6 @@ pub type NoteWriteValidatorFn = Arc<
         + Send
         + Sync,
 >;
-
-/// Immutable identity for a non-text vector store owned by a pack consumer.
-///
-/// This does not register an [`crate::EmbedderProvider`]. It gives a pack that
-/// performs its own governed inference a narrow path to a namespace-scoped
-/// Khive vector table while keeping model-key and dimension validation at the
-/// runtime boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NamedVectorIdentity {
-    model_key: String,
-    model_name: String,
-    dimensions: usize,
-}
-
-impl NamedVectorIdentity {
-    const MAX_MODEL_KEY_BYTES: usize = 128;
-    const MAX_MODEL_NAME_BYTES: usize = 512;
-
-    /// Validate and construct a named vector identity.
-    pub fn new(
-        model_key: impl Into<String>,
-        model_name: impl Into<String>,
-        dimensions: usize,
-    ) -> RuntimeResult<Self> {
-        let model_key = model_key.into();
-        let model_name = model_name.into();
-        if model_key.is_empty()
-            || model_key.len() > Self::MAX_MODEL_KEY_BYTES
-            || !model_key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            return Err(RuntimeError::InvalidInput(format!(
-                "named vector model_key must be 1..={} bytes of ASCII alphanumeric/underscore",
-                Self::MAX_MODEL_KEY_BYTES
-            )));
-        }
-        if model_name.trim().is_empty()
-            || model_name.trim() != model_name
-            || model_name.len() > Self::MAX_MODEL_NAME_BYTES
-        {
-            return Err(RuntimeError::InvalidInput(format!(
-                "named vector model_name must be 1..={} bytes with no surrounding whitespace",
-                Self::MAX_MODEL_NAME_BYTES
-            )));
-        }
-        if !(1..=8192).contains(&dimensions) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "named vector dimensions must be in 1..=8192, got {dimensions}"
-            )));
-        }
-        Ok(Self {
-            model_key,
-            model_name,
-            dimensions,
-        })
-    }
-
-    pub fn model_key(&self) -> &str {
-        &self.model_key
-    }
-
-    pub fn model_name(&self) -> &str {
-        &self.model_name
-    }
-
-    pub fn dimensions(&self) -> usize {
-        self.dimensions
-    }
-}
 
 pub use crate::config::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
@@ -631,26 +562,27 @@ impl KhiveRuntime {
         )?)
     }
 
-    /// Get a namespace-scoped vector store for a pack-owned immutable identity.
+    /// Get a table-bound vector store using the token namespace as its default.
     ///
-    /// The table key is syntactically validated by [`NamedVectorIdentity`]. This
-    /// accessor additionally verifies the table's actual sqlite-vec dimension
-    /// declaration and every persisted `embedding_model` value before returning
-    /// the store, so reusing one key for incompatible descriptor geometry or
-    /// semantics fails before a caller can replace rows.
-    pub async fn vectors_for_named_identity(
+    /// [`EmbeddingSpaceIdentity`] derives the physical key from the governed
+    /// fingerprint and dimensions. This accessor additionally verifies the
+    /// table's actual sqlite-vec dimension declaration and every persisted
+    /// `embedding_model` value before returning the store, so reusing one key
+    /// for incompatible descriptor semantics fails before a caller can replace
+    /// rows.
+    pub async fn vectors_for_embedding_space(
         &self,
         token: &NamespaceToken,
-        identity: &NamedVectorIdentity,
+        identity: &EmbeddingSpaceIdentity,
     ) -> RuntimeResult<Arc<dyn VectorStore>> {
         let store = self.backend.vectors_for_namespace(
-            identity.model_key(),
+            identity.space_key().as_str(),
             identity.model_name(),
-            identity.dimensions(),
+            identity.dimensions().get() as usize,
             token.namespace().as_str(),
         )?;
 
-        let table = format!("vec_{}", identity.model_key());
+        let table = format!("vec_{}", identity.space_key());
         let mut reader = self.sql().reader().await?;
         let dimension_row = reader
             .query_row(SqlStatement {
@@ -677,11 +609,11 @@ impl KhiveRuntime {
                 "named vector table {table} has no parseable embedding dimension"
             ))
         })?;
-        if declared_dimensions != identity.dimensions() {
+        if declared_dimensions != identity.dimensions().get() as usize {
             return Err(RuntimeError::InvalidInput(format!(
-                "named vector model_key {:?} is already bound to {declared_dimensions} dimensions, expected {}",
-                identity.model_key(),
-                identity.dimensions()
+                "embedding space key {:?} is already bound to {declared_dimensions} dimensions, expected {}",
+                identity.space_key().as_str(),
+                identity.dimensions().get()
             )));
         }
 
@@ -705,8 +637,8 @@ impl KhiveRuntime {
             };
             if stored != identity.model_name() {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "named vector model_key {:?} already contains model {stored:?}, cannot bind it to {:?}",
-                    identity.model_key(),
+                    "embedding space key {:?} already contains model {stored:?}, cannot bind it to {:?}",
+                    identity.space_key().as_str(),
                     identity.model_name()
                 )));
             }
@@ -714,10 +646,10 @@ impl KhiveRuntime {
 
         self.backend
             .register_embedding_model(
-                identity.model_key(),
+                identity.space_key().as_str(),
                 identity.model_name(),
-                identity.model_key(),
-                identity.dimensions() as u32,
+                identity.space_key().as_str(),
+                identity.dimensions().get(),
             )
             .map_err(|error| {
                 if matches!(
@@ -726,8 +658,8 @@ impl KhiveRuntime {
                         if code.code == rusqlite::ErrorCode::ConstraintViolation
                 ) {
                     RuntimeError::InvalidInput(format!(
-                        "named vector model_key {:?} is already bound to a different active model identity",
-                        identity.model_key()
+                        "embedding space key {:?} is already bound to a different active model identity",
+                        identity.space_key().as_str()
                     ))
                 } else {
                     RuntimeError::Sqlite(error)
@@ -1557,6 +1489,7 @@ fn vector_dimensions_from_ddl(ddl: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use khive_gate::GateRef;
+    use khive_storage::EmbeddingSpaceIdentity;
     use serial_test::serial;
 
     fn test_blob_hydrator() -> (tempfile::TempDir, Arc<crate::BlobHydrator>) {
@@ -1576,6 +1509,30 @@ mod tests {
     fn memory_runtime_creates_successfully() {
         let rt = KhiveRuntime::memory().expect("memory runtime should create");
         assert!(rt.config().db_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_embedding_identity_selects_and_registers_the_physical_space() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let identity =
+            EmbeddingSpaceIdentity::new("visual", "test.visual.v1", [0x11; 32], "visual-model", 4)
+                .expect("identity");
+
+        runtime
+            .vectors_for_embedding_space(&token, &identity)
+            .await
+            .expect("open vector space");
+
+        let records = runtime
+            .list_embedding_models(Some(identity.space_key().as_str()))
+            .await
+            .expect("registry rows");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].engine_name, identity.space_key().as_str());
+        assert_eq!(records[0].model_id, identity.model_name());
+        assert_eq!(records[0].key_version, identity.space_key().as_str());
+        assert_eq!(records[0].dimensions, identity.dimensions().get());
     }
 
     #[test]
@@ -2783,67 +2740,89 @@ mod tests {
         assert!(no_match.is_empty());
     }
 
-    #[test]
-    fn named_vector_identity_rejects_ambiguous_or_unsafe_values() {
-        assert!(NamedVectorIdentity::new("", "model", 4).is_err());
-        assert!(NamedVectorIdentity::new("bad-key", "model", 4).is_err());
-        assert!(NamedVectorIdentity::new("valid_key", " model", 4).is_err());
-        assert!(NamedVectorIdentity::new("valid_key", "model", 0).is_err());
-        assert!(NamedVectorIdentity::new("valid_key", "model", 8193).is_err());
-        assert!(NamedVectorIdentity::new("k".repeat(128), "m".repeat(512), 4).is_ok());
-        assert!(NamedVectorIdentity::new("k".repeat(129), "model", 4).is_err());
-        assert!(NamedVectorIdentity::new("valid_key", "m".repeat(513), 4).is_err());
-        assert_eq!(
-            NamedVectorIdentity::new("valid_key", "model", 4)
-                .expect("valid identity")
-                .dimensions(),
-            4
-        );
+    fn test_embedding_identity(
+        prefix: &str,
+        fingerprint_byte: u8,
+        model_name: &str,
+        dimensions: u32,
+    ) -> EmbeddingSpaceIdentity {
+        EmbeddingSpaceIdentity::new(
+            prefix,
+            "test.embedding-space.v1",
+            [fingerprint_byte; 32],
+            model_name,
+            dimensions,
+        )
+        .expect("valid test identity")
     }
 
     #[tokio::test]
-    async fn named_vector_store_rejects_dimension_or_model_key_rebinding() {
+    async fn embedding_space_rejects_model_rebinding_but_dimensions_select_a_new_key() {
         let rt = KhiveRuntime::memory().expect("memory runtime");
         let token = rt.authorize(Namespace::local()).expect("authorize");
-        let original = NamedVectorIdentity::new("visual_contract", "model-a", 4).unwrap();
-        rt.vectors_for_named_identity(&token, &original)
+        let original = test_embedding_identity("visual", 0x11, "model-a", 4);
+        rt.vectors_for_embedding_space(&token, &original)
             .await
-            .expect("create named vector store");
+            .expect("create embedding space");
         let registered = rt
-            .list_embedding_models(Some("visual_contract"))
+            .list_embedding_models(Some(original.space_key().as_str()))
             .await
             .expect("list model registry");
         assert!(registered.iter().any(|record| {
             record.model_id == "model-a"
-                && record.key_version == "visual_contract"
+                && record.key_version == original.space_key().as_str()
                 && record.dimensions == 4
         }));
-        let wrong_dimensions = NamedVectorIdentity::new("visual_contract", "model-a", 5).unwrap();
-        let Err(dimension_error) = rt
-            .vectors_for_named_identity(&token, &wrong_dimensions)
-            .await
-        else {
-            panic!("same key cannot change dimensions");
-        };
-        assert!(dimension_error.to_string().contains("dimensions"));
 
-        let wrong_model = NamedVectorIdentity::new("visual_contract", "model-b", 4).unwrap();
-        let Err(model_error) = rt.vectors_for_named_identity(&token, &wrong_model).await else {
+        let different_dimensions = test_embedding_identity("visual", 0x11, "model-a", 5);
+        assert_ne!(
+            original.space_key(),
+            different_dimensions.space_key(),
+            "geometry is part of the derived physical key"
+        );
+        rt.vectors_for_embedding_space(&token, &different_dimensions)
+            .await
+            .expect("different dimensions select an isolated space");
+
+        let wrong_model = test_embedding_identity("visual", 0x11, "model-b", 4);
+        let Err(model_error) = rt.vectors_for_embedding_space(&token, &wrong_model).await else {
             panic!("same key cannot change model identity");
         };
         assert!(model_error.to_string().contains("already bound"));
     }
 
     #[tokio::test]
-    async fn concurrent_named_vector_first_bind_has_one_immutable_winner() {
+    async fn embedding_space_rejects_a_preexisting_table_with_wrong_geometry() {
         let rt = KhiveRuntime::memory().expect("memory runtime");
         let token = rt.authorize(Namespace::local()).expect("authorize");
-        let first = NamedVectorIdentity::new("visual_race", "model-a", 4).unwrap();
-        let second = NamedVectorIdentity::new("visual_race", "model-b", 4).unwrap();
+        let identity = test_embedding_identity("geometry", 0x12, "model-a", 4);
+
+        rt.backend
+            .vectors_for_namespace(
+                identity.space_key().as_str(),
+                identity.model_name(),
+                5,
+                token.namespace().as_str(),
+            )
+            .expect("plant incompatible table");
+
+        let error = match rt.vectors_for_embedding_space(&token, &identity).await {
+            Ok(_) => panic!("wrong table geometry must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("dimensions"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_embedding_space_first_bind_has_one_immutable_winner() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let first = test_embedding_identity("visual_race", 0x22, "model-a", 4);
+        let second = test_embedding_identity("visual_race", 0x22, "model-b", 4);
 
         let (first_result, second_result) = tokio::join!(
-            rt.vectors_for_named_identity(&token, &first),
-            rt.vectors_for_named_identity(&token, &second),
+            rt.vectors_for_embedding_space(&token, &first),
+            rt.vectors_for_embedding_space(&token, &second),
         );
         assert_ne!(
             first_result.is_ok(),
@@ -2856,17 +2835,17 @@ mod tests {
         } else {
             (&second, &first)
         };
-        rt.vectors_for_named_identity(&token, winner)
+        rt.vectors_for_embedding_space(&token, winner)
             .await
             .expect("winning identity remains idempotent");
-        let error = match rt.vectors_for_named_identity(&token, loser).await {
+        let error = match rt.vectors_for_embedding_space(&token, loser).await {
             Ok(_) => panic!("losing identity cannot rebind the empty table"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("already bound"));
 
         let registered = rt
-            .list_embedding_models(Some("visual_race"))
+            .list_embedding_models(Some(winner.space_key().as_str()))
             .await
             .expect("list race registry");
         assert_eq!(registered.len(), 1);
@@ -2874,31 +2853,166 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn named_vector_registry_keeps_immutable_revisions_active_together() {
+    async fn embedding_space_registry_keeps_immutable_revisions_active_together() {
         let rt = KhiveRuntime::memory().expect("memory runtime");
         let token = rt.authorize(Namespace::local()).expect("authorize");
-        let first = NamedVectorIdentity::new("visual_revision_a", "visual-model", 4).unwrap();
-        let second = NamedVectorIdentity::new("visual_revision_b", "visual-model", 4).unwrap();
+        let first = test_embedding_identity("visual", 0x33, "visual-model", 4);
+        let second = test_embedding_identity("visual", 0x44, "visual-model", 4);
 
-        rt.vectors_for_named_identity(&token, &first)
+        let first_store = rt
+            .vectors_for_embedding_space(&token, &first)
             .await
             .expect("open first immutable space");
-        rt.vectors_for_named_identity(&token, &second)
+        let second_store = rt
+            .vectors_for_embedding_space(&token, &second)
             .await
             .expect("open second immutable space");
 
+        let subject_id = uuid::Uuid::new_v4();
+        first_store
+            .insert_exact_only(
+                subject_id,
+                SubstrateKind::Entity,
+                Namespace::LOCAL,
+                "entity.body",
+                vec![vec![1.0, 0.0, 0.0, 0.0]],
+            )
+            .await
+            .expect("insert first revision");
+        assert!(first_store
+            .batch_exists(&[subject_id], Namespace::LOCAL)
+            .await
+            .expect("first existence")
+            .contains(&subject_id));
+        assert!(!second_store
+            .batch_exists(&[subject_id], Namespace::LOCAL)
+            .await
+            .expect("second existence")
+            .contains(&subject_id));
+
         let registered = rt.list_embedding_models(None).await.expect("list registry");
         assert!(registered.iter().any(|record| {
-            record.engine_name == "visual_revision_a"
+            record.engine_name == first.space_key().as_str()
                 && record.model_id == "visual-model"
-                && record.key_version == "visual_revision_a"
+                && record.key_version == first.space_key().as_str()
                 && record.status == "active"
         }));
         assert!(registered.iter().any(|record| {
-            record.engine_name == "visual_revision_b"
+            record.engine_name == second.space_key().as_str()
                 && record.model_id == "visual-model"
-                && record.key_version == "visual_revision_b"
+                && record.key_version == second.space_key().as_str()
                 && record.status == "active"
         }));
+    }
+
+    #[tokio::test]
+    async fn namespace_changes_do_not_change_the_embedding_space_identity() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let local = rt.authorize(Namespace::local()).expect("local token");
+        let project = rt
+            .authorize(Namespace::parse("project").expect("namespace"))
+            .expect("project token");
+        let identity = test_embedding_identity("namespace", 0x55, "visual-model", 4);
+
+        let local_store = rt
+            .vectors_for_embedding_space(&local, &identity)
+            .await
+            .expect("local store");
+        let project_store = rt
+            .vectors_for_embedding_space(&project, &identity)
+            .await
+            .expect("project store");
+
+        let subject_id = uuid::Uuid::new_v4();
+        local_store
+            .insert_exact_only(
+                subject_id,
+                SubstrateKind::Entity,
+                Namespace::LOCAL,
+                "entity.body",
+                vec![vec![1.0, 0.0, 0.0, 0.0]],
+            )
+            .await
+            .expect("insert local vector");
+        assert!(local_store
+            .batch_exists(&[subject_id], Namespace::LOCAL)
+            .await
+            .expect("local visibility")
+            .contains(&subject_id));
+        assert!(!project_store
+            .batch_exists(&[subject_id], "project")
+            .await
+            .expect("project visibility")
+            .contains(&subject_id));
+
+        let registered = rt
+            .list_embedding_models(Some(identity.space_key().as_str()))
+            .await
+            .expect("registry rows");
+        assert_eq!(registered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_embedding_identity_reopens_the_same_space_after_restart() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = Some(directory.path().join("embedding-space.db"));
+        let identity = test_embedding_identity("restart", 0x66, "visual-model", 4);
+        let subject_id = uuid::Uuid::new_v4();
+
+        let first = KhiveRuntime::new(config.clone()).expect("first runtime");
+        let first_token = first.authorize(Namespace::local()).expect("first token");
+        let first_store = first
+            .vectors_for_embedding_space(&first_token, &identity)
+            .await
+            .expect("first store");
+        first_store
+            .insert_exact_only(
+                subject_id,
+                SubstrateKind::Entity,
+                Namespace::LOCAL,
+                "entity.body",
+                vec![vec![1.0, 0.0, 0.0, 0.0]],
+            )
+            .await
+            .expect("insert vector");
+        let request = khive_storage::types::VectorSearchRequest {
+            query_vectors: vec![vec![1.0, 0.0, 0.0, 0.0]],
+            top_k: 1,
+            namespace: Some(Namespace::LOCAL.to_string()),
+            kind: Some(SubstrateKind::Entity),
+            embedding_model: Some(identity.model_name().to_string()),
+            filter: None,
+            backend_hints: None,
+        };
+        let before_restart = first_store
+            .search(request.clone())
+            .await
+            .expect("search before restart");
+        assert_eq!(before_restart.len(), 1);
+        drop(first_store);
+        drop(first);
+
+        let restarted = KhiveRuntime::new(config).expect("restarted runtime");
+        let restarted_token = restarted
+            .authorize(Namespace::local())
+            .expect("restarted token");
+        let reopened = restarted
+            .vectors_for_embedding_space(&restarted_token, &identity)
+            .await
+            .expect("reopen unchanged space");
+        assert!(reopened
+            .batch_exists(&[subject_id], Namespace::LOCAL)
+            .await
+            .expect("reopened existence")
+            .contains(&subject_id));
+        let after_restart = reopened
+            .search(request)
+            .await
+            .expect("search after restart");
+        assert_eq!(after_restart.len(), 1);
+        assert_eq!(after_restart[0].subject_id, before_restart[0].subject_id);
+        assert_eq!(after_restart[0].score, before_restart[0].score);
+        assert_eq!(after_restart[0].rank, before_restart[0].rank);
     }
 }

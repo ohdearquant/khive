@@ -22,7 +22,7 @@ use khive_storage::blob::ContentRef;
 use khive_storage::types::{
     SqlStatement, SqlValue, VectorIndexKind, VectorSearchHit, VectorSearchRequest,
 };
-use khive_storage::{BlobStore, Entity, NewAttachment, VectorStore};
+use khive_storage::{BlobStore, EmbeddingSpaceIdentity, Entity, NewAttachment, VectorStore};
 use khive_types::SubstrateKind;
 
 use crate::model::{validate_embedding, DescriptorIdentity, LoadedVisionModel, VisionModelState};
@@ -66,6 +66,7 @@ pub(crate) async fn handle_ingest(
     // this preserves the no-blob-side-effect identity fence without holding
     // the preprocessing memory permit across Qwen construction.
     let model = pack.model_state().get().await?;
+    let embedding_identity = model.embedding_identity().clone();
     let descriptor = model.descriptor().clone();
     let preprocessing_permit = pack.model_state().acquire_preprocessing_permit().await?;
     let raw = decode_image_base64(encoded_image)?;
@@ -93,7 +94,15 @@ pub(crate) async fn handle_ingest(
         &descriptor,
     )
     .await?;
-    index_embedding(pack.runtime(), token, &descriptor, asset.id, &embedding).await?;
+    index_embedding_with_identity(
+        pack.runtime(),
+        token,
+        &embedding_identity,
+        &descriptor,
+        asset.id,
+        &embedding,
+    )
+    .await?;
 
     Ok(json!({
         "asset_id": asset.id.to_string(),
@@ -123,6 +132,7 @@ pub(crate) async fn handle_search(
     let prepared = prepare_source_raster(pack, &core, &content_ref).await?;
 
     let model = pack.model_state().get().await?;
+    let embedding_identity = model.embedding_identity().clone();
     let descriptor = model.descriptor().clone();
     let embedding = infer_prepared(
         pack.model_state(),
@@ -131,9 +141,10 @@ pub(crate) async fn handle_search(
         &descriptor,
     )
     .await?;
-    let raw_hits = search_embedding(
+    let raw_hits = search_embedding_with_identity(
         pack.runtime(),
         token,
+        &embedding_identity,
         &descriptor,
         &embedding,
         candidate_limit(top_k),
@@ -720,10 +731,9 @@ async fn infer_prepared(
 async fn exact_store(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
-    descriptor: &DescriptorIdentity,
+    identity: &EmbeddingSpaceIdentity,
 ) -> Result<Arc<dyn VectorStore>, RuntimeError> {
-    let identity = descriptor.vector_identity()?;
-    let store = runtime.vectors_for_named_identity(token, &identity).await?;
+    let store = runtime.vectors_for_embedding_space(token, identity).await?;
     let info = store.info().await?;
     if info.index_kind != VectorIndexKind::SqliteVec {
         return Err(RuntimeError::Unconfigured(format!(
@@ -734,15 +744,16 @@ async fn exact_store(
     Ok(store)
 }
 
-async fn index_embedding(
+async fn index_embedding_with_identity(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    identity: &EmbeddingSpaceIdentity,
     descriptor: &DescriptorIdentity,
     asset_id: Uuid,
     embedding: &[f32],
 ) -> Result<(), RuntimeError> {
     validate_embedding(embedding, descriptor)?;
-    let store = exact_store(runtime, token, descriptor).await?;
+    let store = exact_store(runtime, token, identity).await?;
     store
         .insert_exact_only(
             asset_id,
@@ -755,15 +766,16 @@ async fn index_embedding(
     Ok(())
 }
 
-async fn search_embedding(
+async fn search_embedding_with_identity(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    identity: &EmbeddingSpaceIdentity,
     descriptor: &DescriptorIdentity,
     embedding: &[f32],
     top_k: u32,
 ) -> Result<Vec<VectorSearchHit>, RuntimeError> {
     validate_embedding(embedding, descriptor)?;
-    let store = exact_store(runtime, token, descriptor).await?;
+    let store = exact_store(runtime, token, identity).await?;
     let namespaces: BTreeSet<String> = token
         .visible_namespaces()
         .iter()
@@ -786,6 +798,30 @@ async fn search_embedding(
         namespace_hits.push(store.search(request).await?);
     }
     Ok(merge_namespace_hits(namespace_hits, top_k))
+}
+
+#[cfg(test)]
+async fn index_embedding(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    descriptor: &DescriptorIdentity,
+    asset_id: Uuid,
+    embedding: &[f32],
+) -> Result<(), RuntimeError> {
+    let identity = descriptor.vector_identity()?;
+    index_embedding_with_identity(runtime, token, &identity, descriptor, asset_id, embedding).await
+}
+
+#[cfg(test)]
+async fn search_embedding(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    descriptor: &DescriptorIdentity,
+    embedding: &[f32],
+    top_k: u32,
+) -> Result<Vec<VectorSearchHit>, RuntimeError> {
+    let identity = descriptor.vector_identity()?;
+    search_embedding_with_identity(runtime, token, &identity, descriptor, embedding, top_k).await
 }
 
 fn merge_namespace_hits(

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `khive_storage::EmbeddingSpaceIdentity`, a validated immutable physical-vector
+  fence derived from a protocol-owned fingerprint and dimensions (ADR-160 D6).
 - ADR-149 Moodboard pairwise preference learning: actor-attributed randomized
   serve/judgment events, deterministic grouped logistic BCE training,
   temperature/tie calibration, and BlobStore-backed `lattice-fann` model
@@ -26,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Pack-owned vector consumers replace `khive_runtime::NamedVectorIdentity` and
+  `vectors_for_named_identity` with `khive_storage::EmbeddingSpaceIdentity` and
+  `vectors_for_embedding_space`; the source-breaking replacement intentionally
+  has no arbitrary-key compatibility alias (ADR-160 D6).
 - `resolve_project_actor_id` (khive-runtime) now returns
   `ConfigError::ExplicitConfigMissing` when the explicit
   `--config`/`KHIVE_CONFIG` path does not exist, instead of resolving to

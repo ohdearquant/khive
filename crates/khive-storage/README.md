@@ -8,6 +8,11 @@ A concrete backend (`khive-db`'s SQLite implementation, for example) implements
 these traits; the runtime and every pack depend only on this crate, never on a
 specific backend.
 
+The crate also owns backend-neutral value contracts shared by storage and
+runtime. [`EmbeddingSpaceIdentity`](docs/api/embedding-space-identity.md)
+derives one immutable physical vector key from a protocol-owned fingerprint and
+geometry; it is not an additional capability trait.
+
 ## Capability traits
 
 | Trait                                      | Surface                                                                          |
@@ -20,6 +25,15 @@ specific backend.
 | `AttachmentStore`                          | role-keyed blob references owned by entity or note records                       |
 | `BlobStore`                                | content-addressed CRUD and bounded, digest-verified whole-object reads           |
 | `SparseStore`                              | sparse (BM25-style) vector storage                                               |
+
+## Embedding-space identity
+
+`EmbeddingSpaceIdentity` validates the key prefix, governed protocol, owner
+fingerprint, model label, and dimensions, then derives
+`{prefix}_{lowercase_hex(fingerprint)}_{dimensions}`. The physical key has no
+unchecked public constructor. Protocol owners remain responsible for defining
+and golden-testing every vector-affecting field in their fingerprint preimage;
+the shared type does not infer model semantics.
 
 Every method returns `StorageResult<T> = Result<T, StorageError>`.
 `StorageError` variants (`NotFound`, `AlreadyExists`, `Conflict`,
