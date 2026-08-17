@@ -105,7 +105,9 @@ describe("repository showcase", () => {
       `Restored ${bundle.capability.views.dependency_topology.label} for ${pool.source_path}.`,
     );
     expect(pushState).toHaveBeenCalledTimes(2);
-  });
+    // Measured ~1.1-2.2s locally for this golden-fixture, multi-navigation flow; full-suite
+    // CPU contention pushed it past the default 5s timeout, so this needs headroom.
+  }, 20_000);
 
   it("keeps stale and missing deep-link evidence explicit and recoverable", async () => {
     const bundle = golden();
@@ -138,7 +140,9 @@ describe("repository showcase", () => {
     expect(new URL(window.location.href).searchParams.get("module")).not.toBe(
       missingPath,
     );
-  });
+    // Measured ~0.15-0.2s locally; full-suite CPU contention pushed it past the default
+    // 5s timeout, so this needs headroom.
+  }, 20_000);
 
   it("copies the normalized investigation link with visible feedback", async () => {
     const user = userEvent.setup();
