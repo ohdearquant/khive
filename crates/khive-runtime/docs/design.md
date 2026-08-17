@@ -37,6 +37,23 @@
   maintenance. Production whole-buffer reads route through `BlobHydrator`; the
   unbounded raw read surface was removed in ADR-160 Phase 3
 
+### Complete Embedding-Space Identity (ADR-160 D6)
+
+- Pack-owned vector consumers construct `khive_storage::EmbeddingSpaceIdentity`
+  from a protocol-owned fingerprint and pass it to
+  `vectors_for_embedding_space`; runtime no longer exposes an arbitrary named
+  vector key constructor
+- The derived complete key selects the physical table. Runtime verifies the
+  actual sqlite-vec geometry and stored model metadata before returning a
+  table-bound handle seeded with the token namespace as its default
+- Namespace is row/query scope, never part of identity. Unchanged identity
+  reopens the same table after restart; a changed fingerprint or dimensions
+  selects an isolated table
+- The Phase-6 bridge records pack-owned identities in the current registry by
+  full space key. Text-provider registration, lineage schema, vector/ANN/cache
+  keys, rebuild, and atomic serving cutover remain the indivisible Phase-7
+  program
+
 ### Role-Keyed Attachments and V21 Cutover (ADR-121, ADR-160 D4)
 
 - Phase 4a separately ships the transactional-GC compatibility gate without

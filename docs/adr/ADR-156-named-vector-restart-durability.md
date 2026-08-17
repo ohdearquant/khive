@@ -106,6 +106,8 @@ restart semantics for exact-search named vector spaces only.
 
 - `crates/khive-db/src/stores/vectors.rs` — one instance per `vec_{model_key}` table;
   namespace and model predicates applied before rank projection
-- `crates/khive-pack-moodboard/src/model.rs` — descriptor identity fingerprint and
-  `NamedVectorIdentity` derivation
+- `crates/khive-storage/src/embedding_space.rs` — validated complete identity and derived physical
+  key
+- `crates/khive-pack-moodboard/src/model.rs` — descriptor protocol fingerprint and
+  `EmbeddingSpaceIdentity` construction
 - `crates/khive-pack-moodboard/src/handlers.rs` — result materialization and orphan skip

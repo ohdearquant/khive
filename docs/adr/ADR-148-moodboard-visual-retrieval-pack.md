@@ -13,9 +13,9 @@ materialization, and checkpoint seams on acceptance.
 Graphic-media curation needs a durable asset identity, a model-identity-bound visual
 descriptor, and similarity retrieval without pretending that one embedding is a complete
 measure of aesthetic coherence. Khive already owns the required persistence boundaries:
-artifact entities, `BlobStore` content-addressed bytes, token-scoped vector stores, and the
-single MCP `request` surface. Lattice already exposes local Qwen3.5 vision-language pooled
-embedding inference.
+artifact entities, `BlobStore` content-addressed bytes, scope-filtered vector operations, and
+the single MCP `request` surface. Lattice already exposes local Qwen3.5 vision-language
+pooled embedding inference.
 
 The missing layer is composition. Registering a vision checkpoint as a text
 `EmbedderProvider` is incorrect: entity and note creation fans text into every registered
@@ -144,15 +144,23 @@ The runtime adds two consumer seams rather than exposing its backend:
    `BlobStore`, verifies every `ContentRef` before mutation, and commits the entity plus roles in
    one transaction before the existing FTS/vector compensation path; compensation hard-deletes
    the entity and attachment rows together.
-2. `vectors_for_named_identity(token, &NamedVectorIdentity)` returns a token-scoped vector store.
-   `NamedVectorIdentity::new` rejects an empty/unsafe or over-128-byte model key, an empty or
-   over-512-byte model name, zero dimension, and dimensions above 8192. The accessor validates the actual vec table's declared dimension
-   and any stored `embedding_model` value before returning it. After validation it registers the
-   identity in ADR-043's `_embedding_models` lineage with collision-safe engine name `model_key`,
-   model id `model_name`, key version `model_key`, and the validated dimension. A provider-wide
-   engine name such as `lattice-embed` would incorrectly make immutable descriptor revisions
-   contend for ADR-043's one-active-model slot. Pack-owned visual spaces therefore remain visible
-   to `engine list`, and old/new descriptor revisions can remain active together.
+2. `vectors_for_embedding_space(token, &EmbeddingSpaceIdentity)` returns a table-bound vector
+   store seeded with the token namespace as its default; moodboard continues to pass only the
+   authorized write namespace or visible read scopes on each operation. Moodboard supplies prefix
+   `moodboard`, protocol
+   `moodboard.visual-descriptor.v1`, the existing canonical SHA-256 bytes, model label, and
+   dimensions. The shared constructor derives the exact existing
+   `moodboard_{fingerprint}_{dimensions}` key; callers cannot provide a physical key independently.
+   It rejects an invalid prefix/protocol, an empty or over-512-byte model name, zero dimension,
+   dimensions above 8192, or a derived key over 128 bytes. The accessor validates the actual vec
+   table's declared dimension and any stored `embedding_model` value before returning it. During
+   ADR-160 Phase 6 it bridges the identity into ADR-043's current registry with collision-safe
+   engine name `space_key`, model id `model_name`, key version `space_key`, and the validated
+   dimension. A provider-wide engine name such as `lattice-embed` would incorrectly make immutable
+   descriptor revisions contend for ADR-043's one-active-model slot. Pack-owned visual spaces
+   therefore remain visible to `engine list`, and old/new descriptor revisions can remain active
+   together. ADR-160 Phase 7 replaces that transitional registry shape atomically with complete
+   identity and lineage fields.
 
 The vision model is never registered as a text `EmbedderProvider`.
 
