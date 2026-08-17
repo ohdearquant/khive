@@ -2,7 +2,8 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-17
-- **Extends:** ADR-162 (adds a per-class contract dimension in the sense of its §4; ADR-162 is not replaced)
+- **Extends:** ADR-162 (adds a per-class contract dimension in the sense of its §4; ADR-162 is not
+  replaced; takes a scoped, declared exception to §1's single-plane claim — see Consequences)
 - **Depends on:** ADR-005, ADR-007, ADR-018, ADR-022, ADR-161, ADR-162
 
 ## Context
@@ -60,11 +61,20 @@ A third destination is a further decision, not a new label. The set is closed fo
 the entity, note, and edge vocabularies are closed: a value that can be invented at a call site is
 not a contract.
 
+Because sink joins the same per-class contract as write posture, a class declares its posture with
+respect to the sink it declares. A routed class's posture governs writes to the operator audit
+sink, not to the store ADR-022 queries, which that class does not write to at all.
+
 ### 2. Existing classes are grandfathered; omission rejects only new classes
 
 Every class that exists when this ADR is accepted has sink `caller_event_store` without
-redeclaration, and its readers are unaffected. No existing read narrows as a consequence of this
-decision.
+redeclaration, except where this ADR binds a class explicitly (§3), and its readers are
+unaffected. No existing read narrows as a consequence of this decision.
+
+The exception is stated rather than left to inference because ADR-161 is merged and its classes
+are implementable before this ADR is accepted. Without it, a class implemented in that window
+would be assigned `caller_event_store` by this section and `operator_audit` by §3, and a reader
+would have to reconcile two normative assignments. An explicit binding in §3 always wins.
 
 A newly introduced class must declare its sink explicitly. Omission is a rejection of the class
 definition, not a default.
