@@ -32,8 +32,33 @@ fn file_backed_registry(
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
     builder.register(CommPack::new(rt.clone()));
+    // ADR-133: wire the real EventStore so this fixture's dispatches
+    // actually route through the audit-batch seam. Without this, `event_store`
+    // stays `None`, `audit_batch` is never constructed (`pack.rs`'s
+    // `build()`), and every writer_acquisitions delta measured below is pure
+    // note-store cost with no deferred audit row riding along — silently
+    // contradicting the "includes the deferred audit-batch row" claim this
+    // file's comments make about what the delta contains.
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let event_store = rt.events(&token).expect("event store");
+    builder.with_event_store(event_store);
     let registry = builder.build().expect("registry builds");
     (registry, rt)
+}
+
+/// Number of persisted `Audit` events naming `verb` — proof that a dispatch
+/// actually rode the ADR-133 batch seam into the store, not just that the
+/// dispatch itself succeeded.
+async fn audit_row_count_for_verb(rt: &KhiveRuntime, verb: &str) -> u64 {
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let store = rt.events(&token).expect("event store");
+    store
+        .count_events(khive_storage::EventFilter {
+            verbs: vec![verb.to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("count_events")
 }
 
 /// Self-send `n` messages and return their inbound message ids (full UUIDs),
@@ -89,6 +114,7 @@ async fn comm_mark_read_atomic_uses_one_transaction() {
     let (registry, rt) = file_backed_registry(dir.path().join("adr133-d6-atomic.db"));
     let ids = seed_inbound_ids(&registry, 3).await;
 
+    let audit_rows_before = audit_row_count_for_verb(&rt, "comm.mark_read").await;
     let before = rt.db_diagnostics().await.expect("diagnostics before");
     let atomic = registry
         .dispatch(
@@ -98,6 +124,17 @@ async fn comm_mark_read_atomic_uses_one_transaction() {
         .await
         .expect("atomic mark_read commits every target in one transaction");
     let after = rt.db_diagnostics().await.expect("diagnostics after");
+
+    // The batch-seam claim in this file's comments must hold for this
+    // fixture: the dispatch persisted a deferred audit row through
+    // `AuditBatch`, not just through the note store.
+    let audit_rows_after = audit_row_count_for_verb(&rt, "comm.mark_read").await;
+    assert_eq!(
+        audit_rows_after,
+        audit_rows_before + 1,
+        "the atomic mark_read dispatch must persist exactly one audit row through the \
+         ADR-133 batch seam"
+    );
     let atomic_delta = after
         .writer_contention
         .writer_acquisitions
