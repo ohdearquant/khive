@@ -15,6 +15,9 @@ description = "Experimental Khive-native visual retrieval and pairwise preferenc
 khive-types = { version = "0.7.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.7.0", path = "../khive-runtime" }
 khive-storage = { version = "0.7.0", path = "../khive-storage" }
+khive-fusion = { version = "0.7.0", path = "../khive-fusion" }
+khive-retrieval = { version = "0.7.0", path = "../khive-retrieval" }
+khive-score = { version = "0.7.0", path = "../khive-score" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
