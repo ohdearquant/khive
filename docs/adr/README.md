@@ -181,6 +181,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-162](ADR-162-unified-event-plane-ownership.md)                     | Unified Event-Plane Ownership                                                                              |
 | [ADR-163](ADR-163-restart-boundary-event-legibility.md)                 | Restart-Boundary Event Legibility                                                                          |
 | [ADR-164](ADR-164-event-sink-boundary.md)                               | Event Sink Boundary                                                                                        |
+| [ADR-165](ADR-165-read-path-performance-recovery.md)                    | Read-Path Performance Recovery                                                                             |
+| [ADR-166](ADR-166-hot-path-latency-regression-guard.md)                 | Hot-Path Latency Regression Guard                                                                          |
 
 <!-- END GENERATED ADR CATALOG -->
 
