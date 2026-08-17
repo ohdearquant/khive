@@ -92,7 +92,33 @@ describe("materialized repository lookup", () => {
     await user.click(screen.getByRole("button", { name: "Use the curated khive example" }));
     await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
     expect(mockedLoad).toHaveBeenCalledTimes(1);
-  }, 15_000);
+    // Measured ~2.5-4.9s locally across several userEvent interactions and bundle loads;
+    // full-suite CPU contention pushed it past the default 5s timeout, so this needs headroom.
+  }, 30_000);
+
+  it.each([
+    ["query string", `${bundle.meta.repository.canonical_url}?tab=readme`],
+    ["fragment", `${bundle.meta.repository.canonical_url}#readme`],
+  ])(
+    "opens a direct link whose curated repository alias carries a %s",
+    async (_name, repositoryWithExtras) => {
+      window.history.replaceState(
+        null,
+        "",
+        `/?repo=${encodeURIComponent(repositoryWithExtras)}`,
+      );
+
+      const { container } = render(<Showcase />);
+
+      await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+      expect(
+        screen.queryByText("No curated showcase bundle matches this repository"),
+      ).not.toBeInTheDocument();
+      expect(new URL(window.location.href).searchParams.get("repo")).toBe(
+        bundle.meta.repository.canonical_url,
+      );
+    },
+  );
 
   it("preserves a direct investigation while canonicalizing a curated alias", async () => {
     const pool = bundle.graph.modules.items.find((module) =>

@@ -47,9 +47,7 @@ export function publicRepositoryUrlIssue(value: string): string | null {
     if (
       (repository.protocol !== "https:" && repository.protocol !== "http:") ||
       repository.username ||
-      repository.password ||
-      repository.search ||
-      repository.hash
+      repository.password
     ) {
       return "The repository must be a public HTTP or HTTPS URL.";
     }
