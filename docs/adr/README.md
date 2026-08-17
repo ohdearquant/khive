@@ -177,6 +177,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-158](ADR-158-cargo-source-role-projections.md)                     | Cargo Source-Role Projections for Repository Showcase                                                      |
 | [ADR-159](ADR-159-edge-governance-provenance.md)                        | Durable Edge-Governance Provenance for Supersession Canonicalization                                       |
 | [ADR-160](ADR-160-shared-pack-infrastructure.md)                        | Shared Pack Infrastructure Program                                                                         |
+| [ADR-162](ADR-162-unified-event-plane-ownership.md)                     | Unified Event-Plane Ownership                                                                              |
 | [ADR-163](ADR-163-restart-boundary-event-legibility.md)                 | Restart-Boundary Event Legibility                                                                          |
 
 <!-- END GENERATED ADR CATALOG -->
