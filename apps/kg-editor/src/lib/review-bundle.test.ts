@@ -24,8 +24,8 @@ describe("khive.review.v1", () => {
     expect(bundle.snapshot_identity.hash_status).toBe("fixture");
     expect(bundle.snapshot_identity.head_hash).toMatch(/^sha256:/);
     expect(bundle.pull_request.number).toBe(184);
-    expect(bundle.change_set.envelope.batch_id).toBe("atlas-enrich-2026-08-07-184");
-    expect(bundle.change_set.envelope.producer).toBe("lambda:atlas");
+    expect(bundle.change_set.envelope.batch_id).toBe("demo-enrich-2026-08-07-184");
+    expect(bundle.change_set.envelope.producer).toBe("actor:casey");
     expect(bundle.live_proposal).toBeNull();
   });
 
@@ -115,10 +115,10 @@ describe("khive.review.v1", () => {
       change_set: {
         envelope: {
           schema_version: 1,
-          producer: "lambda:atlas",
-          producer_model_family: "family:atlas",
+          producer: "actor:casey",
+          producer_model_family: "family:demo",
           staged_at: 2_000_000,
-          batch_id: "atlas-batch-7",
+          batch_id: "demo-batch-7",
         },
         operations: [
           {
@@ -155,7 +155,7 @@ describe("khive.review.v1", () => {
       findings: [],
       review_gate: {
         required: false,
-        producer_model_family: "family:atlas",
+        producer_model_family: "family:demo",
         reviewer_model_family: null,
         eligible: true,
         approval_ready: true,
@@ -182,7 +182,7 @@ describe("review gate", () => {
       ),
     ).toEqual({
       allowed: false,
-      reason: "ADR-102 requires a reviewer outside family:atlas-frontier.",
+      reason: "ADR-102 requires a reviewer outside family:demo-frontier.",
     });
   });
 

@@ -217,7 +217,7 @@ describe("KG Studio", () => {
     await user.click(screen.getByRole("button", { name: /Approve locally/i }));
 
     expect(
-      screen.getAllByText(/ADR-102 requires a reviewer outside family:atlas-frontier/i),
+      screen.getAllByText(/ADR-102 requires a reviewer outside family:demo-frontier/i),
     ).toHaveLength(2);
     expect(screen.queryByText(/Local decision: approved/i)).not.toBeInTheDocument();
   });
@@ -231,7 +231,7 @@ describe("KG Studio", () => {
     await user.click(screen.getByRole("button", { name: /Approve locally/i }));
     expect(screen.getByText(/Local decision: approved/i)).toBeVisible();
 
-    await user.selectOptions(reviewer, "family:atlas-frontier");
+    await user.selectOptions(reviewer, "family:demo-frontier");
     expect(screen.queryByText(/Local decision: approved/i)).not.toBeInTheDocument();
   });
 
