@@ -1288,7 +1288,7 @@ impl VerbRegistry {
     /// per-relation source/target allowlist (issue #964) — so batch callers can
     /// defer to the kernel's own table instead of re-implementing it locally.
     /// Every `param_type == "uuid"` parameter description has
-    /// [`ID_PARAM_CONTRACT`] appended — a single shared explanation of the
+    /// `ID_PARAM_CONTRACT` appended — a single shared explanation of the
     /// full-UUID-vs-short-prefix contract instead of restating it per param
     /// across every `HandlerDef` in every pack.
     /// Unknown verbs return `RuntimeError::InvalidInput`. Full shape documented
