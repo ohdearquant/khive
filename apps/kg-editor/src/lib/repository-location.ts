@@ -1,4 +1,5 @@
 import type { ViewId } from "@/lib/repo-bundle";
+import { normalizeRepositoryUrl } from "@/lib/showcase-registry";
 
 export const REPOSITORY_VIEW_IDS = [
   "structure_graph",
@@ -105,9 +106,13 @@ function parseRepository(
   issues: RepositoryLocationIssue[],
 ): string | null {
   if (value == null) return null;
-  const message = publicRepositoryUrlIssue(value);
-  if (message) {
-    issues.push({ parameter: "repo", message });
+  if (value.length > REPOSITORY_URL_LIMIT) {
+    issues.push({ parameter: "repo", message: "The repository URL is too long." });
+    return null;
+  }
+  const normalized = normalizeRepositoryUrl(value);
+  if (!normalized.ok) {
+    issues.push({ parameter: "repo", message: normalized.reason });
     return null;
   }
   return value;

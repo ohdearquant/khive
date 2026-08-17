@@ -72,6 +72,27 @@ describe("repository investigation location", () => {
     },
   );
 
+  it.each([
+    [
+      "a query-bearing repository value",
+      `repo=${encodeURIComponent(`${repository}?tab=readme`)}`,
+    ],
+    [
+      "a fragment-bearing repository value",
+      `repo=${encodeURIComponent(`${repository}#readme`)}`,
+    ],
+  ])(
+    "accepts a deep link with %s, deferring to registry normalization",
+    (_name, search) => {
+      const parsed = parseRepositoryLocation(
+        new URL(`https://example.test/?${search}`),
+      );
+
+      expect(parsed.issues).toEqual([]);
+      expect(parsed.location.repository).not.toBeNull();
+    },
+  );
+
   it("canonicalizes only the closed location parameters in stable order", () => {
     const url = repositoryLocationUrl(
       new URL(

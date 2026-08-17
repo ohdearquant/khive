@@ -14,7 +14,7 @@ the allowlisted server route:
 
 ```bash
 KHIVE_SHOWCASE_ANALYSIS_ROOT=/absolute/path/to/analyses \
-KHIVE_SHOWCASE_ANALYSIS_IDS=khive \
+KHIVE_SHOWCASE_ANALYSES='[{"analysis_id":"khive","canonical_url":"https://github.com/ohdearquant/khive"}]' \
 npm run dev
 ```
 

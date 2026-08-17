@@ -152,6 +152,27 @@ describe("materialized repository lookup", () => {
     );
   });
 
+  it.each([
+    ["a query string", "https://github.com/ohdearquant/khive?tab=readme"],
+    ["a fragment", "https://github.com/ohdearquant/khive#readme"],
+  ])(
+    "resolves a curated deep link whose repository value carries %s",
+    async (_name, repositoryValue) => {
+      window.history.replaceState(
+        null,
+        "",
+        `/?repo=${encodeURIComponent(repositoryValue)}`,
+      );
+
+      const { container } = render(<Showcase />);
+
+      await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+      expect(new URL(window.location.href).searchParams.get("repo")).toBe(
+        bundle.meta.repository.canonical_url,
+      );
+    },
+  );
+
   it("waits for catalog discovery before resolving a dynamic deep link", async () => {
     const dynamicAnalysisId = "deep-link-only";
     let releaseCatalog: ((value: Awaited<ReturnType<typeof loadShowcaseAnalysisCatalog>>) => void) | undefined;
