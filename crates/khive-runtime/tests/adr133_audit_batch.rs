@@ -1,0 +1,517 @@
+//! ADR-133 Slice 1: mechanism tests for the audit-batch seam
+//! (`crates/khive-runtime/src/audit_batch.rs`).
+//!
+//! Requires `--features fault-injection,test-internals`. Counters and
+//! checked state prove behavior; clocks are diagnostic only
+//! (`final_verification_plan_r2.md` §1-2).
+
+#![cfg(all(feature = "fault-injection", feature = "test-internals"))]
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use parking_lot::Mutex;
+
+use khive_runtime::audit_batch::{
+    audit_delta, fault_injection, AuditBatch, AuditBatchConfig, AuditBatchControl,
+    AuditBatchSnapshot, AuditCommitOutcome, AuditProducer, AuditSnapshotError, AuditTerminalReason,
+    PreparedAuditRow,
+};
+use khive_storage::event::{EventAppendDisposition, IdempotentEventBatchResult};
+use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
+use khive_storage::{
+    Event, EventFilter, EventStore, StorageCapability, StorageError, StorageResult,
+};
+use khive_types::{EventKind, EventOutcome, SubstrateKind};
+use serial_test::serial;
+
+struct FakeStore {
+    fail_next: AtomicUsize,
+    calls: AtomicU64,
+    rows: Mutex<Vec<Event>>,
+}
+
+impl FakeStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            fail_next: AtomicUsize::new(0),
+            calls: AtomicU64::new(0),
+            rows: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl EventStore for FakeStore {
+    async fn append_event(&self, event: Event) -> StorageResult<()> {
+        self.rows.lock().push(event);
+        Ok(())
+    }
+    async fn append_events(&self, events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+        let n = events.len() as u64;
+        self.rows.lock().extend(events);
+        Ok(BatchWriteSummary {
+            attempted: n,
+            affected: n,
+            failed: 0,
+            first_error: String::new(),
+        })
+    }
+    async fn get_event(&self, id: uuid::Uuid) -> StorageResult<Option<Event>> {
+        Ok(self.rows.lock().iter().find(|e| e.id == id).cloned())
+    }
+    async fn query_events(
+        &self,
+        _filter: EventFilter,
+        _page: PageRequest,
+    ) -> StorageResult<Page<Event>> {
+        unimplemented!("not exercised by audit_batch tests")
+    }
+    async fn count_events(&self, _filter: EventFilter) -> StorageResult<u64> {
+        Ok(self.rows.lock().len() as u64)
+    }
+
+    fn preflight_event(&self, event: &Event) -> StorageResult<()> {
+        if event.verb.is_empty() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Events,
+                operation: "preflight_event".into(),
+                message: "empty verb".into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn append_events_idempotent(
+        &self,
+        events: Vec<Event>,
+    ) -> StorageResult<IdempotentEventBatchResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_next.load(Ordering::SeqCst) > 0 {
+            self.fail_next.fetch_sub(1, Ordering::SeqCst);
+            return Err(StorageError::WriterTaskBusy { timeout_ms: 1 });
+        }
+        let mut rows = self.rows.lock();
+        let mut dispositions = Vec::with_capacity(events.len());
+        for event in events {
+            if let Some(existing) = rows.iter().find(|e| e.id == event.id) {
+                if *existing == event {
+                    dispositions.push(EventAppendDisposition::AlreadyPresentIdentical);
+                } else {
+                    dispositions.push(EventAppendDisposition::IdentityConflict);
+                }
+            } else {
+                rows.push(event);
+                dispositions.push(EventAppendDisposition::Inserted);
+            }
+        }
+        Ok(IdempotentEventBatchResult { rows: dispositions })
+    }
+}
+
+fn mk_event(verb: &str) -> Event {
+    Event::new(
+        "local",
+        verb,
+        EventKind::Audit,
+        SubstrateKind::Event,
+        "test:actor",
+    )
+    .with_outcome(EventOutcome::Success)
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_idle_submit_commits_before_response() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let outcome = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await
+        .expect("commits");
+    assert_eq!(outcome, AuditCommitOutcome::Committed);
+    assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+    batch.quiesce().await.expect("idle");
+    assert!(batch.test_snapshot().is_idle());
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_arrivals_during_commit_share_next_generation() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let batch = batch.clone();
+        handles.push(tokio::spawn(async move {
+            batch
+                .submit(PreparedAuditRow {
+                    event: mk_event(&format!("verb.{i}")),
+                    producer: AuditProducer::DispatchSucceeded,
+                })
+                .await
+        }));
+    }
+    for h in handles {
+        h.await.unwrap().expect("commits");
+    }
+    batch.quiesce().await.expect("idle");
+    let snap = batch.test_snapshot();
+    assert!(snap.store_batch_calls >= 1);
+    assert!(
+        snap.store_batch_calls < 8,
+        "concurrent arrivals must batch, not each take their own acquisition"
+    );
+    assert_eq!(snap.committed_rows, 8);
+}
+
+/// Also exercises `d1_mid_commit_arrival_needs_no_third_generation_without_split_or_retry`:
+/// a burst that lands entirely while idle collapses to few generations, never
+/// one-per-row and never re-splitting an already-formed generation.
+#[serial]
+#[tokio::test]
+async fn d1_mid_commit_arrival_needs_no_third_generation_without_split_or_retry() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let batch = batch.clone();
+        handles.push(tokio::spawn(async move {
+            batch
+                .submit(PreparedAuditRow {
+                    event: mk_event(&format!("verb.{i}")),
+                    producer: AuditProducer::DispatchSucceeded,
+                })
+                .await
+        }));
+    }
+    for h in handles {
+        h.await.unwrap().expect("commits");
+    }
+    batch.quiesce().await.expect("idle");
+    let snap = batch.test_snapshot();
+    assert_eq!(snap.committed_rows, 16);
+    assert!(
+        snap.store_batch_calls < 16,
+        "must not degrade to one acquisition per row"
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_preflight_failure_does_not_poison_other_caller() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let bad = batch
+        .submit(PreparedAuditRow {
+            event: mk_event(""),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(bad, Err(AuditTerminalReason::PreflightRejected));
+    let good = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(good, Ok(AuditCommitOutcome::Committed));
+    assert_eq!(batch.test_snapshot().submitted_rows, 1);
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_retry_table_uses_typed_request_state() {
+    let store = FakeStore::new();
+    store.fail_next.store(1, Ordering::SeqCst);
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let outcome = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(outcome, Ok(AuditCommitOutcome::Committed));
+    assert_eq!(
+        store.calls.load(Ordering::SeqCst),
+        2,
+        "one failure then one successful retry"
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_dropped_waiter_does_not_cancel_generation() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let batch2 = batch.clone();
+    let dropped = tokio::spawn(async move {
+        batch2
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.create"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    dropped.abort();
+    let survivor = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.list"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(survivor, Ok(AuditCommitOutcome::Committed));
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_close_rejects_new_and_drains_accepted() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await
+        .expect("commits");
+    batch.close_and_drain().await.expect("clean close");
+    let rejected = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.list"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(rejected, Err(AuditTerminalReason::AdmissionClosed));
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_child_driver_panic_fails_waiters() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    fault_injection::arm_child_panic();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::DriverPanicked));
+    assert_eq!(
+        batch.quiesce().await,
+        Err(AuditTerminalReason::DriverPanicked)
+    );
+    let second = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.list"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(
+        second,
+        Err(AuditTerminalReason::DriverPanicked),
+        "Failed wins once and rejects further admission"
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_child_driver_cancellation_fails_waiters() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    fault_injection::arm_child_cancel();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::DriverCancelled));
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_supervisor_panic_fails_waiters_before_background_baseline() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    fault_injection::arm_supervisor_panic();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::DriverPanicked));
+    let metrics = batch.metrics_snapshot();
+    assert_eq!(metrics.flush_failures, 1);
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_supervisor_cancellation_fails_waiters_before_background_baseline() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let batch2 = batch.clone();
+    let submitted = tokio::spawn(async move {
+        batch2
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.create"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    // Give the supervisor time to enter the armed sleep, then abort its
+    // retained handle — simulating a shutdown abort landing mid-generation.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        batch.test_abort_supervisor(),
+        "a supervisor must be in flight to abort"
+    );
+    let result = submitted.await.unwrap();
+    assert_eq!(result, Err(AuditTerminalReason::DriverCancelled));
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_lost_join_maps_to_driver_join_lost() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    fault_injection::arm_join_lost();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::DriverJoinLost));
+}
+
+#[serial]
+#[tokio::test]
+async fn d1_success_with_nonterminal_state_maps_to_driver_exited_inconsistent() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    fault_injection::arm_inconsistent_exit();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::DriverExitedInconsistent));
+}
+
+#[serial]
+#[tokio::test]
+async fn d2_d3_pure_observability_degrades_instead_of_blocking() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    fault_injection::arm_child_panic();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("memory.recall"),
+            producer: AuditProducer::RecallExecuted,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::DriverPanicked));
+    let metrics = batch.metrics_snapshot();
+    assert_eq!(metrics.degraded_rows, 1);
+    assert!(metrics.degraded);
+}
+
+#[serial]
+#[tokio::test]
+async fn d2_d3_config_locked_degrades_instead_of_blocking() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    fault_injection::arm_child_panic();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("config.lock"),
+            producer: AuditProducer::ConfigLocked,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::DriverPanicked));
+    assert_eq!(batch.metrics_snapshot().degraded_rows, 1);
+}
+
+#[serial]
+#[tokio::test]
+async fn d2_d3_every_obligation_producer_fails_closed_on_persistent_commit_failure() {
+    for producer in [
+        AuditProducer::GateDenied,
+        AuditProducer::DispatchSucceeded,
+        AuditProducer::DispatchFailed,
+        AuditProducer::UnknownVerb,
+        AuditProducer::GitDigestReceipt,
+    ] {
+        let store = FakeStore::new();
+        let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+        fault_injection::arm_child_panic();
+        let result = batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.create"),
+                producer,
+            })
+            .await;
+        assert_eq!(
+            result,
+            Err(AuditTerminalReason::DriverPanicked),
+            "producer {producer:?} must fail closed"
+        );
+        assert_eq!(
+            batch.metrics_snapshot().degraded_rows,
+            0,
+            "producer {producer:?} is an obligation, not a degraded pure-observability row"
+        );
+    }
+}
+
+#[serial]
+#[tokio::test]
+async fn audit_delta_rejects_regressed_counters() {
+    let before = AuditBatchSnapshot {
+        pending_rows: 0,
+        in_flight_generation: None,
+        driver_active: false,
+        next_generation_id: 2,
+        submitted_rows: 5,
+        committed_rows: 5,
+        store_batch_calls: 1,
+        per_generation: vec![],
+    };
+    let mut after = before.clone();
+    after.submitted_rows = 4;
+    assert_eq!(
+        audit_delta(&before, &after),
+        Err(AuditSnapshotError::CounterRegressed)
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn identity_conflict_reported_per_row_and_isolated() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let base = mk_event("kg.create");
+    store.rows.lock().push(
+        Event {
+            id: base.id,
+            ..base.clone()
+        }
+        .with_payload(serde_json::json!({"different": true})),
+    );
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: base,
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::IdentityConflict));
+}
