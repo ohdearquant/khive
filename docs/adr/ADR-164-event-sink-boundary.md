@@ -131,6 +131,12 @@ for at the cost of a trusted field on every row.
   and this decision is built on them rather than amending them.
 - **No retention, aggregation, or transport policy for the operator sink.** Where operator audit
   records live and how long they survive is a separate operational decision.
+- **No migration of already-persisted records.** The sink declaration governs writes from its
+  effective date; migration of already-persisted records is out of scope. Selecting a destination
+  is a property of the write path, so the guarantee is prospective: a record written before a
+  class's declaration takes effect keeps the reachability it was written with. This is a
+  clarification rather than a limitation, because §2 grandfathers existing classes and §3 binds
+  only the classes named there, so this decision creates no reclassification to migrate.
 - **No restart-visibility projection.** ADR-163 §4 declares its cross-namespace scope correct and
   requires deliberate projection for any caller surface that wants it. That is a different problem
   with a different answer, and routing it through a sink declaration would be a category error.
