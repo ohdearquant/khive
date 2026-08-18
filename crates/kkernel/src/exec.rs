@@ -230,18 +230,24 @@ type ForwardFuture<'a> = std::pin::Pin<
 
 /// Function pointer type for the daemon-forwarding seam.
 #[cfg(unix)]
-type ForwardFnPtr =
-    for<'a> fn(&'a DaemonRequestFrame, Option<PathBuf>, Option<&'a str>) -> ForwardFuture<'a>;
+type ForwardFnPtr = for<'a> fn(
+    &'a DaemonRequestFrame,
+    Option<PathBuf>,
+    Option<&'a str>,
+    Vec<String>,
+) -> ForwardFuture<'a>;
 
-/// Adapts the real `forward_or_spawn` to the `ForwardFnPtr` signature.
+/// Adapts the real `forward_or_spawn_with_config` to the `ForwardFnPtr` signature.
 #[cfg(unix)]
 fn forward_or_spawn_boxed<'a>(
     frame: &'a DaemonRequestFrame,
     config: Option<PathBuf>,
     db: Option<&'a str>,
+    packs: Vec<String>,
 ) -> ForwardFuture<'a> {
     Box::pin(async move {
-        khive_mcp::daemon::forward_or_spawn_with_config(frame, config.as_deref(), db).await
+        khive_mcp::daemon::forward_or_spawn_with_config(frame, config.as_deref(), db, Some(&packs))
+            .await
     })
 }
 
@@ -2311,7 +2317,12 @@ async fn run_exec_inline_with_forward(
             }
             _ => None,
         };
-        if let Some(res) = forward_fn(&frame, spawn_config, spawn_db).await {
+        // Forward this client's already-resolved pack list unconditionally so
+        // a daemon this call spawns matches `cfg`'s `config_id` fingerprint
+        // (which folds `packs`) instead of re-deriving its own selection from
+        // ambient env/config and risking a mismatch (khive-oss#1941).
+        let spawn_packs = cfg.packs.clone();
+        if let Some(res) = forward_fn(&frame, spawn_config, spawn_db, spawn_packs).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             let output = prepare_exec_output(&output, strict);
             println!("{output}");
@@ -6001,6 +6012,7 @@ id = "lambda:fallback"
         _frame: &'a DaemonRequestFrame,
         _config: Option<PathBuf>,
         _db: Option<&'a str>,
+        _packs: Vec<String>,
     ) -> super::ForwardFuture<'a> {
         SPY_WAS_CALLED.with(|c| c.set(true));
         Box::pin(async { None })
@@ -6137,6 +6149,8 @@ id = "lambda:fallback"
             const { std::cell::RefCell::new(None) };
         static SPY_CAPTURED_DB: std::cell::RefCell<Option<String>> =
             const { std::cell::RefCell::new(None) };
+        static SPY_CAPTURED_PACKS: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(unix)]
@@ -6144,10 +6158,12 @@ id = "lambda:fallback"
         frame: &'a DaemonRequestFrame,
         config: Option<PathBuf>,
         db: Option<&'a str>,
+        packs: Vec<String>,
     ) -> super::ForwardFuture<'a> {
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
         SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config);
         SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = db.map(str::to_string));
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
         Box::pin(async { None })
     }
 
@@ -6156,10 +6172,12 @@ id = "lambda:fallback"
         frame: &'a DaemonRequestFrame,
         config: Option<PathBuf>,
         db: Option<&'a str>,
+        packs: Vec<String>,
     ) -> super::ForwardFuture<'a> {
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
         SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config);
         SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = db.map(str::to_string));
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
         Box::pin(async {
             Some(Ok(
                 r#"{"results":[{"ok":true,"tool":"stats","result":{}}],"summary":{"total":1,"succeeded":1,"failed":0}}"#
@@ -6641,6 +6659,121 @@ path = "{}"
             Some(override_path.display().to_string()),
             "the single-backend concrete override must reach the daemon spawn seam so a \
              spawned daemon binds the operator's file instead of the default database"
+        );
+    }
+
+    /// khive-oss#1941: a client whose environment sets `KHIVE_PACKS` must
+    /// forward that resolved pack list to any daemon it spawns, or the fresh
+    /// daemon defaults to the built-in pack set, its `config_id` disagrees
+    /// with every caller expecting the wider selection, and those callers
+    /// permanently fall back to in-process dispatch instead of the warm
+    /// daemon.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn env_khive_packs_reaches_daemon_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        std::env::set_var("KHIVE_PACKS", "kg,gtd,memory");
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config from KHIVE_PACKS env");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        std::env::remove_var("KHIVE_PACKS");
+
+        assert!(
+            result.is_ok(),
+            "forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_PACKS.with(|captured| captured.borrow_mut().take()),
+            Some(vec![
+                "kg".to_string(),
+                "gtd".to_string(),
+                "memory".to_string()
+            ]),
+            "the KHIVE_PACKS-resolved pack list must reach the daemon spawn seam so a \
+             spawned daemon serves the same packs this client resolved"
+        );
+    }
+
+    /// Control for `env_khive_packs_reaches_daemon_spawn_seam`: with no
+    /// `KHIVE_PACKS` (or other pack-selection input) set, the client resolves
+    /// the built-in production pack set and forwards exactly that — a
+    /// spawned daemon re-deriving the same built-in default independently
+    /// would reach the identical outcome, so this proves the fix is additive
+    /// and does not change the unconfigured default path's effective result.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn no_env_control_forwards_built_in_default_packs_to_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config with no pack-selection input");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_PACKS.with(|captured| captured.borrow_mut().take()),
+            Some(RuntimeConfig::built_in_packs()),
+            "with no pack-selection input the client must forward exactly the built-in \
+             default pack set — identical to what an independently-spawned daemon would \
+             have defaulted to on its own"
         );
     }
 

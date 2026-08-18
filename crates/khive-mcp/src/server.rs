@@ -2645,7 +2645,24 @@ impl KhiveMcpServer {
         #[cfg(unix)]
         if p.save_to.is_none() {
             let frame = self.wire_daemon_frame(&p);
-            let forwarded = crate::daemon::forward_or_spawn(&frame);
+            // Forward this server's own resolved pack list so a daemon this
+            // call spawns serves the SAME packs this process registered —
+            // `pack_names()` reflects the actual loaded registry regardless
+            // of whether that selection came from `--pack`, `KHIVE_PACKS`,
+            // or a discovered `[runtime].packs` config entry, none of which
+            // otherwise reach a freshly spawned child (khive-oss#1941).
+            let resolved_packs: Vec<String> = self
+                .registry
+                .pack_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            let forwarded = crate::daemon::forward_or_spawn_with_config(
+                &frame,
+                None,
+                None,
+                Some(&resolved_packs),
+            );
             tokio::pin!(forwarded);
             let forwarded = tokio::select! {
                 result = &mut forwarded => result,
