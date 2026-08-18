@@ -2477,6 +2477,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-general-category",
  "uuid",
 ]
 
@@ -2596,6 +2597,7 @@ dependencies = [
  "dotenvy",
  "khive-changeset",
  "khive-db",
+ "khive-gate-rego",
  "khive-mcp",
  "khive-pack-blob",
  "khive-pack-brain",

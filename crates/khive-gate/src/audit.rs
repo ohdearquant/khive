@@ -17,12 +17,12 @@ pub struct AuditEvent {
     pub namespace: String,
     /// Verb being dispatched.
     pub verb: String,
-    /// Gate outcome — `"allow"` or `"deny"`.
+    /// Gate outcome — `"allow"`, `"deny"`, or `"gate_unavailable"`.
     pub decision: AuditDecision,
     /// Deny reason, present only when `decision == "deny"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_reason: Option<String>,
-    /// Obligations on allow; always serialized and empty on deny.
+    /// Obligations on allow; always serialized and empty on deny or outage.
     #[serde(default)]
     pub obligations: Vec<Obligation>,
     /// Name of the gate implementation that produced this decision.
@@ -32,12 +32,13 @@ pub struct AuditEvent {
     pub session_id: Option<String>,
 }
 
-/// The outcome field of an [`AuditEvent`], serialised as `"allow"` / `"deny"`.
+/// The outcome field of an [`AuditEvent`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditDecision {
     Allow,
     Deny,
+    GateUnavailable,
 }
 
 impl AuditEvent {
@@ -61,6 +62,21 @@ impl AuditEvent {
             decision: audit_decision,
             deny_reason,
             obligations,
+            gate_impl: gate_impl.to_string(),
+            session_id: req.context.session_id.clone(),
+        }
+    }
+
+    /// Project a gate infrastructure failure into the stable audit envelope.
+    pub fn gate_unavailable(req: &crate::GateRequest, gate_impl: &str) -> Self {
+        Self {
+            timestamp: req.context.timestamp.unwrap_or_else(chrono::Utc::now),
+            actor: req.actor.clone(),
+            namespace: req.namespace.as_str().to_string(),
+            verb: req.verb.clone(),
+            decision: AuditDecision::GateUnavailable,
+            deny_reason: None,
+            obligations: Vec::new(),
             gate_impl: gate_impl.to_string(),
             session_id: req.context.session_id.clone(),
         }

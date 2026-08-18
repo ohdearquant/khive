@@ -4,10 +4,11 @@
 **Date**: 2026-07-16
 **Authors**: khive maintainers
 **Relates to**: [ADR-018](ADR-018-authorization-gate.md) (authorization Gate seam, rejected as
-the layer for this decision), [ADR-014](ADR-014-curation-operations.md) (curation operations,
-unaffected), [ADR-015](ADR-015-schema-migrations.md) (migration policy, if a durable event shape
-requires one), [ADR-096](ADR-096-warm-daemon-per-request-identity.md) (single-principal host-trust
-posture this ADR relies on and does not extend)
+the layer for this decision, with its Gate-error posture amended by ADR-129),
+[ADR-014](ADR-014-curation-operations.md) (curation operations, unaffected),
+[ADR-015](ADR-015-schema-migrations.md) (migration policy, if a durable event shape requires one),
+[ADR-096](ADR-096-warm-daemon-per-request-identity.md) (single-principal host-trust posture this ADR
+relies on and does not extend)
 
 ---
 
@@ -271,8 +272,9 @@ final outcome, and the persisted record id. It records no content and no detecto
 records also distinguish `exempted`, `manifest-invalid`, `audit-failed`, `stamp-failed`, and
 `record-write-failed` outcomes. This audit is part of the exemption control itself, not a general
 [ADR-018](ADR-018-authorization-gate.md) Gate audit event, and its failure semantics are independent
-of that ADR's fail-open infrastructure-error handling (see Fail-closed, below). An admitted exempted
-record must never exist without both its reserved stamp and a queryable audit event; if the
+of the Gate audit and infrastructure-error handling defined there and amended by ADR-129 (see
+Fail-closed, below). An admitted exempted record must never exist without both its reserved stamp and
+a queryable audit event; if the
 implementation cannot make this atomic in one transaction, it must use a transactional outbox or
 equivalent, and audit-persistence failure on this path blocks the write rather than proceeding.
 
@@ -291,10 +293,10 @@ what is shown).
 The exemption is a scoped carve-out from the existing heuristic path, not a replacement for it. Any
 error condition on the exemption path — missing, unreadable, malformed, stale, duplicate-conflicting,
 unsupported-algorithm, or unknown-version manifest; stamp-write failure; audit-persistence failure —
-degrades to the current, unchanged blocking behavior. It never degrades to allow. This applies even
-though [ADR-018](ADR-018-authorization-gate.md) treats Gate-infrastructure errors as fail-open;
-that policy governs the coarse authorization seam, not this content-level exemption, and this ADR
-does not adopt it here.
+degrades to the current, unchanged blocking behavior. It never degrades to allow. ADR-129 now also
+makes [ADR-018](ADR-018-authorization-gate.md) Gate-infrastructure errors fail closed, but that
+policy governs the coarse authorization seam, not this content-level exemption. The two layers
+refuse independently for different reasons.
 
 ---
 
@@ -494,10 +496,10 @@ patching individual manifest entries.
   no verified hash; making it content-aware would require threading the exact scanner input and a
   runtime field scope into the request, a recomputation/consumption step in every handler, and
   equivalent treatment of the `code.ingest` direct-write path — which reconstructs this ADR's design
-  after an added policy round trip, while also inheriting ADR-018's fail-open-on-infrastructure-error
-  semantics, which this exemption must not have. A future real Gate may still authorize who is
-  permitted to administer the exemption manifest; it must not decide whether submitted bytes match
-  an entry.
+  after an added policy round trip. ADR-129 has since made Gate infrastructure errors fail closed,
+  but the Gate still lacks the content evidence this exemption requires. A future real Gate may
+  still authorize who is permitted to administer the exemption manifest; it must not decide whether
+  submitted bytes match an entry.
 - **[ADR-014](ADR-014-curation-operations.md)**: curation operations (`update`, `delete`, `merge`)
   are unaffected by this ADR beyond the property-reservation requirement in Decision §4 — none of
   them may set or clear `khive:secret_gate` on the caller's behalf, and `merge` must carry the
@@ -516,9 +518,9 @@ patching individual manifest entries.
 
 - **At the [ADR-018](ADR-018-authorization-gate.md) Gate seam.** Rejected. The seam is coarse —
   verb, namespace, actor, source — and has no content access. Making it content-aware converges on
-  this ADR's own design plumbed through an extra policy round trip, while inheriting Gate's
-  fail-open-on-error semantics, which this exemption must not have. The shipping Gate is
-  `AllowAllGate`, so this option is also inert today.
+  this ADR's own design plumbed through an extra policy round trip. ADR-129 has removed the former
+  fail-open-on-error difference, but it does not give the Gate content-specific evidence. The
+  shipping Gate is `AllowAllGate`, so this option is also inert today.
 - **A new pre-handler attestation service.** Rejected for now. A dedicated component that
   recomputes hashes and consults the allowlist ahead of dispatch offers cleaner separation, but it
   is a new registry, lifecycle, cache, refresh protocol, and failure surface with no distinct trust
