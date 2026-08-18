@@ -2868,6 +2868,28 @@ mod tests {
         }
     }
 
+    /// RAII guard restoring `KHIVE_PACKS`, `HOME`, and the working directory
+    /// to their pre-test values on every exit path, including an unwinding
+    /// panic — a bare cleanup call at the end of a test function only runs
+    /// when every earlier statement (setup and assertions alike) succeeds,
+    /// which leaks process-globals to later `#[serial]` tests otherwise.
+    struct EnvAndCwdGuard {
+        original_packs: Option<std::ffi::OsString>,
+        original_home: Option<std::ffi::OsString>,
+        original_cwd: std::path::PathBuf,
+    }
+
+    impl Drop for EnvAndCwdGuard {
+        fn drop(&mut self) {
+            match self.original_packs.take() {
+                Some(v) => std::env::set_var("KHIVE_PACKS", v),
+                None => std::env::remove_var("KHIVE_PACKS"),
+            }
+            restore_home(self.original_home.take());
+            let _ = std::env::set_current_dir(&self.original_cwd);
+        }
+    }
+
     // ── acquire_local_construction_guard: in-memory dbs skip the guard ────────
 
     #[test]
@@ -6732,6 +6754,10 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn no_env_control_forwards_built_in_default_packs_to_spawn_seam() {
+        let original_cwd = std::env::current_dir().expect("read cwd");
+        let original_packs = std::env::var_os("KHIVE_PACKS");
+        let original_home = std::env::var_os("HOME");
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -6743,11 +6769,22 @@ path = "{}"
         // (`~/.khive/config.toml`) — either one declaring `[runtime].packs`
         // would satisfy this control incidentally instead of proving the
         // built-in-default path, so neither may be the ambient machine's.
-        let (prev_home, _home_dir) = isolate_home_for_test();
-        let original_cwd = std::env::current_dir().expect("read cwd");
+        let home_dir = tempfile::tempdir().expect("tempdir for isolated HOME");
+        std::env::set_var("HOME", home_dir.path());
         let empty_project_root = tempfile::tempdir().expect("empty project-root tempdir");
         std::env::set_current_dir(empty_project_root.path())
             .expect("chdir into isolated project root with no discoverable config");
+
+        // Declared last so it drops FIRST (reverse declaration order):
+        // KHIVE_PACKS/HOME/cwd are restored before `home_dir` and
+        // `empty_project_root` are removed, on every exit including a
+        // panic from an assertion below.
+        let _guard = EnvAndCwdGuard {
+            original_packs,
+            original_home,
+            original_cwd,
+        };
+
         SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
 
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
@@ -6784,9 +6821,6 @@ path = "{}"
             spy_capture_config_and_succeed,
         )
         .await;
-
-        std::env::set_current_dir(&original_cwd).expect("restore cwd");
-        restore_home(prev_home);
 
         assert!(
             result.is_ok(),
