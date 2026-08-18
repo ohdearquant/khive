@@ -1848,8 +1848,16 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
     );
 
     assert!(
-        logs.contains(CANARY),
-        "T2c: the full backend error must still reach the server-side log: {logs}"
+        !logs.contains(CANARY),
+        "T2c: backend error text must not reach the server-side log unmasked: {logs}"
+    );
+    assert!(
+        !logs.contains("not-a-real-secret"),
+        "T2c: the credential fragment must not reach the server-side log: {logs}"
+    );
+    assert!(
+        logs.contains("***MASKED***"),
+        "T2c: the gate failure log must still record the masked backend error: {logs}"
     );
 }
 

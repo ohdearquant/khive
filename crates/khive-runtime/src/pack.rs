@@ -1338,7 +1338,9 @@ impl VerbRegistry {
     /// loop is spawned (ADR-056 §6).  Returns `Ok(())` when the gate allows the
     /// namespace, or `Err(RuntimeError::PermissionDenied{..})` when denied.
     /// Gate errors (implementation failures) are surfaced as
-    /// `RuntimeError::Internal`.
+    /// `RuntimeError::Internal` carrying the stable classified reason; the
+    /// bounded, masked backend detail goes to the server-side log here, since
+    /// callers log the returned error.
     pub fn authorize_namespace(&self, ns: Namespace) -> Result<(), RuntimeError> {
         let actor = crate::actor_identity::resolve_actor(self.actor_id.as_deref());
         let req = GateRequest::new(actor, ns, "authorize", serde_json::Value::Null);
@@ -1352,7 +1354,16 @@ impl VerbRegistry {
                 verb: "authorize".to_string(),
                 reason: "gate denied".to_string(),
             }),
-            Err(e) => Err(RuntimeError::Internal(format!("gate error: {e}"))),
+            Err(e) => {
+                tracing::warn!(
+                    error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
+                    "authorize_namespace: gate check failed (fail-closed)"
+                );
+                Err(RuntimeError::Internal(format!(
+                    "gate error: {}",
+                    e.wire_reason()
+                )))
+            }
         }
     }
 
@@ -1604,7 +1615,7 @@ impl VerbRegistry {
         );
         tracing::warn!(
             verb = %gate_req.verb,
-            error = %error,
+            error = %crate::secret_gate::bounded_masked_log_text(&error.to_string()),
             "gate check failed (fail-closed)"
         );
         if let Some(store) = &self.event_store {
@@ -6132,8 +6143,9 @@ pub(crate) mod tests {
     /// `Display` text can embed connection details (URLs, addresses, auth
     /// material). That text must never reach `RuntimeError::GateUnavailable`
     /// as observed by a dispatch caller — only the stable classified
-    /// `wire_reason()` may cross that boundary. The full error is still
-    /// logged server-side via `tracing::warn!` in `gate_unavailable_error`.
+    /// `wire_reason()` may cross that boundary. A bounded, masked rendering
+    /// of the error is logged server-side via `tracing::warn!` in
+    /// `gate_unavailable_error`.
     #[tokio::test]
     async fn gate_unavailable_reason_never_carries_backend_error_text() {
         const CANARY: &str = "postgres://svc:not-a-real-secret@internal-host";

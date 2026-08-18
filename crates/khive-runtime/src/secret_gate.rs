@@ -281,6 +281,31 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Maximum characters of raw error text admitted to the masking pass.
+const MAX_LOG_TEXT_INPUT_CHARS: usize = 4_096;
+/// Maximum characters of masked error text emitted to a log record.
+const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
+
+/// Bound and mask arbitrary error text for log emission.
+///
+/// Log records are a disclosure surface the same way wire errors are: they are
+/// shipped, aggregated, and read by consumers outside the process. Backend
+/// error text (gate backends included) can embed connection strings or
+/// credentials, so it is truncated before masking (a pathological input cannot
+/// inflate the masking pass), masked with the canonical detector set, and
+/// bounded again for the emitted record. A truncation in either pass appends
+/// `…` so the record declares its own incompleteness.
+pub fn bounded_masked_log_text(text: &str) -> String {
+    let bounded_input: String = text.chars().take(MAX_LOG_TEXT_INPUT_CHARS).collect();
+    let masked = mask_secrets(&bounded_input);
+    let mut chars = masked.chars();
+    let mut bounded: String = chars.by_ref().take(MAX_LOG_TEXT_OUTPUT_CHARS).collect();
+    if chars.next().is_some() || text.chars().nth(MAX_LOG_TEXT_INPUT_CHARS).is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
 // ─── Layer 1: known patterns ─────────────────────────────────────────────────
 
 /// Each entry: (detector_name, needle, min_total_token_len).
@@ -3593,6 +3618,47 @@ mod tests {
     }
 
     // ── mask_secrets: in-place redaction reusing the canonical detector ───────
+
+    #[test]
+    fn bounded_masked_log_text_masks_connection_string_credentials() {
+        let raw =
+            "gate backend probe failed: postgres://svc:not-a-real-secret@internal-host refused"; // gitleaks:allow
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains("not-a-real-secret"),
+            "credential must be masked: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "masked marker must record that detail was redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("gate backend probe failed"),
+            "non-secret diagnostic prose must survive: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_bounds_pathological_input() {
+        let raw = "x".repeat(MAX_LOG_TEXT_INPUT_CHARS + 500);
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            rendered.chars().count() <= MAX_LOG_TEXT_OUTPUT_CHARS + 1,
+            "output must be bounded: {} chars",
+            rendered.chars().count()
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated output must declare its own truncation"
+        );
+
+        let short = "gate policy file unreadable";
+        assert_eq!(
+            bounded_masked_log_text(short),
+            short,
+            "short clean text passes through unchanged"
+        );
+    }
 
     #[test]
     fn mask_secrets_borrows_clean_text() {

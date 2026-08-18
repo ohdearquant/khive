@@ -820,7 +820,7 @@ impl KhiveRuntime {
             Err(e) => {
                 tracing::warn!(
                     namespace = %ns.as_str(),
-                    error = %e,
+                    error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
                     "authorize: gate check failed (fail-closed)"
                 );
                 Err(crate::RuntimeError::Internal(format!(
@@ -887,7 +887,7 @@ impl KhiveRuntime {
             Err(e) => {
                 tracing::warn!(
                     namespace = %primary.as_str(),
-                    error = %e,
+                    error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
                     "authorize_with_visibility: gate check failed (fail-closed)"
                 );
                 Err(crate::RuntimeError::Internal(format!(
