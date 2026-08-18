@@ -42,12 +42,46 @@ export async function loadPreferredShowcaseBundle(
   };
 }
 
+// A connection that never resolves, or a response body that stops
+// delivering bytes without rejecting, would otherwise leave the snapshot
+// read pending forever and keep the page in its loading state instead of
+// reaching the static fallback below. This deadline bounds the connection,
+// header wait, and full body parse together, so any of those hangs falls
+// back to the curated static asset once it elapses.
+export const DB_SNAPSHOT_TIMEOUT_MS = 5_000;
+
 // The DB snapshot is a progressive enhancement over the static asset: any
-// failure on this path (network, status, provenance, schema, or identity)
-// must fall back to the static render rather than fail the page.
+// failure on this path (network, status, provenance, schema, identity, or
+// timeout) must fall back to the static render rather than fail the page.
 async function tryLoadDbSnapshotBundle(
   entry: ShowcaseRegistryEntry,
   fetchBundle: ShowcaseFetch,
+): Promise<RepoBundle | null> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    DB_SNAPSHOT_TIMEOUT_MS,
+  );
+  const deadline = new Promise<null>((resolve) => {
+    controller.signal.addEventListener("abort", () => resolve(null), {
+      once: true,
+    });
+  });
+
+  try {
+    return await Promise.race([
+      readDbSnapshotBundle(entry, fetchBundle, controller.signal),
+      deadline,
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function readDbSnapshotBundle(
+  entry: ShowcaseRegistryEntry,
+  fetchBundle: ShowcaseFetch,
+  signal: AbortSignal,
 ): Promise<RepoBundle | null> {
   const endpoint = `/api/showcase/analyses/${entry.analysisId}`;
   let response: ShowcaseResponse;
@@ -56,6 +90,7 @@ async function tryLoadDbSnapshotBundle(
       cache: "no-store",
       credentials: "same-origin",
       redirect: "error",
+      signal,
     });
   } catch {
     return null;

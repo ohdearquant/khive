@@ -2,7 +2,10 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { loadPreferredShowcaseBundle } from "@/lib/adapters/preferred-showcase-source";
+import {
+  DB_SNAPSHOT_TIMEOUT_MS,
+  loadPreferredShowcaseBundle,
+} from "@/lib/adapters/preferred-showcase-source";
 import { SHOWCASE_REGISTRY } from "@/lib/showcase-registry";
 
 const golden = readFileSync(
@@ -50,6 +53,7 @@ describe("preferred showcase source", () => {
       cache: "no-store",
       credentials: "same-origin",
       redirect: "error",
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -190,6 +194,62 @@ describe("preferred showcase source", () => {
     expect(result.source).toBe("curated-static-fallback");
     expect(result.bundle.schema_version).toBe("khive.repo.v1");
     expect(fetchBundle).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the static asset when the DB snapshot request never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchBundle = vi.fn((input: string) => {
+        if (input.startsWith("/api/")) {
+          return new Promise<never>(() => {});
+        }
+        return Promise.resolve(response(golden, 200));
+      });
+
+      const resultPromise = loadPreferredShowcaseBundle(
+        SHOWCASE_REGISTRY[0],
+        fetchBundle,
+      );
+      await vi.advanceTimersByTimeAsync(DB_SNAPSHOT_TIMEOUT_MS);
+      const result = await resultPromise;
+
+      expect(result.source).toBe("curated-static-fallback");
+      expect(result.bundle.schema_version).toBe("khive.repo.v1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to the static asset when the DB snapshot response body never completes", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchBundle = vi.fn((input: string) => {
+        if (input.startsWith("/api/")) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers({
+              "x-khive-analysis-id": "khive",
+              "x-khive-analysis-source": "khive-db-snapshot",
+            }),
+            arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+          });
+        }
+        return Promise.resolve(response(golden, 200));
+      });
+
+      const resultPromise = loadPreferredShowcaseBundle(
+        SHOWCASE_REGISTRY[0],
+        fetchBundle,
+      );
+      await vi.advanceTimersByTimeAsync(DB_SNAPSHOT_TIMEOUT_MS);
+      const result = await resultPromise;
+
+      expect(result.source).toBe("curated-static-fallback");
+      expect(result.bundle.schema_version).toBe("khive.repo.v1");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not surface an unhandled rejection or thrown error when every DB snapshot failure mode falls back", async () => {
