@@ -2596,6 +2596,7 @@ dependencies = [
  "dotenvy",
  "khive-changeset",
  "khive-db",
+ "khive-gate-rego",
  "khive-mcp",
  "khive-pack-blob",
  "khive-pack-brain",

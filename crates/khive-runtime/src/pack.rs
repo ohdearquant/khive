@@ -4726,25 +4726,26 @@ pub(crate) mod tests {
     // ---- Rego gate: fail-closed end-to-end ----
 
     /// A `RegoGate` whose policy lacks the named entrypoint rule must cause
-    /// `VerbRegistry::dispatch` to return `RuntimeError::PermissionDenied` —
-    /// never to proceed to the pack handler.
+    /// `VerbRegistry::dispatch` to fail closed — never to proceed to the pack
+    /// handler.
     ///
     /// This is the runtime-level assertion that a gate evaluation failure
-    /// fails closed rather than opening a security hole.
-    /// `RegoGate::check` converts all evaluation failures (missing rule,
-    /// undefined result, serialization error, poisoned engine) to
-    /// `Ok(GateDecision::Deny)`, so dispatch is blocked as a policy refusal.
-    /// Infrastructure faults from other `Gate` implementations remain
-    /// distinguishable as `RuntimeError::GateUnavailable`.
+    /// fails closed rather than opening a security hole. `RegoGate::check`
+    /// classifies evaluator failures (missing rule, other eval-time errors)
+    /// as `Err(GateError::Policy)`, which `VerbRegistry::dispatch` surfaces as
+    /// `RuntimeError::GateUnavailable` carrying the stable classified reason
+    /// — never the raw evaluator text. A genuine policy deny (undefined
+    /// result, wrong-shaped decision) still returns `Ok(GateDecision::Deny)`
+    /// and surfaces as `RuntimeError::PermissionDenied`.
     #[tokio::test]
-    async fn rego_gate_missing_entrypoint_returns_permission_denied() {
+    async fn rego_gate_missing_entrypoint_returns_gate_unavailable() {
         use khive_gate_rego::RegoGate;
 
         // Policy defines `verdict` but NOT `data.khive.gate.decision` (the
         // default entrypoint).  Construction succeeds — from_policy_str does
-        // not validate the default entrypoint.  check() must convert the
-        // missing-rule evaluation error to Ok(Deny) so the runtime reports a
-        // policy refusal rather than a gate infrastructure outage.
+        // not validate the default entrypoint.  check() classifies the
+        // missing-rule evaluation error as a policy-evaluation failure, which
+        // the runtime surfaces as a gate outage, not a policy refusal.
         let policy = r#"
             package khive.gate
             import rego.v1
@@ -4759,8 +4760,9 @@ pub(crate) mod tests {
 
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
         assert!(
-            matches!(err, RuntimeError::PermissionDenied { ref verb, .. } if verb == "create"),
-            "expected PermissionDenied for missing rego entrypoint, got {err:?}"
+            matches!(err, RuntimeError::GateUnavailable { ref verb, ref reason }
+                if verb == "create" && reason == "gate policy evaluation failed"),
+            "expected GateUnavailable with the classified policy-evaluation reason for a missing rego entrypoint, got {err:?}"
         );
     }
 

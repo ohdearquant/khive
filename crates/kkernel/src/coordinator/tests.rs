@@ -1861,6 +1861,115 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
     );
 }
 
+// ---- T2d: Real RegoGate evaluator failure stays sanitized on the wire ----
+
+/// Regression for the rego-backed `Gate` sanitization fix: `RegoGate::check`
+/// used to fold `regorus`'s raw evaluator-error text directly into a
+/// `GateDecision::deny(...)` reason, which crossed both the MCP wire and the
+/// server-side log unmasked whenever the offending value happened to be
+/// caller-supplied. It now classifies the failure as
+/// `Err(GateError::Policy(..))`, so the runtime's existing fail-closed
+/// classify+mask boundary (`VerbRegistry::gate_unavailable_error`) handles
+/// both surfaces: the wire only ever sees the stable `wire_reason()`, and the
+/// full detail reaches the server-side log already bounded+masked.
+///
+/// Dispatches through `KhiveMcpServer::dispatch_request_local` with no
+/// coordinator attached (single-backend), the same real MCP wire boundary as
+/// T2c, but with a genuine `RegoGate` instead of a synthetic `Gate` impl —
+/// this is what actually exercises `khive-gate-rego/src/gate.rs`'s
+/// evaluator-failure branch rather than the generic classify+mask plumbing
+/// T2c already covers.
+#[tokio::test]
+async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
+    use khive_gate_rego::RegoGate;
+
+    // FAKE key: real AKIA/AWS shape, invented suffix — matches the masking
+    // detector so a leak would be caught either as raw canary text or as a
+    // missing "***MASKED***" marker (see khive-gate-rego's own tests for the
+    // convention).
+    const CANARY: &str = "AKIAFAKEKEY000000000";
+
+    // `input.args.canary` is a string; `1 + <string>` is a regorus type
+    // error raised at eval time whose message embeds the offending value
+    // verbatim — exactly the evaluator-failure shape this fix must sanitize.
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        decision := 1 + input.args.canary
+    "#;
+    let gate = Arc::new(RegoGate::from_policy_str(policy).expect("policy compiles"));
+    let rt = Arc::new(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            gate,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("T2d: memory runtime with rego gate"),
+    );
+
+    let server = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+        packs_registry(Arc::clone(&rt), &["kg"]),
+        "local",
+        "test-rego-evaluator-failure",
+    );
+
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    let ops = format!(r#"list(kind="entity", canary="{CANARY}")"#);
+    let raw = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops,
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("T2d: dispatch must produce a response envelope");
+    drop(guard);
+    let logs = captured.contents();
+
+    let response: serde_json::Value =
+        serde_json::from_str(&raw).expect("T2d: response must be valid JSON");
+    let op = &response["results"][0];
+    assert_eq!(
+        op["ok"].as_bool(),
+        Some(false),
+        "T2d: list op must fail closed on the wire: {response}"
+    );
+    let wire_err = op["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("T2d: MCP-visible error must be a string: {response}"))
+        .to_string();
+
+    assert!(
+        !wire_err.contains(CANARY),
+        "T2d: MCP-visible error must not embed the evaluator's raw error text: {wire_err:?}"
+    );
+    assert!(
+        wire_err.contains("gate policy evaluation failed"),
+        "T2d: MCP-visible error must carry the stable classified reason: {wire_err:?}"
+    );
+
+    assert!(
+        !logs.contains(CANARY),
+        "T2d: canary must not reach the server-side log unmasked: {logs}"
+    );
+    assert!(
+        logs.contains("***MASKED***"),
+        "T2d: the gate failure log must still record the masked evaluator error: {logs}"
+    );
+}
+
 // ---- T3: Fan-out merged from multiple backends ----
 
 /// T3: Fan-out entity search over two backends merges results from both.

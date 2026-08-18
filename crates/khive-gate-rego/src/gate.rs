@@ -160,15 +160,17 @@ impl Gate for RegoGate {
         };
 
         // Keep policy evaluation uncertainty distinguishable from a gate infrastructure outage.
+        // This crate depends only on `khive-gate` and cannot reach the runtime's log masker, so
+        // the raw evaluator error text must never reach `tracing` here — it travels inside the
+        // `GateError` payload instead, where the runtime's masked log sites record it bounded.
         let value = match result {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
                     entrypoint = %self.entrypoint,
-                    error = %e,
                     "rego eval failed — denying (fail-closed)"
                 );
-                return Ok(GateDecision::deny(format!(
+                return Err(GateError::Policy(format!(
                     "policy evaluation failed for {}: {e}",
                     self.entrypoint
                 )));
@@ -183,15 +185,16 @@ impl Gate for RegoGate {
             )));
         }
 
+        // Same rationale as the evaluator-failure branch above: no raw error text in the
+        // tracing call, the detail travels inside the `GateError` payload instead.
         let decision_json = match value.to_json_str() {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
                     entrypoint = %self.entrypoint,
-                    error = %e,
                     "decision value failed to serialize — denying (fail-closed)"
                 );
-                return Ok(GateDecision::deny(format!(
+                return Err(GateError::Internal(format!(
                     "policy rule {} produced unserializable value: {e}",
                     self.entrypoint
                 )));
@@ -314,21 +317,27 @@ mod tests {
             }),
         );
 
-        let decision = gate.check(&req).expect("check must not Err (fail-closed)");
-        let reason = match decision {
-            GateDecision::Deny { reason } => reason,
-            GateDecision::Allow { .. } => {
-                panic!("wrong-shaped policy result must deny, not allow")
-            }
-        };
+        // `default decision := input.args` is rejected by regorus at eval time
+        // ("invalid ref in default value"), not policy-authored deny — this is
+        // now the evaluator-failure path and fails closed via `Err`, not
+        // `Ok(Deny)`. The caller-visible classification is the stable
+        // `wire_reason()`, never the error's `Display` text.
+        let err = gate
+            .check(&req)
+            .expect_err("evaluator failure must be Err (fail-closed)");
+        let reason = err.wire_reason();
 
         assert!(
             !reason.contains(fake_key),
-            "Deny reason must never echo the caller-supplied secret; got: {reason}"
+            "wire_reason must never echo the caller-supplied secret; got: {reason}"
         );
         assert!(
             !reason.contains("api_key"),
-            "Deny reason must never echo caller-supplied field names either; got: {reason}"
+            "wire_reason must never echo caller-supplied field names either; got: {reason}"
+        );
+        assert_eq!(
+            reason, "gate policy evaluation failed",
+            "evaluator failure must classify as a policy error, not an infra outage"
         );
     }
 
@@ -420,6 +429,46 @@ mod tests {
         assert!(
             !log_output.contains("api_key"),
             "tracing output must never contain caller-supplied field names either; got: {log_output}"
+        );
+    }
+
+    // ---- distinguishability: evaluator failure vs decision-serialization
+    // failure must classify into different stable wire reasons ----
+
+    #[test]
+    fn evaluator_failure_and_serialization_failure_classify_differently() {
+        let evaluator_failure_policy = r#"
+            package khive.gate
+            import rego.v1
+            default decision := input.args
+        "#;
+        let evaluator_failure_gate =
+            RegoGate::from_policy_str(evaluator_failure_policy).expect("policy compiles");
+        let evaluator_err = evaluator_failure_gate
+            .check(&request("search"))
+            .expect_err("evaluator failure must be Err (fail-closed)");
+
+        // A float product large enough that regorus's arbitrary-precision
+        // number can no longer be reformatted into a JSON-parseable literal —
+        // forces the decision-serialization branch without needing the
+        // evaluator itself to fail.
+        let serialization_failure_policy = r#"
+            package khive.gate
+            import rego.v1
+            decision := 1.0e300 * 1.0e300
+        "#;
+        let serialization_failure_gate =
+            RegoGate::from_policy_str(serialization_failure_policy).expect("policy compiles");
+        let serialization_err = serialization_failure_gate
+            .check(&request("search"))
+            .expect_err("unserializable decision value must be Err (fail-closed)");
+
+        assert_eq!(evaluator_err.wire_reason(), "gate policy evaluation failed");
+        assert_eq!(serialization_err.wire_reason(), "gate backend unavailable");
+        assert_ne!(
+            evaluator_err.wire_reason(),
+            serialization_err.wire_reason(),
+            "policy evaluation uncertainty must stay distinguishable from a gate infrastructure outage"
         );
     }
 }
