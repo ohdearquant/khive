@@ -1688,6 +1688,138 @@ async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
     );
 }
 
+// ---- T2c: Cross-backend link's authorize() gate error stays sanitized on the wire ----
+
+/// A gate that allows its first three checks — the test's own entity-setup
+/// authorize call, plus the two `locate_endpoint` probe-authorize calls
+/// `link_cross_backend` issues against this backend for the source and
+/// target ids before it authorizes the link itself — and then fails every
+/// subsequent check with a backend error carrying connection-string-shaped
+/// detail, simulating a gate backend outage discovered during
+/// `link_cross_backend`'s own `src_runtime.authorize(...)` call
+/// (`crates/kkernel/src/coordinator/dispatch.rs`).
+#[derive(Debug)]
+struct ErrorAfterSetupCallsGate {
+    cause: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl khive_runtime::Gate for ErrorAfterSetupCallsGate {
+    fn check(
+        &self,
+        _req: &khive_runtime::GateRequest,
+    ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call < 3 {
+            Ok(khive_runtime::GateDecision::allow())
+        } else {
+            Err(khive_runtime::GateError::Internal(self.cause.clone()))
+        }
+    }
+}
+
+fn memory_runtime_gate_erroring_after_first_call_with(cause: String) -> Arc<KhiveRuntime> {
+    Arc::new(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            gate: Arc::new(ErrorAfterSetupCallsGate {
+                cause,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime with gate-erroring-after-setup-calls gate"),
+    )
+}
+
+/// Regression for the second production leak the round-2 review found: a
+/// `GateError` raised inside `link_cross_backend`'s own `authorize()` call on
+/// the source backend must never put backend `Display` text (which can embed
+/// connection strings or credentials) on the MCP-visible wire response. Only
+/// the stable classified `wire_reason()` may cross that boundary; the full
+/// error must still land in the server-side `tracing::warn!` emitted by
+/// `KhiveRuntime::authorize`.
+#[tokio::test]
+async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wire() {
+    const CANARY: &str = "postgres://svc:not-a-real-secret@internal-host";
+
+    let rt_main = memory_runtime_gate_erroring_after_first_call_with(CANARY.to_string());
+    let rt_lore = memory_runtime();
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
+    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    let coord = SubstrateCoordinator::new(registry);
+    let ns = Namespace::local();
+
+    // Entity creation on "main" consumes the gate's first free `Allow` call.
+    let tok_main = rt_main.authorize(ns.clone()).expect("setup authorize");
+    let src = rt_main
+        .create_entity(
+            &tok_main,
+            "project",
+            None,
+            "SourceProject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T2c: create source on main");
+
+    let tok_lore = rt_lore.authorize(ns.clone()).expect("setup authorize lore");
+    let tgt = rt_lore
+        .create_entity(
+            &tok_lore,
+            "concept",
+            None,
+            "TargetConcept",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T2c: create target on lore");
+
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    // The gate's three free `Allow` calls are already spent (entity setup,
+    // then `locate_endpoint`'s probe-authorize for source and target). The
+    // real `src_runtime.authorize(...)` inside `link_cross_backend` is the
+    // fourth call on "main" and now errors.
+    let result = coord
+        .link_cross_backend(&ns, src.id, tgt.id, EdgeRelation::Implements, 1.0, None)
+        .await;
+    drop(guard);
+    let logs = captured.contents();
+
+    let wire_err = result.expect_err("T2c: gate error during link must fail closed");
+    assert!(
+        !wire_err.contains(CANARY),
+        "T2c: MCP-visible link error must not embed backend error text: {wire_err:?}"
+    );
+    assert!(
+        !wire_err.contains("svc") && !wire_err.contains("internal-host"),
+        "T2c: MCP-visible link error must not embed backend error fragments: {wire_err:?}"
+    );
+    assert!(
+        wire_err.contains("gate backend unavailable"),
+        "T2c: MCP-visible link error must carry the stable classified reason: {wire_err:?}"
+    );
+
+    assert!(
+        logs.contains(CANARY),
+        "T2c: the full backend error must still reach the server-side log: {logs}"
+    );
+}
+
 // ---- T3: Fan-out merged from multiple backends ----
 
 /// T3: Fan-out entity search over two backends merges results from both.
