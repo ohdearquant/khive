@@ -1690,14 +1690,16 @@ async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
 
 // ---- T2c: Cross-backend link's authorize() gate error stays sanitized on the wire ----
 
-/// A gate that allows its first three checks — the test's own entity-setup
-/// authorize call, plus the two `locate_endpoint` probe-authorize calls
-/// `link_cross_backend` issues against this backend for the source and
-/// target ids before it authorizes the link itself — and then fails every
-/// subsequent check with a backend error carrying connection-string-shaped
-/// detail, simulating a gate backend outage discovered during
-/// `link_cross_backend`'s own `src_runtime.authorize(...)` call
-/// (`crates/kkernel/src/coordinator/dispatch.rs`).
+/// A gate that allows its first four checks — the test's own entity-setup
+/// authorize call, the MCP dispatch's own top-level namespace authorize check
+/// (`VerbRegistry::dispatch_intercepted_with_metadata_with_identity`, which
+/// runs once before the coordinator ever sees the request), and the two
+/// `locate_endpoint` probe-authorize calls `link_cross_backend` issues
+/// against this backend for the source and target ids before it authorizes
+/// the link itself — and then fails every subsequent check with a backend
+/// error carrying connection-string-shaped detail, simulating a gate backend
+/// outage discovered during `link_cross_backend`'s own
+/// `src_runtime.authorize(...)` call (`crates/kkernel/src/coordinator/dispatch.rs`).
 #[derive(Debug)]
 struct ErrorAfterSetupCallsGate {
     cause: String,
@@ -1710,7 +1712,7 @@ impl khive_runtime::Gate for ErrorAfterSetupCallsGate {
         _req: &khive_runtime::GateRequest,
     ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if call < 3 {
+        if call < 4 {
             Ok(khive_runtime::GateDecision::allow())
         } else {
             Err(khive_runtime::GateError::Internal(self.cause.clone()))
@@ -1733,24 +1735,27 @@ fn memory_runtime_gate_erroring_after_first_call_with(cause: String) -> Arc<Khiv
     )
 }
 
-/// Regression for a second production disclosure path: a
+/// Regression for a second production disclosure path, exercised through the
+/// real MCP wire boundary rather than the coordinator's Rust API directly: a
 /// `GateError` raised inside `link_cross_backend`'s own `authorize()` call on
 /// the source backend must never put backend `Display` text (which can embed
-/// connection strings or credentials) on the MCP-visible wire response. Only
-/// the stable classified `wire_reason()` may cross that boundary; the full
-/// error must still land in the server-side `tracing::warn!` emitted by
-/// `KhiveRuntime::authorize`.
+/// connection strings or credentials) into the per-operation error a caller
+/// receives from `request(ops="link(...)")`. Only the stable classified
+/// `wire_reason()` may cross that boundary; the full error must still land in
+/// the server-side `tracing::warn!` emitted by `KhiveRuntime::authorize`.
+///
+/// Dispatches through `KhiveMcpServer::dispatch_request_local`, which routes
+/// `link` through `dispatch_via_coordinator_inner` ->
+/// `VerbRegistry::dispatch_intercepted_with_identity` ->
+/// `SubstrateCoordinatorService::link` -> `DispatchFailure::from_runtime` ->
+/// the serialized MCP response — the same chain a real MCP client's `link`
+/// call goes through in multi-backend mode.
 #[tokio::test]
 async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wire() {
     const CANARY: &str = "postgres://svc:not-a-real-secret@internal-host";
 
     let rt_main = memory_runtime_gate_erroring_after_first_call_with(CANARY.to_string());
     let rt_lore = memory_runtime();
-
-    let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
-    let coord = SubstrateCoordinator::new(registry);
     let ns = Namespace::local();
 
     // Entity creation on "main" consumes the gate's first free `Allow` call.
@@ -1782,6 +1787,8 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
         .await
         .expect("T2c: create target on lore");
 
+    let server = two_backend_server_with_packs(Arc::clone(&rt_main), Arc::clone(&rt_lore), &["kg"]);
+
     let captured = CoordinatorLogCapture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(MakeCoordinatorLogCapture(captured.clone()))
@@ -1790,17 +1797,43 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
         .finish();
 
     let guard = tracing::subscriber::set_default(subscriber);
-    // The gate's three free `Allow` calls are already spent (entity setup,
-    // then `locate_endpoint`'s probe-authorize for source and target). The
-    // real `src_runtime.authorize(...)` inside `link_cross_backend` is the
-    // fourth call on "main" and now errors.
-    let result = coord
-        .link_cross_backend(&ns, src.id, tgt.id, EdgeRelation::Implements, 1.0, None)
-        .await;
+    // The gate's four free `Allow` calls are already spent by this point:
+    // entity setup, this dispatch's own top-level namespace check, and
+    // `locate_endpoint`'s probe-authorize for source and target. The real
+    // `src_runtime.authorize(...)` inside `link_cross_backend` is the fifth
+    // call on "main" and now errors.
+    let ops = format!(
+        r#"link(source_id="{}", target_id="{}", relation="implements")"#,
+        src.id, tgt.id
+    );
+    let raw = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops,
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("T2c: dispatch must produce a response envelope");
     drop(guard);
     let logs = captured.contents();
 
-    let wire_err = result.expect_err("T2c: gate error during link must fail closed");
+    let response: serde_json::Value =
+        serde_json::from_str(&raw).expect("T2c: response must be valid JSON");
+    let op = &response["results"][0];
+    assert_eq!(
+        op["ok"].as_bool(),
+        Some(false),
+        "T2c: link op must fail closed on the wire: {response}"
+    );
+    let wire_err = op["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("T2c: MCP-visible error must be a string: {response}"))
+        .to_string();
+
     assert!(
         !wire_err.contains(CANARY),
         "T2c: MCP-visible link error must not embed backend error text: {wire_err:?}"
