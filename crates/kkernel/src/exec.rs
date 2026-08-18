@@ -6738,6 +6738,16 @@ path = "{}"
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
+        // Isolate both HOME and cwd: with `db: None` config discovery falls
+        // through to tier-2 (`<cwd>/khive.toml`) then tier-4
+        // (`~/.khive/config.toml`) — either one declaring `[runtime].packs`
+        // would satisfy this control incidentally instead of proving the
+        // built-in-default path, so neither may be the ambient machine's.
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        let original_cwd = std::env::current_dir().expect("read cwd");
+        let empty_project_root = tempfile::tempdir().expect("empty project-root tempdir");
+        std::env::set_current_dir(empty_project_root.path())
+            .expect("chdir into isolated project root with no discoverable config");
         SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
 
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
@@ -6752,6 +6762,17 @@ path = "{}"
         })
         .expect("resolve exec-shaped config with no pack-selection input");
 
+        // Isolating HOME/cwd only keeps the ambient machine's config from
+        // leaking in; it does not by itself prove resolution landed on the
+        // built-in set rather than some other value. Certify that directly
+        // before the forwarding seam is exercised.
+        assert_eq!(
+            cfg.packs,
+            RuntimeConfig::built_in_packs(),
+            "the isolated no-selection environment must resolve to the built-in default \
+             pack set before the forwarding seam is exercised"
+        );
+
         let result = run_exec_inline_with_forward(
             "stats()".to_string(),
             cfg,
@@ -6763,6 +6784,9 @@ path = "{}"
             spy_capture_config_and_succeed,
         )
         .await;
+
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+        restore_home(prev_home);
 
         assert!(
             result.is_ok(),
