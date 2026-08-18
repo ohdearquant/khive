@@ -75,19 +75,24 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-057](ADR-057-comm-actor-addressed-delivery.md)                     | Comm Actor-Addressed Delivery                                                                              |
 | [ADR-058](ADR-058-brain-posterior-read-path.md)                         | Brain Posterior Read Path — Wiring Profile Posteriors into Recall Ranking                                  |
 | [ADR-059](ADR-059-namespace-write-tiers.md)                             | Namespace Write Tiers and Cross-Namespace Link Access Control                                              |
+| [ADR-060](ADR-060-number-retired.md)                                    | Number Retired — v0-Series Record Archived                                                                 |
 | [ADR-061](ADR-061-pack-extensible-by-id-resolution.md)                  | Pack-Extensible by-ID Resolution                                                                           |
 | [ADR-062](ADR-062-fts-ann-consolidation.md)                             | FTS and ANN Consolidation -- Unified Search Tables (Schema V4)                                             |
 | [ADR-063](ADR-063-comm-principal-model.md)                              | Comm Pack Principal Model and Remote Backend Isolation                                                     |
+| [ADR-064](ADR-064-number-retired.md)                                    | Number Retired — v0-Series Record Archived                                                                 |
+| [ADR-065](ADR-065-number-retired.md)                                    | Number Retired — Draft Archived                                                                            |
 | [ADR-066](ADR-066-autonomous-merge-pipeline.md)                         | Autonomous Merge Pipeline — Gate Wall as Reviewer                                                          |
 | [ADR-067](ADR-067-write-owner-daemon.md)                                | Write-Owner Daemon — Single-Writer Task and Write Queue                                                    |
 | [ADR-068](ADR-068-process-isolation-topology.md)                        | Per-Process Isolation Topology                                                                             |
 | [ADR-069](ADR-069-subject-model.md)                                     | The Subject Model -- Domain-Ontology Ingestion and Map Pipeline                                            |
+| [ADR-070](ADR-070-comprehensive-event-capture.md)                       | Comprehensive Event Capture — Reference-Based, Read+Write, Default-On                                      |
 | [ADR-071](ADR-071-backend-pluggable-runtime.md)                         | Backend-Pluggable Runtime — Polystore Restoration                                                          |
 | [ADR-072](ADR-072-subject-ontologyspec-as-data.md)                      | Subject OntologySpec as Runtime Data -- Verbless Verticals and Pack Retirement                             |
 | [ADR-073](ADR-073-pack-core-backend-accessor.md)                        | Pack Core-Backend Accessor                                                                                 |
 | [ADR-074](ADR-074-graph-aware-recall.md)                                | Graph-Aware Recall — Graph-Proximity Signal in Memory Retrieval                                            |
 | [ADR-075](ADR-075-owl-rdf-interoperability.md)                          | OWL/RDF Interoperability -- Publishing the khive Vocabulary and Aligning with External Ontologies          |
 | [ADR-076](ADR-076-relation-calculability-and-system-role.md)            | Relation-Set Calculability — System Role and the Non-Redundancy Certificate                                |
+| [ADR-077](ADR-077-number-retired.md)                                    | Number Retired — v0-Series Record Archived                                                                 |
 | [ADR-078](ADR-078-output-format-shape-aware-rendering.md)               | Output Format and Shape-Aware Rendering                                                                    |
 | [ADR-079](ADR-079-ann-persistence-warm-path-integration.md)             | ANN Persistence Warm-Path Integration — Wiring v2 Persistence into the Daemon                              |
 | [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md)                | Session Pack — OSS Storage Mechanism                                                                       |
@@ -107,6 +112,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-094](ADR-094-lifecycle-telemetry-events.md)                        | Sequencing-Assertable Lifecycle Telemetry Events                                                           |
 | [ADR-095](ADR-095-verb-surface-consolidation.md)                        | Verb-Surface Consolidation and Field-Validation Governance                                                 |
 | [ADR-096](ADR-096-warm-daemon-per-request-identity.md)                  | warm daemon per-request identity — serving many attribution identities over one shared backend             |
+| [ADR-097](ADR-097-number-retired.md)                                    | Number Retired — Never Allocated                                                                           |
+| [ADR-098](ADR-098-number-retired.md)                                    | Number Retired — Never Allocated                                                                           |
 | [ADR-099](ADR-099-bulk-apply-atomic-units.md)                           | Cross-Op Atomicity for Bulk Apply — Prepared Write Plans over the Single-Writer Seam                       |
 | [ADR-100](ADR-100-store-backup-replication.md)                          | Store backup and replication                                                                               |
 | [ADR-101](ADR-101-kg-changeset-model.md)                                | KG Change-Set Model — Producer-Agnostic Op-List with Stage-Time Stable IDs                                 |
@@ -124,6 +131,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-113](ADR-113-identifier-continuity.md)                             | Identifier Continuity — Merged-Entity Redirect Resolution and Split Endpoint-Move                          |
 | [ADR-114](ADR-114-code-audit-derived-report.md)                         | Code-Audit Derived Report, Not Agent Findings                                                              |
 | [ADR-115](ADR-115-secret-gate-content-manifest-exemption.md)            | Exact-Content Manifest Exemption for the Write Secret Gate                                                 |
+| [ADR-116](ADR-116-memory-ann-generation-coherence.md)                   | Durable Per-Model Generation Coherence for the Memory ANN Warm Path                                        |
 | [ADR-117](ADR-117-session-continuity-search.md)                         | Session Continuity — Cross-Session Search and Remote Ingestion                                             |
 | [ADR-117a](ADR-117a-session-identity-tenant-isolation.md)               | Session Identity and Tenant Isolation                                                                      |
 | [ADR-118](ADR-118-fresh-tail-recall-visibility.md)                      | Fresh-Tail Exact Leg — Read-Your-Writes Visibility for Vector Recall                                       |
@@ -134,11 +142,13 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-123](ADR-123-comm-forward.md)                                      | comm.forward — Provenance-Preserving Message Forwarding                                                    |
 | [ADR-124](ADR-124-note-write-identity.md)                               | Note-Write Identity — Deriving Pack-Owned Identity Properties at the Write                                 |
 | [ADR-125](ADR-125-reserved-property-keys.md)                            | Reserved property keys on pack-owned note kinds                                                            |
+| [ADR-126](ADR-126-number-retired.md)                                    | Number Retired — Never Allocated                                                                           |
 | [ADR-127](ADR-127-authenticated-actor-and-grant-primitive.md)           | Authenticated actor and grant primitive                                                                    |
 | [ADR-128](ADR-128-custody-party-pairs-and-slot-authenticity.md)         | Custody party-pairs and slot authenticity                                                                  |
 | [ADR-129](ADR-129-fail-closed-gate-default.md)                          | Fail-closed authorization gate default                                                                     |
 | [ADR-130](ADR-130-search-response-completeness-and-ranking-evidence.md) | Search response completeness and ranking evidence                                                          |
 | [ADR-131](ADR-131-batch-write-admission-control.md)                     | Admission control for parallel write batches                                                               |
+| [ADR-132](ADR-132-number-retired.md)                                    | Number Retired — Never Allocated                                                                           |
 | [ADR-133](ADR-133-incidental-writes-off-the-request-hot-path.md)        | Reduce writer acquisitions on the request path                                                             |
 | [ADR-134](ADR-134-store-durability-posture.md)                          | Store durability posture, and the obligation it carries for accounting records                             |
 | [ADR-135](ADR-135-write-scaling-demand-before-ownership.md)             | Scale SQLite writes by reducing writer demand before changing ownership                                    |
@@ -164,8 +174,15 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-155](ADR-155-pack-artifact-ingest-blobstore.md)                    | Pack Artifact Ingest over BlobStore                                                                        |
 | [ADR-156](ADR-156-named-vector-restart-durability.md)                   | Named-Vector Search Restart and Durability Semantics                                                       |
 | [ADR-157](ADR-157-supersession-chain-canonicalization.md)               | Canonicalize Verified Supersession Chains Before Memory Recall Scoring                                     |
+| [ADR-158](ADR-158-cargo-source-role-projections.md)                     | Cargo Source-Role Projections for Repository Showcase                                                      |
 | [ADR-159](ADR-159-edge-governance-provenance.md)                        | Durable Edge-Governance Provenance for Supersession Canonicalization                                       |
 | [ADR-160](ADR-160-shared-pack-infrastructure.md)                        | Shared Pack Infrastructure Program                                                                         |
+| [ADR-161](ADR-161-agent-process-lineage.md)                             | Agent Process Lineage                                                                                      |
+| [ADR-162](ADR-162-unified-event-plane-ownership.md)                     | Unified Event-Plane Ownership                                                                              |
+| [ADR-163](ADR-163-restart-boundary-event-legibility.md)                 | Restart-Boundary Event Legibility                                                                          |
+| [ADR-164](ADR-164-event-sink-boundary.md)                               | Event Sink Boundary                                                                                        |
+| [ADR-165](ADR-165-read-path-performance-recovery.md)                    | Read-Path Performance Recovery                                                                             |
+| [ADR-166](ADR-166-hot-path-latency-regression-guard.md)                 | Hot-Path Latency Regression Guard                                                                          |
 
 <!-- END GENERATED ADR CATALOG -->
 
