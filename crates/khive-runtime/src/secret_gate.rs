@@ -354,37 +354,42 @@ pub fn bounded_masked_log_text(text: &str) -> String {
 /// has to come from this fallback, not from the cap's size.
 ///
 /// Only called when `bounded_masked_log_text` actually truncated the input.
-/// It inspects the LAST `://` occurrence in `text` — the sole span that can
-/// reach all the way to the end of the truncated text, since it's exactly
-/// where the input was cut. An earlier `://` with no `@` after it is an
-/// ordinary malformed/incomplete URL already present in the source text
-/// (e.g. two URLs logged side by side), not a truncation artifact, and is
-/// left untouched. If that last span looks like an unterminated
-/// `user:<password-run>` (a colon splits it into two non-empty pieces, and
-/// no `@`, space, or newline appears anywhere in the tail), the whole tail
-/// from the colon onward is redacted — zero password characters survive,
-/// no matter how long the password actually is.
+/// It scans `://` occurrences left to right and redacts at the EARLIEST
+/// unterminated `user:<password-run>` opening: a colon splits the tail into
+/// two non-empty pieces and no `@`, space, or newline appears anywhere from
+/// that occurrence to the end of the truncated text. An occurrence whose
+/// tail does contain one of those terminators is a complete URL or ordinary
+/// prose that ends inside the text (e.g. two URLs logged side by side) and
+/// is skipped, not redacted. The anchor must be the earliest such opening,
+/// never the last: a later `://` can sit INSIDE the crossing password
+/// itself (passwords may contain `://`), and anchoring there would leave
+/// the real `user:<password prefix>` before it in the emitted log. From the
+/// earliest unterminated opening's colon onward everything is redacted —
+/// zero password characters survive, no matter how long the password
+/// actually is.
 fn redact_crossing_boundary_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
-    let Some(scheme_pos) = text.rfind("://") else {
-        return std::borrow::Cow::Borrowed(text);
-    };
-    let rest = &text[scheme_pos + 3..];
-    if rest.contains('@') || rest.contains(' ') || rest.contains('\n') || rest.contains('\r') {
-        return std::borrow::Cow::Borrowed(text);
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find("://") {
+        let scheme_pos = search_from + rel;
+        let rest = &text[scheme_pos + 3..];
+        let terminated =
+            rest.contains('@') || rest.contains(' ') || rest.contains('\n') || rest.contains('\r');
+        if !terminated {
+            if let Some(colon) = rest.find(':') {
+                let user = &rest[..colon];
+                let pass = &rest[colon + 1..];
+                if !user.is_empty() && !pass.is_empty() {
+                    let redact_from = scheme_pos + 3 + colon;
+                    let mut out = String::with_capacity(redact_from + REDACTION_MARKER.len());
+                    out.push_str(&text[..redact_from]);
+                    out.push_str(REDACTION_MARKER);
+                    return std::borrow::Cow::Owned(out);
+                }
+            }
+        }
+        search_from = scheme_pos + 3;
     }
-    let Some(colon) = rest.find(':') else {
-        return std::borrow::Cow::Borrowed(text);
-    };
-    let user = &rest[..colon];
-    let pass = &rest[colon + 1..];
-    if user.is_empty() || pass.is_empty() {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let redact_from = scheme_pos + 3 + colon;
-    let mut out = String::with_capacity(redact_from + REDACTION_MARKER.len());
-    out.push_str(&text[..redact_from]);
-    out.push_str(REDACTION_MARKER);
-    std::borrow::Cow::Owned(out)
+    std::borrow::Cow::Borrowed(text)
 }
 
 /// `true` for a Unicode control (`Cc`) or format (`Cf`) codepoint, tab excepted.
@@ -3829,6 +3834,60 @@ mod tests {
         assert!(
             rendered.ends_with('…'),
             "truncated record must declare its own incompleteness: {rendered:?}"
+        );
+    }
+
+    /// Regression: a crossing password that itself contains `://` must not
+    /// let the fallback anchor at that nested delimiter. Anchoring at the
+    /// last `://` would redact only from the nested span onward, leaving
+    /// the real `user:<password prefix>` before it in the emitted log. The
+    /// fallback must anchor at the earliest unterminated credential
+    /// opening, so zero password characters survive.
+    #[test]
+    fn bounded_masked_log_text_redacts_crossing_password_containing_nested_scheme() {
+        let mut password = "a".repeat(1000);
+        password.push_str("://h:");
+        password.push_str(&"b".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000));
+        let raw =
+            format!("gate backend probe failed: postgres://svc:{password}@internal-host refused");
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "password prefix before the nested delimiter must not survive: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&"b".repeat(50)),
+            "password tail after the nested delimiter must not survive: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression: a complete URL earlier in the text must not stop the
+    /// fallback from catching a later credential run that crosses the cap.
+    /// The earlier URL's span terminates inside the text (whitespace after
+    /// it), so it is skipped; the later unterminated `user:<password-run>`
+    /// is the one redacted.
+    #[test]
+    fn bounded_masked_log_text_redacts_crossing_credential_after_complete_url() {
+        let huge_low_entropy_password = "c".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw = format!(
+            "probe of https://ok-host/health failed; retry hit postgres://svc:{huge_low_entropy_password}@internal-host refused"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            rendered.contains("ok-host"),
+            "the earlier complete URL must survive untouched: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&"c".repeat(50)),
+            "no password fragment may survive: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
         );
     }
 
