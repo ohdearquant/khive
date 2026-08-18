@@ -1618,7 +1618,12 @@ impl VerbRegistry {
         }
         RuntimeError::GateUnavailable {
             verb: gate_req.verb.clone(),
-            reason: error.to_string(),
+            // Caller-visible: a stable, classified reason derived from the
+            // `GateError` variant only. `error`'s `Display` text is logged
+            // above (server-side, via `tracing::warn!`) and must never be
+            // interpolated here — a gate backend's error message can embed
+            // connection details, addresses, or credentials.
+            reason: error.wire_reason().to_string(),
         }
     }
 
@@ -5399,7 +5404,9 @@ pub(crate) mod tests {
         assert!(matches!(
             err,
             RuntimeError::GateUnavailable { ref verb, ref reason }
-                if verb == "git.digest" && reason.contains("injected gate failure")
+                if verb == "git.digest"
+                    && reason == "gate backend unavailable"
+                    && !reason.contains("injected gate failure")
         ));
         let event = only_git_digest_event(&store);
         assert_eq!(event.outcome, EventOutcome::Error);
@@ -5448,7 +5455,9 @@ pub(crate) mod tests {
         assert!(matches!(
             err,
             RuntimeError::GateUnavailable { ref verb, ref reason }
-                if verb == "list" && reason.contains("intercepted gate broken")
+                if verb == "list"
+                    && reason == "gate backend unavailable"
+                    && !reason.contains("intercepted gate broken")
         ));
         assert_eq!(
             invoked.load(Ordering::SeqCst),
@@ -6043,7 +6052,9 @@ pub(crate) mod tests {
         assert!(matches!(
             err,
             RuntimeError::GateUnavailable { ref verb, ref reason }
-                if verb == "guarded" && reason.contains("gate broken")
+                if verb == "guarded"
+                    && reason == "gate backend unavailable"
+                    && !reason.contains("gate broken")
         ));
         assert_eq!(
             invoked.load(Ordering::SeqCst),
@@ -6105,7 +6116,9 @@ pub(crate) mod tests {
         assert!(matches!(
             error,
             RuntimeError::GateUnavailable { ref verb, ref reason }
-                if verb == "guarded" && reason.contains("gate still broken")
+                if verb == "guarded"
+                    && reason == "gate backend unavailable"
+                    && !reason.contains("gate still broken")
         ));
         assert_eq!(invoked.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -6113,6 +6126,95 @@ pub(crate) mod tests {
             before + 1,
             "best-effort audit failure remains diagnostic without changing the refusal"
         );
+    }
+
+    /// Regression for a credential-disclosure path: a gate backend's error
+    /// `Display` text can embed connection details (URLs, addresses, auth
+    /// material). That text must never reach `RuntimeError::GateUnavailable`
+    /// as observed by a dispatch caller — only the stable classified
+    /// `wire_reason()` may cross that boundary. The full error is still
+    /// logged server-side via `tracing::warn!` in `gate_unavailable_error`.
+    #[tokio::test]
+    async fn gate_unavailable_reason_never_carries_backend_error_text() {
+        const CANARY: &str = "postgres://svc:not-a-real-secret@internal-host";
+
+        #[derive(Debug)]
+        struct FailingGate;
+        impl Gate for FailingGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Err(GateError::Internal(CANARY.to_string()))
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GateErrorTrackingPack {
+            invoked: Arc::new(AtomicUsize::new(0)),
+        });
+        builder.with_gate(Arc::new(FailingGate));
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("guarded", Value::Null)
+            .await
+            .expect_err("gate unavailability must refuse dispatch");
+
+        let RuntimeError::GateUnavailable { reason, .. } = &err else {
+            panic!("expected GateUnavailable, got {err:?}");
+        };
+        assert!(
+            !reason.contains(CANARY),
+            "caller-visible reason must not embed backend error text: {reason:?}"
+        );
+        assert!(
+            !reason.contains("svc") && !reason.contains("internal-host"),
+            "caller-visible reason must not embed backend error fragments: {reason:?}"
+        );
+        assert_eq!(reason, "gate backend unavailable");
+
+        // The full error, canary included, still reaches the server-side log.
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(CANARY),
+            "top-level Display must not embed backend error text either: {rendered:?}"
+        );
+    }
+
+    /// Task 2 (ADR-129 gate-error classification): a `GateError::Policy`
+    /// failure — the gate backend is reachable but its configured policy
+    /// could not be evaluated — is a distinct, non-transient class from a
+    /// `GateError::Internal` backend-availability failure, and gets its own
+    /// stable reason text at the dispatch boundary.
+    #[tokio::test]
+    async fn gate_policy_error_classifies_distinctly_from_backend_unavailable() {
+        #[derive(Debug)]
+        struct PolicyBrokenGate;
+        impl Gate for PolicyBrokenGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Err(GateError::Policy(
+                    "rule set has no allow clause for this namespace".to_string(),
+                ))
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GateErrorTrackingPack {
+            invoked: Arc::new(AtomicUsize::new(0)),
+        });
+        builder.with_gate(Arc::new(PolicyBrokenGate));
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("guarded", Value::Null)
+            .await
+            .expect_err("gate unavailability must refuse dispatch");
+
+        assert!(matches!(
+            err,
+            RuntimeError::GateUnavailable { ref verb, ref reason }
+                if verb == "guarded"
+                    && reason == "gate policy evaluation failed"
+                    && !reason.contains("rule set has no allow clause")
+        ));
     }
 
     #[tokio::test]
