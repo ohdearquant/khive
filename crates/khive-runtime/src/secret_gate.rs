@@ -285,13 +285,14 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// This is NOT a tight bound like [`MAX_LOG_TEXT_OUTPUT_CHARS`] below — it exists only to
 /// stop a truly pathological input (gigabytes of attacker-controlled text funneled into one
-/// error/log line) from making the masking scan unbounded. It must stay far above any
-/// credible secret length (the longest detector shapes here — PEM blocks, bridged
-/// fragments — top out in the low kilobytes) so that truncating TO this bound can never cut
-/// a secret in half before [`mask_secrets`] gets to see it; that half-secret-then-truncate
-/// ordering was exactly the leak this function used to have (see
-/// [`bounded_masked_log_text`]'s doc comment). 1 MiB of chars comfortably clears that bar
-/// while still bounding the scan.
+/// error/log line) from making the masking scan unbounded. It is a pure compute bound, not a
+/// safety bound: [`find_url_userinfo`] has no length limit on the password it recognizes, so
+/// no finite value of this constant can guarantee a credential never straddles it — a
+/// password longer than whatever this is set to always has a crossing case. The actual
+/// safety invariant lives in [`redact_crossing_boundary_url_userinfo`], the fallback
+/// [`bounded_masked_log_text`] runs after [`mask_secrets`]: it redacts any `scheme://user:`
+/// opening whose password run reaches this cut point without a terminating `@`, regardless
+/// of how long that password is. 1 MiB just keeps the scan itself cheap.
 const MAX_LOG_TEXT_MASK_INPUT_CHARS: usize = 1_048_576;
 /// Maximum characters of masked error text emitted to a log record.
 const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
@@ -302,18 +303,23 @@ const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
 /// shipped, aggregated, and read by consumers outside the process. Backend
 /// error text (gate backends included) can embed connection strings or
 /// credentials, so the FULL text (up to [`MAX_LOG_TEXT_MASK_INPUT_CHARS`], a
-/// bound sized far above any credible secret — see its doc comment) is masked
-/// with the canonical detector set before any truncation happens. Masking
-/// after truncation would let a secret whose tail sits past the bound lose the
-/// context (e.g. a URL's terminating `@`) a detector needs to recognize it,
-/// leaving its head unmasked in the log — truncate-then-mask must never
-/// replace mask-then-truncate here. Control (`Cc`) and format (`Cf`) Unicode
-/// codepoints in the masked text are then escaped: a log line is plain text
-/// read by tooling outside this process, and an embedded CR/LF or bidi/format
-/// override could forge or visually disguise part of the record. The result is
-/// bounded again for the emitted record. A truncation in either the masking
-/// pass or the output pass appends `…` so the record declares its own
-/// incompleteness.
+/// pure compute bound — see its doc comment) is masked with the canonical
+/// detector set before any truncation happens. Masking after truncation would
+/// let a secret whose tail sits past the bound lose the context (e.g. a URL's
+/// terminating `@`) a detector needs to recognize it, leaving its head
+/// unmasked in the log — truncate-then-mask must never replace
+/// mask-then-truncate here. Because [`MAX_LOG_TEXT_MASK_INPUT_CHARS`] is
+/// finite and [`find_url_userinfo`] has no bound on password length, a
+/// password long enough still crosses the cut before its terminating `@`
+/// ever appears; [`redact_crossing_boundary_url_userinfo`] closes that gap
+/// by redacting the unterminated opening directly, so no credential prefix
+/// survives regardless of secret length. Control (`Cc`) and format
+/// (`Cf`) Unicode codepoints in the masked text are then escaped: a log line
+/// is plain text read by tooling outside this process, and an embedded CR/LF
+/// or bidi/format override could forge or visually disguise part of the
+/// record. The result is bounded again for the emitted record. A truncation
+/// in either the masking pass or the output pass appends `…` so the record
+/// declares its own incompleteness.
 pub fn bounded_masked_log_text(text: &str) -> String {
     let mask_input_truncated = text.chars().nth(MAX_LOG_TEXT_MASK_INPUT_CHARS).is_some();
     let bounded_input: std::borrow::Cow<'_, str> = if mask_input_truncated {
@@ -322,6 +328,11 @@ pub fn bounded_masked_log_text(text: &str) -> String {
         std::borrow::Cow::Borrowed(text)
     };
     let masked = mask_secrets(&bounded_input);
+    let masked = if mask_input_truncated {
+        redact_crossing_boundary_url_userinfo(&masked)
+    } else {
+        masked
+    };
     let neutralized = neutralize_log_unsafe_chars(&masked);
 
     let mut chars = neutralized.chars();
@@ -330,6 +341,50 @@ pub fn bounded_masked_log_text(text: &str) -> String {
         bounded.push('…');
     }
     bounded
+}
+
+/// Fallback for a `scheme://user:<password>` credential whose password run
+/// collided with [`bounded_masked_log_text`]'s truncation of the mask-scan
+/// input at [`MAX_LOG_TEXT_MASK_INPUT_CHARS`]. [`find_url_userinfo`] only
+/// recognizes a credential once it sees the terminating `@`; when that `@`
+/// sits past the truncation point, [`mask_secrets`] never sees the shape at
+/// all and the raw `scheme://user:<password prefix>` reaches the log. No
+/// finite value of [`MAX_LOG_TEXT_MASK_INPUT_CHARS`] can rule this out — the
+/// detector is unbounded, so any cap has a crossing case — so the invariant
+/// has to come from this fallback, not from the cap's size.
+///
+/// Only called when `bounded_masked_log_text` actually truncated the input.
+/// It inspects the LAST `://` occurrence in `text` — the sole span that can
+/// reach all the way to the end of the truncated text, since it's exactly
+/// where the input was cut. An earlier `://` with no `@` after it is an
+/// ordinary malformed/incomplete URL already present in the source text
+/// (e.g. two URLs logged side by side), not a truncation artifact, and is
+/// left untouched. If that last span looks like an unterminated
+/// `user:<password-run>` (a colon splits it into two non-empty pieces, and
+/// no `@`, space, or newline appears anywhere in the tail), the whole tail
+/// from the colon onward is redacted — zero password characters survive,
+/// no matter how long the password actually is.
+fn redact_crossing_boundary_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
+    let Some(scheme_pos) = text.rfind("://") else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let rest = &text[scheme_pos + 3..];
+    if rest.contains('@') || rest.contains(' ') || rest.contains('\n') || rest.contains('\r') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let Some(colon) = rest.find(':') else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let user = &rest[..colon];
+    let pass = &rest[colon + 1..];
+    if user.is_empty() || pass.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let redact_from = scheme_pos + 3 + colon;
+    let mut out = String::with_capacity(redact_from + REDACTION_MARKER.len());
+    out.push_str(&text[..redact_from]);
+    out.push_str(REDACTION_MARKER);
+    std::borrow::Cow::Owned(out)
 }
 
 /// `true` for a Unicode control (`Cc`) or format (`Cf`) codepoint, tab excepted.
@@ -3748,6 +3803,102 @@ mod tests {
         assert!(
             rendered.contains("***MASKED***"),
             "masked marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression for the crossing-boundary leak: a password longer than
+    /// [`MAX_LOG_TEXT_MASK_INPUT_CHARS`] never gets a chance to show its
+    /// terminating `@` to `find_url_userinfo` inside the truncated scan
+    /// input, so the shape detector alone can never catch it — and it's
+    /// deliberately low-entropy so the entropy heuristic can't catch it
+    /// either. Only `redact_crossing_boundary_url_userinfo` can close this.
+    #[test]
+    fn bounded_masked_log_text_redacts_password_crossing_mask_input_cap() {
+        let huge_low_entropy_password = "a".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw =
+            format!("gate backend probe failed: postgres://svc:{huge_low_entropy_password}@internal-host refused");
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "no password fragment may survive when the password crosses the mask-input cap: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated record must declare its own incompleteness: {rendered:?}"
+        );
+    }
+
+    /// Regression: the crossing-boundary fallback must not fire when the
+    /// password's terminating `@` sits safely inside the (untruncated)
+    /// bounded input — the existing `find_url_userinfo` arm alone must
+    /// still catch and mask it, with exactly one mask marker.
+    #[test]
+    fn bounded_masked_log_text_masks_password_just_under_cap_with_terminating_at() {
+        let password_under_cap = "a".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS - 1000);
+        let raw = format!(
+            "gate backend probe failed: postgres://svc:{password_under_cap}@internal-host refused"
+        );
+        assert!(
+            raw.chars().count() < MAX_LOG_TEXT_MASK_INPUT_CHARS,
+            "test precondition: whole input must stay under the mask-input cap so no truncation occurs"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "terminated credential must still be masked normally: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches("***MASKED***").count(),
+            1,
+            "exactly one mask marker — the crossing fallback must not fire early: {rendered:?}"
+        );
+    }
+
+    /// Regression: giant truncated text with no `://user:` shape at all must
+    /// pass through unmodified by the crossing-boundary fallback — it must
+    /// not manufacture a false redaction out of ordinary non-credential
+    /// prose that happens to be long enough to hit the mask-input cap.
+    #[test]
+    fn bounded_masked_log_text_giant_non_credential_text_unaffected_by_crossing_fallback() {
+        let raw = "x".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains("***MASKED***"),
+            "non-credential text must never be redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated record must still declare its own incompleteness: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("xxxx"),
+            "non-credential content must survive verbatim up to the output bound: {rendered:?}"
+        );
+    }
+
+    /// Regression: an ordinary short connection string (well under both
+    /// caps) must keep being masked exactly as before — the crossing
+    /// fallback is gated on truncation and must never touch this path.
+    #[test]
+    fn bounded_masked_log_text_masks_ordinary_short_connection_string() {
+        let raw = "gate backend probe failed: postgres://svc:hunter2pw@internal-host refused"; // gitleaks:allow
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains("hunter2pw"),
+            "credential must be masked: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches("***MASKED***").count(),
+            1,
+            "exactly one mask marker for the one credential: {rendered:?}"
+        );
+        assert!(
+            !rendered.ends_with('…'),
+            "short untruncated text must not declare truncation: {rendered:?}"
         );
     }
 
