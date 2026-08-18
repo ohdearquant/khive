@@ -1221,7 +1221,8 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 /// always require caller disambiguation.
 ///
 /// Resolution scope follows the verb, and the by-ID verbs do **not** scope to
-/// the caller's namespace. `get`, `update`, `delete` and `merge` resolve a
+/// the caller's namespace. `get`, `update`, `delete`, `merge`, and `link`
+/// (whose `source_id`/`target_id` endpoints resolve the same way) resolve a
 /// prefix through `resolve_prefix_unfiltered`, which applies no namespace
 /// predicate at all, so their prefix path matches their already-unfiltered
 /// full-UUID path (ADR-007 Rev 6: by-ID access is namespace-agnostic, and the
@@ -1230,7 +1231,7 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 /// namespace only.
 const ID_PARAM_CONTRACT: &str = "ID contract: a full UUID is namespace-agnostic (the caller \
     already knows the specific record). A short hex prefix is a resolution — a search — which \
-    may match nothing, or match ambiguously. On the by-ID verbs (get/update/delete/merge) \
+    may match nothing, or match ambiguously. On the by-ID verbs (get/update/delete/merge/link) \
     prefix resolution applies no namespace filter, matching their already-unfiltered full-UUID \
     path; authorization is the Gate's seam, not resolution's.";
 
@@ -7998,6 +7999,24 @@ mod help_tests {
         description: "UUID of the record to fetch.",
     }];
 
+    // Mirrors link's real source_id/target_id params (both `param_type:
+    // "uuid"`) — used to verify the shared id contract is appended to link's
+    // endpoint params too, matching the enumeration in `ID_PARAM_CONTRACT`.
+    static LINK_PARAMS: [ParamDef; 2] = [
+        ParamDef {
+            name: "source_id",
+            param_type: "uuid",
+            required: true,
+            description: "Source node UUID.",
+        },
+        ParamDef {
+            name: "target_id",
+            param_type: "uuid",
+            required: true,
+            description: "Target node UUID.",
+        },
+    ];
+
     struct HelpPack {
         invocations: Arc<AtomicUsize>,
     }
@@ -8035,7 +8054,7 @@ mod help_tests {
                 description: "Create a typed directed edge",
                 visibility: Visibility::Verb,
                 category: VerbCategory::Commissive,
-                params: &[],
+                params: &LINK_PARAMS,
             },
             HandlerDef {
                 name: "get",
@@ -8216,6 +8235,32 @@ mod help_tests {
         assert!(
             description.to_ascii_lowercase().contains("prefix"),
             "id contract must describe short-prefix semantics; got: {description}"
+        );
+
+        // `link`'s source_id/target_id are `param_type: "uuid"` too (they
+        // resolve through the same unfiltered path as get/update/delete/
+        // merge — see `crates/khive-pack-kg/src/handlers/link.rs`), so the
+        // contract's enumerated verb list must name `link` explicitly, not
+        // just the four record-level by-ID verbs.
+        let link_result = reg
+            .dispatch("link", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed for link");
+        let link_params = link_result["params"]
+            .as_array()
+            .expect("link params must be a JSON array");
+        let source_id_param = link_params
+            .iter()
+            .find(|p| p["name"] == "source_id")
+            .expect("link params must include 'source_id'");
+        let source_id_description = source_id_param["description"]
+            .as_str()
+            .expect("description must be a string");
+        assert!(
+            source_id_description.contains("get/update/delete/merge/link"),
+            "id contract's by-ID verb enumeration must include 'link' alongside get/update/\
+             delete/merge, since link's source_id/target_id resolve through the same \
+             unfiltered path; got: {source_id_description}"
         );
     }
 

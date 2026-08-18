@@ -132,9 +132,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, \
-                              note, edge, event, or proposal to fetch. UUID and prefix lookup \
-                              are namespace-unfiltered under ADR-007; other input falls back \
-                              to primary-namespace entity-name lookup.",
+                              note, edge, event, or proposal to fetch. Entity-name fallback \
+                              uses the primary namespace.",
             },
             ParamDef {
                 name: "include_deleted",
@@ -361,8 +360,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, note, \
-                              or edge to patch. UUID and prefix lookup are namespace-unfiltered \
-                              under ADR-007; entity-name fallback uses the primary namespace.",
+                              or edge to patch. Entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "kind",
@@ -438,8 +436,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the record to \
-                              delete. UUID and prefix lookup are namespace-unfiltered under \
-                              ADR-007; entity-name fallback uses the primary namespace.",
+                              delete. Entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "kind",
@@ -468,16 +465,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity or \
-                              note that survives. UUID and prefix lookup are namespace-unfiltered \
-                              under ADR-007; entity-name fallback uses the primary namespace.",
+                              note that survives. Entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "from_id",
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity or \
-                              note to merge from. UUID and prefix lookup are namespace-unfiltered \
-                              under ADR-007; entity-name fallback uses the primary namespace.",
+                              note to merge from. Entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "kind",
@@ -597,17 +592,15 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "source_id",
                 param_type: "uuid",
                 required: true,
-                description: "Source node complete UUID or globally unique 8+ hex prefix. UUID \
-                              and prefix lookup are namespace-unfiltered under ADR-007; \
-                              entity-name fallback uses the primary namespace.",
+                description: "Source node complete UUID or globally unique 8+ hex prefix. \
+                              Entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "target_id",
                 param_type: "uuid",
                 required: true,
-                description: "Target node complete UUID or globally unique 8+ hex prefix. UUID \
-                              and prefix lookup are namespace-unfiltered under ADR-007; \
-                              entity-name fallback uses the primary namespace.",
+                description: "Target node complete UUID or globally unique 8+ hex prefix. \
+                              Entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "relation",

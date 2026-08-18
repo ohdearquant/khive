@@ -72,11 +72,12 @@ fn require_str<'a>(args: &'a Value, key: &str) -> RuntimeResult<&'a str> {
 
 /// Parse `key` as a bare UUID — never a short hex prefix.
 ///
-/// A short prefix is a *resolution*: a namespace-scoped search that can match
-/// nothing, or match ambiguously, depending on what else lives in the
-/// caller's namespace. That search already happened upstream, at the
-/// `kkernel` CLI boundary that has namespace context and calls
-/// `resolve_uuid_unfiltered` before handing args down to this module
+/// A short prefix is a *resolution*: an unfiltered search that applies no
+/// namespace predicate, so it can match nothing, match exactly one record
+/// across every namespace, or match ambiguously. That search already
+/// happened upstream, at the `kkernel` CLI boundary that has namespace
+/// context and calls `resolve_uuid_unfiltered` before handing args down to
+/// this module
 /// (`crates/kkernel/src/atomic_apply.rs::resolve_kg_ids_in_args`). By the
 /// time an id reaches this plan-preparation stage it must already name one
 /// specific, already-identified record — which is exactly what a full UUID
