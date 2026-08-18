@@ -1867,11 +1867,11 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
 /// used to fold `regorus`'s raw evaluator-error text directly into a
 /// `GateDecision::deny(...)` reason, which crossed both the MCP wire and the
 /// server-side log unmasked whenever the offending value happened to be
-/// caller-supplied. It now classifies the failure as
-/// `Err(GateError::Policy(..))`, so the runtime's existing fail-closed
-/// classify+mask boundary (`VerbRegistry::gate_unavailable_error`) handles
-/// both surfaces: the wire only ever sees the stable `wire_reason()`, and the
-/// full detail reaches the server-side log already bounded+masked.
+/// caller-supplied. It now returns `Ok(GateDecision::Deny)` with a static
+/// classified reason that never embeds evaluator output, so the failure
+/// surfaces on the wire as an ordinary `RuntimeError::PermissionDenied` and
+/// the audit log records only that static reason — there is nothing
+/// secret-bearing left to mask on this path.
 ///
 /// Dispatches through `KhiveMcpServer::dispatch_request_local` with no
 /// coordinator attached (single-backend), the same real MCP wire boundary as
@@ -1956,17 +1956,24 @@ async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
         "T2d: MCP-visible error must not embed the evaluator's raw error text: {wire_err:?}"
     );
     assert!(
-        wire_err.contains("gate policy evaluation failed"),
-        "T2d: MCP-visible error must carry the stable classified reason: {wire_err:?}"
+        wire_err.contains("policy evaluation failed"),
+        "T2d: MCP-visible error must carry the static classified reason: {wire_err:?}"
+    );
+    // A `RegoGate` evaluator failure is a policy denial (`Ok(GateDecision::Deny)`), not a
+    // gate infrastructure outage — it must surface as `RuntimeError::PermissionDenied`'s
+    // wire shape ("permission denied for verb ..."), never
+    // `RuntimeError::GateUnavailable`'s ("gate unavailable for verb ...").
+    assert!(
+        wire_err.starts_with("permission denied for verb"),
+        "T2d: MCP-visible error must have the PermissionDenied shape, not GateUnavailable: {wire_err:?}"
     );
 
+    // Nothing secret-bearing is emitted on this path anymore — the deny
+    // reason is a static string, so there is no masked-marker expectation
+    // here. The masking machinery itself stays covered by T2c above.
     assert!(
         !logs.contains(CANARY),
-        "T2d: canary must not reach the server-side log unmasked: {logs}"
-    );
-    assert!(
-        logs.contains("***MASKED***"),
-        "T2d: the gate failure log must still record the masked evaluator error: {logs}"
+        "T2d: canary must not reach the server-side log: {logs}"
     );
 }
 

@@ -282,7 +282,17 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Maximum characters of raw error text admitted to the masking pass.
-const MAX_LOG_TEXT_INPUT_CHARS: usize = 4_096;
+///
+/// This is NOT a tight bound like [`MAX_LOG_TEXT_OUTPUT_CHARS`] below — it exists only to
+/// stop a truly pathological input (gigabytes of attacker-controlled text funneled into one
+/// error/log line) from making the masking scan unbounded. It must stay far above any
+/// credible secret length (the longest detector shapes here — PEM blocks, bridged
+/// fragments — top out in the low kilobytes) so that truncating TO this bound can never cut
+/// a secret in half before [`mask_secrets`] gets to see it; that half-secret-then-truncate
+/// ordering was exactly the leak this function used to have (see
+/// [`bounded_masked_log_text`]'s doc comment). 1 MiB of chars comfortably clears that bar
+/// while still bounding the scan.
+const MAX_LOG_TEXT_MASK_INPUT_CHARS: usize = 1_048_576;
 /// Maximum characters of masked error text emitted to a log record.
 const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
 
@@ -291,19 +301,75 @@ const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
 /// Log records are a disclosure surface the same way wire errors are: they are
 /// shipped, aggregated, and read by consumers outside the process. Backend
 /// error text (gate backends included) can embed connection strings or
-/// credentials, so it is truncated before masking (a pathological input cannot
-/// inflate the masking pass), masked with the canonical detector set, and
-/// bounded again for the emitted record. A truncation in either pass appends
-/// `…` so the record declares its own incompleteness.
+/// credentials, so the FULL text (up to [`MAX_LOG_TEXT_MASK_INPUT_CHARS`], a
+/// bound sized far above any credible secret — see its doc comment) is masked
+/// with the canonical detector set before any truncation happens. Masking
+/// after truncation would let a secret whose tail sits past the bound lose the
+/// context (e.g. a URL's terminating `@`) a detector needs to recognize it,
+/// leaving its head unmasked in the log — truncate-then-mask must never
+/// replace mask-then-truncate here. Control (`Cc`) and format (`Cf`) Unicode
+/// codepoints in the masked text are then escaped: a log line is plain text
+/// read by tooling outside this process, and an embedded CR/LF or bidi/format
+/// override could forge or visually disguise part of the record. The result is
+/// bounded again for the emitted record. A truncation in either the masking
+/// pass or the output pass appends `…` so the record declares its own
+/// incompleteness.
 pub fn bounded_masked_log_text(text: &str) -> String {
-    let bounded_input: String = text.chars().take(MAX_LOG_TEXT_INPUT_CHARS).collect();
+    let mask_input_truncated = text.chars().nth(MAX_LOG_TEXT_MASK_INPUT_CHARS).is_some();
+    let bounded_input: std::borrow::Cow<'_, str> = if mask_input_truncated {
+        std::borrow::Cow::Owned(text.chars().take(MAX_LOG_TEXT_MASK_INPUT_CHARS).collect())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
     let masked = mask_secrets(&bounded_input);
-    let mut chars = masked.chars();
+    let neutralized = neutralize_log_unsafe_chars(&masked);
+
+    let mut chars = neutralized.chars();
     let mut bounded: String = chars.by_ref().take(MAX_LOG_TEXT_OUTPUT_CHARS).collect();
-    if chars.next().is_some() || text.chars().nth(MAX_LOG_TEXT_INPUT_CHARS).is_some() {
+    if chars.next().is_some() || mask_input_truncated {
         bounded.push('…');
     }
     bounded
+}
+
+/// `true` for a Unicode control (`Cc`) or format (`Cf`) codepoint, tab excepted.
+///
+/// Classification is by Unicode general category rather than an ASCII byte range so that
+/// multi-byte control/format characters (bidi overrides, zero-width joiners, line/paragraph
+/// separators encoded as UTF-8) are caught the same way as single-byte C0 controls like
+/// CR/LF — a byte-range check would only ever see the latter. Tab is excepted: it is
+/// visually inert in a log line and common in legitimately reformatted prose.
+fn is_log_unsafe_char(c: char) -> bool {
+    if c == '\t' {
+        return false;
+    }
+    matches!(
+        unicode_general_category::get_general_category(c),
+        unicode_general_category::GeneralCategory::Control
+            | unicode_general_category::GeneralCategory::Format
+    )
+}
+
+/// Escape every [`is_log_unsafe_char`] codepoint in `text` as `\u{XXXX}`.
+///
+/// Returns `Cow::Borrowed` when nothing needs escaping (the common case), avoiding an
+/// allocation. This runs on already-masked text: it must never be skipped for text that
+/// bypassed [`mask_secrets`], since a control character can sit inside a would-be secret
+/// span and is a distinct disclosure vector from the credential detectors (log injection /
+/// forgery, not credential leakage).
+fn neutralize_log_unsafe_chars(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_log_unsafe_char) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if is_log_unsafe_char(c) {
+            out.push_str(&format!("\\u{{{:04x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 // ─── Layer 1: known patterns ─────────────────────────────────────────────────
@@ -3640,7 +3706,7 @@ mod tests {
 
     #[test]
     fn bounded_masked_log_text_bounds_pathological_input() {
-        let raw = "x".repeat(MAX_LOG_TEXT_INPUT_CHARS + 500);
+        let raw = "x".repeat(MAX_LOG_TEXT_OUTPUT_CHARS + 500);
         let rendered = bounded_masked_log_text(&raw);
         assert!(
             rendered.chars().count() <= MAX_LOG_TEXT_OUTPUT_CHARS + 1,
@@ -3657,6 +3723,59 @@ mod tests {
             bounded_masked_log_text(short),
             short,
             "short clean text passes through unchanged"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_masks_low_entropy_password_past_old_truncation_bound() {
+        // Regression: masking used to run AFTER truncating the raw input to a
+        // few KB, so a connection string whose password ran past that bound
+        // lost its terminating `@` before the url-userinfo detector (a
+        // shape match, not an entropy one) ever saw it — a low-entropy
+        // password can't trip the entropy heuristic either, so it leaked
+        // verbatim into the log. Masking now runs on the full input first,
+        // so a password far longer than the old 4096-char bound is still
+        // caught.
+        let long_low_entropy_password = "a".repeat(5_000);
+        let raw = format!(
+            "gate backend probe failed: postgres://svc:{long_low_entropy_password}@internal-host refused"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "long low-entropy password must not survive in the log: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "masked marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_neutralizes_control_and_format_chars() {
+        let raw = "line one\r\ninjected: \u{1b}[31mFAKE ALERT\u{1b}[0m line two";
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains('\r') && !rendered.contains('\n'),
+            "CR/LF must be neutralized so a single log line cannot be split/forged: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC control character must be neutralized: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("line one") && rendered.contains("line two"),
+            "surrounding prose must survive neutralization: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_keeps_accented_and_cjk_text_unchanged() {
+        let raw = "café résumé 日本語のテキスト 数据库连接管理";
+        assert_eq!(
+            bounded_masked_log_text(raw),
+            raw,
+            "accented and CJK prose must pass through unmodified"
         );
     }
 
