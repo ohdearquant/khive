@@ -302,16 +302,16 @@ const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
 /// Log records are a disclosure surface the same way wire errors are: they are
 /// shipped, aggregated, and read by consumers outside the process. Backend
 /// error text (gate backends included) can embed connection strings or
-/// credentials, so the FULL text (up to [`MAX_LOG_TEXT_MASK_INPUT_CHARS`], a
+/// credentials, so the FULL text (up to `MAX_LOG_TEXT_MASK_INPUT_CHARS`, a
 /// pure compute bound — see its doc comment) is masked with the canonical
 /// detector set before any truncation happens. Masking after truncation would
 /// let a secret whose tail sits past the bound lose the context (e.g. a URL's
 /// terminating `@`) a detector needs to recognize it, leaving its head
 /// unmasked in the log — truncate-then-mask must never replace
-/// mask-then-truncate here. Because [`MAX_LOG_TEXT_MASK_INPUT_CHARS`] is
-/// finite and [`find_url_userinfo`] has no bound on password length, a
+/// mask-then-truncate here. Because `MAX_LOG_TEXT_MASK_INPUT_CHARS` is
+/// finite and `find_url_userinfo` has no bound on password length, a
 /// password long enough still crosses the cut before its terminating `@`
-/// ever appears; [`redact_crossing_boundary_url_userinfo`] closes that gap
+/// ever appears; `redact_crossing_boundary_url_userinfo` closes that gap
 /// by redacting the unterminated opening directly, so no credential prefix
 /// survives regardless of secret length. Control (`Cc`) and format
 /// (`Cf`) Unicode codepoints in the masked text are then escaped: a log line
