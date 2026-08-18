@@ -555,10 +555,11 @@ export function RepositoryTriage({
                   <div data-inspector-metric="commits">
                     <dt>{labels.metrics.commits}</dt>
                     <dd>
-                      {selectedInsight.history.status === "unavailable" ||
-                          (selectedInsight.history.total == null &&
-                            selectedInsight.history.shown === 0)
+                      {selectedInsight.history.status === "unavailable"
                         ? labels.unavailable
+                        : selectedInsight.history.status === "truncated" &&
+                            selectedInsight.history.total == null
+                        ? `${formatNumber(selectedInsight.history.shown)} shown`
                         : formatNumber(
                           selectedInsight.history.total ??
                             selectedInsight.history.shown,

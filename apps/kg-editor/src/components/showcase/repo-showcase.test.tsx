@@ -217,6 +217,8 @@ describe("repository showcase", () => {
       .closest('[data-state="truncated"]') as HTMLElement;
 
     expect(commitMetric).not.toHaveTextContent(/^0$/);
+    expect(commitMetric).not.toHaveTextContent(bundle.capability.labels.unavailable);
+    expect(commitMetric).toHaveTextContent(/0 shown/i);
     expect(coverage).toBeVisible();
     expect(coverage).toHaveTextContent(/by-module history export was capped/i);
     expect(inspector).not.toHaveTextContent("No module history-navigation row was captured.");
