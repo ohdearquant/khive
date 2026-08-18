@@ -3143,10 +3143,40 @@ fn build_audit_storage_event(
     storage_event
 }
 
+/// Process-wide pure-observability audit appends whose errors were logged
+/// and swallowed — never an obligation-bearing row, which fails its dispatch
+/// instead and is counted separately by
+/// [`AUDIT_OBLIGATION_APPEND_FAILURES`]/[`audit_obligation_append_failure_count`].
+/// Keeping this counter obligation-free preserves its documented contract
+/// (`docs/guide/api-reference.md`, `khive-db`'s `WriterContentionDiagnostics::audit_append_failures`
+/// doc comment): every unit counted here was swallowed, none was propagated.
 static AUDIT_APPEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn audit_append_failure_count() -> u64 {
     AUDIT_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide commit failures for obligation-bearing audit rows (ADR-133
+/// D2/D3/D4): gate denials, dispatch outcomes, unknown-verb rows, and
+/// `git.digest` success receipts. Most call sites fold this failure into the
+/// dispatch's own error (a would-be success becomes an error, per
+/// [`fold_audit_obligation`]); a denial's own audit row is the one
+/// exception — its dispatch already returns `PermissionDenied` independent
+/// of whether this row commits, so the failure is logged and counted here
+/// but not separately propagated. Disjoint from [`AUDIT_APPEND_FAILURES`] —
+/// each failing row is classified by [`crate::audit_batch::classify`] into
+/// exactly one of the two classes and increments exactly one of these two
+/// counters, never both.
+static AUDIT_OBLIGATION_APPEND_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only reader: no production caller needs this counter today (unlike
+/// [`audit_append_failure_count`], which `KhiveRuntime::db_diagnostics`
+/// surfaces), but the mechanism tests need to observe it directly to prove
+/// obligation and swallowed failures land on disjoint counters.
+#[cfg(test)]
+pub(crate) fn audit_obligation_append_failure_count() -> u64 {
+    AUDIT_OBLIGATION_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 const GIT_DIGEST_RECEIPT_FAILURE: &str =
@@ -3290,7 +3320,11 @@ async fn persist_git_digest_receipt(
         store.append_event(event).await.map_err(|e| e.to_string())
     };
     if let Err(store_err) = submit_result {
-        AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `GitDigestReceipt` is always `DispatchObligation` (see
+        // `crate::audit_batch::classify`) and this failure always
+        // propagates below, so it belongs on the obligation counter, not
+        // the swallowed-failures one.
+        AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
             verb = "git.digest",
             error = %store_err,
@@ -3345,8 +3379,8 @@ async fn append_audit_event_best_effort(
             .submit(crate::audit_batch::PreparedAuditRow { event, producer })
             .await
         {
-            AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if is_obligation {
+                AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
                     verb,
                     reason = ?reason,
@@ -3356,6 +3390,7 @@ async fn append_audit_event_best_effort(
                     "audit obligation commit failed for verb {verb:?}: {reason:?}"
                 )));
             }
+            AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 verb,
                 reason = ?reason,
@@ -3366,8 +3401,8 @@ async fn append_audit_event_best_effort(
     }
 
     if let Err(store_err) = store.append_event(event).await {
-        AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if is_obligation {
+            AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::error!(
                 verb,
                 error = %store_err,
@@ -3377,6 +3412,7 @@ async fn append_audit_event_best_effort(
                 "audit obligation commit failed for verb {verb:?}: {store_err}"
             )));
         }
+        AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             verb,
             error = %store_err,
@@ -5322,12 +5358,18 @@ pub(crate) mod tests {
     struct MemoryEventStore {
         events: std::sync::Mutex<Vec<Event>>,
         fail_appends: bool,
+        /// Fail only a generation whose batch contains an event of this
+        /// kind, leaving every other generation (e.g. the deferred
+        /// obligation row committed after dispatch resolves) to commit
+        /// normally. Lets a test fail a pure-observability row without
+        /// also failing the obligation row that shares the same store.
+        fail_kind: Option<EventKind>,
     }
 
     #[async_trait]
     impl EventStore for MemoryEventStore {
         async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
-            if self.fail_appends {
+            if self.fail_appends || self.fail_kind == Some(event.kind) {
                 return Err(khive_storage::StorageError::Internal(
                     "injected audit append failure".to_string(),
                 ));
@@ -5383,7 +5425,11 @@ pub(crate) mod tests {
             events: Vec<Event>,
         ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
         {
-            if self.fail_appends {
+            if self.fail_appends
+                || self
+                    .fail_kind
+                    .is_some_and(|kind| events.iter().any(|e| e.kind == kind))
+            {
                 return Err(khive_storage::StorageError::Internal(
                     "injected audit append failure".to_string(),
                 ));
@@ -5507,8 +5553,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
     async fn git_digest_receipt_append_failure_never_returns_unqualified_success() {
         let before = audit_append_failure_count();
+        let before_obligation = audit_obligation_append_failure_count();
         let store = Arc::new(MemoryEventStore {
             fail_appends: true,
             ..MemoryEventStore::default()
@@ -5530,7 +5578,15 @@ pub(crate) mod tests {
                     && message.contains("writes may have committed")),
             "error is stable, safe, and retry-aware: {err}"
         );
-        assert_eq!(audit_append_failure_count(), before + 1);
+        // The git.digest receipt is obligation-bearing (`GitDigestReceipt`
+        // classifies as `DispatchObligation`) and this failure propagated
+        // into the dispatch's own error above, so it counts on the
+        // obligation counter, not the swallowed-failures one.
+        assert_eq!(audit_append_failure_count(), before);
+        assert_eq!(
+            audit_obligation_append_failure_count(),
+            before_obligation + 1
+        );
     }
 
     #[tokio::test]
@@ -5940,8 +5996,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
     async fn audit_append_failure_fails_an_obligation_bearing_dispatch() {
         let before = audit_append_failure_count();
+        let before_obligation = audit_obligation_append_failure_count();
 
         let successful_store = Arc::new(MemoryEventStore::default());
         let mut successful_builder = VerbRegistryBuilder::new();
@@ -5955,7 +6013,12 @@ pub(crate) mod tests {
         assert_eq!(
             audit_append_failure_count(),
             before,
-            "successful audit appends must not increment the failure counter"
+            "successful audit appends must not increment the swallowed-failure counter"
+        );
+        assert_eq!(
+            audit_obligation_append_failure_count(),
+            before_obligation,
+            "successful audit appends must not increment the obligation-failure counter"
         );
 
         // ADR-133 D2/D3/D4: `list`'s deferred audit row is a
@@ -5983,23 +6046,35 @@ pub(crate) mod tests {
             "error names the obligation failure so it is distinguishable from a handler error: {err}"
         );
 
+        // `list`'s deferred audit row is `DispatchSucceeded`, an obligation
+        // producer, so this propagated failure belongs on the obligation
+        // counter — the swallowed-failure counter must not move for it.
         assert_eq!(
             audit_append_failure_count(),
-            before + 1,
-            "the failed append must remain visible to diagnostics"
+            before,
+            "an obligation failure must never inflate the swallowed-failure counter"
+        );
+        assert_eq!(
+            audit_obligation_append_failure_count(),
+            before_obligation + 1,
+            "the failed obligation append must remain visible to diagnostics"
         );
     }
 
     #[tokio::test]
     #[serial(config_ledger)]
     #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
     async fn config_locked_row_degrades_without_failing_the_dispatch_that_observed_it() {
         // Deny-gate a dispatch so the only append this call makes is the
         // immediate `ConfigLocked` drain in the gate-check block: the
         // `GateDenied` row and the eventual `PermissionDenied` return are
         // unaffected by the store either way (see the two `let _ =` sites
         // above), so any failure this test observes is isolated to the
-        // pure-observability `ConfigLocked` row.
+        // pure-observability `ConfigLocked` row. The `fail_appends: true`
+        // store also fails the fire-and-forget `GateDenied` append, which
+        // now counts on the obligation counter (`#[serial(...)]` above
+        // keeps that from racing this file's exact-delta assertions on it).
         #[derive(Debug)]
         struct DenyGate;
         impl Gate for DenyGate {
@@ -6039,6 +6114,48 @@ pub(crate) mod tests {
             "the config-locked row's commit failure must be visible as degradation"
         );
         assert!(metrics.degraded_rows >= 1);
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    #[serial(audit_append_failures)]
+    async fn config_locked_row_failure_never_fails_a_dispatch_that_would_otherwise_succeed() {
+        // ADR-133 criterion 4's success half: a pure-observability row's
+        // commit failure must degrade gracefully without touching the
+        // caller-visible outcome of a dispatch that has nothing to do with
+        // it. Only the `ConfigLocked` generation fails here — the gate
+        // allows the call, so `list`'s own `DispatchSucceeded` obligation
+        // row commits in a later, unaffected generation.
+        crate::config_ledger::record_config_locked(
+            "adr133_success_path_key",
+            "adr133_success_path_value",
+        );
+
+        let store = Arc::new(MemoryEventStore {
+            fail_kind: Some(EventKind::ConfigLocked),
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store);
+        let registry = builder.build().expect("registry builds");
+
+        let result = registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect("a config-locked row's commit failure must never fail an unrelated dispatch");
+        assert_eq!(
+            result,
+            serde_json::json!({ "pack": "alpha", "verb": "list" })
+        );
+
+        let metrics = registry
+            .audit_batch_metrics()
+            .expect("with_event_store configures the ADR-133 seam");
+        assert!(
+            metrics.degraded_rows >= 1,
+            "the config-locked row's failure must remain visible as degradation"
+        );
     }
 
     /// An `EventStore` that only implements the base trait — the
@@ -6116,6 +6233,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial(config_ledger)]
     #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
     async fn db_diagnostics_with_audit_metrics_reports_batch_failure_and_degradation() {
         // One dispatch call exercises both halves of the classifier through
         // the registry it actually owns the seam on: the queued

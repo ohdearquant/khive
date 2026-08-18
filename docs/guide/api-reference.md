@@ -789,7 +789,13 @@ standalone writer opens, and the third counts dequeued writer-task requests that
 dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
 executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
-process-wide best-effort audit appends whose storage error was logged and swallowed. Zero-wait
+process-wide best-effort audit appends whose storage error was logged and swallowed —
+pure-observability rows only. An obligation-bearing row's commit failure (a dispatch outcome, an
+unknown-verb row, a `git.digest` receipt, or a gate denial's own audit row) is never counted here:
+it instead fails the dispatch that produced it directly, or — for a denial whose dispatch already
+fails independent of the row — is tracked by a separate internal counter. `audit_append_failures`
+and `audit_batch_flush_failures` are therefore disjoint for that case; summing them does not
+double-count an obligation-bearing generation failure. Zero-wait
 checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
 connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
 and reused across ticks) do not inflate the write-traffic acquisition total.

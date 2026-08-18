@@ -145,6 +145,43 @@ fn mk_event(verb: &str) -> Event {
     .with_outcome(EventOutcome::Success)
 }
 
+/// An accounting-bearing event carrying the same `resource.units`/
+/// `resource.cost_unit` payload shape a real successful dispatch emits
+/// (`khive_runtime::cost_unit::resource_payload`, wired into the audit row
+/// at `crates/khive-runtime/src/pack.rs`), so a test built on this fixture
+/// can observe whether the accounting projection is duplicated or lost on
+/// an ambiguous-ack retry — a bare `mk_event` carries no such payload to
+/// lose.
+fn mk_accounting_event(verb: &str) -> Event {
+    let resource = khive_runtime::cost_unit::resource_payload(
+        verb,
+        &serde_json::json!({}),
+        &serde_json::json!({ "done": true }),
+        || 0,
+        None,
+    );
+    Event::new(
+        "local",
+        verb,
+        EventKind::Audit,
+        SubstrateKind::Event,
+        "test:actor",
+    )
+    .with_outcome(EventOutcome::Success)
+    .with_payload(serde_json::json!({ "resource": resource }))
+}
+
+/// The accounting consumer's projection: sum `resource.cost_unit` across a
+/// set of persisted rows, mirroring `khive-pack-brain`'s `brain.event_counts`
+/// aggregation (`event_cost_unit` in `crates/khive-pack-brain/src/handlers.rs`)
+/// without depending on that pack. A duplicated or dropped row changes this
+/// total; a row replayed as `AlreadyPresentIdentical` must not.
+fn total_cost_unit(rows: &[Event]) -> i64 {
+    rows.iter()
+        .filter_map(|e| e.payload.get("resource")?.get("cost_unit")?.as_i64())
+        .sum()
+}
+
 #[serial]
 #[tokio::test]
 async fn d1_idle_submit_commits_before_response() {
@@ -551,8 +588,11 @@ async fn d1c_ambiguous_ack_retry_persists_exactly_one_accounting_row() {
     let store = FakeStore::new();
     store.ambiguous_ack_once.store(true, Ordering::SeqCst);
     let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
-    let event = mk_event("kg.create");
+    let event = mk_accounting_event("kg.create");
     let event_id = event.id;
+    let expected_cost_unit = event.payload["resource"]["cost_unit"]
+        .as_i64()
+        .expect("the fixture carries a real resource.cost_unit payload");
 
     let result = batch
         .submit(PreparedAuditRow {
@@ -565,16 +605,20 @@ async fn d1c_ambiguous_ack_retry_persists_exactly_one_accounting_row() {
     // holds it, so the accounting consumer sees a fresh commit's twin
     // (`AlreadyPresentIdentical`), not a second row.
     assert_eq!(result, Ok(AuditCommitOutcome::AlreadyPresentIdentical));
+    let rows = store.rows.lock();
     assert_eq!(
-        store
-            .rows
-            .lock()
-            .iter()
-            .filter(|e| e.id == event_id)
-            .count(),
+        rows.iter().filter(|e| e.id == event_id).count(),
         1,
         "the ambiguous commit followed by retry must persist exactly one row, not zero or two"
     );
+    assert_eq!(
+        total_cost_unit(&rows),
+        expected_cost_unit,
+        "the accounting consumer's projected total must reflect exactly one dispatch's \
+         cost_unit — an ambiguous ack retried into a duplicate row would double it, and a \
+         retried loss would zero it"
+    );
+    drop(rows);
     assert_eq!(
         store.calls.load(Ordering::SeqCst),
         2,

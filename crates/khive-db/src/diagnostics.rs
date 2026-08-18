@@ -475,7 +475,17 @@ pub struct WriterContentionDiagnostics {
     /// Subset of `writer_task_request_failures` whose terminal state was
     /// `WriterTaskRequestState::SideEffectsUnknown`.
     pub writer_task_side_effects_unknown: u64,
-    /// Process-wide audit appends whose errors were logged and swallowed.
+    /// Process-wide audit appends whose errors were logged and swallowed —
+    /// pure-observability rows only (config-lock rows, best-effort recall
+    /// telemetry). An obligation-bearing row's commit failure (a gate
+    /// denial's own audit row, a dispatch outcome, an unknown-verb row, or a
+    /// `git.digest` receipt) is never counted here: those either fail the
+    /// dispatch that produced them directly (visible to the caller as an
+    /// error, not as this counter moving) or, for a denial whose dispatch
+    /// already fails independent of the row, are tracked by the runtime's
+    /// own separate obligation-failure counter instead. Summing this field
+    /// with `audit_batch_flush_failures` therefore does not double-count an
+    /// obligation-bearing generation failure against this one.
     pub audit_append_failures: Option<u64>,
     /// Why `audit_append_failures` is unavailable to this caller.
     pub audit_append_failures_unavailable_reason: Option<String>,
