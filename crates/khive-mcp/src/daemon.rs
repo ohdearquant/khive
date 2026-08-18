@@ -2078,11 +2078,68 @@ pub async fn forward_or_spawn_with_config(
     db: Option<&str>,
     packs: Option<&[String]>,
 ) -> Option<Result<String, McpError>> {
+    #[cfg(any(test, feature = "test-forward-seam"))]
+    if let Some(intercepted) = test_forward_seam::intercept(packs) {
+        return intercepted;
+    }
     let spawn = || {
         let exe = std::env::current_exe()?;
         spawn_daemon_with_exe_and_config(&exe, config, db, packs)
     };
     forward_or_spawn_with(frame, &spawn).await
+}
+
+/// Test-only capture hook armed at the real entry of
+/// `forward_or_spawn_with_config` — the actual adapter-boundary conversion
+/// site (`packs.as_deref()` at each production call site) production code
+/// runs through, as opposed to a `ForwardFnPtr` spy that stands in for the
+/// whole adapter and never executes its conversion. Unarmed, `intercept`
+/// costs one thread-local read and returns `None` immediately: the
+/// production path is byte-for-byte unaffected.
+///
+/// Gated by `cfg(any(test, feature = "test-forward-seam"))` so both the
+/// in-crate `khive-mcp` test suite (plain `cfg(test)`) and a cross-crate
+/// `kkernel` test (which cannot see `khive-mcp`'s `cfg(test)` items, so it
+/// enables the `test-forward-seam` feature via a `[dev-dependencies]`
+/// re-declaration instead) can reach it.
+#[cfg(any(test, feature = "test-forward-seam"))]
+pub mod test_forward_seam {
+    use super::McpError;
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static CAPTURED: std::cell::RefCell<Option<Option<Vec<String>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Arm the one-shot hook. The next call into
+    /// `forward_or_spawn_with_config` on this thread records its `packs`
+    /// argument and returns a canned success without touching a socket or
+    /// spawning a process; the hook then disarms itself.
+    pub fn arm() {
+        CAPTURED.with(|c| *c.borrow_mut() = None);
+        ARMED.with(|a| a.set(true));
+    }
+
+    /// Take the captured `packs` argument from the most recent armed call,
+    /// if any.
+    pub fn take_captured() -> Option<Option<Vec<String>>> {
+        CAPTURED.with(|c| c.borrow_mut().take())
+    }
+
+    pub(super) fn intercept(packs: Option<&[String]>) -> Option<Option<Result<String, McpError>>> {
+        let was_armed = ARMED.with(|a| a.replace(false));
+        if !was_armed {
+            return None;
+        }
+        CAPTURED.with(|c| *c.borrow_mut() = Some(packs.map(<[String]>::to_vec)));
+        Some(Some(Ok(serde_json::json!({
+            "results": [{"ok": true, "tool": "stats", "result": {}}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0},
+        })
+        .to_string())))
+    }
 }
 
 #[cfg(test)]

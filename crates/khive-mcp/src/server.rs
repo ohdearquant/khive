@@ -3957,6 +3957,60 @@ mod tests {
         );
     }
 
+    /// Adapter-boundary regression: `restricted_registry_pack_list_reaches_forward_seam`
+    /// above proves the derivation site (`Some(resolved_packs)` in
+    /// `request_with_forward`) folds the right pack list, but its `spy_forward`
+    /// stands in for `forward_or_spawn_boxed` itself, so it never executes the
+    /// adapter's own `packs.as_deref()` conversion at
+    /// `crate::daemon::forward_or_spawn_with_config`'s call site. This test
+    /// instead drives `request_with_cancellation` — the real production entry
+    /// point, which always calls the real `forward_or_spawn_boxed` — and
+    /// observes the argument via a one-shot capture hook armed at the entry of
+    /// `forward_or_spawn_with_config` itself (`crate::daemon::test_forward_seam`),
+    /// past both the derivation site AND the adapter conversion. Changing the
+    /// adapter's `packs.as_deref()` argument to `None` reddens this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_registry_pack_list_reaches_real_adapter_boundary() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "gtd".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime restricted to kg + gtd");
+        let server =
+            KhiveMcpServer::new(runtime).expect("server builds with restricted kg+gtd registry");
+
+        crate::daemon::test_forward_seam::arm();
+
+        let params = RequestParams {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        };
+
+        let result = server.request_with_cancellation(params).await;
+
+        assert!(
+            result.is_ok(),
+            "the intercepted dispatch through the real production entry point must \
+             succeed: {result:?}"
+        );
+        assert_eq!(
+            crate::daemon::test_forward_seam::take_captured(),
+            Some(Some(vec!["kg".to_string(), "gtd".to_string()])),
+            "the real forward_or_spawn_boxed adapter must convert the server's resolved \
+             registry pack set into Some(&packs) at the forward_or_spawn_with_config \
+             call boundary"
+        );
+    }
+
     /// ADR-118's serving toggle is baked into a runtime. Opposite policies
     /// must never share one warm daemon even when every `RuntimeConfig` field
     /// is otherwise identical.

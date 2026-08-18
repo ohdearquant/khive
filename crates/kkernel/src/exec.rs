@@ -5999,6 +5999,62 @@ id = "lambda:fallback"
         );
     }
 
+    // ── adapter-boundary regression (cross-crate member) ──────────────────────
+    //
+    // The exec-side `forward_or_spawn_boxed` in this file converts `cfg.packs`
+    // into `Some(&packs)` at its own `forward_or_spawn_with_config` call site
+    // (line ~249). Every spy-based test in this file replaces
+    // `forward_or_spawn_boxed` itself via `run_exec_inline_with_forward`'s
+    // `ForwardFnPtr` seam, so none of them execute that conversion. This test
+    // instead drives `run_exec_inline` — the real production entry point,
+    // which always calls the real `forward_or_spawn_boxed` on Unix — and
+    // observes the argument via a one-shot capture hook armed at the entry of
+    // `khive_mcp::daemon::forward_or_spawn_with_config` itself, reached
+    // cross-crate via khive-mcp's `test-forward-seam` feature (enabled from
+    // this crate's `[dev-dependencies]` re-declaration of khive-mcp).
+    // Changing the adapter's `Some(&packs)` argument to `None` reddens this
+    // test.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn resolved_pack_list_reaches_real_exec_adapter_boundary() {
+        let (prev_home, _home_dir) = isolate_home_for_test();
+
+        khive_mcp::daemon::test_forward_seam::arm();
+
+        let cfg = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string(), "gtd".to_string()],
+            actor_id: None,
+            ..RuntimeConfig::default()
+        };
+
+        let result = run_exec_inline(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+        )
+        .await;
+
+        restore_home(prev_home);
+
+        assert!(
+            result.is_ok(),
+            "the intercepted dispatch through the real production entry point must \
+             succeed: {result:?}"
+        );
+        assert_eq!(
+            khive_mcp::daemon::test_forward_seam::take_captured(),
+            Some(Some(vec!["kg".to_string(), "gtd".to_string()])),
+            "the real forward_or_spawn_boxed adapter in this crate must convert cfg.packs \
+             into Some(&packs) at the forward_or_spawn_with_config call boundary"
+        );
+    }
+
     // ── spy-based isomorphism guard (Unix only) ───────────────────────────────
     //
     // The three tests above use KHIVE_NO_DAEMON=1, which disables the daemon
@@ -6758,32 +6814,42 @@ path = "{}"
         let original_packs = std::env::var_os("KHIVE_PACKS");
         let original_home = std::env::var_os("HOME");
 
+        // Declared first so it drops LAST (reverse declaration order):
+        // constructing the guard here, before either tempdir is created and
+        // before any process-global mutation, means every panic from this
+        // point on — including a `tempdir()`/`set_current_dir()` setup panic,
+        // not just a later assertion — has a live guard whose Drop restores
+        // KHIVE_PACKS/HOME/cwd. Because it drops last, `home_dir` and
+        // `empty_project_root` are removed BEFORE that restore runs, i.e.
+        // `empty_project_root` is removed while it is still the process cwd
+        // (verified empirically below: `TempDir::drop` tolerates removing the
+        // current working directory on macOS and ignores its own errors).
+        let _guard = EnvAndCwdGuard {
+            original_packs,
+            original_home,
+            original_cwd,
+        };
+
+        // Isolate both HOME and cwd: with `db: None` config discovery falls
+        // through to tier-2 (`<cwd>/khive.toml`) then tier-4
+        // (`~/.khive/config.toml`) — either one declaring `[runtime].packs`
+        // would satisfy this control incidentally instead of proving the
+        // built-in-default path, so neither may be the ambient machine's.
+        // Creating these tempdirs mutates nothing process-global by itself
+        // (a panic here would be caught by the guard above, harmlessly
+        // restoring values that were never changed).
+        let home_dir = tempfile::tempdir().expect("tempdir for isolated HOME");
+        let empty_project_root = tempfile::tempdir().expect("empty project-root tempdir");
+
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
-        // Isolate both HOME and cwd: with `db: None` config discovery falls
-        // through to tier-2 (`<cwd>/khive.toml`) then tier-4
-        // (`~/.khive/config.toml`) — either one declaring `[runtime].packs`
-        // would satisfy this control incidentally instead of proving the
-        // built-in-default path, so neither may be the ambient machine's.
-        let home_dir = tempfile::tempdir().expect("tempdir for isolated HOME");
         std::env::set_var("HOME", home_dir.path());
-        let empty_project_root = tempfile::tempdir().expect("empty project-root tempdir");
         std::env::set_current_dir(empty_project_root.path())
             .expect("chdir into isolated project root with no discoverable config");
-
-        // Declared last so it drops FIRST (reverse declaration order):
-        // KHIVE_PACKS/HOME/cwd are restored before `home_dir` and
-        // `empty_project_root` are removed, on every exit including a
-        // panic from an assertion below.
-        let _guard = EnvAndCwdGuard {
-            original_packs,
-            original_home,
-            original_cwd,
-        };
 
         SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
 
