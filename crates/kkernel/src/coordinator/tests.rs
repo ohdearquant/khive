@@ -1733,7 +1733,7 @@ fn memory_runtime_gate_erroring_after_first_call_with(cause: String) -> Arc<Khiv
     )
 }
 
-/// Regression for the second production leak the round-2 review found: a
+/// Regression for a second production disclosure path: a
 /// `GateError` raised inside `link_cross_backend`'s own `authorize()` call on
 /// the source backend must never put backend `Display` text (which can embed
 /// connection strings or credentials) on the MCP-visible wire response. Only
