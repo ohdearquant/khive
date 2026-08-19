@@ -2,7 +2,10 @@
 
 **Status**: accepted\
 **Date**: 2026-05-22\
-**Authors**: khive maintainers
+**Authors**: khive maintainers\
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds the required
+backend-enforced bounded-and-verified BlobStore read while leaving admission and lifecycle policy
+in runtime, and binds vector operations to a complete embedding-space identity on acceptance.
 
 ## Context
 
@@ -17,8 +20,10 @@ compile against contracts; the binary wires in concrete backends at startup.
 
 The constraints on `khive-storage`:
 
-1. **Zero implementations.** The crate defines what a single backend can do. It does not
-   decide which backend to call, when to call it, or what is valid input.
+1. **Zero backend implementations.** The crate defines what a single backend can do. It does
+   not decide which backend to call, when to call it, or what is valid input. Backend-neutral
+   request cancellation/deadline propagation is a shared execution contract, not a storage
+   backend.
 2. **Placement-blind.** Hot/cold/frozen tiers, backend IDs, ATTACH schema aliases, and
    federation topology are runtime/coordinator concerns. Storage traits define capabilities,
    not topology.
@@ -333,16 +338,17 @@ is the backend's choice.
 
 ## Crate Boundary
 
-| Belongs in `khive-storage`                                               | Does NOT belong in `khive-storage`              |
-| ------------------------------------------------------------------------ | ----------------------------------------------- |
-| Eight capability traits                                                  | `StorageProfile` / `PlacementRole`              |
-| Storage-facing record types (`Note`, `Entity`, `Edge`, `Event`)          | `BackendId` / `BackendHandle`                   |
-| Pagination / result types (`Page`, `PageRequest`, `BatchWriteSummary`)   | ATTACH schema aliases (`SqlScope`)              |
-| Single-backend `StorageError`                                            | `CoordinatorError` / federation errors          |
-| `StorageCapability` enum (8 variants)                                    | `CoordinatorStore` / `StorageCoordinator` trait |
-| Mechanical default methods                                               | Policy default methods (quota, retention)       |
-| Filter types (`EntityFilter`, `EdgeFilter`, `EventFilter`, `TextFilter`) | `registered_kinds()` / kind discovery           |
-| Shared types (`SqlValue`, `SqlRow`, `VectorSearchHit`, `TextSearchHit`)  | Placement / routing logic                       |
+| Belongs in `khive-storage`                                               | Does NOT belong in `khive-storage`               |
+| ------------------------------------------------------------------------ | ------------------------------------------------ |
+| Eight capability traits                                                  | `StorageProfile` / `PlacementRole`               |
+| Storage-facing record types (`Note`, `Entity`, `Edge`, `Event`)          | `BackendId` / `BackendHandle`                    |
+| Pagination / result types (`Page`, `PageRequest`, `BatchWriteSummary`)   | ATTACH schema aliases (`SqlScope`)               |
+| Single-backend `StorageError`                                            | `CoordinatorError` / federation errors           |
+| `StorageCapability` enum (8 variants)                                    | `CoordinatorStore` / `StorageCoordinator` trait  |
+| Mechanical default methods                                               | Policy default methods (quota, retention)        |
+| Filter types (`EntityFilter`, `EdgeFilter`, `EventFilter`, `TextFilter`) | `registered_kinds()` / kind discovery            |
+| Shared types (`SqlValue`, `SqlRow`, `VectorSearchHit`, `TextSearchHit`)  | Placement / routing logic                        |
+| Backend-neutral request cancellation/deadline context                    | Driver interrupt/progress-handler implementation |
 
 ### What `SqlAccess` does not own
 
@@ -369,11 +375,12 @@ registry + placement metadata from `khive.toml`, not store-trait discovery.
 
 ## Rationale
 
-### Why trait-only?
+### Why no storage backends?
 
 If `khive-storage` contained SQLite code, every crate depending on it would transitively
-depend on `rusqlite`, `sqlite-vec`, and FTS5 headers. The trait crate has zero heavy
-dependencies — it is pure contracts. Backend crates bring their own dependencies.
+depend on `rusqlite`, `sqlite-vec`, and FTS5 headers. The crate has zero heavy driver
+dependencies: capability traits, shared values, and request execution context remain
+backend-neutral. Backend crates bring their own dependencies.
 
 ### Why eight traits (not fewer)?
 
@@ -452,6 +459,8 @@ is the natural representation.
 - `error.rs`: `StorageError` with `StorageCapability` discriminant.
 - `types.rs`: shared types (`SqlRow`, `SqlValue`, `Page`, `BatchWriteSummary`, filter
   types, hit types).
+- `request_context.rs`: backend-neutral task-local request cancellation, absolute
+  deadlines, child inheritance, and async phase guards.
 
 ## Amendment: bounded `GraphStore::traverse` execution (2026-08-01)
 
@@ -507,3 +516,141 @@ therefore cannot temporarily exceed the live connection budget. The writer
 task's fixed connection and store-internal operation-scoped connections are
 outside this raw-SQL handle budget and retain their ADR-067/ADR-135
 contracts.
+
+## Amendment: operation-scoped raw-SQL reader admission (2026-08-09)
+
+Issue #1828 supersedes the preceding amendment's reader-handle lifetime rule.
+The pool's effective reader count bounds concurrent file-backed raw-SQL reader
+opens and active read operations, not the number of retained `SqlReader`
+handles. `SqlAccess::reader()` may cache a read-only connection on its returned
+handle, but the permit used while opening that connection is released when the
+open finishes. Each ordinary `query_row`, `query_all`, and `query_page` call
+acquires a reader permit before moving the cached connection onto the blocking
+thread and releases it only after SQLite finishes the operation; the explicit
+read-transaction exception below treats its multi-call span as one operation.
+Saturation keeps the existing finite `checkout_timeout` and returns
+`StorageError::Timeout` with operation `sql_bridge.reader_open` or
+`sql_bridge.reader_operation`, respectively.
+
+The same rule applies to reads through a queue-backed `SqlWriter`: its lazily
+opened read-only connection remains cached without a reader permit, while each
+ordinary active query or explicit read-transaction span uses the shared
+permit. If an awaiting task is
+cancelled after SQLite work starts, the detached blocking closure retains the
+connection and permit together until that work actually finishes. Cancellation
+therefore cannot oversubscribe active reads, while idle retained handles no
+longer consume permanent admission capacity.
+
+Cached read-only connections may carry one explicitly admitted, top-level
+deferred read transaction across calls. A successful `BEGIN`, `BEGIN
+TRANSACTION`, or `BEGIN DEFERRED [TRANSACTION]` moves that call's reader permit
+onto the cached handle. Every query in the snapshot reuses the same permit;
+`COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite reports
+autocommit. `BEGIN IMMEDIATE`/`EXCLUSIVE`, `START`, nested `BEGIN`, savepoints,
+`RELEASE`, and `ROLLBACK ... TO` remain typed `StorageError::InvalidInput`
+because they either reserve write-side locks or require a nested lifecycle the
+single-level admission state does not represent. This exception is specific to
+single-statement reader calls: every `execute_batch` path continues to reject
+all transaction control before executing anything.
+
+Defense in depth distinguishes admitted and unadmitted non-autocommit state.
+An ordinary operation that leaves the cached connection outside autocommit is
+rolled back before its operation permit is released; if autocommit cannot be
+restored, the connection is discarded first. An admitted read transaction
+retains its permit across errors until a terminal control restores autocommit.
+On cancellation or handle drop, the connection is destroyed before its
+transaction permit, so SQLite closes the snapshot before admission returns.
+Thus an idle cached reader is autocommit and cannot pin WAL, while every live
+multi-call snapshot remains inside the `max_readers` active-read budget.
+
+The `multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress`
+regression is scoped to #1828: it retains eight cached reader handles against a
+two-reader budget after each handle completes its one-shot read, disables
+SQLite autocheckpoint, drives repeated write cycles, and observes the central
+ADR-091 PASSIVE checkpoint copying every WAL frame each cycle while the file
+size remains bounded. This proves idle handles no longer retain reader
+admission without depending on a zero-reader TRUNCATE window or undoing #1848's
+central checkpoint owner.
+
+The regression does not reproduce or close #1460 or #1812. An idle autocommit
+connection does not pin WAL; those issues concern production stdio/multiprocess
+pinning and continuous concurrent-session WAL bounds, respectively, and remain
+open pending their own production-shaped regressions and fixes.
+
+This amendment does not change the one-permit standalone writer budget. A
+read-write connection still retains its writer permit for its handle lifetime,
+including while one of its reader-supertrait methods runs; that read also
+acquires the ordinary active-read permit. The cached-reader admission state
+does not apply to this writer connection, so reader-supertrait calls within a
+legitimate manual `atomic_unit` do not terminate its transaction. Cached idle
+reader connections are enforced autocommit connections and do not retain a WAL
+snapshot (ADR-091), but their count is no longer a `max_readers` contract:
+callers that retain arbitrarily many handles remain responsible for their
+process's file-descriptor budget.
+
+## Amendment: request-scoped cancellation of SQLite reads (2026-08-11)
+
+Issues #1895, #1843, and #1893 supersede this ADR's statements that a cancelled
+raw read always continues naturally in a detached blocking closure. Every
+request-owned SQLite read now carries merged cancellation sources and one
+absolute monotonic deadline across MCP, daemon, coordinator, pack, and spawned
+child boundaries. The exact connection executing a read-only statement owns
+one progress callback (1,000 VM operations) and one `InterruptHandle`; either
+the request signal or deadline records the first cause and interrupts that
+connection. The async boundary waits for SQLite to stop, subject to the
+validated `KHIVE_SQLITE_INTERRUPT_GRACE_MS` settlement bound. `spawn_blocking`
+cannot be force-aborted once started, so grace expiry does not detach the
+worker: it escalates to a second, longer join bounded by
+`KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS`, and the caller's response is only
+returned once that join resolves — either the real worker settled (its
+connection and admission are released before the response, by construction)
+or the hard cap was also exhausted, in which case the worker is detached and
+does continue to own its connection and admission until it eventually exits
+on its own. A cancellation that arrives before a raw-SQL statement is
+classified as a read or a write takes the same bounded path; only a
+statement already classified and executing as an admitted write or
+transaction-control statement is completion-preserving (see
+[ADR-091](ADR-091-wal-snapshot-lifetime.md) Amendment 12 for the full
+settlement contract). Final hard-cap detachment and late write admission use
+one atomic phase: an admitted write is joined to real completion, while a
+worker that loses to detachment must return the typed timeout before executing
+SQLite.
+
+The merged task-local scope, absolute deadline, child inheritance, and async
+phase guards live in `khive-storage` so runtime and pack callers depend only on
+the backend-neutral contract. `khive-db` consumes an opaque context snapshot
+and owns all `rusqlite` progress callbacks, interrupt handles, teardown, and
+connection quarantine. SQLite fault-injection controls remain local to
+`khive-db` tests and are not part of the shared request context.
+
+The prepared `rusqlite::Statement::readonly()` result is the write-safety
+authority. `INSERT`/`UPDATE`/`DELETE ... RETURNING`, transaction-control
+statements, `execute_batch`, writer-task work, migrations, checkpoints, and
+atomic units never register for read interruption. Cancellation may stop
+awaiting a read; it must not turn an admitted write into `SQLITE_INTERRUPT`,
+partial execution, or a fabricated retryable timeout. Request-owned spawned
+read tasks explicitly inherit the same absolute deadline; nested scopes take
+the earlier deadline and merge rather than replace cancellation sources.
+
+Read teardown is ordered: finalize the statement/cursor; roll back an
+interrupted explicit read transaction or mark its connection for discard;
+clear the connection-global progress callback; retire the interrupt target;
+only then make the connection reusable and release its permit. A callback
+install/clear or interrupted-rollback failure is fail-closed: standalone and
+pooled readers close/replace the connection, while a degraded shared-writer
+reader quarantines its pool connection. `SQLITE_INTERRUPT` becomes a typed
+`StorageError::Timeout` only when the read control recorded a request or
+deadline cause; an unrelated SQLite error racing cancellation is preserved.
+Graph traversal composes its work/time budget into this single live callback,
+with first-cause ordering, rather than installing an independent competing
+request handler.
+
+Async read phases that do not execute SQLite VM instructions (embedding
+inference, reader admission, and OS holder census) select or cooperatively poll
+the same absolute request context. `db_diagnostics` keeps its PASSIVE checkpoint
+outside interruption because it can backfill database pages, then registers
+only the graph-integrity SELECT and runs the process/fd census as a fresh
+cooperative phase. Cancellation is never converted into a degraded diagnostic
+or partial-success search. Coordinator fan-out stamps each child completion and
+accepts it only when the stamp is at or before the shared absolute deadline;
+the interrupt grace is cleanup time, not extra result time.

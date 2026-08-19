@@ -242,6 +242,9 @@ transcripts into three auxiliary tables (`sessions`, `session_messages`,
 `session_mirror_cursor`) declared through the pack's `SCHEMA_PLAN`
 (`SESSION_SCHEMA_PLAN_STMTS`, the ADR-028 mechanism). It shipped as the pack's M2 milestone
 (issue #350, PR #368), gained the Codex CLI source in PR #375, and is disabled by default.
+"Read-only" refers to the transcript inputs. The mirror's auxiliary-table sink
+is writer-bearing, so ADR-028 Amendment A2 disables it when the session pack is
+assigned to a read-only snapshot backend.
 
 The T1 verb surface and the session mirror are additive, not a replacement. This is a deliberate
 design ruling. T1's four verbs read and write `kind=session` notes in the shared `notes` table.

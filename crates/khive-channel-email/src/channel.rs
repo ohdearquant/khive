@@ -26,6 +26,11 @@ const IMAP_FOLDER: &str = "INBOX";
 /// `poll_page` path.
 const IMAP_PAGE_LIMIT: usize = 50;
 
+// Quarantine sender prefix invariant: `email:quarantine` must retain the
+// channel's `email:` prefix because prefix-keyed consumers use it to surface
+// the notification. Renaming it outside that prefix silently hides alerts.
+const EMAIL_QUARANTINE_SENDER: &str = "email:quarantine";
+
 /// Reason a message failed the attribution gate (ADR-056 Amendment
 /// 2026-07-02) and was quarantined instead of attributed to the maintainer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +267,8 @@ impl EmailChannel {
     /// legitimate thread's context.
     fn quarantine_envelope(&self, email: &RawEmail, reason: QuarantineReason) -> ChannelEnvelope {
         let to = format!("email:{}", self.maintainer_address());
-        let mut env = ChannelEnvelope::new("email:quarantine", to, email.best_body());
+        let mut env = ChannelEnvelope::new(EMAIL_QUARANTINE_SENDER, to.clone(), email.best_body())
+            .with_quarantine_replay(email.raw_bytes.clone(), to);
 
         if !email.subject.is_empty() {
             env = env.with_subject(&email.subject);
@@ -296,11 +302,13 @@ impl EmailChannel {
         uid: u32,
         imap_external_id: &str,
         reason: QuarantineReason,
+        raw_bytes: Option<Vec<u8>>,
     ) -> ChannelEnvelope {
         let to = format!("email:{}", self.maintainer_address());
         let body =
             format!("(khive: IMAP message UID {uid} could not be parsed and was quarantined)");
-        let mut env = ChannelEnvelope::new("email:quarantine", to, body);
+        let mut env = ChannelEnvelope::new(EMAIL_QUARANTINE_SENDER, to.clone(), body)
+            .with_quarantine_replay(raw_bytes.unwrap_or_default(), to);
         env = env.with_external_id(imap_external_id);
         env.metadata
             .insert("quarantined".to_string(), "true".to_string());
@@ -423,6 +431,7 @@ impl EmailChannel {
                     uid,
                     imap_external_id,
                     reason,
+                    raw_bytes,
                 } => {
                     let reason: QuarantineReason = reason.into();
                     warn!(
@@ -434,6 +443,7 @@ impl EmailChannel {
                         uid,
                         &imap_external_id,
                         reason,
+                        raw_bytes,
                     ));
                 }
             }
@@ -477,7 +487,10 @@ impl EmailChannel {
             env = env.with_wire_references(refs);
         }
 
-        env
+        env.with_quarantine_replay(
+            email.raw_bytes,
+            format!("email:{}", self.maintainer_address()),
+        )
     }
 }
 
@@ -658,6 +671,7 @@ mod tests {
     fn make_email(from_addr: &str, imap_id: &str) -> RawEmail {
         RawEmail {
             uid: 1,
+            raw_bytes: Vec::new(),
             imap_external_id: imap_id.to_string(),
             from_addrs: vec![from_addr.to_string()],
             sender_addr: None,
@@ -681,6 +695,7 @@ mod tests {
             .unwrap_or_else(|| format!("{TEST_AUTHSERV_ID}; dmarc=pass header.from=example.com"));
         RawEmail {
             uid: 1,
+            raw_bytes: Vec::new(),
             imap_external_id: imap_id.to_string(),
             from_addrs,
             sender_addr: None,
@@ -810,6 +825,18 @@ mod tests {
             "both ancestor ids parsed from raw bytes must survive into wire_references; \
              got envs={envs:?}"
         );
+        let replay = envs[0]
+            .quarantine_replay
+            .as_ref()
+            .expect("parsed email must retain in-memory replay context");
+        assert_eq!(
+            replay.bytes, raw,
+            "email replay context must preserve the byte-exact RFC 822 payload"
+        );
+        assert_eq!(
+            replay.notification_to, "email:maintainer@example.com",
+            "content refusal notifications must route to the configured maintainer"
+        );
     }
 
     #[tokio::test]
@@ -852,7 +879,10 @@ mod tests {
         );
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1, "must be stored as quarantine, not dropped");
-        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0].from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
+        );
         assert_eq!(
             envs[0]
                 .metadata
@@ -943,7 +973,10 @@ mod tests {
             1,
             "multi-From message must be quarantined, not dropped"
         );
-        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0].from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
+        );
         assert_eq!(
             envs[0]
                 .metadata
@@ -1055,7 +1088,10 @@ mod tests {
             envs[0].from, "email:maintainer@example.com",
             "quarantined mail must never carry the claimed maintainer address as `from`"
         );
-        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0].from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
+        );
         assert_eq!(
             envs[0]
                 .metadata
@@ -1141,7 +1177,10 @@ mod tests {
         let ch = build_channel("maintainer@example.com", vec![email]);
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
-        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0].from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
+        );
         assert_eq!(
             envs[0]
                 .metadata
@@ -1169,8 +1208,8 @@ mod tests {
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
         assert_eq!(
-            envs[0].from, "email:quarantine",
-            "a forged dmarc=pass hidden inside a quoted reason pvalue must never attribute mail"
+            envs[0].from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
         );
         assert_eq!(
             envs[0]
@@ -1201,8 +1240,8 @@ mod tests {
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
         assert_eq!(
-            envs[0].from, "email:quarantine",
-            "a forged smtp.mailfrom hidden inside a quoted pvalue's embedded whitespace must never attribute mail"
+            envs[0].from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
         );
         assert_eq!(
             envs[0]
@@ -1225,7 +1264,10 @@ mod tests {
         let ch = build_channel("maintainer@example.com", vec![email]);
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
-        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0].from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
+        );
         assert_eq!(
             envs[0]
                 .metadata
@@ -1301,7 +1343,10 @@ mod tests {
         let ch = build_channel_from(config, vec![email]);
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
-        assert_eq!(envs[0].from, "email:quarantine");
+        assert_eq!(
+            envs[0].from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
+        );
         assert_eq!(
             envs[0]
                 .metadata
@@ -1349,7 +1394,10 @@ mod tests {
             .iter()
             .find(|e| e.external_id.as_deref() == Some("imap:test:0:1"))
             .expect("unauthorized message must still be present, quarantined");
-        assert_eq!(quarantined.from, "email:quarantine");
+        assert_eq!(
+            quarantined.from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
+        );
         assert_eq!(
             quarantined
                 .metadata
@@ -1828,6 +1876,7 @@ mod tests {
                             uid: 1,
                             imap_external_id: "imap:imap.example.com:4:1".to_string(),
                             reason: MalformedReason::MissingBody,
+                            raw_bytes: None,
                         },
                         SelectedMessage::Email(Box::new(self.good.clone())),
                     ],
@@ -1861,9 +1910,15 @@ mod tests {
                  envelope actually handed to comm.ingest",
             );
         assert_eq!(
-            quarantined.from, "email:quarantine",
-            "a malformed UID must be attributed to the fixed quarantine marker"
+            quarantined.from, EMAIL_QUARANTINE_SENDER,
+            "quarantine sender prefix invariant: `email:` keeps the alert visible to prefix-keyed consumers"
         );
+        let replay = quarantined
+            .quarantine_replay
+            .as_ref()
+            .expect("even a missing IMAP body carries an explicit empty replay context");
+        assert!(replay.bytes.is_empty());
+        assert_eq!(replay.notification_to, "email:maintainer@example.com");
         assert_eq!(
             quarantined.metadata.get("quarantined").map(String::as_str),
             Some("true"),

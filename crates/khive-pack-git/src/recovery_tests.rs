@@ -29,6 +29,12 @@ use crate::handlers::RemoteCommitRecovery;
 use crate::ingest::{run_ingest_with_commit_recovery, IngestInclude, IngestOptions};
 use crate::GitPack;
 
+fn list_items(response: &Value) -> &[Value] {
+    response["items"]
+        .as_array()
+        .expect("list response must contain an items array")
+}
+
 /// Every test here mutates process-global state (`PATH`,
 /// `KHIVE_GIT_DIGEST_SCRATCH_ROOT`) -- share `cache`'s lock so these tests
 /// never race against `cache::tests` or each other within the same `cargo
@@ -826,7 +832,7 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs");
-    let pr_items = prs.as_array().expect("array");
+    let pr_items = list_items(&prs);
     assert_eq!(
         pr_items.len(),
         1,
@@ -840,14 +846,18 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues");
-    assert_eq!(issues.as_array().expect("array").len(), 1, "{issues:?}");
-    let issue1_id = issues[0]["id"].as_str().expect("issue1 id").to_string();
+    let issue_items = list_items(&issues);
+    assert_eq!(issue_items.len(), 1, "{issues:?}");
+    let issue1_id = issue_items[0]["id"]
+        .as_str()
+        .expect("issue1 id")
+        .to_string();
 
     let commits = registry
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let commit_items = commits.as_array().expect("array");
+    let commit_items = list_items(&commits);
     assert_eq!(commit_items.len(), 1, "{commit_items:?}");
     assert_eq!(
         commit_items[0]["properties"]["sha"], fixture_commit_sha,

@@ -1,6 +1,6 @@
 # khive
 
-A research knowledge graph runtime for agents that need structure: typed substrates, closed
+A knowledge graph runtime for agents that need structure: typed substrates, closed
 taxonomies, and a verb-consolidated MCP surface.
 
 [![CI](https://github.com/ohdearquant/khive/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/khive/actions/workflows/ci.yml)

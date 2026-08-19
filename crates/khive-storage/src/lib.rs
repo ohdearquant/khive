@@ -8,6 +8,7 @@ pub mod error;
 pub mod event;
 pub mod graph;
 pub mod note;
+pub mod request_context;
 pub mod sparse;
 pub mod sql;
 pub mod telemetry;
@@ -28,6 +29,14 @@ pub use event::{
 };
 pub use graph::GraphStore;
 pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
+pub use request_context::{
+    await_request_read_phase, capture_request_read_context, effective_request_read_deadline,
+    ensure_request_read_active, inherit_request_read_cancellation, inherit_request_read_context,
+    request_read_is_cancelled, request_read_timeout_from_env, scope_request_read_cancellation,
+    scope_request_read_deadline, scope_request_read_deadline_at,
+    wait_for_request_read_cancellation, RequestReadContext, RequestReadDeadline,
+    RequestReadStopReason, DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+};
 pub use sparse::SparseStore;
 pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter};
 pub use telemetry::{

@@ -32,6 +32,7 @@ khive-pack-knowledge = { version = "0.7.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.7.0", path = "../khive-pack-session" }
 khive-pack-git = { version = "0.7.0", path = "../khive-pack-git" }
 khive-pack-blob = { version = "0.7.0", path = "../khive-pack-blob" }
+khive-pack-moodboard = { version = "0.7.0", path = "../khive-pack-moodboard" }
 khive-pack-workspace = { version = "0.7.0", path = "../khive-pack-workspace" }
 khive-request = { version = "0.7.0", path = "../khive-request" }
 khive-changeset = { version = "0.7.0", path = "../khive-changeset" }
@@ -60,6 +61,7 @@ libc = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+khive-gate-rego = { version = "0.7.0", path = "../khive-gate-rego" }
 
 [features]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).

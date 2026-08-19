@@ -87,6 +87,12 @@ impl PackRuntime for SessionPack {
     }
 
     async fn warm(&self) {
+        // Mirror services ingest external sessions and therefore write notes.
+        // A snapshot-inspection runtime may expose session read verbs, but it
+        // must never launch a background mirror against its read-only backend.
+        if self.runtime.is_read_only() {
+            return;
+        }
         let config = crate::mirror::MirrorConfig::from_env();
         if !config.enabled
             && !config.codex_enabled

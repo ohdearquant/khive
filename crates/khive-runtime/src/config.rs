@@ -313,6 +313,24 @@ pub fn parse_pack_list(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Interpret the construction-time `KHIVE_ANN_FRESH_TAIL` value.
+///
+/// Preserve the escape hatch's existing semantics while moving its read out of
+/// request serving: only `0` disables; unset and every other value enable.
+fn ann_fresh_tail_enabled_from_value(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// Sample ADR-118's fresh-tail escape hatch for runtime construction.
+///
+/// Callers must retain the returned value for the runtime's lifetime instead
+/// of re-reading the environment on a serving path. Only the exact value `0`
+/// disables; unset and every other value enable.
+pub fn ann_fresh_tail_enabled_from_env() -> bool {
+    let value = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
+    ann_fresh_tail_enabled_from_value(value.as_deref())
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         let db_path = std::env::var("HOME")
@@ -1005,6 +1023,20 @@ mod no_embeddings_tests {
             configured_embedding_models(&config),
             vec![EmbeddingModel::AllMiniLmL6V2]
         );
+    }
+}
+
+#[cfg(test)]
+mod ann_fresh_tail_config_tests {
+    use super::ann_fresh_tail_enabled_from_value;
+
+    #[test]
+    fn only_exact_zero_disables_fresh_tail() {
+        assert!(ann_fresh_tail_enabled_from_value(None));
+        assert!(!ann_fresh_tail_enabled_from_value(Some("0")));
+        assert!(ann_fresh_tail_enabled_from_value(Some("1")));
+        assert!(ann_fresh_tail_enabled_from_value(Some("false")));
+        assert!(ann_fresh_tail_enabled_from_value(Some(" 0")));
     }
 }
 

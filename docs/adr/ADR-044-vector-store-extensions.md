@@ -3,6 +3,8 @@
 **Status**: accepted
 **Date**: 2026-05-23
 **Authors**: khive maintainers
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which requires vector
+insert/search handles to be bound to the complete immutable embedding-space identity on acceptance.
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (base `VectorStore`)

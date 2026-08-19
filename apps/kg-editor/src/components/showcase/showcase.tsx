@@ -1,10 +1,11 @@
 "use client";
 
-import { ArrowRight, GitBranch, LoaderCircle, Search, ShieldCheck } from "lucide-react";
+import { ArrowRight, GitBranch, Search, ShieldCheck } from "@/icons";
 import Link from "next/link";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
+import { DataState } from "@/components/data-state";
 import { loadStaticShowcaseBundle } from "@/lib/adapters/static-showcase-source";
 import type { RepoBundle } from "@/lib/repo-bundle";
 import {
@@ -102,6 +103,28 @@ export function Showcase() {
       });
   }
 
+  function openCuratedExample() {
+    const sequence = ++loadSequence.current;
+    setInput(defaultEntry.canonicalUrl);
+    setState({ status: "loading", entry: defaultEntry });
+    replaceRepositoryQuery(defaultEntry.canonicalUrl);
+    void loadEntry(defaultEntry)
+      .then((bundle) => {
+        if (loadSequence.current === sequence) {
+          setLabels(bundle.capability.labels);
+          setState({ status: "ready", entry: defaultEntry, bundle });
+        }
+      })
+      .catch((error: unknown) => {
+        if (loadSequence.current === sequence) {
+          setState({
+            status: "error",
+            reason: error instanceof Error ? error.message : "The showcase bundle could not be loaded.",
+          });
+        }
+      });
+  }
+
   return (
     <div className="repo-shell">
       <header className="repo-topbar">
@@ -147,22 +170,37 @@ export function Showcase() {
 
         <div className="repo-result" aria-busy={state.status === "loading"}>
           {state.status === "loading" && (
-            <div className="repo-state-card loading" role="status">
-              <LoaderCircle aria-hidden="true" />
-              <div><strong>Opening the static showcase bundle</strong><span>No repository process is running.</span></div>
-            </div>
+            <DataState
+              className="repo-state-card"
+              state="loading"
+              title="Opening the static showcase bundle"
+              message="Repository showcase data belongs here; no repository process is running."
+            />
           )}
           {state.status === "invalid" && (
-            <div className="repo-state-card warning" role="alert"><Search aria-hidden="true" /><div><strong>{labels?.unavailable ?? "Unavailable"}</strong><span>{state.reason}</span></div></div>
+            <DataState
+              className="repo-state-card"
+              state="error"
+              title="Repository lookup could not start"
+              message={state.reason}
+            />
           )}
           {state.status === "miss" && (
-            <div className="repo-state-card miss" role="status">
-              <Search aria-hidden="true" />
-              <div><strong>{labels?.miss_title}</strong><span>{labels?.miss_body} · {state.normalizedUrl}</span></div>
-            </div>
+            <DataState
+              className="repo-state-card"
+              state="empty"
+              title={labels?.miss_title ?? "No curated showcase bundle matches this repository"}
+              message={`${labels?.miss_body ?? "Curated repository showcase bundles belong here."} · ${state.normalizedUrl}`}
+              action={{ label: "Use the curated khive example", onClick: openCuratedExample }}
+            />
           )}
           {state.status === "error" && (
-            <div className="repo-state-card warning" role="alert"><ShieldCheck aria-hidden="true" /><div><strong>{labels?.unavailable ?? "Unavailable"}</strong><span>{state.reason}</span></div></div>
+            <DataState
+              className="repo-state-card"
+              state="error"
+              title="Showcase bundle could not be opened"
+              message={state.reason}
+            />
           )}
           {state.status === "ready" && <RepoShowcase bundle={state.bundle} />}
         </div>

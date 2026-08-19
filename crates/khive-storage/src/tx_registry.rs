@@ -1,11 +1,11 @@
 //! Process-wide open-transaction registry (ADR-091 Plank 0).
 //!
 //! Every caller-controllable SQL transaction span (`WriterGuard::transaction`,
-//! `atomic_unit`'s own registered span, and the raw `BEGIN IMMEDIATE`/`COMMIT`
-//! batch-writer spans) registers here on open and deregisters via `TxHandle`'s
-//! `Drop`. This is observe-only: no enforcement reads the registry in this
-//! plank. It exists so the checkpoint task can name which caller, if any, is
-//! holding a WAL snapshot open.
+//! `atomic_unit`'s own registered span, raw `BEGIN IMMEDIATE`/`COMMIT`
+//! batch-writer spans, and admitted cached-reader transactions) registers here
+//! on open and deregisters via `TxHandle`'s `Drop`. This is observe-only: no
+//! enforcement reads the registry in this plank. It exists so the checkpoint
+//! task can name which caller, if any, is holding a WAL snapshot open.
 
 use std::collections::HashMap;
 use std::ffi::OsString;

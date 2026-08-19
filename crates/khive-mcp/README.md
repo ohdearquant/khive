@@ -12,12 +12,14 @@ lifetime.
 ## Features
 
 - **One tool, `request`** — `RequestParams { ops, presentation, format, save_to, .. }` is
-  the entire MCP-visible surface (ADR-016); verb-specific schemas live in packs, not here
+  the entire MCP-visible surface (ADR-016); its outer envelope is closed to undeclared
+  fields, while verb-specific schemas live in packs
 - **Pluggable transports** — `Transport` trait + `TransportRegistry`; ships `StdioTransport`,
   open for more (e.g. Streamable HTTP) via `TransportRegistry::register`
 - **Daemon-aware dispatch** — `compute_config_id` fingerprints a resolved `RuntimeConfig`
-  (packs, db target, embedders, backend routing, outbound policy) so a thin
-  client only forwards to a warm daemon (ADR-049) when the fingerprints match;
+  plus captured serving policy (packs, db target, embedders, fresh-tail policy,
+  backend routing, outbound policy) so a thin client only forwards to a warm daemon
+  (ADR-049) when the fingerprints match;
   otherwise it falls back to local dispatch
 - **Result sinking** — `RequestParams::save_to` writes results as JSONL and returns a
   manifest (`path`, `rows`, `per_column_null_counts`, `schema_fingerprint`, `checksum`,

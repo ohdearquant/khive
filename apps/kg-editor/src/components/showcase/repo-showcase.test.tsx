@@ -8,6 +8,8 @@ import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
 
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
+const showcaseSourcePath = resolve(process.cwd(), "src/components/showcase/repo-showcase.tsx");
+const studioSourcePath = resolve(process.cwd(), "src/components/studio.tsx");
 
 function golden(): RepoBundle {
   return parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
@@ -26,6 +28,73 @@ describe("repository showcase", () => {
     for (const view of Object.values(bundle.capability.views)) {
       expect(within(navigation).getByRole("button", { name: view.label })).toBeVisible();
     }
+  });
+
+  it("keeps legacy state markup out of Studio and repository showcase surfaces", () => {
+    const showcaseSource = readFileSync(showcaseSourcePath, "utf8");
+    const studioSource = readFileSync(studioSourcePath, "utf8");
+
+    expect(showcaseSource).not.toMatch(/<div className="repo-empty/);
+    expect(showcaseSource).not.toMatch(/<div className={`repo-bounded/);
+    expect(showcaseSource).not.toMatch(/return <em className="repo-inline-state"/);
+    expect(studioSource).not.toMatch(/<div className="page-notice"/);
+  });
+
+  it("uses the shared unavailable state and exposes the capability reason", async () => {
+    const bundle = structuredClone(golden());
+    const user = userEvent.setup();
+    const view = bundle.capability.views.scorecard;
+    view.status = "unavailable";
+    view.unavailable_reason = "scorecard evidence was outside this export";
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="scorecard"]')!);
+
+    const unavailable = container.querySelector<HTMLElement>('[data-state="unavailable"]');
+    expect(unavailable).toBeVisible();
+    expect(unavailable).toHaveTextContent(view.unavailable_reason);
+  });
+
+  it("uses the shared ontology legend and marks exporter-derived edges geometrically", () => {
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+
+    expect(screen.getByLabelText("Ontology legend")).toHaveTextContent(/Concept.*Project.*Contains.*Derived/i);
+    expect(container.querySelector('line[data-edge-origin="derived"]')).toHaveAttribute("marker-end", "url(#showcase-ontology-arrow)");
+    expect(container.querySelector(".ontology-direction-glyph")?.getAttribute("transform")).toMatch(/^rotate\(/);
+    expect(container.querySelector("polygon.ontology-derived-glyph")).toBeInTheDocument();
+  });
+
+  it("lays out the structure graph from the shared seeded layout, independent of input order", () => {
+    const bundle = golden();
+    const reversed = structuredClone(bundle);
+    reversed.graph.packages = {
+      ...reversed.graph.packages,
+      items: [...reversed.graph.packages.items].reverse(),
+    };
+    reversed.graph.modules = {
+      ...reversed.graph.modules,
+      items: [...reversed.graph.modules.items].reverse(),
+    };
+
+    function nodePositions(container: HTMLElement): Record<string, { left: string; top: string }> {
+      const positions: Record<string, { left: string; top: string }> = {};
+      for (const node of container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]")) {
+        const id = node.getAttribute("data-node-id")!;
+        positions[id] = { left: node.style.left, top: node.style.top };
+      }
+      return positions;
+    }
+
+    const forward = render(<RepoShowcase bundle={bundle} />);
+    const forwardPositions = nodePositions(forward.container);
+    expect(Object.keys(forwardPositions).length).toBeGreaterThan(0);
+    forward.unmount();
+
+    const backward = render(<RepoShowcase bundle={reversed} />);
+    const backwardPositions = nodePositions(backward.container);
+    backward.unmount();
+
+    expect(backwardPositions).toEqual(forwardPositions);
   });
 
   it("navigates from a module to its precomputed commits and back to modules", async () => {
@@ -72,6 +141,9 @@ describe("repository showcase", () => {
     const commits = container.querySelector<HTMLElement>("[data-history-commits]")!;
     expect(within(commits).getAllByText("0").length).toBeGreaterThan(0);
     expect(within(commits).queryByText(bundle.capability.labels.unavailable)).not.toBeInTheDocument();
+    const empty = commits.querySelector<HTMLElement>('[data-state="empty"]');
+    expect(empty).toBeVisible();
+    expect(empty?.querySelectorAll("button")).toHaveLength(1);
     expect(within(container.querySelector<HTMLElement>("[data-history-capabilities]")!).getByText("false")).toBeVisible();
   });
 
@@ -107,10 +179,65 @@ describe("repository showcase", () => {
     bundle.graph.modules.disclosure = { status: "truncated", reason: "fixture node budget" };
     bundle.graph.modules.next_cursor = "opaque-cursor";
 
-    render(<RepoShowcase bundle={bundle} />);
+    const { container } = render(<RepoShowcase bundle={bundle} />);
 
-    expect(screen.getByText(/fixture node budget/i)).toBeVisible();
-    expect(screen.getAllByText((content) => content.includes(bundle.capability.labels.truncated)).length).toBeGreaterThan(0);
+    // Multiple `[data-state="truncated"]` disclosures can coexist: the browser-side
+    // local display slice (bound = shown, always ambient once a list exceeds the UI
+    // row cap) is a separate concern from the bundle's own page-bound disclosure.
+    // Target the modules page's own disclosure by its distinguishing reason text.
+    const state = Array.from(container.querySelectorAll<HTMLElement>('[data-state="truncated"]'))
+      .find((node) => node.textContent?.includes("fixture node budget"));
+    expect(state).toBeVisible();
+    expect(state).toHaveAttribute("data-bound", String(bundle.graph.modules.bound.max_items));
+    if (bundle.graph.modules.total_count.status === "available") {
+      expect(state).toHaveAttribute("data-known-total", String(bundle.graph.modules.total_count.value));
+    }
+    expect(state).toHaveTextContent(/fixture node budget/i);
+  });
+
+  it.each([
+    ["truncated", { truncated: true, next_cursor: null, disclosure: "truncated" }],
+    ["next cursor", { truncated: false, next_cursor: "next-page", disclosure: "complete" }],
+  ] as const)("does not mislabel a zero-item %s repository page as known-empty", async (_name, incomplete) => {
+    const bundle = structuredClone(golden());
+    const user = userEvent.setup();
+    const cycles = bundle.aggregates.dependency_topology.cycles;
+    cycles.items = [];
+    cycles.truncated = incomplete.truncated;
+    cycles.next_cursor = incomplete.next_cursor;
+    cycles.total_count = { status: "available", value: 3 };
+    cycles.disclosure = { status: incomplete.disclosure, reason: "fixture incomplete cycle page" };
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="dependency_topology"]')!);
+
+    const card = screen.getByRole("heading", { name: bundle.capability.labels.metrics.cycle_count }).closest("section")!;
+    expect(card.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+    const state = card.querySelector<HTMLElement>('[data-state="truncated"]');
+    expect(state).toBeVisible();
+    expect(state).toHaveAttribute("data-shown", "0");
+    expect(state).toHaveAttribute("data-bound", String(cycles.bound.max_items));
+  });
+
+  it.each([
+    ["nonempty", false],
+    ["empty", true],
+  ] as const)("treats an omitted cursor on a complete %s repository page as complete", async (_name, empty) => {
+    const bundle = structuredClone(golden());
+    const user = userEvent.setup();
+    const cycles = bundle.aggregates.dependency_topology.cycles;
+    cycles.items = empty ? [] : cycles.items.slice(0, 1);
+    cycles.truncated = false;
+    cycles.disclosure = { status: "complete", reason: null };
+    Reflect.deleteProperty(cycles, "next_cursor");
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="dependency_topology"]')!);
+
+    const card = screen.getByRole("heading", { name: bundle.capability.labels.metrics.cycle_count }).closest("section")!;
+    expect(card.querySelector('[data-state="truncated"]')).not.toBeInTheDocument();
+    if (empty) expect(card.querySelector('[data-state="empty"]')).toBeVisible();
+    else expect(card.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
   });
 
   it("keeps repository-wide ownership visible when the module join is unavailable", async () => {
@@ -158,6 +285,39 @@ describe("repository showcase", () => {
     await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
 
     expect(container.querySelectorAll(".repo-view-panel tbody tr")).toHaveLength(200);
-    expect(Array.from(container.querySelectorAll(".repo-view-panel .repo-bounded.truncated")).some((node) => node.textContent?.includes(bundle.capability.labels.truncated))).toBe(true);
+    expect(Array.from(container.querySelectorAll(".repo-view-panel .repo-bounded.truncated")).some((node) => node.textContent?.toLocaleLowerCase().includes(bundle.capability.labels.truncated.toLocaleLowerCase()))).toBe(true);
+  });
+
+  it("settles the structure graph without collapsing nodes onto a handful of shared coordinates", () => {
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const nodes = Array.from(container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]"));
+    expect(nodes).toHaveLength(51);
+
+    const coordinateCounts = new Map<string, number>();
+    for (const node of nodes) {
+      const key = `${node.style.left}|${node.style.top}`;
+      coordinateCounts.set(key, (coordinateCounts.get(key) ?? 0) + 1);
+    }
+
+    const overcrowded = Array.from(coordinateCounts.entries()).filter(([, count]) => count > 2);
+    expect(overcrowded).toEqual([]);
+  });
+
+  it("keeps every structure-graph card footprint inside a 300px mobile stage", () => {
+    const stageWidth = 300;
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const nodes = Array.from(container.querySelectorAll<HTMLElement>(".repo-graph-node[data-node-id]"));
+    expect(nodes).toHaveLength(51);
+
+    for (const node of nodes) {
+      const leftPercent = Number.parseFloat(node.style.left);
+      const widthPx = Number.parseFloat(node.style.width);
+      expect(Number.isNaN(leftPercent)).toBe(false);
+      expect(Number.isNaN(widthPx)).toBe(false);
+      const center = leftPercent / 100 * stageWidth;
+      const halfWidth = widthPx / 2;
+      expect(center - halfWidth).toBeGreaterThanOrEqual(0);
+      expect(center + halfWidth).toBeLessThanOrEqual(stageWidth);
+    }
   });
 });

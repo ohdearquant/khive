@@ -51,7 +51,14 @@ describe("static repository lookup", () => {
 
     expect(await screen.findByText(bundle.capability.labels.miss_title)).toBeVisible();
     expect(screen.getByText(new RegExp(bundle.capability.labels.miss_body))).toBeVisible();
+    const empty = container.querySelector<HTMLElement>('[data-state="empty"]');
+    expect(empty).toBeVisible();
+    expect(empty?.querySelectorAll("button")).toHaveLength(1);
     expect(window.location.search).toBe("");
+    expect(mockedLoad).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "Use the curated khive example" }));
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
     expect(mockedLoad).toHaveBeenCalledTimes(1);
   }, 15_000);
 });

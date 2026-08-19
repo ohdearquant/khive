@@ -21,8 +21,8 @@ request(ops="schedule.remind(content=\"check CI results\", at=\"2026-06-22T10:00
 ```
 
 The `at` param is an RFC 3339 timestamp. It is named `at`, not `due`. Add `repeat` to make it
-recurring: `"daily"`, `"weekly"`, `"monthly"`, or a 5-field cron expression (`"0 9 * * 1"` for
-Mondays at 09:00).
+recurring: `"daily"`, `"weekly"`, or `"monthly"`. Cron expressions are rejected because the
+executor cannot advance them safely.
 
 ```
 request(ops="schedule.remind(content=\"weekly standup prep\", at=\"2026-06-23T09:00:00Z\", repeat=\"weekly\")")
@@ -37,12 +37,13 @@ expression — it is validated at write time. Plain English prose is rejected.
 request(ops="schedule.schedule(action=\"gtd.assign(title=\\\"weekly review\\\", priority=\\\"p1\\\")\", at=\"2026-06-23T09:00:00Z\")")
 ```
 
-Any expression accepted by `request` is valid as an action:
+The action must be one exactly registered public verb call with literal arguments and
+all required fields. Batches, chains, `$prev`, bare shorthand, and internal subhandlers
+are rejected because the stored call must replay independently:
 
 ```
-schedule.remind(content="check status")
 comm.send(to="lambda:leo", content="heartbeat")
-[memory.recall(query="recent work"), comm.inbox()]
+gtd.assign(title="weekly review", priority="p1")
 ```
 
 ### 3. Agenda: review what is pending
@@ -75,8 +76,9 @@ Run `schedule.agenda()` first to confirm the event is still pending before cance
 
 ## Anti-patterns
 
-- **`at` named wrong.** The param is `at`, not `due`. Using `due=` is silently wrong or rejected.
+- **`at` named wrong.** The param is `at`, not `due`. Using `due=` is rejected.
 - **`action` as prose.** `action="send a heartbeat"` is rejected. The value must be a valid DSL verb call.
+- **Batch/chain action.** A scheduled action is one replayable call, not a batch or `$prev` chain.
 - **Natural-language timestamps.** `"tomorrow"` or `"next week"` are rejected by both `remind` and `schedule`. Compute the RFC 3339 string.
 - **Cancelling by ambiguous prefix.** If the short prefix matches more than one event, the call is rejected. Use a longer prefix or the full UUID.
 - **Expecting `agenda` to show cancelled events.** It only returns `status: "pending"`. Use `list(kind="scheduled_event")` via the KG pack to see all states.

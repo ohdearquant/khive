@@ -8,14 +8,15 @@ use super::common::{deser, DbDiagnosticsParams};
 use crate::KgPack;
 
 impl KgPack {
-    /// Writer-contention plus WAL/checkpoint diagnostics (ADR-091/ADR-135
-    /// operator surface): aggregate and class-specific writer acquisition,
-    /// pooled-timeout, and audit-failure counters; build identity; checkpoint
-    /// counters; a single PASSIVE probe; WAL file size; and an explicitly
-    /// qualified WAL-pin census. Zero-arg, always targets the main backend
-    /// regardless of the caller's namespace. Not write-free: the PASSIVE probe
-    /// may backfill WAL frames (normal checkpoint I/O) — it never changes
-    /// logical state, escalates to TRUNCATE, or deletes sidecar evidence.
+    /// Writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics
+    /// (ADR-091/ADR-135 operator surface): aggregate and class-specific writer
+    /// acquisition, pooled-timeout, and audit-failure counters; build identity;
+    /// duplicate edge-ID and list-ledger counts; checkpoint counters; a single
+    /// PASSIVE probe; WAL file size; and an explicitly qualified WAL-pin census.
+    /// Zero-arg, always targets the main backend regardless of the caller's
+    /// namespace. Not write-free: the PASSIVE probe may backfill WAL frames
+    /// (normal checkpoint I/O) — it never changes logical state, escalates to
+    /// TRUNCATE, or deletes sidecar evidence.
     pub(crate) async fn handle_db_diagnostics(
         &self,
         _token: &NamespaceToken,

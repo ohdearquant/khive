@@ -5,8 +5,8 @@
 //! `src/conflict.rs` under `#[cfg(test)] mod tests`.
 
 use khive_request::{
-    parse_request, ArgValue, DslError, ExecutionMode, MAX_OPS, MAX_OPS_INPUT_LEN,
-    NESTING_DEPTH_LIMIT,
+    parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, TypedJsonOp, MAX_OPS,
+    MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, RESERVED_ENVELOPE_ARGS,
 };
 use serde_json::json;
 
@@ -1220,7 +1220,7 @@ fn three_segment_verb_name_rejected() {
 #[test]
 fn chain_prev_array_index_at_root() {
     // `$prev[0].id` — index at the root of a prev result.
-    let r = req(r#"list(kind="concept") | get(id=$prev[0].id)"#);
+    let r = req(r#"search(kind="concept", query="root index") | get(id=$prev[0].id)"#);
     assert_eq!(r.mode, ExecutionMode::Chain);
     assert_eq!(
         r.ops[1].args["id"],
@@ -1275,7 +1275,7 @@ fn resolve_prev_array_index_out_of_bounds_returns_none() {
 #[test]
 fn quoted_prev_ref_with_array_index_parses() {
     // `"$prev[0].id"` quoted with bracket index should also promote.
-    let r = req(r#"list(kind="concept") | get(id="$prev[0].id")"#);
+    let r = req(r#"search(kind="concept", query="quoted root index") | get(id="$prev[0].id")"#);
     assert_eq!(r.mode, ExecutionMode::Chain);
     assert_eq!(
         r.ops[1].args["id"],
@@ -1579,6 +1579,32 @@ fn non_reserved_presentation_like_arg_accepted() {
     assert_eq!(val(&r.ops[0].args["present"]), &json!("yes"));
 }
 
+#[test]
+fn preference_verbs_share_the_envelope_reserved_argument_contract() {
+    for verb in [
+        "moodboard.serve",
+        "moodboard.judge",
+        "moodboard.train_preference",
+        "moodboard.preference",
+    ] {
+        for argument in RESERVED_ENVELOPE_ARGS {
+            let error = parse_typed_json_batch(vec![TypedJsonOp {
+                tool: verb.to_string(),
+                args: serde_json::Map::from_iter([((*argument).to_string(), json!("verbose"))]),
+            }])
+            .expect_err("envelope-owned names must fail before every preference handler");
+            assert!(
+                matches!(
+                    error,
+                    DslError::ReservedEnvelopeArg { ref arg_name, verb: ref error_verb }
+                        if arg_name == argument && error_verb == verb
+                ),
+                "unexpected error for {verb}.{argument}: {error:?}"
+            );
+        }
+    }
+}
+
 /// RUNTIME-AUD-002 (#433): the JSON-form parser must preserve a present-but
 /// non-string `namespace` verbatim (as `ArgValue::Value`), never dropping or
 /// coercing it. This is the ingress link that carries the malformed value into
@@ -1751,6 +1777,105 @@ fn oversized_ops_input_rejected_before_parsing() {
 }
 
 #[test]
+fn typed_json_batch_uses_transport_bounds_instead_of_raw_dsl_cap() {
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "payload".to_string(),
+        json!("x".repeat(MAX_OPS_INPUT_LEN + 1)),
+    );
+
+    let parsed = parse_typed_json_batch(vec![TypedJsonOp {
+        tool: "blob.put".to_string(),
+        args,
+    }])
+    .expect("the bounded typed transport must not reapply the raw DSL byte cap");
+
+    assert_eq!(parsed.mode, ExecutionMode::Parallel);
+    assert_eq!(parsed.ops.len(), 1);
+    assert_eq!(parsed.ops[0].tool, "blob.put");
+    assert_eq!(
+        val(&parsed.ops[0].args["payload"]).as_str().unwrap().len(),
+        MAX_OPS_INPUT_LEN + 1
+    );
+}
+
+#[test]
+fn typed_json_batch_preserves_json_form_structural_guards() {
+    assert!(matches!(
+        parse_typed_json_batch(Vec::new()),
+        Err(DslError::EmptyBatch)
+    ));
+    let over_count = (0..=MAX_OPS)
+        .map(|index| TypedJsonOp {
+            tool: format!("probe_{index}"),
+            args: serde_json::Map::new(),
+        })
+        .collect();
+    assert!(matches!(
+        parse_typed_json_batch(over_count),
+        Err(DslError::TooManyOps { count, max }) if count == MAX_OPS + 1 && max == MAX_OPS
+    ));
+
+    let reserved = TypedJsonOp {
+        tool: "list".to_string(),
+        args: serde_json::Map::from_iter([
+            ("kind".to_string(), json!("concept")),
+            ("presentation".to_string(), json!("verbose")),
+        ]),
+    };
+    assert!(matches!(
+        parse_typed_json_batch(vec![reserved]),
+        Err(DslError::ReservedEnvelopeArg { arg_name, .. }) if arg_name == "presentation"
+    ));
+
+    let exposure = TypedJsonOp {
+        tool: "moodboard.serve".to_string(),
+        args: serde_json::Map::from_iter([(
+            "exposure".to_string(),
+            json!({"preference_probability_shown": false, "source_rank_shown": true}),
+        )]),
+    };
+    let parsed = parse_typed_json_batch(vec![exposure])
+        .expect("business exposure provenance must not collide with the request envelope");
+    assert_eq!(
+        val(&parsed.ops[0].args["exposure"])["source_rank_shown"],
+        true
+    );
+
+    let prev = TypedJsonOp {
+        tool: "get".to_string(),
+        args: serde_json::Map::from_iter([("id".to_string(), json!({"nested": "$prev.id"}))]),
+    };
+    assert!(matches!(
+        parse_typed_json_batch(vec![prev]),
+        Err(DslError::PrevRefInJsonForm { arg_name }) if arg_name == "id"
+    ));
+
+    let mut at_limit = json!(null);
+    for _ in 0..(NESTING_DEPTH_LIMIT - 3) {
+        at_limit = json!([at_limit]);
+    }
+    let at_limit = TypedJsonOp {
+        tool: "stats".to_string(),
+        args: serde_json::Map::from_iter([("payload".to_string(), at_limit)]),
+    };
+    assert!(parse_typed_json_batch(vec![at_limit]).is_ok());
+
+    let mut over_limit = json!(null);
+    for _ in 0..(NESTING_DEPTH_LIMIT - 2) {
+        over_limit = json!([over_limit]);
+    }
+    let over_limit = TypedJsonOp {
+        tool: "stats".to_string(),
+        args: serde_json::Map::from_iter([("payload".to_string(), over_limit)]),
+    };
+    assert!(matches!(
+        parse_typed_json_batch(vec![over_limit]),
+        Err(DslError::NestingTooDeep { max, .. }) if max == NESTING_DEPTH_LIMIT
+    ));
+}
+
+#[test]
 fn ops_input_at_max_len_boundary_still_parses() {
     // Pad a trivially valid op with a comment-free string arg up to exactly
     // MAX_OPS_INPUT_LEN bytes, proving the length cap does not reject
@@ -1875,7 +2000,7 @@ fn find_prev_failure_reports_not_found_for_missing_field() {
 
 #[test]
 fn find_prev_failure_renders_root_index_as_valid_dsl_path() {
-    let parsed = req(r#"list(kind="concept") | get(id=$prev[2])"#);
+    let parsed = req(r#"search(kind="concept", query="missing root index") | get(id=$prev[2])"#);
     let failure = parsed.ops[1].args["id"]
         .find_prev_failure(&json!([]))
         .expect("out-of-range index must report a substitution failure");

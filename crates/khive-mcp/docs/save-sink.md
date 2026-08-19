@@ -22,6 +22,13 @@ defined in `crates/kkernel/docs/usage.md`. For `kkernel exec --strict
 manifest projection, canonical JSONL rows, and checksum all describe the same
 classified data.
 
+For an atomic ops-file envelope, `write_envelope` also copies the complete
+top-level `atomic` object into the stdout manifest. This unit-level commit and
+retry contract cannot be reconstructed from independent JSONL rows. In
+particular, a manifest for a committed-but-degraded unit retains
+`atomic.committed=true`, `atomic.status="committed_degraded"`, its typed
+`atomic.degradations`, and `atomic.retryable=false` unchanged.
+
 `write_and_manifest` derives that projection from its in-memory envelope.
 Incremental callers pass their already-bounded `summary.failures` projection to
 `finish`; the sink promotes exactly those entries to top-level `failures`
@@ -90,3 +97,10 @@ is known in those cases, so the ordinary manifest is the correct reconciliation
 record and no aborted manifest is emitted. Callers reconcile
 the manifest before applying the per-op/idempotency contracts to a retry;
 atomic ops-files retain their separate all-or-nothing database contract.
+
+Atomic execution also has a distinct post-commit sink-failure boundary. If a
+row write, flush, or final rename fails after the database unit committed, the
+CLI cannot return a manifest for an unpublished file. It instead prints the
+original result envelope augmented with a `save_file_publish` degradation and
+`retryable=false`, then exits non-zero for the sink failure. That non-zero exit
+does not roll back or make the already-durable atomic unit safe to replay.

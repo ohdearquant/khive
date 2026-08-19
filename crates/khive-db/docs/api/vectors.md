@@ -11,26 +11,28 @@ pins down; public-item contracts stay complete in their own doc-comments.
 See `crates/khive-db/src/stores/vectors.rs` — private methods `with_writer`,
 `with_writer_unmanaged`.
 
-`with_writer` routes a single-row write through the pool-wide `WriterTask`
-when `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise it falls
-back to the legacy pool-mutex path (`with_writer_unmanaged`).
+`with_writer` resolves the pool-wide `WriterTask` at write time and routes
+through it when available; a handle missed by construction outside Tokio is
+refreshed here. Strict routing fails closed when no handle is available.
+Compatibility mode falls back to the legacy pool-mutex path
+(`with_writer_unmanaged`) and emits a store-specific direct-route violation
+when the file-backed queue is enabled.
 
-This is the routing point for callers whose closure is DML-only
-(`delete`/`vec_delete`, `delete_subjects`/`vec_delete_subjects`): on the
-flag-on path the closure runs inside the WriterTask's own transaction, so a
-bare `BEGIN IMMEDIATE` (or an inner `conn.unchecked_transaction()`) would
-violate SQLite's nested-transaction rule. `insert`/`update` (which need
-their own delete-then-insert atomicity), `insert_batch` (the batch method),
-and `orphan_sweep` (ADR-067 Amendment 1) each do their own flag check and
-return early on `Some`, routing a DML-only closure directly through the
-WriterTask instead — their fallback calls into `with_writer` only ever
-execute on the flag-off path (`self.writer_task` is `None` by construction
-whenever those calls are reached), so there is no double-routing.
+This is the routing point for DML-only `delete` and the compatibility
+fallbacks of `insert`/`update`/`insert_batch`. On the queue path the closure
+runs inside the WriterTask's own transaction, so a bare `BEGIN IMMEDIATE` (or
+an inner `conn.unchecked_transaction()`) would violate SQLite's
+nested-transaction rule. Those replacement/batch operations, plus
+`delete_subjects` and `orphan_sweep`, first perform their own write-time lookup
+and submit a DML-only closure directly through the WriterTask. On a non-strict
+`None`, they fall through to the matching legacy helper and record only at the
+actual fallback seam; strict mode never reaches it.
 
-`with_writer_unmanaged` bypasses the WriterTask channel unconditionally
-regardless of `KHIVE_WRITE_QUEUE`. Reserved for closures that manage their
-own transaction — those cannot be sent through the WriterTask channel, which
-already wraps every request in its own transaction. The flag-off paths for
+`with_writer_unmanaged` bypasses the WriterTask channel unconditionally and is
+therefore reachable only after the shared write-time routing decision.
+Reserved for compatibility closures that manage their own transaction — those
+cannot be sent through the WriterTask channel, which already wraps every
+request in its own transaction. The fallback paths for
 `delete_subjects` and `orphan_sweep` use it with
 `Transaction::new_unchecked` (their own `BEGIN IMMEDIATE`); their flag-on
 paths route DML-only closures directly through the WriterTask instead, since
@@ -78,6 +80,13 @@ helper logs that identity as `delete` before removing it; no returned row means
 the subject is new and needs no second delete. Cross-identity repair therefore
 retains the original delete-then-upsert log order. Every statement shares the
 caller's transaction/savepoint, so all of them commit or roll back together.
+
+The public `insert_exact_only` seam passes `record_ann_delta=false` for vector
+identities whose contract permanently excludes an approximate-index consumer.
+That path still performs the same atomic replacement and metadata repair, but
+deletes a mismatched prior row directly and emits neither delete nor upsert
+rows into `ann_write_log`. Ordinary `insert`, `update`, and `insert_batch`
+always pass `true`; their restart-classification behavior is unchanged.
 
 `failpoint_flag`, when `Some` in a `cfg(test)` build, is checked between the
 DELETE and the INSERT so tests can force an error at that exact point and

@@ -153,8 +153,9 @@ impl SqlEntityStore {
         // fallback remains possible: a missing writer task — whether
         // explicitly disabled, spawn degraded (e.g. in-memory pool), or no
         // Tokio runtime was available at this first access (ADR-067
-        // Component A runtime-handle guard) — degrades to the legacy
-        // pool-mutex path rather than failing construction.
+        // Component A runtime-handle guard) — is cached without failing
+        // construction. Every write re-resolves it; strict mode refuses a
+        // remaining miss and compatibility mode may use the legacy path.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
@@ -164,34 +165,18 @@ impl SqlEntityStore {
         }
     }
 
-    fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
-        let config = self.pool.config();
-        let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-            operation: "entity_reader".into(),
-            message: "in-memory databases do not support standalone connections".into(),
-        })?;
-
-        let conn = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| map_err(e, "open_entity_reader"))?;
-
-        conn.busy_timeout(config.busy_timeout)
-            .map_err(|e| map_err(e, "open_entity_reader"))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| map_err(e, "open_entity_reader"))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| map_err(e, "open_entity_reader"))?;
-
-        Ok(conn)
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        self.pool
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
     }
 
     /// Route a single-row write through the pool-wide `WriterTask` when
-    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
-    /// to the legacy pool-mutex path.
+    /// the write queue is enabled and a handle is available. Strict mode
+    /// refuses a missing handle; compatibility mode falls back to the legacy
+    /// pool-mutex path.
     ///
     /// ADR-067 Component A (Fork C slice 2): this is the ONE routing point
     /// for every `with_writer` caller in this store — `upsert_entity`,
@@ -200,22 +185,23 @@ impl SqlEntityStore {
     /// DML-only (a single statement, no bare `BEGIN IMMEDIATE`): on the
     /// flag-on path it runs inside the WriterTask's own transaction, and a
     /// nested `BEGIN IMMEDIATE` would violate SQLite's nested-transaction
-    /// rule. `upsert_entities` (the batch method) does its OWN flag check
-    /// and returns early on `Some`, so its fallback call into this helper
-    /// only ever executes on the flag-off path (`self.writer_task` is
-    /// `None` by construction whenever that call is reached) — no
-    /// double-routing.
+    /// rule. `upsert_entities` (the batch method) performs the same write-time
+    /// lookup first; a non-strict `None` then falls through this helper, which
+    /// records the actual compatibility fallback. Strict mode returns before
+    /// either direct-writer seam is reached.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteEntity);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
@@ -231,18 +217,35 @@ impl SqlEntityStore {
         R: Send + 'static,
     {
         if self.is_file_backed {
-            let conn = self.open_standalone_reader()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Entities, op, e))?
+            let pool = Arc::clone(&self.pool);
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Entities,
+                op,
+                move |scope| {
+                    scope.ensure_active()?;
+                    let conn = pool
+                        .open_standalone_reader()
+                        .map_err(|error| map_sqlite_err(error, op))?;
+                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
+                },
+            )
+            .await
         } else {
             let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.reader().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Entities,
+                op,
+                move |scope| {
+                    let mut guard = pool
+                        .reader_until(|| scope.should_stop())
+                        .map_err(|e| map_sqlite_err(e, op))?
+                        .ok_or_else(|| StorageError::Timeout {
+                            operation: op.into(),
+                        })?;
+                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
+                },
+            )
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Entities, op, e))?
         }
     }
 }
@@ -594,7 +597,7 @@ impl EntityStore for SqlEntityStore {
         // owns the transaction and `WriteRequest::execute_and_reply` owns
         // the commit/rollback decision (a bare BEGIN IMMEDIATE inside this
         // closure would violate SQLite's nested-transaction rule).
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("upsert_entities")? {
             return writer_task
                 .send_bounded(move |conn| {
                     batch_upsert_entities(conn, &entities, attempted)

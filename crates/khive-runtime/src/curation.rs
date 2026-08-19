@@ -282,6 +282,11 @@ pub struct MergeSummary {
     pub tags_unioned: usize,
     pub content_appended: bool,
     pub dry_run: bool,
+    /// Rows and bytes this merge materialized against the per-transaction
+    /// budget, alongside the limits it was admitted under. Enforcement already
+    /// happened inside the transaction; this is the observed usage.
+    #[serde(default)]
+    pub tx_budget: MergeTxBudgetReport,
     /// Actual embedding-input truncation observed while reindexing the survivor.
     #[serde(skip)]
     pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
@@ -317,6 +322,105 @@ pub struct MergeEdgeConflictPreimage {
     /// `annotates` edges, including already-soft-deleted rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incident_edge_preimages: Vec<MergeEdgePreimage>,
+}
+
+/// Default per-transaction row cap for a direct entity/note merge. Every row
+/// materialized into Rust inside the merge transaction counts: the two merge
+/// records, incident edges, endpoint-contract resolutions, and conflict
+/// cascade rows. Far above any legitimate single-record merge, while bounding
+/// the writer hold and heap of a hub-node merge (`traverse` bounds its shared
+/// read expansion at 100k rows; a merge holds the writer, so it is tighter).
+const MERGE_TX_MAX_ROWS: usize = 50_000;
+
+/// Default per-transaction aggregate byte cap across the same materialized
+/// state (variable-length payloads: descriptions/content, properties, tags,
+/// edge metadata, fanout table names).
+const MERGE_TX_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Hard materialization limits for one merge transaction.
+///
+/// Enforced on the writer connection inside the merge's own `BEGIN IMMEDIATE`
+/// transaction, so the counted rows are exactly the rows the merge operates
+/// on — a pre-flight count on another connection could be outgrown between
+/// the count and the merge. Exceeding either limit rejects the merge with the
+/// observed counts before further state is materialized, and the transaction
+/// rolls back. Dry runs are budgeted identically: the preview performs the
+/// same reads and carries the same materialization hazard.
+#[derive(Clone, Copy, Debug)]
+pub struct MergeTxLimits {
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for MergeTxLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: MERGE_TX_MAX_ROWS,
+            max_bytes: MERGE_TX_MAX_BYTES,
+        }
+    }
+}
+
+/// Observed budget usage for one merge transaction (see [`MergeTxLimits`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeTxBudgetReport {
+    pub rows_charged: usize,
+    pub bytes_charged: usize,
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+/// Running row/byte account for one merge transaction.
+struct MergeTxBudget {
+    limits: MergeTxLimits,
+    rows: usize,
+    bytes: usize,
+}
+
+impl MergeTxBudget {
+    fn new(limits: MergeTxLimits) -> Self {
+        Self {
+            limits,
+            rows: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Add `rows`/`bytes` to the account; reject once either limit is passed.
+    /// Callers charge each unit of state *before* retaining it, so a rejected
+    /// merge never materializes more than one row past the cap.
+    fn charge(&mut self, rows: usize, bytes: usize, context: &str) -> Result<(), SqliteError> {
+        self.rows = self.rows.saturating_add(rows);
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.rows > self.limits.max_rows || self.bytes > self.limits.max_bytes {
+            return Err(SqliteError::InvalidData(format!(
+                "merge transaction budget exceeded while {context}: {} rows / {} bytes \
+                 materialized (limits {} rows / {} bytes); the merge was rejected before \
+                 materializing further state — curate the incident edges down or merge in \
+                 smaller steps",
+                self.rows, self.bytes, self.limits.max_rows, self.limits.max_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn report(&self) -> MergeTxBudgetReport {
+        MergeTxBudgetReport {
+            rows_charged: self.rows,
+            bytes_charged: self.bytes,
+            max_rows: self.limits.max_rows,
+            max_bytes: self.limits.max_bytes,
+        }
+    }
+}
+
+/// Fixed overhead approximates the id/timestamp/weight columns; variable
+/// payloads are counted at their stored length.
+fn edge_row_budget_bytes(edge: &EdgeRow) -> usize {
+    96 + edge.namespace.len()
+        + edge.relation.len()
+        + edge.target_backend.as_deref().map_or(0, str::len)
+        + edge.metadata.as_deref().map_or(0, str::len)
 }
 
 /// Patch for `update_edge`. Only `Some(_)` fields are applied; `None` means "leave unchanged".
@@ -534,6 +638,7 @@ fn collect_conflict_incident_edge_preimages(
     conn: &rusqlite::Connection,
     root_edge_id: Uuid,
     original_edges: &HashMap<Uuid, EdgeRow>,
+    budget: &mut MergeTxBudget,
 ) -> Result<Vec<MergeEdgePreimage>, SqliteError> {
     let parse_id =
         |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
@@ -562,6 +667,11 @@ fn collect_conflict_incident_edge_preimages(
                 target_backend: row.get(9)?,
                 metadata: row.get(10)?,
             };
+            budget.charge(
+                1,
+                edge_row_budget_bytes(&edge),
+                "collecting conflict cascade rows",
+            )?;
             if !seen.insert(edge.id) {
                 continue;
             }
@@ -628,6 +738,25 @@ fn resolve_merge_edge_endpoint(
         return Ok(Some(("note", kind, None)));
     }
     Ok(None)
+}
+
+/// [`resolve_merge_edge_endpoint`] with the resolved row charged against the
+/// merge transaction budget — endpoint resolution reads one row per non-merging
+/// endpoint, so a hub merge's contract checks are part of its materialization.
+fn resolve_merge_edge_endpoint_budgeted(
+    conn: &rusqlite::Connection,
+    id: Uuid,
+    budget: &mut MergeTxBudget,
+) -> Result<Option<MergeEdgeEndpointInfo>, SqliteError> {
+    let info = resolve_merge_edge_endpoint(conn, id)?;
+    if let Some((_, kind, entity_type)) = &info {
+        budget.charge(
+            1,
+            kind.len() + entity_type.as_deref().map_or(0, str::len),
+            "resolving rewire endpoint contracts",
+        )?;
+    }
+    Ok(info)
 }
 
 /// `true` if `(src_sub, src_kind, src_type) -[relation]-> (tgt_sub, tgt_kind, tgt_type)`
@@ -700,6 +829,7 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, bool, Vec<&'static str>)> {
+        crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref name) = patch.name {
             crate::secret_gate::check(name)?;
         }
@@ -960,6 +1090,7 @@ impl KhiveRuntime {
                         dry_run,
                         pack_rules,
                         validation,
+                        MergeTxLimits::default(),
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -988,6 +1119,7 @@ impl KhiveRuntime {
                         dry_run,
                         pack_rules,
                         validation,
+                        MergeTxLimits::default(),
                     )
                     .map_err(|error| match error {
                         MergeEntitySqlError::Sqlite(error) => error,
@@ -1007,6 +1139,20 @@ impl KhiveRuntime {
             .await
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
         };
+
+        // Emitted only after the transaction has committed, so the log write
+        // never extends the writer hold the budget exists to bound.
+        if !dry_run {
+            tracing::info!(
+                into_id = %summary.kept_id,
+                from_id = %summary.removed_id,
+                budget_rows = summary.tx_budget.rows_charged,
+                budget_bytes = summary.tx_budget.bytes_charged,
+                budget_max_rows = summary.tx_budget.max_rows,
+                budget_max_bytes = summary.tx_budget.max_bytes,
+                "merge_entity: transaction materialization budget"
+            );
+        }
 
         // FTS and vec-deletes already committed inside the transaction above;
         // only the embedding re-insert needs an async step outside it.
@@ -1245,6 +1391,7 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
+        crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
             crate::secret_gate::check(content)?;
         }
@@ -1465,6 +1612,67 @@ impl KhiveRuntime {
         Ok((note, embedding_report))
     }
 
+    /// Claim `external_id` on an outbound `message` note through the
+    /// ADR-124-sanctioned store-level one-key atomic path, bypassing the
+    /// caller-facing owner-established-property refusal in
+    /// [`Self::update_note`] (and its crate-internal prepare path). This is deliberately
+    /// NOT exposed through any registered verb (ADR-124's stated bound): it is
+    /// reachable only from pack/runtime code that owns outbox bookkeeping for
+    /// the `message` note kind.
+    ///
+    /// Refuses (returns `Err`, never writes) unless the live row is a
+    /// `message` note, `properties.direction == "outbound"`, and
+    /// `properties.external_id` is currently absent or empty.
+    pub async fn claim_outbound_message_external_id(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        external_id: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let store = self.notes(token)?;
+        let note = store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+        if note.kind != "message" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "external_id can only be claimed on a `message` note; note {id} is a `{}`",
+                note.kind
+            )));
+        }
+        let props = note.properties.as_ref().and_then(|v| v.as_object());
+        let direction = props
+            .and_then(|p| p.get("direction"))
+            .and_then(|v| v.as_str());
+        if direction != Some("outbound") {
+            return Err(RuntimeError::InvalidInput(format!(
+                "external_id can only be claimed on an outbound message note; note {id} has \
+                 direction {:?}",
+                direction
+            )));
+        }
+        let existing = props
+            .and_then(|p| p.get("external_id"))
+            .and_then(|v| v.as_str());
+        if existing.is_some_and(|v| !v.is_empty()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} already has an external_id claimed"
+            )));
+        }
+        store
+            .set_note_property(
+                id,
+                "external_id",
+                Value::String(external_id),
+                note.updated_at,
+            )
+            .await?;
+        store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
+    }
+
     /// Merge `from_id` note into `into_id` note.
     ///
     /// Both notes must exist in the namespace and have the same `kind`. Content is merged
@@ -1570,6 +1778,7 @@ impl KhiveRuntime {
                         dry_run,
                         pack_rules,
                         preserve_owner_established,
+                        MergeTxLimits::default(),
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -1597,12 +1806,27 @@ impl KhiveRuntime {
                         dry_run,
                         pack_rules,
                         preserve_owner_established,
+                        MergeTxLimits::default(),
                     )
                 })
             })
             .await
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
         };
+
+        // Emitted only after the transaction has committed, so the log write
+        // never extends the writer hold the budget exists to bound.
+        if !dry_run {
+            tracing::info!(
+                into_id = %summary.kept_id,
+                from_id = %summary.removed_id,
+                budget_rows = summary.tx_budget.rows_charged,
+                budget_bytes = summary.tx_budget.bytes_charged,
+                budget_max_rows = summary.tx_budget.max_rows,
+                budget_max_bytes = summary.tx_budget.max_bytes,
+                "merge_note: transaction materialization budget"
+            );
+        }
 
         if !dry_run && !embedding_plan.is_empty() {
             summary.embedding_truncation = self
@@ -1800,6 +2024,37 @@ pub(crate) fn note_fts_scalars(note: &Note) -> NoteFtsScalars {
 // Transactional merge SQL helpers
 // ---------------------------------------------------------------------------
 
+/// Cheap SQL-side byte-length probe for one merge entity, evaluated BEFORE
+/// [`read_merge_entity`] copies its columns into Rust `String`s and parses
+/// `properties`/`tags` as JSON. `LENGTH()` still requires SQLite to touch the
+/// stored bytes, but skips the Rust-side allocation and JSON parse — the
+/// expensive part for an oversized record. Charging this probe against the
+/// budget before the full read means an over-budget record is rejected
+/// without ever being materialized or parsed inside the writer transaction.
+/// Each column is wrapped in `CAST(... AS BLOB)` — plain `LENGTH(text)`
+/// returns SQLite's *character* count for TEXT values, not the UTF-8 byte
+/// count the budget is denominated in, so a multibyte (CJK/emoji) record
+/// could under-report and pass a probe its true byte size exceeds. Casting
+/// to BLOB forces `LENGTH()` to report octets instead.
+/// A missing row probes as zero; `read_merge_entity`'s own "not found" error
+/// fires on the subsequent full read and is unaffected by this probe.
+fn probe_merge_entity_bytes(conn: &rusqlite::Connection, id: Uuid) -> Result<usize, SqliteError> {
+    let id_str = id.to_string();
+    let len: Option<i64> = conn
+        .query_row(
+            "SELECT LENGTH(CAST(name AS BLOB)) \
+                    + COALESCE(LENGTH(CAST(description AS BLOB)), 0) \
+                    + COALESCE(LENGTH(CAST(properties AS BLOB)), 0) \
+                    + LENGTH(CAST(tags AS BLOB)) \
+             FROM entities WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id_str],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(SqliteError::Rusqlite)?;
+    Ok(128_usize.saturating_add(len.unwrap_or(0).max(0) as usize))
+}
+
 /// Read one entity row by ID within a namespace, returning `SqliteError` on missing/wrong-ns.
 fn read_merge_entity(
     conn: &rusqlite::Connection,
@@ -1898,8 +2153,30 @@ fn merge_entity_sql(
     dry_run: bool,
     pack_rules: Vec<EdgeEndpointRule>,
     validation: EntityMergeValidation,
+    limits: MergeTxLimits,
 ) -> Result<(MergeSummary, Entity), MergeEntitySqlError> {
+    let mut budget = MergeTxBudget::new(limits);
+    // Config-scaled fanout (one FTS/vector delete per table, one contract rule
+    // set per pack) is charged in bytes only: it is bounded by configuration,
+    // not by graph shape, but belongs in the same account it amortizes over.
+    budget.charge(
+        0,
+        vec_tables.iter().map(String::len).sum::<usize>()
+            + pack_rules.len() * std::mem::size_of::<EdgeEndpointRule>(),
+        "preparing pack and vector fanout",
+    )?;
+
+    budget.charge(
+        1,
+        probe_merge_entity_bytes(conn, into_id)?,
+        "reading merge records",
+    )?;
     let into_entity = read_merge_entity(conn, into_id, &namespace)?;
+    budget.charge(
+        1,
+        probe_merge_entity_bytes(conn, from_id)?,
+        "reading merge records",
+    )?;
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
 
     match validation {
@@ -1942,7 +2219,7 @@ fn merge_entity_sql(
         )?;
         let mut rows = stmt.query(rusqlite::params![&from_str])?;
         while let Some(row) = rows.next()? {
-            outbound.push(EdgeRow {
+            let edge = EdgeRow {
                 id: parse_id(row.get(0)?)?,
                 namespace: row.get(1)?,
                 source_id: parse_id(row.get(2)?)?,
@@ -1954,7 +2231,9 @@ fn merge_entity_sql(
                 deleted_at: row.get(8)?,
                 target_backend: row.get(9)?,
                 metadata: row.get(10)?,
-            });
+            };
+            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
+            outbound.push(edge);
         }
     }
 
@@ -1967,7 +2246,7 @@ fn merge_entity_sql(
         )?;
         let mut rows = stmt.query(rusqlite::params![&from_str])?;
         while let Some(row) = rows.next()? {
-            inbound.push(EdgeRow {
+            let edge = EdgeRow {
                 id: parse_id(row.get(0)?)?,
                 namespace: row.get(1)?,
                 source_id: parse_id(row.get(2)?)?,
@@ -1979,7 +2258,9 @@ fn merge_entity_sql(
                 deleted_at: row.get(8)?,
                 target_backend: row.get(9)?,
                 metadata: row.get(10)?,
-            });
+            };
+            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
+            inbound.push(edge);
         }
     }
 
@@ -2086,7 +2367,7 @@ fn merge_entity_sql(
                         into_entity.entity_type.clone(),
                     ))
                 } else {
-                    resolve_merge_edge_endpoint(conn, new_src)?
+                    resolve_merge_edge_endpoint_budgeted(conn, new_src, &mut budget)?
                 };
                 let tgt_info = if new_tgt == into_id {
                     Some((
@@ -2095,7 +2376,7 @@ fn merge_entity_sql(
                         into_entity.entity_type.clone(),
                     ))
                 } else {
-                    resolve_merge_edge_endpoint(conn, new_tgt)?
+                    resolve_merge_edge_endpoint_budgeted(conn, new_tgt, &mut budget)?
                 };
                 match (src_info, tgt_info) {
                     (Some((src_sub, src_kind, src_type)), Some((tgt_sub, tgt_kind, tgt_type))) => {
@@ -2170,8 +2451,12 @@ fn merge_entity_sql(
             // event contains enough state to restore every destroyed row.
             let surviving_edge_id = Uuid::parse_str(&conflict_id)
                 .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
-            let incident_edge_preimages =
-                collect_conflict_incident_edge_preimages(conn, edge.id, &original_edges)?;
+            let incident_edge_preimages = collect_conflict_incident_edge_preimages(
+                conn,
+                edge.id,
+                &original_edges,
+                &mut budget,
+            )?;
             for incident in &incident_edge_preimages {
                 conflict_deleted_edge_ids.insert(incident.id);
                 rewired_edge_ids.remove(&incident.id);
@@ -2328,6 +2613,7 @@ fn merge_entity_sql(
             tags_unioned,
             content_appended,
             dry_run,
+            tx_budget: budget.report(),
             embedding_truncation: Default::default(),
         },
         updated_entity,
@@ -2337,6 +2623,26 @@ fn merge_entity_sql(
 // ---------------------------------------------------------------------------
 // Note merge SQL helpers
 // ---------------------------------------------------------------------------
+
+/// Cheap SQL-side byte-length probe for one merge note — see
+/// [`probe_merge_entity_bytes`] for why this runs before
+/// [`read_merge_note`]'s full column copy and JSON parse, and why each
+/// column is cast to BLOB before `LENGTH()`.
+fn probe_merge_note_bytes(conn: &rusqlite::Connection, id: Uuid) -> Result<usize, SqliteError> {
+    let id_str = id.to_string();
+    let len: Option<i64> = conn
+        .query_row(
+            "SELECT COALESCE(LENGTH(CAST(name AS BLOB)), 0) \
+                    + LENGTH(CAST(content AS BLOB)) \
+                    + COALESCE(LENGTH(CAST(properties AS BLOB)), 0) \
+             FROM notes WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id_str],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(SqliteError::Rusqlite)?;
+    Ok(128_usize.saturating_add(len.unwrap_or(0).max(0) as usize))
+}
 
 /// Read one note row by ID within a namespace, returning `SqliteError` on missing/wrong-ns.
 fn read_merge_note(
@@ -2449,8 +2755,28 @@ fn merge_note_sql(
     dry_run: bool,
     pack_rules: Vec<EdgeEndpointRule>,
     preserve_owner_established: bool,
+    limits: MergeTxLimits,
 ) -> Result<(MergeSummary, khive_storage::note::Note), SqliteError> {
+    let mut budget = MergeTxBudget::new(limits);
+    // Same accounting as `merge_entity_sql`: config-scaled fanout in bytes only.
+    budget.charge(
+        0,
+        vec_tables.iter().map(String::len).sum::<usize>()
+            + pack_rules.len() * std::mem::size_of::<EdgeEndpointRule>(),
+        "preparing pack and vector fanout",
+    )?;
+
+    budget.charge(
+        1,
+        probe_merge_note_bytes(conn, into_id)?,
+        "reading merge records",
+    )?;
     let into_note = read_merge_note(conn, into_id, &namespace)?;
+    budget.charge(
+        1,
+        probe_merge_note_bytes(conn, from_id)?,
+        "reading merge records",
+    )?;
     let from_note = read_merge_note(conn, from_id, &namespace)?;
 
     if into_note.kind != from_note.kind {
@@ -2492,7 +2818,7 @@ fn merge_note_sql(
         )?;
         let mut rows = stmt.query(rusqlite::params![&from_str])?;
         while let Some(row) = rows.next()? {
-            outbound.push(EdgeRow {
+            let edge = EdgeRow {
                 id: parse_id(row.get(0)?)?,
                 namespace: row.get(1)?,
                 source_id: parse_id(row.get(2)?)?,
@@ -2504,7 +2830,9 @@ fn merge_note_sql(
                 deleted_at: row.get(8)?,
                 target_backend: row.get(9)?,
                 metadata: row.get(10)?,
-            });
+            };
+            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
+            outbound.push(edge);
         }
     }
     let mut inbound: Vec<EdgeRow> = Vec::new();
@@ -2515,7 +2843,7 @@ fn merge_note_sql(
         )?;
         let mut rows = stmt.query(rusqlite::params![&from_str])?;
         while let Some(row) = rows.next()? {
-            inbound.push(EdgeRow {
+            let edge = EdgeRow {
                 id: parse_id(row.get(0)?)?,
                 namespace: row.get(1)?,
                 source_id: parse_id(row.get(2)?)?,
@@ -2527,7 +2855,9 @@ fn merge_note_sql(
                 deleted_at: row.get(8)?,
                 target_backend: row.get(9)?,
                 metadata: row.get(10)?,
-            });
+            };
+            budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
+            inbound.push(edge);
         }
     }
     let mut seen: HashSet<Uuid> = HashSet::new();
@@ -2662,12 +2992,12 @@ fn merge_note_sql(
                     let src_info = if new_src == into_id {
                         Some(("note", into_note.kind.clone(), None))
                     } else {
-                        resolve_merge_edge_endpoint(conn, new_src)?
+                        resolve_merge_edge_endpoint_budgeted(conn, new_src, &mut budget)?
                     };
                     let tgt_info = if new_tgt == into_id {
                         Some(("note", into_note.kind.clone(), None))
                     } else {
-                        resolve_merge_edge_endpoint(conn, new_tgt)?
+                        resolve_merge_edge_endpoint_budgeted(conn, new_tgt, &mut budget)?
                     };
                     match (src_info, tgt_info) {
                         (
@@ -2733,8 +3063,12 @@ fn merge_note_sql(
                 // incident annotations, and preserve every removed row first.
                 let surviving_edge_id = Uuid::parse_str(&conflict_id)
                     .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
-                let incident_edge_preimages =
-                    collect_conflict_incident_edge_preimages(conn, edge.id, &original_edges)?;
+                let incident_edge_preimages = collect_conflict_incident_edge_preimages(
+                    conn,
+                    edge.id,
+                    &original_edges,
+                    &mut budget,
+                )?;
                 for incident in &incident_edge_preimages {
                     conflict_deleted_edge_ids.insert(incident.id);
                     rewired_edge_ids.remove(&incident.id);
@@ -2884,6 +3218,7 @@ fn merge_note_sql(
             tags_unioned: 0,
             content_appended,
             dry_run,
+            tx_budget: budget.report(),
             embedding_truncation: Default::default(),
         },
         updated_note,
@@ -3260,6 +3595,203 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    fn outbound_message_note() -> Note {
+        let mut note = Note::new("local", "message", "hello");
+        note.properties = Some(serde_json::json!({"direction": "outbound"}));
+        note
+    }
+
+    #[tokio::test]
+    async fn claim_outbound_message_external_id_sets_value_and_survives_readback() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let note = outbound_message_note();
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let claimed = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<abc@example.com>".to_string())
+            .await
+            .expect("claim succeeds on a fresh outbound message note");
+        assert_eq!(
+            claimed
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("external_id"))
+                .and_then(|v| v.as_str()),
+            Some("<abc@example.com>")
+        );
+
+        // Reads the persisted row back independently of the claim call's own
+        // return value. This is the check that fails if the fix is reverted
+        // to routing the claim through `dispatch("update", ...)`: that path is
+        // refused by the owner-established-property gate exercised in
+        // `generic_update_still_refuses_external_id_on_message_note` below, so
+        // external_id would never actually persist and this read would come
+        // back `None`.
+        let reread = rt
+            .notes(&tok)
+            .expect("note store")
+            .get_note(note_id)
+            .await
+            .expect("read note")
+            .expect("note still exists");
+        assert_eq!(
+            reread
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("external_id"))
+                .and_then(|v| v.as_str()),
+            Some("<abc@example.com>")
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_update_still_refuses_external_id_on_message_note() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let note = outbound_message_note();
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = rt
+            .update_note(
+                &tok,
+                note_id,
+                NotePatch {
+                    properties: Some(serde_json::json!({"external_id": "<forged@example.com>"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("caller-facing update must keep refusing external_id on a message note");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+        assert!(err.to_string().contains("is not patchable"), "error: {err}");
+
+        // The owner path is unaffected by the caller-side refusal above.
+        let claimed = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<claimed@example.com>".to_string())
+            .await
+            .expect("owner-bookkeeping path still claims after a refused caller patch");
+        assert_eq!(
+            claimed
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("external_id"))
+                .and_then(|v| v.as_str()),
+            Some("<claimed@example.com>")
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_non_message_note() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let mut note = Note::new("local", "observation", "not a message");
+        note.properties = Some(serde_json::json!({"direction": "outbound"}));
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<x@example.com>".to_string())
+            .await
+            .expect_err("a non-message note must never accept the claim");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_inbound_message() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let mut note = Note::new("local", "message", "inbound content");
+        note.properties = Some(serde_json::json!({"direction": "inbound"}));
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<x@example.com>".to_string())
+            .await
+            .expect_err("an inbound message note must never accept the claim");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_when_external_id_already_set() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let mut note = outbound_message_note();
+        note.properties = Some(
+            serde_json::json!({"direction": "outbound", "external_id": "<already@example.com>"}),
+        );
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = rt
+            .claim_outbound_message_external_id(&tok, note_id, "<new@example.com>".to_string())
+            .await
+            .expect_err("a note that already carries external_id must refuse re-claim");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn generic_update_can_still_patch_delivered_at_on_message_note() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let note = outbound_message_note();
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let updated = rt
+            .update_note(
+                &tok,
+                note_id,
+                NotePatch {
+                    properties: Some(serde_json::json!({"delivered_at": "2026-08-09T00:00:00Z"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delivered_at is not owner-established and must remain patchable");
+        assert_eq!(
+            updated
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("delivered_at"))
+                .and_then(|v| v.as_str()),
+            Some("2026-08-09T00:00:00Z")
+        );
     }
 
     fn secret_shaped_reason() -> String {
@@ -8200,5 +8732,798 @@ mod tests {
             1,
             "a surviving key is still counted",
         );
+    }
+
+    // ---- merge transaction budget tests ----
+
+    /// Run `merge_entity_sql` directly on the writer connection with explicit
+    /// limits, mapping the two-variant error the way the production fallback
+    /// path does. The budget refusal must surface as the SQLite-side error
+    /// whose message carries the observed counts.
+    async fn run_entity_merge_with_limits(
+        rt: &KhiveRuntime,
+        into_id: Uuid,
+        from_id: Uuid,
+        limits: MergeTxLimits,
+    ) -> Result<(MergeSummary, Entity), SqliteError> {
+        let pack_rules = rt.pack_edge_rules();
+        let pool = rt.backend().pool_arc();
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().unwrap();
+            guard.transaction(|conn| {
+                merge_entity_sql(
+                    conn,
+                    "local".to_string(),
+                    "fts_entities".to_string(),
+                    Vec::new(),
+                    into_id,
+                    from_id,
+                    EntityDedupMergePolicy::PreferInto,
+                    ContentMergeStrategy::Append,
+                    false,
+                    pack_rules,
+                    EntityMergeValidation::LegacyKind,
+                    limits,
+                )
+                .map_err(|error| match error {
+                    MergeEntitySqlError::Sqlite(error) => error,
+                    MergeEntitySqlError::Refusal(_) => SqliteError::InvalidData(
+                        "unexpected transactional policy refusal".to_string(),
+                    ),
+                })
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Preview-only variant of [`run_entity_merge_with_limits`]: runs
+    /// `merge_entity_sql` with `dry_run = true` and an unlimited budget, and
+    /// returns the observed byte charge without committing any write. Lets a
+    /// test read back the probe's true cost for a record and then reuse that
+    /// exact number to place a tight `MergeTxLimits` threshold, instead of
+    /// guessing at fanout/overhead constants.
+    async fn preview_entity_merge_bytes(rt: &KhiveRuntime, into_id: Uuid, from_id: Uuid) -> usize {
+        let pack_rules = rt.pack_edge_rules();
+        let pool = rt.backend().pool_arc();
+        let (summary, _) = tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().unwrap();
+            guard.transaction(|conn| {
+                merge_entity_sql(
+                    conn,
+                    "local".to_string(),
+                    "fts_entities".to_string(),
+                    Vec::new(),
+                    into_id,
+                    from_id,
+                    EntityDedupMergePolicy::PreferInto,
+                    ContentMergeStrategy::Append,
+                    true,
+                    pack_rules,
+                    EntityMergeValidation::LegacyKind,
+                    MergeTxLimits {
+                        max_rows: usize::MAX,
+                        max_bytes: usize::MAX,
+                    },
+                )
+                .map_err(|error| match error {
+                    MergeEntitySqlError::Sqlite(error) => error,
+                    MergeEntitySqlError::Refusal(_) => SqliteError::InvalidData(
+                        "unexpected transactional policy refusal".to_string(),
+                    ),
+                })
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        summary.tx_budget.bytes_charged
+    }
+
+    /// The byte-budget probe must count actual UTF-8 bytes, not SQLite's
+    /// `LENGTH(text)` character count. Two records with an identical
+    /// character count but different UTF-8 byte sizes (an ASCII control vs.
+    /// a CJK payload, each 200 characters) must charge the budget
+    /// differently — proving the probe casts to BLOB before measuring —
+    /// and a budget threshold placed strictly between the two true costs
+    /// must accept the ASCII control and reject the multibyte payload.
+    #[tokio::test]
+    async fn merge_entity_byte_budget_rejects_multibyte_properties_char_count_would_pass() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let ascii_payload = "x".repeat(200);
+        let multibyte_payload = "\u{4e2d}".repeat(200);
+        assert_eq!(
+            ascii_payload.chars().count(),
+            multibyte_payload.chars().count(),
+            "control and payload must share one character count"
+        );
+        assert!(
+            multibyte_payload.len() > ascii_payload.len(),
+            "multibyte payload must have more UTF-8 bytes than the ASCII control"
+        );
+
+        let into_ascii = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from_ascii = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "From",
+                None,
+                Some(serde_json::json!({ "note": ascii_payload })),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let into_multi = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from_multi = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "From",
+                None,
+                Some(serde_json::json!({ "note": multibyte_payload })),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let ascii_total_bytes = preview_entity_merge_bytes(&rt, into_ascii.id, from_ascii.id).await;
+        let multi_total_bytes = preview_entity_merge_bytes(&rt, into_multi.id, from_multi.id).await;
+        assert!(
+            multi_total_bytes > ascii_total_bytes,
+            "byte-accurate probe must charge more for the multibyte record: \
+             ascii={ascii_total_bytes} multi={multi_total_bytes}"
+        );
+
+        // A threshold pinned exactly at the ASCII control's true cost must
+        // accept it and reject the multibyte record, which a character-
+        // counting probe would have under-charged into passing too.
+        let limits = MergeTxLimits {
+            max_rows: usize::MAX,
+            max_bytes: ascii_total_bytes,
+        };
+
+        run_entity_merge_with_limits(&rt, into_ascii.id, from_ascii.id, limits)
+            .await
+            .expect("ASCII control's true byte cost must fit its own threshold");
+
+        let error = run_entity_merge_with_limits(&rt, into_multi.id, from_multi.id, limits)
+            .await
+            .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("merge transaction budget exceeded"),
+            "multibyte properties must be rejected by the byte-accurate probe; got: {msg}"
+        );
+        assert!(msg.contains("reading merge records"), "got: {msg}");
+        assert!(
+            rt.get_entity(&tok, from_multi.id).await.is_ok(),
+            "from-entity must survive a budget-rejected merge"
+        );
+    }
+
+    async fn run_note_merge_with_limits(
+        rt: &KhiveRuntime,
+        into_id: Uuid,
+        from_id: Uuid,
+        pack_rules: Vec<khive_types::EdgeEndpointRule>,
+        limits: MergeTxLimits,
+    ) -> Result<(MergeSummary, Note), SqliteError> {
+        let pool = rt.backend().pool_arc();
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().unwrap();
+            guard.transaction(|conn| {
+                merge_note_sql(
+                    conn,
+                    "local".to_string(),
+                    "fts_notes".to_string(),
+                    Vec::new(),
+                    into_id,
+                    from_id,
+                    EntityDedupMergePolicy::PreferInto,
+                    ContentMergeStrategy::Append,
+                    false,
+                    pack_rules,
+                    false,
+                    limits,
+                )
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn merge_entity_rejects_row_budget_while_collecting_incident_edges() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        for name in ["T1", "T2", "T3"] {
+            let target = rt
+                .create_entity(&tok, "concept", None, name, None, None, vec![])
+                .await
+                .unwrap();
+            rt.link(&tok, from.id, target.id, EdgeRelation::Extends, 1.0, None)
+                .await
+                .unwrap();
+        }
+
+        // Two merge records charge first; the cap of 4 admits the first two
+        // incident edges and trips on the third, before it is retained.
+        let error = run_entity_merge_with_limits(
+            &rt,
+            into.id,
+            from.id,
+            MergeTxLimits {
+                max_rows: 4,
+                max_bytes: usize::MAX,
+            },
+        )
+        .await
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("merge transaction budget exceeded"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("collecting incident edges"), "got: {msg}");
+
+        // The rejected transaction must roll back completely.
+        assert!(
+            rt.get_entity(&tok, from.id).await.is_ok(),
+            "from-entity must survive a budget-rejected merge"
+        );
+        let edges = rt
+            .list_edges(
+                &tok,
+                EdgeListFilter {
+                    source_id: Some(from.id),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            edges.len(),
+            3,
+            "every incident edge must survive a budget-rejected merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entity_rejects_row_budget_while_collecting_conflict_cascade_rows() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "annotator note",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let nested_annotator = rt
+            .create_note(&tok, "observation", None, "nested note", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(&tok, into.id, shared.id, EdgeRelation::Extends, 0.9, None)
+            .await
+            .unwrap();
+        let dropped = rt
+            .link(&tok, from.id, shared.id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .unwrap();
+        let annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                dropped.id.into(),
+                EdgeRelation::Annotates,
+                0.7,
+                None,
+            )
+            .await
+            .unwrap();
+        let nested_annotation = rt
+            .link(
+                &tok,
+                nested_annotator.id,
+                annotation.id.into(),
+                EdgeRelation::Annotates,
+                0.6,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Row walk under a cap of 5: two merge records, one incident edge,
+        // one endpoint-contract resolution, then the natural-key conflict's
+        // recursive cascade collection charges the annotation chain and trips
+        // on its second (nested) row.
+        let error = run_entity_merge_with_limits(
+            &rt,
+            into.id,
+            from.id,
+            MergeTxLimits {
+                max_rows: 5,
+                max_bytes: usize::MAX,
+            },
+        )
+        .await
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("merge transaction budget exceeded"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("collecting conflict cascade rows"),
+            "got: {msg}"
+        );
+
+        // Roll back means the whole annotation chain is still present.
+        for id in [dropped.id, annotation.id, nested_annotation.id] {
+            assert!(
+                rt.get_edge_including_deleted(&tok, id.into())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "edge {id} must survive a budget-rejected merge"
+            );
+        }
+        assert!(
+            rt.get_entity(&tok, from.id).await.is_ok(),
+            "from-entity must survive a budget-rejected merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_rejects_byte_budget_while_reading_merge_records() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "into content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let fat = "x".repeat(8192);
+        let from = rt
+            .create_note(&tok, "observation", None, &fat, None, None, vec![])
+            .await
+            .unwrap();
+
+        let error = run_note_merge_with_limits(
+            &rt,
+            into.id,
+            from.id,
+            Vec::new(),
+            MergeTxLimits {
+                max_rows: usize::MAX,
+                max_bytes: 4096,
+            },
+        )
+        .await
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("merge transaction budget exceeded"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("reading merge records"), "got: {msg}");
+
+        assert!(
+            rt.notes(&tok)
+                .unwrap()
+                .get_note(from.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "from-note must survive a budget-rejected merge"
+        );
+    }
+
+    /// The byte budget must be charged from a cheap SQL-side length probe
+    /// BEFORE the merge fully loads and JSON-parses a record's `properties`
+    /// column — never after. Prove it adversarially: store an oversized
+    /// `properties` value that is also invalid JSON directly on `from`,
+    /// bypassing the create path's own validation. If the budget were still
+    /// charged only after `read_merge_entity`'s full load-and-parse (the
+    /// pre-fix ordering), this merge would fail with a JSON parse error
+    /// instead of a budget error, because the parse would run before the
+    /// stale post-read charge was ever reached. Charging from the pre-parse
+    /// length probe must reject on budget first, so `serde_json::from_str`
+    /// never runs on this column at all.
+    #[tokio::test]
+    async fn merge_entity_rejects_byte_budget_before_parsing_oversized_malformed_properties() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        let huge_malformed_properties = format!("{{not valid json: {}", "x".repeat(8192));
+        let pool = rt.backend().pool_arc();
+        let from_id = from.id;
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().unwrap();
+            guard.transaction(|conn| {
+                conn.execute(
+                    "UPDATE entities SET properties = ?1 WHERE id = ?2",
+                    rusqlite::params![huge_malformed_properties, from_id.to_string()],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let error = run_entity_merge_with_limits(
+            &rt,
+            into.id,
+            from.id,
+            MergeTxLimits {
+                max_rows: usize::MAX,
+                max_bytes: 4096,
+            },
+        )
+        .await
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("merge transaction budget exceeded"),
+            "expected an early budget rejection, not a JSON parse failure; got: {msg}"
+        );
+        assert!(msg.contains("reading merge records"), "got: {msg}");
+
+        // `get_entity` would itself fail to parse the malformed properties this
+        // test deliberately stored, so check survival via a raw row count
+        // instead of the parsing read path.
+        let pool = rt.backend().pool_arc();
+        let still_present: i64 = tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().unwrap();
+            guard.transaction(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entities WHERE id = ?1 AND deleted_at IS NULL",
+                    rusqlite::params![from_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(SqliteError::Rusqlite)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            still_present, 1,
+            "from-entity must survive a budget-rejected merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_rejects_row_budget_while_collecting_incident_edges() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        for name in ["T1", "T2", "T3"] {
+            let target = rt
+                .create_entity(&tok, "concept", None, name, None, None, vec![])
+                .await
+                .unwrap();
+            rt.link(&tok, from.id, target.id, EdgeRelation::Annotates, 1.0, None)
+                .await
+                .unwrap();
+        }
+
+        let error = run_note_merge_with_limits(
+            &rt,
+            into.id,
+            from.id,
+            rt.pack_edge_rules(),
+            MergeTxLimits {
+                max_rows: 4,
+                max_bytes: usize::MAX,
+            },
+        )
+        .await
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("merge transaction budget exceeded"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("collecting incident edges"), "got: {msg}");
+
+        let edges = rt
+            .list_edges(
+                &tok,
+                EdgeListFilter {
+                    source_id: Some(from.id),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            edges.len(),
+            3,
+            "every incident edge must survive a budget-rejected merge"
+        );
+    }
+
+    // The post-commit budget logs are captured by the process-global tracing
+    // subscriber owned by `crate::pack::tests` — one test binary supports at
+    // most one `set_global_default`, and a thread-local `set_default` guard
+    // here proved lossy under parallel tests (the same event-loss class the
+    // pack tests' subscriber documents). Each test selects its own rows from
+    // the append-only sink by the merge's `into_id`.
+    use crate::pack::tests::budget_log_events;
+
+    #[tokio::test]
+    async fn merge_entity_reports_and_logs_tx_budget_after_commit() {
+        use khive_storage::EdgeRelation;
+        let events = budget_log_events();
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let target = rt
+            .create_entity(&tok, "concept", None, "Target", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(&tok, from.id, target.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // A dry run reports the same predictive budget usage but must not
+        // emit the post-commit log: nothing committed.
+        let preview = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(preview.tx_budget.rows_charged >= 2);
+        assert_eq!(preview.tx_budget.max_rows, MERGE_TX_MAX_ROWS);
+        assert_eq!(preview.tx_budget.max_bytes, MERGE_TX_MAX_BYTES);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| e.into_id != into.id.to_string()),
+            "a dry-run preview must not emit the post-commit budget log"
+        );
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(summary.tx_budget.rows_charged >= 2);
+        assert!(summary.tx_budget.bytes_charged > 0);
+
+        let captured = events.lock().unwrap();
+        let row = captured
+            .iter()
+            .find(|e| {
+                e.into_id == summary.kept_id.to_string()
+                    && e.message == "merge_entity: transaction materialization budget"
+            })
+            .expect("committing entity merge must emit the post-commit budget log");
+        assert_eq!(
+            row.budget_rows as usize, summary.tx_budget.rows_charged,
+            "the log must carry the same observed row count the summary reports"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_reports_and_logs_tx_budget_after_commit() {
+        let events = budget_log_events();
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(summary.tx_budget.rows_charged >= 2);
+        assert!(summary.tx_budget.bytes_charged > 0);
+
+        let captured = events.lock().unwrap();
+        let row = captured
+            .iter()
+            .find(|e| {
+                e.into_id == summary.kept_id.to_string()
+                    && e.message == "merge_note: transaction materialization budget"
+            })
+            .expect("committing note merge must emit the post-commit budget log");
+        assert_eq!(
+            row.budget_rows as usize, summary.tx_budget.rows_charged,
+            "the log must carry the same observed row count the summary reports"
+        );
+    }
+
+    // ── Universal reserved-key reservation (ADR-115 Amendment 1, first rung) ──
+
+    fn reserved_key_props() -> serde_json::Value {
+        serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"})
+    }
+
+    #[tokio::test]
+    async fn update_entity_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "reservation-target-entity",
+                None,
+                Some(serde_json::json!({"k": "v"})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    properties: Some(reserved_key_props()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected on patch update");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+
+        // No partial mutation: the original properties must be unchanged.
+        let unchanged = rt
+            .entities(&tok)
+            .unwrap()
+            .get_entity(entity.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.properties, Some(serde_json::json!({"k": "v"})));
+    }
+
+    #[tokio::test]
+    async fn update_note_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "reservation target note",
+                None,
+                Some(serde_json::json!({"k": "v"})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = rt
+            .update_note(
+                &tok,
+                note.id,
+                NotePatch::new(None, None, None, None, Some(reserved_key_props())),
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected on patch update");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+
+        let unchanged = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.properties, Some(serde_json::json!({"k": "v"})));
     }
 }

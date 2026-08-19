@@ -1003,17 +1003,16 @@ async fn sch_aud_002_out_of_range_cron_minute_rejected() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("minute") || msg.contains("range") || msg.contains("99"),
-        "SCH-AUD-002: out-of-range minute field must be rejected; got: {msg}"
+        msg.contains("cron") && msg.contains("not executable"),
+        "SCH-AUD-002: every unsupported cron form must be rejected; got: {msg}"
     );
 }
 
 #[tokio::test]
-async fn sch_aud_002_valid_wildcard_cron_accepted() {
+async fn sch_aud_002_wildcard_cron_rejected_as_unexecutable() {
     let (registry, _rt) = build_registry();
 
-    // All-wildcard five-field cron must be accepted.
-    let result = registry
+    let error = registry
         .dispatch(
             "schedule.remind",
             serde_json::json!({
@@ -1023,16 +1022,15 @@ async fn sch_aud_002_valid_wildcard_cron_accepted() {
             }),
         )
         .await
-        .expect("SCH-AUD-002: all-wildcard cron must be accepted");
-    assert_eq!(result["status"], "pending");
+        .expect_err("SCH-AUD-002: an unadvanceable wildcard cron must be rejected");
+    assert!(error.to_string().contains("not executable"));
 }
 
 #[tokio::test]
-async fn sch_aud_002_valid_numeric_cron_accepted() {
+async fn sch_aud_002_numeric_cron_rejected_as_unexecutable() {
     let (registry, _rt) = build_registry();
 
-    // 0 9 * * 1 (every Monday at 09:00) — standard five-field cron.
-    let result = registry
+    let error = registry
         .dispatch(
             "schedule.remind",
             serde_json::json!({
@@ -1042,8 +1040,8 @@ async fn sch_aud_002_valid_numeric_cron_accepted() {
             }),
         )
         .await
-        .expect("SCH-AUD-002: valid numeric cron must be accepted");
-    assert_eq!(result["status"], "pending");
+        .expect_err("SCH-AUD-002: an unadvanceable numeric cron must be rejected");
+    assert!(error.to_string().contains("not executable"));
 }
 
 // ── SCH-AUD-003 regression: agenda limit=0 and limit>200 rejected ────────────

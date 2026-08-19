@@ -154,78 +154,76 @@ pub(super) fn score_sections(
     domain_scores: &HashMap<String, f32>,
     type_weights: &HashMap<String, f32>,
     weights: &ComposeScoreWeights,
-) -> Vec<ComposeSectionResult> {
+) -> Result<Vec<ComposeSectionResult>, RuntimeError> {
     let flat: Vec<&ScoredSection> = sections.values().flat_map(|secs| secs.iter()).collect();
 
     if flat.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let doc_pairs: Vec<(&str, &str)> = flat
         .iter()
         .map(|s| (s.heading.as_str(), s.content.as_str()))
         .collect();
-    let query_terms = tokenize(raw_query);
-    let bm25_raw = compute_bm25_scores(&query_terms, &doc_pairs);
+    let query_terms = tokenize_checked(raw_query)?;
+    let bm25_raw = compute_bm25_scores(&query_terms, &doc_pairs)?;
 
     let max_bm25 = bm25_raw.iter().cloned().fold(0.0f32, f32::max);
 
-    let mut results: Vec<ComposeSectionResult> = flat
-        .iter()
-        .zip(bm25_raw.iter())
-        .map(|(section, &bm25_unnorm)| {
-            let sec_cos = match &section.embedding {
-                Some(emb) if !emb.is_empty() => cosine_similarity(query_embedding, emb).max(0.0),
-                _ => 0.0,
-            };
+    let mut results: Vec<ComposeSectionResult> = Vec::with_capacity(flat.len());
+    for (section, &bm25_unnorm) in flat.iter().zip(bm25_raw.iter()) {
+        khive_storage::ensure_request_read_active("knowledge.compose")?;
+        let sec_cos = match &section.embedding {
+            Some(emb) if !emb.is_empty() => cosine_similarity(query_embedding, emb).max(0.0),
+            _ => 0.0,
+        };
 
-            let atom_cos = atom_cosine_scores
-                .get(&section.atom_id)
-                .copied()
-                .unwrap_or(0.0)
-                .max(0.0);
+        let atom_cos = atom_cosine_scores
+            .get(&section.atom_id)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
 
-            let dom = domain_scores
-                .get(&section.atom_id)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
+        let dom = domain_scores
+            .get(&section.atom_id)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
 
-            let type_w = type_weights
-                .get(section.section_type.as_str())
-                .copied()
-                .unwrap_or(0.05)
-                .clamp(0.0, 1.0);
+        let type_w = type_weights
+            .get(section.section_type.as_str())
+            .copied()
+            .unwrap_or(0.05)
+            .clamp(0.0, 1.0);
 
-            let bm25_norm = if max_bm25 > 0.0 {
-                (bm25_unnorm / max_bm25).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+        let bm25_norm = if max_bm25 > 0.0 {
+            (bm25_unnorm / max_bm25).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
-            let score = weights.section_cosine * sec_cos
-                + weights.section_bm25 * bm25_norm
-                + weights.atom_cosine * atom_cos
-                + weights.domain_score * dom
-                + weights.type_weight * type_w;
+        let score = weights.section_cosine * sec_cos
+            + weights.section_bm25 * bm25_norm
+            + weights.atom_cosine * atom_cos
+            + weights.domain_score * dom
+            + weights.type_weight * type_w;
 
-            ComposeSectionResult {
-                section_id: section.id.clone(),
-                atom_id: section.atom_id.clone(),
-                section_type: section.section_type.clone(),
-                heading: section.heading.clone(),
-                content: section.content.clone(),
-                score,
-                score_breakdown: ScoreBreakdown {
-                    section_cosine: sec_cos,
-                    section_bm25: bm25_norm,
-                    atom_cosine: atom_cos,
-                    domain_score: dom,
-                    type_weight: type_w,
-                },
-            }
-        })
-        .collect();
+        results.push(ComposeSectionResult {
+            section_id: section.id.clone(),
+            atom_id: section.atom_id.clone(),
+            section_type: section.section_type.clone(),
+            heading: section.heading.clone(),
+            content: section.content.clone(),
+            score,
+            score_breakdown: ScoreBreakdown {
+                section_cosine: sec_cos,
+                section_bm25: bm25_norm,
+                atom_cosine: atom_cos,
+                domain_score: dom,
+                type_weight: type_w,
+            },
+        });
+    }
 
     results.sort_by(|a, b| {
         b.score
@@ -233,29 +231,38 @@ pub(super) fn score_sections(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.section_id.cmp(&b.section_id))
     });
-    results
+    Ok(results)
 }
 
 // ─── BM25 over candidate set ──────────────────────────────────────────────────
 
-fn compute_bm25_scores(query_terms: &[String], sections: &[(&str, &str)]) -> Vec<f32> {
+fn compute_bm25_scores(
+    query_terms: &[String],
+    sections: &[(&str, &str)],
+) -> Result<Vec<f32>, RuntimeError> {
     const K1: f32 = 1.5;
     const B: f32 = 0.75;
 
     if sections.is_empty() || query_terms.is_empty() {
-        return vec![0.0; sections.len()];
+        return Ok(vec![0.0; sections.len()]);
     }
 
-    let docs: Vec<Vec<String>> = sections
-        .iter()
-        .map(|(heading, content)| tokenize(&format!("{heading} {content}")))
-        .collect();
+    let mut docs = Vec::with_capacity(sections.len());
+    for (heading, content) in sections {
+        khive_storage::ensure_request_read_active("knowledge.compose")?;
+        let mut text = String::with_capacity(heading.len() + content.len() + 1);
+        text.push_str(heading);
+        text.push(' ');
+        text.push_str(content);
+        docs.push(tokenize_checked(&text)?);
+    }
 
     let n = docs.len() as f32;
     let avg_dl = docs.iter().map(|d| d.len() as f32).sum::<f32>() / n;
 
     let mut scores = vec![0.0f32; docs.len()];
     for term in query_terms {
+        khive_storage::ensure_request_read_active("knowledge.compose")?;
         let df = docs.iter().filter(|d| d.iter().any(|t| t == term)).count() as f32;
         if df == 0.0 {
             continue;
@@ -263,6 +270,9 @@ fn compute_bm25_scores(query_terms: &[String], sections: &[(&str, &str)]) -> Vec
         let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
 
         for (i, doc) in docs.iter().enumerate() {
+            if i.is_multiple_of(64) {
+                khive_storage::ensure_request_read_active("knowledge.compose")?;
+            }
             let tf = doc.iter().filter(|t| *t == term).count() as f32;
             if tf == 0.0 {
                 continue;
@@ -273,7 +283,7 @@ fn compute_bm25_scores(query_terms: &[String], sections: &[(&str, &str)]) -> Vec
         }
     }
 
-    scores
+    Ok(scores)
 }
 
 // ─── pure helpers ─────────────────────────────────────────────────────────────
@@ -307,12 +317,26 @@ pub(super) fn decode_embedding(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn tokenize(text: &str) -> Vec<String> {
-    text.to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|t| t.len() >= 2)
-        .map(str::to_string)
-        .collect()
+fn tokenize_checked(text: &str) -> Result<Vec<String>, RuntimeError> {
+    khive_storage::ensure_request_read_active("knowledge.compose")?;
+    let mut terms = Vec::new();
+    let mut term = String::new();
+    for (index, byte) in text.bytes().enumerate() {
+        if index.is_multiple_of(4_096) {
+            khive_storage::ensure_request_read_active("knowledge.compose")?;
+        }
+        if byte.is_ascii_alphanumeric() {
+            term.push((byte as char).to_ascii_lowercase());
+        } else if term.len() >= 2 {
+            terms.push(std::mem::take(&mut term));
+        } else {
+            term.clear();
+        }
+    }
+    if term.len() >= 2 {
+        terms.push(term);
+    }
+    Ok(terms)
 }
 
 // ─── slow-request / abandonment observability (#887) ─────────────────────────
@@ -434,13 +458,15 @@ impl ComposeTiming {
     /// total, then opens `phase` as the new active phase. Call this
     /// immediately before starting the phase's work — including before any
     /// `.await` — not after it completes.
-    pub(super) fn begin(&mut self, phase: Phase) {
+    pub(super) fn begin(&mut self, phase: Phase) -> Result<(), RuntimeError> {
+        khive_storage::ensure_request_read_active("knowledge.compose")?;
         let now = Instant::now();
         if let Some(prev) = self.active_phase {
             self.phase_totals[prev.index()] += now.duration_since(self.last);
         }
         self.active_phase = Some(phase);
         self.last = now;
+        Ok(())
     }
 
     /// Folds `last..now` into whichever phase is still active, so a phase
@@ -558,7 +584,7 @@ mod tests {
             ),
             ("Python lists", "Python list operations and indexing"),
         ];
-        let scores = compute_bm25_scores(&terms, docs);
+        let scores = compute_bm25_scores(&terms, docs).unwrap();
         assert_eq!(scores.len(), 2);
         assert!(scores[0] > scores[1], "matching doc must score higher");
     }
@@ -566,7 +592,7 @@ mod tests {
     #[test]
     fn bm25_empty_terms_returns_zeros() {
         let docs = &[("heading", "content"), ("heading2", "content2")];
-        let scores = compute_bm25_scores(&[], docs);
+        let scores = compute_bm25_scores(&[], docs).unwrap();
         assert!(scores.iter().all(|&s| s == 0.0));
     }
 
@@ -607,7 +633,8 @@ mod tests {
             &domain_scores,
             &type_weights,
             &ComposeScoreWeights::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 2);
         assert!(results[0].score >= results[1].score, "must be sorted desc");
@@ -659,7 +686,8 @@ mod tests {
             &domain_scores,
             &type_weights,
             &ComposeScoreWeights::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 2, "both sections must be scored");
         let unembedded_result = results.iter().find(|r| r.section_id == "s2").unwrap();
@@ -701,17 +729,17 @@ mod tests {
     #[test]
     fn begin_accumulates_duration_under_repeated_phase_names() {
         let mut t = ComposeTiming::start("test query", false);
-        t.begin(Phase::Suggest);
+        t.begin(Phase::Suggest).unwrap();
         std::thread::sleep(Duration::from_millis(2));
         // Second DB fetch (e.g. load_sections) accumulates into the same
         // Fetch bucket instead of overwriting or duplicating it.
-        t.begin(Phase::Fetch);
+        t.begin(Phase::Fetch).unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        t.begin(Phase::Rerank);
+        t.begin(Phase::Rerank).unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        t.begin(Phase::Fetch);
+        t.begin(Phase::Fetch).unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        t.begin(Phase::Trim);
+        t.begin(Phase::Trim).unwrap();
 
         let fetch_ms = t.phase_totals[Phase::Fetch.index()].as_millis();
         let rerank_ms = t.phase_totals[Phase::Rerank.index()].as_millis();
@@ -727,6 +755,25 @@ mod tests {
         t.finish(3);
     }
 
+    #[tokio::test]
+    async fn compose_stage_boundary_refuses_work_after_request_cancellation() {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        khive_storage::scope_request_read_cancellation(cancel_rx, async move {
+            let mut timing = ComposeTiming::start("cancel between stages", true);
+            timing
+                .begin(Phase::Suggest)
+                .expect("active request may enter its first compose stage");
+            cancel_tx.send(true).unwrap();
+
+            let cancelled = timing.begin(Phase::Fetch);
+            assert!(
+                cancelled.is_err(),
+                "compose must not start a later read phase after its request is cancelled"
+            );
+        })
+        .await;
+    }
+
     #[test]
     fn helper_level_flush_active_covers_an_in_flight_phase() {
         // Unit-level check of `flush_active` itself, kept separate from the
@@ -734,7 +781,7 @@ mod tests {
         // `finish_call_site_flushes_the_still_active_phase` and
         // `drop_call_site_flushes_the_still_active_phase` for that.
         let mut t = ComposeTiming::start("test query", true);
-        t.begin(Phase::Suggest);
+        t.begin(Phase::Suggest).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         // No begin(Phase::Fetch) — Suggest is still the active phase.
         t.flush_active();
@@ -757,7 +804,7 @@ mod tests {
         // post-flush breakdown), so the assertion can only pass if `finish`
         // performed the flush itself.
         let mut t = ComposeTiming::start("test query", true);
-        t.begin(Phase::Suggest);
+        t.begin(Phase::Suggest).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         // No begin(Phase::Fetch), no manual flush_active() — Suggest is still
         // the active phase when finish() is called, simulating finish()
@@ -850,7 +897,7 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             let mut t = ComposeTiming::start("abandoned", false);
-            t.begin(Phase::Rerank);
+            t.begin(Phase::Rerank).unwrap();
             std::thread::sleep(Duration::from_millis(5));
             // No begin(next phase), no manual flush_active() — Rerank is
             // still active when `t` is dropped, simulating a future dropped

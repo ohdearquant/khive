@@ -28,6 +28,8 @@ pub use khive_pack_knowledge::KnowledgePack as _KnowledgePack;
 #[doc(hidden)]
 pub use khive_pack_memory::MemoryPack as _MemoryPack;
 #[doc(hidden)]
+pub use khive_pack_moodboard::MoodboardPack as _MoodboardPack;
+#[doc(hidden)]
 pub use khive_pack_schedule::SchedulePack as _SchedulePack;
 #[doc(hidden)]
 pub use khive_pack_session::SessionPack as _SessionPack;

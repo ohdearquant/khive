@@ -82,7 +82,7 @@ test("a valid repository miss stays local and renders an honest state", async ({
   observing = true;
   await page.locator(".repo-url-form button[type=submit]").click();
 
-  await expect(page.locator(".repo-state-card.miss")).toBeVisible();
+  await expect(page.locator(".repo-state-card[data-state='empty']")).toBeVisible();
   await page.waitForTimeout(100);
   expect(requestedAfterSubmit).toEqual([]);
 });

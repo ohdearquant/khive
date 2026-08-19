@@ -5,6 +5,6 @@ mod parser_impl;
 mod path;
 mod scan;
 
-pub use dispatch::parse_request;
+pub use dispatch::{parse_request, parse_typed_json_batch};
 
 pub(crate) use path::{apply_path_segment, split_path, PathSegment};

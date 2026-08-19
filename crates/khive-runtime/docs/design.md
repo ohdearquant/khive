@@ -84,7 +84,8 @@
 
 ### ADR-018: Authorization Gate
 
-- Gate is consulted before every verb dispatch; gate infrastructure failures are fail-open
+- Gate is consulted before every verb dispatch; gate infrastructure failures are audited and
+  fail closed with `RuntimeError::GateUnavailable`
 - `GateDecision::Deny` is hard enforcement: the pack is never invoked on denial
 - Namespace token is minted at the dispatch boundary after gate approval
 - `namespace` is stripped from params before forwarding to pack handlers
@@ -126,6 +127,9 @@
 ### Gate Authorization (ADR-029)
 
 - `RuntimeConfig::gate` defaults to `AllowAllGate`; production deployments plug in a policy-backed impl
+- Operator `[gate]` configuration is reserved and rejected until ADR-143's
+  store-held caller grants ship; an unenforced enrollment policy must not be
+  accepted silently
 
 ### Layered Retrieval Architecture (ADR-030)
 
@@ -182,7 +186,9 @@
 ### Persistent Daemon (ADR-049)
 
 - `khived` is a persistent warm runtime over a Unix socket
-- `PackRuntime::warm` is invoked on every registered pack during daemon startup
+- `PackRuntime::warm` is invoked on every registered pack during daemon startup;
+  each hook follows its own assigned backend mode, suppressing writer-bearing
+  work for read-only snapshot runtimes (ADR-028 A2)
 
 ### Namespace Token Contract (ADR-050)
 

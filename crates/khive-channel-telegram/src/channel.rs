@@ -98,8 +98,9 @@ impl TelegramChannel {
         let from = format!("telegram:{}", self.config.maintainer_slug);
         let sent_at = Utc.timestamp_opt(message.date, 0).single();
 
-        let mut env = ChannelEnvelope::new(from, BOT_SELF_ADDRESS, text.clone())
-            .with_external_id(external_id);
+        let mut env = ChannelEnvelope::new(from.clone(), BOT_SELF_ADDRESS, text.clone())
+            .with_external_id(external_id)
+            .with_quarantine_replay(text.as_bytes().to_vec(), from);
         if let Some(ts) = sent_at {
             env = env.with_sent_at(ts);
         }

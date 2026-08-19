@@ -58,6 +58,12 @@ V1 baseline at v0.2.8. The live post-consolidation sequence is:
   cursors.
 - **V14**: Adds an idempotent compatibility guard enforcing global uniqueness
   of `graph_edges.id`, ahead of the UUID-keyed edge ledger.
+- **V15**: Adds serve-ledger attribution fields.
+- **V16**: Adds GTD dependency-cycle guard triggers.
+- **V17**: Adds the agents pack schema.
+- **V18**: Adds ANN consumer-pending lifecycle metadata.
+- **V19**: Repairs divergent V13/V14 migration names and cursor-sequence rows.
+- **V20**: Adds bounded blob-GC claims and entity write-fence triggers.
 
 The historical pre-consolidation allocation table remains in ADR-015 for
 provenance; its version numbers do not describe the live migration array.

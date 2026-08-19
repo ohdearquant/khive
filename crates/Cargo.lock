@@ -919,7 +919,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1019,12 +1019,6 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -1248,9 +1242,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1278,24 +1272,13 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.1.5",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
@@ -1304,7 +1287,9 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "foldhash 0.2.0",
+ "allocator-api2",
+ "equivalent",
+ "foldhash",
 ]
 
 [[package]]
@@ -1595,11 +1580,22 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error 2.0.1",
 ]
 
 [[package]]
@@ -1646,7 +1642,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1986,6 +1982,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "futures",
@@ -2003,6 +2000,7 @@ dependencies = [
  "khive-pack-kg",
  "khive-pack-knowledge",
  "khive-pack-memory",
+ "khive-pack-moodboard",
  "khive-pack-schedule",
  "khive-pack-session",
  "khive-pack-workspace",
@@ -2160,6 +2158,7 @@ dependencies = [
  "khive-storage",
  "khive-types",
  "lattice-embed",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -2228,6 +2227,7 @@ dependencies = [
  "khive-types",
  "khive-vamana",
  "lattice-embed",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -2259,7 +2259,7 @@ dependencies = [
  "khive-types",
  "khive-vamana",
  "lattice-embed",
- "lru 0.12.5",
+ "lru 0.18.2",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2268,6 +2268,33 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "khive-pack-moodboard"
+version = "0.7.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "image",
+ "inventory",
+ "khive-db",
+ "khive-pack-kg",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "lattice-embed",
+ "lattice-fann",
+ "lattice-inference",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2450,6 +2477,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-general-category",
  "uuid",
 ]
 
@@ -2569,6 +2597,7 @@ dependencies = [
  "dotenvy",
  "khive-changeset",
  "khive-db",
+ "khive-gate-rego",
  "khive-mcp",
  "khive-pack-blob",
  "khive-pack-brain",
@@ -2580,6 +2609,7 @@ dependencies = [
  "khive-pack-kg",
  "khive-pack-knowledge",
  "khive-pack-memory",
+ "khive-pack-moodboard",
  "khive-pack-schedule",
  "khive-pack-session",
  "khive-pack-workspace",
@@ -2593,7 +2623,7 @@ dependencies = [
  "khive-vcs-adapters",
  "lattice-embed",
  "libc",
- "lru 0.12.5",
+ "lru 0.18.2",
  "rmcp",
  "serde",
  "serde_json",
@@ -2609,9 +2639,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.7.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a8471670d8eb3dc5b52b7c977f1be449a4d39404ebd47bd084a1e922fa6002e"
+checksum = "186873eb55d987651cf21643a9b3d157128c655d83492a5781e67144d920a8ca"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2628,9 +2658,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.7.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84227647ece462f8551a4585f60a1edcace4b85255ecc27520f2324859853a84"
+checksum = "cd766cb81f951cc61af9519fd58c97e383dcb52a8e153069002b2f89f553d328"
 dependencies = [
  "rand 0.8.7",
  "rand_distr",
@@ -2640,10 +2670,11 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.7.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc6ebeb70001f572be393e646e9207b2b10fc8c7649eb0b197d027bc87018585"
+checksum = "183b60dac1428baf58fc817d1c643448946d031399654c36945bac0485688158"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "half",
  "image",
@@ -2745,15 +2776,6 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lru"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
-dependencies = [
- "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "lru"
 version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
@@ -2763,9 +2785,12 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b6180140927ee907000b0aa540091f6ea512ead4447c92b8fc35bc72788a5a6"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
+dependencies = [
+ "hashbrown 0.17.1",
+]
 
 [[package]]
 name = "lru-slab"
@@ -3344,6 +3369,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
+name = "quick-error"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
+
+[[package]]
 name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3407,7 +3438,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3651,7 +3682,7 @@ dependencies = [
  "ipnet",
  "jsonschema",
  "lazy_static",
- "lru 0.18.1",
+ "lru 0.18.2",
  "msvc_spectre_libs",
  "num-bigint",
  "num-traits",
@@ -3860,7 +3891,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3919,7 +3950,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3953,7 +3984,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
 dependencies = [
  "fnv",
- "quick-error",
+ "quick-error 1.2.3",
  "tempfile",
  "wait-timeout",
 ]
@@ -4352,7 +4383,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4950,7 +4981,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

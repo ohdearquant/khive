@@ -148,13 +148,23 @@ def _tool_raw(proc: subprocess.Popen, name: str, args: dict) -> dict:
 
 
 def _tool(proc: subprocess.Popen, name: str, args: dict) -> Any:
-    """Call a verb through `request`; raise on any error; return its result."""
+    """Call a verb through `request`; raise on any error; return its result.
+
+    This suite's list assertions predate the stable pagination envelope and
+    operate on rows. Normalize offset-mode `list` results here while leaving
+    `_tool_raw` available to tests that need to inspect envelope metadata.
+    """
     result = _tool_raw(proc, name, args)
     if "_rpc_error" in result:
         raise RuntimeError(f"MCP-level error calling {name}: {result['_rpc_error']}")
     if "_op_error" in result:
         raise RuntimeError(f"Verb '{name}' returned error: {result['_op_error']}")
-    return result.get("_ok")
+    value = result.get("_ok")
+    if name == "list":
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            raise RuntimeError(f"Verb 'list' returned an invalid stable envelope: {value!r}")
+        return value["items"]
+    return value
 
 
 def _expect_rpc_error(proc: subprocess.Popen, name: str, args: dict) -> str:

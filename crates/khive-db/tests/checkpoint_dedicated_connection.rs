@@ -64,28 +64,35 @@ fn wal_path(db_path: &Path) -> PathBuf {
     PathBuf::from(wal)
 }
 
-/// Safety bound on the fattening loop below: 200,000 rows * 64 KiB caps
-/// worst-case disk usage at ~12.2 GiB instead of an unbounded loop if the
-/// WAL threshold is never reached for some unexpected reason.
-const MAX_FATTEN_ROWS: u32 = 200_000;
+/// Safety bound on the fattening loop below: 1,024 rows * 64 KiB keeps an
+/// unexpected fixture failure near 64 MiB instead of consuming runner disk.
+const MAX_FATTEN_ROWS: u32 = 1_024;
 
 /// Insert 64 KiB blobs, each its own committed (autocommit) transaction, so
 /// `checkpoint_once` has real, checkpointable frames waiting, until the
-/// `-wal` file reaches `MIN_WAL_BYTES`. Disables `PRAGMA wal_autocheckpoint`
-/// on this connection first — otherwise SQLite's own default auto-checkpoint
-/// threshold (~4000 pages / 16 MiB, well under `MIN_WAL_BYTES`) fires on
-/// every commit past that point, capping the WAL near that default forever
-/// instead of letting it grow, which turns this loop into a runaway
-/// insert-and-immediately-reclaim cycle instead of a bounded fixture.
+/// `-wal` file reaches `MIN_WAL_BYTES`. The production pool configuration
+/// disables connection-local autocheckpoint, so this fixture also fails loud
+/// if that writer invariant regresses.
 fn fatten_wal(pool: &ConnectionPool, db_path: &Path) {
+    // This test exercises the dedicated-owner posture (`checkpoint_once` is
+    // the owner's tick), so claim ownership exactly as the scheduled task
+    // does at startup — that is what disables the writer's bounded
+    // autocheckpoint fallback and lets the WAL grow for the fixture.
+    pool.claim_checkpoint_ownership()
+        .expect("claim checkpoint ownership for the dedicated-owner posture");
     let writer = pool.writer().expect("acquire writer to seed the WAL");
+    let autocheckpoint: u32 = writer
+        .conn()
+        .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+        .expect("read writer wal_autocheckpoint");
+    assert_eq!(
+        autocheckpoint, 0,
+        "fixture requires the claimed-owner writer invariant before allocating WAL bytes"
+    );
     writer
         .conn()
-        .execute_batch(
-            "PRAGMA wal_autocheckpoint = 0; \
-             CREATE TABLE blobs (v BLOB NOT NULL);",
-        )
-        .expect("disable auto-checkpoint and create table");
+        .execute_batch("CREATE TABLE blobs (v BLOB NOT NULL)")
+        .expect("create table");
 
     let payload = vec![0xABu8; 64 * 1024];
     let wal = wal_path(db_path);

@@ -117,6 +117,17 @@ pub trait SqlWriter: SqlReader + Send + 'static {
 /// Base SQL access capability.
 #[async_trait]
 pub trait SqlAccess: Send + Sync + 'static {
+    /// Canonical filesystem identity for this SQL database, when file-backed.
+    ///
+    /// Cross-resource operations use this only to derive advisory coordination
+    /// files outside SQLite. Only genuinely pathless, process-private
+    /// implementations may return `None`; every file-backed implementation
+    /// must expose its canonical path so cross-process exclusion cannot
+    /// silently degrade. The method performs no I/O.
+    fn database_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Acquire a read-only connection from the pool.
     async fn reader(&self) -> StorageResult<Box<dyn SqlReader>>;
     /// Acquire a read-write connection from the pool.
@@ -140,8 +151,14 @@ pub trait SqlAccess: Send + Sync + 'static {
     /// issue only synchronous DML against the `&mut dyn SqlWriter` it is
     /// handed and must never reach a real suspension point (no embedding
     /// computation, no ANN warming, no service or channel `await`, no
-    /// network round-trip). On the single-writer path this is enforced at
-    /// runtime: the writer task drives `op` through a single-poll driver and
+    /// network round-trip). Synchronous external work is forbidden too: no
+    /// filesystem/process/network I/O, sleeps, blocking waits, or unbounded CPU
+    /// may run between the transaction owner's `BEGIN IMMEDIATE` and
+    /// `COMMIT`. First-poll enforcement alone cannot detect those operations;
+    /// ADR-091's write-transaction audit table is the review-time guard, and a
+    /// new owner or caller must update that table before merge. On the
+    /// single-writer path this is enforced at runtime: the writer task drives
+    /// `op` through a single-poll driver and
     /// returns a typed error the instant the future is `Pending`, so a
     /// violation fails loudly rather than corrupting state. On the flag-off
     /// path (no writer task active) a suspending `op` would currently

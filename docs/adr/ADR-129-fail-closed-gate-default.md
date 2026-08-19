@@ -8,10 +8,27 @@
 - Depends on: ADR-127 (authenticated actor and grant primitive), the capability
   substrate this design builds on — the published `lion-core` crate (crates.io,
   Apache-2.0) plus `khive-capability`
-- Amended by: a forthcoming amendment on hierarchical subactor identity, which
-  supersedes Amendment 2's "no runtime registration API" invariant with an
-  audited grant surface and delivers its per-caller differentiation in
-  per-view form
+- Amended by: [ADR-143](ADR-143-store-held-caller-grants.md), which supersedes
+  Amendment 2's configuration-text roster and "no runtime registration API"
+  invariant with store-held caller grants and hierarchical subactor identity,
+  delivering per-caller differentiation in per-view form
+
+> **Implementation status (2026-08-18):** This accepted staged design is
+> partially shipped. Stage 1a has landed: every `Gate::check` call-site in
+> `khive-runtime` — both `dispatch_with_identity` and
+> `dispatch_intercepted_with_identity` — now treats a `GateError` as a
+> refusal, returning `RuntimeError::GateUnavailable` without invoking the
+> pack handler, and the caller-visible `reason` on that refusal is a stable
+> classification derived from the `GateError` variant, never the gate
+> backend's own error text (which may embed connection details or
+> credentials and stays in the server-side log only). Stage 1b through
+> Stage 2 remain unshipped: the current runtime default is still
+> `AllowAllGate`, and the ADR-143 store-held caller-grant model has not been
+> implemented. Because silently accepting Amendment 2's now-superseded
+> `[gate]` roster would claim enforcement that does not exist, this build
+> rejects every `[gate]` table at configuration load. This note records
+> implementation state only; it does not change the accepted fail-closed
+> decision or ADR-143's superseding design.
 
 ## Context
 
@@ -32,14 +49,16 @@ deployment-specific policy layered at the deployment edge.
 Three facts about the current code shape the staging below; a decision that
 ignored them would not be implementable as written:
 
-1. **Two dispatch seams fail open today.**
-   `dispatch_intercepted_with_identity` documents "gate errors fail open" and,
-   on a `GateError`, logs and invokes the intercepted operation anyway
-   (`crates/khive-runtime/src/pack.rs:1153-1206`); the ordinary dispatch path
-   advertises the same contract in its public API doc and its error arm does
-   the same (`crates/khive-runtime/src/pack.rs:1315-1319,1463-1468`). Both are
-   masked by the permissive default — `AllowAllGate::check` cannot error — and
-   become live authorization bypasses the moment any fallible gate is wired.
+1. **Two dispatch seams failed open at the time this ADR was accepted.**
+   `dispatch_intercepted_with_identity` documented "gate errors fail open" and,
+   on a `GateError`, logged and invoked the intercepted operation anyway; the
+   ordinary dispatch path advertised the same contract in its public API doc
+   and its error arm did the same. Both were masked by the permissive
+   default — `AllowAllGate::check` cannot error — and would become live
+   authorization bypasses the moment any fallible gate was wired. Stage 1a
+   below closes this gap: both seams now return
+   `RuntimeError::GateUnavailable` without invoking the operation, and their
+   doc comments say so.
 2. **No runtime `Gate` implementation exists over the capability layer.**
    `RuntimeConfig` accepts a `GateRef`; `khive-runtime` depends on neither
    capability crate, and `khive-capability`'s validator requires
@@ -66,11 +85,15 @@ documented fail-open behaviour to returning a typed gate-unavailable error
 without invoking the operation: `dispatch_intercepted_with_identity` and the
 ordinary `dispatch_with_identity` path. Every changed seam's `GateError`
 documentation — doc comments and any prose contract that states fail-open
-behaviour (`crates/khive-runtime/src/pack.rs:1315-1319` today) — changes in
-the same commit as its behaviour; a seam whose code fails closed while its
-public doc still promises fail-open is a defect of this stage. Denials and
-gate-unavailable refusals remain distinguishable in errors and audit events.
-A regression test per seam pins both that the dispatch closure is never
+behaviour — changes in the same commit as its behaviour; a seam whose code
+fails closed while its public doc still promises fail-open is a defect of
+this stage. Denials and gate-unavailable refusals remain distinguishable in
+errors and audit events. The `reason` carried on `RuntimeError::GateUnavailable`
+is a stable classification derived from the `GateError` variant (e.g. backend
+unavailable vs. policy-evaluation failure) — never the gate backend's own
+`Display` text, which can embed connection details or credentials; the full
+error is logged server-side instead. A regression test per seam pins both
+that the dispatch closure is never
 invoked after a gate error and the typed gate-unavailable result the caller
 observes. This stage is a behaviour change only for gates that can error —
 the permissive default cannot — so it is safe to land ahead of the flip.

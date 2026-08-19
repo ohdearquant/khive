@@ -28,6 +28,7 @@ khive-pack-session = { version = "0.7.0", path = "../khive-pack-session" }
 khive-pack-git = { version = "0.7.0", path = "../khive-pack-git" }
 khive-pack-code = { version = "0.7.0", path = "../khive-pack-code" }
 khive-pack-blob = { version = "0.7.0", path = "../khive-pack-blob" }
+khive-pack-moodboard = { version = "0.7.0", path = "../khive-pack-moodboard" }
 khive-pack-workspace = { version = "0.7.0", path = "../khive-pack-workspace" }
 uuid = { workspace = true }
 inventory = { workspace = true }
@@ -42,6 +43,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }

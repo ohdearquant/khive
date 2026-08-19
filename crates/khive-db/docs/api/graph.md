@@ -9,17 +9,19 @@ endpoint-existence guards that back `link`'s atomic-unit safety.
 
 See `crates/khive-db/src/stores/graph.rs` — private method `with_writer`.
 
-Routes a single-row write through the pool-wide `WriterTask` when
-`KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise falls back to the
-legacy standalone-connection / pool-mutex path. This is the ONE routing
+Resolves the pool-wide `WriterTask` at write time and routes through it when
+available; a handle missed by construction outside Tokio is refreshed here.
+Strict routing fails closed when no handle is available. Compatibility mode
+falls back to the legacy standalone-connection / pool-mutex path and emits a
+`direct_route:graph_general_write` violation when the file-backed queue is
+enabled. This is the ONE routing
 point for every `with_writer` caller in this store (`upsert_edge`,
 `delete_edge`, `purge_incident_edges`). `f` must be DML-only — on the
 flag-on path it runs inside the WriterTask's own transaction, so a bare
 `BEGIN IMMEDIATE` would violate SQLite's nested-transaction rule.
-`upsert_edges` (the batch method) does its own flag check and returns early
-on `Some`, so its fallback call into this helper only ever executes on the
-flag-off path (`self.writer_task` is `None` by construction whenever that
-call is reached) — no double-routing.
+`upsert_edges` and guarded batch/transaction paths perform the same write-time
+lookup before falling through this helper. A non-strict `None` records only at
+the actual fallback seam; strict mode never reaches it.
 
 ## `edge_insert_guarded_by_endpoints_statement` — commit-time endpoint guard (ADR-099 §B3)
 

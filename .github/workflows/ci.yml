@@ -5,8 +5,10 @@ on:
     branches: [main, "integration/**"]
   # Keep pull_request (not pull_request_target): GitHub's first-time-contributor
   # approval gate must remain in front of workflows from external forks.
+  # No branches filter: stacked PRs (base = another feature branch) must run CI
+  # too — a filtered trigger leaves them mergeStateStatus=CLEAN with zero checks,
+  # and a base retarget after the parent merges does not re-fire the workflow.
   pull_request:
-    branches: [main, "integration/**"]
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * *"
@@ -97,7 +99,9 @@ jobs:
   ci:
     name: CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
+    # so any slow runner day converted a green run into a timeout cancellation.
+    timeout-minutes: 70
     strategy:
       # A fast failure cancels the sibling OS to control runner cost. The tradeoff
       # is that a macOS-only failure may need a second run after Linux is fixed.
@@ -294,8 +298,26 @@ jobs:
         run: npm run check:showcase
       - name: Production build
         run: npm run build
+      # The install intermittently stalls in a hung mirror download until the
+      # job-level timeout cancels the whole run (#2066). Bounding the npx
+      # process with timeout(1) is unsound for the apt half: killing the
+      # wrapper orphans apt-get with the dpkg lock held and the retry then
+      # fails on the lock. Instead, bound stalls where they happen: apt gets
+      # transport-level read timeouts and native retries, and only the
+      # lock-free browser download is wrapped in timeout-with-retry.
+      - name: Bound apt downloads against mirror stalls
+        run: |
+          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "3";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-download-timeouts
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
       - name: Install browser for repository dogfood
-        run: npx playwright install --with-deps chromium
+        run: timeout 240 npx playwright install chromium || timeout 240 npx playwright install chromium
+      - name: Install browser OS dependencies
+        run: npx playwright install-deps chromium
       - name: Repository showcase dogfood
         run: npx playwright test
 
