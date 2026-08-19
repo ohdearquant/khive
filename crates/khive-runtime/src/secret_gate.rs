@@ -130,6 +130,41 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
     Ok(())
 }
 
+// ─── Reserved property key (ADR-115 Amendment 1) ────────────────────────────
+
+/// Top-level JSON property key reserved for runtime-owned exemption state.
+///
+/// No caller may create, replace, merge, or remove this key through any
+/// properties-bearing write path — ADR-115 Amendment 1 §3. Reservation binds
+/// unconditionally: the runtime does not yet stamp any record with this key
+/// (the finalizer that would do so is a separate, later increment), so no
+/// caller-supplied occurrence of it can ever be a legitimate echo of
+/// persisted state. Only the exact top-level key is reserved; the same
+/// spelling nested inside an object *value* is ordinary content and remains
+/// subject to [`check_json`], never a posture mutation.
+pub(crate) const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
+
+/// Reject a caller-supplied top-level `khive:secret_gate` property key.
+///
+/// Call this before any diff, merge, or storage preparation touches
+/// caller-supplied `properties` on any properties-bearing write path —
+/// create, patch update, or full replace. Returns `Ok(())` when `properties`
+/// is absent, is not a JSON object, or does not name the reserved key at the
+/// top level.
+pub(crate) fn reject_reserved_secret_gate_property(
+    properties: Option<&serde_json::Value>,
+) -> RuntimeResult<()> {
+    if let Some(serde_json::Value::Object(map)) = properties {
+        if map.contains_key(RESERVED_SECRET_GATE_KEY) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "property key `{RESERVED_SECRET_GATE_KEY}` is runtime-owned and cannot be \
+                 created, replaced, merged, or removed by callers"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn scan_json_value(value: &serde_json::Value) -> RuntimeResult<()> {
     match value {
         serde_json::Value::String(s) => check(s),
@@ -2581,6 +2616,75 @@ mod tests {
             check_json(&props).is_err(),
             "secret in JSON array must be blocked"
         );
+    }
+
+    // ── Reserved secret-gate property key (ADR-115 Amendment 1) ─────────────
+
+    #[test]
+    fn reject_reserved_key_passes_absent_properties() {
+        assert!(reject_reserved_secret_gate_property(None).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_passes_unrelated_properties() {
+        let props = serde_json::json!({"name": "value", "tags": ["a", "b"]});
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_passes_non_object_properties() {
+        // Non-object properties cannot name a top-level key at all.
+        let props = serde_json::json!("just a string");
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+        let arr = serde_json::json!(["a", "b"]);
+        assert!(reject_reserved_secret_gate_property(Some(&arr)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_top_level_key_creation() {
+        let props = serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"});
+        let err = reject_reserved_secret_gate_property(Some(&props)).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_regardless_of_value_shape() {
+        // Presence alone is rejected — arbitrary value, null (explicit removal
+        // shape), and a value that happens to match the real stamp format are
+        // all rejected identically; a caller can never legitimately write this
+        // key by any value.
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!({"nested": "object"}),
+            serde_json::json!("exempted:content-sha256-manifest-v1"),
+        ] {
+            let props = serde_json::json!({"khive:secret_gate": value});
+            assert!(
+                reject_reserved_secret_gate_property(Some(&props)).is_err(),
+                "must reject value shape: {props:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_reserved_key_allows_nested_non_top_level_occurrence() {
+        // The same spelling nested inside a value is ordinary content, not a
+        // posture mutation — only the exact top-level key is reserved.
+        let props = serde_json::json!({"notes": {"khive:secret_gate": "not-a-stamp"}});
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_alongside_other_legitimate_keys() {
+        let props = serde_json::json!({
+            "name": "value",
+            "khive:secret_gate": "exempted:content-sha256-manifest-v1",
+        });
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_err());
     }
 
     #[test]
