@@ -5,8 +5,10 @@ on:
     branches: [main, "integration/**"]
   # Keep pull_request (not pull_request_target): GitHub's first-time-contributor
   # approval gate must remain in front of workflows from external forks.
+  # No branches filter: stacked PRs (base = another feature branch) must run CI
+  # too — a filtered trigger leaves them mergeStateStatus=CLEAN with zero checks,
+  # and a base retarget after the parent merges does not re-fire the workflow.
   pull_request:
-    branches: [main, "integration/**"]
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * *"
