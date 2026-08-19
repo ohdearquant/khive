@@ -165,6 +165,29 @@ describe("repository triage model", () => {
     });
   });
 
+  it("reports truncated attention coverage for a zero-row partial page instead of complete", () => {
+    const partial = structuredClone(bundle);
+    partial.aggregates.hotspot_quadrant.data.items = [];
+    partial.aggregates.hotspot_quadrant.data.total_count = {
+      status: "available",
+      value: 0,
+    };
+    partial.aggregates.hotspot_quadrant.data.truncated = true;
+    partial.aggregates.hotspot_quadrant.data.disclosure = {
+      status: "truncated",
+      reason: "hotspot export was capped",
+    };
+    partial.aggregates.dependency_topology.cycles.items = [];
+    partial.aggregates.hidden_coupling.data.items = [];
+    partial.aggregates.ownership.modules.items = [];
+
+    const brief = buildRepositoryBrief(partial);
+
+    expect(brief.attentionSignals).toEqual([]);
+    expect(brief.attentionState.status).toBe("truncated");
+    expect(brief.attentionState.reason).toContain("hotspot export was capped");
+  });
+
   it("does not fabricate recommendations from zero-evidence rows or cycle order", () => {
     const quiet = structuredClone(bundle);
     quiet.aggregates.hotspot_quadrant.data.items = quiet.aggregates

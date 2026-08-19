@@ -42,7 +42,10 @@ import {
 import { settleGraphLayout } from "@/lib/graph-layout";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import { buildRepositoryBrief } from "@/lib/repository-brief";
-import { buildStructureCouplingLens } from "@/lib/structure-coupling-lens";
+import {
+  buildStructureCouplingLens,
+  structureCouplingPairKey,
+} from "@/lib/structure-coupling-lens";
 import type {
   RepoBundle,
   RepoModule,
@@ -50,9 +53,12 @@ import type {
   ViewId,
 } from "@/lib/repo-bundle";
 import {
+  canonicalCouplingPair,
+  DEFAULT_STRUCTURE_GRAPH_LOCATION,
   parseRepositoryLocation,
   REPOSITORY_VIEW_IDS,
   repositoryLocationUrl,
+  type StructureGraphLocation,
 } from "@/lib/repository-location";
 
 type Labels = RepoBundle["capability"]["labels"];
@@ -65,8 +71,13 @@ type ViewProps = Readonly<{
   bundle: RepoBundle;
   moduleById: ModuleMap;
   selectedModuleId: string | null;
-  onInspectModule: (moduleId: string) => void;
+  structureGraph: StructureGraphLocation;
+  onInspectModule: (
+    moduleId: string,
+    nextStructureGraph?: StructureGraphLocation,
+  ) => void;
   onExploreStructure: () => void;
+  onChangeStructureGraph: (location: StructureGraphLocation) => void;
 }>;
 
 const viewOrder: readonly ViewId[] = REPOSITORY_VIEW_IDS;
@@ -89,6 +100,99 @@ const UI_TREEMAP_LIMIT = 180;
 const UI_RESIDUAL_LIMIT = 80;
 const UI_GRAPH_EDGE_LIMIT = 50;
 const UI_COUPLING_EDGE_LIMIT = 20;
+
+type ResolvedStructureGraphLocation = Readonly<{
+  location: StructureGraphLocation;
+  issues: readonly string[];
+}>;
+
+function resolveStructureGraphLocation(
+  bundle: RepoBundle,
+  requested: StructureGraphLocation,
+  suppressPair = false,
+): ResolvedStructureGraphLocation {
+  const issues: string[] = [];
+  let packageName = requested.packageName;
+  let packageId = bundle.graph.repository.id;
+  if (packageName) {
+    const matches = bundle.graph.packages.items.filter((item) =>
+      item.name === packageName
+    );
+    if (matches.length !== 1) {
+      issues.push(matches.length === 0
+        ? `The requested package ${packageName} is not present in this bounded snapshot.`
+        : `The requested package ${packageName} is ambiguous in this bounded snapshot.`);
+      packageName = null;
+    } else {
+      packageId = matches[0].id;
+    }
+  }
+
+  let couplingPair = requested.couplingPair;
+  if (couplingPair && (suppressPair || packageName !== requested.packageName)) {
+    couplingPair = null;
+  }
+  if (couplingPair) {
+    const endpointModules = couplingPair.map((sourcePath) =>
+      bundle.graph.modules.items.filter((item) =>
+        item.source_path === sourcePath
+      )
+    );
+    if (endpointModules.some((matches) => matches.length !== 1)) {
+      issues.push(
+        "The requested coupling pair does not resolve to two unique modules in this bounded snapshot.",
+      );
+      couplingPair = null;
+    } else {
+      const visiblePackages = packageName
+        ? bundle.graph.packages.items.filter((item) => item.id === packageId)
+        : [...bundle.graph.packages.items]
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .slice(0, 8);
+      const visiblePackageIds = new Set(
+        visiblePackages.map((item) => item.id),
+      );
+      const visibleModuleIds = new Set(
+        bundle.graph.modules.items
+          .filter((item) =>
+            visiblePackageIds.has(item.package_id) &&
+            (packageName === null || item.package_id === packageId)
+          )
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .slice(0, 42)
+          .map((item) => item.id),
+      );
+      const lens = buildStructureCouplingLens({
+        pairPage: bundle.aggregates.hidden_coupling.data,
+        structureEdgePage: bundle.graph.structure_edges,
+        visibleModuleIds,
+        limit: UI_COUPLING_EDGE_LIMIT,
+        analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+        analysisUnavailableReason:
+          bundle.aggregates.hidden_coupling.meta.unavailable_reason,
+      });
+      const pairKey = structureCouplingPairKey(
+        endpointModules[0][0].id,
+        endpointModules[1][0].id,
+      );
+      if (!lens.pairs.some((pair) => pair.key === pairKey)) {
+        issues.push(
+          "The requested coupling pair is not in the captured visible top-20 slice for this package scope.",
+        );
+        couplingPair = null;
+      }
+    }
+  }
+
+  return {
+    location: {
+      packageName,
+      lens: requested.lens,
+      couplingPair,
+    },
+    issues,
+  };
+}
 
 function derivedDiamondPoints(x: number, y: number): string {
   const r = 1.1;
@@ -373,20 +477,23 @@ function StructureGraph({
   bundle,
   moduleById,
   selectedModuleId,
+  structureGraph,
   onInspectModule,
+  onChangeStructureGraph,
 }: ViewProps) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
-  const [subtreeId, setSubtreeId] = useState(graph.repository.id);
+  const subtreeId = structureGraph.packageName
+    ? graph.packages.items.find((item) =>
+      item.name === structureGraph.packageName
+    )?.id ?? graph.repository.id
+    : graph.repository.id;
   const [zoom, setZoom] = useState(1);
   const [graphSelection, setGraphSelection] = useState({
     id: graph.repository.id,
     visibleSharedModuleId: null as string | null,
   });
-  const [lens, setLens] = useState<"structure" | "hidden_coupling">(
-    "structure",
-  );
-  const [focusedPairKey, setFocusedPairKey] = useState<string | null>(null);
+  const lens = structureGraph.lens;
   const lensGroupName = useId();
   const {
     displayedEdges,
@@ -407,7 +514,22 @@ function StructureGraph({
     const nextDisplayedPackages = [...nextSubtreePackages]
       .sort((left, right) => left.id.localeCompare(right.id))
       .slice(0, 8);
-    const nextSelectablePackages = graph.packages.items.slice(0, UI_ROW_LIMIT);
+    const boundedSelectablePackages = graph.packages.items.slice(
+      0,
+      UI_ROW_LIMIT,
+    );
+    const selectedScopePackage = subtreeId === graph.repository.id
+      ? null
+      : graph.packages.items.find((item) => item.id === subtreeId) ?? null;
+    const nextSelectablePackages = selectedScopePackage &&
+        !boundedSelectablePackages.some((item) =>
+          item.id === selectedScopePackage.id
+        )
+      ? [
+          ...boundedSelectablePackages.slice(0, UI_ROW_LIMIT - 1),
+          selectedScopePackage,
+        ]
+      : boundedSelectablePackages;
     const displayedPackageIds = new Set(nextDisplayedPackages.map((item) => item.id));
     const nextSubtreeModules = graph.modules.items.filter((item) =>
       subtreeId === graph.repository.id || item.package_id === subtreeId
@@ -525,6 +647,16 @@ function StructureGraph({
     graph.structure_edges,
     visibleIds,
   ]);
+  const moduleIdBySourcePath = new Map(
+    [...moduleById.values()].map((module) => [module.source_path, module.id]),
+  );
+  const focusedPairKey = structureGraph.couplingPair
+    ? (() => {
+      const left = moduleIdBySourcePath.get(structureGraph.couplingPair[0]);
+      const right = moduleIdBySourcePath.get(structureGraph.couplingPair[1]);
+      return left && right ? structureCouplingPairKey(left, right) : null;
+    })()
+    : null;
   const focusedPair = couplingLens.pairs.find((pair) =>
     pair.key === focusedPairKey
   ) ?? null;
@@ -551,6 +683,13 @@ function StructureGraph({
     setGraphSelection({ id: moduleId, visibleSharedModuleId: moduleId });
     onInspectModule(moduleId);
   };
+  const clearFocusedPair = () => {
+    if (!structureGraph.couplingPair) return;
+    onChangeStructureGraph({
+      ...structureGraph,
+      couplingPair: null,
+    });
+  };
 
   return (
     <div className="repo-view-body">
@@ -562,12 +701,18 @@ function StructureGraph({
               aria-label={`${labels.node_types.package} · ${capability.views.structure_graph.label}`}
               value={subtreeId}
               onChange={(event) => {
-                setSubtreeId(event.target.value);
+                const packageName = graph.packages.items.find((item) =>
+                  item.id === event.target.value
+                )?.name ?? null;
                 setGraphSelection((current) => ({
                   ...current,
                   id: event.target.value,
                 }));
-                setFocusedPairKey(null);
+                onChangeStructureGraph({
+                  packageName,
+                  lens,
+                  couplingPair: null,
+                });
               }}
             >
               <option value={graph.repository.id}>{labels.node_types.repository}</option>
@@ -583,8 +728,11 @@ function StructureGraph({
                 value="structure"
                 checked={lens === "structure"}
                 onChange={() => {
-                  setLens("structure");
-                  setFocusedPairKey(null);
+                  onChangeStructureGraph({
+                    ...structureGraph,
+                    lens: "structure",
+                    couplingPair: null,
+                  });
                 }}
               />
               <span>{capability.views.structure_graph.label}</span>
@@ -595,7 +743,11 @@ function StructureGraph({
                 name={lensGroupName}
                 value="hidden_coupling"
                 checked={lens === "hidden_coupling"}
-                onChange={() => setLens("hidden_coupling")}
+                onChange={() => onChangeStructureGraph({
+                  ...structureGraph,
+                  lens: "hidden_coupling",
+                  couplingPair: null,
+                })}
               />
               <span>{capability.views.hidden_coupling.label}</span>
             </label>
@@ -606,6 +758,12 @@ function StructureGraph({
             <button type="button" aria-label={`${capability.views.structure_graph.label} +`} onClick={() => setZoom((value) => Math.min(1.5, value + 0.25))}>+</button>
           </div>
         </div>
+        <LocalSliceDisclosure
+          shown={selectablePackages.length}
+          total={graph.packages.items.length}
+          label={`${labels.node_types.package} scope options`}
+          labels={labels}
+        />
         <OntologyLegend
           className="repo-ontology-legend"
           presentEntityKinds={["project", "concept"]}
@@ -728,7 +886,7 @@ function StructureGraph({
                   ...current,
                   id: graph.repository.id,
                 }));
-                setFocusedPairKey(null);
+                clearFocusedPair();
               }}
             >
               <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
@@ -742,7 +900,7 @@ function StructureGraph({
                     ...current,
                     id: item.id,
                   }));
-                  setFocusedPairKey(null);
+                  clearFocusedPair();
                 }}>
                   <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
                   <span>{labels.node_types.package}</span><strong>{item.name}</strong>
@@ -758,8 +916,10 @@ function StructureGraph({
                     id: item.id,
                     visibleSharedModuleId: item.id,
                   });
-                  setFocusedPairKey(null);
-                  onInspectModule(item.id);
+                  onInspectModule(item.id, {
+                    ...structureGraph,
+                    couplingPair: null,
+                  });
                 }}>
                   <EntityKindMark className="repo-node-kind-icon" kind="concept" showLabel={false} />
                   <span>{labels.node_types.module}</span><strong>{item.module_path}</strong>
@@ -837,8 +997,11 @@ function StructureGraph({
                   action={{
                     label: "Return to structure lens",
                     onClick: () => {
-                      setLens("structure");
-                      setFocusedPairKey(null);
+                      onChangeStructureGraph({
+                        ...structureGraph,
+                        lens: "structure",
+                        couplingPair: null,
+                      });
                     },
                   }}
                 />
@@ -862,7 +1025,13 @@ function StructureGraph({
                           className="repo-coupling-focus"
                           aria-pressed={focusedPairKey === pair.key}
                           aria-label={`Focus coupling candidate between ${leftLabel} and ${rightLabel}`}
-                          onClick={() => setFocusedPairKey(pair.key)}
+                          onClick={() => onChangeStructureGraph({
+                            ...structureGraph,
+                            couplingPair: canonicalCouplingPair(
+                              left!.source_path,
+                              right!.source_path,
+                            ),
+                          })}
                         >
                           <Braces aria-hidden="true" />
                           <span><strong>{labels.metrics.cochange_count}: {formatNumber(pair.cochangeCount)} · {labels.metrics.support}: {formatPercent(pair.support)}</strong>{dependencyMessage}</span>
@@ -1373,8 +1542,10 @@ function ActiveView({
   bundle,
   moduleById,
   selectedModuleId,
+  structureGraph,
   onInspectModule,
   onExploreStructure,
+  onChangeStructureGraph,
 }: ViewProps & { id: ViewId }) {
   const capability = bundle.capability.views[id];
   const labels = bundle.capability.labels;
@@ -1385,8 +1556,10 @@ function ActiveView({
         bundle={bundle}
         moduleById={moduleById}
         selectedModuleId={selectedModuleId}
+        structureGraph={structureGraph}
         onInspectModule={onInspectModule}
         onExploreStructure={onExploreStructure}
+        onChangeStructureGraph={onChangeStructureGraph}
       />
     </ViewFrame>
   );
@@ -1419,6 +1592,11 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     reason: string;
   }> | null>(null);
   const [activeView, setActiveView] = useState<ViewId>("structure_graph");
+  const [structureGraph, setStructureGraph] = useState<StructureGraphLocation>(
+    DEFAULT_STRUCTURE_GRAPH_LOCATION,
+  );
+  const [pendingStaleStructureGraph, setPendingStaleStructureGraph] =
+    useState<StructureGraphLocation | null>(null);
   const [locationNotice, setLocationNotice] = useState<Readonly<{
     title: string;
     message: string;
@@ -1456,15 +1634,30 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         parsed.location.snapshotSha &&
           parsed.location.snapshotSha !== snapshot.head_sha,
       );
+      const resolvedStructureGraph = resolveStructureGraphLocation(
+        bundle,
+        parsed.location.structureGraph,
+        staleSnapshot,
+      );
+      messages.push(...resolvedStructureGraph.issues);
       if (staleSnapshot && parsed.location.snapshotSha) {
         messages.unshift(
           `The requested snapshot ${parsed.location.snapshotSha} is not loaded; this page is showing ${snapshot.head_sha}.`,
         );
+        if (parsed.location.structureGraph.couplingPair) {
+          messages.push(
+            "The requested coupling pair will not be focused until the current snapshot is accepted.",
+          );
+        }
       }
 
       setSelectedModuleId(nextModuleId);
       setUnresolvedModule(nextUnresolved);
       setActiveView(nextView);
+      setStructureGraph(resolvedStructureGraph.location);
+      setPendingStaleStructureGraph(
+        staleSnapshot ? parsed.location.structureGraph : null,
+      );
       setCopyStatus("");
       setLocationNotice(messages.length
         ? {
@@ -1481,9 +1674,22 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
           : requestedPath
           ? `unresolved module ${requestedPath}`
           : "repository overview";
-        setNavigationStatus(
-          `Restored ${capability.views[nextView].label} for ${moduleLabel}.`,
-        );
+        let status =
+          `Restored ${capability.views[nextView].label} for ${moduleLabel}.`;
+        if (nextView === "structure_graph") {
+          const graphLocation = resolvedStructureGraph.location;
+          const lensLabel = capability.views[
+            graphLocation.lens === "hidden_coupling"
+              ? "hidden_coupling"
+              : "structure_graph"
+          ].label;
+          const pairLabel = graphLocation.couplingPair
+            ? `focused pair ${graphLocation.couplingPair[0]} and ${graphLocation.couplingPair[1]}`
+            : "no focused pair";
+          status +=
+            ` Package scope ${graphLocation.packageName ?? capability.labels.node_types.repository}; lens ${lensLabel}; ${pairLabel}.`;
+        }
+        setNavigationStatus(status);
       }
 
       const canonical = repositoryLocationUrl(
@@ -1494,6 +1700,9 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
           modulePath: requestedPath ??
             (nextModuleId ? moduleById.get(nextModuleId)?.source_path ?? null : null),
           view: nextView,
+          structureGraph: staleSnapshot
+            ? parsed.location.structureGraph
+            : resolvedStructureGraph.location,
         },
       );
       if (canonical.href !== window.location.href) {
@@ -1510,7 +1719,9 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
   }, [
+    capability.labels.node_types.repository,
     capability.views,
+    bundle,
     defaultModuleId,
     moduleById,
     modulesBySourcePath,
@@ -1522,6 +1733,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     moduleId: string | null,
     view: ViewId,
     missingPath: string | null = null,
+    nextStructureGraph: StructureGraphLocation = structureGraph,
   ) {
     return repositoryLocationUrl(new URL(window.location.href), {
       repository: repository.canonical_url,
@@ -1530,6 +1742,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         ? moduleById.get(moduleId)?.source_path ?? null
         : missingPath,
       view,
+      structureGraph: nextStructureGraph,
     });
   }
 
@@ -1537,8 +1750,14 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     moduleId: string | null,
     view: ViewId,
     missingPath: string | null = null,
+    nextStructureGraph: StructureGraphLocation = structureGraph,
   ) {
-    const next = locationFor(moduleId, view, missingPath);
+    const next = locationFor(
+      moduleId,
+      view,
+      missingPath,
+      nextStructureGraph,
+    );
     if (next.href === window.location.href) return;
     window.history.pushState(
       null,
@@ -1547,20 +1766,42 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     );
   }
 
-  function selectModule(moduleId: string) {
+  function selectModule(
+    moduleId: string,
+    nextStructureGraph: StructureGraphLocation = structureGraph,
+  ) {
     if (!moduleById.has(moduleId)) return;
-    pushLocation(moduleId, activeView);
+    pushLocation(
+      moduleId,
+      activeView,
+      null,
+      nextStructureGraph,
+    );
     setNavigationStatus("");
     setSelectedModuleId(moduleId);
+    setStructureGraph(nextStructureGraph);
     setUnresolvedModule(null);
+    setPendingStaleStructureGraph(null);
     setLocationNotice(null);
     setCopyStatus("");
   }
 
   function selectView(view: ViewId) {
-    pushLocation(selectedModuleId, view, unresolvedModule?.path ?? null);
+    if (view === activeView) return;
+    const nextStructureGraph = view === "structure_graph" &&
+        activeView !== "structure_graph"
+      ? DEFAULT_STRUCTURE_GRAPH_LOCATION
+      : structureGraph;
+    pushLocation(
+      selectedModuleId,
+      view,
+      unresolvedModule?.path ?? null,
+      nextStructureGraph,
+    );
     setNavigationStatus("");
     setActiveView(view);
+    setStructureGraph(nextStructureGraph);
+    setPendingStaleStructureGraph(null);
     setLocationNotice(null);
     setCopyStatus("");
   }
@@ -1575,17 +1816,30 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
   }
 
   function normalizeCurrentLocation() {
+    const resolvedStructureGraph = resolveStructureGraphLocation(
+      bundle,
+      pendingStaleStructureGraph ?? structureGraph,
+    );
     const next = locationFor(
       selectedModuleId,
       activeView,
       unresolvedModule?.path ?? null,
+      resolvedStructureGraph.location,
     );
     window.history.replaceState(
       null,
       "",
       `${next.pathname}${next.search}${next.hash}`,
     );
-    setLocationNotice(null);
+    setStructureGraph(resolvedStructureGraph.location);
+    setPendingStaleStructureGraph(null);
+    setLocationNotice(resolvedStructureGraph.issues.length
+      ? {
+          title: "Investigation link was repaired",
+          message: resolvedStructureGraph.issues.join(" "),
+          action: "dismiss",
+        }
+      : null);
     setCopyStatus("");
     queueMicrotask(() => copyLinkRef.current?.focus());
   }
@@ -1609,6 +1863,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
           `${current.pathname}${current.search}${current.hash}`,
         );
         setLocationNotice(null);
+        setPendingStaleStructureGraph(null);
       }
       setCopyStatus("Investigation link copied.");
     } catch {
@@ -1630,9 +1885,12 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     });
   }
 
-  function inspectModule(moduleId: string) {
+  function inspectModule(
+    moduleId: string,
+    nextStructureGraph: StructureGraphLocation = structureGraph,
+  ) {
     if (!moduleById.has(moduleId)) return;
-    selectModule(moduleId);
+    selectModule(moduleId, nextStructureGraph);
     const inspector = moduleInspectorRef.current;
     if (!inspector) return;
     inspector.focus({ preventScroll: true });
@@ -1643,6 +1901,27 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       behavior: reduceMotion ? "auto" : "smooth",
       block: "start",
     });
+  }
+
+  function changeStructureGraph(requested: StructureGraphLocation) {
+    const resolved = resolveStructureGraphLocation(bundle, requested);
+    pushLocation(
+      selectedModuleId,
+      "structure_graph",
+      unresolvedModule?.path ?? null,
+      resolved.location,
+    );
+    setStructureGraph(resolved.location);
+    setPendingStaleStructureGraph(null);
+    setNavigationStatus("");
+    setLocationNotice(resolved.issues.length
+      ? {
+          title: "Investigation link was repaired",
+          message: resolved.issues.join(" "),
+          action: "dismiss",
+        }
+      : null);
+    setCopyStatus("");
   }
   return (
     <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
@@ -1704,7 +1983,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
           })}
         </nav>
         <section className="repo-view-panel" aria-label={capability.views[activeView].label}>
-          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} selectedModuleId={selectedModuleId} onInspectModule={inspectModule} onExploreStructure={() => selectView("structure_graph")} />
+          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} selectedModuleId={selectedModuleId} structureGraph={structureGraph} onInspectModule={inspectModule} onExploreStructure={() => selectView("structure_graph")} onChangeStructureGraph={changeStructureGraph} />
         </section>
       </div>
     </article>

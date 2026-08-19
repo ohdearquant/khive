@@ -72,7 +72,7 @@ describe("materialized repository lookup", () => {
     window.history.replaceState(
       null,
       "",
-      `${window.location.pathname}${window.location.search}&at=${bundle.meta.snapshot.head_sha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
+      `${window.location.pathname}${window.location.search}&at=${bundle.meta.snapshot.head_sha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=structure_graph&pkg=khive-db&lens=hidden_coupling&pair=crates%2Fa.rs&pair=crates%2Fb.rs`,
     );
     await user.clear(input);
     await user.type(input, "https://github.com/example/not-curated");
@@ -87,6 +87,10 @@ describe("materialized repository lookup", () => {
     expect(new URL(window.location.href).searchParams.get("at")).toBeNull();
     expect(new URL(window.location.href).searchParams.get("module")).toBeNull();
     expect(new URL(window.location.href).searchParams.get("view")).toBeNull();
+    expect(new URL(window.location.href).searchParams.get("pkg")).toBeNull();
+    expect(new URL(window.location.href).searchParams.get("lens")).toBeNull();
+    expect(new URL(window.location.href).searchParams.getAll("pair"))
+      .toEqual([]);
     expect(mockedLoad).toHaveBeenCalledTimes(1);
 
     await user.click(screen.getByRole("button", { name: "Use the curated khive example" }));

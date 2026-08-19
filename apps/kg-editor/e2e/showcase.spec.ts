@@ -260,12 +260,15 @@ test("shares structure graph module selection with browser history", async ({ pa
 
 test("uses the structure lens to verify a hidden khive-db boundary", async ({ page }) => {
   const graphImplementation = "crates/khive-db/src/stores/graph.rs";
+  const graphTests = "crates/khive-db/src/stores/graph_tests.rs";
   await page.goto("/");
 
   const toolbar = page.locator(".repo-graph-toolbar");
   await toolbar.getByRole("combobox", { name: /Package · Structure graph/ })
     .selectOption({ label: "khive-db" });
+  await expect(page).toHaveURL(/pkg=khive-db/);
   await toolbar.getByRole("radio", { name: "Hidden coupling" }).check();
+  await expect(page).toHaveURL(/lens=hidden_coupling/);
 
   const lens = page.getByRole("region", { name: "Hidden coupling lens" });
   await expect(lens).toContainText("20 of 70 captured visible pairs shown");
@@ -278,6 +281,10 @@ test("uses the structure lens to verify a hidden khive-db boundary", async ({ pa
       "Focus coupling candidate between crates/khive-db/src/stores/graph_tests.rs and crates/khive-db/src/stores/graph.rs",
   });
   await graphPair.press("Enter");
+  expect(new URL(page.url()).searchParams.getAll("pair")).toEqual([
+    graphImplementation,
+    graphTests,
+  ]);
   await expect(lens).toContainText("No captured direct dependency edge");
   await expect(page.locator("[data-coupling-overlay].selected")).toHaveCount(1);
   expect(await page.locator(".repo-graph-node.context-dimmed").count())
@@ -295,6 +302,31 @@ test("uses the structure lens to verify a hidden khive-db boundary", async ({ pa
   await expect(page).toHaveURL(
     new RegExp(`module=${encodeURIComponent(graphImplementation)}`),
   );
+  expect(new URL(page.url()).searchParams.getAll("pair")).toEqual([
+    graphImplementation,
+    graphTests,
+  ]);
+
+  await page.reload();
+  await expect(toolbar.getByRole("combobox", {
+    name: /Package · Structure graph/,
+  }).locator("option:checked")).toHaveText("khive-db");
+  await expect(toolbar.getByRole("radio", { name: "Hidden coupling" }))
+    .toBeChecked();
+  await expect(page.locator("[data-coupling-overlay].selected")).toHaveCount(1);
+  await expect(page.locator("[data-module-inspector]").getByRole("heading", {
+    level: 3,
+  })).toHaveText(graphImplementation);
+
+  await page.goBack();
+  await expect(page.locator("[data-coupling-overlay].selected")).toHaveCount(1);
+  await page.goBack();
+  await expect(page).not.toHaveURL(/pair=/);
+  await expect(page.locator("[data-coupling-overlay].selected")).toHaveCount(0);
+  await page.goBack();
+  await expect(toolbar.getByRole("radio", { name: "Structure graph" }))
+    .toBeChecked();
+  await expect(page).not.toHaveURL(/lens=/);
 });
 
 test("keeps the structure inspector legible across desktop and mobile", async ({ page }) => {

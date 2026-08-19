@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
+import { repositoryLocationUrl } from "@/lib/repository-location";
 
 const settleGraphLayoutSpy = vi.hoisted(() => vi.fn());
 
@@ -98,6 +99,7 @@ describe("repository showcase hidden-coupling lens", () => {
     expect(container.querySelectorAll(".repo-graph-node.coupling-focused"))
       .toHaveLength(0);
     expect(focusButtons[0]).toHaveAttribute("aria-pressed", "false");
+    expect(new URL(window.location.href).searchParams.has("pair")).toBe(false);
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
   });
 
@@ -122,7 +124,14 @@ describe("repository showcase hidden-coupling lens", () => {
     const lens = screen.getByRole("region", {
       name: `${bundle.capability.views.hidden_coupling.label} lens`,
     });
-    const endpoint = within(lens).getAllByRole("button", {
+    const focus = within(lens).getAllByRole("button", {
+      name: /Focus coupling candidate between/,
+    })[0];
+    await user.click(focus);
+    const focusedPair = new URL(window.location.href).searchParams.getAll(
+      "pair",
+    );
+    const endpoint = within(focus.closest("li")!).getAllByRole("button", {
       name: /Inspect crates\/khive-db\/src\/stores\/graph(_tests)?\.rs/,
     })[0];
     const sourcePath = endpoint.getAttribute("aria-label")!.replace(
@@ -139,7 +148,216 @@ describe("repository showcase hidden-coupling lens", () => {
       .toBe("structure_graph");
     expect(new URL(window.location.href).searchParams.get("module"))
       .toBe(sourcePath);
+    expect(new URL(window.location.href).searchParams.get("pkg"))
+      .toBe("khive-db");
+    expect(new URL(window.location.href).searchParams.get("lens"))
+      .toBe("hidden_coupling");
+    expect(new URL(window.location.href).searchParams.getAll("pair"))
+      .toEqual(focusedPair);
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("pushes and restores the package, lens, and focused pair without relayout", async () => {
+    const bundle = golden();
+    const databasePackage = bundle.graph.packages.items.find((item) =>
+      item.name === "khive-db"
+    )!;
+    const user = userEvent.setup();
+    const pushState = vi.spyOn(window.history, "pushState");
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await waitFor(() => expect(settleGraphLayoutSpy).toHaveBeenCalledOnce());
+    const packageSelect = screen.getByRole("combobox", {
+      name:
+        `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+    });
+    await user.selectOptions(packageSelect, databasePackage.id);
+    expect(new URL(window.location.href).searchParams.get("pkg"))
+      .toBe("khive-db");
+    expect(pushState).toHaveBeenCalledTimes(1);
+    expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+
+    const hiddenLens = screen.getByRole("radio", {
+      name: bundle.capability.views.hidden_coupling.label,
+    });
+    await user.click(hiddenLens);
+    expect(new URL(window.location.href).searchParams.get("lens"))
+      .toBe("hidden_coupling");
+    expect(pushState).toHaveBeenCalledTimes(2);
+    expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+
+    const focus = screen.getAllByRole("button", {
+      name: /Focus coupling candidate between/,
+    })[0];
+    const focusName = focus.getAttribute("aria-label")!;
+    const [, left, right] = focusName.match(
+      /^Focus coupling candidate between (.+) and (.+)$/,
+    )!;
+    await user.click(focus);
+    const focusedUrl = window.location.href;
+    expect(new URL(focusedUrl).searchParams.getAll("pair")).toEqual(
+      [left, right].sort(),
+    );
+    expect(pushState).toHaveBeenCalledTimes(3);
+    expect(container.querySelectorAll("[data-coupling-overlay].selected"))
+      .toHaveLength(1);
+    expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+
+    await user.click(screen.getByRole("radio", {
+      name: bundle.capability.views.structure_graph.label,
+    }));
+    const otherLensUrl = window.location.href;
+    expect(new URL(window.location.href).searchParams.has("pair")).toBe(false);
+    expect(pushState).toHaveBeenCalledTimes(4);
+    expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+
+    window.history.replaceState(null, "", focusedUrl);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await waitFor(() => expect(hiddenLens).toBeChecked());
+    expect(packageSelect).toHaveValue(databasePackage.id);
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-coupling-overlay].selected"))
+        .toHaveLength(1)
+    );
+    const focusedAnnouncement = screen.getByRole("status", {
+      name: "Investigation navigation",
+    }).textContent;
+    const [canonicalLeft, canonicalRight] = new URL(focusedUrl).searchParams
+      .getAll("pair");
+    expect(focusedAnnouncement).toContain("Package scope khive-db");
+    expect(focusedAnnouncement).toContain("lens Hidden coupling");
+    expect(focusedAnnouncement).toContain(
+      `focused pair ${canonicalLeft} and ${canonicalRight}`,
+    );
+    expect(pushState).toHaveBeenCalledTimes(4);
+    expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+
+    window.history.replaceState(null, "", otherLensUrl);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await waitFor(() => expect(hiddenLens).not.toBeChecked());
+    const structureAnnouncement = screen.getByRole("status", {
+      name: "Investigation navigation",
+    }).textContent;
+    expect(structureAnnouncement).toContain("Package scope khive-db");
+    expect(structureAnnouncement).toContain("lens Structure graph");
+    expect(structureAnnouncement).toContain("no focused pair");
+    expect(structureAnnouncement).not.toBe(focusedAnnouncement);
+    expect(pushState).toHaveBeenCalledTimes(4);
+    expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.scorecard.label,
+    }));
+    const otherViewUrl = new URL(window.location.href);
+    expect(otherViewUrl.searchParams.has("pkg")).toBe(false);
+    expect(otherViewUrl.searchParams.has("lens")).toBe(false);
+    expect(otherViewUrl.searchParams.has("pair")).toBe(false);
+    expect(pushState).toHaveBeenCalledTimes(5);
+    expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a stale coupling pair pending until the current snapshot is accepted", async () => {
+    const bundle = golden();
+    const pair = bundle.aggregates.hidden_coupling.data.items.find((candidate) => {
+      const left = bundle.graph.modules.items.find((item) =>
+        item.id === candidate.left_module_id
+      );
+      const right = bundle.graph.modules.items.find((item) =>
+        item.id === candidate.right_module_id
+      );
+      return left?.source_path.includes("khive-db/src/stores/graph") &&
+        right?.source_path.includes("khive-db/src/stores/graph");
+    })!;
+    const endpoints = [pair.left_module_id, pair.right_module_id]
+      .map((id) => bundle.graph.modules.items.find((item) => item.id === id)!.source_path)
+      .sort() as [string, string];
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: "0000000000000000000000000000000000000000",
+      modulePath: endpoints[0],
+      view: "structure_graph",
+      structureGraph: {
+        packageName: "khive-db",
+        lens: "hidden_coupling",
+        couplingPair: endpoints,
+      },
+    });
+    window.history.replaceState(null, "", direct);
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    expect(await screen.findByRole("radio", {
+      name: bundle.capability.views.hidden_coupling.label,
+    })).toBeChecked();
+    expect(container.querySelectorAll("[data-coupling-overlay].selected"))
+      .toHaveLength(0);
+    expect(new URL(window.location.href).searchParams.getAll("pair"))
+      .toEqual(endpoints);
+    const notice = await screen.findByRole("status", {
+      name: "Investigation link status",
+    });
+    expect(notice).toHaveTextContent(/coupling pair.*current snapshot/i);
+
+    const staleHref = window.location.href;
+    const pushState = vi.spyOn(window.history, "pushState");
+    pushState.mockClear();
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.structure_graph.label,
+    }));
+    expect(window.location.href).toBe(staleHref);
+    expect(pushState).not.toHaveBeenCalled();
+    expect(screen.getByRole("status", {
+      name: "Investigation link status",
+    })).toHaveTextContent(/coupling pair.*current snapshot/i);
+    expect(new URL(window.location.href).searchParams.getAll("pair"))
+      .toEqual(endpoints);
+
+    await user.click(within(notice).getByRole("button", {
+      name: "Use current snapshot",
+    }));
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-coupling-overlay].selected"))
+        .toHaveLength(1)
+    );
+    expect(new URL(window.location.href).searchParams.get("at"))
+      .toBe(bundle.meta.snapshot.head_sha);
+    expect(new URL(window.location.href).searchParams.getAll("pair"))
+      .toEqual(endpoints);
+  });
+
+  it("fails closed when a package scope cannot be resolved", async () => {
+    const bundle = golden();
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: null,
+      view: "structure_graph",
+      structureGraph: {
+        packageName: "not-a-captured-package",
+        lens: "hidden_coupling",
+        couplingPair: [
+          "crates/khive-db/src/stores/graph.rs",
+          "crates/khive-db/src/stores/graph_tests.rs",
+        ],
+      },
+    });
+    window.history.replaceState(null, "", direct);
+    render(<RepoShowcase bundle={bundle} />);
+
+    const notice = await screen.findByRole("status", {
+      name: "Investigation link status",
+    });
+    expect(notice).toHaveTextContent(/requested package.*not present/i);
+    expect(screen.getByRole("combobox", {
+      name:
+        `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+    })).toHaveValue(bundle.graph.repository.id);
+    expect(screen.getByRole("radio", {
+      name: bundle.capability.views.hidden_coupling.label,
+    })).toBeChecked();
+    const repaired = new URL(window.location.href);
+    expect(repaired.searchParams.has("pkg")).toBe(false);
+    expect(repaired.searchParams.has("pair")).toBe(false);
   });
 
   it("surfaces an unavailable aggregate instead of drawing empty evidence", async () => {
