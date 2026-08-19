@@ -751,11 +751,19 @@ The admission-capable set is defined by code path, not by verb: a mutation is ad
 and only if it reaches storage through the shared finalizer's entity or note constructor entry
 points named above. Merge and restore participate exactly when their implementations construct a
 final entity or note candidate through those entry points; a merge or restore implementation that
-writes rows by any other path is reservation-only and owned by #2057. Curation, atomic-prepare, and
-proposal-materialization paths are reservation-only in this slice and owned by #2057. The first
-acceptance rung's matrix enumerates the finalizer's constructor entry points, and #2057's inventory
-is every write path that does not pass through them; both lists are derivable from the code without
-further judgment.
+writes rows by any other path is reservation-only and owned by #2057. In the initial slice,
+curation, atomic-prepare, and proposal-materialization implementations must not route through the
+finalizer's entry points: they remain reservation-only on their legacy write paths, and #2057 owns
+their migration. That is an implementation obligation, not a competing classification — the
+code-path criterion stays the sole test of admission capability.
+
+The finalizer and its constructor entry points are introduced by this slice's implementation, and
+one runtime-owned module must declare the complete entry-point list. The first acceptance rung's
+matrix is generated from that declaration, and #2057's inventory is every property-bearing write
+path that does not pass through a declared entry point. A write path added later either routes
+through a declared entry point or extends #2057's inventory; the declaration is the auditable
+anchor for both.
+
 Everything else is reservation-only in this slice: knowledge atoms and domains, proposal-only
 metadata, edge metadata, merge reasons, embedding-content overrides, and any field not present in
 the final stored entity or note use the unchanged blocking scanner and can never receive a stamp.
@@ -785,6 +793,10 @@ tracked issue before this amendment merges:
 - **Integrate the MCP redaction surface.** Preserve current masking until a final stored target,
   stamp location, and atomic success-event boundary are specified and implemented; no exemption is
   allowed until then. **Owner reference:** `(follow-on issue: #2061)`.
+
+The five obligations are disjoint: #2058 through #2061 own exactly their named surfaces, and #2057
+owns every other excluded property-bearing path. Closing #2057 neither closes nor is blocked by the
+four named-surface obligations.
 
 An excluded surface follows its unchanged blocking or masking behavior. It cannot consume a
 manifest match, synthesize the reserved stamp, or claim coverage under either acceptance rung.
@@ -869,6 +881,10 @@ unchanged scanner path:
    unknown-version, missing-identity, or identity-mismatched document. The refresh must make the
    effective snapshot empty before returning its typed fault; a subsequent would-have-matched input
    must follow the legacy scanner and receive no stamp or successful exemption event.
+
+Each fault above is a distinguishable cause of the `ManifestInvalid` outcome defined in §4: loading
+and refresh return `ManifestInvalid` carrying the specific fault, and each acceptance construction
+asserts the specific fault rather than the bare outcome.
 
 For v1, the expected corpus identity is the corpus-level digest required by the frozen-inputs
 acceptance section and is pinned by runtime-owned configuration. Every construction above is
