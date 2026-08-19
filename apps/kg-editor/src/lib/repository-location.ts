@@ -71,9 +71,7 @@ export function publicRepositoryUrlIssue(value: string): string | null {
     if (
       (repository.protocol !== "https:" && repository.protocol !== "http:") ||
       repository.username ||
-      repository.password ||
-      repository.search ||
-      repository.hash
+      repository.password
     ) {
       return "The repository must be a public HTTP or HTTPS URL.";
     }
@@ -341,16 +339,22 @@ export function repositoryLocationUrl(
   base: URL,
   location: RepositoryLocation,
 ): URL {
-  const url = new URL(base);
+  const url = new URL(base.origin + base.pathname);
+  const values: Record<LocationParameter, string | null> = {
+    repo: location.repository,
+    at: location.snapshotSha,
+    module: location.modulePath,
+    view: location.view,
+    // Structure-graph parameters are conditional on the view and emitted by
+    // the dedicated block below; null here so the closed-order loop skips them.
+    pkg: null,
+    lens: null,
+    pair: null,
+  };
   for (const parameter of LOCATION_PARAMETERS) {
-    url.searchParams.delete(parameter);
+    const value = values[parameter];
+    if (value) url.searchParams.append(parameter, value);
   }
-  if (location.repository) url.searchParams.append("repo", location.repository);
-  if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
-  if (location.modulePath) {
-    url.searchParams.append("module", location.modulePath);
-  }
-  if (location.view) url.searchParams.append("view", location.view);
   if (location.view === "structure_graph") {
     if (location.structureGraph.packageName) {
       url.searchParams.append("pkg", location.structureGraph.packageName);

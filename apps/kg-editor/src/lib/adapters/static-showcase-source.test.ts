@@ -54,4 +54,40 @@ describe("static showcase source", () => {
     await expect(loadStaticShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle)).rejects.toThrow(new RegExp(`${REPO_BUNDLE_MAX_MIB} MiB`, "i"));
     expect(arrayBuffer).not.toHaveBeenCalled();
   });
+
+  it("aborts a chunked, missing-Content-Length response as soon as it crosses the byte budget, without materializing the rest", async () => {
+    const chunkSize = 5 * 1024 * 1024;
+    const chunks = [
+      new Uint8Array(chunkSize),
+      new Uint8Array(chunkSize),
+      new Uint8Array(chunkSize),
+    ];
+    let readCalls = 0;
+    let cancelled = false;
+    const reader = {
+      read: vi.fn(async () => {
+        if (readCalls >= chunks.length) return { done: true, value: undefined };
+        const value = chunks[readCalls];
+        readCalls += 1;
+        return { done: false, value };
+      }),
+      cancel: vi.fn(async () => {
+        cancelled = true;
+      }),
+    };
+    const arrayBuffer = vi.fn();
+    const fetchBundle = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      arrayBuffer,
+      body: { getReader: () => reader } as unknown as Response["body"],
+    }));
+
+    await expect(loadStaticShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle))
+      .rejects.toThrow(new RegExp(`${REPO_BUNDLE_MAX_MIB} MiB`, "i"));
+    expect(arrayBuffer).not.toHaveBeenCalled();
+    expect(reader.read).toHaveBeenCalledTimes(2);
+    expect(cancelled).toBe(true);
+  });
 });

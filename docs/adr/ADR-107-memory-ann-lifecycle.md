@@ -2,6 +2,9 @@
 
 **Status**: Accepted
 **Date**: 2026-07-10
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which keys memory ANN
+state, pending logs, and replay watermarks by the complete immutable embedding-space key on
+acceptance.
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-079](ADR-079-ann-persistence-warm-path-integration.md) (ANN persistence warm-path integration, knowledge pack scope)
 **References**: issue #791, PR #812
 

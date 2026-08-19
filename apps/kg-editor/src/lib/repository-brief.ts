@@ -202,13 +202,15 @@ function pageEvidence(
           page.disclosure.status === "truncated"
       ? "truncated"
       : "complete";
+  const reason = page.disclosure.reason ??
+    (page.next_cursor != null && page.disclosure.status === "complete"
+      ? "Additional items are available beyond this page."
+      : null);
   const status = effectiveStatus === "complete"
     ? "complete"
     : `${
       effectiveStatus === "truncated" ? labels.truncated : labels.unavailable
-    }${
-      page.disclosure.reason ? `: ${page.disclosure.reason}` : ""
-    }`;
+    }${reason ? `: ${reason}` : ""}`;
   return {
     label,
     value: `${page.items.length} present, ${total}; ${status}`,
@@ -296,6 +298,42 @@ function unavailableMetric(
   };
 }
 
+function missingHistoryNavigationMetric(
+  coverage: {
+    bound: { kind: "all" | "top_n"; max_items: number; order: string };
+    disclosure: {
+      status: "complete" | "truncated" | "unavailable";
+      reason?: string | null;
+    };
+  },
+  labels: RepoBundle["capability"]["labels"],
+): RepositoryMetric {
+  if (coverage.disclosure.status === "unavailable") {
+    return unavailableMetric(
+      labels,
+      coverage.disclosure.reason ?? "History navigation was not produced.",
+    );
+  }
+  if (coverage.disclosure.status === "truncated") {
+    const reason = coverage.disclosure.reason ??
+      "The by-module history-navigation page was truncated before reaching this module.";
+    return {
+      shown: 0,
+      total: null,
+      bound: coverage.bound.max_items,
+      status: "truncated",
+      reason,
+      summary: `0 captured; ${labels.truncated}: ${reason}`,
+      detail:
+        `Bound ${coverage.bound.kind} to ${coverage.bound.max_items}, ordered by ${coverage.bound.order}; this module's row may exist beyond that bound.`,
+    };
+  }
+  return unavailableMetric(
+    labels,
+    "No module history-navigation row was captured.",
+  );
+}
+
 function analysisMetric(
   analysis: {
     meta: {
@@ -343,7 +381,7 @@ function combinedAttentionMetric(
       bound: shown,
       status: "truncated",
       reason,
-      summary: `${shown} signals from available analyses; ${labels.truncated}`,
+      summary: `${shown} signals from available analyses; ${labels.truncated}: ${reason}`,
       detail:
         "Each signal carries its own capability-owned row coverage and export bound.",
     };
@@ -876,15 +914,13 @@ export function buildModuleInsight(
   const commitById = new Map(
     bundle.graph.commits.items.map((commit) => [commit.id, commit]),
   );
-  const navigation = bundle.graph.history_navigation.by_module.items.find(
+  const historyNavigationCoverage = bundle.graph.history_navigation.by_module;
+  const navigation = historyNavigationCoverage.items.find(
     (row) => row.module_id === moduleId,
   );
   const history = navigation
     ? pageMetric(navigation.commits, labels)
-    : unavailableMetric(
-      labels,
-      "No module history-navigation row was captured.",
-    );
+    : missingHistoryNavigationMetric(historyNavigationCoverage, labels);
   const recentCommits = (navigation?.commits.items ?? [])
     .flatMap((commitId) => {
       const commit = commitById.get(commitId);
@@ -935,7 +971,10 @@ export function buildModuleInsight(
     ? pageEvidence("History navigation", navigation.commits, labels)
     : {
       label: "History navigation",
-      value: "No module history-navigation row was captured.",
+      value: historyNavigationCoverage.disclosure.status === "truncated"
+        ? historyNavigationCoverage.disclosure.reason ??
+          "The by-module history-navigation page was truncated before reaching this module."
+        : "No module history-navigation row was captured.",
     };
   const analysisWindows = [
     bundle.aggregates.hotspot_quadrant.meta.status === "available"
@@ -1037,14 +1076,22 @@ export function buildModuleInsight(
   };
 }
 
+export interface RepositoryModuleMatches {
+  items: RepoModule[];
+  total: number;
+  bound: number;
+}
+
 export function findRepositoryModules(
   bundle: RepoBundle,
   query: string,
   limit = 8,
-): RepoModule[] {
+): RepositoryModuleMatches {
   const normalizedQuery = query.trim().toLowerCase();
   const normalizedLimit = Math.max(0, Math.floor(limit));
-  if (!normalizedQuery || normalizedLimit === 0) return [];
+  if (!normalizedQuery || normalizedLimit === 0) {
+    return { items: [], total: 0, bound: normalizedLimit };
+  }
 
   const score = (module: RepoModule): number | null => {
     const sourcePath = module.source_path.toLowerCase();
@@ -1078,7 +1125,7 @@ export function findRepositoryModules(
     return null;
   };
 
-  return bundle.graph.modules.items
+  const matches = bundle.graph.modules.items
     .flatMap((module) => {
       const relevance = score(module);
       return relevance == null ? [] : [{ module, relevance }];
@@ -1088,7 +1135,10 @@ export function findRepositoryModules(
         left.relevance - right.relevance ||
         left.module.source_path.length - right.module.source_path.length ||
         compareModules(left.module, right.module),
-    )
-    .slice(0, normalizedLimit)
-    .map(({ module }) => module);
+    );
+  return {
+    items: matches.slice(0, normalizedLimit).map(({ module }) => module),
+    total: matches.length,
+    bound: normalizedLimit,
+  };
 }

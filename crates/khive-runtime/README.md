@@ -81,7 +81,7 @@ NamespaceToken ──── VerbRegistryBuilder::register(pack) × N
                     Gate::check  first pack whose handlers() match verb
                     (authoritative
                      Deny; errors
-                     fail open)
+                     fail closed)
 ```
 
 `dispatch` short-circuits to `describe_verb` when `params["help"] == true`, otherwise

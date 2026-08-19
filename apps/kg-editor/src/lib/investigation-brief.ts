@@ -24,6 +24,56 @@ const RECENT_COMMIT_LIMIT = 5;
 const OWNERSHIP_AUTHOR_LIMIT = 5;
 const SCC_LIMIT = 3;
 const SCC_MEMBER_LIMIT = 6;
+const AUTHOR_TOKEN_HEX_CHARS = 10;
+
+// Model-facing dynamic-field allowlist.
+//
+// The brief below is copied verbatim into an instruction-following model's
+// context, so every dynamic value it contains must fall into one of these
+// bounded classes — nothing else is permitted through untouched:
+//
+//   1. Constrained identifiers: full/short commit SHAs (regex-validated hex
+//      in the bundle schema), ISO-8601 timestamps, and numeric stats (counts,
+//      percentages, weights) — these cannot carry instruction text by
+//      construction.
+//   2. Validated repository-relative source/module paths — rendered through
+//      `code()`, which applies a hard length bound (`PATH_VALUE_LIMIT`) and
+//      Markdown-escapes the result.
+//   3. Producer-authored operational text: disclosure/unavailable reasons,
+//      pagination cursors, and `bound.order` labels. These come from the
+//      khive exporter's own fixed status vocabulary describing capture
+//      bounds/truncation — never from repository content an external
+//      contributor controls — and are still rendered through
+//      `code()`/`boundedInline()` for a hard length bound plus escaping.
+//   4. Repository-controlled free text (commit subjects, commit and
+//      ownership author identities) is NEVER copied verbatim, because a
+//      Markdown code span is presentation escaping, not an
+//      instruction/data boundary. Commit subjects are omitted from the
+//      brief entirely. Author identities are replaced by `authorToken()`,
+//      a short stable hash labeled as a hashed token so no attacker-
+//      supplied identity text reaches the model channel.
+//
+// Adding a new dynamic field to the brief means placing it in class 1-3
+// above, or hashing/dropping it per class 4 — never passing an unconstrained
+// repository-sourced string through untouched.
+
+// FNV-1a 32-bit, extended by re-hashing the running state until the token is
+// long enough. Deterministic across runtimes so the same author collapses to
+// the same token every time the brief is rebuilt.
+export function authorToken(value: string): string {
+  let state = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    state ^= value.charCodeAt(index);
+    state = Math.imul(state, 0x01000193);
+  }
+  let token = "";
+  let extended = state >>> 0;
+  while (token.length < AUTHOR_TOKEN_HEX_CHARS) {
+    token += extended.toString(16).padStart(8, "0");
+    extended = Math.imul(extended ^ 0x9e3779b9, 0x01000193) >>> 0;
+  }
+  return token.slice(0, AUTHOR_TOKEN_HEX_CHARS);
+}
 
 type BoundedPage = Readonly<{
   items: readonly unknown[];
@@ -255,7 +305,7 @@ function appendCouplingWorkbench(
     lines.push("- Bounded shared-commit sample:");
     for (const item of comparison.sharedCommits.items) {
       lines.push(
-        `  - ${code(item.commit.sha)} at ${code(item.commit.committed_at)}: ${code(item.commit.subject)}.`,
+        `  - ${code(item.commit.sha)} at ${code(item.commit.committed_at)}.`,
       );
     }
   }
@@ -560,7 +610,7 @@ export function buildInvestigationBrief({
     const authorLines = ownershipRow.authors.items
       .slice(0, OWNERSHIP_AUTHOR_LIMIT)
       .map((author) =>
-        `- ${code(author.author)}: ${author.commits} commits; ${percentage(author.share)} share.`
+        `- author token ${code(authorToken(author.author))} (hashed identity, not raw text): ${author.commits} commits; ${percentage(author.share)} share.`
       );
     if (authorLines.length > 0) {
       optionalBlocks.push(
@@ -572,7 +622,9 @@ export function buildInvestigationBrief({
     const commitLines = insight.recentCommits
       .slice(0, RECENT_COMMIT_LIMIT)
       .map((commit) =>
-        `- ${code(commit.sha)} at ${code(commit.committed_at)}: ${code(commit.subject)}.`
+        `- ${code(commit.sha)} at ${code(commit.committed_at)}, author token ${
+          code(authorToken(commit.author))
+        } (hashed identity, not raw text).`
       );
     optionalBlocks.push(
       `## Captured recent history records\n\n${commitLines.join("\n")}`,
