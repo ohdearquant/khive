@@ -747,8 +747,15 @@ atomic success event keyed to the target's identity:
 - entity create, update, and bulk mutations, including direct code-ingest entity candidates;
 - note create, update, and atomic-message mutations, including direct code-ingest note candidates.
 
-Merge and restore operations participate only by routing a final entity or note candidate through
-that same finalizer; an operation that cannot do so is excluded and follows its legacy path.
+The admission-capable set is defined by code path, not by verb: a mutation is admission-capable if
+and only if it reaches storage through the shared finalizer's entity or note constructor entry
+points named above. Merge and restore participate exactly when their implementations construct a
+final entity or note candidate through those entry points; a merge or restore implementation that
+writes rows by any other path is reservation-only and owned by #2057. Curation, atomic-prepare, and
+proposal-materialization paths are reservation-only in this slice and owned by #2057. The first
+acceptance rung's matrix enumerates the finalizer's constructor entry points, and #2057's inventory
+is every write path that does not pass through them; both lists are derivable from the code without
+further judgment.
 Everything else is reservation-only in this slice: knowledge atoms and domains, proposal-only
 metadata, edge metadata, merge reasons, embedding-content overrides, and any field not present in
 the final stored entity or note use the unchanged blocking scanner and can never receive a stamp.
