@@ -285,8 +285,17 @@ describe("repository triage model", () => {
   });
 
   it("finds a module by the path a user already knows", () => {
-    const hits = findRepositoryModules(bundle, "pool.rs", 8);
-    expect(hits.length).toBeGreaterThan(0);
-    expect(hits[0].source_path).toContain("pool.rs");
+    const matches = findRepositoryModules(bundle, "pool.rs", 8);
+    expect(matches.items.length).toBeGreaterThan(0);
+    expect(matches.items[0].source_path).toContain("pool.rs");
+    expect(matches.total).toBe(matches.items.length);
+    expect(matches.bound).toBe(8);
+  });
+
+  it("reports the total match count when a search is capped by the limit", () => {
+    const matches = findRepositoryModules(bundle, "e", 1);
+    expect(matches.items.length).toBe(1);
+    expect(matches.total).toBeGreaterThan(1);
+    expect(matches.bound).toBe(1);
   });
 });
