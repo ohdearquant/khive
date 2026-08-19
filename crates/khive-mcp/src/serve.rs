@@ -7778,8 +7778,12 @@ backend = "kg-backend"
         async fn record_heartbeat_success_is_visible_via_comm_health() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             record_channel_heartbeat(
@@ -7818,8 +7822,12 @@ backend = "kg-backend"
         async fn heartbeat_visible_via_health_regardless_of_configured_ingest_namespace() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             // Simulates `KHIVE_EMAIL_INGEST_NAMESPACE=lambda:mybot`: comm.ingest for
@@ -7938,8 +7946,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             // Drive exactly what the production poll loop does per tick: iterate
@@ -8391,8 +8403,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let store = Arc::new(FakeEventStore::default());
             builder.with_event_store(store.clone());
             let registry = builder.build().expect("registry builds");
@@ -8441,8 +8457,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
             assert!(
                 registry.event_store().is_none(),
@@ -8575,8 +8595,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let task = tokio::spawn(channel_poll_loop(
@@ -8734,8 +8758,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let task = tokio::spawn(channel_poll_loop(
@@ -8861,8 +8889,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let task = tokio::spawn(channel_poll_loop(
@@ -8961,8 +8993,12 @@ backend = "kg-backend"
         async fn committed_cursor_round_trips_across_a_fresh_cursor_get() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             // Simulates a poll that crosses an IMAP UIDVALIDITY/date-window
@@ -9148,8 +9184,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             // Seed a valid row (also bootstraps the pack-owned schema), then
@@ -9268,8 +9308,12 @@ backend = "kg-backend"
         async fn quarantine_ingest_failure_blocking_first_commit_preserves_the_bootstrap_floor() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let control_calls = Arc::new(Mutex::new(Vec::new()));
@@ -9349,8 +9393,12 @@ backend = "kg-backend"
         async fn first_tick_uses_startup_time_not_post_sleep_time() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let calls = Arc::new(Mutex::new(Vec::new()));

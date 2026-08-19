@@ -18,8 +18,12 @@ use khive_types::Pack;
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-    builder.register(CommPack::new(runtime.clone()));
+    khive_runtime::PackRegistry::register_packs(
+        &["kg".to_string(), "comm".to_string()],
+        runtime.clone(),
+        &mut builder,
+    )
+    .expect("register kg+comm through the factory path");
     let registry = builder.build().expect("registry builds");
     (registry, runtime)
 }
@@ -28,8 +32,12 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
 fn build_registry_for_ns(ns: &str) -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-    builder.register(CommPack::new(runtime.clone()));
+    khive_runtime::PackRegistry::register_packs(
+        &["kg".to_string(), "comm".to_string()],
+        runtime.clone(),
+        &mut builder,
+    )
+    .expect("register kg+comm through the factory path");
     builder.with_default_namespace(ns);
     let registry = builder.build().expect("registry builds");
     (registry, runtime)
@@ -5733,40 +5741,38 @@ async fn try_create_note_rejects_forged_transport_owned_message_properties() {
     );
 }
 
-/// The trusted-ingest entry point must still permit `comm.ingest` (its sole
-/// caller) to establish the same three properties `try_create_note` refuses,
-/// and `comm.health` must count the resulting row.
+/// The trusted-ingest path must still permit `comm.ingest` (its sole caller,
+/// holding the registration-granted channel-ingest capability) to establish
+/// the same three properties `try_create_note` refuses, and `comm.health`
+/// must count the resulting row. Exercised through the verb so the test
+/// proves the granted capability path end to end; the runtime method itself
+/// is uncallable from outside `khive-runtime` without a grant, which is the
+/// restriction under test.
 #[tokio::test]
-async fn try_create_note_as_trusted_ingest_permits_comm_ingest_quarantine() {
+async fn comm_ingest_establishes_quarantine_via_granted_capability() {
     let (registry, rt) = build_registry_for_ns("local");
-    let token = rt
-        .authorize(khive_runtime::Namespace::local())
-        .expect("authorize local");
 
-    let note = rt
-        .try_create_note_as_trusted_ingest(
-            &token,
-            "message",
-            None,
-            "legitimate quarantine row via the trusted ingest path",
-            Some(serde_json::json!({
-                "quarantined": true,
-                "channel_kind": "email",
-                "channel_slug": "trusted-channel",
-                "direction": "inbound",
-                "from_actor": "external:sender",
-            })),
-        )
-        .await
-        .expect("trusted ingest write")
-        .expect("insert must not be deduplicated");
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "external:sender",
+            "to": "local",
+            "content": "legitimate quarantine row via the trusted ingest path",
+            "channel_kind": "email",
+            "channel_slug": "trusted-channel",
+            "metadata": {"quarantined": true},
+        }),
+    )
+    .await;
     assert_eq!(
-        note.properties
-            .as_ref()
-            .and_then(|p| p.get("quarantined"))
+        props
+            .get("quarantined")
             .and_then(serde_json::Value::as_bool),
         Some(true)
     );
+    assert_eq!(props["channel_kind"], "email");
+    assert_eq!(props["channel_slug"], "trusted-channel");
 
     let health = registry
         .dispatch("comm.health", serde_json::json!({}))
@@ -12200,11 +12206,10 @@ async fn merge_never_transfers_transport_properties_under_any_strategy() {
                     "namespace": "local",
                     "from": "email:quarantine",
                     "to": "local",
-                    "content": format!("attributed quarantined source for {strategy}"),
+                    "content": format!("attributed transport source for {strategy}"),
                     "channel_kind": "email",
                     "channel_slug": format!("source-{strategy}"),
-                    "external_id": format!("attributed-quarantine-source-{strategy}"),
-                    "metadata": {"quarantined": true, "quarantine_reason": "test"},
+                    "external_id": format!("attributed-transport-source-{strategy}"),
                 }),
             )
             .await
@@ -12214,7 +12219,6 @@ async fn merge_never_transfers_transport_properties_under_any_strategy() {
             .dispatch("get", serde_json::json!({"id": from_id}))
             .await
             .expect("read transport source before merge");
-        assert_eq!(from_before["properties"]["quarantined"], true);
         assert_eq!(from_before["properties"]["channel_kind"], "email");
         assert_eq!(
             from_before["properties"]["channel_slug"],
@@ -12238,13 +12242,95 @@ async fn merge_never_transfers_transport_properties_under_any_strategy() {
             .dispatch("get", serde_json::json!({"id": into_id}))
             .await
             .expect("read survivor after merge");
-        for key in ["quarantined", "channel_kind", "channel_slug"] {
+        for key in ["channel_kind", "channel_slug"] {
             assert!(
                 after["properties"].get(key).is_none(),
                 "{strategy} must not transfer transport-owned `{key}` from the absorbed \
                  message into a survivor that lacked it; got {after}"
             );
         }
+    }
+}
+
+/// A quarantined message participates in no merges at all: folding its content
+/// into an ordinary message while the marker restoration drops `quarantined`
+/// would launder quarantined transport content into an unmarked record.
+/// Release is the channel-ingest path's decision, never a curation side
+/// effect, so the merge is refused in every strategy and either operand role.
+#[tokio::test]
+async fn merge_refuses_quarantined_message_under_every_strategy() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    for strategy in ["prefer_into", "prefer_from", "union"] {
+        let ordinary = registry
+            .dispatch(
+                "comm.ingest",
+                serde_json::json!({
+                    "namespace": "local",
+                    "from": "legacy:unattributed",
+                    "to": "local",
+                    "content": format!("ordinary operand for {strategy}"),
+                    "external_id": format!("quarantine-merge-ordinary-{strategy}"),
+                }),
+            )
+            .await
+            .expect("ordinary ingest");
+        let quarantined = registry
+            .dispatch(
+                "comm.ingest",
+                serde_json::json!({
+                    "namespace": "local",
+                    "from": "email:quarantine",
+                    "to": "local",
+                    "content": format!("quarantined operand for {strategy}"),
+                    "channel_kind": "email",
+                    "channel_slug": format!("quarantine-merge-{strategy}"),
+                    "external_id": format!("quarantine-merge-parked-{strategy}"),
+                    "metadata": {"quarantined": true, "quarantine_reason": "test"},
+                }),
+            )
+            .await
+            .expect("quarantined ingest");
+        let ordinary_id = ordinary["full_id"].as_str().expect("full_id").to_string();
+        let quarantined_id = quarantined["full_id"]
+            .as_str()
+            .expect("full_id")
+            .to_string();
+
+        for (into_id, from_id) in [
+            (&ordinary_id, &quarantined_id),
+            (&quarantined_id, &ordinary_id),
+        ] {
+            let error = registry
+                .dispatch(
+                    "merge",
+                    serde_json::json!({
+                        "kind": "message",
+                        "into_id": into_id,
+                        "from_id": from_id,
+                        "strategy": strategy,
+                    }),
+                )
+                .await
+                .expect_err("a quarantined message must not merge in either role");
+            assert!(
+                error.to_string().contains("quarantined"),
+                "{strategy}: {error}"
+            );
+        }
+
+        let parked = registry
+            .dispatch("get", serde_json::json!({"id": quarantined_id}))
+            .await
+            .expect("quarantined note intact after refused merges");
+        assert_eq!(parked["properties"]["quarantined"], true);
+        assert!(
+            parked["content"]
+                .as_str()
+                .expect("content")
+                .contains("quarantined operand"),
+            "refused merge must not mutate the quarantined operand"
+        );
     }
 }
 

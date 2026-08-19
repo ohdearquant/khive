@@ -2643,6 +2643,26 @@ pub struct PackInstall {
 ///
 /// Implementors must be `Send + Sync + 'static` because the registry is built
 /// once and shared across async tasks.
+/// Possession-bounded capability for the trusted channel-ingest note path.
+///
+/// Constructible only inside `khive-runtime` (the field is private), and
+/// granted during pack registration exclusively to factories named in
+/// [`CHANNEL_INGEST_CAPABLE_PACKS`]. Every call to
+/// [`crate::KhiveRuntime::try_create_note_as_trusted_ingest`] must present a
+/// reference to one, so the set of callers able to establish transport-owned
+/// message properties is bounded by possession at the composition root, not
+/// by a documentation prohibition. The residual trust assumption is the pack
+/// name registry itself: names are unique per registration, so a rogue
+/// factory could obtain the grant only by shipping in the binary under the
+/// `comm` name in a composition that omits the real comm pack — a change the
+/// composition root would have to make deliberately.
+pub struct ChannelIngestCapability {
+    pub(crate) _sealed: (),
+}
+
+/// Pack names entitled to a [`ChannelIngestCapability`] grant at registration.
+pub(crate) const CHANNEL_INGEST_CAPABLE_PACKS: &[&str] = &["comm"];
+
 pub trait PackFactory: Send + Sync + 'static {
     /// Canonical lowercase name for this pack (e.g. `"kg"`, `"gtd"`).
     fn name(&self) -> &'static str;
@@ -2685,6 +2705,14 @@ pub trait PackFactory: Send + Sync + 'static {
     fn create_resolver(&self, _runtime: KhiveRuntime) -> Option<Box<dyn PackByIdResolver>> {
         None
     }
+
+    /// Receive the trusted channel-ingest capability during registration.
+    ///
+    /// Called at most once per registration, and only for factories whose
+    /// name appears in [`CHANNEL_INGEST_CAPABLE_PACKS`]. The default drops
+    /// the grant, so a pack reaches the trusted-ingest path only by
+    /// deliberately overriding this method and storing the capability.
+    fn grant_channel_ingest(&self, _capability: ChannelIngestCapability) {}
 }
 
 /// Newtype wrapper collected by `inventory` so pack crates can submit
@@ -2788,6 +2816,9 @@ impl PackRegistry {
         // performs the topo-sort, so insertion order here does not matter.
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
+            if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
+                factory.grant_channel_ingest(ChannelIngestCapability { _sealed: () });
+            }
             let install = factory.create_install(runtime.clone());
             builder.register_boxed(install.runtime);
             if let Some(resolver) = install.resolver {
@@ -2843,6 +2874,9 @@ impl PackRegistry {
 
         for name in names {
             let factory = factory_for(name.as_str()).unwrap();
+            if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
+                factory.grant_channel_ingest(ChannelIngestCapability { _sealed: () });
+            }
             let runtime = runtimes
                 .get(name.as_str())
                 .cloned()
@@ -3152,6 +3186,93 @@ mod tests {
     use super::*;
     use crate::ActorRef;
     use khive_types::Pack;
+
+    static COMM_PROBE_GRANTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static OTHER_PROBE_GRANTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Probe factories proving the channel-ingest grant is name-bounded.
+    /// khive-runtime's own test binary links no real pack crates, so the
+    /// `comm` name is free for the probe here.
+    struct CommProbeFactory;
+    struct OtherProbeFactory;
+
+    fn probe_pack(_runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
+        struct ProbePack;
+        #[async_trait::async_trait]
+        impl PackRuntime for ProbePack {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                &[]
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: serde_json::Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<serde_json::Value, crate::RuntimeError> {
+                Err(crate::RuntimeError::InvalidInput("probe".into()))
+            }
+        }
+        Box::new(ProbePack)
+    }
+
+    impl PackFactory for CommProbeFactory {
+        fn name(&self) -> &'static str {
+            "comm"
+        }
+        fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
+            probe_pack(runtime)
+        }
+        fn grant_channel_ingest(&self, _capability: ChannelIngestCapability) {
+            COMM_PROBE_GRANTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl PackFactory for OtherProbeFactory {
+        fn name(&self) -> &'static str {
+            "grant-probe-other"
+        }
+        fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
+            probe_pack(runtime)
+        }
+        fn grant_channel_ingest(&self, _capability: ChannelIngestCapability) {
+            OTHER_PROBE_GRANTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    inventory::submit! { PackRegistration(&CommProbeFactory) }
+    inventory::submit! { PackRegistration(&OtherProbeFactory) }
+
+    #[test]
+    fn channel_ingest_grant_reaches_only_allowlisted_pack_names() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs(
+            &["comm".to_string(), "grant-probe-other".to_string()],
+            runtime,
+            &mut builder,
+        )
+        .expect("probe registration succeeds");
+        assert!(
+            COMM_PROBE_GRANTED.load(std::sync::atomic::Ordering::SeqCst),
+            "the comm-named factory must receive the channel-ingest grant"
+        );
+        assert!(
+            !OTHER_PROBE_GRANTED.load(std::sync::atomic::Ordering::SeqCst),
+            "a factory outside CHANNEL_INGEST_CAPABLE_PACKS must never be granted"
+        );
+    }
 
     #[test]
     fn from_token_preserves_process_ref() {

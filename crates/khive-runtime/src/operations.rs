@@ -3201,11 +3201,15 @@ impl KhiveRuntime {
     /// site: `comm.ingest` (`khive-pack-comm/src/handlers.rs`) is the sole
     /// legitimate caller, because it is the only code that has just derived
     /// quarantine disposition and channel provenance from the inbound
-    /// transport itself. No other caller — in this crate or any pack — should
-    /// ever call this method; use `try_create_note` instead, which rejects
-    /// those three properties unconditionally.
+    /// transport itself. The caller set is bounded by possession, not
+    /// documentation: the required [`crate::ChannelIngestCapability`] is
+    /// constructible only inside this crate and granted at pack registration
+    /// exclusively to channel-transport packs. Every other write path uses
+    /// `try_create_note`, which rejects those three properties
+    /// unconditionally.
     pub async fn try_create_note_as_trusted_ingest(
         &self,
+        _capability: &crate::pack::ChannelIngestCapability,
         token: &NamespaceToken,
         kind: &str,
         name: Option<&str>,

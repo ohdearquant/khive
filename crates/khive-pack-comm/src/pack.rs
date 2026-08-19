@@ -167,6 +167,19 @@ pub(crate) fn derive_message_identity(
 
 struct CommPackFactory;
 
+/// The trusted channel-ingest capability the runtime grants at registration.
+///
+/// `comm.ingest` presents it on every trusted-ingest write; an ungranted pack
+/// (a composition that never registered comm through the pack registry) fails
+/// closed at the handler rather than establishing transport-owned properties.
+static CHANNEL_INGEST_CAPABILITY: std::sync::OnceLock<khive_runtime::ChannelIngestCapability> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn channel_ingest_capability() -> Option<&'static khive_runtime::ChannelIngestCapability>
+{
+    CHANNEL_INGEST_CAPABILITY.get()
+}
+
 impl khive_runtime::PackFactory for CommPackFactory {
     fn name(&self) -> &'static str {
         "comm"
@@ -176,6 +189,9 @@ impl khive_runtime::PackFactory for CommPackFactory {
     }
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(CommPack::new(runtime))
+    }
+    fn grant_channel_ingest(&self, capability: khive_runtime::ChannelIngestCapability) {
+        let _ = CHANNEL_INGEST_CAPABILITY.set(capability);
     }
 }
 

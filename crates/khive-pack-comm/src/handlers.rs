@@ -2107,8 +2107,15 @@ pub(crate) async fn handle_ingest(
     // transport-owned quarantine disposition and channel provenance (`quarantined`,
     // `channel_kind`, `channel_slug`), derived above from the inbound transport
     // itself. Every other write path uses `try_create_note`, which refuses them.
+    let capability = crate::pack::channel_ingest_capability().ok_or_else(|| {
+        RuntimeError::InvalidInput(
+            "comm pack holds no channel-ingest capability grant; refusing to              establish transport-owned message properties"
+                .to_string(),
+        )
+    })?;
     let note = match runtime
         .try_create_note_as_trusted_ingest(
+            capability,
             token,
             "message",
             p.subject.as_deref(),
@@ -3316,6 +3323,18 @@ mod tests {
             .authorize(Namespace::parse(&ns).unwrap())
             .expect("authorize");
         let signal = InboxSignal::new();
+
+        // Seed the channel-ingest grant through the real registration path;
+        // handle_ingest fails closed without it. The symbol reference keeps
+        // khive-pack-kg linked so its factory reaches this binary's inventory.
+        let _force_kg_link = khive_pack_kg::KgPack::new;
+        let mut grant_builder = khive_runtime::VerbRegistryBuilder::new();
+        khive_runtime::PackRegistry::register_packs(
+            &["kg".to_string(), "comm".to_string()],
+            runtime.clone(),
+            &mut grant_builder,
+        )
+        .expect("registration grants channel ingest");
 
         let body = json!({
             "from": "email:sender@example.com",
