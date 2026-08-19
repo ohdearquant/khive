@@ -37,11 +37,13 @@ describe("structure hidden-coupling lens", () => {
   it("selects a deterministic bounded visible slice from the real snapshot", () => {
     const bundle = golden();
     const rootLens = buildStructureCouplingLens({
-      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, null),
       limit: 20,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
     expect(rootLens.capturedVisiblePairCount).toBe(10);
     expect(rootLens.pairs).toHaveLength(10);
@@ -51,11 +53,13 @@ describe("structure hidden-coupling lens", () => {
     );
     expect(databasePackage).toBeDefined();
     const databaseLens = buildStructureCouplingLens({
-      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, databasePackage!.id),
       limit: 20,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
 
     expect(databaseLens.capturedVisiblePairCount).toBe(70);
@@ -80,15 +84,42 @@ describe("structure hidden-coupling lens", () => {
       },
     };
     const lens = buildStructureCouplingLens({
-      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, null),
       limit: 20,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
 
     expect(lens.coverage).toBe("truncated");
     expect(lens.coverageReason).toContain("continuation cursor");
+  });
+
+  it("treats an unavailable analysis as unavailable even when the captured page looks complete", () => {
+    const bundle = golden();
+    const pairPage = {
+      ...bundle.aggregates.hidden_coupling.data,
+      truncated: false,
+      next_cursor: null,
+      disclosure: { status: "complete" as const },
+    };
+    const lens = buildStructureCouplingLens({
+      pairPage,
+      structureEdgePage: bundle.graph.structure_edges,
+      visibleModuleIds: visibleModuleIds(bundle, null),
+      limit: 20,
+      analysisStatus: "unavailable",
+      analysisUnavailableReason: "hidden-coupling analysis was not run",
+    });
+
+    expect(lens.coverage).toBe("unavailable");
+    expect(lens.coverageReason).toBe("hidden-coupling analysis was not run");
+    expect(lens.pairs).toHaveLength(0);
+    expect(lens.capturedVisiblePairCount).toBe(0);
+    expect(lens.capturedPairCount).toBe(0);
+    expect(lens.declaredPairCount).toBeNull();
   });
 
   it("never turns incomplete structure evidence into an absence claim", () => {
@@ -106,11 +137,13 @@ describe("structure hidden-coupling lens", () => {
       },
     };
     const lens = buildStructureCouplingLens({
-      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage,
       visibleModuleIds: visibleModuleIds(bundle, databasePackage.id),
       limit: 20,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
 
     expect(lens.pairs).toHaveLength(20);
@@ -140,7 +173,6 @@ describe("structure hidden-coupling lens", () => {
     };
     const bundle = parseRepoBundle(draft);
     const lens = buildStructureCouplingLens({
-      aggregateStatus: bundle.aggregates.hidden_coupling.meta.status,
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: new Set([
@@ -148,6 +180,9 @@ describe("structure hidden-coupling lens", () => {
         pair.right_module_id,
       ]),
       limit: 1,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     });
 
     expect(lens.pairs[0]).toMatchObject({
@@ -160,7 +195,7 @@ describe("structure hidden-coupling lens", () => {
   it("suppresses overlays when the aggregate declares itself unavailable, even with captured rows still present", () => {
     const bundle = golden();
     const lens = buildStructureCouplingLens({
-      aggregateStatus: "unavailable",
+      analysisStatus: "unavailable",
       pairPage: bundle.aggregates.hidden_coupling.data,
       structureEdgePage: bundle.graph.structure_edges,
       visibleModuleIds: visibleModuleIds(bundle, null),

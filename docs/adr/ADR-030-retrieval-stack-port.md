@@ -2,7 +2,9 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: khive maintainers
+**Authors**: khive maintainers\
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds policy-free
+ranked-prefix materialization and pure query-variant fusion/attribution primitives on acceptance.
 
 ## Context
 

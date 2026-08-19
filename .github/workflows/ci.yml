@@ -5,8 +5,10 @@ on:
     branches: [main, "integration/**"]
   # Keep pull_request (not pull_request_target): GitHub's first-time-contributor
   # approval gate must remain in front of workflows from external forks.
+  # No branches filter: stacked PRs (base = another feature branch) must run CI
+  # too — a filtered trigger leaves them mergeStateStatus=CLEAN with zero checks,
+  # and a base retarget after the parent merges does not re-fire the workflow.
   pull_request:
-    branches: [main, "integration/**"]
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * *"
@@ -97,7 +99,9 @@ jobs:
   ci:
     name: CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
+    # so any slow runner day converted a green run into a timeout cancellation.
+    timeout-minutes: 70
     strategy:
       # A fast failure cancels the sibling OS to control runner cost. The tradeoff
       # is that a macOS-only failure may need a second run after Linux is fixed.
