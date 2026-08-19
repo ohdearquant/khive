@@ -465,8 +465,8 @@ walk — the exact exhaustion surface the bound exists to close. That choice has
 consequence and this ADR admits it rather than leaving it implicit: whether the refusal
 fires depends on records the caller cannot see, so a caller can learn one threshold bit
 about hidden population size — the same footing as `undisclosed_survivors`, and one of
-exactly three bounded structural-aggregate disclosures enumerated in §3's authorization
-paragraph. The two-population arm — identical visible sets over hidden populations of
+the bounded structural-aggregate disclosures enumerated in §3's authorization paragraph,
+which owns their count. The two-population arm — identical visible sets over hidden populations of
 `lineage_visit_limit` and `lineage_visit_limit + 1` structural records, asserted to produce
 empty success and the bound refusal respectively, and asserted to disclose nothing beyond
 that bit — is an acceptance fixture for any implementation of this ADR. (For a cascading kill that has
