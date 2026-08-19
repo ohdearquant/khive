@@ -14,6 +14,8 @@ const goldenPath = resolve(
   "../../docs/schemas/examples/khive-repo-v1-khive.json",
 );
 const temporaryRoots: string[] = [];
+const authorized = () => true;
+const unauthorized = () => false;
 
 async function configuredAnalysis() {
   const root = await mkdtemp(resolve(tmpdir(), "khive-showcase-route-"));
@@ -46,6 +48,7 @@ describe("GET /api/showcase/analyses/[id]", () => {
       const get = createShowcaseAnalysisGet(
         () => registry,
         async () => ({ bytes, etag: `"sha256-${"a".repeat(64)}"` }),
+        authorized,
       );
 
       const response = await get(
@@ -78,7 +81,11 @@ describe("GET /api/showcase/analyses/[id]", () => {
       }],
     };
     const loadAnalysis = vi.fn();
-    const get = createShowcaseAnalysisGet(() => registry, loadAnalysis);
+    const get = createShowcaseAnalysisGet(
+      () => registry,
+      loadAnalysis,
+      authorized,
+    );
 
     const response = await get(
       new Request("http://localhost/api/showcase/analyses/missing"),
@@ -113,6 +120,7 @@ describe("GET /api/showcase/analyses/[id]", () => {
       async () => {
         throw new ShowcaseAnalysisError("ANALYSIS_INVALID");
       },
+      authorized,
     );
 
     const response = await get(
@@ -133,4 +141,55 @@ describe("GET /api/showcase/analyses/[id]", () => {
     expect(body).not.toContain(registry.root);
     expect(body).not.toContain(registry.entries[0].canonical_url);
   });
+
+  it("rejects a configured analysis when the caller is not authorized", async () => {
+    const registry = await configuredAnalysis();
+    const loadAnalysis = vi.fn();
+    const get = createShowcaseAnalysisGet(
+      () => registry,
+      loadAnalysis,
+      unauthorized,
+    );
+
+    const response = await get(
+      new Request("http://localhost/api/showcase/analyses/khive"),
+      { params: Promise.resolve({ id: "khive" }) },
+    );
+
+    expect(response.status).toBe(404);
+    const body = await response.text();
+    expect(JSON.parse(body)).toEqual({
+      error: {
+        code: "NOT_CONFIGURED",
+        message: "This repository analysis is not configured.",
+      },
+    });
+    expect(loadAnalysis).not.toHaveBeenCalled();
+  });
+
+  it(
+    "rejects the default request authorizer without a matching bearer token",
+    async () => {
+      vi.stubEnv("KHIVE_SHOWCASE_ACCESS_TOKEN", "operator-secret");
+      const registry = await configuredAnalysis();
+      const loadAnalysis = vi.fn();
+      const get = createShowcaseAnalysisGet(() => registry, loadAnalysis);
+
+      const noHeader = await get(
+        new Request("http://localhost/api/showcase/analyses/khive"),
+        { params: Promise.resolve({ id: "khive" }) },
+      );
+      const wrongToken = await get(
+        new Request("http://localhost/api/showcase/analyses/khive", {
+          headers: { authorization: "Bearer wrong-token" },
+        }),
+        { params: Promise.resolve({ id: "khive" }) },
+      );
+
+      expect(noHeader.status).toBe(404);
+      expect(wrongToken.status).toBe(404);
+      expect(loadAnalysis).not.toHaveBeenCalled();
+      vi.unstubAllEnvs();
+    },
+  );
 });

@@ -3,6 +3,9 @@
 **Status**: accepted
 **Date**: 2026-05-23
 **Authors**: khive maintainers
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which separates the
+logical `lineage_slot` from immutable `space_key`, defines the registry migration, and forbids
+relabeling old vectors on acceptance.
 **Depends on**:
 
 - ADR-011 (Embedding and Inference Architecture)

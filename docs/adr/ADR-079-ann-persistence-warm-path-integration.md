@@ -3,7 +3,9 @@
 **Status**: Accepted
 **Date**: 2026-06-28
 **Authors**: khive maintainers
-**Amended by**: issue #1479 (bounded pending-consumer lifecycle)
+**Amended by**: issue #1479 (bounded pending-consumer lifecycle); proposed
+[ADR-160](ADR-160-shared-pack-infrastructure.md), which keys ANN segments, pending logs, and replay
+watermarks by the complete immutable embedding-space key on acceptance.
 
 ## Context
 

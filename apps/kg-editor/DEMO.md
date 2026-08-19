@@ -24,7 +24,11 @@ Before presenting, verify that the source badge says **khive DB snapshot**, not
 
 This setup requires the DB snapshot API route from the companion backend PR (or
 its merged equivalent). Without that route, this UI branch intentionally uses
-the curated static fallback.
+the curated static fallback. Per ADR-147 Amendment 3, only a 404 on the
+snapshot route may fall back to the approved static asset; server errors,
+timeouts, oversized or malformed bodies, and provenance or repository
+mismatches are surfaced as hard failures so a stale static bundle never
+conceals a configured report's integrity or availability failure.
 
 ## Five-to-seven-minute flow
 

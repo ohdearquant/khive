@@ -29,6 +29,15 @@ export class ShowcaseAnalysisNotFoundError extends Error {
   }
 }
 
+// A connection that never resolves, or a response body that stops
+// delivering bytes without rejecting, would otherwise leave the snapshot
+// read pending forever and keep the page in its loading state. This
+// deadline bounds the connection, header wait, and full body parse
+// together. Per ADR-147 Amendment 3 only a 404 may fall back to the
+// curated static asset, so an elapsed deadline is reported as a hard
+// failure rather than silently serving stale static data.
+export const DB_SNAPSHOT_TIMEOUT_MS = 5_000;
+
 export async function loadPreferredShowcaseBundle(
   entry: ShowcaseRegistryEntry,
   fetchBundle: ShowcaseFetch = fetch,
@@ -43,11 +52,44 @@ export async function loadPreferredShowcaseBundle(
     };
   }
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    DB_SNAPSHOT_TIMEOUT_MS,
+  );
+  const deadline = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener("abort", () => {
+      reject(
+        new Error(
+          `Database snapshot request did not settle within ${DB_SNAPSHOT_TIMEOUT_MS}ms.`,
+        ),
+      );
+    }, { once: true });
+  });
+
+  const read = readDbSnapshotBundle(entry, fetchBundle, controller.signal);
+  // When the deadline wins the race the abandoned read may still reject
+  // later (e.g. an AbortError from the fetch); mark it handled so it never
+  // surfaces as an unhandled rejection.
+  read.catch(() => {});
+  try {
+    return await Promise.race([read, deadline]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function readDbSnapshotBundle(
+  entry: ShowcaseRegistryEntry,
+  fetchBundle: ShowcaseFetch,
+  signal: AbortSignal,
+): Promise<LoadedShowcaseBundle> {
   const endpoint = `/api/showcase/analyses/${entry.analysisId}`;
   const response = await fetchBundle(endpoint, {
     cache: "no-store",
     credentials: "same-origin",
     redirect: "error",
+    signal,
   });
 
   if (response.status === 404) {

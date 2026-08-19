@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  DB_SNAPSHOT_TIMEOUT_MS,
   loadPreferredShowcaseBundle,
   ShowcaseAnalysisNotFoundError,
 } from "@/lib/adapters/preferred-showcase-source";
@@ -58,6 +59,7 @@ describe("preferred showcase source", () => {
       cache: "no-store",
       credentials: "same-origin",
       redirect: "error",
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -154,5 +156,78 @@ describe("preferred showcase source", () => {
       "/api/showcase/analyses/dynamic-only",
       expect.any(Object),
     );
+  });
+
+  it("reports a hard failure when the DB snapshot request never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchBundle = vi.fn(() => new Promise<never>(() => {}));
+
+      const resultPromise = loadPreferredShowcaseBundle(
+        configuredStaticEntry,
+        fetchBundle,
+      );
+      const assertion = expect(resultPromise).rejects.toThrow(
+        /did not settle/i,
+      );
+      await vi.advanceTimersByTimeAsync(DB_SNAPSHOT_TIMEOUT_MS);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a hard failure when the DB snapshot response body never completes", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchBundle = vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers({
+            "x-khive-analysis-id": "khive",
+            "x-khive-analysis-source": "khive-db-snapshot",
+          }),
+          arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+        })
+      );
+
+      const resultPromise = loadPreferredShowcaseBundle(
+        configuredStaticEntry,
+        fetchBundle,
+      );
+      const assertion = expect(resultPromise).rejects.toThrow(
+        /did not settle/i,
+      );
+      await vi.advanceTimersByTimeAsync(DB_SNAPSHOT_TIMEOUT_MS);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never substitutes stale static data for a failing DB snapshot", async () => {
+    const failureModes: Array<() => Promise<ReturnType<typeof response>>> = [
+      () => Promise.reject(new TypeError("network down")),
+      () => Promise.resolve(response(new Uint8Array(), 500)),
+      () =>
+        Promise.resolve(
+          response(new TextEncoder().encode("{"), 200, {
+            "x-khive-analysis-id": "khive",
+            "x-khive-analysis-source": "khive-db-snapshot",
+          }),
+        ),
+    ];
+
+    for (const failureMode of failureModes) {
+      const fetchBundle = vi.fn(async (input: string) =>
+        input.startsWith("/api/") ? failureMode() : response(golden, 200)
+      );
+
+      await expect(
+        loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle),
+      ).rejects.toThrow();
+      expect(fetchBundle).toHaveBeenCalledOnce();
+    }
   });
 });

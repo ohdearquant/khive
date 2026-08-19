@@ -5,6 +5,7 @@ import { dirname, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  authorizeShowcaseRequest,
   loadMaterializedShowcaseAnalysis,
   resolveShowcaseAnalysisRegistry,
   ShowcaseAnalysisError,
@@ -302,5 +303,60 @@ describe("materialized showcase analysis source", () => {
     }
     expect(error).toMatchObject({ code: "ANALYSIS_INVALID" });
     expect(String(error)).not.toContain(root);
+  });
+});
+
+describe("authorizeShowcaseRequest", () => {
+  const environment = { KHIVE_SHOWCASE_ACCESS_TOKEN: "operator-secret" };
+
+  it("authorizes a request bearing the configured token", () => {
+    const request = new Request("http://localhost/api/showcase/analyses", {
+      headers: { authorization: "Bearer operator-secret" },
+    });
+    expect(authorizeShowcaseRequest(request, environment)).toBe(true);
+  });
+
+  it("is case-insensitive on the Bearer scheme", () => {
+    const request = new Request("http://localhost/api/showcase/analyses", {
+      headers: { authorization: "bearer operator-secret" },
+    });
+    expect(authorizeShowcaseRequest(request, environment)).toBe(true);
+  });
+
+  it("rejects a request with no authorization header", () => {
+    const request = new Request("http://localhost/api/showcase/analyses");
+    expect(authorizeShowcaseRequest(request, environment)).toBe(false);
+  });
+
+  it("rejects a request with a mismatched token", () => {
+    const request = new Request("http://localhost/api/showcase/analyses", {
+      headers: { authorization: "Bearer wrong-secret" },
+    });
+    expect(authorizeShowcaseRequest(request, environment)).toBe(false);
+  });
+
+  it("rejects a request with a malformed authorization header", () => {
+    const request = new Request("http://localhost/api/showcase/analyses", {
+      headers: { authorization: "operator-secret" },
+    });
+    expect(authorizeShowcaseRequest(request, environment)).toBe(false);
+  });
+
+  it("fails closed when no access token is configured", () => {
+    const request = new Request("http://localhost/api/showcase/analyses", {
+      headers: { authorization: "Bearer operator-secret" },
+    });
+    expect(authorizeShowcaseRequest(request, {})).toBe(false);
+  });
+
+  it("fails closed when the configured token is blank", () => {
+    const request = new Request("http://localhost/api/showcase/analyses", {
+      headers: { authorization: "Bearer some-value" },
+    });
+    expect(
+      authorizeShowcaseRequest(request, {
+        KHIVE_SHOWCASE_ACCESS_TOKEN: "   ",
+      }),
+    ).toBe(false);
   });
 });

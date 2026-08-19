@@ -2,7 +2,10 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: khive maintainers
+**Authors**: khive maintainers\
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which atomically binds a
+provider factory to a complete immutable embedding-space identity and replaces sanitized
+model-derived physical selection on acceptance.\
 **Consolidates** (retired v0-series drafts predating the 2026-05-23 ADR renumbering; these
 numbers do not refer to current-index ADRs): ADR-078 (umbrella), ADR-081 (Embedder trait +
 EmbedderRegistry), ADR-082 (engine TOML schema), ADR-083 (runtime API — caller-computed

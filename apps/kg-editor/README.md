@@ -101,6 +101,7 @@ server-private materialized report without placing it under `public/`:
 ```bash
 KHIVE_SHOWCASE_ANALYSIS_ROOT=/absolute/path/to/analyses \
 KHIVE_SHOWCASE_ANALYSES='[{"analysis_id":"khive","canonical_url":"https://github.com/ohdearquant/khive"}]' \
+KHIVE_SHOWCASE_ACCESS_TOKEN=a-long-random-operator-secret \
 npm run dev
 ```
 
@@ -122,13 +123,25 @@ entries with the same normalized URL are one selection: the DB snapshot is prefe
 and only its 404 may use the approved static asset. A 5xx, invalid bundle, provenance or
 repository mismatch never falls back. A configured-only 404 is shown as an honest miss.
 
+Both API routes require `Authorization: Bearer $KHIVE_SHOWCASE_ACCESS_TOKEN` on every
+request, checked in constant time. An absent or mismatched token is indistinguishable
+from an unconfigured catalog: both routes fail closed to the same sanitized 404. Without
+`KHIVE_SHOWCASE_ACCESS_TOKEN` set, no request can be authorized, regardless of what
+credentials it presents.
+
+```bash
+curl -H "Authorization: Bearer $KHIVE_SHOWCASE_ACCESS_TOKEN" \
+  http://localhost:3000/api/showcase/analyses/khive
+```
+
 The report route rejects symlinks, reports above 8 MiB, malformed bundles, unknown IDs,
 and bundles whose normalized `meta.repository.canonical_url` does not match the URL
 configured for that ID. It never opens SQLite or starts a repository process. Responses
 deliberately omit server paths and carry
 `X-Khive-Analysis-Source: khive-db-snapshot` plus the analysis ID and a canonical byte
 ETag. Both API routes use `private, no-store` and `nosniff` responses; an absent or
-invalid operator catalog returns a sanitized 404.
+invalid operator catalog, and an absent or invalid credential, all return the same
+sanitized 404.
 
 The analysis root and its parent must be owned by the operator and unavailable for
 untrusted local writes. Promoted analysis directories are immutable: build into a fresh
@@ -137,7 +150,7 @@ containment and file identity after opening and reads at most 8 MiB plus one sen
 byte.
 
 This is a pinned DB-backed snapshot, not a live mutable query and not arbitrary URL
-ingest. See ADR-147 Amendments 1–3 and the repository-showcase CLI guide.
+ingest. See ADR-147 Amendments 1–4 and the repository-showcase CLI guide.
 
 ## Adapter boundary
 

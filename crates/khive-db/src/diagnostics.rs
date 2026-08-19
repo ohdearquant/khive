@@ -439,7 +439,11 @@ pub fn wal_pin_attribution(_db_path: &Path, _sweep_interval: Duration) -> WalPin
 /// classes below. `writer_acquisition_timeouts` remains specific to the
 /// finite-wait pool-mutex stage; standalone SQLite failures and writer-task
 /// `BEGIN` failures have different ADR-135 F6 stages and are not mislabeled as
-/// pool checkout timeouts. `audit_append_failures` is supplied by the runtime
+/// pool checkout timeouts. Those stages now carry their OWN failure counters
+/// (`writer_task_begin_busy`, `writer_task_begin_errors`) rather than being
+/// absent: refusing to mislabel a failure is not a reason to omit it, and an
+/// omitted failure counter fails toward looking healthy, which is the reading
+/// an operator believes. `audit_append_failures` is supplied by the runtime
 /// because the audit store lives above `khive-db`; direct `khive-db` callers
 /// receive `None` plus an explicit reason instead of a fabricated zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -455,6 +459,14 @@ pub struct WriterContentionDiagnostics {
     pub writer_task_acquisitions: u64,
     /// Main-pool writer checkouts that exhausted their finite deadline.
     pub writer_acquisition_timeouts: u64,
+    /// Writer-task `BEGIN IMMEDIATE` attempts refused busy or locked. These
+    /// are the refusals a caller sees as the retryable `writer_task_begin_busy`
+    /// stage, so a nonzero value here has a matching failed request on the
+    /// caller's side rather than being visible only from inside the process.
+    pub writer_task_begin_busy: u64,
+    /// Writer-task `BEGIN IMMEDIATE` attempts that failed for a reason other
+    /// than busy or locked.
+    pub writer_task_begin_errors: u64,
     /// Process-wide audit appends whose errors were logged and swallowed.
     pub audit_append_failures: Option<u64>,
     /// Why `audit_append_failures` is unavailable to this caller.
@@ -470,6 +482,8 @@ impl WriterContentionDiagnostics {
             standalone_writer_acquisitions: writer.standalone_acquisitions,
             writer_task_acquisitions: writer.writer_task_acquisitions,
             writer_acquisition_timeouts: writer.timeouts,
+            writer_task_begin_busy: writer.writer_task_begin_busy,
+            writer_task_begin_errors: writer.writer_task_begin_errors,
             audit_append_failures,
             audit_append_failures_unavailable_reason: audit_append_failures.is_none().then(|| {
                 "runtime audit instrumentation was not supplied to khive-db diagnostics".to_string()

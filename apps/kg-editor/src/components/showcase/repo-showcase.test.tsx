@@ -207,7 +207,9 @@ describe("repository showcase", () => {
     expect(new URL(window.location.href).searchParams.get("module")).not.toBe(
       missingPath,
     );
-  });
+    // Measured ~0.15-0.2s locally; full-suite CPU contention pushed it past the default
+    // 5s timeout, so this needs headroom.
+  }, 20_000);
 
   it("copies the normalized investigation link with visible feedback", async () => {
     const user = userEvent.setup();
@@ -405,6 +407,47 @@ describe("repository showcase", () => {
     expect(scrollIntoView).toHaveBeenCalledOnce();
   });
 
+  it("renders an unavailable top-level metric as unavailable text, not a fabricated zero", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.dependency_topology.meta.status = "unavailable";
+    bundle.aggregates.dependency_topology.meta.unavailable_reason = "topology analysis was not produced";
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const cyclesMetric = container.querySelector<HTMLElement>('[data-repository-metric="cycles"]')!;
+
+    expect(cyclesMetric).toHaveTextContent(bundle.capability.labels.unavailable);
+    expect(cyclesMetric.querySelector("strong")).not.toHaveTextContent(/^0$/);
+  });
+
+  it("marks the combined attention metric truncated (not complete) when one attention analysis is truncated", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.hotspot_quadrant.data.items = bundle.aggregates.hotspot_quadrant.data.items.slice(0, 1);
+    bundle.aggregates.hotspot_quadrant.data.total_count = { status: "available", value: 99 };
+    bundle.aggregates.hotspot_quadrant.data.truncated = true;
+    bundle.aggregates.hotspot_quadrant.data.disclosure = {
+      status: "truncated",
+      reason: "hotspot export was capped",
+    };
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    expect(within(triage).getAllByText(/hotspot export was capped/i).length).toBeGreaterThan(0);
+    expect(triage.querySelector('[data-state="unavailable"]')).not.toBeInTheDocument();
+  });
+
+  it("discloses when a bounded module search hides matches beyond its cap", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "e");
+
+    const state = triage.querySelector<HTMLElement>('[data-state="truncated"][data-bound="8"]');
+    expect(state).toBeVisible();
+    expect(within(triage).getByText(/8 of \d+ captured matches/)).toBeVisible();
+  });
+
   it("distinguishes unavailable recommendation analyses from measured empty", () => {
     const bundle = structuredClone(golden());
     bundle.aggregates.api_surface.meta.status = "unavailable";
@@ -478,6 +521,31 @@ describe("repository showcase", () => {
     expect(commitMetric).toHaveTextContent(bundle.capability.labels.unavailable);
     expect(commitMetric).not.toHaveTextContent(/^0$/);
     expect(inspector).toHaveTextContent("No module history-navigation row was captured.");
+  });
+
+  it("reports truncated (not unavailable) history when a module's row is missing from a truncated by-module page", () => {
+    const bundle = structuredClone(golden());
+    const target = [...bundle.aggregates.api_surface.data.items].sort((left, right) => right.dependent_count - left.dependent_count)[0];
+    bundle.graph.history_navigation.by_module.items = bundle.graph.history_navigation.by_module.items.filter((row) => row.module_id !== target.module_id);
+    bundle.graph.history_navigation.by_module.truncated = true;
+    bundle.graph.history_navigation.by_module.disclosure = {
+      status: "truncated",
+      reason: "by-module history export was capped",
+    };
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>("[data-module-inspector]")!;
+    const commitMetric = inspector.querySelector<HTMLElement>('[data-inspector-metric="commits"]')!;
+    const coverage = within(inspector)
+      .getByText(`${bundle.capability.labels.metrics.commits} coverage`)
+      .closest('[data-state="truncated"]') as HTMLElement;
+
+    expect(commitMetric).not.toHaveTextContent(/^0$/);
+    expect(commitMetric).not.toHaveTextContent(bundle.capability.labels.unavailable);
+    expect(commitMetric).toHaveTextContent(/0 shown/i);
+    expect(coverage).toBeVisible();
+    expect(coverage).toHaveTextContent(/by-module history export was capped/i);
+    expect(inspector).not.toHaveTextContent("No module history-navigation row was captured.");
   });
 
   it("renders unavailable topology metrics as unavailable rather than zero", () => {
