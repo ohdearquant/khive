@@ -4,23 +4,24 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { loadStaticShowcaseBundle } from "@/lib/adapters/static-showcase-source";
+import { loadPreferredShowcaseBundle } from "@/lib/adapters/preferred-showcase-source";
 import { parseRepoBundle } from "@/lib/repo-bundle";
 
-vi.mock("@/lib/adapters/static-showcase-source", () => ({
-  loadStaticShowcaseBundle: vi.fn(),
+vi.mock("@/lib/adapters/preferred-showcase-source", () => ({
+  loadPreferredShowcaseBundle: vi.fn(),
+  readOperatorShowcaseAccessToken: vi.fn(() => null),
 }));
 
 import { Showcase } from "@/components/showcase/showcase";
 
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
 const bundle = parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
-const mockedLoad = vi.mocked(loadStaticShowcaseBundle);
+const mockedLoad = vi.mocked(loadPreferredShowcaseBundle);
 
-describe("static repository lookup", () => {
+describe("materialized repository lookup", () => {
   beforeEach(() => {
     window.history.replaceState(null, "", "/");
-    mockedLoad.mockResolvedValue(bundle);
+    mockedLoad.mockResolvedValue({ bundle, source: "khive-db-snapshot" });
   });
 
   it("normalizes a curated alias and performs no bundle load for a later miss", async () => {
@@ -33,6 +34,11 @@ describe("static repository lookup", () => {
       "data-head-sha",
       "c2979d2443738a075e55a170c772d1dc86cf0f91",
     );
+    expect(container.querySelector(".repo-overview")).toHaveAttribute(
+      "data-analysis-source",
+      "khive-db-snapshot",
+    );
+    expect(screen.getAllByText(/khive DB snapshot/i).length).toBeGreaterThan(0);
 
     const input = screen.getByLabelText("Public repository URL");
     await user.clear(input);

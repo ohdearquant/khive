@@ -9,6 +9,7 @@ import {
   CircleDot,
   Clock3,
   Code2,
+  Database,
   GitBranch,
   GitCommitHorizontal,
   GitFork,
@@ -22,9 +23,11 @@ import {
   TrendingUp,
   Users,
 } from "@/icons";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import { DataState } from "@/components/data-state";
+import { RepositoryTriage } from "@/components/showcase/repository-triage";
+import type { ShowcaseBundleSource } from "@/lib/adapters/preferred-showcase-source";
 import {
   DerivedEdgeMark,
   edgeDirectionMark,
@@ -734,7 +737,7 @@ function DependencyTopology({ bundle, moduleById, onExploreStructure }: ViewProp
       </section>
       <section className="repo-card">
         <div className="repo-card-heading"><h3>{labels.metrics.cycle_count}</h3><p>{formatNumber(analysis.cycles.items.length)}</p></div>
-        <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>{cycle.module_ids.map((id) => moduleName(moduleById, id)).join(" → ")}</span></div></div>)}</div>
+        <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>SCC members: {cycle.module_ids.map((id) => moduleName(moduleById, id)).join(" · ")}</span></div></div>)}</div>
         {isKnownEmptyRepoPage(analysis.cycles) && <DataState className="repo-empty" state="empty" title="No dependency cycles in this bundle" message="Dependency cycles found by the captured topology analysis belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={cycleRows.length} total={analysis.cycles.items.length} label={labels.metrics.cycle_count} labels={labels} />
         <BoundDisclosure page={analysis.cycles} labels={labels} />
@@ -816,8 +819,11 @@ type CadenceSeriesId = "commits" | "issues_opened" | "issues_closed" | "pull_req
 
 function CadenceSeries({ id, page, label, labels, onExploreStructure }: { id: CadenceSeriesId; page: CadencePage; label: string; labels: Labels; onExploreStructure: () => void }) {
   const rows = page.items.slice(0, UI_ROW_LIMIT);
+  const seriesStatus = page.disclosure.status === "complete" && isIncompleteRepoPage(page)
+    ? "truncated"
+    : page.disclosure.status;
   return (
-    <section className="repo-card repo-table-wrap" data-cadence-series={id} data-series-status={page.disclosure.status}>
+    <section className="repo-card repo-table-wrap" data-cadence-series={id} data-series-status={seriesStatus}>
       <div className="repo-card-heading"><h3>{label}</h3><p>{page.total_count.status === "available" ? formatNumber(page.total_count.value) : labels.unavailable}</p></div>
       {page.disclosure.status === "unavailable" ? (
         <DataState className="repo-empty compact" state="unavailable" title={`${label} ${labels.unavailable.toLocaleLowerCase()}`} message={page.disclosure.reason ?? "This bundle does not claim cadence data."} />
@@ -979,25 +985,48 @@ function ActiveView({ id, bundle, moduleById, onExploreStructure }: ViewProps & 
   );
 }
 
-export function RepoShowcase({ bundle }: { bundle: RepoBundle }) {
+export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback" }: { bundle: RepoBundle; analysisSource?: ShowcaseBundleSource }) {
   const [activeView, setActiveView] = useState<ViewId>("structure_graph");
+  const dashboardRef = useRef<HTMLDivElement>(null);
   const moduleById = useMemo(
     () => new Map(bundle.graph.modules.items.map((module) => [module.id, module])),
     [bundle.graph.modules.items],
   );
   const { repository, snapshot, producer } = bundle.meta;
   const { capability } = bundle;
+  function openAnalysis(view: ViewId) {
+    setActiveView(view);
+    const dashboard = dashboardRef.current;
+    if (!dashboard) return;
+    dashboard.focus({ preventScroll: true });
+    const reduceMotion = window.matchMedia?.(
+      "(prefers-reduced-motion: reduce)",
+    ).matches ?? false;
+    dashboard.scrollIntoView?.({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  }
   return (
-    <article className="repo-overview" data-head-sha={snapshot.head_sha}>
+    <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
       <header className="repo-overview-heading">
         <div className="repo-identity"><span className="repo-avatar"><Package aria-hidden="true" /></span><div><span>{repository.host} · {availabilityText(repository.default_branch, capability.labels)}</span><strong>{repository.owner}/{repository.name}</strong></div></div>
-        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span></div>
+        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span></div>
       </header>
       <section className="repo-capability-strip" aria-label={capability.labels.product}>
         <div><ShieldCheck aria-hidden="true" /><div><strong>{capability.labels.product}</strong><span>{capability.mode}</span></div></div>
         <div className="repo-capability-flags">{Object.values(capability.languages).map((language) => <i key={language.label}>{language.label} · {language.module_join ? capability.views.history_structure_navigation.label : capability.labels.unavailable}</i>)}</div>
       </section>
-      <div className="repo-dashboard">
+      <RepositoryTriage key={snapshot.head_sha} bundle={bundle} onOpenAnalysis={openAnalysis} />
+      <div
+        className="repo-dashboard"
+        data-repository-dashboard
+        id="repository-analysis-dashboard"
+        ref={dashboardRef}
+        role="region"
+        aria-label={`${capability.labels.product} analysis`}
+        tabIndex={-1}
+      >
         <nav className="repo-view-nav" aria-label={capability.labels.product}>
           <span>{capability.labels.product}</span>
           {viewOrder.map((id) => {
