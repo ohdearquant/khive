@@ -751,19 +751,19 @@ tracked issue before this amendment merges:
 - **Complete full write-inventory finalization.** Route every remaining property-bearing runtime,
   pack, proposal-materialization, curation, merge, restore, and direct-write path named in Decision
   §4 through the shared finalization and reservation contract. **Owner reference:**
-  `(follow-on issue: TBD)`.
+  `(follow-on issue: #2057)`.
 - **Extend knowledge admission beyond the legacy path.** Define the durable stamp, target identity,
   atomic event representation, and readback contract before a knowledge record can consume an
-  exemption. **Owner reference:** `(follow-on issue: TBD)`.
+  exemption. **Owner reference:** `(follow-on issue: #2058)`.
 - **Integrate the git redaction surface.** Define whether it remains permanently mask-only or gains
   a final stored target with the same stamp and atomic success-event guarantees; no exemption is
-  allowed until then. **Owner reference:** `(follow-on issue: TBD)`.
+  allowed until then. **Owner reference:** `(follow-on issue: #2059)`.
 - **Integrate the session redaction surface.** Define whether it remains permanently mask-only or
   gains a final stored target with the same stamp and atomic success-event guarantees; no exemption
-  is allowed until then. **Owner reference:** `(follow-on issue: TBD)`.
+  is allowed until then. **Owner reference:** `(follow-on issue: #2060)`.
 - **Integrate the MCP redaction surface.** Preserve current masking until a final stored target,
   stamp location, and atomic success-event boundary are specified and implemented; no exemption is
-  allowed until then. **Owner reference:** `(follow-on issue: TBD)`.
+  allowed until then. **Owner reference:** `(follow-on issue: #2061)`.
 
 An excluded surface follows its unchanged blocking or masking behavior. It cannot consume a
 manifest match, synthesize the reserved stamp, or claim coverage under either acceptance rung.
