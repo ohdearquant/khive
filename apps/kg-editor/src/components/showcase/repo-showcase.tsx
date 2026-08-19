@@ -379,7 +379,10 @@ function StructureGraph({
   const labels = capability.labels;
   const [subtreeId, setSubtreeId] = useState(graph.repository.id);
   const [zoom, setZoom] = useState(1);
-  const [selectedId, setSelectedId] = useState(graph.repository.id);
+  const [graphSelection, setGraphSelection] = useState({
+    id: graph.repository.id,
+    visibleSharedModuleId: null as string | null,
+  });
   const [lens, setLens] = useState<"structure" | "hidden_coupling">(
     "structure",
   );
@@ -467,6 +470,15 @@ function StructureGraph({
     graph.structure_edges.items,
     subtreeId,
   ]);
+  const visibleSharedModuleId = selectedModuleId &&
+      visibleIds.has(selectedModuleId)
+    ? selectedModuleId
+    : null;
+  let selectedId = graphSelection.id;
+  if (visibleSharedModuleId !== graphSelection.visibleSharedModuleId) {
+    selectedId = visibleSharedModuleId ?? graphSelection.id;
+    setGraphSelection({ id: selectedId, visibleSharedModuleId });
+  }
   const { degrees, fanIn, fanOut, maxDegree } = useMemo(() => {
     const nextDegrees = new Map<string, number>();
     const nextFanIn = new Map<string, number>();
@@ -507,8 +519,8 @@ function StructureGraph({
       analysisUnavailableReason:
         bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     }), [
-    bundle.aggregates.hidden_coupling.data,
     bundle.aggregates.hidden_coupling.meta.status,
+    bundle.aggregates.hidden_coupling.data,
     bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     graph.structure_edges,
     visibleIds,
@@ -536,7 +548,7 @@ function StructureGraph({
   const isCouplingFocused = (id: string) =>
     lens === "hidden_coupling" && focusedModuleIds?.has(id) === true;
   const inspectCouplingEndpoint = (moduleId: string) => {
-    setSelectedId(moduleId);
+    setGraphSelection({ id: moduleId, visibleSharedModuleId: moduleId });
     onInspectModule(moduleId);
   };
 
@@ -551,7 +563,10 @@ function StructureGraph({
               value={subtreeId}
               onChange={(event) => {
                 setSubtreeId(event.target.value);
-                setSelectedId(event.target.value);
+                setGraphSelection((current) => ({
+                  ...current,
+                  id: event.target.value,
+                }));
                 setFocusedPairKey(null);
               }}
             >
@@ -709,7 +724,10 @@ function StructureGraph({
               type="button"
               aria-pressed={selectedId === graph.repository.id}
               onClick={() => {
-                setSelectedId(graph.repository.id);
+                setGraphSelection((current) => ({
+                  ...current,
+                  id: graph.repository.id,
+                }));
                 setFocusedPairKey(null);
               }}
             >
@@ -720,7 +738,10 @@ function StructureGraph({
               const position = positions.get(item.id)!;
               return (
                 <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
-                  setSelectedId(item.id);
+                  setGraphSelection((current) => ({
+                    ...current,
+                    id: item.id,
+                  }));
                   setFocusedPairKey(null);
                 }}>
                   <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
@@ -732,9 +753,13 @@ function StructureGraph({
               const position = positions.get(item.id)!;
               const couplingCount = couplingNodeCounts.get(item.id);
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""} ${isCouplingFocused(item.id) ? "coupling-focused" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
-                  setSelectedId(item.id);
+                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""} ${isCouplingFocused(item.id) ? "coupling-focused" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-controls="repository-module-inspector" aria-label={`Inspect ${item.source_path}`} aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
+                  setGraphSelection({
+                    id: item.id,
+                    visibleSharedModuleId: item.id,
+                  });
                   setFocusedPairKey(null);
+                  onInspectModule(item.id);
                 }}>
                   <EntityKindMark className="repo-node-kind-icon" kind="concept" showLabel={false} />
                   <span>{labels.node_types.module}</span><strong>{item.module_path}</strong>

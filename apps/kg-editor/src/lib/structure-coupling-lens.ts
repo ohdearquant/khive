@@ -92,7 +92,7 @@ export function buildStructureCouplingLens({
       : null);
 
   return {
-    pairs: visiblePairs.slice(0, boundedLimit).map((pair) => {
+    pairs: pairEvidenceUnavailable ? [] : visiblePairs.slice(0, boundedLimit).map((pair) => {
       const key = undirectedPairKey(pair.left_module_id, pair.right_module_id);
       return {
         key,

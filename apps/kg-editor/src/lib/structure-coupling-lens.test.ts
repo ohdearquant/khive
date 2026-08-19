@@ -191,4 +191,19 @@ describe("structure hidden-coupling lens", () => {
       dependencyEvidence: "present",
     });
   });
+
+  it("suppresses overlays when the aggregate declares itself unavailable, even with captured rows still present", () => {
+    const bundle = golden();
+    const lens = buildStructureCouplingLens({
+      analysisStatus: "unavailable",
+      pairPage: bundle.aggregates.hidden_coupling.data,
+      structureEdgePage: bundle.graph.structure_edges,
+      visibleModuleIds: visibleModuleIds(bundle, null),
+      limit: 20,
+    });
+
+    expect(bundle.aggregates.hidden_coupling.data.items.length).toBeGreaterThan(0);
+    expect(lens.pairs).toHaveLength(0);
+    expect(lens.coverage).toBe("unavailable");
+  });
 });

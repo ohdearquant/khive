@@ -207,6 +207,57 @@ test("drills from analysis results into the shared inspector and browser history
   await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(apiPath!);
 });
 
+test("shares structure graph module selection with browser history", async ({ page }) => {
+  await page.goto("/");
+  const inspector = page.locator("[data-module-inspector]");
+  const graph = page.locator(".repo-graph-stage");
+  const moduleNodes = graph.locator(
+    '.repo-graph-node[aria-controls="repository-module-inspector"]',
+  );
+  await expect(moduleNodes.first()).toBeVisible();
+
+  const unselectedModuleNodes = graph.locator(
+    '.repo-graph-node[aria-controls="repository-module-inspector"][aria-pressed="false"]',
+  );
+  const firstCandidate = unselectedModuleNodes.first();
+  const firstLabel = await firstCandidate.getAttribute("aria-label");
+  const firstPath = firstLabel?.replace(/^Inspect /, "");
+  expect(firstPath).toBeTruthy();
+  const first = graph.getByRole("button", { name: firstLabel!, exact: true });
+  await first.press("Enter");
+
+  await expect(first).toHaveAttribute("aria-pressed", "true");
+  await expect(inspector).toBeFocused();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(
+    firstPath!,
+  );
+  await expect(page).toHaveURL(/view=structure_graph/);
+  await expect(page).toHaveURL(
+    new RegExp(`module=${encodeURIComponent(firstPath!)}`),
+  );
+
+  const secondCandidate = unselectedModuleNodes.first();
+  const secondLabel = await secondCandidate.getAttribute("aria-label");
+  const secondPath = secondLabel?.replace(/^Inspect /, "");
+  expect(secondPath).toBeTruthy();
+  const second = graph.getByRole("button", { name: secondLabel!, exact: true });
+  await second.click();
+  await expect(second).toHaveAttribute("aria-pressed", "true");
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(
+    secondPath!,
+  );
+
+  await page.goBack();
+  await expect(page).toHaveURL(
+    new RegExp(`module=${encodeURIComponent(firstPath!)}`),
+  );
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(
+    firstPath!,
+  );
+  await expect(first).toHaveAttribute("aria-pressed", "true");
+  await expect(second).toHaveAttribute("aria-pressed", "false");
+});
+
 test("uses the structure lens to verify a hidden khive-db boundary", async ({ page }) => {
   const graphImplementation = "crates/khive-db/src/stores/graph.rs";
   await page.goto("/");
@@ -252,7 +303,7 @@ test("keeps the structure inspector legible across desktop and mobile", async ({
   await page.getByRole("combobox", { name: /Package · Structure graph/ })
     .selectOption({ label: "khive-db" });
   await page.getByRole("button", {
-    name: "Concept Module stores::graph",
+    name: "Inspect crates/khive-db/src/stores/graph.rs",
     exact: true,
   }).click();
 
