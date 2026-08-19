@@ -38,12 +38,12 @@ pub enum EdgeChange {
     Added(ExportedEdge),
     /// Deleted in branch.
     Deleted,
-    /// Weight modified.
-    WeightModified {
-        // Retained for future “was → now” diff displays.
-        #[allow(dead_code)]
-        base_weight: f64,
-        branch_weight: f64,
+    /// Merge-relevant edge content or durable identity modified.
+    Modified {
+        // Complete records are retained so a one-sided change can pass through
+        // without losing edge identity, properties, or provenance timestamps.
+        base: ExportedEdge,
+        branch: ExportedEdge,
     },
 }
 
@@ -119,8 +119,11 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
 
 /// Classifies every semantic edge key in the union of `base` and `branch`.
 ///
-/// Added values retain their original `edge_id`; weights differing by less
-/// than `f64::EPSILON` are unchanged. See `crates/khive-merge/docs/api/edge-merge.md`.
+/// Added and modified values retain complete edge records. Durable `edge_id`,
+/// weight, and properties participate in classification; timestamps do not,
+/// so deterministic archive rebuilds cannot manufacture semantic changes.
+/// Weights differing by less than `f64::EPSILON` are unchanged. See
+/// `crates/khive-merge/docs/api/edge-merge.md`.
 ///
 /// # Errors
 ///
@@ -157,12 +160,12 @@ pub fn diff_edges(
             (None, Some(branch_e)) => EdgeChange::Added((*branch_e).clone()),
             (Some(_), None) => EdgeChange::Deleted,
             (Some(base_e), Some(branch_e)) => {
-                if (base_e.weight - branch_e.weight).abs() < f64::EPSILON {
+                if edges_equal(base_e, branch_e) {
                     EdgeChange::Unchanged
                 } else {
-                    EdgeChange::WeightModified {
-                        base_weight: base_e.weight,
-                        branch_weight: branch_e.weight,
+                    EdgeChange::Modified {
+                        base: (*base_e).clone(),
+                        branch: (*branch_e).clone(),
                     }
                 }
             }
@@ -172,6 +175,18 @@ pub fn diff_edges(
     }
 
     Ok(result)
+}
+
+/// Compares merge-relevant fields for one semantic edge key.
+///
+/// Source, target, and relation form [`EdgeKey`] and are therefore classified
+/// structurally as add/delete when they change. Timestamps are provenance, not
+/// semantic content: a branch that wins a real change carries its complete
+/// timestamps, while timestamp-only rebuild drift remains unchanged.
+fn edges_equal(a: &ExportedEdge, b: &ExportedEdge) -> bool {
+    a.edge_id == b.edge_id
+        && (a.weight - b.weight).abs() < f64::EPSILON
+        && properties_equal(&a.properties, &b.properties)
 }
 
 /// Compares merge-relevant entity fields, excluding timestamps.
@@ -238,6 +253,9 @@ mod tests {
             target: tgt,
             relation: EdgeRelation::Extends,
             weight,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -323,12 +341,74 @@ mod tests {
             target: b,
             relation: "extends".into(),
         };
-        assert!(matches!(
-            diff[&key],
-            EdgeChange::WeightModified {
-                base_weight: _,
-                branch_weight: _
+        assert!(matches!(diff[&key], EdgeChange::Modified { .. }));
+    }
+
+    #[test]
+    fn property_only_edge_change_is_modified_with_full_branch_record() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let base_edge = edge(a, b, 0.7);
+        let mut branch_edge = base_edge.clone();
+        branch_edge.properties = Some(serde_json::json!({"confidence": 0.95}));
+        branch_edge.created_at = chrono::DateTime::parse_from_rfc3339("2026-03-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        branch_edge.updated_at = chrono::DateTime::parse_from_rfc3339("2026-04-04T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let base = make_archive(vec![], vec![base_edge.clone()]);
+        let branch = make_archive(vec![], vec![branch_edge.clone()]);
+        let diff = diff_edges(&base, &branch).unwrap();
+        let key = EdgeKey::from_edge(&base_edge);
+
+        match &diff[&key] {
+            EdgeChange::Modified { base, branch } => {
+                assert_eq!(base.properties, None);
+                assert_eq!(branch.edge_id, branch_edge.edge_id);
+                assert_eq!(branch.properties, branch_edge.properties);
+                assert_eq!(branch.created_at, branch_edge.created_at);
+                assert_eq!(branch.updated_at, branch_edge.updated_at);
             }
+            other => panic!("property-only change must be Modified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edge_identity_change_is_modified() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let base_edge = edge(a, b, 0.7);
+        let mut branch_edge = base_edge.clone();
+        branch_edge.edge_id = Uuid::new_v4();
+
+        let base = make_archive(vec![], vec![base_edge.clone()]);
+        let branch = make_archive(vec![], vec![branch_edge]);
+        let diff = diff_edges(&base, &branch).unwrap();
+
+        assert!(matches!(
+            diff[&EdgeKey::from_edge(&base_edge)],
+            EdgeChange::Modified { .. }
+        ));
+    }
+
+    #[test]
+    fn timestamp_only_edge_drift_is_unchanged() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let base_edge = edge(a, b, 0.7);
+        let mut rebuilt_edge = base_edge.clone();
+        rebuilt_edge.created_at += chrono::TimeDelta::seconds(1);
+        rebuilt_edge.updated_at += chrono::TimeDelta::seconds(2);
+
+        let base = make_archive(vec![], vec![base_edge.clone()]);
+        let branch = make_archive(vec![], vec![rebuilt_edge]);
+        let diff = diff_edges(&base, &branch).unwrap();
+
+        assert!(matches!(
+            diff[&EdgeKey::from_edge(&base_edge)],
+            EdgeChange::Unchanged
         ));
     }
 }
