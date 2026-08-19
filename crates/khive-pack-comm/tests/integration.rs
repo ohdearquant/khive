@@ -11021,7 +11021,7 @@ async fn create_refuses_transport_owned_quarantine_properties() {
         .await
         .expect("list after refused creates");
     assert_eq!(
-        messages.as_array().map(Vec::len),
+        messages["items"].as_array().map(Vec::len),
         Some(0),
         "a refused generic create must not leave a partial message row"
     );

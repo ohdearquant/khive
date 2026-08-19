@@ -474,8 +474,7 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
     match mode {
         PresentationMode::Verbose | PresentationMode::Human => value,
         PresentationMode::Agent => {
-            let preserved_nulls: HashSet<&str> =
-                LIFECYCLE_NULL_PRESERVE.iter().copied().collect();
+            let preserved_nulls: HashSet<&str> = LIFECYCLE_NULL_PRESERVE.iter().copied().collect();
             let score_fields: HashSet<&str> = SCORE_FIELDS.iter().copied().collect();
             let payload_timestamps: HashSet<&str> =
                 PAYLOAD_TIMESTAMP_FIELDS.iter().copied().collect();
