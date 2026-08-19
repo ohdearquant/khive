@@ -247,11 +247,16 @@ and gate rules as the existing five [ADR-142 §1; ADR-023]:
   enumeration that cannot read the table is a per-operation error, never an empty success.
 - Depth truncation is a property of the scope, not of pagination, and the two are reported
   separately. `agent.descendants` carries `depth_truncated`: true exactly when at least one
-  returned record at relative depth equal to `max_depth` has, within the enumeration's
-  admission horizon, at least one child — that is, when the forest actually continues past
-  the requested depth, not merely when the bound was supplied. The existence probe that
-  answers it examines at most one child per frontier record and is not a visit for
-  `lineage_visit_limit` purposes. A walk whose pages are exhausted but whose depth was cut
+  record at relative depth equal to `max_depth` has, within the enumeration's admission
+  horizon, at least one child — that is, when the **structural** forest actually continues
+  past the requested depth, not merely when the bound was supplied. Structural is deliberate,
+  on the same reasoning as `subtree_terminal`: the walk crosses records the caller may not
+  see, so a visible-only probe could report false while deeper visible records exist behind
+  a hidden intermediate — a flag that lies about the caller's own view. The structural probe
+  is instead one of the bounded structural-aggregate disclosures enumerated in §3's
+  authorization paragraph: its value can depend on a child the caller may not observe, and
+  that is admitted rather than accidental. The existence probe that answers it examines at
+  most one child per frontier record and is not a visit for `lineage_visit_limit` purposes. A walk whose pages are exhausted but whose depth was cut
   reports `complete: true, depth_truncated: true` and no cursor: there are no further pages
   in this scope, and a deeper scope is a new enumeration with a larger `max_depth`, not a
   continuation of this one. Conflating the two — one flag for both page truncation and depth
@@ -268,8 +273,15 @@ and gate rules as the existing five [ADR-142 §1; ADR-023]:
   falsifies `complete`, and a single new shallow subtree omits its entire prefix. Enumeration
   therefore fixes its population when the cursor is minted: the first page captures an
   **admission horizon** — the position, in admission order, of the most recently admitted
-  record at that moment — and every page of the enumeration returns only records admitted at
-  or before it. Records admitted later are outside this enumeration's scope by definition
+  record **visible to the caller** at that moment — and every page of the enumeration
+  returns only records admitted at or before it. Scoping the horizon to the visible
+  population changes no result and is required by the disclosure budget: it changes no
+  result because a parent is always admitted before its child, so every record servable to
+  the caller — and every structural ancestor a walk crosses to reach it — sits at or before
+  the newest visible record's position, making a table-wide horizon and a visible one select
+  the same pages; and it is required because a table-wide horizon would make the cursor, and
+  `as_of` below, a function of hidden records' admission times, a disclosure §3's
+  authorization paragraph does not budget. Records admitted later are outside this enumeration's scope by definition
   rather than missed by accident; a caller that wants them starts a new enumeration and gets
   a new horizon. Within that fixed population both verbs enumerate in a total, stable order —
   ascending `(spawned_at, agent_id)`, with `agent_id` breaking ties so the order is total
@@ -289,9 +301,10 @@ and gate rules as the existing five [ADR-142 §1; ADR-023]:
   order; passing it back as `cursor` resumes immediately after the last returned record,
   under the same horizon. `next_cursor` is present exactly when `complete` is false, and
   absent exactly when it is true, so the two fields cannot disagree. Every page's result
-  carries `as_of`: the admission timestamp — the `spawned_at` of the most recently admitted
-  record at cursor mint, or null when no record had been admitted — so the age of the view is
-  inspectable rather than inferred. `as_of` is an informational projection of the horizon,
+  carries `as_of`: the admission timestamp of the horizon — the `spawned_at` of the most
+  recently admitted record visible to the caller at cursor mint, or null when none was — so
+  the age of the view is inspectable rather than inferred, and carries no information about
+  records the caller may not see. `as_of` is an informational projection of the horizon,
   not the horizon itself: the authoritative horizon, including its tiebreak, travels only
   inside the cursor, and `as_of` is never accepted back as an input.
 - **A cursor is bound to the enumeration that minted it, and presenting it anywhere else is a
@@ -321,9 +334,24 @@ whose current mapped peer class is in the operator's delegated-lifecycle class s
 §1, "Actor provenance"]. Enumeration applies exactly that predicate per candidate record and
 returns the records that pass, silently omitting the rest: a caller's enumeration result is
 precisely the set of records it could have `agent.observe`d individually, so the two
-surfaces can never disagree about visibility, and enumeration discloses nothing about
-records outside the caller's authority — including their existence. `count` and `complete`
-describe the visible set, not the table.
+surfaces can never disagree about visibility, and enumeration discloses no record outside
+the caller's authority: not its fields, not its identity. `count` and `complete` describe
+the visible set, not the table.
+
+That claim is scoped to records, and the scoping is deliberate, because an absolute
+zero-disclosure claim would be false: this ADR contains exactly four places where a caller
+learns a bounded structural-aggregate fact whose value depends on records it cannot see, and
+they are enumerated here rather than left to be discovered. `subtree_terminal` is computed
+over the structural set (§4). `undisclosed_survivors: true` says unseen survivors exist
+(§4). `depth_truncated` probes structural children, so its value can depend on a child the
+caller may not observe (§3 above). And a `lineage_visit_limit` refusal (§4) is a
+caller-visible error whose occurrence depends on how many records — visible or not — the
+structural walk reached: two hidden populations straddling the bound are distinguishable by
+whether the refusal fires, which is one threshold bit about hidden population size. Each of
+the four is deliberate, bounded to an aggregate fact, and justified where it is defined;
+none discloses a record. An implementation must not widen any of them, and must not add a
+fifth without amending this paragraph — this list is the contract's complete disclosure
+budget.
 
 ### 4. Reaching a subtree: kill with descendants
 
@@ -430,7 +458,18 @@ with a published default. Total records visited by a single enumeration or by on
 is capped independently of `limit` by `lineage_visit_limit`, because a walk can visit far more
 records than it returns once filters and authorization are applied; exceeding it is a
 per-operation error naming the bound, never a silently short answer — a truncated-looking
-success here would be indistinguishable from a small tree. (For a cascading kill that has
+success here would be indistinguishable from a small tree. The bound counts structural
+visits, not visible results, and must: the walk's cost is driven by every record it touches,
+so a bound over only what the caller may see would hand a low-visibility caller an unbounded
+walk — the exact exhaustion surface the bound exists to close. That choice has a disclosure
+consequence and this ADR admits it rather than leaving it implicit: whether the refusal
+fires depends on records the caller cannot see, so a caller can learn one threshold bit
+about hidden population size — the same footing as `undisclosed_survivors`, and one of
+exactly three bounded structural-aggregate disclosures enumerated in §3's authorization
+paragraph. The two-population arm — identical visible sets over hidden populations of
+`lineage_visit_limit` and `lineage_visit_limit + 1` structural records, asserted to produce
+empty success and the bound refusal respectively, and asserted to disclose nothing beyond
+that bit — is an acceptance fixture for any implementation of this ADR. (For a cascading kill that has
 already terminated records, this rule is refined below: the error arm applies only while
 nothing has been destroyed.) Cascade passes are capped by
 `cascade_pass_limit`, as §4 already requires, and a cascade that exhausts it returns
