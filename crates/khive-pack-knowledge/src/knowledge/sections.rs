@@ -1045,6 +1045,9 @@ impl KnowledgeHandlers {
             ));
         }
 
+        // json_set targets the fixed nested path `$.dispute_count` only; no caller
+        // input reaches this statement, so it cannot create or replace the
+        // top-level reserved property key.
         writer
             .execute(SqlStatement {
                 sql: format!(
@@ -1192,6 +1195,9 @@ impl KnowledgeHandlers {
             ));
         }
 
+        // json_set targets the fixed nested path `$.dispute_count` only; no caller
+        // input reaches this statement, so it cannot create or replace the
+        // top-level reserved property key.
         writer
             .execute(SqlStatement {
                 sql: format!(
