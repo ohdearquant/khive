@@ -298,8 +298,17 @@ jobs:
         run: npm run check:showcase
       - name: Production build
         run: npm run build
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
+      # The browser download intermittently stalls until the job-level timeout
+      # cancels the whole run (#2066). Bound each attempt well under the job
+      # budget and retry once so a stalled download fails fast instead of
+      # consuming the run; the cache above makes a warm install a near no-op.
       - name: Install browser for repository dogfood
-        run: npx playwright install --with-deps chromium
+        run: timeout 240 npx playwright install --with-deps chromium || timeout 240 npx playwright install --with-deps chromium
       - name: Repository showcase dogfood
         run: npx playwright test
 
