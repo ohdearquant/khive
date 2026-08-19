@@ -3,6 +3,9 @@
 **Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
+operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
+on acceptance.
 
 ## Amendment (2026-08-06): identifier parity for `knowledge.get`
 

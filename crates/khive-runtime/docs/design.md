@@ -84,7 +84,8 @@
 
 ### ADR-018: Authorization Gate
 
-- Gate is consulted before every verb dispatch; gate infrastructure failures are fail-open
+- Gate is consulted before every verb dispatch; gate infrastructure failures are audited and
+  fail closed with `RuntimeError::GateUnavailable`
 - `GateDecision::Deny` is hard enforcement: the pack is never invoked on denial
 - Namespace token is minted at the dispatch boundary after gate approval
 - `namespace` is stripped from params before forwarding to pack handlers
