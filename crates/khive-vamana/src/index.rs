@@ -915,19 +915,15 @@ impl VamanaIndex {
         let metadata_path = path.join("metadata.bin");
         let metadata_tmp = path.join("metadata.bin.tmp");
 
-        // 1. Write vectors.bin.v2new (identical format to v1).
         write_vectors(&vectors_new, self.vectors()?)?;
 
-        // 2. Write graph.bin.v2new (identical format to v1, medoid-overflow capped).
         write_graph(&graph_new, &self.graph, self.config.max_degree)?;
 
-        // 3. Compute the capped reverse adjacency that matches what write_graph wrote.
-        //    The medoid's forward list may exceed max_degree in-memory; write_graph caps it
-        //    before serialization. Build reverse adj from the same capped view so that
-        //    lifecycle.bin stays consistent with graph.bin after restore.
+        // write_graph caps the medoid's forward list at max_degree before serializing;
+        // build reverse_adj from that same capped view so lifecycle.bin stays consistent
+        // with graph.bin after restore.
         let capped_reverse_adj = capped_reverse_adjacency(self);
 
-        // 4. Write lifecycle.bin.v2new with the capped reverse adjacency.
         write_lifecycle(
             &lifecycle_new,
             &self.tombstones,
@@ -936,8 +932,7 @@ impl VamanaIndex {
             self.ops_since_consolidation,
         )?;
 
-        // 4b. Write codes.bin.v2new (SQ8 codec + per-node codes, ADR-052
-        // acquisition tier) so the load path never retrains over the corpus.
+        // codes.bin.v2new persists the SQ8 codec + codes so load never retrains.
         {
             let buf = encode_codes_bin(&self.gs_codec, self.gs_codes.view());
             let file = File::create(&codes_new)?;
@@ -947,7 +942,6 @@ impl VamanaIndex {
             file.sync_all()?;
         }
 
-        // 5. Compute blake3 checksums of the four staged segments.
         let vectors_data = fs::read(&vectors_new)?;
         let graph_data = fs::read(&graph_new)?;
         let lifecycle_data = fs::read(&lifecycle_new)?;
@@ -958,7 +952,6 @@ impl VamanaIndex {
         let lifecycle_hash = blake3::hash(&lifecycle_data);
         let codes_hash = blake3::hash(&codes_data);
 
-        // 6. Build the corpus fingerprint (content_hash = blake3 over raw vector bytes).
         let content_hash = *vectors_hash.as_bytes();
         let fp = V2CorpusFingerprint {
             vector_count: self.num_vectors as u64,
@@ -966,7 +959,6 @@ impl VamanaIndex {
             content_hash,
         };
 
-        // 7. Write metadata.bin.tmp then rename atomically (the commit gate).
         write_v2_commit_full(
             &metadata_tmp,
             vectors_hash.as_bytes(),
@@ -983,23 +975,19 @@ impl VamanaIndex {
         )?;
         fs::rename(&metadata_tmp, &metadata_path)?;
 
-        // Barrier: make metadata.bin durable before promoting canonical segments.
-        // Commit gate is metadata.bin: after this fsync any post-crash state is either
-        // (old metadata + old segments) or (new KHVVAMG2 metadata + maybe-stale segments).
-        // The new-metadata path is checksum-guarded, so stale/partial segments safe-degrade
-        // to rebuild — never a torn no-checksum read.
+        // Commit gate is metadata.bin: fsync it durable before promoting segments, so any
+        // post-crash state is either (old metadata + old segments) or (new metadata +
+        // maybe-stale segments) — the latter is checksum-guarded and safe-degrades to rebuild.
         {
             let dir_file = File::open(path)?;
             dir_file.sync_all()?;
         }
 
-        // 8. Promote staged segments to their final names.
         fs::rename(&vectors_new, &vectors_path)?;
         fs::rename(&graph_new, &graph_path)?;
         fs::rename(&lifecycle_new, &lifecycle_path)?;
         fs::rename(&codes_new, &codes_path)?;
 
-        // 9. Sync the directory entry so all renames are durable.
         let dir_file = File::open(path)?;
         dir_file.sync_all()?;
 
@@ -1788,27 +1776,11 @@ impl VamanaIndex {
             self.graph
                 .replace_adjacency_and_update_reverse(ordinal, new_neighbors.clone());
 
-            // INVARIANT (never-drop insert):
-            // insert() never removes any existing node's inbound edge. Every node
-            // reachable before this insert therefore remains reachable after it.
-            // The inserted node receives at least one inbound edge from an always-
-            // reachable node (a free-slot out-neighbor, or the medoid), so it is
-            // reachable too. No successful insert can make a previously-findable
-            // vector unfindable.
-            //
-            // Back-edge rule (Option E): for each selected out-neighbor j, add the
-            // back-edge j→ordinal ONLY IF j has a free slot (|adj(j)| < max_degree).
-            // If j is already full, SKIP the back-edge entirely — do NOT call
-            // robust_prune_inner(j) and do NOT drop any of j's existing edges.
-            // Pruning j's adjacency to make room is what caused earlier
-            // orphan/disconnect defects.
-            //
-            // Trade-off: skipping back-edges on saturated neighbors lowers incremental
-            // graph quality on heavily-saturated graphs (ordinal becomes less
-            // well-connected via back-edges, increasing reliance on the medoid hub for
-            // routing). This is a quality trade-off, not a correctness issue — recall
-            // is bounded and ADR-052-acceptable. A future consolidate-side redistri-
-            // bution pass (separate issue + ADR-052 amendment) can repair it.
+            // INVARIANT (never-drop insert): insert() never removes an existing node's
+            // inbound edge, so nothing reachable before this call becomes unreachable.
+            // Back-edge rule (Option E): add j→ordinal only if j has a free slot; a full
+            // j keeps all its existing edges instead. See
+            // crates/khive-vamana/docs/index.md#insert-back-edge-and-medoid-pin-rules.
             for &j in &new_neighbors {
                 if self.graph.adjacency()[j as usize].len() < self.config.max_degree {
                     // j has a free slot: add the back-edge without dropping anything.
@@ -1824,18 +1796,9 @@ impl VamanaIndex {
                 // j is full: skip the back-edge to preserve all of j's existing edges.
             }
 
-            // Medoid-pin eager repair: if no selected out-neighbor had a free slot,
-            // the inserted node has zero inbound edges and is unreachable. Pin it by
-            // adding the edge medoid→ordinal. The medoid is the search entry point and
-            // is always reachable; it is the designated overflow node for this edge.
-            //
-            // Native directory and snapshot writers cap this overflow for their
-            // existing degree contract. The ADR-110 portable writer preserves it
-            // losslessly so byte round trips retain reachability.
-            //
-            // Edge case: if the graph was empty before this insert and ordinal became
-            // the medoid (live_before == 0 branch), no pin is needed — handled by the
-            // `if live_before == 0` branch above this block.
+            // Medoid-pin eager repair: if no out-neighbor had a free slot, pin
+            // medoid→ordinal so the new node stays reachable (medoid is always
+            // reachable). See crates/khive-vamana/docs/index.md#insert-back-edge-and-medoid-pin-rules.
             debug_assert!(
                 !new_neighbors.is_empty(),
                 "insert: new_neighbors must be non-empty when live_before > 0"
@@ -2733,13 +2696,10 @@ struct ParsedLifecycle {
     ops_since_consolidation: usize,
 }
 
-/// A checksum-valid incumbent can still be structurally corrupt (see
-/// [`validate_v2_structural`]) — one `load_or_build` would discard and rebuild on its own
-/// next load. The sequence guard must reach the same verdict, or it permanently blocks the
-/// one write (a repair checkpoint from a sequenced rebuild) that would fix the corruption:
-/// a corrupt incumbent at sequence N would reject every candidate below N forever, even
-/// though nothing before N is actually recoverable data. Only a structurally valid incumbent
-/// gets the regression guard; a structurally invalid one is treated as no incumbent at all.
+/// Rejects a rebuild candidate only against a structurally valid incumbent (see
+/// [`validate_v2_structural`]); a corrupt incumbent is treated as no incumbent, or a
+/// repair checkpoint could never publish below its sequence. See
+/// crates/khive-vamana/docs/index.md#checkpoint-sequence-regression-guard.
 #[cfg(feature = "mmap")]
 fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) -> Result<()> {
     let metadata = match fs::read(path.join("metadata.bin")) {
@@ -2798,14 +2758,8 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
     let max_degree = commit.index_meta.max_degree;
     let num_vectors = commit.index_meta.num_vectors;
     let dimensions = commit.index_meta.dimensions;
-    // Every check `load_v2_fast` applies to a v2 checkpoint, replicated here so guard-valid
-    // implies loader-loadable with no residual segment:
-    //   metadata.bin  -> parse_v2_commit (done above) + VamanaConfig::validate on index_meta
-    //   graph.bin     -> read_graph (checked degree/neighbor bounds, medoid, num_nodes)
-    //   vectors.bin   -> checked num_vectors * dimensions shape, exact byte-length match
-    //   lifecycle.bin -> parse_lifecycle (checked tombstone/free-slot/reverse-adj bounds)
-    //   cross-segment -> validate_v2_structural (bidirectional reverse_adj, tombstone count)
-    //   codes.bin     -> parse_codes_bin (magic, checked shape, non-finite codec params)
+    // Replicates every check `load_v2_fast` applies to a v2 checkpoint, so guard-valid
+    // implies loader-loadable. See crates/khive-vamana/docs/index.md#checkpoint-sequence-regression-guard.
     let structurally_valid = (|| -> Result<()> {
         let config = VamanaConfig {
             dimensions,
@@ -2833,11 +2787,7 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
 
         let lifecycle = parse_lifecycle(&lifecycle_data, num_vectors, max_degree)?;
         validate_v2_structural(&graph, &lifecycle, num_vectors)?;
-        // A checksum-valid codes.bin can still fail the same structural checks
-        // `load_v2_fast` applies (bad magic, shape mismatch, non-finite codec
-        // params). The guard must agree with the loader on what counts as a
-        // usable incumbent, or a malformed codes segment blocks every future
-        // repair checkpoint below its sequence forever.
+        // codes.bin gets the same structural check as load_v2_fast applies.
         if let Some(codes_data) = &codes_data {
             parse_codes_bin(codes_data, dimensions, num_vectors)?;
         }
@@ -2858,14 +2808,10 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
     Ok(())
 }
 
-/// Structural validity of a v2 commit's graph + lifecycle state, on top of the blake3
-/// checksum match the caller already verified. A checksum only proves the bytes on disk
-/// match what `save_atomic` last wrote — it says nothing about whether a writer bug left
-/// `reverse_adj` out of sync with the forward graph, or the node/tombstone counts
-/// inconsistent with the commit record. Shared by `load_v2_fast` (which restores lifecycle
-/// state from a checksum-valid segment) and `reject_checkpoint_sequence_regression` (which
-/// must not let a checksum-valid-but-structurally-corrupt incumbent block a repair
-/// checkpoint at a lower sequence) so the two agree on what counts as a valid incumbent.
+/// Structural validity of a v2 commit's graph + lifecycle state beyond the blake3 checksum
+/// the caller already verified. Shared by `load_v2_fast` and
+/// `reject_checkpoint_sequence_regression` so both agree on what counts as a valid
+/// incumbent. See crates/khive-vamana/docs/index.md#checkpoint-sequence-regression-guard.
 #[cfg(feature = "mmap")]
 fn validate_v2_structural(
     graph: &VamanaGraph,
@@ -2880,12 +2826,10 @@ fn validate_v2_structural(
         )));
     }
 
-    // The persisted reverse_adj must be the exact inverse of the loaded forward graph. A
-    // checksum-valid but writer-bugged lifecycle segment can pass parse_lifecycle's
-    // per-list shape checks (in-range, no dup, no self-ref) while still being semantically
-    // wrong (phantom sources, missing entries). Wolverine delete-repair relies on the
-    // invariant at graph.rs:96-98 that reverse_adj[v] == { u | v ∈ adjacency[u] }; a false
-    // in-neighbor corrupts repair.
+    // INVARIANT (graph.rs:173-182): reverse_adj[v] == { u | v ∈ adjacency[u] }. A
+    // checksum-valid but writer-bugged lifecycle segment can satisfy parse_lifecycle's
+    // per-list shape checks while still violating this — a false in-neighbor corrupts
+    // Wolverine delete-repair.
     let adjacency = graph.adjacency();
     let mut expected: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
     for (u, neighbors) in adjacency.iter().enumerate() {
@@ -3781,12 +3725,8 @@ pub fn corpus_content_hash(vectors: &[f32]) -> [u8; 32] {
     *blake3::hash(cast_slice(vectors)).as_bytes()
 }
 
-// INLINE TEST JUSTIFICATION: Tests in this module exercise private helpers
-// (`exact_search`, `write_metadata`, `read_metadata`, `write_graph`, `read_graph`,
-// `mmap_vectors`) and the internal `VectorStorage` enum that cannot be accessed
-// from `tests/`. Moving snapshot-corruption and save/load tests here avoids
-// publishing test-only re-exports. The section is larger than 300 lines because
-// each persistence and snapshot variant requires independent fixture setup.
+// Kept inline (not in tests/) because these tests exercise private helpers and the
+// internal `VectorStorage` enum, which moving out would require re-exporting.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4824,15 +4764,8 @@ mod tests {
         );
     }
 
-    /// SQ8 recall parity gate (ADR-052 §1, Step 2).
-    ///
-    /// Builds one SQ8-wired index, then measures recall@10 for two search oracles
-    /// on the same graph topology:
-    ///   - f32 oracle  : `greedy_search_inner` (exact f32 distances throughout)
-    ///   - SQ8 oracle  : `greedy_search_inner_sq8` (SQ8 acquisition + f32 re-score)
-    ///
-    /// Asserts: SQ8 recall >= f32 recall - 0.02 (tolerance for integer rounding).
-    /// Prints actual values so the PR body can quote measured numbers.
+    /// SQ8 recall@10 must stay within 0.02 of the exact-f32 oracle (ADR-052 §1 Step 2). See
+    /// crates/khive-vamana/docs/index.md#test-fixture-notes.
     #[test]
     fn sq8_recall_parity_vs_f32_oracle() {
         const N: usize = 1000;
@@ -4847,7 +4780,6 @@ mod tests {
             .with_max_degree(32)
             .with_search_list_size(64);
 
-        // Build the SQ8-wired index (ADR-052 §1 Step 2 default-on path).
         let index = VamanaIndex::build(&vectors, cfg).expect("build failed");
         let vecs = index.vectors().expect("vectors");
         let adj = index.graph.adjacency();
@@ -4861,11 +4793,9 @@ mod tests {
         for qi in 0..NUM_QUERIES {
             let q = &queries[qi * DIM..(qi + 1) * DIM];
 
-            // Ground truth: exact f32 brute-force.
             let gt = exact_search(vecs, DIM, q, K, None);
             let gt_ids: std::collections::HashSet<u32> = gt.iter().map(|(id, _)| *id).collect();
 
-            // f32 oracle: greedy search with exact f32 distances.
             let mut visited_f32 = VisitedSet::new(N);
             let f32_result = greedy_search_inner(
                 vecs,
@@ -4882,7 +4812,6 @@ mod tests {
                 f32_result.results.iter().map(|(id, _)| *id).collect();
             f32_total += f32_ids.intersection(&gt_ids).count() as f64 / denom;
 
-            // SQ8 oracle: greedy search with SQ8 acquisition distances + f32 re-score.
             let sq8_result = index.search(q, K).expect("sq8 search failed");
             let sq8_ids: std::collections::HashSet<u32> =
                 sq8_result.iter().map(|(id, _)| *id).collect();
@@ -4905,22 +4834,9 @@ mod tests {
         );
     }
 
-    /// OOD fallback — deterministic ranking-flip fixture (ADR-052 §2).
-    ///
-    /// Corpus: 10 fixed 2-D vectors in [0,1]×[0,1]. Global-scale codec: gs ≈ 0.00287
-    /// (range anchored by the widest observed dim spread ~0.733). OOD query has
-    /// dim 0 = -7.36 (far below min ≈ 0.28), which clamps to code 0 in dim 0.
-    ///
-    /// With search_list_size=1 (single-candidate frontier), SQ8-only traversal
-    /// picks n1 as the nearest-1 (SQ8 codes make n1 look close via dim-1 score
-    /// since the clamped dim-0 code masks the true dim-0 distances). Exact f32
-    /// greedy traversal picks n6 (which is genuinely nearest at f32 dist≈58.8).
-    ///
-    /// index.search() gates on is_in_distribution → false → f32 fallback → n6.
-    /// Removing the fallback branch makes index.search() use SQ8 → n1 → RED.
-    ///
-    /// Fixture verified empirically: both assertions (SQ8-only=n1, fallback=n6)
-    /// hold for the built Vamana graph at the fixed random seed.
+    /// An OOD query must take the f32 fallback in `search()` rather than the SQ8 path,
+    /// which would return a different (wrong) nearest neighbor for this fixture
+    /// (ADR-052 §2). See crates/khive-vamana/docs/index.md#test-fixture-notes.
     #[test]
     fn sq8_ood_fallback_deterministic_ranking_flip() {
         use crate::graph::greedy_search_inner_sq8;
@@ -4928,9 +4844,8 @@ mod tests {
         const DIM: usize = 2;
         const N: usize = 10;
 
-        // Fixed corpus from Python random.Random(seed=0).uniform(0,1) x (N*DIM).
-        // These are NOT random in the test — they are fixed values verified to
-        // produce a ranking flip between SQ8 (search_list_size=1) and exact f32.
+        // Fixed corpus (Python random.Random(seed=0)) verified to produce a ranking
+        // flip between SQ8 (search_list_size=1) and exact f32; see docs/index.md.
         #[rustfmt::skip]
         let corpus: Vec<f32> = vec![
             0.844_421_85, 0.757_954_4,   // n0
@@ -4945,21 +4860,16 @@ mod tests {
             0.810_217_24, 0.902_165_95,  // n9
         ];
 
-        // OOD query: dim 0 = -7.36 (far below corpus min ≈ 0.28), dim 1 = 0.10.
-        // After clamping: q_enc = [0, 0]. Corpus vector n6 encodes to [0, 176];
-        // n1 encodes to [48, 3]. SQ8 dist from [0,0]: n1=(48²+9)=2313; n6=(176²)=30976.
-        // SQ8 thinks n1 is much closer. Exact f32: n6 is at dist²≈58.8, n1 at ≈60.5.
+        // OOD query (dim 0 far below corpus min): clamped SQ8 codes rank n1 closest;
+        // exact f32 correctly ranks n6 closest. See docs/index.md#test-fixture-notes.
         let query = vec![-7.360_714_f32, 0.100_701_2];
 
-        // Build index with tight search_list_size to force traversal to commit early.
-        // sls must be >= max_degree (VamanaConfig invariant). Use sls=4, max_degree=4.
         let cfg = VamanaConfig::with_dimensions(DIM)
             .with_max_degree(4)
             .with_search_list_size(4);
         let index = VamanaIndex::build(&corpus, cfg).expect("build failed");
         let vecs = index.vectors().expect("vectors");
 
-        // Verify OOD gate triggers for this query.
         assert!(
             !index.gs_codec.is_in_distribution(&query),
             "query dim0={} must be below codec min≈{}; is_in_distribution must be false",
@@ -4967,7 +4877,6 @@ mod tests {
             index.gs_codec.min[0]
         );
 
-        // SQ8-only path: call greedy_search_inner_sq8 directly (bypasses fallback).
         let mut visited = VisitedSet::new(N);
         let query_enc = index.gs_codec.encode(&query);
         let sq8_only = greedy_search_inner_sq8(
@@ -4985,11 +4894,9 @@ mod tests {
             None,
         );
 
-        // Exact brute-force ground truth.
         let gt = exact_search(vecs, DIM, &query, 1, None);
         let gt_top1 = gt[0].0;
 
-        // index.search() with OOD fallback.
         let fallback_result = index.search(&query, 1).expect("search failed");
         let fallback_top1 = fallback_result[0].0;
 
@@ -5005,15 +4912,13 @@ mod tests {
             sq8_top1, fallback_top1, gt_top1
         );
 
-        // The SQ8-only path must NOT match ground truth (that's the flip this fixture proves).
-        // If this fails, the corpus no longer exhibits the flip — the fixture needs updating.
+        // Non-vacuous check: the fixture must still exhibit the flip.
         assert_ne!(
             sq8_top1, gt_top1,
             "SQ8-only path (sls=1) must miss the true nearest n{gt_top1} for this fixture \
              to be non-vacuous; got sq8=n{sq8_top1}. Fixture may need updating for this graph.",
         );
 
-        // The fallback (f32) path must match ground truth.
         assert_eq!(
             fallback_top1, gt_top1,
             "index.search() OOD fallback must return gt_top1=n{gt_top1}, got n{fallback_top1}; \
@@ -5021,21 +4926,14 @@ mod tests {
         );
     }
 
-    /// Equal-code collision test (ADR-052 §2).
-    ///
-    /// Forces two distinct f32 vectors to collide in u8 code space (low-dim corpus
-    /// trained on [0, 1] quantizes differently from a corpus with range >> 1/255).
-    /// Asserts that both greedy search and RobustPrune return the same neighbor
-    /// ranking as the exact f32 path when SQ8 codes collide.
+    /// When two vectors collide to the same SQ8 code, greedy search and RobustPrune must
+    /// still rank/select them identically to the exact-f32 path (ADR-052 §2). See
+    /// crates/khive-vamana/docs/index.md#test-fixture-notes.
     #[test]
     fn sq8_equal_code_collision_correctness() {
         use crate::graph::{greedy_search_inner_sq8, robust_prune_inner, robust_prune_inner_sq8};
         use khive_quant::GsSq8Codec;
 
-        // 1-D corpus: two vectors very close together so they quantize to the same code.
-        // Codec trained on [0.0, 1.0] in 1-D: gs = 1.0/255 ≈ 0.00392.
-        // v0=0.0 → code 0; v1=0.001 → code round(0.001/0.00392) = round(0.255) = 0.
-        // Both map to code 0. Only exact f32 can distinguish them.
         const DIM: usize = 1;
         let vectors: Vec<f32> = vec![0.0, 0.001, 0.9];
         let codec = GsSq8Codec::train_flat(&vectors, DIM);
@@ -5043,22 +4941,18 @@ mod tests {
             .map(|i| codec.encode(&vectors[i * DIM..(i + 1) * DIM]))
             .collect();
 
-        // Verify collision: v0 and v1 should have identical codes.
         assert_eq!(
             encoded[0].codes, encoded[1].codes,
             "vectors 0 and 1 must collide in u8 code space for this test to be meaningful"
         );
 
-        // Build a simple graph: node 0 → [1, 2], node 1 → [0, 2], node 2 → [0, 1].
         let n = 3usize;
         let adjacency: Vec<Vec<u32>> = vec![vec![1, 2], vec![0, 2], vec![0, 1]];
         let mut visited = crate::graph::VisitedSet::new(n);
 
-        // Query = v0 (0.0). Exact nearest: v1 (d=0.001²=0.000001), then v2 (d=0.81).
         let query = vec![0.0f32; DIM];
         let query_enc = codec.encode(&query);
 
-        // SQ8 greedy search — must tiebreak v0/v1 collision by f32 → return v1 first.
         let sq8_result = greedy_search_inner_sq8(
             &vectors,
             DIM,
@@ -5075,7 +4969,6 @@ mod tests {
         );
         let sq8_ids: Vec<u32> = sq8_result.results.iter().map(|(id, _)| *id).collect();
 
-        // f32 greedy search — oracle.
         let mut visited_f32 = crate::graph::VisitedSet::new(n);
         let f32_result = greedy_search_inner(
             &vectors,
@@ -5096,9 +4989,6 @@ mod tests {
             "SQ8 greedy search must return same top-2 as f32 oracle when codes collide"
         );
 
-        // RobustPrune collision test: candidates [0, 1, 2] from node perspective of node 2.
-        // Node 2 is at 0.9. Nearest in f32: v1 (d=(0.9-0.001)²=0.808), v0 (d=(0.9)²=0.81).
-        // With alpha=1.0, all candidates should be selected (diversity check won't prune).
         let sq8_prune = robust_prune_inner_sq8(
             &vectors,
             DIM,
@@ -5125,37 +5015,22 @@ mod tests {
         );
     }
 
-    /// RobustPrune alpha-predicate regression (ADR-052 §2).
-    ///
-    /// Regression reproduction: when node AND multiple candidates all collapse to the same u8 code,
-    /// d2_node_candidate from the SQ8 pool is 0. The strict-≤ check then reads
-    /// `alpha² * dist(selected, candidate) <= 0`, which is false for any non-zero
-    /// inter-selected distance — so the candidate is NOT pruned even though exact f32
-    /// WOULD prune it. This test verifies the fix: use exact f32 as the predicate RHS.
-    ///
-    /// Fixture (exact reproduction): vectors=[0.0, 0.001, 0.0018, 1.0], DIM=1, node=0,
-    /// candidates=[1,2], alpha=1.2.
-    ///   - All of v0..v2 collapse to code 0 (gs=1/255, 0.001*255=0.255→0, 0.0018*255=0.459→0).
-    ///   - f32 prune: selects v1, PRUNES v2 (alpha²*d(v1,v2)=0.000000922 ≤ d(v0,v2)=3.24e-6).
-    ///   - SQ8 prune (broken): d2_node_candidate=0 → never prune → selects [v1, v2].
-    ///   - SQ8 prune (fixed): uses exact f32 RHS → [v1] only. Matches f32 variant.
-    ///
-    /// VERIFIED RED when `d2_node_candidate_exact` is replaced with the old `_sq8_d2`.
+    /// SQ8 RobustPrune's alpha predicate must use the exact-f32 RHS, not the SQ8-pool
+    /// distance, when node and candidates collide to the same code — the SQ8 distance is
+    /// 0 there so the strict-≤ check would never prune (ADR-052 §2). See
+    /// crates/khive-vamana/docs/index.md#test-fixture-notes.
     #[test]
     fn sq8_robust_prune_alpha_predicate_collision_regression() {
         use crate::graph::{robust_prune_inner, robust_prune_inner_sq8};
         use khive_quant::GsSq8Codec;
 
         const DIM: usize = 1;
-        // v3=1.0 anchors the global scale so gs = 1.0/255.
-        // v0=0.0, v1=0.001, v2=0.0018 all encode to code 0.
         let vectors: Vec<f32> = vec![0.0, 0.001, 0.0018, 1.0];
         let codec = GsSq8Codec::train_flat(&vectors, DIM);
         let encoded: Vec<_> = (0..4)
             .map(|i| codec.encode(&vectors[i * DIM..(i + 1) * DIM]))
             .collect();
 
-        // Verify the three-way collision in code space.
         assert_eq!(
             encoded[0].codes[0], encoded[1].codes[0],
             "v0 and v1 must collide (code={}); gs={:.6}",
@@ -5167,10 +5042,8 @@ mod tests {
             encoded[0].codes[0], codec.gs
         );
 
-        // f32 RobustPrune from node=0, candidates=[1, 2], alpha=1.2.
         let f32_result = robust_prune_inner(&vectors, DIM, 0, vec![1, 2], 1.2, 4);
 
-        // SQ8 RobustPrune — after the predicate fix, must match f32.
         let sq8_result = robust_prune_inner_sq8(
             &vectors,
             DIM,
@@ -5187,14 +5060,12 @@ mod tests {
              (expect both=[1], broken SQ8 would give [1,2])"
         );
 
-        // Verify f32 selects only v1 (v2 is pruned by the alpha diversity check).
         assert_eq!(
             f32_result,
             vec![1],
             "f32 RobustPrune must prune v2 from [v1,v2]; got {f32_result:?}"
         );
 
-        // Verify SQ8 matches (the predicate fix makes this pass; reverting breaks it).
         assert_eq!(
             sq8_result, f32_result,
             "SQ8 RobustPrune must match f32 variant; got sq8={sq8_result:?} vs f32={f32_result:?} \
@@ -5207,9 +5078,6 @@ mod tests {
     #[cfg(feature = "mmap")]
     #[test]
     fn read_commit_fingerprint_matches_save_atomic() {
-        // Build a small index from normalized vectors, save it, then verify
-        // that read_commit_fingerprint returns a fingerprint whose content_hash
-        // matches corpus_content_hash over the same input vectors.
         let vectors = rand_unit_vectors(10, 4, 42);
         let cfg = VamanaConfig::with_dimensions(4)
             .with_max_degree(4)
@@ -5445,19 +5313,9 @@ mod tests {
         });
         locked_rx.recv().unwrap();
 
-        // `newer` now holds the OS-level lock on `.checkpoint.lock` and cannot release it
-        // until `release_tx.send(())` below unblocks its hook. `stale`'s hook probes with its
-        // own `try_lock()` call on that same file first: `WouldBlock` is an outcome the OS
-        // reports if and only if an incompatible lock is held at that exact instant, so
-        // observing it here is proof of genuine contention, never a guess based on elapsed
-        // time. The probe result is sent over `contended_rx` before the hook falls back to a
-        // blocking `lock()`, so the channel resolves on every probe outcome — contention,
-        // probe failure, or (unreachable in this scenario) an uncontended immediate lock —
-        // and the receiver never hangs waiting on a signal that a failed probe would
-        // otherwise never send. There is no interleaving in which `contended_rx` reports
-        // contention without genuine overlap having occurred, and no interleaving in which
-        // `newer` can race ahead and release the lock first, since it is parked on
-        // `release_rx` until this thread proceeds.
+        // `stale`'s hook probes `try_lock()` while `newer` holds the lock, so a `WouldBlock`
+        // here proves genuine contention rather than a timing guess. See
+        // crates/khive-vamana/docs/index.md#concurrency-test-harness.
         enum ProbeOutcome {
             Contended,
             Uncontended,
@@ -5487,9 +5345,7 @@ mod tests {
                 });
             result_tx.send(result).unwrap();
         });
-        // The probe hook always signals before it can block, so this rendezvous cannot
-        // hang on a live probe outcome; the timeout only guards against the hook never
-        // running at all (e.g. a panic before the `try_lock` call).
+        // Timeout guards only against the hook never running (e.g. a pre-probe panic).
         match contended_rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("contention probe never signaled within 60s")
@@ -5523,12 +5379,9 @@ mod tests {
     #[cfg(feature = "mmap")]
     #[test]
     fn checkpoint_publication_repairs_structurally_corrupt_incumbent() {
-        // A checksum-valid incumbent can still be structurally corrupt: a writer bug can
-        // leave lifecycle.bin's reverse_adj out of sync with graph.bin's forward adjacency
-        // while every per-segment blake3 checksum still matches what save_atomic wrote. The
-        // sequence guard must not treat such an incumbent as a legitimate barrier — doing so
-        // would reject every future repair checkpoint below its sequence forever, leaving the
-        // corruption permanent.
+        // Checksum-valid-but-structurally-corrupt incumbent (see
+        // crates/khive-vamana/docs/index.md#test-fixture-notes): lifecycle.bin's
+        // reverse_adj is out of sync with graph.bin despite matching blake3 checksums.
         let vectors = rand_unit_vectors(20, 4, 0x2200_0100);
         let cfg = VamanaConfig::with_dimensions(4)
             .with_max_degree(4)
@@ -5539,10 +5392,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         incumbent.save_atomic(dir.path()).unwrap();
 
-        // Corrupt the on-disk incumbent: give some node a phantom in-neighbor that
-        // parse_lifecycle's per-list shape checks (in-range, no dup, no self-ref) accept,
-        // but that is not actually a predecessor in graph.bin's forward adjacency. Then
-        // re-sign metadata.bin so the checksum still matches the corrupted bytes.
+        // Inject a phantom in-neighbor that passes parse_lifecycle's shape checks but is
+        // not a real predecessor in graph.bin, then re-sign metadata.bin to match.
         let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
         let commit = parse_v2_commit(&metadata_bytes).unwrap();
         let lifecycle_bytes = fs::read(dir.path().join("lifecycle.bin")).unwrap();
@@ -5553,14 +5404,10 @@ mod tests {
         )
         .unwrap();
         let num_vectors = commit.index_meta.num_vectors;
-        // Reverse in-degree is bounded by num_vectors-1, not max_degree, so a fixed
-        // destination (e.g. node 0) can in principle already list every other node as a
-        // predecessor, leaving no room for a phantom. Search all destinations for one with
-        // a free reverse-adjacency slot, and require the chosen source to be provably
-        // absent from BOTH the persisted reverse list and the true forward predecessors —
-        // otherwise the corruption would be indistinguishable from legitimate data. A
-        // future graph-shape change that breaks this precondition fails loudly here, at
-        // setup, instead of panicking deep inside the corruption path.
+        // Search for a destination with a free reverse-adjacency slot and a source
+        // provably absent from both the persisted list and the true predecessors,
+        // so the injected phantom is unambiguous. Panics loudly here if none exists
+        // rather than deep inside the corruption path.
         let (dest, phantom) = (0..num_vectors)
             .find_map(|dest| {
                 let reverse = &lifecycle.reverse_adj[dest];
@@ -5612,15 +5459,13 @@ mod tests {
         )
         .unwrap();
 
-        // The on-disk incumbent now passes every checksum, but load_v2_fast's bidirectional
-        // reverse_adj check must still reject it as structurally invalid.
+        // Passes every checksum but must still fail load_v2_fast's bidirectional check.
         assert!(matches!(
             VamanaIndex::load(dir.path()),
             Err(VamanaError::InvalidFormat { .. })
         ));
 
-        // A repair checkpoint at a lower sequence than the corrupt incumbent (500) must
-        // still be allowed to publish — the corrupt incumbent is not a legitimate barrier.
+        // A corrupt incumbent is not a legitimate barrier to a lower-sequence repair.
         let repair_vectors = rand_unit_vectors(15, 4, 0x2200_0200);
         let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
         repair.set_last_applied_seq(Some(100));
@@ -5636,10 +5481,8 @@ mod tests {
     #[cfg(feature = "mmap")]
     #[test]
     fn checkpoint_publication_repairs_incumbent_with_malformed_codes_segment() {
-        // A checksum-valid but structurally malformed codes.bin (bad magic) is rejected by
-        // load_v2_fast just like a malformed graph or lifecycle segment, but the sequence
-        // guard used to check codes.bin by hash alone — so this class of corruption slipped
-        // past the guard and blocked every repair checkpoint below its sequence forever.
+        // codes.bin gets the same structural check as graph/lifecycle (see
+        // crates/khive-vamana/docs/index.md#test-fixture-notes).
         let vectors = rand_unit_vectors(20, 4, 0x2200_0300);
         let cfg = VamanaConfig::with_dimensions(4)
             .with_max_degree(4)
@@ -5653,8 +5496,6 @@ mod tests {
         let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
         let commit = parse_v2_commit(&metadata_bytes).unwrap();
 
-        // Corrupt codes.bin's magic while keeping its length unchanged, then re-sign
-        // metadata.bin so the checksum still matches the corrupted bytes.
         let mut codes_bytes = fs::read(dir.path().join("codes.bin")).unwrap();
         codes_bytes[..8].copy_from_slice(b"CORRUPT!");
         fs::write(dir.path().join("codes.bin"), &codes_bytes).unwrap();
@@ -5680,15 +5521,13 @@ mod tests {
         )
         .unwrap();
 
-        // The on-disk incumbent now passes every checksum, but load_v2_fast's codes.bin
-        // header validation must still reject it as structurally invalid.
+        // Passes every checksum but must still fail load_v2_fast's codes.bin header check.
         assert!(matches!(
             VamanaIndex::load(dir.path()),
             Err(VamanaError::InvalidFormat { .. })
         ));
 
-        // A repair checkpoint at a lower sequence than the corrupt incumbent (500) must
-        // still be allowed to publish — the corrupt incumbent is not a legitimate barrier.
+        // A corrupt incumbent is not a legitimate barrier to a lower-sequence repair.
         let repair_vectors = rand_unit_vectors(15, 4, 0x2200_0400);
         let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
         repair.set_last_applied_seq(Some(100));
@@ -5704,12 +5543,9 @@ mod tests {
     #[cfg(feature = "mmap")]
     #[test]
     fn checkpoint_guard_rejects_absurd_num_vectors_without_huge_allocation() {
-        // A re-signed incumbent can declare an attacker-controlled num_vectors that
-        // doesn't match the actual size of its segments. Before parse_graph preflighted
-        // the declared node count against the segment's actual byte length, a header
-        // declaring num_nodes near u32::MAX paired with a tiny graph segment drove
-        // `Vec::with_capacity(num_nodes)` to reserve ~103GB and abort the process instead
-        // of returning InvalidFormat. The guard must reject this cheaply and quickly.
+        // Regression: parse_graph must preflight the declared node count against the
+        // segment's actual byte length before allocating, or a forged num_nodes near
+        // u32::MAX aborts the process. See crates/khive-vamana/docs/index.md#test-fixture-notes.
         let vectors = rand_unit_vectors(5, 4, 0x2200_0500);
         let cfg = VamanaConfig::with_dimensions(4)
             .with_max_degree(4)
@@ -5723,8 +5559,6 @@ mod tests {
         let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
         let commit = parse_v2_commit(&metadata_bytes).unwrap();
 
-        // Forge the shortest possible malformed graph.bin: a valid 16-byte header
-        // declaring an absurd node count, with no per-node data at all.
         let absurd_num_vectors = u32::MAX as usize;
         let mut malicious_graph = Vec::with_capacity(16);
         malicious_graph.extend_from_slice(GRAPH_MAGIC);
@@ -5753,9 +5587,6 @@ mod tests {
         )
         .unwrap();
 
-        // A repair checkpoint below the forged incumbent's sequence must publish quickly:
-        // the guard must reject the forged incumbent as structurally invalid (too short
-        // for its declared node count) rather than attempt a multi-gigabyte allocation.
         let repair_vectors = rand_unit_vectors(3, 4, 0x2200_0600);
         let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
         repair.set_last_applied_seq(Some(100));
@@ -5775,11 +5606,8 @@ mod tests {
 
     #[test]
     fn parse_lifecycle_rejects_short_body_for_absurd_rev_num_nodes_without_huge_allocation() {
-        // A re-signed lifecycle.bin can declare a rev_num_nodes that equals num_vectors
-        // (passing the equality check) while the segment itself carries no per-node data.
-        // Before the preflight below, `Vec::with_capacity(rev_num_nodes)` on a
-        // `Vec<Vec<u32>>` (24 bytes per element) ran immediately after the equality check,
-        // driving a multi-gigabyte allocation instead of returning InvalidFormat.
+        // Same allocation-bomb class as the graph.bin guard, for lifecycle.bin's
+        // rev_num_nodes field. See crates/khive-vamana/docs/index.md#test-fixture-notes.
         let absurd_num_vectors = u32::MAX as usize;
         let mut body = b"KHVVLIF1".to_vec();
         body.extend_from_slice(&0u64.to_le_bytes()); // ts_words
@@ -5802,11 +5630,8 @@ mod tests {
     #[cfg(feature = "mmap")]
     #[test]
     fn parse_codes_bin_rejects_overflowing_shape_without_allocation() {
-        // A re-signed metadata.bin can pair a small, checksum-matching codes.bin with an
-        // attacker-controlled shape whose header-length arithmetic overflows usize. Before
-        // the checked arithmetic below, `dims * 4 + count * dims` could wrap past the
-        // segment's actual length and let a tiny file pass the length check, immediately
-        // followed by `Vec::with_capacity(dims)` requesting an enormous allocation.
+        // Regression: `dims * 4 + count * dims` must use checked arithmetic, or an
+        // overflowing shape passes the length check and drives an enormous allocation.
         let dims = 1usize << 61;
         let count = 4usize;
         let mut data = Vec::with_capacity(CODES_HEADER_LEN);
@@ -5827,11 +5652,8 @@ mod tests {
     #[cfg(feature = "mmap")]
     #[test]
     fn checkpoint_publication_repairs_incumbent_with_wrong_length_vectors_segment() {
-        // A checksum-valid vectors.bin can still be the wrong length for its declared
-        // num_vectors * dimensions shape: the guard used to hash vectors.bin without
-        // validating its shape, so a checksum-valid-but-wrong-length vectors segment was
-        // treated as a legitimate incumbent and could block every repair checkpoint below
-        // its sequence forever — the same failure mode this PR closes for graph/lifecycle.
+        // vectors.bin gets the same shape validation as graph/lifecycle (see
+        // crates/khive-vamana/docs/index.md#test-fixture-notes).
         let vectors = rand_unit_vectors(20, 4, 0x2200_0700);
         let cfg = VamanaConfig::with_dimensions(4)
             .with_max_degree(4)
@@ -5845,8 +5667,6 @@ mod tests {
         let metadata_bytes = fs::read(dir.path().join("metadata.bin")).unwrap();
         let commit = parse_v2_commit(&metadata_bytes).unwrap();
 
-        // Truncate vectors.bin by one f32 and re-sign metadata.bin so the checksum still
-        // matches the shortened bytes.
         let mut vectors_bytes = fs::read(dir.path().join("vectors.bin")).unwrap();
         let new_len = vectors_bytes.len() - 4;
         vectors_bytes.truncate(new_len);
@@ -5873,15 +5693,13 @@ mod tests {
         )
         .unwrap();
 
-        // The on-disk incumbent now passes every checksum, but load_v2_fast's vectors.bin
-        // byte-length check must still reject it as structurally invalid.
+        // Passes every checksum but must still fail load_v2_fast's byte-length check.
         assert!(matches!(
             VamanaIndex::load(dir.path()),
             Err(VamanaError::InvalidFormat { .. })
         ));
 
-        // A repair checkpoint at a lower sequence than the corrupt incumbent (500) must
-        // still be allowed to publish — the corrupt incumbent is not a legitimate barrier.
+        // A corrupt incumbent is not a legitimate barrier to a lower-sequence repair.
         let repair_vectors = rand_unit_vectors(15, 4, 0x2200_0800);
         let mut repair = VamanaIndex::build(&repair_vectors, cfg).unwrap();
         repair.set_last_applied_seq(Some(100));

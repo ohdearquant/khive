@@ -686,3 +686,107 @@ async fn suggest_flags_degraded_no_match_when_hits_empty() {
         Some(false)
     );
 }
+
+// ── P4: issue #1930 — lexical-timeout degraded arm ────────────────────────────
+
+/// A lexical/FTS candidate fetch that hits the request read deadline must
+/// degrade `suggest` to ANN-backed results carrying `degraded.lexical_timeout`
+/// — never a verb-level error. ANN candidates are fetched before the lexical
+/// stage precisely so they survive a lexical timeout (see `search.rs`'s
+/// `search`/`suggest` handlers); a real (unwarmed, no snapshot) `SharedAnn`
+/// still serves via the fresh-tail vector-store scan, so this exercises the
+/// production code path, not a mock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "degrade-lexical-timeout-domain",
+                "name": "Degrade Lexical Timeout Domain",
+                "description": "a domain seeded only so ANN has a real vector to serve from the fresh-tail scan path when the lexical fetch itself exceeds the request read deadline during this regression test",
+                "members": []
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    // A large low-overlap lexical corpus, seeded via raw SQL *after*
+    // `knowledge.index` above (which pages every un-deleted atom in the
+    // namespace) so these 200K rows are never embedded — only the domain is.
+    // This makes the bounded per-term lexical fetch itself take long enough
+    // to exceed a tight deadline, without paying to embed 200K atoms.
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+
+    // A fresh SharedAnn: nothing warmed, no snapshot. `search_eligible_ann_with_refill`
+    // falls back to the fresh-tail vector-store scan, which still finds the
+    // domain seeded above.
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let deadline = std::time::Duration::from_millis(200);
+    let result = khive_storage::scope_request_read_deadline(
+        deadline,
+        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+    )
+    .await
+    .expect("suggest must not Err on a lexical-stage read timeout");
+
+    assert_eq!(
+        result["degraded"]["lexical_timeout"], true,
+        "suggest must flag degraded.lexical_timeout when the lexical fetch times out; got: {result}"
+    );
+    assert!(
+        result["total"].as_u64().unwrap_or(0) > 0,
+        "ANN candidates fetched before the lexical stage must still produce results; got: {result}"
+    );
+    assert_eq!(
+        result["results"][0]["name"], "Degrade Lexical Timeout Domain",
+        "the only vector-backed candidate must be the seeded domain; got: {result}"
+    );
+}
+
+/// Fail-open applies to a genuine read-deadline timeout only. A storage error
+/// that is *not* `StorageError::Timeout` — such as a malformed FTS5 MATCH
+/// expression the parser rejects — must still surface as a hard error, never
+/// be silently treated as a degraded-but-ok response.
+#[tokio::test]
+async fn malformed_fts5_match_expression_still_errors() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+
+    // An unbalanced quote plus a dangling boolean operator is a genuine FTS5
+    // parse error, never something `khive-pack-knowledge`'s own query
+    // construction would emit (`quote_fts5_phrase` always escapes/balances
+    // quotes) — this reproduces what a malformed expression from any other
+    // caller of the same `fts_knowledge` table would surface as.
+    let result = reader
+        .query_all(khive_storage::types::SqlStatement {
+            sql: "SELECT a.rowid FROM fts_knowledge \
+                  JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                  WHERE fts_knowledge MATCH ?1 AND fts_knowledge.namespace = ?2 \
+                  ORDER BY bm25(fts_knowledge) LIMIT 10"
+                .to_string(),
+            params: vec![
+                khive_storage::types::SqlValue::Text("\"unterminated OR OR".to_string()),
+                khive_storage::types::SqlValue::Text("local".to_string()),
+            ],
+            label: None,
+        })
+        .await;
+
+    let err = result.expect_err("a malformed FTS5 MATCH expression must not silently succeed");
+    assert!(
+        !matches!(err, khive_storage::StorageError::Timeout { .. }),
+        "a syntax error must not be classified as StorageError::Timeout, got {err:?}"
+    );
+}

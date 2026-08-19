@@ -105,11 +105,15 @@ Per [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-au
 - **Policy evaluation uncertainty fails closed.** When `check` cannot produce a usable
   decision — the `decision` rule is undefined (no match and no `default`), the value
   fails to serialize, or the result is not a `GateDecision` shape — the gate converts
-  it to an explicit `Ok(GateDecision::Deny)` with a diagnostic reason. Only failures
-  before evaluation (e.g. request serialization, `GateError::Internal`) surface as
-  `Err(GateError)`, which the runtime treats as an infrastructure failure per ADR-018.
-  Declaring a `default decision := {deny ...}` is still good practice so unmatched
-  requests deny with a policy-authored reason instead of the generic fail-closed one.
+  it to an explicit `Ok(GateDecision::Deny)`. The evaluation-error and
+  unserializable-result cases use a static, classified reason (e.g. `"policy
+  evaluation failed"`) — never the raw `regorus` error text or any caller-supplied
+  input, since this crate cannot mask that text before it crosses the wire or a log.
+  Only failures before evaluation (e.g. request serialization, `GateError::Internal`)
+  surface as `Err(GateError)`, which the runtime treats as an infrastructure failure
+  per ADR-018. Declaring a `default decision := {deny ...}` is still good practice so
+  unmatched requests deny with a policy-authored reason instead of the generic
+  fail-closed one.
 
 ## Where this sits
 

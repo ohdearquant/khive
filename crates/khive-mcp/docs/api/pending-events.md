@@ -7,7 +7,8 @@ replays the stored action DSL when policy permits, and CAS-finalizes the row to
 from two entry points — a one-shot CLI drain
 (`kkernel exec --pending-events`) and a daemon-resident periodic loop
 (`schedule_tick_loop`, ADR-106) — both funnelling into the same
-`run_pending_events_on`.
+`run_pending_events_on`. Design narrative and module-placement history live
+in the sibling [`../pending-events.md`](../pending-events.md).
 
 ## Why `rt` and `server` are two separate handles (PR #782)
 

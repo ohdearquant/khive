@@ -141,8 +141,7 @@ key for one successful digest result. The handler policy is `AlwaysVerbose`,
 so the default MCP presentation returns the exact stored `payload.result`
 without shortening UUIDs or dropping empty fields.
 
-No configured event store, no gate audit decision, malformed `project_id`,
-or append failure replaces the handler success with
+No configured event store, malformed `project_id`, or append failure replaces the handler success with
 `RuntimeError::Internal("git_digest_receipt_persist_failed: ...")`. The
 message tells the caller that writes may already have committed and reveals
 no storage/source/command detail. When receipt construction rejects malformed
@@ -151,6 +150,10 @@ is still appended once through the generic schema-v1 Error path; it is not
 silently consumed. A receipt append failure is not retried as a generic append
 against the same failing store. Handler errors and every other verb retain the
 ordinary best-effort audit path.
+
+A gate infrastructure error takes precedence over the receipt path: it writes the ordinary
+best-effort `gate_unavailable` Error audit and returns `RuntimeError::GateUnavailable` before the
+handler or intercepted operation can run.
 
 ## LinkAuditSuccessV2
 

@@ -59,12 +59,18 @@ function shortSha(value: string): string {
 
 function MetricValue({
   metric,
+  labels,
 }: {
   metric: RepositoryMetric;
+  labels: RepoBundle["capability"]["labels"];
 }) {
   return (
     <dd>
-      <strong>{formatNumber(metric.shown)}</strong>
+      <strong>
+        {metric.status === "unavailable"
+          ? labels.unavailable
+          : formatNumber(metric.shown)}
+      </strong>
       <small className={styles.metricCoverage}>{metric.summary}</small>
     </dd>
   );
@@ -189,10 +195,15 @@ export function RepositoryTriage({
       selectedModuleId ? buildModuleInsight(bundle, selectedModuleId) : null,
     [bundle, selectedModuleId],
   );
-  const searchResults = useMemo(
-    () => (query.trim() ? findRepositoryModules(bundle, query, 8) : []),
+  const searchMatches = useMemo(
+    () =>
+      query.trim()
+        ? findRepositoryModules(bundle, query, 8)
+        : { items: [], total: 0, bound: 8 },
     [bundle, query],
   );
+  const searchResults = searchMatches.items;
+  const searchTruncated = searchMatches.total > searchResults.length;
 
   function focusInspector() {
     const inspector = inspectorRef.current;
@@ -257,25 +268,25 @@ export function RepositoryTriage({
           <dt>
             <Package aria-hidden="true" /> {labels.metrics.package_count}
           </dt>
-          <MetricValue metric={brief.metrics.packages} />
+          <MetricValue metric={brief.metrics.packages} labels={labels} />
         </div>
         <div data-repository-metric="modules">
           <dt>
             <Boxes aria-hidden="true" /> {labels.metrics.module_count}
           </dt>
-          <MetricValue metric={brief.metrics.modules} />
+          <MetricValue metric={brief.metrics.modules} labels={labels} />
         </div>
         <div data-repository-metric="commits">
           <dt>
             <GitCommitHorizontal aria-hidden="true" /> {labels.metrics.commits}
           </dt>
-          <MetricValue metric={brief.metrics.commits} />
+          <MetricValue metric={brief.metrics.commits} labels={labels} />
         </div>
         <div data-repository-metric="cycles">
           <dt>
             <GitFork aria-hidden="true" /> {labels.metrics.cycle_count}
           </dt>
-          <MetricValue metric={brief.metrics.cycles} />
+          <MetricValue metric={brief.metrics.cycles} labels={labels} />
         </div>
       </dl>
 
@@ -301,7 +312,11 @@ export function RepositoryTriage({
                   aria-label={`${moduleLabel} search results`}
                 >
                   <div className={styles.resultHeading}>
-                    <strong>{searchResults.length} captured matches</strong>
+                    <strong>
+                      {searchTruncated
+                        ? `${searchResults.length} of ${searchMatches.total} captured matches`
+                        : `${searchResults.length} captured matches`}
+                    </strong>
                     {searchResults.length > 0 && (
                       <button
                         type="button"
@@ -311,6 +326,17 @@ export function RepositoryTriage({
                       </button>
                     )}
                   </div>
+                  {searchTruncated && (
+                    <DataState
+                      presentation="inline"
+                      state="truncated"
+                      title={`${moduleLabel} search matches`}
+                      shown={searchResults.length}
+                      bound={searchMatches.bound}
+                      knownTotal={searchMatches.total}
+                      reason="Narrow the search to see matches beyond this bound."
+                    />
+                  )}
                   {searchResults.length
                     ? (
                       searchResults.map((module) => (
@@ -563,6 +589,9 @@ export function RepositoryTriage({
                     <dd>
                       {selectedInsight.history.status === "unavailable"
                         ? labels.unavailable
+                        : selectedInsight.history.status === "truncated" &&
+                            selectedInsight.history.total == null
+                        ? `${formatNumber(selectedInsight.history.shown)} shown`
                         : formatNumber(
                           selectedInsight.history.total ??
                             selectedInsight.history.shown,
