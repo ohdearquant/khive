@@ -72,6 +72,23 @@ describe("repository investigation location", () => {
     },
   );
 
+  it.each([
+    ["query string", `${repository}?tab=readme`],
+    ["fragment", `${repository}#readme`],
+  ])(
+    "accepts a curated repository URL carrying a %s",
+    (_name, repositoryWithExtras) => {
+      const parsed = parseRepositoryLocation(
+        new URL(
+          `https://example.test/?repo=${encodeURIComponent(repositoryWithExtras)}`,
+        ),
+      );
+
+      expect(parsed.issues).toEqual([]);
+      expect(parsed.location.repository).toBe(repositoryWithExtras);
+    },
+  );
+
   it("canonicalizes to only the closed location parameters in stable order, dropping every other query parameter", () => {
     const url = repositoryLocationUrl(
       new URL(

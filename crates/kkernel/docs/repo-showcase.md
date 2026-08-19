@@ -100,3 +100,60 @@ Section-specific ceilings are producer-enforced by `ExportBounds` validation:
 and 100 authors per scope. The generic JSON Schema `Page` definition retains a
 50,000-item safety ceiling; each emitted page's `bound.max_items` records the
 tighter producer limit that actually governed that section.
+
+## Serve a completed local analysis
+
+ADR-147 Amendment 1 permits an operator to serve a completed `repo build` result
+through KG Studio without checking the report into Git or copying it under `public/`.
+The directory layout is closed and server-private:
+
+```text
+<analysis-root>/
+  khive/
+    khive.repo.v1.json
+  runs/
+    khive-<opaque-run-id>/
+      history.db
+      code-map.db
+      source/
+```
+
+Generate into a fresh run directory and publish the canonical report only after the
+command succeeds:
+
+```bash
+kkernel repo build \
+  --source /absolute/path/to/clean/khive \
+  --repository-url https://github.com/ohdearquant/khive \
+  --revision <40-hex-sha> \
+  --work-dir <analysis-root>/runs/khive-<opaque-run-id> \
+  --include commits \
+  --tags none \
+  --default-branch main \
+  --generated-at <rfc3339> \
+  --out <analysis-root>/khive/khive.repo.v1.json
+```
+
+KG Studio receives only the opaque `khive` ID. It never receives the paths above and
+does not run this command in response to a browser request.
+
+Configure the server with an explicit ID-to-repository binding:
+
+```bash
+KHIVE_SHOWCASE_ANALYSIS_ROOT=<analysis-root> \
+KHIVE_SHOWCASE_ANALYSES='[{"analysis_id":"khive","canonical_url":"https://github.com/ohdearquant/khive"}]' \
+npm run dev
+```
+
+`KHIVE_SHOWCASE_ANALYSES` accepts one to 64 strict objects. Both the ID and normalized
+repository URL must be unique across the array; malformed JSON, unknown fields, invalid
+IDs or URLs, and duplicate bindings make the complete catalog unavailable. The legacy
+ID-only allowlist is not accepted because an ID without a repository identity cannot
+bind the materialized report to operator intent.
+
+`GET /api/showcase/analyses` returns the sorted
+`khive.showcase.catalog.v1` catalog. It exposes only `analysis_id` and `canonical_url`,
+does not enumerate the analysis root, and does not read reports, databases, or process
+state. `GET /api/showcase/analyses/khive` reads the explicit bounded report and rejects
+it when the bundle's normalized repository URL differs from the configured URL. Both
+routes return sanitized, private, non-cacheable responses.
