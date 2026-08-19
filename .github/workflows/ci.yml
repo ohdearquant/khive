@@ -317,7 +317,10 @@ jobs:
       - name: Install browser for repository dogfood
         run: timeout 240 npx playwright install chromium || timeout 240 npx playwright install chromium
       - name: Install browser OS dependencies
-        run: npx playwright install-deps chromium
+        # Same bound as the browser download above. The apt.conf Acquire timeouts
+        # cannot bound a dpkg lock wait, which otherwise hangs this step until the
+        # 10-minute job timeout when a runner-side apt process holds the lock.
+        run: timeout 240 npx playwright install-deps chromium || timeout 240 npx playwright install-deps chromium
       - name: Repository showcase dogfood
         run: npx playwright test
 
