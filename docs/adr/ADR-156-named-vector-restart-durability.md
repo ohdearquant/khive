@@ -3,6 +3,8 @@
 **Status**: proposed
 **Date**: 2026-08-14
 **Authors**: khive maintainers
+**Related**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md); this record's identity and
+materialization assumptions must be rebased on ADR-160 before ratification.
 **Depends on**:
 
 - ADR-148 (Moodboard Visual Retrieval Pack) — descriptor identity and the first named-vector

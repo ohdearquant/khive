@@ -32,8 +32,8 @@ describe("repository investigation location", () => {
 
       expect(parsed.issues).toEqual([]);
       expect(parsed.location).toEqual(location);
-      expect(url.searchParams.get("utm_source")).toBe("demo");
-      expect(url.hash).toBe("#analysis");
+      expect(url.searchParams.has("utm_source")).toBe(false);
+      expect(url.hash).toBe("");
     },
   );
 
@@ -207,7 +207,24 @@ describe("repository investigation location", () => {
     },
   );
 
-  it("canonicalizes only the closed location parameters in stable order", () => {
+  it.each([
+    ["query string", `${repository}?tab=readme`],
+    ["fragment", `${repository}#readme`],
+  ])(
+    "accepts a curated repository URL carrying a %s",
+    (_name, repositoryWithExtras) => {
+      const parsed = parseRepositoryLocation(
+        new URL(
+          `https://example.test/?repo=${encodeURIComponent(repositoryWithExtras)}`,
+        ),
+      );
+
+      expect(parsed.issues).toEqual([]);
+      expect(parsed.location.repository).toBe(repositoryWithExtras);
+    },
+  );
+
+  it("canonicalizes to only the closed location parameters in stable order, dropping every other query parameter", () => {
     const url = repositoryLocationUrl(
       new URL(
         "https://example.test/?view=scorecard&module=old.rs&at=old&repo=old&keep=1",
@@ -222,9 +239,48 @@ describe("repository investigation location", () => {
     );
 
     expect(url.search).toBe(
-      `?keep=1&repo=${
+      `?repo=${
         encodeURIComponent(repository)
       }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
     );
+    expect(url.searchParams.has("keep")).toBe(false);
+  });
+
+  it("drops credential-bearing query parameters instead of preserving them", () => {
+    const url = repositoryLocationUrl(
+      new URL(
+        "https://example.test/?access_token=super-secret&id_token=another-secret",
+      ),
+      {
+        repository,
+        snapshotSha,
+        modulePath: null,
+        view: "scorecard",
+        structureGraph: DEFAULT_STRUCTURE_GRAPH_LOCATION,
+      },
+    );
+
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.searchParams.has("id_token")).toBe(false);
+    expect(url.href).not.toContain("super-secret");
+    expect(url.href).not.toContain("another-secret");
+  });
+
+  it("drops a fragment-borne credential instead of preserving it", () => {
+    const url = repositoryLocationUrl(
+      new URL(
+        "https://example.test/#access_token=super-secret",
+      ),
+      {
+        repository,
+        snapshotSha,
+        modulePath: null,
+        view: "scorecard",
+        structureGraph: DEFAULT_STRUCTURE_GRAPH_LOCATION,
+      },
+    );
+
+    expect(url.hash).toBe("");
+    expect(url.href).not.toContain("super-secret");
   });
 });

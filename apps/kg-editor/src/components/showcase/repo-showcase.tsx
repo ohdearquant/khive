@@ -167,6 +167,9 @@ function resolveStructureGraphLocation(
         structureEdgePage: bundle.graph.structure_edges,
         visibleModuleIds,
         limit: UI_COUPLING_EDGE_LIMIT,
+        analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+        analysisUnavailableReason:
+          bundle.aggregates.hidden_coupling.meta.unavailable_reason,
       });
       const pairKey = structureCouplingPairKey(
         endpointModules[0][0].id,
@@ -498,8 +501,8 @@ function StructureGraph({
     displayedPackages,
     positions,
     selectablePackages,
-    subtreeModules,
-    subtreePackages,
+    subtreeModuleCount,
+    subtreePackageCount,
     visibleIds,
   } = useMemo(() => {
     const nextSubtreePackages = subtreeId === graph.repository.id
@@ -578,8 +581,8 @@ function StructureGraph({
       displayedPackages: nextDisplayedPackages,
       positions: nextPositions,
       selectablePackages: nextSelectablePackages,
-      subtreeModules: nextSubtreeModules,
-      subtreePackages: nextSubtreePackages,
+      subtreeModuleCount: nextSubtreeModules.length,
+      subtreePackageCount: nextSubtreePackages.length,
       visibleIds: nextVisibleIds,
     };
   }, [
@@ -598,16 +601,27 @@ function StructureGraph({
     selectedId = visibleSharedModuleId ?? graphSelection.id;
     setGraphSelection({ id: selectedId, visibleSharedModuleId });
   }
-  const degrees = new Map<string, number>();
-  const fanIn = new Map<string, number>();
-  const fanOut = new Map<string, number>();
-  for (const edge of graph.structure_edges.items) {
-    degrees.set(edge.source, (degrees.get(edge.source) ?? 0) + 1);
-    degrees.set(edge.target, (degrees.get(edge.target) ?? 0) + 1);
-    fanOut.set(edge.source, (fanOut.get(edge.source) ?? 0) + 1);
-    fanIn.set(edge.target, (fanIn.get(edge.target) ?? 0) + 1);
-  }
-  const maxDegree = Math.max(1, ...visibleIds.values().map((id) => degrees.get(id) ?? 0));
+  const { degrees, fanIn, fanOut, maxDegree } = useMemo(() => {
+    const nextDegrees = new Map<string, number>();
+    const nextFanIn = new Map<string, number>();
+    const nextFanOut = new Map<string, number>();
+    for (const edge of graph.structure_edges.items) {
+      nextDegrees.set(edge.source, (nextDegrees.get(edge.source) ?? 0) + 1);
+      nextDegrees.set(edge.target, (nextDegrees.get(edge.target) ?? 0) + 1);
+      nextFanOut.set(edge.source, (nextFanOut.get(edge.source) ?? 0) + 1);
+      nextFanIn.set(edge.target, (nextFanIn.get(edge.target) ?? 0) + 1);
+    }
+    const nextMaxDegree = Math.max(
+      1,
+      ...visibleIds.values().map((id) => nextDegrees.get(id) ?? 0),
+    );
+    return {
+      degrees: nextDegrees,
+      fanIn: nextFanIn,
+      fanOut: nextFanOut,
+      maxDegree: nextMaxDegree,
+    };
+  }, [graph.structure_edges.items, visibleIds]);
   const nodeWidth = (id: string) => 92 + ((degrees.get(id) ?? 0) / maxDegree) * 46;
   const selectedModule = displayedModules.find((item) => item.id === selectedId);
   const selectedPackage = displayedPackages.find((item) => item.id === selectedId);
@@ -623,8 +637,13 @@ function StructureGraph({
       structureEdgePage: graph.structure_edges,
       visibleModuleIds: visibleIds,
       limit: UI_COUPLING_EDGE_LIMIT,
+      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+      analysisUnavailableReason:
+        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     }), [
+    bundle.aggregates.hidden_coupling.meta.status,
     bundle.aggregates.hidden_coupling.data,
+    bundle.aggregates.hidden_coupling.meta.unavailable_reason,
     graph.structure_edges,
     visibleIds,
   ]);
@@ -1051,8 +1070,8 @@ function StructureGraph({
           ))}
         </ul>
         <LocalSliceDisclosure shown={displayedEdges.length} total={graph.structure_edges.items.length} label={capability.views.structure_graph.label} labels={labels} />
-        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackages.length} label={labels.node_types.package} labels={labels} />
-        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModules.length} label={labels.node_types.module} labels={labels} />
+        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackageCount} label={labels.node_types.package} labels={labels} />
+        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModuleCount} label={labels.node_types.module} labels={labels} />
       </div>
       <BoundDisclosure page={graph.packages} labels={labels} />
       <BoundDisclosure page={graph.modules} labels={labels} />

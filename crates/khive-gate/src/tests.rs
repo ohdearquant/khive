@@ -253,11 +253,33 @@ fn audit_event_allow_no_obligations() {
 }
 
 #[test]
+fn audit_event_gate_unavailable_path_has_no_deny_fields() {
+    let req = sample_request();
+    let ev = AuditEvent::gate_unavailable(&req, "FailingGate");
+
+    let json = serde_json::to_value(&ev).unwrap();
+
+    assert_eq!(json["decision"], "gate_unavailable");
+    assert_eq!(json["gate_impl"], "FailingGate");
+    assert!(json.get("deny_reason").is_none() || json["deny_reason"].is_null());
+    assert_eq!(
+        json["obligations"],
+        serde_json::Value::Array(Vec::new()),
+        "obligations must be an empty array when the gate is unavailable"
+    );
+
+    let back: AuditEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(back.decision, AuditDecision::GateUnavailable);
+}
+
+#[test]
 fn audit_decision_serialises_as_snake_case() {
     let allow = serde_json::to_value(AuditDecision::Allow).unwrap();
     assert_eq!(allow, "allow");
     let deny = serde_json::to_value(AuditDecision::Deny).unwrap();
     assert_eq!(deny, "deny");
+    let unavailable = serde_json::to_value(AuditDecision::GateUnavailable).unwrap();
+    assert_eq!(unavailable, "gate_unavailable");
 }
 
 // ---- GATE-AUD-001: impl_name() default ----

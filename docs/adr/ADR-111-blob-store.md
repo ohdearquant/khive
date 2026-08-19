@@ -5,6 +5,8 @@
 2026-07-17, PR #1054; Amendment 3
 accepted 2026-07-17; Amendment 4 accepted 2026-07-19)
 **Authors**: khive maintainers
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which requires
+backend-enforced bounded and digest-verified reads and retires public unbounded `get` on acceptance.
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (trait-only capability
