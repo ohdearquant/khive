@@ -27,6 +27,7 @@ import {
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { DataState } from "@/components/data-state";
+import { CouplingBoundaryWorkbench } from "@/components/showcase/coupling-boundary-workbench";
 import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
 import { RepositoryTriage } from "@/components/showcase/repository-triage";
 import type { ShowcaseBundleSource } from "@/lib/adapters/preferred-showcase-source";
@@ -40,6 +41,7 @@ import {
   RelationMark,
 } from "@/components/ontology-mark";
 import { settleGraphLayout } from "@/lib/graph-layout";
+import { buildCouplingComparison } from "@/lib/coupling-comparison";
 import {
   buildInvestigationBrief,
   InvestigationBriefError,
@@ -71,6 +73,7 @@ type Icon = typeof Network;
 type ModuleMap = Map<string, RepoModule>;
 type AnalysisWindow =
   RepoBundle["aggregates"]["hidden_coupling"]["meta"]["window"];
+type InspectModuleOptions = Readonly<{ focusInspector?: boolean }>;
 type ViewProps = Readonly<{
   bundle: RepoBundle;
   moduleById: ModuleMap;
@@ -79,6 +82,7 @@ type ViewProps = Readonly<{
   onInspectModule: (
     moduleId: string,
     nextStructureGraph?: StructureGraphLocation,
+    options?: InspectModuleOptions,
   ) => void;
   onExploreStructure: () => void;
   onChangeStructureGraph: (location: StructureGraphLocation) => void;
@@ -147,44 +151,14 @@ function resolveStructureGraphLocation(
         "The requested coupling pair does not resolve to two unique modules in this bounded snapshot.",
       );
       couplingPair = null;
-    } else {
-      const visiblePackages = packageName
-        ? bundle.graph.packages.items.filter((item) => item.id === packageId)
-        : [...bundle.graph.packages.items]
-          .sort((left, right) => left.id.localeCompare(right.id))
-          .slice(0, 8);
-      const visiblePackageIds = new Set(
-        visiblePackages.map((item) => item.id),
+    } else if (
+      packageName &&
+      endpointModules.some(([moduleNode]) => moduleNode.package_id !== packageId)
+    ) {
+      issues.push(
+        "The requested coupling pair is outside the requested package scope.",
       );
-      const visibleModuleIds = new Set(
-        bundle.graph.modules.items
-          .filter((item) =>
-            visiblePackageIds.has(item.package_id) &&
-            (packageName === null || item.package_id === packageId)
-          )
-          .sort((left, right) => left.id.localeCompare(right.id))
-          .slice(0, 42)
-          .map((item) => item.id),
-      );
-      const lens = buildStructureCouplingLens({
-        pairPage: bundle.aggregates.hidden_coupling.data,
-        structureEdgePage: bundle.graph.structure_edges,
-        visibleModuleIds,
-        limit: UI_COUPLING_EDGE_LIMIT,
-        analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
-        analysisUnavailableReason:
-          bundle.aggregates.hidden_coupling.meta.unavailable_reason,
-      });
-      const pairKey = structureCouplingPairKey(
-        endpointModules[0][0].id,
-        endpointModules[1][0].id,
-      );
-      if (!lens.pairs.some((pair) => pair.key === pairKey)) {
-        issues.push(
-          "The requested coupling pair is not in the captured visible top-20 slice for this package scope.",
-        );
-        couplingPair = null;
-      }
+      couplingPair = null;
     }
   }
 
@@ -664,6 +638,13 @@ function StructureGraph({
   const focusedPair = couplingLens.pairs.find((pair) =>
     pair.key === focusedPairKey
   ) ?? null;
+  const focusedComparison = useMemo(() => {
+    if (!structureGraph.couplingPair) return null;
+    return buildCouplingComparison({
+      bundle,
+      sourcePaths: structureGraph.couplingPair,
+    });
+  }, [bundle, structureGraph.couplingPair]);
   const focusedModuleIds = focusedPair
     ? new Set([focusedPair.leftModuleId, focusedPair.rightModuleId])
     : null;
@@ -686,6 +667,10 @@ function StructureGraph({
   const inspectCouplingEndpoint = (moduleId: string) => {
     setGraphSelection({ id: moduleId, visibleSharedModuleId: moduleId });
     onInspectModule(moduleId);
+  };
+  const inspectBoundaryEndpoint = (moduleId: string) => {
+    setGraphSelection({ id: moduleId, visibleSharedModuleId: moduleId });
+    onInspectModule(moduleId, structureGraph, { focusInspector: false });
   };
   const clearFocusedPair = () => {
     if (!structureGraph.couplingPair) return;
@@ -1050,6 +1035,13 @@ function StructureGraph({
                   })}
                 </ol>
               )}
+            {focusedComparison && (
+              <CouplingBoundaryWorkbench
+                result={focusedComparison}
+                selectedModuleId={selectedModuleId}
+                onInspectModule={inspectBoundaryEndpoint}
+              />
+            )}
           </section>
         )}
         <div className="repo-inspector">
@@ -1947,9 +1939,11 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
   function inspectModule(
     moduleId: string,
     nextStructureGraph: StructureGraphLocation = structureGraph,
+    options: InspectModuleOptions = {},
   ) {
     if (!moduleById.has(moduleId)) return;
     selectModule(moduleId, nextStructureGraph);
+    if (options.focusInspector === false) return;
     const inspector = moduleInspectorRef.current;
     if (!inspector) return;
     inspector.focus({ preventScroll: true });

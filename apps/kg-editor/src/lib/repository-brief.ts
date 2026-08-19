@@ -195,17 +195,21 @@ function pageEvidence(
   const total = page.total_count.status === "available"
     ? `${page.total_count.value} declared`
     : `total ${labels.unavailable}`;
-  const hasUnseenPage = page.next_cursor != null &&
-    page.disclosure.status === "complete";
-  const disclosureStatus = hasUnseenPage ? "truncated" : page.disclosure.status;
+  const effectiveStatus: "complete" | "truncated" | "unavailable" =
+    page.disclosure.status === "unavailable"
+      ? "unavailable"
+      : page.truncated || page.next_cursor != null ||
+          page.disclosure.status === "truncated"
+      ? "truncated"
+      : "complete";
   const reason = page.disclosure.reason ??
-    (hasUnseenPage
+    (page.next_cursor != null && page.disclosure.status === "complete"
       ? "Additional items are available beyond this page."
       : null);
-  const status = disclosureStatus === "complete"
+  const status = effectiveStatus === "complete"
     ? "complete"
     : `${
-      disclosureStatus === "truncated" ? labels.truncated : labels.unavailable
+      effectiveStatus === "truncated" ? labels.truncated : labels.unavailable
     }${reason ? `: ${reason}` : ""}`;
   return {
     label,
@@ -370,7 +374,7 @@ function combinedAttentionMetric(
       .map((metric) => metric.reason)
       .filter(Boolean)
       .join("; ") ||
-      "One or more attention analyses returned a truncated page.";
+      "One or more attention analyses are truncated; unseen rows may contain additional signals.";
     return {
       shown,
       total: null,
