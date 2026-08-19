@@ -234,7 +234,7 @@ class WriterCensusTests(unittest.TestCase):
         self.assertNotIn("entries", report)
         self.assertIn("comm.read", " ".join(report["errors"]))
 
-    def test_unreachable_observed_revision_voids_run_via_control(self):
+    def test_unreachable_observed_revision_fails_closed(self):
         report = self.census.build_report(
             manifest(),
             inventory(
@@ -247,23 +247,64 @@ class WriterCensusTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "VOID")
         self.assertNotIn("entries", report)
-        self.assertIn("control", " ".join(report["errors"]))
+        self.assertIn(
+            "does not resolve to a commit", " ".join(report["errors"])
+        )
+
+    def test_tree_object_observed_revision_fails_closed(self):
+        tree_revision = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertNotEqual(tree_revision, SOURCE_REVISION)
+
+        report = self.census.build_report(
+            manifest(),
+            inventory(
+                ("comm", "comm.read"),
+                ("memory", "memory.recall"),
+                packs=("comm", "memory", "brain"),
+            ),
+            observed_revision=tree_revision,
+        )
+
+        self.assertEqual(report["status"], "VOID")
+        self.assertNotIn("entries", report)
+        self.assertIn(
+            "does not resolve to a commit", " ".join(report["errors"])
+        )
 
     def test_revision_mismatch_reverifies_evidence_at_observed_revision(self):
         if PARENT_REVISION is None:
             self.skipTest("HEAD~1 unavailable (shallow clone)")
         pinned_elsewhere = manifest()
         pinned_elsewhere["source_revision"] = PARENT_REVISION
-        report = self.census.build_report(
-            pinned_elsewhere,
-            inventory(
-                ("comm", "comm.read"),
-                ("memory", "memory.recall"),
-                packs=("comm", "memory", "brain"),
-            ),
-            observed_revision=SOURCE_REVISION,
-        )
+        verified_at: list[str] = []
+        original_verify = self.census._verify_path_evidence
 
+        def recording_verify(path, repo_root, revision):
+            verified_at.append(revision)
+            return original_verify(path, repo_root, revision)
+
+        self.census._verify_path_evidence = recording_verify
+        try:
+            report = self.census.build_report(
+                pinned_elsewhere,
+                inventory(
+                    ("comm", "comm.read"),
+                    ("memory", "memory.recall"),
+                    packs=("comm", "memory", "brain"),
+                ),
+                observed_revision=SOURCE_REVISION,
+            )
+        finally:
+            self.census._verify_path_evidence = original_verify
+
+        self.assertTrue(verified_at)
+        self.assertEqual(set(verified_at), {SOURCE_REVISION})
         self.assertEqual(report["status"], "OK")
         self.assertEqual(report["control"]["status"], "PASS")
         self.assertIn(

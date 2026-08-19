@@ -275,6 +275,16 @@ def _sorted_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(paths, key=canonical_json)
 
 
+def _revision_is_commit(repo_root: Path, revision: str) -> bool:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-t", revision],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.returncode == 0 and completed.stdout.strip() == "commit"
+
+
 def _verify_path_evidence(
     path: dict[str, Any], repo_root: Path, revision: str
 ) -> tuple[dict[str, Any], str | None]:
@@ -499,6 +509,11 @@ def build_report(
     ):
         errors.append(
             "observed artifact revision is absent or invalid; census is void"
+        )
+    elif not _revision_is_commit(repo_root, observed_revision):
+        errors.append(
+            "observed artifact revision does not resolve to a commit; "
+            "census is void"
         )
     elif observed_revision != checked["source_revision"]:
         evidence_revision = observed_revision
