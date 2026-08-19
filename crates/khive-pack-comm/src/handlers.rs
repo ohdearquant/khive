@@ -1009,6 +1009,8 @@ async fn mark_read_targets_atomic(
     requested_count: usize,
     targets: Vec<(Uuid, Note)>,
 ) -> Result<Value, RuntimeError> {
+    // Fixed dotted-path patch (`$.read`) — no caller input reaches the
+    // top-level properties object, so the reserved key is unreachable here.
     let store = runtime.notes(token)?;
     let ids = targets.iter().map(|(id, _)| *id).collect();
     store
@@ -1195,6 +1197,8 @@ async fn mark_read_target(
     // both degrade to `read: false` + `mark_error` instead of failing the
     // response. A caller polling unread counts simply sees the message still
     // unread and can re-issue `read` — self-healing, no retry loop needed here.
+    // Fixed dotted-path patch (`$.read`) — no caller input reaches the
+    // top-level properties object, so the reserved key is unreachable here.
     let patch_result = store
         .try_patch_note_property(
             id,
@@ -2275,6 +2279,10 @@ pub(crate) async fn handle_heartbeat(
     let now = Utc::now();
     let at = p.at.clone().unwrap_or_else(|| now.to_rfc3339());
 
+    // `HeartbeatParams` (khive-pack-comm/src/params.rs) carries no free-form
+    // `properties` field — every key assigned below is a fixed literal, so no
+    // caller-supplied JSON can reach (create/replace) the reserved top-level
+    // `khive:secret_gate` key through this carry-forward merge.
     let mut props = existing
         .as_ref()
         .and_then(|n| n.properties.clone())

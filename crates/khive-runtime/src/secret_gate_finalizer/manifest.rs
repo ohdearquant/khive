@@ -388,7 +388,7 @@ impl ManifestManager {
 // ─── Test-only, non-deployable lookup fixture ───────────────────────────────
 
 #[cfg(test)]
-mod fixture {
+pub(crate) mod fixture {
     use super::*;
 
     /// Verbatim ADR-115 Amendment 1 disclaimer sentence. The harness asserts
@@ -743,6 +743,60 @@ mod tests {
         assert!(
             manager.current().is_empty(),
             "a failed refresh must never leave stale non-empty state live"
+        );
+    }
+
+    /// ADR-115 Amendment 1's one-snapshot invariant: a candidate clones the
+    /// manager's live snapshot `Arc` exactly once before its first field
+    /// scan and uses that one clone for every scan and finalization
+    /// decision. A `refresh` that swaps the manager's live snapshot after
+    /// that clone was taken must never mutate the already-cloned `Arc` — the
+    /// candidate's in-flight decision stays pinned to the snapshot it
+    /// started with, so a concurrent manifest refresh can never straddle one
+    /// candidate's decision (MatrixCaseKind::OneSnapshotRefreshRace).
+    #[test]
+    fn snapshot_taken_before_refresh_is_unaffected_by_a_later_refresh() {
+        let manager = ManifestManager::new();
+        let digest = digest_to_hex(&scoped_digest(
+            RuntimeFieldScope::RecordContent,
+            "race-fixture-value",
+        ));
+        let corpus = digest_to_hex(&scoped_digest(RuntimeFieldScope::RecordContent, "corpus"));
+        let first = format!(
+            r#"{{"schema_version":1,"manifest_id":"race-v1","algorithm":"sha256","corpus_identity_sha256":"{corpus}","entries":[
+                {{"field_scope":"record-content","digest_sha256":"{digest}","overridden_detector":"a"}}
+            ]}}"#
+        );
+        let expected = digest_from_hex(&corpus).unwrap();
+        manager
+            .refresh(Some(first.as_bytes()), Some(expected))
+            .expect("first load succeeds");
+
+        // The candidate's one clone, taken before the field scan begins.
+        let candidate_snapshot = manager.current();
+        assert_eq!(candidate_snapshot.manifest_id(), "race-v1");
+        assert!(candidate_snapshot
+            .lookup(RuntimeFieldScope::RecordContent, "race-fixture-value")
+            .is_some());
+
+        // A refresh lands concurrently, publishing a completely different
+        // (empty) manifest as the manager's new live snapshot.
+        manager
+            .refresh(None, None)
+            .expect_err("absent bytes is a refresh fault by design");
+        assert!(
+            manager.current().is_empty(),
+            "manager's live state advanced"
+        );
+
+        // The candidate's already-cloned Arc must still resolve exactly as
+        // it did at clone time — untouched by the manager's later refresh.
+        assert_eq!(candidate_snapshot.manifest_id(), "race-v1");
+        assert!(
+            candidate_snapshot
+                .lookup(RuntimeFieldScope::RecordContent, "race-fixture-value")
+                .is_some(),
+            "a snapshot cloned before refresh must not observe a later refresh"
         );
     }
 

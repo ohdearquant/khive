@@ -142,7 +142,7 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
 /// persisted state. Only the exact top-level key is reserved; the same
 /// spelling nested inside an object *value* is ordinary content and remains
 /// subject to [`check_json`], never a posture mutation.
-pub(crate) const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
+pub const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
 
 /// Reject a caller-supplied top-level `khive:secret_gate` property key.
 ///
@@ -151,7 +151,11 @@ pub(crate) const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
 /// create, patch update, or full replace. Returns `Ok(())` when `properties`
 /// is absent, is not a JSON object, or does not name the reserved key at the
 /// top level.
-pub(crate) fn reject_reserved_secret_gate_property(
+///
+/// This is the one shared validator for the reservation rule (ADR-115
+/// Amendment 1 §3); every properties-bearing write path across every crate
+/// must call this instead of re-implementing the check.
+pub fn reject_reserved_secret_gate_property(
     properties: Option<&serde_json::Value>,
 ) -> RuntimeResult<()> {
     if let Some(serde_json::Value::Object(map)) = properties {

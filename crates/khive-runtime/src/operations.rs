@@ -5332,6 +5332,7 @@ impl KhiveRuntime {
             changed_fields.push("weight");
         }
         if let Some(props) = patch.properties {
+            crate::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;
             edge.metadata = Some(props);
         }
 

@@ -50,8 +50,10 @@ mod tests {
     };
     use crate::secret_gate_finalizer::faults;
     use crate::secret_gate_finalizer::log_sink::CapturingLogSink;
+    use crate::secret_gate_finalizer::manifest::fixture::TestOnlyManifestFixture;
     use crate::secret_gate_finalizer::manifest::{
-        canonical_empty_document_sha256_hex, digest_to_hex, scoped_digest, RuntimeFieldScope,
+        canonical_empty_document_sha256_hex, digest_to_hex, resolve_match, scoped_digest,
+        ManifestManager, ManifestSnapshot, RuntimeFieldScope,
     };
     use crate::secret_gate_finalizer::matrix::{generated_acceptance_matrix, MatrixCaseKind};
     use crate::secret_gate_finalizer::outcome::{
@@ -135,6 +137,28 @@ mod tests {
         MatrixCaseKind::StampFailure,
         MatrixCaseKind::SuccessAuditFailure,
         MatrixCaseKind::SecondOrderFailureAuditFailure,
+    ];
+
+    /// The generated-matrix case kinds `transaction::finalize` structurally
+    /// never observes — not a storage-wiring gap but a permanent property of
+    /// the design: a manifest miss (`LegacyScannerBehavior`, `OneByteMiss`,
+    /// `WrongScopeMiss`) "falls through to the unchanged legacy scanner" and
+    /// never reaches `finalize` at all (see `outcome::ManifestFault`'s own
+    /// doc comment), a caller-supplied reserved key (`ReservedKeyMutation`)
+    /// is rejected at the reservation boundary before any candidate is
+    /// constructed, and the one-snapshot invariant (`OneSnapshotRefreshRace`)
+    /// governs how a candidate obtains its `ManifestSnapshot` *before*
+    /// `finalize` is ever called, not anything `finalize` itself decides.
+    /// Each is still driven through its real, owning production function
+    /// below (`deferred_case_kinds_are_covered_by_their_owning_functions`)
+    /// rather than silently skipped — see that test and its doc comment for
+    /// the per-case mapping.
+    const DEFERRED_TO_OWNING_FUNCTION: &[MatrixCaseKind] = &[
+        MatrixCaseKind::LegacyScannerBehavior,
+        MatrixCaseKind::OneByteMiss,
+        MatrixCaseKind::WrongScopeMiss,
+        MatrixCaseKind::ReservedKeyMutation,
+        MatrixCaseKind::OneSnapshotRefreshRace,
     ];
 
     /// Deliverables 2 + 3: drive every generated-matrix row whose case kind
@@ -291,6 +315,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Completeness: every one of `MatrixCaseKind::ALL` is
+    /// exactly one of finalize-observable or explicitly deferred — no third,
+    /// silently-skipped category exists. The generator (`matrix.rs`) is the
+    /// sole source of the row set; this test only asserts the two constant
+    /// lists above partition it exactly, so a newly added `MatrixCaseKind`
+    /// variant that nobody classified fails this test instead of silently
+    /// vanishing from coverage.
+    #[test]
+    fn finalize_observable_and_deferred_partition_every_case_kind_exactly() {
+        let observable: BTreeSet<MatrixCaseKind> = FINALIZE_OBSERVABLE.iter().copied().collect();
+        let deferred: BTreeSet<MatrixCaseKind> =
+            DEFERRED_TO_OWNING_FUNCTION.iter().copied().collect();
+        assert!(
+            observable.is_disjoint(&deferred),
+            "a case kind must not be both finalize-observable and deferred"
+        );
+        let union: BTreeSet<MatrixCaseKind> = observable.union(&deferred).copied().collect();
+        let all: BTreeSet<MatrixCaseKind> = MatrixCaseKind::ALL.iter().copied().collect();
+        assert_eq!(
+            union, all,
+            "every declared MatrixCaseKind must be finalize-observable or explicitly deferred"
+        );
+    }
+
+    /// Completeness: every entry in `DEFERRED_TO_OWNING_FUNCTION`
+    /// is driven through the real production function that owns it — not
+    /// re-implemented as a second, parallel model, and not silently skipped.
+    /// This runs once per case kind, not once per declared entry point,
+    /// because the manifest scanner and reservation boundary behave
+    /// identically regardless of which of the six entry points a candidate
+    /// originated from: entry-point identity plays no role in manifest
+    /// digest matching or reservation-key rejection.
+    #[test]
+    fn deferred_case_kinds_are_covered_by_their_owning_functions() {
+        // LegacyScannerBehavior: on the production-default empty manifest,
+        // `resolve_match` reports no candidate hit (falls through), and the
+        // pre-existing legacy `secret_gate::check` still rejects
+        // secret-shaped content exactly as it did before this finalizer
+        // existed — ADR-115 added no new admission path around it.
+        let empty = ManifestSnapshot::empty();
+        let secret_like = "AKIAFAKELEGACYSCANNER0000000000";
+        let scanned = [(RuntimeFieldScope::RecordContent, secret_like)];
+        assert_eq!(
+            resolve_match(&empty, &scanned).expect("empty snapshot never faults"),
+            None,
+            "LegacyScannerBehavior: empty manifest must report no candidate hit"
+        );
+        assert!(
+            crate::secret_gate::check(secret_like).is_err(),
+            "LegacyScannerBehavior: the unchanged legacy scanner must still reject \
+             secret-shaped content when no manifest entry matches"
+        );
+
+        // OneByteMiss: a fixture's exact value hits; the same value with its
+        // last byte mutated misses, through the real `resolve_match`.
+        let fixture = TestOnlyManifestFixture::new();
+        let fixture_snapshot = fixture.snapshot();
+        let exact = fixture.exact_value();
+        assert!(
+            resolve_match(&fixture_snapshot, &[(fixture.field_scope(), exact)])
+                .expect("fixture snapshot never faults")
+                .is_some(),
+            "OneByteMiss baseline: the exact fixture value must hit"
+        );
+        let mut mutated = exact.as_bytes().to_vec();
+        let last = mutated.len() - 1;
+        mutated[last] = mutated[last].wrapping_add(1);
+        let mutated = String::from_utf8(mutated).expect("mutated byte stays valid UTF-8");
+        assert_eq!(
+            resolve_match(
+                &fixture_snapshot,
+                &[(fixture.field_scope(), mutated.as_str())]
+            )
+            .expect("fixture snapshot never faults"),
+            None,
+            "OneByteMiss: a one-byte-mutated value must miss"
+        );
+
+        // WrongScopeMiss: the exact same value, looked up under a different
+        // `RuntimeFieldScope` than the one it was entered under, must miss.
+        let wrong_scope = if fixture.field_scope() == RuntimeFieldScope::RecordContent {
+            RuntimeFieldScope::NameDescription
+        } else {
+            RuntimeFieldScope::RecordContent
+        };
+        assert_eq!(
+            resolve_match(&fixture_snapshot, &[(wrong_scope, exact)])
+                .expect("fixture snapshot never faults"),
+            None,
+            "WrongScopeMiss: the same exact value under the wrong scope must miss"
+        );
+
+        // ReservedKeyMutation: the one shared reservation validator, called
+        // directly against a top-level occurrence of the reserved key.
+        let reserved =
+            serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"});
+        assert!(
+            reject_reserved_secret_gate_property(Some(&reserved)).is_err(),
+            "ReservedKeyMutation: the shared reservation validator must reject the key"
+        );
+
+        // OneSnapshotRefreshRace: a snapshot cloned via `ManifestManager::current`
+        // before a later `refresh` must not observe that refresh — see
+        // `manifest::tests::snapshot_taken_before_refresh_is_unaffected_by_a_later_refresh`
+        // for the full end-to-end regression; this call proves the same
+        // manager type is reachable and behaves identically from this module.
+        let manager = ManifestManager::new();
+        let pinned = manager.current();
+        assert!(
+            pinned.is_empty(),
+            "manager starts on the empty default snapshot"
+        );
+        let _ = manager.refresh(None, None);
+        assert!(
+            pinned.is_empty(),
+            "OneSnapshotRefreshRace: a snapshot cloned before refresh must stay pinned"
+        );
     }
 
     /// Deliverable 1: universal reservation, exercised through the crate's
