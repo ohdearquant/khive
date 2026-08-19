@@ -9,6 +9,7 @@ import { parseRepoBundle } from "@/lib/repo-bundle";
 
 vi.mock("@/lib/adapters/preferred-showcase-source", () => ({
   loadPreferredShowcaseBundle: vi.fn(),
+  readOperatorShowcaseAccessToken: vi.fn(() => null),
 }));
 
 import { Showcase } from "@/components/showcase/showcase";

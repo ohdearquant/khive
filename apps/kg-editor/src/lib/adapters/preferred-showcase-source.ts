@@ -19,9 +19,34 @@ export type LoadedShowcaseBundle = Readonly<{
   source: ShowcaseBundleSource;
 }>;
 
+export type PreferredShowcaseOptions = Readonly<{
+  /**
+   * Operator-supplied bearer token for the protected DB-snapshot routes.
+   * When absent, the request is sent without credentials and the protected
+   * route fails closed to 404, which selects the curated static fallback.
+   */
+  accessToken?: string | null;
+}>;
+
+/**
+ * Browser storage key an operator uses to unlock DB-backed snapshots in the
+ * UI: `sessionStorage.setItem(SHOWCASE_ACCESS_TOKEN_STORAGE_KEY, token)`.
+ */
+export const SHOWCASE_ACCESS_TOKEN_STORAGE_KEY = "khive.showcase.accessToken";
+
+export function readOperatorShowcaseAccessToken(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.sessionStorage.getItem(SHOWCASE_ACCESS_TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
 export async function loadPreferredShowcaseBundle(
   entry: ShowcaseRegistryEntry,
   fetchBundle: ShowcaseFetch = fetch,
+  options: PreferredShowcaseOptions = {},
 ): Promise<LoadedShowcaseBundle> {
   if (!isAllowedShowcaseAnalysis(entry)) {
     return {
@@ -31,10 +56,14 @@ export async function loadPreferredShowcaseBundle(
   }
 
   const endpoint = `/api/showcase/analyses/${entry.analysisId}`;
+  const accessToken = options.accessToken?.trim();
   const response = await fetchBundle(endpoint, {
     cache: "no-store",
     credentials: "same-origin",
     redirect: "error",
+    ...(accessToken
+      ? { headers: { authorization: `Bearer ${accessToken}` } }
+      : {}),
   });
 
   if (response.status === 404) {

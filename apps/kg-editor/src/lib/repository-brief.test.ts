@@ -221,6 +221,23 @@ describe("repository triage model", () => {
     ).toBe(true);
   });
 
+  it("reports a module omitted from a cursor-paginated history page as truncated, not unavailable", () => {
+    const target = buildRepositoryBrief(bundle).startHere[0];
+    const paged = structuredClone(bundle);
+    const byModule = paged.graph.history_navigation.by_module;
+    byModule.items = byModule.items.filter(
+      (row) => row.module_id !== target.moduleId,
+    );
+    // A later page may hold the row: cursor set, page-level disclosure complete.
+    byModule.next_cursor = "cursor-after-first-page";
+
+    const insight = buildModuleInsight(paged, target.moduleId);
+
+    expect(insight?.history.status).toBe("truncated");
+    expect(insight?.history.shown).toBe(0);
+    expect(insight?.history.reason).toMatch(/truncated/i);
+  });
+
   it("does not consume aggregate rows whose analysis is unavailable", () => {
     const unavailable = structuredClone(bundle);
     const target = buildRepositoryBrief(bundle).startHere[0];

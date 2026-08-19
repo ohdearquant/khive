@@ -293,6 +293,7 @@ function unavailableMetric(
 function missingHistoryNavigationMetric(
   coverage: {
     bound: { kind: "all" | "top_n"; max_items: number; order: string };
+    next_cursor?: string | null;
     disclosure: {
       status: "complete" | "truncated" | "unavailable";
       reason?: string | null;
@@ -306,7 +307,10 @@ function missingHistoryNavigationMetric(
       coverage.disclosure.reason ?? "History navigation was not produced.",
     );
   }
-  if (coverage.disclosure.status === "truncated") {
+  if (
+    coverage.disclosure.status === "truncated" ||
+    coverage.next_cursor != null
+  ) {
     const reason = coverage.disclosure.reason ??
       "The by-module history-navigation page was truncated before reaching this module.";
     return {

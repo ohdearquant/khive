@@ -2,7 +2,11 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { loadPreferredShowcaseBundle } from "@/lib/adapters/preferred-showcase-source";
+import {
+  loadPreferredShowcaseBundle,
+  readOperatorShowcaseAccessToken,
+  SHOWCASE_ACCESS_TOKEN_STORAGE_KEY,
+} from "@/lib/adapters/preferred-showcase-source";
 import { SHOWCASE_REGISTRY } from "@/lib/showcase-registry";
 
 const golden = readFileSync(
@@ -51,6 +55,61 @@ describe("preferred showcase source", () => {
       credentials: "same-origin",
       redirect: "error",
     });
+  });
+
+  it("sends the operator bearer token to the protected snapshot route when supplied", async () => {
+    const fetchBundle = vi.fn(async () =>
+      response(golden, 200, {
+        "x-khive-analysis-id": "khive",
+        "x-khive-analysis-source": "khive-db-snapshot",
+      })
+    );
+
+    const result = await loadPreferredShowcaseBundle(
+      SHOWCASE_REGISTRY[0],
+      fetchBundle,
+      { accessToken: "  operator-secret  " },
+    );
+
+    expect(result.source).toBe("khive-db-snapshot");
+    expect(fetchBundle).toHaveBeenCalledWith("/api/showcase/analyses/khive", {
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
+      headers: { authorization: "Bearer operator-secret" },
+    });
+  });
+
+  it("sends no Authorization header when the operator token is blank", async () => {
+    const fetchBundle = vi.fn(async () =>
+      response(golden, 200, {
+        "x-khive-analysis-id": "khive",
+        "x-khive-analysis-source": "khive-db-snapshot",
+      })
+    );
+
+    await loadPreferredShowcaseBundle(SHOWCASE_REGISTRY[0], fetchBundle, {
+      accessToken: "   ",
+    });
+
+    expect(fetchBundle).toHaveBeenCalledWith("/api/showcase/analyses/khive", {
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
+    });
+  });
+
+  it("reads the operator token from browser session storage", () => {
+    window.sessionStorage.setItem(
+      SHOWCASE_ACCESS_TOKEN_STORAGE_KEY,
+      "session-secret",
+    );
+    try {
+      expect(readOperatorShowcaseAccessToken()).toBe("session-secret");
+    } finally {
+      window.sessionStorage.removeItem(SHOWCASE_ACCESS_TOKEN_STORAGE_KEY);
+    }
+    expect(readOperatorShowcaseAccessToken()).toBeNull();
   });
 
   it("uses the curated asset only when the DB snapshot route is not configured", async () => {

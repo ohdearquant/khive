@@ -113,7 +113,16 @@ sorted by analysis ID and exposes only those two public fields. It does not scan
 analysis root or read a report.
 
 Both API routes require `Authorization: Bearer $KHIVE_SHOWCASE_ACCESS_TOKEN` on every
-request, checked in constant time. An absent or mismatched token is indistinguishable
+request, checked in constant time. To use the DB-backed setup through the showcase UI,
+supply the same token to your own browser session before loading a repository:
+
+```js
+sessionStorage.setItem("khive.showcase.accessToken", "a-long-random-operator-secret");
+```
+
+The UI sends it as the bearer credential on snapshot requests. Without it the protected
+route answers 404 and the UI falls back to the curated static bundle, so the token never
+ships in the client build. An absent or mismatched token is indistinguishable
 from an unconfigured catalog: both routes fail closed to the same sanitized 404. Without
 `KHIVE_SHOWCASE_ACCESS_TOKEN` set, no request can be authorized, regardless of what
 credentials it presents.

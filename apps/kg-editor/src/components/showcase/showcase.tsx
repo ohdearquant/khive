@@ -8,6 +8,7 @@ import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { DataState } from "@/components/data-state";
 import {
   loadPreferredShowcaseBundle,
+  readOperatorShowcaseAccessToken,
   type LoadedShowcaseBundle,
   type ShowcaseBundleSource,
 } from "@/lib/adapters/preferred-showcase-source";
@@ -30,7 +31,9 @@ const bundleCache = new Map<string, Promise<LoadedShowcaseBundle>>();
 function loadEntry(entry: ShowcaseRegistryEntry): Promise<LoadedShowcaseBundle> {
   const existing = bundleCache.get(entry.id);
   if (existing) return existing;
-  const pending = loadPreferredShowcaseBundle(entry).catch((error: unknown) => {
+  const pending = loadPreferredShowcaseBundle(entry, fetch, {
+    accessToken: readOperatorShowcaseAccessToken(),
+  }).catch((error: unknown) => {
     bundleCache.delete(entry.id);
     throw error;
   });
