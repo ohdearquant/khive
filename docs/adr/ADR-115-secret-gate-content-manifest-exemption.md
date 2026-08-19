@@ -691,8 +691,9 @@ Acceptance has two explicit rungs.
    empty, so no ordinary runtime write can become newly eligible and externally observable behavior
    remains unchanged. An in-process, crate-private harness is sufficient for this rung. It must
    exercise the manifest types and digest parity, one-snapshot lookup, runtime-owned finalization,
-   reserved-key enforcement, typed outcomes, atomic successful admission, rollback faults, and the
-   legacy knowledge-admission behavior. It may use only the test-only fixture defined in §2 to
+   reserved-key enforcement, typed outcomes, atomic successful admission, rollback faults, the
+   deterministic failure constructions of §4 including the second-order failure of the best-effort
+   failure audit, and the legacy knowledge-admission behavior. It may use only the test-only fixture defined in §2 to
    exercise a non-empty lookup. Passing this rung accepts the implementation mechanism; it does not
    authorize a non-empty operator manifest.
 2. **Non-empty operator-manifest activation.** Before any release, configuration, or artifact may
@@ -739,19 +740,32 @@ flowchart LR
 
 ### 3. Initial implementation scope and follow-on obligations
 
-The initial slice covers only the runtime finalization boundary for final entity and note mutations,
-including direct code-ingest entity and note candidates, plus the legacy knowledge-admission path.
-The knowledge path retains its existing scanner behavior, rejects the reserved property wherever it
-accepts or carries properties, and cannot consume an exemption in this slice. This is a scope
-reduction for sequencing, not a deletion of the base ADR's target architecture.
+The initial slice's admission-capable set is exactly the following, each routed through the shared
+runtime finalizer, with the durable stamp written into the final stored `properties` object and the
+atomic success event keyed to the target's identity:
+
+- entity create, update, and bulk mutations, including direct code-ingest entity candidates;
+- note create, update, and atomic-message mutations, including direct code-ingest note candidates.
+
+Merge and restore operations participate only by routing a final entity or note candidate through
+that same finalizer; an operation that cannot do so is excluded and follows its legacy path.
+Everything else is reservation-only in this slice: knowledge atoms and domains, proposal-only
+metadata, edge metadata, merge reasons, embedding-content overrides, and any field not present in
+the final stored entity or note use the unchanged blocking scanner and can never receive a stamp.
+Deletes preserve or remove existing rows without fresh exemption. The legacy knowledge-admission
+path retains its existing scanner behavior, rejects the reserved property wherever it accepts or
+carries properties, and cannot consume an exemption in this slice. This is a scope reduction for
+sequencing, not a deletion of the base ADR's target architecture. This enumeration and the first
+obligation below are the same list read in two directions: #2057 owns every property-bearing path
+not named admission-capable here.
 
 The following exclusions are named obligations. Each issue reference must be replaced with a real
 tracked issue before this amendment merges:
 
-- **Complete full write-inventory finalization.** Route every remaining property-bearing runtime,
-  pack, proposal-materialization, curation, merge, restore, and direct-write path named in Decision
-  §4 through the shared finalization and reservation contract. **Owner reference:**
-  `(follow-on issue: #2057)`.
+- **Complete full write-inventory finalization.** Route every property-bearing runtime, pack,
+  proposal-materialization, curation, merge, restore, and direct-write path named in Decision §4
+  that is not in this section's admission-capable enumeration through the shared finalization and
+  reservation contract. **Owner reference:** `(follow-on issue: #2057)`.
 - **Extend knowledge admission beyond the legacy path.** Define the durable stamp, target identity,
   atomic event representation, and readback contract before a knowledge record can consume an
   exemption. **Owner reference:** `(follow-on issue: #2058)`.
@@ -768,6 +782,12 @@ tracked issue before this amendment merges:
 An excluded surface follows its unchanged blocking or masking behavior. It cannot consume a
 manifest match, synthesize the reserved stamp, or claim coverage under either acceptance rung.
 Narrowing the implementation without its named obligation is non-conforming.
+
+The reserved-key reservation is not deferred. During the initial slice, every properties-bearing
+write path — admission-capable or excluded — must reject caller creation, replacement, merge, or
+removal of the reserved property, exactly as Decision §4 of the base text requires. The named
+obligations defer finalization routing, durable stamps, and exemption consumption for the excluded
+paths; they do not defer, narrow, or supersede the reservation rule on any path.
 
 ### 4. Failure observability and load-bearing atomicity
 
@@ -790,6 +810,15 @@ fails, the same code path **must emit a structured log line through a store-inde
 That log line must name the typed failure class and must not include submitted content or a detector
 excerpt. The independent log is evidence of an audit gap, not a substitute for a durable success
 event and not evidence that a record was admitted.
+
+These requirements are testable by construction. The implementation must expose an injectable
+failure seam for each of `ManifestInvalid`, `AuditFailed`, `StampFailed`, and `RecordWriteFailed`,
+and an injectable store-independent log sink. The first acceptance rung must include a deterministic
+construction for each typed failure, plus the second-order case in which the best-effort failure
+audit itself fails: the harness captures the structured log record through the injected sink and
+asserts that it names the typed failure class, that it contains no submitted content and no detector
+excerpt, and that no record, stamp, or success event survives the rollback, before the typed failure
+outcome is returned to the caller.
 
 The following invariant is load-bearing and unchanged: **no admitted record may survive a stamp,
 audit, or record-write failure.** Implementations must not weaken rollback in order to make failure
