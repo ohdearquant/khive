@@ -19,6 +19,14 @@ SOURCE_REVISION = subprocess.run(
     capture_output=True,
     text=True,
 ).stdout.strip()
+_parent = subprocess.run(
+    ["git", "rev-parse", "--verify", "HEAD~1"],
+    cwd=REPO_ROOT,
+    check=False,
+    capture_output=True,
+    text=True,
+)
+PARENT_REVISION = _parent.stdout.strip() if _parent.returncode == 0 else None
 
 
 def load_module():
@@ -226,7 +234,7 @@ class WriterCensusTests(unittest.TestCase):
         self.assertNotIn("entries", report)
         self.assertIn("comm.read", " ".join(report["errors"]))
 
-    def test_artifact_revision_mismatch_voids_run(self):
+    def test_unreachable_observed_revision_voids_run_via_control(self):
         report = self.census.build_report(
             manifest(),
             inventory(
@@ -239,7 +247,72 @@ class WriterCensusTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "VOID")
         self.assertNotIn("entries", report)
-        self.assertIn("revision", " ".join(report["errors"]))
+        self.assertIn("control", " ".join(report["errors"]))
+
+    def test_revision_mismatch_reverifies_evidence_at_observed_revision(self):
+        if PARENT_REVISION is None:
+            self.skipTest("HEAD~1 unavailable (shallow clone)")
+        pinned_elsewhere = manifest()
+        pinned_elsewhere["source_revision"] = PARENT_REVISION
+        report = self.census.build_report(
+            pinned_elsewhere,
+            inventory(
+                ("comm", "comm.read"),
+                ("memory", "memory.recall"),
+                packs=("comm", "memory", "brain"),
+            ),
+            observed_revision=SOURCE_REVISION,
+        )
+
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["control"]["status"], "PASS")
+        self.assertIn(
+            "re-verified at the observed revision",
+            " ".join(report["warnings"]),
+        )
+
+    def test_absent_observed_revision_still_voids_run(self):
+        report = self.census.build_report(
+            manifest(),
+            inventory(
+                ("comm", "comm.read"),
+                ("memory", "memory.recall"),
+                packs=("comm", "memory", "brain"),
+            ),
+            observed_revision=None,
+        )
+
+        self.assertEqual(report["status"], "VOID")
+        self.assertIn("absent or invalid", " ".join(report["errors"]))
+
+    def test_no_writer_without_surviving_evidence_fails_closed(self):
+        stripped = manifest()
+        stripped["overrides"]["memory.recall"] = {
+            "classification": "NO-WRITER",
+            "reason": "declared read-only",
+            "trace_complete": True,
+            "inherit_default_paths": False,
+            "paths": [],
+        }
+        report = self.census.build_report(
+            manifest=stripped,
+            observed_inventory=inventory(
+                ("comm", "comm.read"),
+                ("memory", "memory.recall"),
+                packs=("comm", "memory", "brain"),
+            ),
+            observed_revision=SOURCE_REVISION,
+        )
+
+        self.assertEqual(report["status"], "OK")
+        entry = next(
+            row for row in report["entries"] if row["verb"] == "memory.recall"
+        )
+        self.assertEqual(entry["classification"], "UNKNOWN")
+        self.assertIn(
+            "no verified read-only evidence",
+            entry["reason"],
+        )
 
     def test_ci_lint_phase_runs_writer_census_contracts(self):
         ci = (REPO_ROOT / "scripts" / "ci.sh").read_text()

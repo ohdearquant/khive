@@ -348,6 +348,11 @@ def _effective_classification(
         for path in paths
     ):
         return "UNKNOWN"
+    if declared == "NO-WRITER" and (
+        not paths
+        or all(path["classification"] == "UNKNOWN" for path in paths)
+    ):
+        return "UNKNOWN"
     return declared
 
 
@@ -357,6 +362,7 @@ def _public_entry(
     pack: str,
     pinned: bool,
     repo_root: Path,
+    evidence_revision: str,
 ) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = []
     if not pinned:
@@ -382,7 +388,7 @@ def _public_entry(
         else:
             paths = list(override["paths"])
     paths, evidence_warnings = _verified_paths(
-        paths, repo_root, manifest["source_revision"], verb
+        paths, repo_root, evidence_revision, verb
     )
     warnings.extend(evidence_warnings)
 
@@ -401,7 +407,7 @@ def _public_entry(
             target_paths, target_warnings = _verified_paths(
                 target_paths,
                 repo_root,
-                manifest["source_revision"],
+                evidence_revision,
                 f"{verb} -> {target}",
             )
             warnings.extend(target_warnings)
@@ -427,8 +433,13 @@ def _public_entry(
     effective = _effective_classification(declared, all_writer_paths)
     reason = selected["reason"]
     if effective != declared:
-        if declared == "NO-WRITER":
+        if declared == "NO-WRITER" and any(
+            path["classification"] in {"WRITER", "WRITER-COND"}
+            for path in all_writer_paths
+        ):
             reason = "declared NO-WRITER is contradicted by verified writer evidence"
+        elif declared == "NO-WRITER":
+            reason = "declared NO-WRITER carries no verified read-only evidence"
         else:
             reason = f"declared {declared} lacks verified matching writer evidence"
         warnings.append(f"{verb}: {reason}")
@@ -480,6 +491,8 @@ def build_report(
         f"configured pack {pack!r} is absent from the observed inventory"
         for pack in missing_packs
     ]
+    warnings: list[str] = []
+    evidence_revision = checked["source_revision"]
     if (
         not isinstance(observed_revision, str)
         or re.fullmatch(r"[0-9a-f]{40}", observed_revision) is None
@@ -488,16 +501,18 @@ def build_report(
             "observed artifact revision is absent or invalid; census is void"
         )
     elif observed_revision != checked["source_revision"]:
-        errors.append(
-            f"observed artifact revision {observed_revision} does not match "
-            f"manifest source revision {checked['source_revision']}; census is void"
+        evidence_revision = observed_revision
+        warnings.append(
+            f"observed artifact revision {observed_revision} differs from "
+            f"manifest source revision {checked['source_revision']}; every "
+            "evidence pattern was re-verified at the observed revision"
         )
-    warnings: list[str] = []
     pinned_owner = checked["public_owner"]
     entries: list[dict[str, Any]] = []
     for verb, pack in sorted(observed.items()):
         entry, entry_warnings = _public_entry(
-            checked, verb, pack, verb in pinned_owner, repo_root
+            checked, verb, pack, verb in pinned_owner, repo_root,
+            evidence_revision,
         )
         entries.append(entry)
         warnings.extend(entry_warnings)
