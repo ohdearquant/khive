@@ -471,8 +471,9 @@ resolution, when `default_output_format` is still `None`.
 
 ### Shape detection sequence
 
-The shape detector operates on the final post-presentation `serde_json::Value`, before the
-redundancy-reduction pass runs. Detection precedence:
+The shape detector operates on the final post-presentation `serde_json::Value` after the
+redundancy-reduction pass has run (or on the unreduced value when that pass is skipped — see the
+next subsection). Detection precedence:
 
 1. If the pack has registered a bespoke renderer for this verb and this format, invoke it.
 2. If the value contains a key whose value is a JSON array of two or more objects sharing a

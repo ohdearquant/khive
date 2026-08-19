@@ -1688,6 +1688,295 @@ async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
     );
 }
 
+// ---- T2c: Cross-backend link's authorize() gate error stays sanitized on the wire ----
+
+/// A gate that allows its first four checks — the test's own entity-setup
+/// authorize call, the MCP dispatch's own top-level namespace authorize check
+/// (`VerbRegistry::dispatch_intercepted_with_metadata_with_identity`, which
+/// runs once before the coordinator ever sees the request), and the two
+/// `locate_endpoint` probe-authorize calls `link_cross_backend` issues
+/// against this backend for the source and target ids before it authorizes
+/// the link itself — and then fails every subsequent check with a backend
+/// error carrying connection-string-shaped detail, simulating a gate backend
+/// outage discovered during `link_cross_backend`'s own
+/// `src_runtime.authorize(...)` call (`crates/kkernel/src/coordinator/dispatch.rs`).
+#[derive(Debug)]
+struct ErrorAfterSetupCallsGate {
+    cause: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl khive_runtime::Gate for ErrorAfterSetupCallsGate {
+    fn check(
+        &self,
+        _req: &khive_runtime::GateRequest,
+    ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call < 4 {
+            Ok(khive_runtime::GateDecision::allow())
+        } else {
+            Err(khive_runtime::GateError::Internal(self.cause.clone()))
+        }
+    }
+}
+
+fn memory_runtime_gate_erroring_after_first_call_with(cause: String) -> Arc<KhiveRuntime> {
+    Arc::new(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            gate: Arc::new(ErrorAfterSetupCallsGate {
+                cause,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime with gate-erroring-after-setup-calls gate"),
+    )
+}
+
+/// Regression for a second production disclosure path, exercised through the
+/// real MCP wire boundary rather than the coordinator's Rust API directly: a
+/// `GateError` raised inside `link_cross_backend`'s own `authorize()` call on
+/// the source backend must never put backend `Display` text (which can embed
+/// connection strings or credentials) into the per-operation error a caller
+/// receives from `request(ops="link(...)")`. Only the stable classified
+/// `wire_reason()` may cross that boundary; the full error must still land in
+/// the server-side `tracing::warn!` emitted by `KhiveRuntime::authorize`.
+///
+/// Dispatches through `KhiveMcpServer::dispatch_request_local`, which routes
+/// `link` through `dispatch_via_coordinator_inner` ->
+/// `VerbRegistry::dispatch_intercepted_with_identity` ->
+/// `SubstrateCoordinatorService::link` -> `DispatchFailure::from_runtime` ->
+/// the serialized MCP response — the same chain a real MCP client's `link`
+/// call goes through in multi-backend mode.
+#[tokio::test]
+async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wire() {
+    const CANARY: &str = "postgres://svc:not-a-real-secret@internal-host";
+
+    let rt_main = memory_runtime_gate_erroring_after_first_call_with(CANARY.to_string());
+    let rt_lore = memory_runtime();
+    let ns = Namespace::local();
+
+    // Entity creation on "main" consumes the gate's first free `Allow` call.
+    let tok_main = rt_main.authorize(ns.clone()).expect("setup authorize");
+    let src = rt_main
+        .create_entity(
+            &tok_main,
+            "project",
+            None,
+            "SourceProject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T2c: create source on main");
+
+    let tok_lore = rt_lore.authorize(ns.clone()).expect("setup authorize lore");
+    let tgt = rt_lore
+        .create_entity(
+            &tok_lore,
+            "concept",
+            None,
+            "TargetConcept",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T2c: create target on lore");
+
+    let server = two_backend_server_with_packs(Arc::clone(&rt_main), Arc::clone(&rt_lore), &["kg"]);
+
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    // The gate's four free `Allow` calls are already spent by this point:
+    // entity setup, this dispatch's own top-level namespace check, and
+    // `locate_endpoint`'s probe-authorize for source and target. The real
+    // `src_runtime.authorize(...)` inside `link_cross_backend` is the fifth
+    // call on "main" and now errors.
+    let ops = format!(
+        r#"link(source_id="{}", target_id="{}", relation="implements")"#,
+        src.id, tgt.id
+    );
+    let raw = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops,
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("T2c: dispatch must produce a response envelope");
+    drop(guard);
+    let logs = captured.contents();
+
+    let response: serde_json::Value =
+        serde_json::from_str(&raw).expect("T2c: response must be valid JSON");
+    let op = &response["results"][0];
+    assert_eq!(
+        op["ok"].as_bool(),
+        Some(false),
+        "T2c: link op must fail closed on the wire: {response}"
+    );
+    let wire_err = op["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("T2c: MCP-visible error must be a string: {response}"))
+        .to_string();
+
+    assert!(
+        !wire_err.contains(CANARY),
+        "T2c: MCP-visible link error must not embed backend error text: {wire_err:?}"
+    );
+    assert!(
+        !wire_err.contains("svc") && !wire_err.contains("internal-host"),
+        "T2c: MCP-visible link error must not embed backend error fragments: {wire_err:?}"
+    );
+    assert!(
+        wire_err.contains("gate backend unavailable"),
+        "T2c: MCP-visible link error must carry the stable classified reason: {wire_err:?}"
+    );
+
+    assert!(
+        !logs.contains(CANARY),
+        "T2c: backend error text must not reach the server-side log unmasked: {logs}"
+    );
+    assert!(
+        !logs.contains("not-a-real-secret"),
+        "T2c: the credential fragment must not reach the server-side log: {logs}"
+    );
+    assert!(
+        logs.contains("***MASKED***"),
+        "T2c: the gate failure log must still record the masked backend error: {logs}"
+    );
+}
+
+// ---- T2d: Real RegoGate evaluator failure stays sanitized on the wire ----
+
+/// Regression for the rego-backed `Gate` sanitization fix: `RegoGate::check`
+/// used to fold `regorus`'s raw evaluator-error text directly into a
+/// `GateDecision::deny(...)` reason, which crossed both the MCP wire and the
+/// server-side log unmasked whenever the offending value happened to be
+/// caller-supplied. It now returns `Ok(GateDecision::Deny)` with a static
+/// classified reason that never embeds evaluator output, so the failure
+/// surfaces on the wire as an ordinary `RuntimeError::PermissionDenied` and
+/// the audit log records only that static reason — there is nothing
+/// secret-bearing left to mask on this path.
+///
+/// Dispatches through `KhiveMcpServer::dispatch_request_local` with no
+/// coordinator attached (single-backend), the same real MCP wire boundary as
+/// T2c, but with a genuine `RegoGate` instead of a synthetic `Gate` impl —
+/// this is what actually exercises `khive-gate-rego/src/gate.rs`'s
+/// evaluator-failure branch rather than the generic classify+mask plumbing
+/// T2c already covers.
+#[tokio::test]
+async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
+    use khive_gate_rego::RegoGate;
+
+    // FAKE key: real AKIA/AWS shape, invented suffix — matches the masking
+    // detector so a leak would be caught either as raw canary text or as a
+    // missing "***MASKED***" marker (see khive-gate-rego's own tests for the
+    // convention).
+    const CANARY: &str = "AKIAFAKEKEY000000000";
+
+    // `input.args.canary` is a string; `1 + <string>` is a regorus type
+    // error raised at eval time whose message embeds the offending value
+    // verbatim — exactly the evaluator-failure shape this fix must sanitize.
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        decision := 1 + input.args.canary
+    "#;
+    let gate = Arc::new(RegoGate::from_policy_str(policy).expect("policy compiles"));
+    let rt = Arc::new(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            gate,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("T2d: memory runtime with rego gate"),
+    );
+
+    let server = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+        packs_registry(Arc::clone(&rt), &["kg"]),
+        "local",
+        "test-rego-evaluator-failure",
+    );
+
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    let ops = format!(r#"list(kind="entity", canary="{CANARY}")"#);
+    let raw = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops,
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("T2d: dispatch must produce a response envelope");
+    drop(guard);
+    let logs = captured.contents();
+
+    let response: serde_json::Value =
+        serde_json::from_str(&raw).expect("T2d: response must be valid JSON");
+    let op = &response["results"][0];
+    assert_eq!(
+        op["ok"].as_bool(),
+        Some(false),
+        "T2d: list op must fail closed on the wire: {response}"
+    );
+    let wire_err = op["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("T2d: MCP-visible error must be a string: {response}"))
+        .to_string();
+
+    assert!(
+        !wire_err.contains(CANARY),
+        "T2d: MCP-visible error must not embed the evaluator's raw error text: {wire_err:?}"
+    );
+    assert!(
+        wire_err.contains("policy evaluation failed"),
+        "T2d: MCP-visible error must carry the static classified reason: {wire_err:?}"
+    );
+    // A `RegoGate` evaluator failure is a policy denial (`Ok(GateDecision::Deny)`), not a
+    // gate infrastructure outage — it must surface as `RuntimeError::PermissionDenied`'s
+    // wire shape ("permission denied for verb ..."), never
+    // `RuntimeError::GateUnavailable`'s ("gate unavailable for verb ...").
+    assert!(
+        wire_err.starts_with("permission denied for verb"),
+        "T2d: MCP-visible error must have the PermissionDenied shape, not GateUnavailable: {wire_err:?}"
+    );
+
+    // Nothing secret-bearing is emitted on this path anymore — the deny
+    // reason is a static string, so there is no masked-marker expectation
+    // here. The masking machinery itself stays covered by T2c above.
+    assert!(
+        !logs.contains(CANARY),
+        "T2d: canary must not reach the server-side log: {logs}"
+    );
+}
+
 // ---- T3: Fan-out merged from multiple backends ----
 
 /// T3: Fan-out entity search over two backends merges results from both.

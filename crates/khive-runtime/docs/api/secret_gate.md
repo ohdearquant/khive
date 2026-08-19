@@ -295,6 +295,116 @@ Bare base64 tokens of those lengths WITHOUT the `sha<N>-` prefix are NOT allowli
 without the prefix, so the explicit prefix is required to avoid false-negative credential
 escapes.
 
+## check_entropy_heuristic — per-token flagging sequence
+
+For each token, in order:
+
+1. **UUID / content-hash near trigger.** Both exact-shape checkers (`is_uuid_canonical`,
+   `is_base64_content_hash`) require the WHOLE candidate to match, so `value_candidates` is used
+   instead of the raw token to reach a credential glued to storage syntax (`api_key=<uuid>`,
+   `(<uuid>)`, `{"api_key":"<uuid>"}`, a doubled assignment, a trailing sentence period, or a
+   label itself containing `:`/`=`) — `strip_delimiters` only trims outer punctuation, not an
+   internal separator from an assignment form. `value_candidates` is used only for this pair of
+   checks; it does not replace `token` for entropy, hex, or structured-identifier checks, none of
+   which require an exact shape match. This is a small bounded iteration over separator positions
+   in one token, not an allocation-heavy scan. Off-trigger, a UUID or content hash is allowlisted
+   outright.
+2. **Pure hex off-trigger** is allowlisted (git SHA, checksum digests). Trigger-adjacent hex
+   requires an explicit VCS coordinate marker (`commit`, `revision`, `rev`, `sha`) to earn the
+   same exemption, and only when the surrounding clause carries no credential label (`api key
+   value is commit <hex>` is a labeled credential wearing a marker, not a VCS citation). The
+   exemption is a flag over the hex-credential-shape checks only, never an early skip of fragment
+   reconstruction — an exempted anchor that skipped reconstruction would let a marker-adjacent
+   fragment hide a split credential. The bare-marker-word form (`commit <hex>`) is skipped
+   entirely via `continue`, since a fixed marker word is not attacker-controlled material and
+   letting it anchor fragment reconstruction would re-accumulate its own legitimate neighboring
+   revision; the hex value itself is a separate token checked on its own iteration.
+3. **Hex credential shape near trigger.** The entropy heuristic cannot catch hex API keys (AWS
+   secret access key, Stripe test keys): hex's alphabet maxes at log2(16) = 4.0 bits/char, always
+   below `ENTROPY_THRESHOLD` (4.5). A credential-shaped hex token (32/40/64/128 chars,
+   `HEX_CREDENTIAL_LENGTHS`) near a trigger word is flagged directly.
+4. **Per-run hex/entropy re-check (issue #1044).** A genuine credential can dilute below the
+   whole-token-average checks above when it shares a whitespace token with low-entropy filler
+   segments (`vault/<payload>/rotate.md`). Decomposing the token on every non-alphanumeric
+   separator (the same split `is_structured_identifier` uses) and re-running the hex-length and
+   entropy checks against each run independently closes that gap. Only `MIN_ENTROPY_LEN`+ runs
+   are considered — the #1040 measurement corpus confirmed no real path false positive contains a
+   single run that long. This does not touch the `is_structured_identifier` exemption itself,
+   which stays scoped to `!near_trigger`; a run this long clearing its own check is evidence
+   independent of that exemption's word-shape rule.
+5. **Normalized hex concatenation (issue #1062).** The per-run loop above still misses a
+   credential hex payload split into multiple runs each individually below `MIN_ENTROPY_LEN`
+   (e.g. two 20-char hex runs joined by `/`). Concatenating consecutive pure-hex runs (dropping
+   separators) and re-checking the combined length against `HEX_CREDENTIAL_LENGTHS` closes this
+   without widening the allowlist.
+6. **Multi-fragment bridge (issue #1062, Unicode variant).** A non-ASCII separator (e.g. U+200B)
+   is a tokenizer delimiter, so it splits the payload into separate tokens instead of leaving it
+   inside one — the concatenation check above never sees the halves together. Bridging only one
+   adjacent pair and bounding the gap by raw byte length is insufficient (repeating the delimiter
+   defeats a byte-length bound, and a three-way split defeats single-pair bridging).
+   `bridge_fragment_chain` fixes both by walking outward in both directions across a bounded
+   chain of fragments (see [Bridge fragment reconstruction](#bridge-fragment-reconstruction)); a
+   delimiter-only token between two gaps is transparent to the walk (absorbed as glue, see
+   `is_delimiter_only_token`). Every fragment found while extending from the anchor must itself
+   be bridge-fragment-shaped (alphanumeric, `MIN_BRIDGE_FRAGMENT_LEN`+) — this stops the walk at
+   a short trigger/glue word (`key`, `api`, `for`) rather than dragging prose into the
+   reconstruction. The anchor itself is included unconditionally, so a shape exemption able to
+   admit a long non-fragment anchor must run after this reconstruction, not before.
+
+   **Actual guarantee** (narrower than "every three-or-more-way split is reconstructed"):
+   coverage extends to splits of up to `MAX_BRIDGE_FRAGMENTS` real fragments (each individually
+   meeting `MIN_BRIDGE_FRAGMENT_LEN`), where a single gap between two fragments may be any byte
+   length but spans at most `MAX_BRIDGE_GLUE_TOKENS` delimiter-only tokens per probe direction. A
+   split into more fragments, into fragments individually below the length floor, or across more
+   glue tokens in one gap, is an accepted residual limitation of the local-neighborhood bound —
+   per ADR-096 / ADR-115 this gate is accidental-persistence hygiene on a single-principal
+   same-uid host, not defense against a same-uid adversary hand-splitting a credential to evade
+   it (that adversary can write the DB directly). This module does not itself establish that the
+   host is same-uid; it inherits that from the daemon's peer-credential check
+   (`khive-runtime/src/daemon.rs`, refusal of any peer uid other than its own before the first
+   frame is read) — if that refusal is ever removed or weakened, this residual limitation stops
+   being residual. See the `allows_seven_way_hex_split_beyond_fragment_cap_documented_limitation`
+   and `allows_six_way_sub_floor_hex_split_documented_limitation` tests.
+
+   The bridged chain is checked two ways: `contains_normalized_hex_credential` over fragments
+   joined by a plain space (a non-alphanumeric separator, so it accumulates only genuinely
+   adjacent hex runs the same way it does for one token's internal `/`-split runs), and
+   separately the fragments concatenated WITHOUT a separator against the same whole-token entropy
+   decision a single-token high-entropy candidate must clear — this catches a
+   base64/base64url-shaped credential split by the same delimiter mechanism, which isn't pure hex
+   so the hex-length check alone misses it. A vcs-exempt anchor skips reconstruction from itself
+   (else the chain would re-accumulate the anchor's own legitimate 40-hex and re-flag every
+   benign marker-adjacent revision); a genuinely split credential hiding one fragment behind a
+   marker is still caught because every OTHER fragment anchors its own chain and accumulates the
+   exempted fragment's hex into the total (`blocks_split_hex_credential_with_marker_adjacent_fragment`).
+7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label`)
+   applies after all of the above, never before — a path-shaped anchor must not be able to skip a
+   chain that would otherwise reconstruct a blocked credential.
+8. **Structured-identifier exemption** off-trigger only — must come after the UUID/content-hash
+   and hex-credential-token checks (neither of which it weakens) and before the entropy
+   computation, since an identifier can exceed `ENTROPY_THRESHOLD` on Shannon entropy alone.
+
+## Bridge fragment reconstruction
+
+`bridge_fragment_chain` checks whether a trigger-adjacent short token is one piece of a
+delimiter-split credential by walking outward and concatenating neighboring fragments.
+`MAX_BRIDGE_FRAGMENTS` bounds the walk by FRAGMENT COUNT, deliberately not by gap byte length: a
+byte-length gap bound is defeated by repeating the delimiter (e.g. three U+200B in a row instead
+of one), while a fragment count cannot be bypassed that way since repeating a delimiter inside a
+single gap never creates a new fragment. Each extension consumes one real fragment plus up to
+`MAX_BRIDGE_GLUE_TOKENS` delimiter-only glue tokens crossed to reach it, and the walk stops the
+moment a gap contains an ASCII alphanumeric character — this keeps reconstruction to a small
+local neighborhood rather than a document-wide scan, even for a document seeded with a long run
+of punctuation-only tokens (`--- --- --- ...`).
+
+`MIN_BRIDGE_FRAGMENT_LEN` is the shortest bare token treated as a plausible fragment (the
+`is_bridge_candidate` check in `check_entropy_heuristic`). Below this length, common short words
+(`dead`, `beef`, `cafe`, or their base64-alphabet equivalents) would let ordinary prose feed the
+bridge checks. It applies equally to hex and generic alphanumeric fragments — a
+base64/base64url-shaped credential half is exactly as plausible a bridge candidate as a hex half;
+the entropy/length decision made over the reconstructed chain, not this floor, is what keeps
+ordinary short prose fragments from being flagged.
+
 ## is_structured_identifier
 
 A structured identifier decomposes into two or more maximal ASCII-alphanumeric "runs" separated

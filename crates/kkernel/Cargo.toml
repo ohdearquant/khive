@@ -61,6 +61,7 @@ libc = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+khive-gate-rego = { version = "0.7.0", path = "../khive-gate-rego" }
 
 [features]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
