@@ -1,8 +1,8 @@
 //! Batch, cursor-based git-history ingester (ADR-088 §5). One-shot: walks
 //! local git history plus (optionally) `gh`-fetched issues and pull
 //! requests, and writes `commit` / `issue` / `pull_request` notes through
-//! the standard `create` verb. See crates/khive-pack-git/docs/api/ingest.md for
-//! the full module overview.
+//! the standard `create` verb. See crates/khive-pack-git/docs/api/ingest.md
+//! and crates/khive-pack-git/docs/ingest.md for the full design notes.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -309,14 +309,9 @@ fn record_write_failure(
         .push(format!("{verb} {record_kind} {record_key}: {error}"));
 }
 
-/// Overwrite a walker's source slot with `StoppedEarly(reason)` from an
-/// end-of-walk arm. Seed invariant: every end-of-walk arm
-/// (`!window_complete` / `cursor_stalled`) is reachable only after at least
-/// one successful page fetch, and each walk seeds its slot on its FIRST
-/// successful fetch — so the slot is `Some` on every path today. The
-/// `None` arm keeps that a release-mode soft fallback: it constructs the
-/// state instead of panicking, with a debug tripwire for the
-/// instrumentation gap.
+/// Overwrite a walker's source slot with `StoppedEarly(reason)` at an
+/// end-of-walk arm. See
+/// crates/khive-pack-git/docs/ingest.md#seed-invariant-for-pin_stopped_early.
 fn pin_stopped_early(slot: &mut Option<IngestSourceState>, reason: String) {
     match slot {
         Some(state) => *state = IngestSourceState::StoppedEarly(reason),
@@ -418,22 +413,16 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                 {
                     Ok(()) => {}
                     Err(e) => {
-                        // The walker is fallible AFTER visiting records
-                        // (continuation-page fetches, per-record existence
-                        // lookups, and the final cursor write can all fail
-                        // mid/post-walk). Only a failure on the first page
-                        // fetch means the source was never walked; the
-                        // walker signals that case by leaving its
-                        // `pull_requests` state unset. Anything else
-                        // preserves the state the walker already wrote.
+                        // Distinguishes a never-walked source (first-page
+                        // failure) from walked-then-failed. See
+                        // crates/khive-pack-git/docs/ingest.md#walker-exit-states.
                         let walked = matches!(
                             report.sources.pull_requests.as_ref(),
                             Some(IngestSourceState::Completed | IngestSourceState::StoppedEarly(_))
                         );
                         if walked {
-                            // Align the prose with the structured state:
-                            // the walk happened, so nothing was "skipped" —
-                            // name how far it got before the pass failed.
+                            // Nothing was "skipped" once the walk began — name
+                            // how far it got before the pass failed.
                             let visited = report.prs_ingested + report.prs_skipped_existing;
                             let noun = if visited == 1 { "record" } else { "records" };
                             report.warnings.push(format!(
@@ -460,13 +449,9 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                                         "; pass then failed after the walk: {e}"
                                     ));
                                 }
-                                // A walk that completed and then failed
-                                // (only the post-loop cursor write can do
-                                // this) is downgraded to stopped-early:
-                                // the records were walked but the pass's
-                                // durability is unproven, and `completed`
-                                // would feed `history_exhausted` a total
-                                // -coverage claim the failure contradicts.
+                                // A completed walk whose pass then fails is
+                                // downgraded to stopped-early so `completed`
+                                // never outlives an unproven pass.
                                 Some(state @ IngestSourceState::Completed) => {
                                     *state = IngestSourceState::StoppedEarly(format!(
                                         "walk completed but the pass then failed: {e}"
@@ -474,14 +459,9 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                                 }
                                 Some(IngestSourceState::Skipped(_)) | None => {}
                             }
-                            // Walked-then-failed leaves the walk's
-                            // durability unproven (e.g. the cursor write
-                            // never landed): the resume loop must not
-                            // treat the source as finished. A first-fetch
-                            // failure (the `!walked` arm) pins nothing —
-                            // it is deterministic (`no git remotes found`)
-                            // and `done` keeps its budget-cursor meaning
-                            // for such repos.
+                            // Walked-then-failed leaves durability unproven,
+                            // so the resume loop must not treat the source as
+                            // finished; a first-fetch failure pins nothing.
                             report.done = false;
                             gh_walk_failed_after_walk = true;
                         }
@@ -604,16 +584,9 @@ pub(crate) async fn run_ingest_with_commit_recovery(
         {
             Ok(()) => {}
             Err(e) => {
-                // `ingest_commits` records its source slot at every walker
-                // exit, so a `Some` slot beside an Err means the walk ran
-                // (possibly to completion) and the pass failed AFTER it —
-                // the final cursor write is the canonical case. Handle that
-                // in-band exactly like the gh walkers: downgrade to
-                // stopped-early and report, never abort the whole ingest
-                // over a failure that leaves the walked records landed. A
-                // `None` slot is a pre-walk failure (snapshot recovery,
-                // cursor read) and stays a hard error — the recovery
-                // contract depends on those surfacing.
+                // A `Some` slot beside an Err means the walk ran and the pass
+                // failed after it; a `None` slot is a pre-walk hard error. See
+                // crates/khive-pack-git/docs/ingest.md#walker-exit-states.
                 if report.sources.commits.is_some() {
                     match report.sources.commits.as_mut() {
                         Some(IngestSourceState::StoppedEarly(reason)) => {
@@ -649,21 +622,10 @@ pub(crate) async fn run_ingest_with_commit_recovery(
         report.done = false;
     }
 
-    // Fold the walk-recorded completion flags into the per-source tri-state
-    // (issue #1617). Every walker records its own state by the time it
-    // returns (PR/issue walkers pre-seed `stopped_early` when the walk
-    // begins and upgrade on completion; `ingest_commits` writes its state
-    // at every exit), so each arm below is a release-mode belt-and-braces
-    // fallback for a walker that returned without recording anything — an
-    // instrumentation gap, not a normal stop, and its reason says so
-    // loudly instead of dressing the gap up as one. Fabrication risk, named
-    // for the next maintainer: in release builds the `debug_assert!` is a
-    // no-op and these arms synthesize a state from the bare completion flag
-    // alone — a future walker that sets a completion flag WITHOUT recording
-    // a source state would silently report a fabricated `completed` /
-    // `stopped_early` here with no real reason behind it. Every walker exit
-    // must record its own state; these arms exist only so a gap degrades to
-    // a loud placeholder instead of leaving the slot empty.
+    // Release-mode belt-and-braces fallback for a walker that returned
+    // without recording its source state — an instrumentation gap, not a
+    // normal stop. See crates/khive-pack-git/docs/ingest.md#walker-exit-states
+    // for the fabrication risk this guards against.
     if report.sources.pull_requests.is_none() && opts.include.pull_requests {
         debug_assert!(
             false,
@@ -846,14 +808,9 @@ async fn link_references(
 }
 
 /// Resolve the exact GitHub `owner/repo` that `gh` can access for this
-/// checkout. The target is derived from the canonical remote source when the
-/// verb has one, otherwise from the checkout's configured `origin`. It is
-/// passed to `gh repo view` explicitly: argument-less repository selection is
-/// forbidden because `gh repo set-default` or an alternate remote could
-/// otherwise redirect ingestion into a different repository.
-///
-/// Failure strings are stable and credential-safe. Neither the origin URL nor
-/// `gh` stderr is copied into the public ingest report.
+/// checkout, passed explicitly to `gh repo view` (never argument-less
+/// selection). Failure strings are stable and credential-safe — see the
+/// module overview in crates/khive-pack-git/docs/api/ingest.md.
 fn probe_gh_repository(
     repo: &Path,
     expected: Option<&str>,
@@ -1151,31 +1108,9 @@ async fn find_document_for_path(
 }
 
 /// Load the live code-map module index for the exact repository snapshot
-/// being digested. ADR-085's `source_path` is relative to a repository root,
-/// so path alone is not a safe cross-repository join key. Requiring the
-/// module's `source_revision` to equal the snapshot HEAD keeps unrelated maps
-/// out; a path with more than one matching live row remains ambiguous and is
-/// deliberately represented by `None` rather than selecting or annotating an
-/// arbitrary candidate. That `None` folds two distinct shapes, both
-/// counted in the same skip counter: (a) two or more rows, including two or
-/// more rows with parseable ids and the case where at most one has a
-/// parseable id (true ambiguity), and (b) exactly ONE row whose id does not
-/// parse — a key that is not ambiguous but has no bindable candidate, so it
-/// must skip for the same reason. Shape (b) is a live row for the key exactly
-/// like any other; it occupies the slot (a second row for the same key marks
-/// the pair ambiguous under shape (a)) but can never itself serve as a
-/// binding target.
-///
-/// A reader/query failure returns `Err` carrying the underlying error text;
-/// the caller degrades to no module annotation with a warning that includes
-/// it rather than aborting the pass: module annotation is best-effort
-/// enrichment (ADR-088 Amendment 1), while the durable `changed_paths` fact
-/// must still be recorded.
-///
-/// The map alone is returned; the caller counts a skip only when a commit
-/// path actually hits an ambiguous (`None`) key, so ambiguous keys no
-/// ingested commit touches never inflate
-/// `IngestReport.code_module_ambiguous_path_skips`.
+/// being digested, keyed by `(source_revision, source_path)`. See
+/// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations
+/// for the ambiguity contract and the best-effort degradation rule.
 async fn load_code_modules_by_snapshot_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1397,15 +1332,9 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
     Ok(commits)
 }
 
-/// `sha -> \[touched paths\]` for every commit in `repo`'s history, via a
-/// separate NUL-delimited `--name-only` pass. Merge commits use their
-/// first-parent diff as the one canonical path set. The resulting paths drive
-/// document/module annotations and the durable
-/// `commit.properties.changed_paths` fact. Rename detection is pinned off so
-/// a rename always surfaces as the delete + add pair `--name-only` reports
-/// without it: those exact path facts are the ADR-085 module join keys, and
-/// Git does not mark which entry is the rename source, so an inferred rename
-/// could otherwise silently swap one side of the pair away.
+/// `sha -> [touched paths]` for every commit in `repo`'s history, via a
+/// separate NUL-delimited `--name-only` pass. See
+/// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
 fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
     let output = Command::new("git")
         .arg("-C")
@@ -1430,38 +1359,13 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
     parse_touched_files(&output.stdout)
 }
 
-/// Decode the `-z --name-only` stream [`touched_files`] produces. The stream
-/// is unambiguous only when every token is either a `/\x1e<40-hex-sha>`
-/// header (optionally followed by one newline and the commit's first path)
-/// or a path belonging to the most recent header; anything else fails the
-/// phase rather than storing a silently partial path set. A bare `[]` is
-/// therefore meaningful: it is a genuinely empty commit, never the residue
-/// of a parser/git-output mismatch.
-///
-/// One ambiguity this layer cannot resolve: a non-header token is
-/// indistinguishable from a real path of the most recent header's commit.
-/// The `--name-only` walk is newest-first, so a header lost mid-stream (with
-/// its NUL separator) leaves the deleted record's path tokens attached to
-/// that NEWER commit — the commit already walked in the same stream — never
-/// to an older one. Containment is partial and per-record, not per-stream:
-/// the missing sha has no path-set entry, so `ingest_commits` skips it,
-/// warns, and stalls the cursor
-/// (`ingest_stalls_cursor_for_commit_missing_touched_paths` pins both), but
-/// the polluted NEWER commit is created as usual — the orphaned tokens ride
-/// into its `changed_paths`, and commit notes are immutable, so the
-/// pollution persists (a re-ingest skips the already-stored sha; repair
-/// requires deleting the note and re-ingesting). The fixture asserts
-/// exactly that pollution.
-/// The parser deliberately does not try to detect it: that would require
-/// judging path content against a commit the parse never saw.
+/// Decode the `-z --name-only` stream [`touched_files`] produces. See
+/// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations
+/// for the header-loss ambiguity this parser deliberately does not resolve.
 fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    // With `-z`, git emits paths verbatim and NUL-terminates each one. Git
-    // may place either one or two NULs between adjacent commit sections, so
-    // parse individual tokens and recognize only the impossible-path header
-    // prefix above. The header and its first path share a token, separated by
-    // one newline; removing exactly that one byte preserves a filename whose
-    // own first byte is a newline.
+    // With `-z`, git NUL-terminates each token; the header and its first
+    // path share one token, separated by exactly one newline.
     let mut current_sha: Option<String> = None;
     for token in bytes.split(|byte| *byte == 0) {
         if token.is_empty() {
@@ -1814,12 +1718,9 @@ async fn ingest_commits(
         files_by_sha,
     } = snapshot;
     if commits.is_empty() {
-        // An empty `{cursor}..HEAD` range is a genuine completion only when
-        // the cursor is an ancestor of the tip being walked. A cursor that is
-        // NOT an ancestor means this source's history lags or diverged from
-        // whatever advanced the cursor (measured: a scratch clone whose HEAD
-        // trailed the cursor by weeks walked nothing and reported a clean
-        // pass, issue #1644) — surface it and refuse the completion claim.
+        // An empty range is a genuine completion only when the cursor is an
+        // ancestor of HEAD. See crates/khive-pack-git/docs/ingest.md
+        // #commit-walk-ancestor-divergence-and-cursor-stall.
         let cursor_not_ancestor = last_sha_of(&since).is_some_and(|since_sha| {
             let not_ancestor = !is_ancestor_of_head(repo, since_sha);
             if not_ancestor {
@@ -1836,13 +1737,8 @@ async fn ingest_commits(
         if let Some(warning) = recovery_warning {
             report.warnings.push(warning);
         }
-        // An empty `{cursor}..HEAD` range over an ancestor cursor means the
-        // walk genuinely reached the tip: the commit source is exhausted.
-        // The source state is recorded HERE, not left for the end-of-pass
-        // fill (whose arms are now loud instrumentation-gap tripwires): the
-        // diverged-cursor refusal is a stop-early — the walk cannot claim
-        // it covered this source's history — while the ancestor case is a
-        // genuine completion.
+        // Recorded here, not the end-of-pass fill: a diverged cursor is a
+        // stop-early, while an ancestor cursor is a genuine completion.
         if cursor_not_ancestor {
             report.sources.commits = Some(IngestSourceState::StoppedEarly(
                 "commits cursor is not an ancestor of this source's HEAD: the walked history \
@@ -1856,22 +1752,14 @@ async fn ingest_commits(
         return Ok(());
     }
 
-    // A non-empty snapshot means the commit walk is now underway. Seed the
-    // source before the first natural-key lookup so a mid-walk database error
-    // is reported in-band as walked-then-failed rather than as a pre-walk
-    // hard error. Cursor and snapshot failures above remain pre-walk errors.
+    // Seed the source before the first natural-key lookup so a mid-walk
+    // database error reports as walked-then-failed, not a pre-walk error.
     report.sources.commits = Some(IngestSourceState::StoppedEarly(
         COMMIT_WALK_SEED_REASON.into(),
     ));
-    // `walk_commits` is oldest-first and includes HEAD whenever this phase
-    // has work, so the last record is the exact repository snapshot against
-    // which ADR-085 `source_revision` must bind. The walk itself is never
-    // truncated: it issues one unbounded `git log {since}..HEAD`, and
-    // `max_items` bounds only the create loop below (a budget check AFTER
-    // this point), never the snapshot. `snapshot_head` is therefore always
-    // the true repository HEAD of this pass, and the module index anchors to
-    // modules-as-of-HEAD regardless of how many commits the budget lets this
-    // pass create.
+    // The last record (walk is oldest-first) is the exact snapshot HEAD the
+    // module index binds against; the walk itself is never truncated by
+    // `max_items` — only the create loop below is.
     let snapshot_head = commits
         .last()
         .expect("non-empty commit snapshot checked above")
@@ -1893,15 +1781,10 @@ async fn ingest_commits(
             }
         };
 
-    // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
-    // processed commit: once a record fails to create, later records in this
-    // same pass are still attempted (so a run surfaces every failure it can,
-    // not just the first) but the cursor no longer advances past them. That
-    // guarantees a failed record is retried — and its warning re-surfaced —
-    // on every subsequent pass until it is fixed upstream, rather than being
-    // silently skipped forever because the cursor moved past it. Records that
-    // do succeed after a stall are still written (idempotent via the
-    // sha natural key), so a retried pass never double-creates them.
+    // `cursor_stalled` freezes `last_sha` at the last contiguous success so a
+    // failed record is retried next pass instead of skipped forever; later
+    // records this pass are still attempted. See crates/khive-pack-git/docs/
+    // ingest.md#commit-walk-ancestor-divergence-and-cursor-stall.
     let mut last_sha: Option<String> = since;
     let mut cursor_stalled = false;
     // Bounded detail for the per-run ambiguous-module-skip warning: the
@@ -1910,18 +1793,12 @@ async fn ingest_commits(
     const AMBIGUOUS_SKIP_DETAIL_CAP: usize = 5;
     const AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS: usize = 80;
     let mut ambiguous_module_skip_paths: Vec<String> = Vec::new();
-    // Parent SHA -> note id for commits created earlier THIS pass (walked
-    // oldest-first) — combined with `find_commit_by_sha`'s DB lookup below,
-    // this resolves parent edges regardless of which pass the parent landed
-    // in.
-    //
-    // Stall guard on every `last_sha` advance below (`!cursor_stalled`):
-    // once a commit create fails, the persisted cursor must freeze at the
-    // last contiguous success — advancing it past a refused/failed record
-    // (including on a later EXISTING record, whose natural-key lookup
-    // proves only its own landing, not the failed record's) would strand
-    // the failed commit behind the floor and skip it forever instead of
-    // retrying it next pass.
+    // Parent SHA -> note id for commits created earlier this pass; combined
+    // with `find_commit_by_sha`'s DB lookup, resolves parent edges regardless
+    // of which pass the parent landed in. The stall guard on the `last_sha`
+    // advances below prevents stranding a failed commit behind an advanced
+    // floor. See crates/khive-pack-git/docs/ingest.md
+    // #commit-walk-ancestor-divergence-and-cursor-stall.
     let mut local_sha_to_id: HashMap<String, Uuid> = HashMap::new();
     for c in &commits {
         if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
@@ -1978,21 +1855,9 @@ async fn ingest_commits(
             ));
             continue;
         };
-        // The `-z` stream is verbatim: a Unix filename may legitimately
-        // contain `\` or start `X:`, and the hook's canonical
-        // `changed_paths` shape can never carry those (CommitHook rejects
-        // them, which would fail the whole commit create and stall the
-        // cursor on every pass). Filter them here, against the same
-        // predicate the hook enforces, and surface the per-run count below.
-        // The predicate runs on the RAW path, not the masked one: a secret
-        // token can itself contain a rejected byte (the masker's tokens are
-        // whitespace-delimited, so a backslash or NUL inside a token is
-        // redacted along with it), and filtering post-masking would then
-        // flip the verdict from reject to accept. Masking is applied only
-        // to the paths that survive the raw filter, for storage. Only
-        // actual predicate rejections count as drops: BTreeSet dedup and
-        // post-masking collisions are not drops and are neither counted
-        // nor warned.
+        // Canonical-path filtering, drop accounting, and raw-vs-masked
+        // filter ordering are documented at crates/khive-pack-git/docs/api/
+        // ingest.md#changed-paths-and-code-module-annotations.
         let mut noncanonical = 0_u64;
         let changed_paths: Vec<String> = touched_paths
             .iter()
@@ -2008,13 +1873,9 @@ async fn ingest_commits(
             .into_iter()
             .collect();
         report.changed_paths_filtered_noncanonical += noncanonical;
-        // Distinguish the three stored states the contract defines: a
-        // genuinely empty commit stores `[]`; a commit whose raw touched
-        // paths were ALL rejected omits `changed_paths` entirely (the drop
-        // count in `changed_paths_filtered_noncanonical` and the per-run
-        // warning carry the evidence); anything else stores the canonical
-        // remainder. The hook treats a missing `changed_paths` as optional,
-        // so the omitted shape still validates.
+        // The three stored `changed_paths` states (empty/remainder/omitted)
+        // are documented at crates/khive-pack-git/docs/api/ingest.md
+        // #changed-paths-and-code-module-annotations.
         let changed_paths_property = if touched_paths.is_empty() || !changed_paths.is_empty() {
             Some(changed_paths.clone())
         } else {
@@ -2027,13 +1888,8 @@ async fn ingest_commits(
                 Some(Some(module_id)) => {
                     annotates.insert(module_id.to_string());
                 }
-                // The key is unusable — either more than one live row binds
-                // it (including the two-parseable-row case) or its single
-                // row's id does not parse — so no candidate is annotated.
-                // Both shapes count once per commit path that hits the key (the
-                // path is also remembered for the bounded per-run warning
-                // below); see `load_code_modules_by_snapshot_path` for the
-                // fold.
+                // Ambiguous-key skip accounting is documented at
+                // crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
                 Some(None) => {
                     report.code_module_ambiguous_path_skips += 1;
                     if ambiguous_module_skip_paths.len() < AMBIGUOUS_SKIP_DETAIL_CAP {
@@ -2701,14 +2557,9 @@ async fn ingest_prs(
             .into_iter()
             .map(|pr| MaskedPrFields::new(pr, &mut report.warnings))
             .collect();
-        // Each page is already `sort:updated-asc` server-side, but `--search`
-        // makes no hard ordering guarantee across ties — re-sort defensively
-        // so the frozen-cursor invariant (records walked in nondecreasing
-        // `updated_at` order) holds regardless. `is_new` below is inclusive
-        // (`updated >= cursor`) for exactly the tie reason documented at
-        // length in the pre-pagination version of this function (a
-        // successful and a failing record sharing one `updated_at` must both
-        // be re-examined next pass until the cursor moves past that tie).
+        // Re-sorted defensively for the frozen-cursor invariant; `is_new` is
+        // inclusive for tie handling. See crates/khive-pack-git/docs/api/
+        // ingest.md#ingest_prs--ingest_issues-cursor-semantics.
         page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
         let last_updated_at = page.last().and_then(|pr| pr.updated_at.clone());
 
@@ -2721,17 +2572,9 @@ async fn ingest_prs(
                     merge_sha_to_pr.insert(oid, existing);
                 }
                 report.prs_skipped_existing += 1;
-                // The natural-key lookup proves THIS record landed — but
-                // while this pass is stalled, records walked after the stall
-                // point sort at/after the refused record (pages are sorted
-                // ascending by `updated_at`). Advancing the floor past them
-                // would persist a cursor strictly newer than the refused
-                // record's timestamp, so the next pass's inclusive
-                // `updated >= cursor` filter would never re-fetch it —
-                // the refusal would be skipped forever instead of retried.
-                // The guard only fires on a stalled pass: a clean
-                // all-existing pass (the common resumed-pass shape) still
-                // advances normally and never re-fetches its window twice.
+                // Advancing the floor past a stalled pass's later records
+                // would skip the refused record forever; see
+                // crates/khive-pack-git/docs/api/ingest.md#ingest_prs--ingest_issues-cursor-semantics.
                 if !cursor_stalled {
                     if let Some(u) = &masked.updated_at {
                         if max_updated
@@ -2758,14 +2601,9 @@ async fn ingest_prs(
                 continue;
             }
             if budget.exhausted() {
-                // Records after this point in the window were never
-                // visited: the walk stops early even when the page itself
-                // is short (a short page only proves the REMOTE window
-                // ended, not that the local walk covered it). This is also
-                // the exact-budget boundary: the budget counter cannot
-                // distinguish "ran out exactly at the last record" from
-                // "records remained", and the conservative answer is
-                // stopped-early — a resumed pass completes idempotently.
+                // Records after this point were never visited even on a short
+                // page — a short page proves only the remote window ended, not
+                // that the local walk covered it.
                 window_complete = false;
                 stop_reason = Some("budget exhausted before the pull request window completed");
                 break;
@@ -2962,14 +2800,10 @@ async fn ingest_issues(
             Err(e) => return Err(e),
         };
         let page_len = page.len();
-        // The ENTIRE fetched page is classified (masked strings, canonicalized
-        // timestamps, governed-enum `state_reason`) before anything else --
-        // including the sort and the paging cursor derivation below -- touches
-        // it. A raw `GhIssue.updated_at` must never reach the sort comparator,
-        // `last_updated_at`, or (via `decide_page_outcome`'s `Continue`) a
-        // future `gh --search updated:>=` argument (a
-        // credential-shaped `updatedAt` could otherwise sort last and leak
-        // into process arguments through the paging floor).
+        // The entire page is classified before sort/paging-cursor derivation
+        // touches it, so a raw `updated_at` never reaches an argv boundary.
+        // See crates/khive-pack-git/docs/api/ingest.md
+        // #ingest_prs--ingest_issues-cursor-semantics.
         let mut masked_page: Vec<MaskedIssueFields> = page
             .into_iter()
             .map(|issue| MaskedIssueFields::new(issue, &mut report.warnings))
@@ -3029,14 +2863,10 @@ async fn ingest_issues(
             let number = masked.number;
             let updated_at = masked.updated_at.clone();
 
-            // `stateReason` was already parsed into the governed enum at the
-            // masking boundary (`canonical_issue_state_reason`). An ungoverned
-            // value is rejected here, before the record is ever built or
-            // dispatched -- the warning names only the field, never the raw
-            // (possibly credential-shaped) value, matching ADR-088's
-            // fail-closed/no-silent-coercion contract while preserving the
-            // per-record warn-and-skip / frozen-cursor-retry behavior shared
-            // with every other create-failure path in this loop.
+            // `stateReason` was already classified at the masking boundary;
+            // an ungoverned value is rejected here before the record is
+            // built, matching ADR-088's fail-closed contract. See
+            // crates/khive-pack-git/docs/api/ingest.md#ingest_prs--ingest_issues-cursor-semantics.
             if masked.state_reason == StateReasonField::Rejected {
                 report.warnings.push(format!(
                     "issue #{number}: stateReason is not one of the governed values, record skipped"

@@ -817,7 +817,17 @@ impl KhiveRuntime {
                 verb: "authorize".to_string(),
                 reason: "gate denied".to_string(),
             }),
-            Err(e) => Err(crate::RuntimeError::Internal(format!("gate error: {e}"))),
+            Err(e) => {
+                tracing::warn!(
+                    namespace = %ns.as_str(),
+                    error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
+                    "authorize: gate check failed (fail-closed)"
+                );
+                Err(crate::RuntimeError::Internal(format!(
+                    "gate error: {}",
+                    e.wire_reason()
+                )))
+            }
         }
     }
 
@@ -874,7 +884,17 @@ impl KhiveRuntime {
                 verb: "authorize".to_string(),
                 reason: "gate denied".to_string(),
             }),
-            Err(e) => Err(crate::RuntimeError::Internal(format!("gate error: {e}"))),
+            Err(e) => {
+                tracing::warn!(
+                    namespace = %primary.as_str(),
+                    error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
+                    "authorize_with_visibility: gate check failed (fail-closed)"
+                );
+                Err(crate::RuntimeError::Internal(format!(
+                    "gate error: {}",
+                    e.wire_reason()
+                )))
+            }
         }
     }
 

@@ -2,7 +2,10 @@
 
 **Status**: accepted\
 **Date**: 2026-05-22\
-**Authors**: khive maintainers
+**Authors**: khive maintainers\
+**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds the required
+backend-enforced bounded-and-verified BlobStore read while leaving admission and lifecycle policy
+in runtime, and binds vector operations to a complete embedding-space identity on acceptance.
 
 ## Context
 

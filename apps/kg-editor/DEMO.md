@@ -27,7 +27,11 @@ This walkthrough assumes that the repository-catalog consumer and DB snapshot
 API route from the companion stack (for example, #1960 and its backend chain),
 or their merged equivalents, are composed with this UI branch. The native
 selector comes from that consumer. Without the composed stack, this branch
-intentionally uses the curated static fallback.
+intentionally uses the curated static fallback. The DB-backed snapshot is
+always an optional enhancement over the bundled static asset: any failure on
+that path — network error, non-2xx status, an oversized or malformed body, or a
+provenance mismatch — falls back to the static asset rather than failing the
+page.
 
 ## Five-to-seven-minute flow
 

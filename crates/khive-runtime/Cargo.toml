@@ -39,6 +39,7 @@ toml = { workspace = true }
 rusqlite = { workspace = true }
 libc = { workspace = true }
 anyhow = { workspace = true }
+unicode-general-category = { workspace = true }
 
 [dev-dependencies]
 khive-gate-rego = { version = "0.7.0", path = "../khive-gate-rego" }
