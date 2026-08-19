@@ -391,8 +391,8 @@ function StructureGraph({
     displayedPackages,
     positions,
     selectablePackages,
-    subtreeModules,
-    subtreePackages,
+    subtreeModuleCount,
+    subtreePackageCount,
     visibleIds,
   } = useMemo(() => {
     const nextSubtreePackages = subtreeId === graph.repository.id
@@ -456,8 +456,8 @@ function StructureGraph({
       displayedPackages: nextDisplayedPackages,
       positions: nextPositions,
       selectablePackages: nextSelectablePackages,
-      subtreeModules: nextSubtreeModules,
-      subtreePackages: nextSubtreePackages,
+      subtreeModuleCount: nextSubtreeModules.length,
+      subtreePackageCount: nextSubtreePackages.length,
       visibleIds: nextVisibleIds,
     };
   }, [
@@ -876,8 +876,8 @@ function StructureGraph({
           ))}
         </ul>
         <LocalSliceDisclosure shown={displayedEdges.length} total={graph.structure_edges.items.length} label={capability.views.structure_graph.label} labels={labels} />
-        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackages.length} label={labels.node_types.package} labels={labels} />
-        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModules.length} label={labels.node_types.module} labels={labels} />
+        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackageCount} label={labels.node_types.package} labels={labels} />
+        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModuleCount} label={labels.node_types.module} labels={labels} />
       </div>
       <BoundDisclosure page={graph.packages} labels={labels} />
       <BoundDisclosure page={graph.modules} labels={labels} />

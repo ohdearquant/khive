@@ -3,6 +3,9 @@
 **Status**: proposed
 **Date**: 2026-08-14
 **Authors**: khive maintainers
+**Superseded by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md) in full on its
+acceptance; ADR-160 converges on accepted ADR-121 attachments and closes the backend allocation
+bound deferred here while retaining typed absent-store refusal and pack-owned self-description.
 **Depends on**:
 
 - ADR-111 (Blob Store) — the `BlobStore` content-addressed storage trait and the

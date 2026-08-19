@@ -10,8 +10,8 @@ This crate implements the public types and default gate defined by ADR-018:
 
 - **`Gate` trait** — the authorization hook consulted before each verb dispatch.
   The `check` method returns `Ok(GateDecision)` or `Err(GateError)`. A `Deny`
-  decision blocks dispatch; an `Err` (infrastructure failure) is fail-open per
-  the ADR — dispatch proceeds with a tracing warning, no audit event emitted.
+  decision blocks dispatch with `PermissionDenied`; an `Err` (infrastructure
+  failure) is audited and blocks dispatch with `GateUnavailable`.
 
 - **`impl_name()`** — stable string identifier per `Gate` implementation.
   Default returns `std::any::type_name::<Self>()`. Concrete impls override for

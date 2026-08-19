@@ -121,9 +121,11 @@ fn malformed_policy_returns_policy_error() {
 #[test]
 fn missing_entrypoint_returns_deny_not_error() {
     // Compiles fine but has no `decision` rule — the default entrypoint
-    // data.khive.gate.decision will be absent.  check() must return
-    // Ok(Deny) rather than Err so the runtime's fail-open Err branch is
-    // never reached.
+    // data.khive.gate.decision will be absent. regorus's `eval_rule` reports
+    // this as "not a valid rule path", indistinguishable at that layer from
+    // any other evaluator failure, so check() fails closed via
+    // Ok(GateDecision::Deny) with a static classified reason, never the raw
+    // evaluator error text.
     let policy = r#"
         package khive.gate
         import rego.v1
@@ -132,7 +134,7 @@ fn missing_entrypoint_returns_deny_not_error() {
     let gate = RegoGate::from_policy_str(policy).expect("compiles");
     let result = gate.check(&request("search"));
     match result {
-        Ok(GateDecision::Deny { .. }) => {}
+        Ok(GateDecision::Deny { reason }) => assert_eq!(reason, "policy evaluation failed"),
         Ok(GateDecision::Allow { .. }) => panic!("expected Deny, got Allow"),
         Err(e) => panic!("expected Ok(Deny), got Err({e})"),
     }

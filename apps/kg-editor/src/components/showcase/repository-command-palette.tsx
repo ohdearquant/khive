@@ -87,15 +87,16 @@ export function RepositoryCommandPalette({
       !normalizedQuery || includesQuery(command, normalizedQuery)
     );
     const moduleCommands: PaletteCommand[] = normalizedQuery
-      ? findRepositoryModules(bundle, normalizedQuery, MODULE_RESULT_LIMIT).map(
-        (module) => ({
-          id: `module:${module.id}`,
-          kind: "module" as const,
-          label: module.source_path,
-          detail: module.module_path,
-          module,
-        }),
-      )
+      ? findRepositoryModules(bundle, normalizedQuery, MODULE_RESULT_LIMIT).items
+        .map(
+          (module) => ({
+            id: `module:${module.id}`,
+            kind: "module" as const,
+            label: module.source_path,
+            detail: module.module_path,
+            module,
+          }),
+        )
       : [];
     const copyCommand: PaletteCommand = {
       id: "action:copy-link",

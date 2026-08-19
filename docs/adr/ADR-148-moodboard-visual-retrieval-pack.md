@@ -3,7 +3,10 @@
 **Status**: accepted\
 **Date**: 2026-08-08\
 **Authors**: khive maintainers\
-**Amended by**: ADR-149
+**Amended by**: [ADR-149](ADR-149-moodboard-preference-learning.md); proposed
+[ADR-160](ADR-160-shared-pack-infrastructure.md) converges attachment publication on ADR-121 and
+extracts shared hydration, complete embedding-space identity/lineage mapping, fusion,
+materialization, and checkpoint seams on acceptance.
 
 ## Context
 
@@ -172,8 +175,10 @@ is shared by the two runtime handles.
 5. Run Lattice inference, validate dimension/finiteness/norm, and replace the identity-specific
    visual vector row.
 
-The normalized PNG is derived cache input, not a second attachment while ADR-121 remains
-unratified. A failure after blob publication may leave an orphan for ADR-111 grace-period GC. A
+The normalized PNG is derived cache input, not a persisted attachment in the current
+implementation. Proposed ADR-160 migrates the original visual and the preference bundle/network
+blob anchors to ADR-121 roles on acceptance without promoting this normalized cache input. A
+failure after blob publication may leave an orphan for ADR-111 grace-period GC. A
 failure after entity creation may leave an attached asset without the current descriptor row;
 retrying the same bytes reuses the entity and heals the vector. `created` reports whether this call
 created the entity; `indexed` is true only in a successful response.
