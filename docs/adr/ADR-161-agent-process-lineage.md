@@ -289,8 +289,11 @@ and gate rules as the existing five [ADR-142 §1; ADR-023]:
   order; passing it back as `cursor` resumes immediately after the last returned record,
   under the same horizon. `next_cursor` is present exactly when `complete` is false, and
   absent exactly when it is true, so the two fields cannot disagree. Every page's result
-  carries `as_of`, the enumeration's admission horizon as an opaque token, so the age of the
-  view is inspectable rather than inferred.
+  carries `as_of`: the admission timestamp — the `spawned_at` of the most recently admitted
+  record at cursor mint, or null when no record had been admitted — so the age of the view is
+  inspectable rather than inferred. `as_of` is an informational projection of the horizon,
+  not the horizon itself: the authoritative horizon, including its tiebreak, travels only
+  inside the cursor, and `as_of` is never accepted back as an input.
 - **A cursor is bound to the enumeration that minted it, and presenting it anywhere else is a
   validation error.** The token binds the verb, the complete parameter set (the filters, the
   root `id` and `max_depth` for `agent.descendants`), the caller's resolved authorization
