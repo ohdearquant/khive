@@ -121,6 +121,10 @@ fn edge_to_canonical_value(e: &ExportedEdge) -> Result<Value, VcsError> {
         ))
     })?;
     obj.insert("weight".to_string(), Value::Number(weight_num));
+    obj.insert(
+        "properties".to_string(),
+        sort_properties_value(e.properties.clone()).unwrap_or(Value::Null),
+    );
     Ok(Value::Object(obj))
 }
 
@@ -251,11 +255,74 @@ mod tests {
             target: uid2,
             relation: EdgeRelation::Extends,
             weight: 1.0,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }];
 
         assert_ne!(
             snapshot_id_for_archive(&without_edge).unwrap(),
             snapshot_id_for_archive(&with_edge).unwrap()
+        );
+    }
+
+    #[test]
+    fn edge_properties_change_snapshot_hash() {
+        let source = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let target = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let edge_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let timestamp = Utc::now();
+        let edge = ExportedEdge {
+            edge_id,
+            source,
+            target,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+            properties: Some(serde_json::json!({"confidence": 0.4})),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let mut changed = edge.clone();
+        changed.properties = Some(serde_json::json!({"confidence": 0.9}));
+
+        let mut before = empty_archive();
+        before.edges = vec![edge];
+        let mut after = empty_archive();
+        after.edges = vec![changed];
+
+        assert_ne!(
+            snapshot_id_for_archive(&before).unwrap(),
+            snapshot_id_for_archive(&after).unwrap(),
+            "metadata-only edge changes must alter snapshot identity"
+        );
+    }
+
+    #[test]
+    fn edge_property_key_order_is_hash_independent() {
+        let source = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let target = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let timestamp = Utc::now();
+        let edge = ExportedEdge {
+            edge_id: Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
+            source,
+            target,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+            properties: Some(serde_json::json!({"a": 1, "z": {"a": 2, "z": 3}})),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let mut reordered = edge.clone();
+        reordered.properties = Some(serde_json::json!({"z": {"z": 3, "a": 2}, "a": 1}));
+        let mut left = empty_archive();
+        left.edges = vec![edge];
+        let mut right = empty_archive();
+        right.edges = vec![reordered];
+
+        assert_eq!(
+            snapshot_id_for_archive(&left).unwrap(),
+            snapshot_id_for_archive(&right).unwrap(),
+            "edge property object ordering must not affect snapshot identity"
         );
     }
 
@@ -320,6 +387,9 @@ mod tests {
             target: uid2,
             relation: EdgeRelation::Extends,
             weight: 1.0,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         let edge2 = ExportedEdge {
             edge_id: edge_id2,
@@ -327,6 +397,9 @@ mod tests {
             target: uid3,
             relation: EdgeRelation::Extends,
             weight: 0.5,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
 
         let mut a1 = empty_archive();
@@ -351,6 +424,9 @@ mod tests {
             target: uid2,
             relation: EdgeRelation::Extends,
             weight: f64::NAN,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }];
         let err = snapshot_id_for_archive(&archive).unwrap_err();
         assert!(matches!(err, VcsError::Internal(ref msg) if msg.contains("not finite")));

@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
 use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
@@ -212,12 +213,14 @@ fn build_edge(
         target: key.target,
         relation,
         weight,
+        properties: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
     use khive_runtime::portability::{ExportedEdge, KgArchive};
     use khive_storage::EdgeRelation;
     use uuid::Uuid;
@@ -242,6 +245,9 @@ mod tests {
             target: tgt,
             relation: EdgeRelation::Extends,
             weight,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -341,6 +347,9 @@ mod tests {
             target: b,
             relation: EdgeRelation::Extends,
             weight: 0.5,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         let ours_edge = ExportedEdge {
             edge_id: Uuid::new_v4(),
@@ -348,6 +357,9 @@ mod tests {
             target: b,
             relation: EdgeRelation::Extends,
             weight: 0.9,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         let expected_id = ours_edge.edge_id;
 

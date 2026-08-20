@@ -238,6 +238,9 @@ mod tests {
             target: tgt,
             relation: EdgeRelation::Extends,
             weight,
+            properties: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 

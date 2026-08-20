@@ -9,7 +9,7 @@ visible as the "current" state.
 
 1. Read `<repo_root>/.khive/kg/entities.ndjson` and `edges.ndjson`.
 2. **Validate-first gate** (`validate_ndjson_records`, issue #476): full
-   ADR-020 structural validation — entity kind validity, entity/edge
+   ADR-020 structural validation — entity kind validity, non-blank entity names, entity/edge
    timestamp validity, entity/edge sort order, duplicate entity ids,
    duplicate edge ids, duplicate semantic edge triples
    `(source, target, relation)`, dangling edge endpoints, edge
@@ -19,8 +19,10 @@ visible as the "current" state.
 4. Upsert entities and populate the FTS5 index. Vector embeddings are
    skipped — they're local-only derived state repaired explicitly via
    `kkernel reindex` (ADR-035 §5).
-5. Checkpoint the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`).
-6. Atomic rename: `<db_path>.tmp` → `<db_path>`. A crash before this step
+5. Upsert edges without normalizing their wire provenance: `properties` map to
+   storage `metadata`, and `created_at`/`updated_at` remain independent.
+6. Checkpoint the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`).
+7. Atomic rename: `<db_path>.tmp` → `<db_path>`. A crash before this step
    leaves the previous DB intact (all-or-nothing guarantee).
 
 Records are converted and written in chunks of `SYNC_CHUNK_SIZE` (10,000 in
@@ -36,8 +38,10 @@ batching path intact.
 1. `git clone --depth=1 --filter=blob:none` into a temporary staging
    directory.
 2. Sparse-checkout `.khive/kg/entities.ndjson` and `.khive/kg/edges.ndjson`.
-3. **Validate-first**: `build_kg_archive` parses all edge relations and
-   returns an error if any relation is invalid — before any cache write.
+3. **Validate-first**: the same full `validate_ndjson_records` gate used by
+   local sync rejects blank names, malformed timestamps, invalid kinds,
+   relations/weights, duplicates, sort violations, and dangling endpoints
+   before any cache write.
 4. Compute the `SnapshotId` over the validated archive (see
    `snapshot-hash.md`).
 5. **Pin verification, fail-closed**: if `pin` is set and `repin=false`, a
@@ -55,6 +59,10 @@ batching path intact.
    directory, briefly absent, or the complete new directory.
 7. `meta.json` records `fetched_at`, `git_ref`, `commit_sha`, `content_hash`
    — written even when no pin is present, for auditability.
+
+The remote archive conversion retains edge properties and both timestamps. Edge
+properties are recursively canonicalized into `SnapshotId`, so metadata-only
+changes cannot pass an existing pin unnoticed.
 
 ### `RemoteName` — construction-time path-traversal safety
 

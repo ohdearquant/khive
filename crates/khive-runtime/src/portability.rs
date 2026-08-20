@@ -65,6 +65,37 @@ pub struct ExportedEdge {
     /// One of the canonical edge relations (closed enum).
     pub relation: EdgeRelation,
     pub weight: f64,
+    /// Portable edge metadata, named `properties` in the ADR-020 wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Value>,
+    /// Edge creation time. Older archives may omit it; those imports use the
+    /// time at which the archive is decoded.
+    #[serde(
+        default = "default_import_timestamp",
+        deserialize_with = "deserialize_import_timestamp"
+    )]
+    pub created_at: DateTime<Utc>,
+    /// Edge last-update time. Kept independent from `created_at` so imported
+    /// provenance is not collapsed during a round trip.
+    #[serde(
+        default = "default_import_timestamp",
+        deserialize_with = "deserialize_import_timestamp"
+    )]
+    pub updated_at: DateTime<Utc>,
+}
+
+fn default_import_timestamp() -> DateTime<Utc> {
+    Utc::now()
+}
+
+fn deserialize_import_timestamp<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    DateTime::parse_from_rfc3339(&raw)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| serde::de::Error::custom(format!("timestamp must be RFC3339: {error}")))
 }
 
 /// Outcome of a successful import operation.
@@ -160,6 +191,9 @@ impl KhiveRuntime {
                     target: e.target_id,
                     relation: e.relation,
                     weight: e.weight,
+                    properties: e.metadata,
+                    created_at: e.created_at,
+                    updated_at: e.updated_at,
                 })
                 .collect()
         };
@@ -208,16 +242,31 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str().to_owned();
 
-        let store = self.entities(token)?;
-        let mut entities_imported = 0usize;
-        let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
-        for ee in &archive.entities {
-            self.validate_entity_kind(&ee.kind)?;
+        // Complete deterministic validation before opening a store or issuing
+        // the first write. Endpoint existence and namespace checks remain at
+        // write time because they depend on mutable target state.
+        for (index, entity) in archive.entities.iter().enumerate() {
+            self.validate_entity_kind(&entity.kind)?;
             // Archive content is caller-controlled input: the runtime-owned
             // `khive:secret_gate` property key is reservation-only on import,
             // exactly as on every other properties-bearing write path
             // (ADR-115 Amendment 1 §3). Import never consumes exemptions.
-            crate::secret_gate::reject_reserved_secret_gate_property(ee.properties.as_ref())?;
+            crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
+            if entity.name.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "archive entity {index} ({}) name must be non-blank",
+                    entity.id
+                )));
+            }
+        }
+        for edge in &archive.edges {
+            crate::operations::validate_edge_weight(edge.weight)?;
+        }
+
+        let store = self.entities(token)?;
+        let mut entities_imported = 0usize;
+        let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
+        for ee in &archive.entities {
             let created_micros = ee.created_at.timestamp_micros();
             let updated_micros = ee.updated_at.timestamp_micros();
             let entity = khive_storage::entity::Entity {
@@ -249,7 +298,6 @@ impl KhiveRuntime {
         let mut edges_imported = 0usize;
         let mut edges_skipped = 0usize;
         for ee in &archive.edges {
-            crate::operations::validate_edge_weight(ee.weight)?;
             let source_ok = match self.get_entity(token, ee.source).await {
                 Ok(_) => true,
                 Err(RuntimeError::NotFound(_)) => false,
@@ -302,7 +350,6 @@ impl KhiveRuntime {
                 }
                 Err(e) => return Err(e),
             }
-            let now = Utc::now();
             let edge = khive_storage::types::Edge {
                 id: LinkId::from(ee.edge_id),
                 namespace: ns.clone(),
@@ -310,10 +357,10 @@ impl KhiveRuntime {
                 target_id: ee.target,
                 relation: ee.relation,
                 weight: ee.weight,
-                created_at: now,
-                updated_at: now,
+                created_at: ee.created_at,
+                updated_at: ee.updated_at,
                 deleted_at: None,
-                metadata: None,
+                metadata: ee.properties.clone(),
                 target_backend: None,
             };
             graph.upsert_edge(edge).await?;
@@ -439,6 +486,57 @@ mod tests {
         assert!(summary.embedding_truncation.discarded_bytes > 0);
         let wire = serde_json::to_value(&summary).expect("serialize import summary");
         assert_eq!(wire["embedding_truncation"]["truncated"], 1);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_whitespace_name_before_any_entity_write() {
+        let runtime = make_rt().await;
+        let token = NamespaceToken::local();
+        let valid_id = Uuid::new_v4();
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![
+                ExportedEntity {
+                    id: valid_id,
+                    kind: "concept".to_string(),
+                    entity_type: None,
+                    name: "Must not be written".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                ExportedEntity {
+                    id: Uuid::new_v4(),
+                    kind: "concept".to_string(),
+                    entity_type: None,
+                    name: " \t\n ".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ],
+            edges: vec![],
+        };
+
+        let err = runtime
+            .import_kg(&archive, &token)
+            .await
+            .expect_err("whitespace-only entity names must fail the whole import");
+        assert!(
+            err.to_string().contains("non-blank"),
+            "error must explain the name invariant: {err}"
+        );
+        assert!(
+            runtime.get_entity(&token, valid_id).await.is_err(),
+            "deterministic validation must finish before the first entity write"
+        );
     }
 
     /// 1. Roundtrip: 3 entities + 2 edges survive export → import on a fresh runtime.
@@ -717,6 +815,9 @@ mod tests {
                 target: real.id,
                 relation: EdgeRelation::Extends,
                 weight: 1.0,
+                properties: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
             }],
         };
 
@@ -770,6 +871,9 @@ mod tests {
                 target: phantom_target,
                 relation: EdgeRelation::DependsOn,
                 weight: 0.8,
+                properties: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
             }],
         };
 
@@ -856,6 +960,9 @@ mod tests {
                     target: b.id,
                     relation: EdgeRelation::Extends,
                     weight: 1.0,
+                    properties: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
                 },
                 ExportedEdge {
                     edge_id: Uuid::new_v4(),
@@ -867,6 +974,9 @@ mod tests {
                     // not an endpoint-contract violation this test isn't about.
                     relation: EdgeRelation::VariantOf,
                     weight: 0.9,
+                    properties: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
                 },
                 ExportedEdge {
                     edge_id: Uuid::new_v4(),
@@ -874,6 +984,9 @@ mod tests {
                     target: phantom,
                     relation: EdgeRelation::Enables,
                     weight: 0.5,
+                    properties: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
                 },
             ],
         };
@@ -971,6 +1084,9 @@ mod tests {
                 target: e2.id,
                 relation: EdgeRelation::Precedes,
                 weight: 1.0,
+                properties: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
             }],
         };
 
@@ -1029,9 +1145,9 @@ mod tests {
         );
     }
 
-    /// 11. import_kg writes the archive edge_id as the stored LinkId.
+    /// 11. import_kg writes the archive edge identity and timestamps exactly.
     #[tokio::test]
-    async fn import_kg_persists_edge_id() {
+    async fn import_kg_persists_edge_id_and_timestamps() {
         let src = make_rt().await;
         let tok = NamespaceToken::local();
         let a = src
@@ -1048,7 +1164,16 @@ mod tests {
             .unwrap();
         let original_id: Uuid = stored_edge.id.into();
 
-        let archive = src.export_kg(&tok).await.unwrap();
+        let expected_created = chrono::DateTime::parse_from_rfc3339("2026-03-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expected_updated = chrono::DateTime::parse_from_rfc3339("2026-04-04T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut archive = src.export_kg(&tok).await.unwrap();
+        archive.edges[0].created_at = expected_created;
+        archive.edges[0].updated_at = expected_updated;
+        archive.edges[0].properties = Some(serde_json::json!({"confidence": 0.95}));
         let dst = make_rt().await;
         dst.import_kg(&archive, &tok).await.unwrap();
 
@@ -1062,6 +1187,26 @@ mod tests {
             Uuid::from(imported_edge.id),
             original_id,
             "stored edge id must equal the archive edge_id"
+        );
+        assert_eq!(
+            imported_edge.created_at, expected_created,
+            "present edge created_at must not be replaced with import time"
+        );
+        assert_eq!(
+            imported_edge.updated_at, expected_updated,
+            "present edge updated_at must not be replaced with created_at or import time"
+        );
+        assert_eq!(
+            imported_edge.metadata,
+            Some(serde_json::json!({"confidence": 0.95})),
+            "edge properties must persist as storage metadata"
+        );
+
+        let reexported = dst.export_kg(&tok).await.unwrap();
+        assert_eq!(
+            reexported.edges[0].properties,
+            Some(serde_json::json!({"confidence": 0.95})),
+            "edge metadata must re-export as portable properties"
         );
     }
 

@@ -116,22 +116,23 @@ kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --name
   follow a pre-existing symlink), `fsync`s it, then renames it into place (`archive.rs:54-80`).
 - `kg import <source> --db <path> [--namespace local] [--format archive|json|ndjson] [--verbose]`:
   `source` and `--db` are required, `--format` defaults to `archive`.
-  - `--format archive` (default): parses `source` directly as a `KgArchive` JSON envelope, checks
-    edge weights are finite and in `[0.0, 1.0]`, then calls `runtime.import_kg`. Entity/note kind
-    validation runs against the **full merged pack kind registry** (every loaded pack's kinds,
-    including pack-registered ones like `resource`), because `cmd_import` installs that registry
-    before importing (`archive.rs:93, 233-255`).
+  - `--format archive` (default): parses `source` directly as a `KgArchive` JSON envelope and
+    completes format/version, entity kind/name, timestamp, and edge-weight validation before the
+    target runtime is constructed. Kind validation uses the **full merged pack kind registry**
+    (including pack-registered kinds such as `resource`) discovered against an in-memory validation
+    runtime, so malformed input cannot create or migrate `--db`.
   - `--format json` / `--format ndjson`: parsed through `khive_vcs_adapters::JsonFormatAdapter`,
     a flat array of entity/edge records in the adapter's own wire shape (a `json` file is one JSON
-    array; an `ndjson` file is one record per line, joined into an array before parsing). **These
-    two formats are not the same code path as `--format archive`** and validate entity kind
-    earlier, against only the base 8 `khive_types::EntityKind` variants, not the merged pack
-    registry. A pack-registered kind such as `resource` imports successfully with `--format
-    archive` but is rejected by `--format json`/`--format ndjson`; this asymmetry is a known,
-    explicitly-commented gap (`archive.rs:609-620`), not a bug to work around locally.
-  - A malformed record anywhere in a `json`/`ndjson` array aborts the entire import before any DB
-    write; earlier well-formed records in the same file are not partially applied
-    (`archive.rs:823-891`).
+    array; an `ndjson` file is one record per line, joined into an array before parsing). These
+    formats pass the merged pack kind registry into the adapter, so pack-registered kinds such as
+    `resource` use the same installed taxonomy as archive import. Canonical `source`+`target`
+    identifies an edge; `from`/`to` remain entity metadata; a complete dual entity/edge signature
+    is rejected as ambiguous. Required names must be non-blank and present timestamps must be valid
+    RFC 3339 strings. Entity labels retain their original nonblank bytes. Edge properties and the
+    two timestamps remain top-level portable fields and persist as storage metadata/provenance.
+  - A malformed record anywhere in an archive, `json`, or `ndjson` input aborts before the target
+    runtime is constructed; `--db` is neither created nor migrated and earlier valid records are
+    not partially applied.
   - The positional `source` argument points at an arbitrary file the operator names. It is **not** the same as reading
     the repo's tracked `.khive/kg/{entities,edges}.ndjson`; that directory-reading path
     (`archive_from_ndjson_repo`) is used only by `kg status`, and separately by `kkernel sync` /
@@ -168,6 +169,9 @@ kkernel kg fetch upstream --url https://github.com/org/kg-data.git --ref main \
   `git_ref`, `commit_sha`, and `content_hash`.
 - Git remote URLs and any embedded credentials are redacted from error messages before they reach
   stdout/stderr (`khive-vcs/src/sync.rs:462-523`).
+- Remote validation uses the same full deterministic gate as local sync. Edge properties are part
+  of `content_hash`, so a metadata-only remote change fails an old pin; independent edge creation
+  and update timestamps are preserved through archive conversion.
 
 **Do not confuse `kg fetch`/`kg sync` with the top-level `kkernel sync`.** They share a name
 fragment but are different commands: `kkernel sync --repo . --db <path> [--namespace local]`
@@ -175,9 +179,10 @@ rebuilds a **local** SQLite DB from the repo's own tracked `.khive/kg/*.ndjson` 
 pin), atomically, via a `.tmp` file and rename, checkpointing the WAL first so no committed rows
 are left behind by the rename (`khive-vcs/src/sync.rs:822-882`). `kg fetch`/`kg sync` instead
 populate a **remote cache directory** with pin verification; it does not touch any SQLite file by
-itself. Both validate NDJSON before writing anything (fail-closed): duplicate ids, dangling edge
-endpoints, out-of-range edge weights, unsorted files, and unknown entity kinds/edge relations all
-abort before any DB write (`khive-vcs/src/sync.rs:707-810`).
+itself. Both validate NDJSON before writing anything (fail-closed): blank names, malformed entity
+or edge timestamps, duplicate ids, dangling endpoints, out-of-range edge weights, unsorted files,
+and unknown entity kinds/edge relations all abort before publication. Local sync maps edge
+`properties` to storage `metadata` and preserves `created_at` and `updated_at` independently.
 
 ### `kg status`: drift between DB and tracked NDJSON
 
@@ -194,6 +199,8 @@ hashes the repo's tracked `.khive/kg/{entities,edges}.ndjson`, and reports:
 
 `clean` is a pure content-hash equality check: not a field-by-field diff, so it tells you _that_
 the DB and tracked files disagree, not _what_ disagrees (use `kg export` + a diff tool for that).
+Edge properties contribute to this hash after recursive key canonicalization; a metadata-only edge
+change therefore makes `clean` false.
 **`kg status` never calls `std::process::exit`**: a "dirty" result is reported only via
 `clean: false` in the JSON, not a nonzero exit code (`kg/status.rs`). This is the opposite of `kg
 validate` (below), which does hard-exit on failure. A cron/CI check against drift must parse
