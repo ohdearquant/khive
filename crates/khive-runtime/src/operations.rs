@@ -5014,34 +5014,29 @@ impl KhiveRuntime {
             return Ok(page.items);
         }
 
-        // Multi-namespace visibility: `offset` must apply to the combined,
-        // deduplicated set rather than per-namespace pages, so fetch enough
-        // of each namespace's page to cover it, merge, then slice.
-        let fetch_limit = offset.saturating_add(limit);
-        let mut results = Vec::new();
-        for ns in visible {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            let page = self
-                .graph(&temp)?
-                .query_edges(
-                    filter.clone().into(),
-                    vec![SortOrder {
-                        field: EdgeSortField::CreatedAt,
-                        direction: khive_storage::types::SortDirection::Asc,
-                    }],
-                    PageRequest {
-                        offset: 0,
-                        limit: fetch_limit,
-                    },
-                )
-                .await?;
-            results.extend(page.items);
-        }
-        results.sort_by_key(|e| Uuid::from(e.id));
-        results.dedup_by_key(|e| Uuid::from(e.id));
-        let start = (offset as usize).min(results.len());
-        let end = (start + limit as usize).min(results.len());
-        Ok(results[start..end].to_vec())
+        // Multi-namespace visibility: one deterministic query with
+        // `namespace IN (...)` and real SQL paging, mirroring
+        // `list_entities`. Fetching per-namespace prefixes and slicing a
+        // client-side merge re-sorted by UUID floats the offset window
+        // between calls — pages silently duplicate and skip rows, so
+        // enumeration never covers the set (#2088).
+        let ns_strs: Vec<String> = visible.iter().map(|ns| ns.as_str().to_owned()).collect();
+        let page = self
+            .graph(token)?
+            .query_edges_in_namespaces(
+                &ns_strs,
+                filter.into(),
+                vec![SortOrder {
+                    field: EdgeSortField::CreatedAt,
+                    direction: khive_storage::types::SortDirection::Asc,
+                }],
+                PageRequest {
+                    offset: offset.into(),
+                    limit,
+                },
+            )
+            .await?;
+        Ok(page.items)
     }
 
     /// Keyset (seek) page of edges matching `filter`, ordered by immutable
@@ -6870,6 +6865,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
+    }
+
+    /// #2088 regression at the runtime seam: a token whose visibility spans
+    /// two namespaces must offset-enumerate the combined edge set exactly —
+    /// no duplicates across pages, nothing skipped.
+    #[tokio::test]
+    async fn list_edges_multi_namespace_offset_paging_enumerates_exactly() {
+        let rt = rt();
+        let ns_a = Namespace::parse("ns-a").unwrap();
+        let ns_b = Namespace::parse("ns-b").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        let mut expected = std::collections::HashSet::new();
+        for (tok, n) in [(&tok_a, 15u32), (&tok_b, 15u32)] {
+            for i in 0..n {
+                let a = rt
+                    .create_entity(tok, "concept", None, &format!("S{i}"), None, None, vec![])
+                    .await
+                    .unwrap();
+                let b = rt
+                    .create_entity(tok, "concept", None, &format!("T{i}"), None, None, vec![])
+                    .await
+                    .unwrap();
+                let e = rt
+                    .link(tok, a.id, b.id, EdgeRelation::Extends, 0.5, None)
+                    .await
+                    .unwrap();
+                expected.insert(Uuid::from(e.id));
+            }
+        }
+
+        let multi = NamespaceToken::mint_with_visibility(ns_a, vec![ns_b], ActorRef::anonymous());
+        let mut seen: Vec<Uuid> = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let page = rt
+                .list_edges(&multi, EdgeListFilter::default(), 4, offset)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            seen.extend(page.iter().map(|e| Uuid::from(e.id)));
+            offset += 4;
+        }
+
+        assert_eq!(seen.len(), 30, "must enumerate all edges across namespaces");
+        let distinct: std::collections::HashSet<Uuid> = seen.iter().copied().collect();
+        assert_eq!(distinct.len(), 30, "no duplicates across pages");
+        assert_eq!(
+            distinct, expected,
+            "enumerated set must equal the created set"
+        );
     }
 
     #[tokio::test]

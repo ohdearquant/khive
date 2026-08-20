@@ -777,6 +777,34 @@ fn micros_to_datetime(micros: i64) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
+/// Deterministic ORDER BY for edge queries. #1671: an `id` tiebreak is
+/// always appended (following the last sort field's direction, DESC for the
+/// empty default) so pages over equal sort values keep a total order. That
+/// removes tie-order instability only — offset paging can still duplicate or
+/// skip rows under concurrent inserts/deletes or sort-key updates (that
+/// would need snapshot isolation or keyset pagination).
+fn edge_order_clause(sort: &[SortOrder<EdgeSortField>]) -> String {
+    if sort.is_empty() {
+        return " ORDER BY created_at DESC, id DESC".to_string();
+    }
+    let mut parts: Vec<String> = sort
+        .iter()
+        .map(|s| {
+            let dir = match s.direction {
+                SortDirection::Asc => "ASC",
+                SortDirection::Desc => "DESC",
+            };
+            format!("{} {}", edge_sort_col(&s.field), dir)
+        })
+        .collect();
+    let dir = match sort.last().map(|s| &s.direction) {
+        Some(SortDirection::Asc) => "ASC",
+        _ => "DESC",
+    };
+    parts.push(format!("id {dir}"));
+    format!(" ORDER BY {}", parts.join(", "))
+}
+
 fn build_edge_filter_sql(
     namespace: &str,
     filter: &EdgeFilter,
@@ -1891,37 +1919,7 @@ impl GraphStore for SqlGraphStore {
                 stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
             };
 
-            let order_clause = if sort.is_empty() {
-                // #1671: append `id` as the final tiebreak in the same DESC
-                // direction as the `created_at` primary sort key, giving a
-                // deterministic total order. That removes tie-order
-                // instability only — offset paging can still duplicate or
-                // skip rows under concurrent inserts/deletes or sort-key
-                // updates (that would need snapshot isolation or keyset
-                // pagination).
-                " ORDER BY created_at DESC, id DESC".to_string()
-            } else {
-                let mut parts: Vec<String> = sort
-                    .iter()
-                    .map(|s| {
-                        let dir = match s.direction {
-                            SortDirection::Asc => "ASC",
-                            SortDirection::Desc => "DESC",
-                        };
-                        format!("{} {}", edge_sort_col(&s.field), dir)
-                    })
-                    .collect();
-                // #1671: the appended `id` tiebreak follows the LAST sort
-                // field's direction (the behavior the multi-field sweep tests
-                // codify), so pages over equal sort values stay a
-                // deterministic total order.
-                let dir = match sort.last().map(|s| &s.direction) {
-                    Some(SortDirection::Asc) => "ASC",
-                    _ => "DESC",
-                };
-                parts.push(format!("id {dir}"));
-                format!(" ORDER BY {}", parts.join(", "))
-            };
+            let order_clause = edge_order_clause(&sort);
 
             let (_, data_filter_params) = build_edge_filter_sql(&namespace, &filter);
             let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
@@ -1993,6 +1991,82 @@ impl GraphStore for SqlGraphStore {
                 total += count as u64;
             }
             Ok(total)
+        })
+        .await
+    }
+
+    async fn query_edges_in_namespaces(
+        &self,
+        namespaces: &[String],
+        filter: EdgeFilter,
+        sort: Vec<SortOrder<EdgeSortField>>,
+        page: PageRequest,
+    ) -> Result<Page<Edge>, StorageError> {
+        // One statement with `namespace IN (...)` and real SQL paging: a
+        // per-namespace prefix fetch merged and re-sliced client-side floats
+        // the offset window between calls, silently duplicating and skipping
+        // rows during enumeration (#2088).
+        let namespaces: Vec<String> = {
+            let mut seen = HashSet::new();
+            namespaces
+                .iter()
+                .filter(|ns| seen.insert((*ns).clone()))
+                .cloned()
+                .collect()
+        };
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Graph,
+            operation: "query_edges_in_namespaces".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
+        self.with_reader("query_edges_in_namespaces", move |conn| {
+            let (where_clause, filter_params) =
+                build_edge_filter_sql_for_namespaces(&namespaces, &filter);
+
+            let count_sql = format!("SELECT COUNT(*) FROM graph_edges{}", where_clause);
+            let total: i64 = {
+                let mut stmt = conn.prepare(&count_sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    filter_params.iter().map(|p| p.as_ref()).collect();
+                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
+            };
+
+            let order_clause = edge_order_clause(&sort);
+
+            let (_, data_filter_params) =
+                build_edge_filter_sql_for_namespaces(&namespaces, &filter);
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
+            all_params.push(Box::new(limit_i64));
+            all_params.push(Box::new(offset_i64));
+
+            let limit_idx = all_params.len() - 1;
+            let offset_idx = all_params.len();
+
+            let data_sql = format!(
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend \
+                 FROM graph_edges{}{} LIMIT ?{} OFFSET ?{}",
+                where_clause, order_clause, limit_idx, offset_idx,
+            );
+
+            let mut stmt = conn.prepare(&data_sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), read_edge)?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+
+            Ok(Page {
+                items,
+                total: Some(total as u64),
+            })
         })
         .await
     }

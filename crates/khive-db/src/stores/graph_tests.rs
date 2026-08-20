@@ -287,6 +287,95 @@ fn make_edge(source: Uuid, target: Uuid, relation: EdgeRelation, weight: f64) ->
 }
 
 #[tokio::test]
+async fn query_edges_in_namespaces_offset_paging_enumerates_exactly() {
+    // #2088 regression: two namespaces, every edge sharing one created_at
+    // (the worst tie population), paged by offset to exhaustion. The single
+    // `namespace IN (...)` statement with the #1671 id tiebreak must
+    // enumerate every row exactly once, in a deterministic order.
+    let store = setup_memory_store();
+    let tied = Utc::now();
+    let mut expected: Vec<Uuid> = Vec::new();
+    for ns in ["ns-a", "ns-b"] {
+        for _ in 0..20 {
+            let mut edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 0.5);
+            edge.namespace = ns.to_string();
+            edge.created_at = tied;
+            edge.updated_at = tied;
+            expected.push(edge.id.into());
+            store.upsert_edge(edge).await.unwrap();
+        }
+    }
+
+    let namespaces = vec!["ns-a".to_string(), "ns-b".to_string()];
+    let sort = || {
+        vec![SortOrder {
+            field: EdgeSortField::CreatedAt,
+            direction: SortDirection::Asc,
+        }]
+    };
+
+    let mut seen: Vec<Uuid> = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let page = store
+            .query_edges_in_namespaces(
+                &namespaces,
+                EdgeFilter::default(),
+                sort(),
+                PageRequest { offset, limit: 7 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(40));
+        if page.items.is_empty() {
+            break;
+        }
+        for e in &page.items {
+            seen.push(e.id.into());
+        }
+        offset += 7;
+    }
+
+    assert_eq!(seen.len(), 40, "offset paging must enumerate every row");
+    let distinct: std::collections::HashSet<Uuid> = seen.iter().copied().collect();
+    assert_eq!(distinct.len(), 40, "no row may appear on two pages");
+    let mut want: Vec<Uuid> = expected.clone();
+    want.sort();
+    let mut got: Vec<Uuid> = seen.clone();
+    got.sort();
+    assert_eq!(got, want, "enumerated set must equal the seeded set");
+
+    // Determinism: the same page re-read returns the same rows in order.
+    let page1 = store
+        .query_edges_in_namespaces(
+            &namespaces,
+            EdgeFilter::default(),
+            sort(),
+            PageRequest {
+                offset: 14,
+                limit: 7,
+            },
+        )
+        .await
+        .unwrap();
+    let page2 = store
+        .query_edges_in_namespaces(
+            &namespaces,
+            EdgeFilter::default(),
+            sort(),
+            PageRequest {
+                offset: 14,
+                limit: 7,
+            },
+        )
+        .await
+        .unwrap();
+    let ids1: Vec<Uuid> = page1.items.iter().map(|e| e.id.into()).collect();
+    let ids2: Vec<Uuid> = page2.items.iter().map(|e| e.id.into()).collect();
+    assert_eq!(ids1, ids2, "a page must be stable across identical reads");
+}
+
+#[tokio::test]
 async fn test_upsert_and_get_edge() {
     let store = setup_memory_store();
 
