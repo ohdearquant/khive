@@ -12,6 +12,31 @@ export type ShowcaseFetch = (
   init?: RequestInit,
 ) => Promise<Pick<Response, "ok" | "status" | "headers" | "arrayBuffer">>;
 
+export type ShowcaseResponse = Awaited<ReturnType<ShowcaseFetch>>;
+
+export async function parseBoundedShowcaseResponse(
+  response: ShowcaseResponse,
+  sourceLabel = "Showcase bundle",
+): Promise<RepoBundle> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > REPO_BUNDLE_MAX_BYTES) {
+    throw new Error(`${sourceLabel} exceeds the ${REPO_BUNDLE_MAX_MIB} MiB browser limit.`);
+  }
+
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > REPO_BUNDLE_MAX_BYTES) {
+    throw new Error(`${sourceLabel} exceeds the ${REPO_BUNDLE_MAX_MIB} MiB browser limit.`);
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new Error(`${sourceLabel} is not valid JSON.`);
+  }
+  return parseRepoBundle(value);
+}
+
 export async function loadStaticShowcaseBundle(
   entry: ShowcaseRegistryEntry,
   fetchBundle: ShowcaseFetch = fetch,
@@ -29,21 +54,5 @@ export async function loadStaticShowcaseBundle(
     throw new Error(`Showcase asset could not be loaded (HTTP ${response.status}).`);
   }
 
-  const declaredLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > REPO_BUNDLE_MAX_BYTES) {
-    throw new Error(`Showcase bundle exceeds the ${REPO_BUNDLE_MAX_MIB} MiB browser limit.`);
-  }
-
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > REPO_BUNDLE_MAX_BYTES) {
-    throw new Error(`Showcase bundle exceeds the ${REPO_BUNDLE_MAX_MIB} MiB browser limit.`);
-  }
-
-  let value: unknown;
-  try {
-    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  } catch {
-    throw new Error("Showcase asset is not valid JSON.");
-  }
-  return parseRepoBundle(value);
+  return parseBoundedShowcaseResponse(response);
 }

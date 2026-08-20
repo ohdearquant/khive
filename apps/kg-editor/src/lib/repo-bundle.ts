@@ -493,6 +493,25 @@ export const repoBundleSchema = z.strictObject({
       context.addIssue({ code: "custom", path: ["graph", key, "items"], message: "symbol-tier collections are typed but empty in khive.repo.v1" });
     }
   }
+  for (const key of [
+    "dependency_topology",
+    "hotspot_quadrant",
+    "hidden_coupling",
+    "structure_treemap",
+    "cadence_timeline",
+    "ownership",
+    "api_surface",
+    "scorecard",
+  ] as const) {
+    const allowedPartialOwnership = key === "ownership" &&
+      bundle.capability.views.ownership.status === "unavailable" &&
+      bundle.aggregates.ownership.meta.status === "available" &&
+      bundle.aggregates.ownership.modules.disclosure.status === "unavailable";
+    if (allowedPartialOwnership) continue;
+    if (bundle.capability.views[key].status !== bundle.aggregates[key].meta.status) {
+      context.addIssue({ code: "custom", path: ["capability", "views", key, "status"], message: "view capability status must match aggregate analysis status" });
+    }
+  }
 });
 
 export type RepoBundle = z.infer<typeof repoBundleSchema>;

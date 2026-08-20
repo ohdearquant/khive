@@ -4,26 +4,27 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { loadStaticShowcaseBundle } from "@/lib/adapters/static-showcase-source";
+import { loadPreferredShowcaseBundle } from "@/lib/adapters/preferred-showcase-source";
 import { parseRepoBundle } from "@/lib/repo-bundle";
 
-vi.mock("@/lib/adapters/static-showcase-source", () => ({
-  loadStaticShowcaseBundle: vi.fn(),
+vi.mock("@/lib/adapters/preferred-showcase-source", () => ({
+  loadPreferredShowcaseBundle: vi.fn(),
+  readOperatorShowcaseAccessToken: vi.fn(() => null),
 }));
 
 import { Showcase } from "@/components/showcase/showcase";
 
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
 const bundle = parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
-const mockedLoad = vi.mocked(loadStaticShowcaseBundle);
+const mockedLoad = vi.mocked(loadPreferredShowcaseBundle);
 
-describe("static repository lookup", () => {
+describe("materialized repository lookup", () => {
   beforeEach(() => {
     window.history.replaceState(null, "", "/");
-    mockedLoad.mockResolvedValue(bundle);
+    mockedLoad.mockResolvedValue({ bundle, source: "khive-db-snapshot" });
   });
 
-  it("normalizes a curated alias and performs no bundle load for a later miss", async () => {
+  it("normalizes a curated alias, reauthorizes each private snapshot load, and performs no bundle load for a later miss", async () => {
     const user = userEvent.setup();
     const { container } = render(<Showcase />);
 
@@ -33,6 +34,11 @@ describe("static repository lookup", () => {
       "data-head-sha",
       "c2979d2443738a075e55a170c772d1dc86cf0f91",
     );
+    expect(container.querySelector(".repo-overview")).toHaveAttribute(
+      "data-analysis-source",
+      "khive-db-snapshot",
+    );
+    expect(screen.getAllByText(/khive DB snapshot/i).length).toBeGreaterThan(0);
 
     const input = screen.getByLabelText("Public repository URL");
     await user.clear(input);
@@ -43,7 +49,9 @@ describe("static repository lookup", () => {
     expect(window.location.search).toContain(
       "repo=https%3A%2F%2Fgithub.com%2Fohdearquant%2Fkhive",
     );
-    expect(mockedLoad).toHaveBeenCalledTimes(1);
+    // Private snapshots are authorized per load: the same entry loads again
+    // rather than being served from the module cache.
+    expect(mockedLoad).toHaveBeenCalledTimes(2);
 
     await user.clear(input);
     await user.type(input, "https://github.com/example/not-curated");
@@ -55,10 +63,33 @@ describe("static repository lookup", () => {
     expect(empty).toBeVisible();
     expect(empty?.querySelectorAll("button")).toHaveLength(1);
     expect(window.location.search).toBe("");
-    expect(mockedLoad).toHaveBeenCalledTimes(1);
+    expect(mockedLoad).toHaveBeenCalledTimes(2);
 
     await user.click(screen.getByRole("button", { name: "Use the curated khive example" }));
     await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    expect(mockedLoad).toHaveBeenCalledTimes(3);
+  }, 15_000);
+
+  it("serves the public static fallback from cache instead of reloading it", async () => {
+    mockedLoad.mockClear();
+    mockedLoad.mockResolvedValue({ bundle, source: "curated-static-fallback" });
+    const user = userEvent.setup();
+    const { container } = render(<Showcase />);
+
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    expect(mockedLoad).toHaveBeenCalledTimes(1);
+    expect(container.querySelector(".repo-overview")).toHaveAttribute(
+      "data-analysis-source",
+      "curated-static-fallback",
+    );
+
+    const input = screen.getByLabelText("Public repository URL");
+    await user.clear(input);
+    await user.type(input, "http://github.com/ohdearquant/khive.git");
+    await user.click(screen.getByRole("button", { name: bundle.capability.labels.lookup_action }));
+
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    // Nothing private is retained here, so the cache may keep serving it.
     expect(mockedLoad).toHaveBeenCalledTimes(1);
   }, 15_000);
 });
