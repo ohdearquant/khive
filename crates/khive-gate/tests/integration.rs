@@ -222,6 +222,8 @@ fn audit_decision_serialises_as_snake_case() {
     assert_eq!(allow, "allow");
     let deny = serde_json::to_value(AuditDecision::Deny).unwrap();
     assert_eq!(deny, "deny");
+    let unavailable = serde_json::to_value(AuditDecision::GateUnavailable).unwrap();
+    assert_eq!(unavailable, "gate_unavailable");
 }
 
 // ---- impl_name() default ----

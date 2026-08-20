@@ -23,8 +23,9 @@ MCP request(ops=...) → khive_request::parse_request → Vec<ParsedOp>
   for each ParsedOp:
     VerbRegistry::dispatch(verb, params)
       → help=true? → describe_verb() [short-circuit, no gate]
-      → Gate::check(GateRequest) → Allow|Deny
+      → Gate::check(GateRequest) → Allow|Deny|Err
           Deny → RuntimeError::PermissionDenied [pack not invoked]
+          Err → RuntimeError::GateUnavailable [pack not invoked]
           Allow → first matching pack.dispatch(verb, params)
                   → RuntimeResult<Value>
       → EventStore::append(audit_event) [if configured]
@@ -93,7 +94,8 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
 ## Invariants
 
 - One pack per verb at boot: duplicate verb names across packs produce `RuntimeError::VerbCollision`.
-- Gate is consulted before every dispatch. Gate infrastructure errors are fail-open (ADR-018).
+- Gate is consulted before every dispatch. Gate infrastructure errors are audited and fail closed
+  with `RuntimeError::GateUnavailable` (ADR-018, ADR-129).
 - Namespace is attribution and gate-policy input (ADR-007 Rev 6, ADR-050): it is minted into
   the dispatch `NamespaceToken`'s read/write scope, not re-checked per record. By-ID
   operations (get, delete, update) resolve globally unique UUIDs without a namespace
@@ -109,6 +111,7 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
 | ----------------------------------------------------- | --------------------------------------------------------------------------- |
 | Unknown verb                                          | `RuntimeError::UnknownVerb("unknown verb ...")`                             |
 | Gate deny                                             | `RuntimeError::PermissionDenied { verb, reason }`                           |
+| Gate infrastructure error                             | `RuntimeError::GateUnavailable { verb, reason }`                            |
 | Pack not loaded                                       | `RuntimeError::UnknownVerb` (unknown verb path)                             |
 | Malformed explicit namespace                          | `RuntimeError::InvalidInput` (non-string `namespace`, rejected before gate) |
 | Read-only audit backend after a successful inspection | Success plus `audit_persistence_skipped_read_only` advisory                 |

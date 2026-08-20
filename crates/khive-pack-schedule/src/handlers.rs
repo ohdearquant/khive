@@ -1111,6 +1111,9 @@ async fn cancel_pending_event(
         .await
         .map_err(|e| RuntimeError::Internal(format!("cancel: open SQL writer: {e}")))?;
 
+    // json_set targets the fixed nested paths `$.status`/`$.cancelled_at`
+    // only; no caller input reaches this statement, so it cannot create or
+    // replace the top-level reserved property key.
     let rows = writer
         .execute(SqlStatement {
             sql: "UPDATE notes \

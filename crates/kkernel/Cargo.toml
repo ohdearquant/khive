@@ -65,6 +65,7 @@ rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 # Cargo unifies features across the build graph, so test builds see the
 # armed-capture hook while the release dependency above stays untouched.
 khive-mcp = { version = "0.7.0", path = "../khive-mcp", features = ["test-forward-seam"] }
+khive-gate-rego = { version = "0.7.0", path = "../khive-gate-rego" }
 
 [features]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).

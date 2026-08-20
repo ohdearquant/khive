@@ -1,0 +1,235 @@
+{
+  "schema_version": "khive.writer-census.manifest.v1",
+  "source_revision": "288b9eee1f471d505e7f5de33e121c58773a10af",
+  "pack_set": [
+    "kg",
+    "gtd",
+    "memory",
+    "brain",
+    "comm",
+    "schedule",
+    "knowledge",
+    "session",
+    "git",
+    "code",
+    "workspace",
+    "blob"
+  ],
+  "inventory": {
+    "kg": [
+      "create",
+      "get",
+      "list",
+      "stats",
+      "update",
+      "delete",
+      "merge",
+      "search",
+      "link",
+      "neighbors",
+      "traverse",
+      "context",
+      "query",
+      "propose",
+      "review",
+      "withdraw",
+      "resolve",
+      "whoami",
+      "db_diagnostics",
+      "verbs"
+    ],
+    "gtd": [
+      "gtd.assign",
+      "gtd.next",
+      "gtd.complete",
+      "gtd.tasks",
+      "gtd.transition"
+    ],
+    "memory": [
+      "memory.remember",
+      "memory.feedback",
+      "memory.recall",
+      "memory.prune",
+      "memory.vacuum"
+    ],
+    "brain": [
+      "brain.event_counts",
+      "brain.profiles",
+      "brain.profile",
+      "brain.resolve",
+      "brain.activate",
+      "brain.deactivate",
+      "brain.archive",
+      "brain.reset",
+      "brain.feedback",
+      "brain.auto_feedback",
+      "brain.mark_turn",
+      "brain.bind",
+      "brain.unbind",
+      "brain.bindings",
+      "brain.create_profile",
+      "brain.register_adapter"
+    ],
+    "comm": [
+      "comm.send",
+      "comm.delivered",
+      "comm.inbox",
+      "comm.read",
+      "comm.mark_read",
+      "comm.unread",
+      "comm.reply",
+      "comm.thread",
+      "comm.health",
+      "comm.probe"
+    ],
+    "schedule": [
+      "schedule.remind",
+      "schedule.schedule",
+      "schedule.agenda",
+      "schedule.cancel"
+    ],
+    "knowledge": [
+      "knowledge.upsert_atoms",
+      "knowledge.upsert_domains",
+      "knowledge.get",
+      "knowledge.list",
+      "knowledge.delete_atoms",
+      "knowledge.stats",
+      "knowledge.index",
+      "knowledge.fold",
+      "knowledge.search",
+      "knowledge.suggest",
+      "knowledge.compose",
+      "knowledge.edit",
+      "knowledge.import",
+      "knowledge.challenge",
+      "knowledge.adjudicate",
+      "knowledge.learn",
+      "knowledge.cite",
+      "knowledge.topic",
+      "knowledge.feedback"
+    ],
+    "session": [
+      "session.store",
+      "session.list",
+      "session.resume",
+      "session.export"
+    ],
+    "git": [
+      "git.digest",
+      "git.commit",
+      "git.branch",
+      "git.push"
+    ],
+    "code": [
+      "code.ingest"
+    ],
+    "workspace": [],
+    "blob": [
+      "blob.put",
+      "blob.get",
+      "blob.stat"
+    ]
+  },
+  "control": {
+    "verb": "comm.read",
+    "required_classification": "WRITER"
+  },
+  "defaults": {
+    "classification": "UNKNOWN",
+    "reason": "intrinsic handler writer trace is not complete in tranche 1",
+    "paths": [
+      {
+        "classification": "WRITER-COND",
+        "condition": "event_store_configured",
+        "kind": "dispatch_audit",
+        "symbol": "VerbRegistry::dispatch_with_identity -> EventStore::append_event",
+        "evidence": {
+          "path": "crates/khive-runtime/src/pack.rs",
+          "required_patterns": [
+            "async fn append_audit_event_best_effort(",
+            "store.append_event(event).await"
+          ]
+        }
+      }
+    ]
+  },
+  "internal_handlers": {
+    "brain.record_serve": {
+      "classification": "WRITER-COND",
+      "reason": "non-empty serve batches acquire SqlWriter once",
+      "paths": [
+        {
+          "classification": "WRITER-COND",
+          "condition": "target_ids_non_empty",
+          "kind": "sqlite",
+          "symbol": "serve_ledger::record_serves -> SqlAccess::writer",
+          "evidence": {
+            "path": "crates/khive-pack-brain/src/serve_ledger.rs",
+            "required_patterns": [
+              "pub(crate) async fn record_serves(",
+              "let mut writer = sql.writer().await"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "overrides": {
+    "comm.read": {
+      "classification": "WRITER",
+      "reason": "a valid inbound target attempts an atomic read-flag update",
+      "paths": [
+        {
+          "classification": "WRITER",
+          "kind": "sqlite",
+          "symbol": "mark_read_target -> NoteStore::try_patch_note_property",
+          "evidence": {
+            "path": "crates/khive-pack-comm/src/handlers.rs",
+            "required_patterns": [
+              "async fn mark_read_target(",
+              ".try_patch_note_property("
+            ]
+          }
+        }
+      ]
+    },
+    "memory.recall": {
+      "classification": "UNKNOWN",
+      "reason": "direct handler trace is incomplete; one nested writer is recorded",
+      "paths": [],
+      "nested_dispatches": [
+        {
+          "condition": "brain pack registered and recall returns target ids",
+          "target": "brain.record_serve",
+          "via_registry": true
+        }
+      ]
+    },
+    "blob.put": {
+      "classification": "UNKNOWN",
+      "reason": "object-store mutation is known but the shared SQLite writer path is untraced",
+      "paths": []
+    },
+    "code.ingest": {
+      "classification": "UNKNOWN",
+      "reason": "dedicated map-database writer path is not reconciled with the shared writer census",
+      "paths": []
+    },
+    "git.branch": {
+      "classification": "UNKNOWN",
+      "reason": "external git mutation remains outside the completed SQLite writer trace",
+      "paths": []
+    },
+    "git.commit": {
+      "classification": "UNKNOWN",
+      "reason": "external git mutation remains outside the completed SQLite writer trace",
+      "paths": []
+    },
+    "git.push": {
+      "classification": "UNKNOWN",
+      "reason": "external git mutation remains outside the completed SQLite writer trace",
+      "paths": []
+    }
+  }
+}
