@@ -1046,6 +1046,11 @@ async fn upsert_edges(
                 .relation
                 .parse()
                 .map_err(|e| anyhow!("invalid relation {:?}: {}", r.relation, e))?;
+            // ADR-115 Amendment 1 §3: edge metadata is a properties-bearing
+            // write path; the runtime-owned `khive:secret_gate` key is
+            // reservation-only on every entry path, sync included.
+            khive_runtime::secret_gate::reject_reserved_secret_gate_property(r.properties.as_ref())
+                .map_err(|e| anyhow!("edge {} properties rejected: {e}", r.edge_id))?;
             let fallback = Utc::now();
             let created_at = parse_timestamp(r.created_at.as_deref(), fallback)
                 .with_context(|| format!("edge {} invalid created_at", r.edge_id))?;
@@ -1361,6 +1366,45 @@ mod tests {
         );
 
         // DB must be untouched (atomic rename guarantee).
+        let after = std::fs::read(&db_path).unwrap();
+        assert_eq!(
+            after, b"ORIGINAL",
+            "failed sync must not replace existing DB"
+        );
+    }
+
+    /// ADR-115 Amendment 1 §3: an edge record carrying the runtime-owned
+    /// `khive:secret_gate` property key must fail the sync before the tmp DB
+    /// replaces the working DB — sync is a caller-controlled write path.
+    #[tokio::test]
+    async fn sync_rejects_edge_with_reserved_secret_gate_property() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"ORIGINAL").unwrap();
+
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let ent_a =
+            format!(r#"{{"id":"{id_a}","kind":"concept","name":"A","properties":{{}},"tags":[]}}"#);
+        let ent_b =
+            format!(r#"{{"id":"{id_b}","kind":"concept","name":"B","properties":{{}},"tags":[]}}"#);
+        let edge_id = "33333333-3333-3333-3333-333333333333";
+        let edge = format!(
+            r#"{{"edge_id":"{edge_id}","source":"{id_a}","target":"{id_b}","relation":"extends","weight":0.8,"properties":{{"khive:secret_gate":"exempted:content-sha256-manifest-v1"}}}}"#
+        );
+        write_repo(repo, &format!("{ent_a}\n{ent_b}\n"), &format!("{edge}\n"));
+
+        let err = run_sync(repo, &db_path, "test-ns")
+            .await
+            .expect_err("sync must reject the reserved edge property key");
+        assert!(
+            err.chain()
+                .any(|e| e.to_string().contains("khive:secret_gate")),
+            "error must name the reserved key, got: {err:#}"
+        );
+
         let after = std::fs::read(&db_path).unwrap();
         assert_eq!(
             after, b"ORIGINAL",
