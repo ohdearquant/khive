@@ -13,7 +13,7 @@ Every strategy first validates four input invariants:
 3. entity IDs and edge IDs are unique within each archive; and
 4. semantic edge keys `(source, target, relation)` are unique within each archive.
 
-Namespace, weight, duplicate-entity, and duplicate-edge-key failures have dedicated `MergeError` variants. A duplicate edge ID or an edge relation that cannot be reconstructed is reported as `MergeError::Internal`.
+Namespace, weight, duplicate-entity, and duplicate-edge-key failures have dedicated `MergeError` variants. A duplicate edge ID or another invariant failure is reported as `MergeError::Internal`.
 
 ## Automatic strategy
 
