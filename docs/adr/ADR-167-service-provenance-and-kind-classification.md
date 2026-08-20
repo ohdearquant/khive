@@ -48,12 +48,19 @@ nothing, which is worse than either deleting it or keeping it attached.
 Enumerating that blast radius has a complication of its own, because an edge may itself be an
 endpoint. `endpoint_exists_clause` in `crates/khive-db/src/stores/graph.rs` admits an undeleted
 `graph_edges` row as a valid endpoint alongside entities, notes and events, so an `annotates` edge
-may point AT another edge, and those rows are part of any migration's affected set. Whether the
-inbound filter `list(kind="edge", target_id=…)` reaches them is disputed and under verification at
-issue #2085 — one measurement says it returns empty, a later integration test says it matches. This
-ADR takes no position on that, and deliberately does not depend on it: a procedure that can lose
-edges must not have its completeness rest on a filter whose behaviour is in question, so the
-enumeration below is specified from the source side, which is unaffected either way.
+may point AT another edge, and those rows are part of any migration's affected set. The inbound
+filter `list(kind="edge", target_id=…)` does reach them: the earlier report that it returns empty
+(issue #2085) has been retracted, and an integration test covering the edge-as-target case matches.
+
+What remains open is exhaustive ENUMERATION, which is a different question from whether the filter
+matches. Issue #2088 records that the multi-namespace visibility path fetches each namespace's rows
+ordered by `created_at`, re-sorts the union by UUID, and then slices `[offset, offset+limit)`: the
+window floats as the prefix grows, so successive pages both duplicate and skip rows, and a paged
+walk terminates having seen a fraction of the population while reporting nothing wrong. A procedure
+that can lose edges must not rest its completeness on offset paging while that holds. The
+enumeration below is therefore specified from the source side, which is unaffected either way, and
+stays that way after the paging fix lands — a deletion procedure earns nothing by depending on the
+more fragile of two available reads.
 
 ## Decision
 
