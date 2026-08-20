@@ -753,6 +753,19 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
             bail!("edge {i}: duplicate edge id {}", r.edge_id);
         }
 
+        // ADR-115 Amendment 1 §3: edge metadata is in the unchanged
+        // blocking-scanner class. This validator guards BOTH consumers —
+        // the local DB rebuild and remote cache publication
+        // (`publish_remote_cache` persists these records reader-visible),
+        // so the reservation and the credential scanner both run here,
+        // before any write or publish.
+        khive_runtime::secret_gate::reject_reserved_secret_gate_property(r.properties.as_ref())
+            .map_err(|e| anyhow!("edge {i} ({}) properties rejected: {e}", r.edge_id))?;
+        if let Some(props) = r.properties.as_ref() {
+            khive_runtime::secret_gate::check_json(props)
+                .map_err(|e| anyhow!("edge {i} ({}) properties rejected: {e}", r.edge_id))?;
+        }
+
         if !triples.insert((r.source, r.target, relation)) {
             bail!(
                 "edge {i} ({}): duplicate edge triple (source={}, target={}, relation={:?})",
@@ -2345,6 +2358,48 @@ mod tests {
 
     /// F201-2: `run_sync_remote` with a wrong pin fails before touching the
     /// cache (fail-closed guarantee).
+    /// The remote publication path must invoke the blocking secret scanner:
+    /// a credential-shaped edge property fails the sync before
+    /// `publish_remote_cache` writes any reader-visible cache generation.
+    #[tokio::test]
+    async fn run_sync_remote_rejects_credential_shaped_edge_property_before_cache_publish() {
+        let remote_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let id_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let id_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let entities = format!(
+            "{{\"id\":\"{id_a}\",\"kind\":\"concept\",\"name\":\"A\",\"properties\":{{}},\"tags\":[]}}\n{{\"id\":\"{id_b}\",\"kind\":\"concept\",\"name\":\"B\",\"properties\":{{}},\"tags\":[]}}"
+        );
+        let edge_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let edges = format!(
+            "{{\"edge_id\":\"{edge_id}\",\"source\":\"{id_a}\",\"target\":\"{id_b}\",\"relation\":\"extends\",\"weight\":0.8,\"properties\":{{\"api_key\":\"AKIAFAKEKEY1234567890\"}}}}"
+        );
+        let remote_url = make_git_remote(remote_dir.path(), &entities, &edges);
+        let remote = RemoteConfig {
+            name: RemoteName::parse("secret-edge").unwrap(),
+            url: remote_url,
+            git_ref: "main".to_string(),
+            namespace: "remote-ns".to_string(),
+            pin: None,
+        };
+
+        let err = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect_err("remote fetch must reject the credential-shaped edge property");
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("properties rejected")),
+            "error must attribute the rejection to edge properties: {err:#}"
+        );
+        assert!(
+            !repo_dir
+                .path()
+                .join(".khive/kg/remotes/secret-edge")
+                .exists(),
+            "credential-shaped remote records must not publish a cache generation"
+        );
+    }
+
     #[tokio::test]
     async fn run_sync_remote_rejects_hash_mismatch() {
         let remote_dir = TempDir::new().unwrap();
