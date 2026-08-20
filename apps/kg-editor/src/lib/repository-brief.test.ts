@@ -264,6 +264,27 @@ describe("repository triage model", () => {
     );
   });
 
+  it("reports unresolved history IDs as unavailable when the commit page itself is unavailable", () => {
+    const target = buildRepositoryBrief(bundle).startHere[0];
+    const broken = structuredClone(bundle);
+    const navigation = broken.graph.history_navigation.by_module.items.find(
+      (row) => row.module_id === target.moduleId,
+    );
+    expect(navigation).toBeDefined();
+    expect(navigation!.commits.items.length).toBeGreaterThan(0);
+    broken.graph.commits.items = [];
+    broken.graph.commits.disclosure = {
+      status: "unavailable",
+      reason: "commit analysis not produced",
+    };
+
+    const insight = buildModuleInsight(broken, target.moduleId);
+
+    expect(insight?.recentCommits).toEqual([]);
+    expect(insight?.history.status).toBe("unavailable");
+    expect(insight?.history.reason).toMatch(/commit page is unavailable/i);
+  });
+
   it("marks history-navigation evidence truncated when a cursor remains despite a complete disclosure", () => {
     const target = buildRepositoryBrief(bundle).startHere[0];
     const paged = structuredClone(bundle);

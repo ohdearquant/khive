@@ -294,12 +294,14 @@ function commitResolutionGapMetric(
   base: RepositoryMetric,
   unresolved: number,
   captured: number,
+  commitsUnavailable: boolean,
 ): RepositoryMetric {
-  const gap =
-    `${unresolved} of ${captured} captured history IDs are not present in the captured commit page`;
+  const gap = commitsUnavailable
+    ? `${unresolved} of ${captured} captured history IDs cannot be resolved because the commit page is unavailable`
+    : `${unresolved} of ${captured} captured history IDs are not present in the captured commit page`;
   return {
     ...base,
-    status: "truncated",
+    status: commitsUnavailable ? "unavailable" : "truncated",
     reason: base.reason ? `${base.reason}; ${gap}` : gap,
     summary: `${base.summary}; ${gap}`,
   };
@@ -946,6 +948,7 @@ export function buildModuleInsight(
       navigationHistory,
       unresolvedCommitCount,
       navigationCommitIds.length,
+      bundle.graph.commits.disclosure.status === "unavailable",
     );
   const recentCommits = navigationCommitIds
     .flatMap((commitId) => {

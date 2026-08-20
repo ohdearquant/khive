@@ -29,15 +29,23 @@ type LoadState =
 const bundleCache = new Map<string, Promise<LoadedShowcaseBundle>>();
 
 function loadEntry(entry: ShowcaseRegistryEntry): Promise<LoadedShowcaseBundle> {
-  const existing = bundleCache.get(entry.id);
+  // The cache must never outlive the authorization that filled it: the key
+  // carries the current session token, so removal or rotation misses the
+  // cache and the protected route re-authorizes, instead of a previously
+  // authorized private snapshot being served from module memory. The raw
+  // token adds no exposure here: sessionStorage already holds it and both
+  // are readable by the same origin's scripts.
+  const accessToken = readOperatorShowcaseAccessToken();
+  const cacheKey = `${entry.id}\u0000${accessToken ?? ""}`;
+  const existing = bundleCache.get(cacheKey);
   if (existing) return existing;
   const pending = loadPreferredShowcaseBundle(entry, fetch, {
-    accessToken: readOperatorShowcaseAccessToken(),
+    accessToken,
   }).catch((error: unknown) => {
-    bundleCache.delete(entry.id);
+    bundleCache.delete(cacheKey);
     throw error;
   });
-  bundleCache.set(entry.id, pending);
+  bundleCache.set(cacheKey, pending);
   return pending;
 }
 
