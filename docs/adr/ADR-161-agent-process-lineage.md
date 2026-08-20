@@ -9,7 +9,10 @@
   for `agent.descendants` with unauthorized/nonexistent indistinguishability, cross-operation
   disclosure composition assigned to the gate; R4: direction claim scoped to
   `state="non_terminal"`, gate-side bound generalized to rate or finite disclosure quota —
-  only the quota form makes the cumulative budget finite)
+  only the quota form makes the cumulative budget finite; R5: enforcement dependency stated
+  honestly — ADR-018 v1 does not enforce rate obligations, so hidden-population deployments
+  are out of contract until its promised rate-limiter successor ships carrying the shared
+  finite quota, requirements on that successor enumerated)
 - **Extends:** ADR-142
 
 ## Context
@@ -387,19 +390,24 @@ call rate. A rate bound alone slows that reconstruction without making it finite
 positive rate over an unbounded lifetime accumulates unbounded bits — and no bound imposed
 by these verbs could do better, because every honest answer to a legitimate operation
 carries its bit: the only finite cumulative budget is refusal of service once a caller's
-budget is spent, and admission refusal is the gate's decision by construction. So this ADR
-assigns the channel instead of pretending to bound it: cumulative disclosure is owned by
-the gate, alongside the per-caller rate concern §4 already routes there, and an operator
-whose delegated-lifecycle class set leaves records hidden from some callers — the only
-deployments in which these bits refer to anything — deploys a gate-side bound on these
-verbs as part of deploying hidden populations, choosing its form by the threat it defends
-against: a call-rate bound where slowing reconstruction suffices, or a finite per-caller
-disclosure quota — the cumulative form, whose exhaustion refuses further calls — where
-hidden structure must remain unreconstructable by a patient caller. That requirement is
-normative in the same sense as §4's bounds: the existence of the gate-side bound is
-required, its form and value are operator policy — with the stated consequence that only
-the quota form yields a finite budget, so an operator relying on hiddenness against a
-patient adversary has chosen it.
+budget is spent, and admission refusal is the gate's decision by construction. So the
+channel can only be closed at the gate — and this ADR does not pretend the gate closes it
+today. ADR-018 ("Why no obligation enforcement in v1?") is explicit that
+`Obligation::RateLimit` is returned by policies and NOT enforced by the runtime in v1,
+with per-actor counters deferred to a future rate-limiter ADR. A sentence here requiring a
+gate-side bound would therefore assign an obligation to a component whose own contract
+documents non-enforcement, and a requirement without an enforcement seam is not a
+contract. The dependency is stated instead, with its consequence: **deployments that rely
+on record hiddenness against these verbs are out of contract until the rate-limiter ADR
+that ADR-018 promises ships, extended to carry a finite per-caller disclosure quota** —
+principal identity the caller's resolved authorization context as ADR-142 snapshots it;
+one budget shared across this ADR's four disclosure sites rather than four independent
+ones; consumption atomic and completed before admission; reset and persistence scope
+defined; exhaustion a refusal naming the bound. A rate-only configuration of that
+successor slows reconstruction and bounds nothing cumulatively, so it does not lift this
+paragraph's restriction; only the quota form does. Deployments whose delegated-lifecycle
+class sets hide no records from any caller — where all four bits refer to nothing — are
+unaffected and deployable under this ADR as written.
 
 ### 4. Reaching a subtree: kill with descendants
 
@@ -556,9 +564,10 @@ record reached, both already bounded above. What does need saying is that the bo
 enforced per operation and not per caller — this ADR does not define a rate limit, and a caller
 issuing many bounded enumerations in a loop remains a matter for the gate rather than for these
 verbs. That assignment carries more than resource cost: §3's disclosure budget composes across
-calls through exactly this loop, so the gate-side bound §3 requires for deployments with
-hidden populations — a call-rate bound, or the finite disclosure quota whose exhaustion
-refuses further calls — is enforced here, at the gate, not by these verbs.
+calls through exactly this loop, so the finite disclosure quota §3 requires before
+hidden-population deployments come into contract is a gate-side mechanism, never one of
+these verbs' — §3 names the ADR-018 successor that must carry it, and until it ships the
+restriction in §3 stands in place of an enforcement claim.
 
 The subtree kill is per-record, not transactional: each record's kill succeeds or fails by
 ADR-142's own rules (an already-`terminal` descendant is a no-op, exactly as in the
