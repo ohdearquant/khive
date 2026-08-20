@@ -272,7 +272,10 @@ jobs:
   kg-editor:
     name: KG Studio (Next.js)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 12 not 10: the two bounded install steps below may legitimately consume
+    # up to 240s each on their retry paths; 600s left showcase tests no budget
+    # after a timed-out first attempt.
+    timeout-minutes: 12
     defaults:
       run:
         working-directory: apps/kg-editor
@@ -306,8 +309,11 @@ jobs:
       # transport-level read timeouts and native retries, and only the
       # lock-free browser download is wrapped in timeout-with-retry.
       - name: Bound apt downloads against mirror stalls
+        # DPkg::Lock::Timeout bounds the dpkg lock wait INSIDE apt: on expiry
+        # apt exits nonzero cleanly without ever holding the lock, so a retry
+        # of the apt-backed step below cannot contend with our own orphan.
         run: |
-          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "3";\n' \
+          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "3";\nDPkg::Lock::Timeout "120";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-download-timeouts
       - name: Cache Playwright browsers
         uses: actions/cache@v4
@@ -315,12 +321,18 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
       - name: Install browser for repository dogfood
-        run: timeout 240 npx playwright install chromium || timeout 240 npx playwright install chromium
+        run: timeout 120 npx playwright install chromium || timeout 120 npx playwright install chromium
       - name: Install browser OS dependencies
-        # Same bound as the browser download above. The apt.conf Acquire timeouts
-        # cannot bound a dpkg lock wait, which otherwise hangs this step until the
-        # 10-minute job timeout when a runner-side apt process holds the lock.
-        run: timeout 240 npx playwright install-deps chromium || timeout 240 npx playwright install-deps chromium
+        # Deliberately NO timeout(1) wrapper: killing the wrapper mid-install
+        # orphans apt-get with the dpkg lock held (the unsound pattern the
+        # comment above the apt.conf step describes). Both hang classes are
+        # bounded inside apt itself: Acquire timeouts for mirror reads,
+        # DPkg::Lock::Timeout for lock waits, so a failed first attempt exits
+        # cleanly and the retry is lock-safe. The step timeout is the backstop
+        # for hangs apt cannot bound (dpkg maintainer scripts); it fails the
+        # job fast instead of eating the whole job budget.
+        timeout-minutes: 4
+        run: npx playwright install-deps chromium || npx playwright install-deps chromium
       - name: Repository showcase dogfood
         run: npx playwright test
 
