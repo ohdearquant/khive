@@ -12,7 +12,9 @@
   only the quota form makes the cumulative budget finite; R5: enforcement dependency stated
   honestly — ADR-018 v1 does not enforce rate obligations, so hidden-population deployments
   are out of contract until its promised rate-limiter successor ships carrying the shared
-  finite quota, requirements on that successor enumerated)
+  finite quota, requirements on that successor enumerated; the quota is a
+  non-resetting caller-lifetime cap, persisted across restarts — resetting quotas are rate
+  bounds and lift nothing)
 - **Extends:** ADR-142
 
 ## Context
@@ -402,10 +404,13 @@ on record hiddenness against these verbs are out of contract until the rate-limi
 that ADR-018 promises ships, extended to carry a finite per-caller disclosure quota** —
 principal identity the caller's resolved authorization context as ADR-142 snapshots it;
 one budget shared across this ADR's four disclosure sites rather than four independent
-ones; consumption atomic and completed before admission; reset and persistence scope
-defined; exhaustion a refusal naming the bound. A rate-only configuration of that
-successor slows reconstruction and bounds nothing cumulatively, so it does not lift this
-paragraph's restriction; only the quota form does. Deployments whose delegated-lifecycle
+ones; consumption atomic and completed before admission; the budget a caller-lifetime
+cap — persisted across restarts and never replenished, because a quota that resets leaks
+one bit per epoch indefinitely and is a rate bound wearing a quota's name; exhaustion a
+refusal naming the bound. A rate-only configuration of that successor — including any
+resetting or replenishing quota — slows reconstruction and bounds nothing cumulatively,
+so it does not lift this paragraph's restriction; only the non-resetting lifetime form
+does. Deployments whose delegated-lifecycle
 class sets hide no records from any caller — where all four bits refer to nothing — are
 unaffected and deployable under this ADR as written.
 
