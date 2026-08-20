@@ -67,7 +67,9 @@ posture, and sink as a per-class contract dimension. The vocabulary is closed:
   durable record with a stated home, written before eligibility and never reset by the
   archival that follows it. Any class serving quota or admission accounting takes this
   value: an aggregate that survives archival is what makes a non-resetting quota
-  implementable over a bounded live store.
+  implementable over a bounded live store. The verification contract for an aggregate —
+  what is checked, against what, and recorded where — is defined at the first class
+  assignment that takes this value, not inherited silently from this decision.
 - **`age_archivable`** — rows are eligible on horizon age alone (§3). The value for pure
   audit and telemetry classes with no referent and no accounting consumer.
 
@@ -126,13 +128,15 @@ dimensions:
   Attribution: the daemon principal (runtime background work, the ADR-162 §2 form). Sink:
   `caller_event_store`. Write posture: **precondition** — the event is appended and
   durable before any prune against that segment may run; if the append fails, the prune
-  does not run. Retention class: `pinned_while_referenced`, referent the segment itself;
-  since this decision provides no segment-destruction path, manifests are effectively
-  permanent, which is intended — the manifest must outlive everything it vouches for.
+  does not run. Retention class: `pinned_while_referenced`, referent the segment
+  itself; terminal condition: destruction of the segment, a path this decision does not
+  provide. Manifests are therefore effectively permanent, which is intended — the
+  manifest must outlive everything it vouches for.
 - **`archive_rows_pruned`** — one per prune, recording the segment pruned against, the
   row count removed, and the recomputed verification values beside the manifest values it
   matched. Same attribution and sink. Write posture: precondition — appended before the
-  delete executes. Retention class: `pinned_while_referenced`, referent the segment.
+  delete executes. Retention class: `pinned_while_referenced`, referent the segment;
+  terminal condition: destruction of the segment, a path this decision does not provide.
 
 Recording the verification pair (manifest value and recomputed value) in the prune event
 is deliberate: a reader auditing retention can check the comparison from the plane alone,
@@ -164,6 +168,9 @@ Retention must not silently change what a query means. Two additive contract beh
 
 This decision governs the runtime event plane: the `events` and `event_observations`
 tables, with observations always archiving alongside their event in the same segment.
+The archived-stub index (§5) is a table this decision creates and is in population: its
+growth is bounded to two identifiers per archived row, and stubs are never themselves
+archived.
 
 Explicitly out of scope:
 
