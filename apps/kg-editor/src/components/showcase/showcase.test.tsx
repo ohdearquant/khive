@@ -24,7 +24,7 @@ describe("materialized repository lookup", () => {
     mockedLoad.mockResolvedValue({ bundle, source: "khive-db-snapshot" });
   });
 
-  it("normalizes a curated alias and performs no bundle load for a later miss", async () => {
+  it("normalizes a curated alias, reauthorizes each private snapshot load, and performs no bundle load for a later miss", async () => {
     const user = userEvent.setup();
     const { container } = render(<Showcase />);
 
@@ -49,7 +49,9 @@ describe("materialized repository lookup", () => {
     expect(window.location.search).toContain(
       "repo=https%3A%2F%2Fgithub.com%2Fohdearquant%2Fkhive",
     );
-    expect(mockedLoad).toHaveBeenCalledTimes(1);
+    // Private snapshots are authorized per load: the same entry loads again
+    // rather than being served from the module cache.
+    expect(mockedLoad).toHaveBeenCalledTimes(2);
 
     await user.clear(input);
     await user.type(input, "https://github.com/example/not-curated");
@@ -61,10 +63,33 @@ describe("materialized repository lookup", () => {
     expect(empty).toBeVisible();
     expect(empty?.querySelectorAll("button")).toHaveLength(1);
     expect(window.location.search).toBe("");
-    expect(mockedLoad).toHaveBeenCalledTimes(1);
+    expect(mockedLoad).toHaveBeenCalledTimes(2);
 
     await user.click(screen.getByRole("button", { name: "Use the curated khive example" }));
     await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    expect(mockedLoad).toHaveBeenCalledTimes(3);
+  }, 15_000);
+
+  it("serves the public static fallback from cache instead of reloading it", async () => {
+    mockedLoad.mockClear();
+    mockedLoad.mockResolvedValue({ bundle, source: "curated-static-fallback" });
+    const user = userEvent.setup();
+    const { container } = render(<Showcase />);
+
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    expect(mockedLoad).toHaveBeenCalledTimes(1);
+    expect(container.querySelector(".repo-overview")).toHaveAttribute(
+      "data-analysis-source",
+      "curated-static-fallback",
+    );
+
+    const input = screen.getByLabelText("Public repository URL");
+    await user.clear(input);
+    await user.type(input, "http://github.com/ohdearquant/khive.git");
+    await user.click(screen.getByRole("button", { name: bundle.capability.labels.lookup_action }));
+
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    // Nothing private is retained here, so the cache may keep serving it.
     expect(mockedLoad).toHaveBeenCalledTimes(1);
   }, 15_000);
 });

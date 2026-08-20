@@ -41,6 +41,14 @@ function loadEntry(entry: ShowcaseRegistryEntry): Promise<LoadedShowcaseBundle> 
   if (existing) return existing;
   const pending = loadPreferredShowcaseBundle(entry, fetch, {
     accessToken,
+  }).then((loaded) => {
+    // A private snapshot is authorized per load. Caching it would keep
+    // serving it after server-side revocation, which no client-side check
+    // can observe, so only the public static fallback may stay cached; the
+    // entry below exists during the request solely to deduplicate
+    // concurrent loads.
+    if (loaded.source === "khive-db-snapshot") bundleCache.delete(cacheKey);
+    return loaded;
   }).catch((error: unknown) => {
     bundleCache.delete(cacheKey);
     throw error;

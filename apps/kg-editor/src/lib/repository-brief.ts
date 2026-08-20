@@ -389,8 +389,11 @@ function combinedAttentionMetric(
       .join("; ") || "One or more attention analyses were truncated.";
     return {
       shown,
-      total: shown,
-      bound: shown,
+      // The derived-signal count is not the population: a truncated analysis
+      // has undisclosed rows, so total and bound are unknown here rather than
+      // the count of what happened to be derived.
+      total: null,
+      bound: null,
       status: "truncated",
       reason,
       summary: `${shown} signals from available analyses; ${labels.truncated}: ${reason}`,
