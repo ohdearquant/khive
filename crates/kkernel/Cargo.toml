@@ -61,6 +61,10 @@ libc = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+# Re-declares the [dependencies] khive-mcp with test instrumentation enabled:
+# Cargo unifies features across the build graph, so test builds see the
+# armed-capture hook while the release dependency above stays untouched.
+khive-mcp = { version = "0.7.0", path = "../khive-mcp", features = ["test-forward-seam"] }
 khive-gate-rego = { version = "0.7.0", path = "../khive-gate-rego" }
 
 [features]
