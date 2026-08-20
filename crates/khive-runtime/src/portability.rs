@@ -261,10 +261,14 @@ impl KhiveRuntime {
         }
         for edge in &archive.edges {
             crate::operations::validate_edge_weight(edge.weight)?;
-            // Edge properties are caller-controlled input on the same footing
-            // as entity properties above: the runtime-owned `khive:secret_gate`
-            // key is reservation-only on import (ADR-115 Amendment 1 §3).
+            // Edge properties are caller-controlled input: the runtime-owned
+            // `khive:secret_gate` key is reservation-only on import, and edge
+            // metadata is in ADR-115 Amendment 1 §3's unchanged blocking-scanner
+            // class, so credential-shaped values are rejected here as well.
             crate::secret_gate::reject_reserved_secret_gate_property(edge.properties.as_ref())?;
+            if let Some(p) = edge.properties.as_ref() {
+                crate::secret_gate::check_json(p)?;
+            }
         }
 
         let store = self.entities(token)?;
@@ -813,6 +817,59 @@ mod tests {
         let entities = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
         assert!(
             !entities.iter().any(|e| e.name == "EdgeGateA"),
+            "rejected archive import must not create any records"
+        );
+    }
+
+    /// ADR-115 Amendment 1 §3: edge metadata is in the unchanged
+    /// blocking-scanner class, so a credential-shaped value in edge
+    /// properties fails the import in the same pre-write pass.
+    #[tokio::test]
+    async fn import_edge_with_credential_shaped_property_is_rejected() {
+        let rt = make_rt().await;
+        let tok = NamespaceToken::local();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mk = |id: Uuid, name: &str| ExportedEntity {
+            id,
+            kind: "concept".to_string(),
+            entity_type: None,
+            name: name.to_string(),
+            description: None,
+            properties: None,
+            tags: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![mk(a, "EdgeScanA"), mk(b, "EdgeScanB")],
+            edges: vec![ExportedEdge {
+                edge_id: Uuid::new_v4(),
+                source: a,
+                target: b,
+                relation: EdgeRelation::Extends,
+                weight: 0.5,
+                properties: Some(serde_json::json!({
+                    "api_key": "AKIAFAKEKEY1234567890"
+                })),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+        };
+
+        let err = rt.import_kg(&archive, &tok).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::SecretDetected(_)),
+            "expected the blocking scanner to reject the value, got {err:?}"
+        );
+
+        let entities = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert!(
+            !entities.iter().any(|e| e.name == "EdgeScanA"),
             "rejected archive import must not create any records"
         );
     }
