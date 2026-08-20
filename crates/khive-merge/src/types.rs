@@ -71,6 +71,36 @@ pub enum MergeConflict {
         modified_in: BranchSide,
         deleted_in: BranchSide,
     },
+    /// Both branches changed an edge's durable UUID to different values.
+    EdgeIdentityMismatch {
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: String,
+        ours: Uuid,
+        theirs: Uuid,
+    },
+    /// An edge's identity change collided with another edge's durable UUID
+    /// already claimed in the merged set. If the key's own unmodified base
+    /// UUID is still unclaimed, the edge falls back to it and
+    /// `retained_edge_id` differs from `attempted_edge_id`. Otherwise there
+    /// is no identity left to restore without creating a second duplicate,
+    /// so the edge is dropped from the merged set and `retained_edge_id`
+    /// equals `attempted_edge_id`.
+    EdgeIdentityCollision {
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: String,
+        attempted_edge_id: Uuid,
+        retained_edge_id: Uuid,
+    },
+    /// Both branches changed the same edge-property key differently.
+    EdgePropertyMismatch {
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: String,
+        ours: Option<serde_json::Value>,
+        theirs: Option<serde_json::Value>,
+    },
     /// An edge references a missing entity (dangling reference).
     DanglingEdge {
         source_id: Uuid,
