@@ -1274,6 +1274,57 @@ fn rejects_swapped_symmetric_duplicate_edges_in_archive() {
     }
 }
 
+#[test]
+fn modified_symmetric_edge_is_emitted_with_canonical_endpoints() {
+    let (lo, hi) = {
+        let x = Uuid::new_v4();
+        let y = Uuid::new_v4();
+        if x < y {
+            (x, y)
+        } else {
+            (y, x)
+        }
+    };
+
+    let base_edge = ExportedEdge {
+        edge_id: Uuid::new_v4(),
+        source: lo,
+        target: hi,
+        relation: EdgeRelation::CompetesWith,
+        weight: 0.5,
+        properties: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    // Theirs modifies the weight and carries the endpoints reversed; the
+    // semantic key matches base, so this is a modification, not an add.
+    let mut theirs_edge = base_edge.clone();
+    theirs_edge.source = hi;
+    theirs_edge.target = lo;
+    theirs_edge.weight = 0.9;
+
+    let entities = vec![entity(lo, "A"), entity(hi, "B")];
+    let base = archive_full(entities.clone(), vec![base_edge.clone()]);
+    let ours = archive_full(entities.clone(), vec![base_edge]);
+    let theirs = archive_full(entities, vec![theirs_edge]);
+
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+    if let MergeResult::Clean { merged } = result {
+        assert_eq!(merged.edges.len(), 1);
+        assert_eq!(merged.edges[0].weight, 0.9);
+        assert_eq!(
+            merged.edges[0].source, lo,
+            "canonical source must be min(source, target)"
+        );
+        assert_eq!(
+            merged.edges[0].target, hi,
+            "canonical target must be max(source, target)"
+        );
+    } else {
+        panic!("expected Clean, got: {result:?}");
+    }
+}
+
 // ── #456: shortcut strategies must not report dangling edges as Clean ──────
 
 #[test]

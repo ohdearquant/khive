@@ -171,7 +171,13 @@ pub fn merge_edges(
             _ => None,
         };
 
-        candidates.push((key, candidate));
+        // Enforce the symmetric-endpoint invariant on every emitted record:
+        // EdgeKey canonicalizes only the lookup key, so a branch record that
+        // won a merge may still carry reversed endpoints.
+        candidates.push((
+            key,
+            candidate.map(|(e, id_base)| (canonicalize_endpoints(e), id_base)),
+        ));
     }
 
     // Second pass: reserve every durable identity inherited unchanged from
@@ -228,6 +234,16 @@ pub fn merge_edges(
     }
 
     Ok((merged, conflicts))
+}
+
+/// Returns the record with symmetric-relation endpoints in canonical
+/// `(min, max)` order, the same normalization [`EdgeKey`] applies to lookup
+/// keys, so merged output always satisfies the storage endpoint invariant.
+fn canonicalize_endpoints(mut e: ExportedEdge) -> ExportedEdge {
+    if e.relation.is_symmetric() && e.target < e.source {
+        std::mem::swap(&mut e.source, &mut e.target);
+    }
+    e
 }
 
 /// Reconciles two independently added records for one semantic edge key.
