@@ -7,7 +7,9 @@
   dispatcher missing-identity fail-closed, cascade serialization rule); 2026-08-20 (design
   review R3: mutable-filter scope semantics for `agent.list(state=...)`, root authorization
   for `agent.descendants` with unauthorized/nonexistent indistinguishability, cross-operation
-  disclosure composition assigned to the gate)
+  disclosure composition assigned to the gate; R4: direction claim scoped to
+  `state="non_terminal"`, gate-side bound generalized to rate or finite disclosure quota —
+  only the quota form makes the cumulative budget finite)
 - **Extends:** ADR-142
 
 ## Context
@@ -330,10 +332,9 @@ and gate rules as the existing five [ADR-142 §1; ADR-023]:
   is the one mutable element a caller can put in scope, and it changes that promise, so the
   change is stated rather than implied: filter membership is evaluated once per record, at
   the moment the page that would carry it is computed, and `complete` is relative to those
-  evaluations. A record that stops matching before its page is computed — the only possible
-  direction, since `terminal` is absorbing and every `state` value a caller can name is
-  either a non-terminal state, `non_terminal` itself, or `terminal`, which no record leaves
-  — is outside the enumeration's scope by that evaluation rather than missed by accident; a
+  evaluations. A record that stops matching before its page is computed — for
+  `state="non_terminal"` the only possible direction, since `terminal` is absorbing — is
+  outside the enumeration's scope by that evaluation rather than missed by accident; a
   record served and then terminalized was truthfully in scope when its page was computed;
   and no record is ever served twice or re-admitted, because positions are immutable and the
   drop-out is one-way. The alternative — holding a state-filtered population fixed as of the
@@ -382,14 +383,23 @@ channel this ADR names rather than hides: each of the four discloses at most one
 bit per call, so a caller iterating a bounded probe — binary-searching hidden structural
 depth with `max_depth` against `depth_truncated`, or bracketing hidden population size
 against the `lineage_visit_limit` refusal — accumulates bits at a rate bounded only by its
-call rate. No per-operation contract can close a cross-operation channel, so this ADR
+call rate. A rate bound alone slows that reconstruction without making it finite — any
+positive rate over an unbounded lifetime accumulates unbounded bits — and no bound imposed
+by these verbs could do better, because every honest answer to a legitimate operation
+carries its bit: the only finite cumulative budget is refusal of service once a caller's
+budget is spent, and admission refusal is the gate's decision by construction. So this ADR
 assigns the channel instead of pretending to bound it: cumulative disclosure is owned by
 the gate, alongside the per-caller rate concern §4 already routes there, and an operator
 whose delegated-lifecycle class set leaves records hidden from some callers — the only
-deployments in which these bits refer to anything — deploys a gate-side rate bound on these
-verbs as part of deploying hidden populations. That requirement is normative in the same
-sense as §4's bounds: the existence of the gate-side bound is required, its value is not
-fixed here.
+deployments in which these bits refer to anything — deploys a gate-side bound on these
+verbs as part of deploying hidden populations, choosing its form by the threat it defends
+against: a call-rate bound where slowing reconstruction suffices, or a finite per-caller
+disclosure quota — the cumulative form, whose exhaustion refuses further calls — where
+hidden structure must remain unreconstructable by a patient caller. That requirement is
+normative in the same sense as §4's bounds: the existence of the gate-side bound is
+required, its form and value are operator policy — with the stated consequence that only
+the quota form yields a finite budget, so an operator relying on hiddenness against a
+patient adversary has chosen it.
 
 ### 4. Reaching a subtree: kill with descendants
 
@@ -546,8 +556,9 @@ record reached, both already bounded above. What does need saying is that the bo
 enforced per operation and not per caller — this ADR does not define a rate limit, and a caller
 issuing many bounded enumerations in a loop remains a matter for the gate rather than for these
 verbs. That assignment carries more than resource cost: §3's disclosure budget composes across
-calls through exactly this loop, so the gate-side rate bound §3 requires for deployments with
-hidden populations is enforced here, at the gate, not by these verbs.
+calls through exactly this loop, so the gate-side bound §3 requires for deployments with
+hidden populations — a call-rate bound, or the finite disclosure quota whose exhaustion
+refuses further calls — is enforced here, at the gate, not by these verbs.
 
 The subtree kill is per-record, not transactional: each record's kill succeeds or fails by
 ADR-142's own rules (an already-`terminal` descendant is a no-op, exactly as in the
