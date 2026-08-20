@@ -14,11 +14,20 @@ the allowlisted server route:
 
 ```bash
 KHIVE_SHOWCASE_ANALYSIS_ROOT=/absolute/path/to/analyses \
-KHIVE_SHOWCASE_ANALYSIS_IDS=khive \
+KHIVE_SHOWCASE_ANALYSES='[{"analysis_id":"khive","canonical_url":"https://github.com/ohdearquant/khive"}]' \
+KHIVE_SHOWCASE_ACCESS_TOKEN=a-long-random-operator-secret \
 npm run dev
 ```
 
 Place the report at `$KHIVE_SHOWCASE_ANALYSIS_ROOT/khive/khive.repo.v1.json`.
+The protected route requires the bearer token on every request and fails closed
+to 404 without it, which silently selects the static fallback. Unlock the UI in
+the browser console before opening the repository:
+
+```js
+sessionStorage.setItem("khive.showcase.accessToken", "a-long-random-operator-secret");
+```
+
 Before presenting, verify that the source badge says **khive DB snapshot**, not
 **curated static fallback**.
 

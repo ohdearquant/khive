@@ -290,6 +290,21 @@ function unavailableMetric(
   };
 }
 
+function commitResolutionGapMetric(
+  base: RepositoryMetric,
+  unresolved: number,
+  captured: number,
+): RepositoryMetric {
+  const gap =
+    `${unresolved} of ${captured} captured history IDs are not present in the captured commit page`;
+  return {
+    ...base,
+    status: "truncated",
+    reason: base.reason ? `${base.reason}; ${gap}` : gap,
+    summary: `${base.summary}; ${gap}`,
+  };
+}
+
 function missingHistoryNavigationMetric(
   coverage: {
     bound: { kind: "all" | "top_n"; max_items: number; order: string };
@@ -913,10 +928,26 @@ export function buildModuleInsight(
   const navigation = historyNavigationCoverage.items.find(
     (row) => row.module_id === moduleId,
   );
-  const history = navigation
+  const navigationHistory = navigation
     ? pageMetric(navigation.commits, labels)
     : missingHistoryNavigationMetric(historyNavigationCoverage, labels);
-  const recentCommits = (navigation?.commits.items ?? [])
+  const navigationCommitIds = navigation?.commits.items ?? [];
+  // History IDs resolve against the independently paged graph.commits
+  // section, so a truncated commit page can drop captured history without
+  // either page's own disclosure reporting it. The metric must carry that
+  // resolution gap, or the inspector renders a false "no captured commits"
+  // empty state for a module whose history was captured.
+  const unresolvedCommitCount = navigationCommitIds.filter(
+    (commitId) => !commitById.has(commitId),
+  ).length;
+  const history = unresolvedCommitCount === 0
+    ? navigationHistory
+    : commitResolutionGapMetric(
+      navigationHistory,
+      unresolvedCommitCount,
+      navigationCommitIds.length,
+    );
+  const recentCommits = navigationCommitIds
     .flatMap((commitId) => {
       const commit = commitById.get(commitId);
       return commit ? [commit] : [];

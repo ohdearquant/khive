@@ -238,6 +238,32 @@ describe("repository triage model", () => {
     expect(insight?.history.reason).toMatch(/truncated/i);
   });
 
+  it("reports a resolution gap when captured history IDs are missing from the commit page", () => {
+    const target = buildRepositoryBrief(bundle).startHere[0];
+    const truncated = structuredClone(bundle);
+    const navigation = truncated.graph.history_navigation.by_module.items.find(
+      (row) => row.module_id === target.moduleId,
+    );
+    expect(navigation).toBeDefined();
+    expect(navigation!.commits.items.length).toBeGreaterThan(0);
+    // The commit page is truncated independently of history navigation: every
+    // commit this module's history references sits on a page that was never
+    // served, while the navigation page itself remains complete.
+    const referenced = new Set(navigation!.commits.items);
+    truncated.graph.commits.items = truncated.graph.commits.items.filter(
+      (commit) => !referenced.has(commit.id),
+    );
+    truncated.graph.commits.next_cursor = "cursor-after-first-page";
+
+    const insight = buildModuleInsight(truncated, target.moduleId);
+
+    expect(insight?.recentCommits).toEqual([]);
+    expect(insight?.history.status).toBe("truncated");
+    expect(insight?.history.reason).toMatch(
+      /not present in the captured commit page/i,
+    );
+  });
+
   it("marks history-navigation evidence truncated when a cursor remains despite a complete disclosure", () => {
     const target = buildRepositoryBrief(bundle).startHere[0];
     const paged = structuredClone(bundle);
