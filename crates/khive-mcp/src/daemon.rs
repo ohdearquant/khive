@@ -2072,7 +2072,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
 /// mix of CLI `--pack`, `KHIVE_PACKS`, or config-file `[runtime].packs`
 /// produced it) forwarded verbatim as explicit `--pack` args on the spawned
 /// daemon — see the doc comment on `spawn_daemon_with_exe_and_config`.
-pub async fn forward_or_spawn_with_config(
+pub async fn forward_or_spawn_with_config_and_packs(
     frame: &DaemonRequestFrame,
     config: Option<&std::path::Path>,
     db: Option<&str>,
@@ -2089,8 +2089,25 @@ pub async fn forward_or_spawn_with_config(
     forward_or_spawn_with(frame, &spawn).await
 }
 
+/// Forward a request, spawning the daemon if needed, without an explicit
+/// pack list: the spawned daemon falls back to its own pack resolution
+/// (config-file `[runtime].packs` or the built-in default set), exactly as
+/// it did before pack forwarding existed.
+///
+/// Thin compatibility wrapper over
+/// [`forward_or_spawn_with_config_and_packs`] preserving the pre-existing
+/// three-argument public signature, so external callers of the published
+/// crate keep compiling unchanged.
+pub async fn forward_or_spawn_with_config(
+    frame: &DaemonRequestFrame,
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+) -> Option<Result<String, McpError>> {
+    forward_or_spawn_with_config_and_packs(frame, config, db, None).await
+}
+
 /// Test-only capture hook armed at the real entry of
-/// `forward_or_spawn_with_config` — the actual adapter-boundary conversion
+/// `forward_or_spawn_with_config_and_packs` — the actual adapter-boundary conversion
 /// site (`packs.as_deref()` at each production call site) production code
 /// runs through, as opposed to a `ForwardFnPtr` spy that stands in for the
 /// whole adapter and never executes its conversion. Unarmed, `intercept`
@@ -2114,7 +2131,7 @@ pub mod test_forward_seam {
     }
 
     /// Arm the one-shot hook. The next call into
-    /// `forward_or_spawn_with_config` on this thread records its `packs`
+    /// `forward_or_spawn_with_config_and_packs` on this thread records its `packs`
     /// argument and returns a canned success without touching a socket or
     /// spawning a process; the hook then disarms itself.
     pub fn arm() {
@@ -2123,8 +2140,11 @@ pub mod test_forward_seam {
     }
 
     /// Take the captured `packs` argument from the most recent armed call,
-    /// if any.
+    /// if any, and disarm the hook. Disarming here means a hook armed for a
+    /// call that never reached `intercept` cannot survive to intercept a
+    /// later, unrelated call on the same thread.
     pub fn take_captured() -> Option<Option<Vec<String>>> {
+        ARMED.with(|a| a.set(false));
         CAPTURED.with(|c| c.borrow_mut().take())
     }
 
@@ -3265,7 +3285,7 @@ mod tests {
         path
     }
 
-    /// The config path threaded through `forward_or_spawn_with_config` must
+    /// The config path threaded through `forward_or_spawn_with_config_and_packs` must
     /// actually appear on the spawned daemon's command line; a script
     /// fixture records its argv so the assertion observes the real child
     /// invocation (`crates/kkernel/src/exec.rs`'s spy seam proves the exec
@@ -3294,7 +3314,7 @@ mod tests {
         );
     }
 
-    /// The pack list threaded through `forward_or_spawn_with_config` must
+    /// The pack list threaded through `forward_or_spawn_with_config_and_packs` must
     /// reach the spawned daemon's command line as explicit `--pack` flags —
     /// the fix for the auto-spawn dropping a client's resolved `KHIVE_PACKS`
     /// (or `--pack`-flag, or config-file `[runtime].packs`) selection when it

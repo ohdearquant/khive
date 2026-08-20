@@ -237,7 +237,7 @@ type ForwardFnPtr = for<'a> fn(
     Vec<String>,
 ) -> ForwardFuture<'a>;
 
-/// Adapts the real `forward_or_spawn_with_config` to the `ForwardFnPtr` signature.
+/// Adapts the real `forward_or_spawn_with_config_and_packs` to the `ForwardFnPtr` signature.
 #[cfg(unix)]
 fn forward_or_spawn_boxed<'a>(
     frame: &'a DaemonRequestFrame,
@@ -246,8 +246,13 @@ fn forward_or_spawn_boxed<'a>(
     packs: Vec<String>,
 ) -> ForwardFuture<'a> {
     Box::pin(async move {
-        khive_mcp::daemon::forward_or_spawn_with_config(frame, config.as_deref(), db, Some(&packs))
-            .await
+        khive_mcp::daemon::forward_or_spawn_with_config_and_packs(
+            frame,
+            config.as_deref(),
+            db,
+            Some(&packs),
+        )
+        .await
     })
 }
 
@@ -6002,14 +6007,14 @@ id = "lambda:fallback"
     // ── adapter-boundary regression (cross-crate member) ──────────────────────
     //
     // The exec-side `forward_or_spawn_boxed` in this file converts `cfg.packs`
-    // into `Some(&packs)` at its own `forward_or_spawn_with_config` call site
+    // into `Some(&packs)` at its own `forward_or_spawn_with_config_and_packs` call site
     // (line ~249). Every spy-based test in this file replaces
     // `forward_or_spawn_boxed` itself via `run_exec_inline_with_forward`'s
     // `ForwardFnPtr` seam, so none of them execute that conversion. This test
     // instead drives `run_exec_inline` — the real production entry point,
     // which always calls the real `forward_or_spawn_boxed` on Unix — and
     // observes the argument via a one-shot capture hook armed at the entry of
-    // `khive_mcp::daemon::forward_or_spawn_with_config` itself, reached
+    // `khive_mcp::daemon::forward_or_spawn_with_config_and_packs` itself, reached
     // cross-crate via khive-mcp's `test-forward-seam` feature (enabled from
     // this crate's `[dev-dependencies]` re-declaration of khive-mcp).
     // Changing the adapter's `Some(&packs)` argument to `None` reddens this
@@ -6051,7 +6056,7 @@ id = "lambda:fallback"
             khive_mcp::daemon::test_forward_seam::take_captured(),
             Some(Some(vec!["kg".to_string(), "gtd".to_string()])),
             "the real forward_or_spawn_boxed adapter in this crate must convert cfg.packs \
-             into Some(&packs) at the forward_or_spawn_with_config call boundary"
+             into Some(&packs) at the forward_or_spawn_with_config_and_packs call boundary"
         );
     }
 

@@ -2623,9 +2623,9 @@ type ForwardFuture<'a> = std::pin::Pin<
 >;
 
 /// Function pointer type for the daemon-forwarding seam, parameterized so
-/// tests can inject a spy in place of the real `forward_or_spawn_with_config`
+/// tests can inject a spy in place of the real `forward_or_spawn_with_config_and_packs`
 /// call — the real call spawns/contacts an actual daemon process, which
-/// tests must not do. `packs` mirrors `forward_or_spawn_with_config`'s own
+/// tests must not do. `packs` mirrors `forward_or_spawn_with_config_and_packs`'s own
 /// optional `packs` argument exactly: the `Some`/`None` decision is made by
 /// the shared call site in `request_with_forward`, not inside the adapter,
 /// so a spy standing in for this seam observes the same optional argument
@@ -2635,7 +2635,7 @@ type ForwardFuture<'a> = std::pin::Pin<
 type ForwardFnPtr =
     for<'a> fn(&'a khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -> ForwardFuture<'a>;
 
-/// Adapts the real `forward_or_spawn_with_config` to the `ForwardFnPtr`
+/// Adapts the real `forward_or_spawn_with_config_and_packs` to the `ForwardFnPtr`
 /// signature. A pure pass-through — the `Some`/`None` decision already
 /// happened at the call site — so this boundary carries no logic a test
 /// spy could fail to observe.
@@ -2645,7 +2645,8 @@ fn forward_or_spawn_boxed(
     packs: Option<Vec<String>>,
 ) -> ForwardFuture<'_> {
     Box::pin(async move {
-        crate::daemon::forward_or_spawn_with_config(frame, None, None, packs.as_deref()).await
+        crate::daemon::forward_or_spawn_with_config_and_packs(frame, None, None, packs.as_deref())
+            .await
     })
 }
 
@@ -2660,7 +2661,7 @@ impl KhiveMcpServer {
     /// Inner implementation of `request_with_cancellation`, parameterized
     /// over the daemon-forwarding seam so tests can drive the real dispatch
     /// path (registry resolution included) while asserting on what would
-    /// have reached `forward_or_spawn_with_config`, without spawning or
+    /// have reached `forward_or_spawn_with_config_and_packs`, without spawning or
     /// contacting a real daemon.
     async fn request_with_forward(
         &self,
@@ -3884,13 +3885,13 @@ mod tests {
     /// THIS server's own resolved registry pack list to the daemon-forwarding
     /// seam as `Some(...)`, not `None` and not some other list. The spy's
     /// signature is `Option<Vec<String>>` — the exact shape
-    /// `forward_or_spawn_with_config` itself receives — because the
+    /// `forward_or_spawn_with_config_and_packs` itself receives — because the
     /// `Some`/`None` decision is made at the shared call site in
     /// `request_with_forward` before `forward_fn` is invoked, not inside the
     /// production adapter (`forward_or_spawn_boxed`) that this spy replaces.
     /// That adapter is now a pure pass-through with no logic of its own, so
     /// this spy observes precisely what the real
-    /// `forward_or_spawn_with_config` call would receive. Two independent
+    /// `forward_or_spawn_with_config_and_packs` call would receive. Two independent
     /// mutations must both redden this test:
     /// - swapping the production `forward_fn(&frame, Some(resolved_packs))`
     ///   call for `forward_fn(&frame, Some(Vec::new()))` — the restricted
@@ -3962,11 +3963,11 @@ mod tests {
     /// `request_with_forward`) folds the right pack list, but its `spy_forward`
     /// stands in for `forward_or_spawn_boxed` itself, so it never executes the
     /// adapter's own `packs.as_deref()` conversion at
-    /// `crate::daemon::forward_or_spawn_with_config`'s call site. This test
+    /// `crate::daemon::forward_or_spawn_with_config_and_packs`'s call site. This test
     /// instead drives `request_with_cancellation` — the real production entry
     /// point, which always calls the real `forward_or_spawn_boxed` — and
     /// observes the argument via a one-shot capture hook armed at the entry of
-    /// `forward_or_spawn_with_config` itself (`crate::daemon::test_forward_seam`),
+    /// `forward_or_spawn_with_config_and_packs` itself (`crate::daemon::test_forward_seam`),
     /// past both the derivation site AND the adapter conversion. Changing the
     /// adapter's `packs.as_deref()` argument to `None` reddens this test.
     #[cfg(unix)]
@@ -4006,7 +4007,7 @@ mod tests {
             crate::daemon::test_forward_seam::take_captured(),
             Some(Some(vec!["kg".to_string(), "gtd".to_string()])),
             "the real forward_or_spawn_boxed adapter must convert the server's resolved \
-             registry pack set into Some(&packs) at the forward_or_spawn_with_config \
+             registry pack set into Some(&packs) at the forward_or_spawn_with_config_and_packs \
              call boundary"
         );
     }
