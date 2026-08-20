@@ -4,7 +4,10 @@
 - **Date:** 2026-08-16
 - **Revised:** 2026-08-19 (Rev 2 — design review R2: enumeration snapshot semantics and cursor
   binding, depth truncation split from page continuation, pre-lineage records classed unknown,
-  dispatcher missing-identity fail-closed, cascade serialization rule)
+  dispatcher missing-identity fail-closed, cascade serialization rule); 2026-08-20 (design
+  review R3: mutable-filter scope semantics for `agent.list(state=...)`, root authorization
+  for `agent.descendants` with unauthorized/nonexistent indistinguishability, cross-operation
+  disclosure composition assigned to the gate)
 - **Extends:** ADR-142
 
 ## Context
@@ -319,11 +322,27 @@ and gate rules as the existing five [ADR-142 §1; ADR-023]:
   expired cursor is a validation error naming the expiry, and the caller re-enumerates. The
   expiry is an operator configuration parameter with a published default; as with the other
   bounds in §4, its existence is normative here and its value is not.
-- Records that reach `terminal` mid-enumeration are still returned, since state is a field
-  rather than a filter on existence, and a record's admission-order position never moves —
-  so a record the caller has already seen can never be served again, and a record in scope
-  can never escape it. The cursor is opaque deliberately — a caller that constructs or
-  arithmetically manipulates one is relying on an encoding this ADR does not fix.
+- Records that reach `terminal` mid-enumeration are still returned when the enumeration's
+  filters are immutable-only — every `agent.descendants` walk, and every `agent.list`
+  without `state` — since state is a field rather than a filter on existence, and a
+  record's admission-order position never moves: a record the caller has already seen can
+  never be served again, and a record in such a scope can never escape it. A `state` filter
+  is the one mutable element a caller can put in scope, and it changes that promise, so the
+  change is stated rather than implied: filter membership is evaluated once per record, at
+  the moment the page that would carry it is computed, and `complete` is relative to those
+  evaluations. A record that stops matching before its page is computed — the only possible
+  direction, since `terminal` is absorbing and every `state` value a caller can name is
+  either a non-terminal state, `non_terminal` itself, or `terminal`, which no record leaves
+  — is outside the enumeration's scope by that evaluation rather than missed by accident; a
+  record served and then terminalized was truthfully in scope when its page was computed;
+  and no record is ever served twice or re-admitted, because positions are immutable and the
+  drop-out is one-way. The alternative — holding a state-filtered population fixed as of the
+  horizon — is rejected deliberately: it would require the read path to answer what a
+  record's state was at cursor mint, a reconstruction the agent table does not hold and only
+  the audit plane could approximate, and a read verb taking an audit-plane dependency to
+  serve a filter would invert the planes' layering. The cursor is opaque deliberately — a
+  caller that constructs or arithmetically manipulates one is relying on an encoding this
+  ADR does not fix.
 - Returned records carry the same field set as `agent.observe`, under the same additive-only
   versioning [ADR-142 §1, "Observation surface"]; `parent_agent_id`, `lineage_depth`, and the
   derived `lineage` classification (§1) appear in both surfaces.
@@ -336,7 +355,14 @@ returns the records that pass, silently omitting the rest: a caller's enumeratio
 precisely the set of records it could have `agent.observe`d individually, so the two
 surfaces can never disagree about visibility, and enumeration discloses no record outside
 the caller's authority: not its fields, not its identity. `count` and `complete` describe
-the visible set, not the table.
+the visible set, not the table. The walk's root is a record like any other, and naming it
+is not authority over it: `agent.descendants` applies this same predicate to the record
+named by `id` before walking anything, and a root that fails it produces the identical
+error, in shape and message, as an `id` naming no record at all — the two cases are
+indistinguishable by construction, so the verb is not an existence oracle for hidden
+records. Anchoring is disclosure: a walk from an unauthorized root would hand the caller
+that root's existence and every returned record's depth relative to it, neither of which
+the per-record predicate on the results ever budgeted.
 
 That claim is scoped to records, and the scoping is deliberate, because an absolute
 zero-disclosure claim would be false: this ADR contains exactly four places where a caller
@@ -351,7 +377,19 @@ whether the refusal fires, which is one threshold bit about hidden population si
 the four is deliberate, bounded to an aggregate fact, and justified where it is defined;
 none discloses a record. An implementation must not widen any of them, and must not add a
 fifth without amending this paragraph — this list is the contract's complete disclosure
-budget.
+budget. The budget counts bits per operation, and composition across operations is a real
+channel this ADR names rather than hides: each of the four discloses at most one threshold
+bit per call, so a caller iterating a bounded probe — binary-searching hidden structural
+depth with `max_depth` against `depth_truncated`, or bracketing hidden population size
+against the `lineage_visit_limit` refusal — accumulates bits at a rate bounded only by its
+call rate. No per-operation contract can close a cross-operation channel, so this ADR
+assigns the channel instead of pretending to bound it: cumulative disclosure is owned by
+the gate, alongside the per-caller rate concern §4 already routes there, and an operator
+whose delegated-lifecycle class set leaves records hidden from some callers — the only
+deployments in which these bits refer to anything — deploys a gate-side rate bound on these
+verbs as part of deploying hidden populations. That requirement is normative in the same
+sense as §4's bounds: the existence of the gate-side bound is required, its value is not
+fixed here.
 
 ### 4. Reaching a subtree: kill with descendants
 
@@ -507,7 +545,9 @@ Audit volume follows from these and needs no separate cap: one event per pass pl
 record reached, both already bounded above. What does need saying is that the bounds are
 enforced per operation and not per caller — this ADR does not define a rate limit, and a caller
 issuing many bounded enumerations in a loop remains a matter for the gate rather than for these
-verbs.
+verbs. That assignment carries more than resource cost: §3's disclosure budget composes across
+calls through exactly this loop, so the gate-side rate bound §3 requires for deployments with
+hidden populations is enforced here, at the gate, not by these verbs.
 
 The subtree kill is per-record, not transactional: each record's kill succeeds or fails by
 ADR-142's own rules (an already-`terminal` descendant is a no-op, exactly as in the
