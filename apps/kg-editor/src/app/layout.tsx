@@ -7,9 +7,6 @@ export const metadata: Metadata = {
   description:
     "Explore repository structure, history, hotspots, coupling, and ownership from a reproducible khive graph bundle.",
   applicationName: "khive",
-  icons: {
-    icon: "/favicon.ico",
-  },
 };
 
 export const viewport: Viewport = {
