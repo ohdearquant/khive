@@ -63,12 +63,12 @@ classification ambiguity.
 
 ### Category 2: Derivation (intellectual lineage)
 
-| Relation        | Direction                                               | When                                                                                       |
-| --------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `extends`       | child → parent                                          | Builds on, generalizes (FlashAttention-2 → FlashAttention)                                 |
-| `variant_of`    | variant → original                                      | Modified version (QLoRA → LoRA)                                                            |
-| `introduced_by` | concept/document/artifact/service → document/person/org | First described in (LoRA → Hu et al. 2021); document authorship (paper → author/publisher) |
-| `supersedes`    | new → old                                               | Replaces entirely; old stops being authoritative                                           |
+| Relation        | Direction                                                                           | When                                                                                       |
+| --------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `extends`       | child → parent                                                                      | Builds on, generalizes (FlashAttention-2 → FlashAttention)                                 |
+| `variant_of`    | variant → original                                                                  | Modified version (QLoRA → LoRA)                                                            |
+| `introduced_by` | concept → document/person/org · document → person/org · artifact/service → document | First described in (LoRA → Hu et al. 2021); document authorship (paper → author/publisher) |
+| `supersedes`    | new → old                                                                           | Replaces entirely; old stops being authoritative                                           |
 
 ### Category 3: Provenance (material/generative source lineage)
 

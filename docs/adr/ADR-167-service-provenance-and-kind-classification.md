@@ -127,8 +127,11 @@ reference to the writer's state of mind or to the world at write time:
   Liveness at write time is not consulted, so a deployable system between deployments still
   satisfies D. Codebase identifiers (repository, package, crate, source language) are
   explicitly step 6 evidence, not instance identifiers.
-- **Technique identity (T)**, evaluated only when D holds: the record's name or description
-  also denotes the technique the instance embodies, as distinct from the instance itself.
+- **Technique identity (T)**, evaluated only when D holds: the record's own text names a
+  technique as its referent — its `entity_type` is a technique-designating `Concept` subtype
+  (`algorithm`, `technique`, `method`, `pattern`, `architecture`, `model`), or its name or
+  description names the referent with one of those designators. A vocabulary-presence test
+  on the record's fields, not an inference about the prose.
 
 The arms partition on D, then on T, so they are mutually exclusive by construction: D absent →
 step 5 does not fire and the walk continues to step 6 (a codebase classifies `Project`, a pure
@@ -144,8 +147,9 @@ split arm required two earlier arms to hold simultaneously — unreachable under
 and whose predicates ("meaningful to say", "when deployed would have", "the writer cannot state
 which") were not decidable from the record; its broad liveness arm could also claim a static
 codebase that ADR-001 step 6 assigns to `Project`. The partition form above closes all three
-defects: no arm can be masked by ordering, every predicate is a field-presence test on the
-record, and codebase identity is routed to step 6 before `Service` can be reached.
+defects: no arm can be masked by ordering, every predicate is a presence test on the record's
+own fields and vocabulary, and codebase identity is routed to step 6 before `Service` can be
+reached.
 
 ### 3. Kind migration: keep delete-and-recreate, and require a re-anchor plan
 
@@ -260,19 +264,33 @@ this ADR is complete when all of the following hold:
 - ADR-001 itself carries the amendment in this PR's diff: its decision tree's step 5 names the
   instance-evidence test and its §"Service/concept tie-break" states the D/T partition. A test
   reading ADR-001 finds the operative text; ADR-167 records the decision and rationale.
-- Each arm has a worked fixture stated as record fields and an expected stored outcome:
-  - D without T → `Service`: a record whose properties name an endpoint and an operator, whose
-    description names no technique, and whose deployment is currently down (no liveness field
-    consulted) classifies `Service`.
-  - D absent, codebase identity → `Project` via step 6: a record naming only a repository and
-    source language classifies `Project`, never `Service`.
-  - D absent, technique identity → `Concept` via step 8: a record describing a method with no
-    instance identifier classifies `Concept`.
-  - D with T → split: a record whose name denotes a technique and whose properties name an
-    endpoint yields two records joined by `Service instance_of Concept`; classifying it as a
-    single record of either kind is rejected by the written rule.
-  - Step 9 note: a record whose description mentions deployment vocabulary but carries no
-    instance identifier lands `Concept` with a question note annotating the record.
+- Each arm has a worked fixture stated as exact record fields, with the tree preconditions
+  explicit (every fixture is not a person, org, document, or dataset, so steps 1-4 are false
+  by construction), and an expected stored outcome decidable from the written rule alone:
+  - D without T → `Service`: name `retrieval-gateway-prod`, description `the deployment
+    serving vector retrieval; currently down between deployments`, properties
+    `{endpoint: "https://retrieval.example/api", operator: "platform"}`, no `entity_type`.
+    D holds (endpoint, operator); T does not (no technique designator in any field).
+    Classifies `Service`; liveness is not consulted.
+  - D absent, codebase identity → `Project` via step 6: name `retrieval-gateway`,
+    description `Rust codebase for the retrieval gateway`, properties
+    `{repository: "https://example.com/r/gateway", language: "rust"}`. No instance
+    identifier, so step 5 does not fire; step 6 matches the repository field. Classifies
+    `Project`, never `Service`.
+  - D absent, technique identity → `Concept` via step 8: name `HNSW`, description
+    `graph-based approximate nearest neighbour search algorithm`, no instance identifier.
+    Step 5 does not fire; step 8 classifies `Concept`.
+  - D with T → split: name `Vamana index service`, description `deployment of the Vamana
+    graph-index algorithm`, properties `{endpoint: "https://ann.example/v1"}`. D holds
+    (endpoint); T holds (`algorithm` designator). The split is mandatory: two records
+    joined by `Service instance_of Concept`; classifying it as a single record of either
+    kind is rejected by the written rule.
+  - Step 9 note: name `experimental serving stack`, description `deployed somewhere in the
+    lab, details unrecorded` — deployment vocabulary (`deployed`) present, no instance
+    identifier, no codebase field (step 6 false), no technique designator (step 8's
+    abstract-idea test unresolved), steps 1-8 thereby exhausted without resolving. Lands
+    `Concept` per step 9, with the open classification question recorded as a note
+    annotating the record.
 
 **Migration procedure (Decision 3).**
 
@@ -280,16 +298,30 @@ this ADR is complete when all of the following hold:
   pages, stable page order) is owned by the tests of the change that closed #2088 and is not
   re-owned here; this ADR's enumeration criteria assume it and test what the listing surface
   cannot answer.
-- Enumeration, destructive-scope completeness: the fixture holds six incident edges on the
-  migrating record spread across two namespaces, of which one is in a namespace NOT visible
-  to the migrating caller and one is already soft-deleted. A visible/live enumeration (the
-  cursor walk or the listing surface) returns four; the in-transaction purge-predicate
-  enumeration returns all six edge ids exactly once (deduplicated, so a self-loop edge
-  matching on both source and target counts once), and reconciles with `COUNT(*)` = 6 under
-  the same predicate in the same transaction. All six receive dispositions before any plan
-  is prepared — because the purge would delete all six. A migration prepared from the
-  four-row visible/live enumeration must be refused, and the refusal is the asserted
-  outcome, not a warning.
+- Enumeration, destructive-scope completeness: the fixture is this exact matrix of six
+  incident edges on the migrating record R. The caller's visible namespaces are `ns_a` and
+  `ns_b`; `ns_hidden` is not visible to it. The invisible row (e5) and the tombstoned row
+  (e6) are distinct edges, both directions appear in both the included and excluded sets,
+  and e3 is a self-loop matching the purge predicate on both source and target:
+
+  | id | source → target   | namespace   | deleted_at | in visible/live walk | in purge set |
+  | -- | ----------------- | ----------- | ---------- | -------------------- | ------------ |
+  | e1 | R → X1            | `ns_a`      | live       | yes                  | yes          |
+  | e2 | X2 → R            | `ns_a`      | live       | yes                  | yes          |
+  | e3 | R → R (self-loop) | `ns_a`      | live       | yes                  | yes, once    |
+  | e4 | X3 → R            | `ns_b`      | live       | yes                  | yes          |
+  | e5 | R → X4            | `ns_hidden` | live       | no (namespace)       | yes          |
+  | e6 | X5 → R            | `ns_a`      | tombstoned | no (live filter)     | yes          |
+
+  The visible/live enumeration (cursor walk or listing surface) returns exactly
+  {e1, e2, e3, e4}. The in-transaction purge-predicate enumeration returns exactly
+  {e1, e2, e3, e4, e5, e6}, each id once — e3 appears once despite matching both the
+  source and target arms of the predicate (the predicate is evaluated per row, so the one
+  self-loop row matches once) — and reconciles with `COUNT(*)` = 6 under the same predicate
+  in the same transaction, the same count Decision 3 step 1 names. All six rows receive dispositions
+  before any plan is prepared, because the purge would delete all six. A migration
+  prepared from the four-row visible/live enumeration must be refused, and the refusal is
+  the asserted outcome, not a warning.
 - Edge-as-endpoint coverage: the fixture includes an `annotates` edge whose TARGET is itself an
   edge incident to the migrating record; the enumeration finds it, and after migration the
   annotation is re-anchored to the recreated edge's new id (or deleted with a recorded

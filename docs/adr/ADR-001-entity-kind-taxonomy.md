@@ -244,9 +244,13 @@ the writer's state of mind or to the world at write time:
   identify only a codebase (repository, package, crate, source language) are step 6
   evidence, not instance identifiers — a record carrying only codebase identity does not
   satisfy D and continues to step 6, where it classifies `Project`.
-- **Technique identity (T)** — evaluated only when D holds: the record's name or
-  description also denotes the technique, method, pattern, or named result the instance
-  embodies, as distinct from the instance itself.
+- **Technique identity (T)** — evaluated only when D holds: the record's own text names a
+  technique as its referent. T holds exactly when the record's `entity_type` is a
+  technique-designating `Concept` subtype (`algorithm`, `technique`, `method`, `pattern`,
+  `architecture`, `model`), or its name or description names the referent with one of those
+  designators (the designating word is present in the record's text). T is a
+  vocabulary-presence test on the record's own fields — the same instrument as step 9's
+  question-note trigger — never an inference about what the prose "really" means.
 
 The sub-procedure:
 
@@ -304,6 +308,9 @@ artifact is generated state — its identity is the process that produced it.
 ## Edge endpoint rules for new kinds
 
 The following `(source, relation, target)` triples are allowed for `Artifact` and `Service`.
+These tables are a summary for classification writers;
+[ADR-002](ADR-002-edge-ontology.md)'s base endpoint contract is the endpoint authority, and on
+any disagreement ADR-002 governs.
 
 ### Artifact
 
@@ -328,19 +335,21 @@ is for "this checkpoint is an instance of this architecture."
 
 ### Service
 
-| Source    | Relation      | Target     | Meaning                                    |
-| --------- | ------------- | ---------- | ------------------------------------------ |
-| `Service` | `instance_of` | `Project`  | deployed/running instance of this codebase |
-| `Service` | `depends_on`  | `Project`  | runtime dependency on code/library         |
-| `Service` | `depends_on`  | `Service`  | service-to-service dependency              |
-| `Service` | `depends_on`  | `Artifact` | uses checkpoint, index, config, state      |
-| `Service` | `depends_on`  | `Dataset`  | uses raw data at runtime                   |
-| `Service` | `implements`  | `Concept`  | realizes an algorithm/protocol             |
-| `Service` | `enables`     | `Concept`  | makes a technique/workflow possible        |
-| `Service` | `precedes`    | `Service`  | earlier deployment/version                 |
-| `Service` | `supersedes`  | `Service`  | replacement service                        |
-| `Org`     | `contains`    | `Service`  | organization operates this service         |
-| `Note`    | `annotates`   | `Service`  | notes can annotate services                |
+| Source    | Relation        | Target     | Meaning                                                      |
+| --------- | --------------- | ---------- | ------------------------------------------------------------ |
+| `Service` | `instance_of`   | `Project`  | deployed/running instance of this codebase                   |
+| `Service` | `instance_of`   | `Concept`  | deployment of a technique (the amended step 5 split outcome) |
+| `Service` | `introduced_by` | `Document` | first described in a paper/spec (2026-08-21 amendment)       |
+| `Service` | `depends_on`    | `Project`  | runtime dependency on code/library                           |
+| `Service` | `depends_on`    | `Service`  | service-to-service dependency                                |
+| `Service` | `depends_on`    | `Artifact` | uses checkpoint, index, config, state                        |
+| `Service` | `depends_on`    | `Dataset`  | uses raw data at runtime                                     |
+| `Service` | `implements`    | `Concept`  | realizes an algorithm/protocol                               |
+| `Service` | `enables`       | `Concept`  | makes a technique/workflow possible                          |
+| `Service` | `precedes`      | `Service`  | earlier deployment/version                                   |
+| `Service` | `supersedes`    | `Service`  | replacement service                                          |
+| `Org`     | `contains`      | `Service`  | organization operates this service                           |
+| `Note`    | `annotates`     | `Service`  | notes can annotate services                                  |
 
 `Service -[instance_of]-> Project` is for "deployed from" semantics.
 `Service -[depends_on]-> Project` is for "requires at runtime."
