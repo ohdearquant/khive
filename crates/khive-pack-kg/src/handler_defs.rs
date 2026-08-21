@@ -147,7 +147,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, \
                               note, edge, event, or proposal to fetch. Entity-name fallback \
                               uses the primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "include_deleted",
@@ -254,7 +254,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Filter edges by source node complete UUID, unique 8+ hex prefix, \
                               or entity name (kind=\"edge\" only). Prefix and name resolution \
                               search the caller's primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "target_id",
@@ -263,7 +263,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Filter edges by target node complete UUID, unique 8+ hex prefix, \
                               or entity name (kind=\"edge\" only). Prefix and name resolution \
                               search the caller's primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "relations",
@@ -305,21 +305,21 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "uuid",
                 required: false,
                 description: "Filter events by an exact full session UUID (kind=\"event\" only). A short-prefix resolution can miss or be ambiguous, so it is rejected for this stable record filter.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "observed",
                 param_type: "array of uuid",
                 required: false,
                 description: "Filter events that observed every listed exact full UUID (kind=\"event\" only). Short-prefix resolution can miss or be ambiguous, so prefixes are rejected for these stable record filters.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "selected",
                 param_type: "array of uuid",
                 required: false,
                 description: "Filter events that selected every listed exact full UUID (kind=\"event\" only). Short-prefix resolution can miss or be ambiguous, so prefixes are rejected for these stable record filters.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "thread_id",
@@ -400,7 +400,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, note, \
                               or edge to patch. Entity-name fallback uses the primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "kind",
@@ -487,7 +487,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the record to \
                               delete. Entity-name fallback uses the primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "kind",
@@ -519,7 +519,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity or \
                               note that survives. Entity-name fallback uses the primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "from_id",
@@ -527,7 +527,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity or \
                               note to merge from. Entity-name fallback uses the primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "kind",
@@ -665,7 +665,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: true,
                 description: "Source node complete UUID or globally unique 8+ hex prefix. \
                               Entity-name fallback uses the primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "target_id",
@@ -673,7 +673,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: true,
                 description: "Target node complete UUID or globally unique 8+ hex prefix. \
                               Entity-name fallback uses the primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "relation",
@@ -724,7 +724,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Complete UUID, unique 8+ hex prefix, or entity name of the node \
                               whose neighbors to return. Prefix and name resolution search the \
                               caller's primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "direction",
@@ -769,7 +769,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               names (maximum 100; aliases resolving to the same UUID are \
                               de-duplicated). Prefix and name resolution search the caller's \
                               primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "max_depth",
@@ -997,7 +997,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "uuid",
                 required: false,
                 description: "Full UUID of a parent proposal this supersedes or extends. A short prefix would require proposal-namespace resolution and is rejected because ancestry is an explicit stable reference.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
             },
         ],
     },
@@ -1015,7 +1015,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Complete UUID or unique 8+ hex prefix of the proposal to review. \
                               Prefix resolution searches open proposals in the caller's primary \
                               namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::FullAndPrefixScopedToPrimary,
             },
             ParamDef {
                 name: "decision",
@@ -1047,7 +1047,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Complete UUID or unique 8+ hex prefix of the open proposal to \
                               withdraw. Prefix resolution searches open proposals in the caller's \
                               primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::FullAndPrefixScopedToPrimary,
             },
             ParamDef {
                 name: "rationale",

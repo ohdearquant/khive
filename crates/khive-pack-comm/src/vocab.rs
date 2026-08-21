@@ -76,7 +76,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 param_type: "uuid",
                 required: false,
                 description: "Optional full UUID to group messages into a thread. A short prefix would require scoped resolution and is rejected because the thread root is an explicit stable reference.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
             },
             ParamDef {
                 name: "tags",
@@ -109,7 +109,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
             description: "Full UUID returned as full_id by comm.send or comm.reply, or surfaced \
                           as outbound_id in an ambiguous atomic-write error. A full UUID is \
                           required because it is the exact correlation key.",
-            resolution_mode: IdResolutionMode::NotApplicable,
+            resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
         }],
     },
     HandlerDef {
@@ -387,7 +387,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 param_type: "uuid",
                 required: false,
                 description: "Optional full internal thread UUID. A short prefix would require scoped resolution and is rejected because the thread root is an explicit stable reference. When absent, a new thread root is created.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
             },
             ParamDef {
                 name: "channel_kind",

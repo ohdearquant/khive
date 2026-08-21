@@ -273,7 +273,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 description: "Complete UUID or globally unique 8+ hex prefix of the memory note \
                               or entity the feedback applies to. Prefix resolution is \
                               namespace-unfiltered under ADR-007.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {
                 name: "signal",
@@ -663,7 +663,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 description: "Complete UUID or globally unique 8+ hex prefix of the record the \
                               feedback applies to. Prefix resolution is namespace-unfiltered \
                               under ADR-007.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {
                 name: "signal",

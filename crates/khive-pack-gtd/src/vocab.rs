@@ -144,14 +144,14 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 description: "Complete UUIDs or unique 8+ hex prefixes of blocking task notes. \
                               Prefix resolution searches the caller's primary namespace, and \
                               each resolved record must be a task in that namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::FullAndPrefixScopedToPrimary,
             },
             ParamDef {
                 name: "context_entity_id",
                 param_type: "uuid",
                 required: false,
                 description: "Full UUID of the KG entity this task concerns. A short prefix would require primary-namespace resolution and is rejected because this field stores an explicit stable reference.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
             },
             ParamDef {
                 name: "tags",
@@ -204,7 +204,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 param_type: "uuid",
                 required: true,
                 description: "Full UUID or unique 8+ hex prefix of the task to complete. By-ID resolution is namespace-agnostic (ADR-007).",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "result",
@@ -287,7 +287,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 param_type: "uuid",
                 required: true,
                 description: "Full UUID or unique 8+ hex prefix of the task to transition. By-ID resolution is namespace-agnostic (ADR-007).",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "status",

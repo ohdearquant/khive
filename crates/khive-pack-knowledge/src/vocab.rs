@@ -628,7 +628,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 required: true,
                 description: "Concept entity complete UUID or unique 8+ hex prefix. Prefix \
                               resolution searches the caller's primary namespace.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "source_id",
@@ -638,7 +638,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                               resolution searches the caller's primary namespace. The source \
                               must be kind=document, kind=person, or kind=org (introduced_by \
                               edge rule).",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "weight",
