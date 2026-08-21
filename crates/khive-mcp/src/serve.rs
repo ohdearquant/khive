@@ -10559,7 +10559,12 @@ backend = "kg-backend"
             runtime.install_blob_store(Arc::new(blob_store));
             let mut builder = VerbRegistryBuilder::new();
             builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
             builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
             let registry = builder.build().expect("registry builds");
             ensure_channel_quarantine_storage(&registry)

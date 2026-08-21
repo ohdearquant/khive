@@ -193,6 +193,20 @@ pub trait PackRuntime: Send + Sync {
         None
     }
 
+    /// Accept the trusted channel-ingest capability grant for this specific
+    /// pack instance.
+    ///
+    /// Called at most once per instance, immediately after this instance is
+    /// constructed via [`PackFactory::create_install`], and only for packs
+    /// whose name appears in [`CHANNEL_INGEST_CAPABLE_PACKS`]. Storing the
+    /// grant on `self` (rather than on the `&'static dyn PackFactory`, which
+    /// is a single process-wide singleton shared by every instance the
+    /// factory ever creates) makes the grant instance-bound: a `CommPack`
+    /// built outside [`PackRegistry::register_packs`] holds no capability
+    /// unless something calls this on that specific instance. Defaults to a
+    /// no-op so packs outside the allowlist compile without changes.
+    fn accept_channel_ingest_capability(&self, _capability: ChannelIngestCapability) {}
+
     /// Pack-auxiliary schema.
     ///
     /// Returns DDL statements for pack-owned tables that are NOT part of the
@@ -2778,13 +2792,33 @@ pub struct PackInstall {
 /// [`crate::KhiveRuntime::try_create_note_as_trusted_ingest`] must present a
 /// reference to one, so the set of callers able to establish transport-owned
 /// message properties is bounded by possession at the composition root, not
-/// by a documentation prohibition. The residual trust assumption is the pack
-/// name registry itself: names are unique per registration, so a rogue
-/// factory could obtain the grant only by shipping in the binary under the
-/// `comm` name in a composition that omits the real comm pack — a change the
-/// composition root would have to make deliberately.
+/// by a documentation prohibition. Two ways to obtain one: registering
+/// through [`PackRegistry::register_packs`]/`register_packs_with_runtimes`
+/// under the `comm` name (the allowlisted, automatic path), or a composition
+/// root that builds packs directly calling
+/// [`ChannelIngestCapability::grant_for_direct_composition`] and passing the
+/// result to [`crate::PackRuntime::accept_channel_ingest_capability`] (or a
+/// pack's constructor variant that does so) itself. The residual trust
+/// assumption is unchanged either way: whoever assembles the
+/// `VerbRegistryBuilder` already decides which packs are wired in and already
+/// holds a `KhiveRuntime`, so minting the grant explicitly carries no more
+/// privilege than that composition already had by choosing to register `comm`
+/// at all.
 pub struct ChannelIngestCapability {
     pub(crate) _sealed: (),
+}
+
+impl ChannelIngestCapability {
+    /// Mint a capability for a composition root that constructs
+    /// channel-transport packs directly, bypassing
+    /// [`PackRegistry::register_packs`] (which grants this automatically).
+    ///
+    /// See the type-level doc for the trust argument: this carries no more
+    /// privilege than the caller already has by virtue of holding a
+    /// `KhiveRuntime` and choosing to wire the pack in.
+    pub fn grant_for_direct_composition() -> Self {
+        Self { _sealed: () }
+    }
 }
 
 /// Pack names entitled to a [`ChannelIngestCapability`] grant at registration.
@@ -2832,14 +2866,6 @@ pub trait PackFactory: Send + Sync + 'static {
     fn create_resolver(&self, _runtime: KhiveRuntime) -> Option<Box<dyn PackByIdResolver>> {
         None
     }
-
-    /// Receive the trusted channel-ingest capability during registration.
-    ///
-    /// Called at most once per registration, and only for factories whose
-    /// name appears in [`CHANNEL_INGEST_CAPABLE_PACKS`]. The default drops
-    /// the grant, so a pack reaches the trusted-ingest path only by
-    /// deliberately overriding this method and storing the capability.
-    fn grant_channel_ingest(&self, _capability: ChannelIngestCapability) {}
 }
 
 /// Newtype wrapper collected by `inventory` so pack crates can submit
@@ -2943,10 +2969,12 @@ impl PackRegistry {
         // performs the topo-sort, so insertion order here does not matter.
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
-            if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
-                factory.grant_channel_ingest(ChannelIngestCapability { _sealed: () });
-            }
             let install = factory.create_install(runtime.clone());
+            if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
+                install
+                    .runtime
+                    .accept_channel_ingest_capability(ChannelIngestCapability { _sealed: () });
+            }
             builder.register_boxed(install.runtime);
             if let Some(resolver) = install.resolver {
                 builder.register_resolver(name.clone(), resolver);
@@ -3001,14 +3029,16 @@ impl PackRegistry {
 
         for name in names {
             let factory = factory_for(name.as_str()).unwrap();
-            if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
-                factory.grant_channel_ingest(ChannelIngestCapability { _sealed: () });
-            }
             let runtime = runtimes
                 .get(name.as_str())
                 .cloned()
                 .unwrap_or_else(|| default_runtime.clone());
             let install = factory.create_install(runtime);
+            if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
+                install
+                    .runtime
+                    .accept_channel_ingest_capability(ChannelIngestCapability { _sealed: () });
+            }
             builder.register_boxed(install.runtime);
             if let Some(resolver) = install.resolver {
                 builder.register_resolver(name.clone(), resolver);
@@ -3325,8 +3355,13 @@ pub(crate) mod tests {
     struct CommProbeFactory;
     struct OtherProbeFactory;
 
-    fn probe_pack(_runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
-        struct ProbePack;
+    fn probe_pack(
+        _runtime: KhiveRuntime,
+        grant_flag: &'static std::sync::atomic::AtomicBool,
+    ) -> Box<dyn PackRuntime> {
+        struct ProbePack {
+            grant_flag: &'static std::sync::atomic::AtomicBool,
+        }
         #[async_trait::async_trait]
         impl PackRuntime for ProbePack {
             fn name(&self) -> &str {
@@ -3341,6 +3376,10 @@ pub(crate) mod tests {
             fn handlers(&self) -> &'static [HandlerDef] {
                 &[]
             }
+            fn accept_channel_ingest_capability(&self, _capability: ChannelIngestCapability) {
+                self.grant_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             async fn dispatch(
                 &self,
                 _verb: &str,
@@ -3351,7 +3390,7 @@ pub(crate) mod tests {
                 Err(crate::RuntimeError::InvalidInput("probe".into()))
             }
         }
-        Box::new(ProbePack)
+        Box::new(ProbePack { grant_flag })
     }
 
     impl PackFactory for CommProbeFactory {
@@ -3359,10 +3398,7 @@ pub(crate) mod tests {
             "comm"
         }
         fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
-            probe_pack(runtime)
-        }
-        fn grant_channel_ingest(&self, _capability: ChannelIngestCapability) {
-            COMM_PROBE_GRANTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            probe_pack(runtime, &COMM_PROBE_GRANTED)
         }
     }
 
@@ -3371,10 +3407,7 @@ pub(crate) mod tests {
             "grant-probe-other"
         }
         fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
-            probe_pack(runtime)
-        }
-        fn grant_channel_ingest(&self, _capability: ChannelIngestCapability) {
-            OTHER_PROBE_GRANTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            probe_pack(runtime, &OTHER_PROBE_GRANTED)
         }
     }
 

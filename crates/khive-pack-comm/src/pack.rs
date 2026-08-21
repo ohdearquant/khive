@@ -20,6 +20,16 @@ use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 pub struct CommPack {
     runtime: KhiveRuntime,
     inbox_signal: InboxSignal,
+    /// Instance-bound trusted channel-ingest grant (khive #1839 round 3).
+    ///
+    /// Previously a process-global `OnceLock` shared by every `CommPack`
+    /// instance the factory ever created, regardless of which runtime or
+    /// composition it belonged to — a grant to one instance leaked into
+    /// every other, and a direct `CommPack::new` composition (bypassing
+    /// `PackRegistry::register_packs`) could never receive it at all. Scoped
+    /// to `self` so each instance's grant reflects only what was explicitly
+    /// given to it.
+    channel_ingest: std::sync::OnceLock<khive_runtime::ChannelIngestCapability>,
 }
 
 impl Pack for CommPack {
@@ -32,14 +42,41 @@ impl Pack for CommPack {
 
 impl CommPack {
     /// Create a new `CommPack` bound to the given runtime.
+    ///
+    /// Holds no channel-ingest capability: `comm.ingest` fails closed with a
+    /// configuration/startup error until one is granted, either
+    /// automatically (registering through `PackRegistry::register_packs`
+    /// under the `comm` name) or explicitly (see
+    /// [`Self::new_with_channel_ingest_capability`] or
+    /// [`khive_runtime::PackRuntime::accept_channel_ingest_capability`]).
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self {
             runtime,
             inbox_signal: InboxSignal::new(),
+            channel_ingest: std::sync::OnceLock::new(),
         }
     }
+
+    /// Create a new `CommPack` with the trusted channel-ingest capability
+    /// already granted — for composition roots that construct packs
+    /// directly rather than going through `PackRegistry::register_packs`.
+    pub fn new_with_channel_ingest_capability(
+        runtime: KhiveRuntime,
+        capability: khive_runtime::ChannelIngestCapability,
+    ) -> Self {
+        let pack = Self::new(runtime);
+        let _ = pack.channel_ingest.set(capability);
+        pack
+    }
+
     pub(crate) fn runtime(&self) -> &KhiveRuntime {
         &self.runtime
+    }
+
+    pub(crate) fn channel_ingest_capability(
+        &self,
+    ) -> Option<&khive_runtime::ChannelIngestCapability> {
+        self.channel_ingest.get()
     }
 }
 
@@ -167,19 +204,6 @@ pub(crate) fn derive_message_identity(
 
 struct CommPackFactory;
 
-/// The trusted channel-ingest capability the runtime grants at registration.
-///
-/// `comm.ingest` presents it on every trusted-ingest write; an ungranted pack
-/// (a composition that never registered comm through the pack registry) fails
-/// closed at the handler rather than establishing transport-owned properties.
-static CHANNEL_INGEST_CAPABILITY: std::sync::OnceLock<khive_runtime::ChannelIngestCapability> =
-    std::sync::OnceLock::new();
-
-pub(crate) fn channel_ingest_capability() -> Option<&'static khive_runtime::ChannelIngestCapability>
-{
-    CHANNEL_INGEST_CAPABILITY.get()
-}
-
 impl khive_runtime::PackFactory for CommPackFactory {
     fn name(&self) -> &'static str {
         "comm"
@@ -189,9 +213,6 @@ impl khive_runtime::PackFactory for CommPackFactory {
     }
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(CommPack::new(runtime))
-    }
-    fn grant_channel_ingest(&self, capability: khive_runtime::ChannelIngestCapability) {
-        let _ = CHANNEL_INGEST_CAPABILITY.set(capability);
     }
 }
 
@@ -220,6 +241,9 @@ impl PackRuntime for CommPack {
     }
     fn register_note_write_validator(&self, runtime: &KhiveRuntime) {
         runtime.install_note_write_validator(std::sync::Arc::new(derive_message_identity));
+    }
+    fn accept_channel_ingest_capability(&self, capability: khive_runtime::ChannelIngestCapability) {
+        let _ = self.channel_ingest.set(capability);
     }
     fn requires(&self) -> &'static [&'static str] {
         <CommPack as Pack>::REQUIRES
@@ -255,7 +279,14 @@ impl PackRuntime for CommPack {
             }
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
             "comm.ingest" => {
-                handlers::handle_ingest(self.runtime(), &self.inbox_signal, token, params).await
+                handlers::handle_ingest(
+                    self.runtime(),
+                    &self.inbox_signal,
+                    self.channel_ingest_capability(),
+                    token,
+                    params,
+                )
+                .await
             }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,

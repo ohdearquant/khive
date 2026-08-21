@@ -1840,6 +1840,7 @@ enum AfterCursor {
 pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
+    channel_ingest_capability: Option<&khive_runtime::ChannelIngestCapability>,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
@@ -2111,9 +2112,13 @@ pub(crate) async fn handle_ingest(
     // transport-owned quarantine disposition and channel provenance (`quarantined`,
     // `channel_kind`, `channel_slug`), derived above from the inbound transport
     // itself. Every other write path uses `try_create_note`, which refuses them.
-    let capability = crate::pack::channel_ingest_capability().ok_or_else(|| {
-        RuntimeError::InvalidInput(
-            "comm pack holds no channel-ingest capability grant; refusing to              establish transport-owned message properties"
+    // A missing grant is a composition/startup defect (this `CommPack` instance
+    // was never granted the capability), not a caller input error — classified
+    // as `Unconfigured` so it is not confused with a malformed request.
+    let capability = channel_ingest_capability.ok_or_else(|| {
+        RuntimeError::Unconfigured(
+            "comm pack instance holds no channel-ingest capability grant; refusing to \
+             establish transport-owned message properties"
                 .to_string(),
         )
     })?;
@@ -3332,17 +3337,9 @@ mod tests {
             .expect("authorize");
         let signal = InboxSignal::new();
 
-        // Seed the channel-ingest grant through the real registration path;
-        // handle_ingest fails closed without it. The symbol reference keeps
-        // khive-pack-kg linked so its factory reaches this binary's inventory.
-        let _force_kg_link = khive_pack_kg::KgPack::new;
-        let mut grant_builder = khive_runtime::VerbRegistryBuilder::new();
-        khive_runtime::PackRegistry::register_packs(
-            &["kg".to_string(), "comm".to_string()],
-            runtime.clone(),
-            &mut grant_builder,
-        )
-        .expect("registration grants channel ingest");
+        // handle_ingest fails closed without a channel-ingest grant; mint one
+        // directly rather than routing through a full pack registration.
+        let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
 
         let body = json!({
             "from": "email:sender@example.com",
@@ -3351,9 +3348,10 @@ mod tests {
             "external_id": "imap:long-poll:dedup:1",
         });
 
-        let first = super::handle_ingest(&runtime, &signal, &token, body.clone())
-            .await
-            .expect("first ingest succeeds");
+        let first =
+            super::handle_ingest(&runtime, &signal, Some(&capability), &token, body.clone())
+                .await
+                .expect("first ingest succeeds");
         assert_eq!(first["deduplicated"].as_bool(), Some(false));
         let generation_after_commit = signal.snapshot();
         assert_ne!(
@@ -3361,7 +3359,7 @@ mod tests {
             "a newly committed ingest must publish a wake"
         );
 
-        let second = super::handle_ingest(&runtime, &signal, &token, body)
+        let second = super::handle_ingest(&runtime, &signal, Some(&capability), &token, body)
             .await
             .expect("deduplicated ingest succeeds");
         assert_eq!(second["deduplicated"].as_bool(), Some(true));
