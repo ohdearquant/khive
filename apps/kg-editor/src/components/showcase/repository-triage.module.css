@@ -452,6 +452,25 @@
   height: 12px;
   width: 12px;
 }
+.breadcrumb {
+  align-items: center;
+  color: var(--repo-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 8px;
+  gap: 5px;
+  margin-top: 10px;
+}
+.breadcrumb svg {
+  flex: 0 0 auto;
+  height: 9px;
+  width: 9px;
+}
+.breadcrumb strong {
+  color: var(--repo-navy);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  overflow-wrap: anywhere;
+}
 .inspectorHeader h3 {
   color: var(--repo-navy);
   font-family: "SFMono-Regular", Consolas, monospace;

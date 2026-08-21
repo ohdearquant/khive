@@ -2,6 +2,7 @@ import {
   loadStaticShowcaseBundle,
   parseBoundedShowcaseResponse,
   type ShowcaseFetch,
+  type ShowcaseResponse,
 } from "@/lib/adapters/static-showcase-source";
 import type { RepoBundle } from "@/lib/repo-bundle";
 import {
@@ -55,57 +56,105 @@ export async function loadPreferredShowcaseBundle(
     };
   }
 
-  const endpoint = `/api/showcase/analyses/${entry.analysisId}`;
-  const accessToken = options.accessToken?.trim();
-  const response = await fetchBundle(endpoint, {
-    cache: "no-store",
-    credentials: "same-origin",
-    redirect: "error",
-    ...(accessToken
-      ? { headers: { authorization: `Bearer ${accessToken}` } }
-      : {}),
+  const dbBundle = await tryLoadDbSnapshotBundle(entry, fetchBundle, options);
+  if (dbBundle) {
+    return { bundle: dbBundle, source: "khive-db-snapshot" };
+  }
+
+  return {
+    bundle: await loadStaticShowcaseBundle(entry, fetchBundle),
+    source: "curated-static-fallback",
+  };
+}
+
+// A connection that never resolves, or a response body that stops
+// delivering bytes without rejecting, would otherwise leave the snapshot
+// read pending forever and keep the page in its loading state instead of
+// reaching the static fallback below. This deadline bounds the connection,
+// header wait, and full body parse together, so any of those hangs falls
+// back to the curated static asset once it elapses.
+export const DB_SNAPSHOT_TIMEOUT_MS = 5_000;
+
+// The DB snapshot is a progressive enhancement over the static asset: any
+// failure on this path (network, status, provenance, schema, identity, or
+// timeout) must fall back to the static render rather than fail the page.
+async function tryLoadDbSnapshotBundle(
+  entry: ShowcaseRegistryEntry,
+  fetchBundle: ShowcaseFetch,
+  options: PreferredShowcaseOptions,
+): Promise<RepoBundle | null> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    DB_SNAPSHOT_TIMEOUT_MS,
+  );
+  const deadline = new Promise<null>((resolve) => {
+    controller.signal.addEventListener("abort", () => resolve(null), {
+      once: true,
+    });
   });
 
-  if (response.status === 404) {
-    return {
-      bundle: await loadStaticShowcaseBundle(entry, fetchBundle),
-      source: "curated-static-fallback",
-    };
+  try {
+    return await Promise.race([
+      readDbSnapshotBundle(entry, fetchBundle, options, controller.signal),
+      deadline,
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
   }
+}
+
+async function readDbSnapshotBundle(
+  entry: ShowcaseRegistryEntry,
+  fetchBundle: ShowcaseFetch,
+  options: PreferredShowcaseOptions,
+  signal: AbortSignal,
+): Promise<RepoBundle | null> {
+  const endpoint = `/api/showcase/analyses/${entry.analysisId}`;
+  const accessToken = options.accessToken?.trim();
+  let response: ShowcaseResponse;
+  try {
+    response = await fetchBundle(endpoint, {
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
+      signal,
+      ...(accessToken
+        ? { headers: { authorization: `Bearer ${accessToken}` } }
+        : {}),
+    });
+  } catch {
+    return null;
+  }
+
   if (!response.ok) {
-    throw new Error(
-      `Database snapshot could not be loaded (HTTP ${response.status}).`,
-    );
+    return null;
   }
   if (
     response.headers.get("x-khive-analysis-source") !== "khive-db-snapshot" ||
     response.headers.get("x-khive-analysis-id") !== entry.analysisId
   ) {
-    throw new Error(
-      "Database snapshot provenance did not match the curated registry.",
-    );
+    return null;
   }
 
-  const bundle = await parseBoundedShowcaseResponse(
-    response,
-    "Database snapshot",
-  );
-  const expectedRepository = normalizeRepositoryUrl(entry.canonicalUrl);
-  const actualRepository = normalizeRepositoryUrl(
-    bundle.meta.repository.canonical_url,
-  );
-  if (
-    !expectedRepository.ok ||
-    !actualRepository.ok ||
-    actualRepository.value !== expectedRepository.value
-  ) {
-    throw new Error(
-      "Database snapshot repository identity did not match the curated registry.",
+  try {
+    const bundle = await parseBoundedShowcaseResponse(
+      response,
+      "Database snapshot",
     );
+    const expectedRepository = normalizeRepositoryUrl(entry.canonicalUrl);
+    const actualRepository = normalizeRepositoryUrl(
+      bundle.meta.repository.canonical_url,
+    );
+    if (
+      !expectedRepository.ok ||
+      !actualRepository.ok ||
+      actualRepository.value !== expectedRepository.value
+    ) {
+      return null;
+    }
+    return bundle;
+  } catch {
+    return null;
   }
-
-  return {
-    bundle,
-    source: "khive-db-snapshot",
-  };
 }

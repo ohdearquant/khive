@@ -44,6 +44,42 @@ describe("khive.repo.v1 browser contract", () => {
     expect(repoBundleSchema.safeParse(value).success).toBe(false);
   });
 
+  it("rejects duplicate module source paths that cannot form a stable investigation link", () => {
+    const value = goldenValue() as {
+      graph: { modules: { items: Array<{ id: string; source_path: string }> } };
+    };
+    expect(value.graph.modules.items.length).toBeGreaterThan(1);
+    value.graph.modules.items[1].source_path =
+      value.graph.modules.items[0].source_path;
+
+    expect(repoBundleSchema.safeParse(value).success).toBe(false);
+  });
+
+  it.each([
+    "",
+    "/absolute.rs",
+    "crates/../outside.rs",
+    "crates\\windows.rs",
+    `crates/${"a".repeat(1_025)}`,
+    "crates/control\u0000.rs",
+  ])("rejects a non-addressable module source path %j", (sourcePath) => {
+    const value = goldenValue() as {
+      graph: { modules: { items: Array<{ source_path: string }> } };
+    };
+    value.graph.modules.items[0].source_path = sourcePath;
+
+    expect(repoBundleSchema.safeParse(value).success).toBe(false);
+  });
+
+  it("rejects a canonical repository URL that cannot be shared publicly", () => {
+    const value = goldenValue() as {
+      meta: { repository: { canonical_url: string } };
+    };
+    value.meta.repository.canonical_url = "file:///private/repository";
+
+    expect(repoBundleSchema.safeParse(value).success).toBe(false);
+  });
+
   it("accepts repository ownership when only the module join is unavailable", () => {
     const value = goldenValue() as {
       capability: { views: { ownership: { status: string; unavailable_reason?: string } } };

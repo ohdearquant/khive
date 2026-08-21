@@ -9,6 +9,7 @@ import {
   CircleDot,
   Clock3,
   Code2,
+  Copy,
   Database,
   GitBranch,
   GitCommitHorizontal,
@@ -23,7 +24,7 @@ import {
   TrendingUp,
   Users,
 } from "@/icons";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { DataState } from "@/components/data-state";
 import { RepositoryTriage } from "@/components/showcase/repository-triage";
@@ -39,12 +40,19 @@ import {
 } from "@/components/ontology-mark";
 import { settleGraphLayout } from "@/lib/graph-layout";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
+import { buildRepositoryBrief } from "@/lib/repository-brief";
 import type {
   RepoBundle,
   RepoModule,
   RepoPage,
   ViewId,
 } from "@/lib/repo-bundle";
+import {
+  parseRepositoryLocation,
+  REPOSITORY_VIEW_IDS,
+  investigationShareUrl,
+  repositoryLocationUrl,
+} from "@/lib/repository-location";
 
 type Labels = RepoBundle["capability"]["labels"];
 type ViewCapability = RepoBundle["capability"]["views"][ViewId];
@@ -53,21 +61,12 @@ type ModuleMap = Map<string, RepoModule>;
 type ViewProps = Readonly<{
   bundle: RepoBundle;
   moduleById: ModuleMap;
+  selectedModuleId: string | null;
+  onSelectModule: (moduleId: string) => void;
   onExploreStructure: () => void;
 }>;
 
-const viewOrder: readonly ViewId[] = [
-  "structure_graph",
-  "history_structure_navigation",
-  "dependency_topology",
-  "hotspot_quadrant",
-  "hidden_coupling",
-  "structure_treemap",
-  "cadence_timeline",
-  "ownership",
-  "api_surface",
-  "scorecard",
-];
+const viewOrder: readonly ViewId[] = REPOSITORY_VIEW_IDS;
 
 const viewIcons: Record<ViewId, Icon> = {
   structure_graph: Network,
@@ -296,7 +295,7 @@ function ViewFrame({
   );
 }
 
-function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function StructureGraph({ bundle }: { bundle: RepoBundle }) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
   const [subtreeId, setSubtreeId] = useState(graph.repository.id);
@@ -588,14 +587,22 @@ function HistoryFacet({
   );
 }
 
-function HistoryStructure({ bundle, moduleById, onExploreStructure }: ViewProps) {
+function HistoryStructure({
+  bundle,
+  selectedModuleId,
+  onSelectModule,
+  onExploreStructure,
+}: ViewProps) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
   const view = capability.views.history_structure_navigation;
-  const [selectedModuleId, setSelectedModuleId] = useState(
-    graph.history_navigation.by_module.items[0]?.module_id ?? graph.modules.items[0]?.id ?? "",
-  );
-  const [selectedCommitId, setSelectedCommitId] = useState("");
+  const [commitSelection, setCommitSelection] = useState<{
+    moduleId: string | null;
+    commitId: string;
+  }>({ moduleId: null, commitId: "" });
+  const selectedCommitId = commitSelection.moduleId === selectedModuleId
+    ? commitSelection.commitId
+    : "";
   const selectedModuleNavigation = graph.history_navigation.by_module.items.find((item) => item.module_id === selectedModuleId);
   const selectedCommitNavigation = graph.history_navigation.by_commit.items.find((item) => item.commit_id === selectedCommitId);
   const linkedCommitIds = new Set(selectedModuleNavigation?.commits.items ?? []);
@@ -618,7 +625,7 @@ function HistoryStructure({ bundle, moduleById, onExploreStructure }: ViewProps)
           <div className="repo-card-heading"><h3>{labels.node_types.module}</h3><p>{formatNumber(modules.length)}</p></div>
           <div className="repo-list">
             {modules.map((module) => (
-              <button type="button" data-module-id={module.id} aria-pressed={selectedModuleId === module.id} className={`repo-list-row ${selectedModuleId === module.id ? "selected" : ""}`} key={module.id} onClick={() => { setSelectedModuleId(module.id); setSelectedCommitId(""); }}>
+              <button type="button" data-module-id={module.id} aria-pressed={selectedModuleId === module.id} className={`repo-list-row ${selectedModuleId === module.id ? "selected" : ""}`} key={module.id} onClick={() => { onSelectModule(module.id); setCommitSelection({ moduleId: module.id, commitId: "" }); }}>
                 <Boxes aria-hidden="true" /><div><strong>{module.module_path}</strong><span>{module.source_path}</span></div>
               </button>
             ))}
@@ -629,7 +636,7 @@ function HistoryStructure({ bundle, moduleById, onExploreStructure }: ViewProps)
           <div className="repo-card-heading"><h3>{labels.node_types.commit}</h3><p>{formatNumber(commits.length)}</p></div>
           <div className="repo-list">
             {commits.map((commit) => (
-              <button type="button" data-commit-id={commit.id} aria-pressed={selectedCommitId === commit.id} className={`repo-list-row ${selectedCommitId === commit.id ? "selected" : ""}`} key={commit.id} onClick={() => setSelectedCommitId(commit.id)}>
+              <button type="button" data-commit-id={commit.id} aria-pressed={selectedCommitId === commit.id} className={`repo-list-row ${selectedCommitId === commit.id ? "selected" : ""}`} key={commit.id} onClick={() => setCommitSelection({ moduleId: selectedModuleId, commitId: commit.id })}>
                 <GitCommitHorizontal aria-hidden="true" /><div><strong>{commit.subject}</strong><span>{commit.author} · {formatDate(commit.committed_at)}</span></div><code>{commit.short_sha}</code>
               </button>
             ))}
@@ -838,7 +845,7 @@ function CadenceSeries({ id, page, label, labels, onExploreStructure }: { id: Ca
   );
 }
 
-function CadenceView({ bundle, moduleById, onExploreStructure }: ViewProps) {
+function CadenceView({ bundle, onExploreStructure }: ViewProps) {
   const analysis = bundle.aggregates.cadence_timeline;
   const labels = bundle.capability.labels;
   const commitRows = analysis.commits.items.slice(0, UI_ROW_LIMIT);
@@ -974,28 +981,276 @@ const viewComponents: Record<ViewId, React.ComponentType<ViewProps>> = {
   scorecard: ScorecardView,
 };
 
-function ActiveView({ id, bundle, moduleById, onExploreStructure }: ViewProps & { id: ViewId }) {
+function ActiveView({
+  id,
+  bundle,
+  moduleById,
+  selectedModuleId,
+  onSelectModule,
+  onExploreStructure,
+}: ViewProps & { id: ViewId }) {
   const capability = bundle.capability.views[id];
   const labels = bundle.capability.labels;
   const ViewComponent = viewComponents[id];
   return (
     <ViewFrame capability={capability} labels={labels} allowPartial={id === "ownership"}>
-      <ViewComponent bundle={bundle} moduleById={moduleById} onExploreStructure={onExploreStructure} />
+      <ViewComponent
+        bundle={bundle}
+        moduleById={moduleById}
+        selectedModuleId={selectedModuleId}
+        onSelectModule={onSelectModule}
+        onExploreStructure={onExploreStructure}
+      />
     </ViewFrame>
   );
 }
 
 export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback" }: { bundle: RepoBundle; analysisSource?: ShowcaseBundleSource }) {
-  const [activeView, setActiveView] = useState<ViewId>("structure_graph");
-  const dashboardRef = useRef<HTMLDivElement>(null);
+  const { repository, snapshot, producer } = bundle.meta;
+  const { capability } = bundle;
   const moduleById = useMemo(
     () => new Map(bundle.graph.modules.items.map((module) => [module.id, module])),
     [bundle.graph.modules.items],
   );
-  const { repository, snapshot, producer } = bundle.meta;
-  const { capability } = bundle;
-  function openAnalysis(view: ViewId) {
+  const modulesBySourcePath = useMemo(() => {
+    const result = new Map<string, RepoModule[]>();
+    for (const moduleNode of bundle.graph.modules.items) {
+      const matches = result.get(moduleNode.source_path) ?? [];
+      matches.push(moduleNode);
+      result.set(moduleNode.source_path, matches);
+    }
+    return result;
+  }, [bundle.graph.modules.items]);
+  const brief = useMemo(() => buildRepositoryBrief(bundle), [bundle]);
+  const defaultModuleId: string | null = brief.startHere[0]?.moduleId ??
+    bundle.graph.modules.items[0]?.id ?? null;
+  const [selectedModuleId, setSelectedModuleId] = useState<string | null>(
+    defaultModuleId,
+  );
+  const [unresolvedModule, setUnresolvedModule] = useState<Readonly<{
+    path: string;
+    reason: string;
+  }> | null>(null);
+  const [activeView, setActiveView] = useState<ViewId>("structure_graph");
+  const [locationNotice, setLocationNotice] = useState<Readonly<{
+    title: string;
+    message: string;
+    action: "use-current-snapshot" | "dismiss";
+  }> | null>(null);
+  const [navigationStatus, setNavigationStatus] = useState("");
+  const [copyStatus, setCopyStatus] = useState("");
+  const dashboardRef = useRef<HTMLDivElement>(null);
+  const copyLinkRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    function restoreLocation(announce = false) {
+      const parsed = parseRepositoryLocation(new URL(window.location.href));
+      const requestedPath = parsed.location.modulePath;
+      let nextModuleId: string | null = defaultModuleId;
+      let nextUnresolved: typeof unresolvedModule = null;
+      if (requestedPath) {
+        const matches = modulesBySourcePath.get(requestedPath) ?? [];
+        if (matches.length === 1) {
+          nextModuleId = matches[0].id;
+        } else {
+          nextModuleId = null;
+          nextUnresolved = {
+            path: requestedPath,
+            reason: matches.length === 0
+              ? "The requested source path is not present in this bounded snapshot."
+              : "The requested source path is ambiguous in this snapshot.",
+          };
+        }
+      }
+      const nextView = parsed.location.view ?? "structure_graph";
+      const messages = parsed.issues.map((issue) => issue.message);
+      const staleSnapshot = Boolean(
+        parsed.location.snapshotSha &&
+          parsed.location.snapshotSha !== snapshot.head_sha,
+      );
+      if (staleSnapshot && parsed.location.snapshotSha) {
+        messages.unshift(
+          `The requested snapshot ${parsed.location.snapshotSha} is not loaded; this page is showing ${snapshot.head_sha}.`,
+        );
+      }
+
+      setSelectedModuleId(nextModuleId);
+      setUnresolvedModule(nextUnresolved);
+      setActiveView(nextView);
+      setCopyStatus("");
+      setLocationNotice(messages.length
+        ? {
+            title: staleSnapshot
+              ? "Investigation link needs attention"
+              : "Investigation link was repaired",
+            message: messages.join(" "),
+            action: staleSnapshot ? "use-current-snapshot" : "dismiss",
+          }
+        : null);
+      if (announce) {
+        const moduleLabel = nextModuleId
+          ? moduleById.get(nextModuleId)?.source_path ?? "repository overview"
+          : requestedPath
+          ? `unresolved module ${requestedPath}`
+          : "repository overview";
+        setNavigationStatus(
+          `Restored ${capability.views[nextView].label} for ${moduleLabel}.`,
+        );
+      }
+
+      const canonical = repositoryLocationUrl(
+        new URL(window.location.href),
+        {
+          repository: repository.canonical_url,
+          snapshotSha: parsed.location.snapshotSha ?? snapshot.head_sha,
+          modulePath: requestedPath ??
+            (nextModuleId ? moduleById.get(nextModuleId)?.source_path ?? null : null),
+          view: nextView,
+        },
+      );
+      if (canonical.href !== window.location.href) {
+        window.history.replaceState(
+          null,
+          "",
+          `${canonical.pathname}${canonical.search}${canonical.hash}`,
+        );
+      }
+    }
+
+    const handlePopState = () => restoreLocation(true);
+    restoreLocation();
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [
+    capability.views,
+    defaultModuleId,
+    moduleById,
+    modulesBySourcePath,
+    repository.canonical_url,
+    snapshot.head_sha,
+  ]);
+
+  function investigationLocation(
+    moduleId: string | null,
+    view: ViewId,
+    missingPath: string | null = null,
+  ) {
+    return {
+      repository: repository.canonical_url,
+      snapshotSha: snapshot.head_sha,
+      modulePath: moduleId
+        ? moduleById.get(moduleId)?.source_path ?? null
+        : missingPath,
+      view,
+    };
+  }
+
+  function locationFor(
+    moduleId: string | null,
+    view: ViewId,
+    missingPath: string | null = null,
+  ) {
+    return repositoryLocationUrl(
+      new URL(window.location.href),
+      investigationLocation(moduleId, view, missingPath),
+    );
+  }
+
+  function pushLocation(
+    moduleId: string | null,
+    view: ViewId,
+    missingPath: string | null = null,
+  ) {
+    const next = locationFor(moduleId, view, missingPath);
+    if (next.href === window.location.href) return;
+    window.history.pushState(
+      null,
+      "",
+      `${next.pathname}${next.search}${next.hash}`,
+    );
+  }
+
+  function selectModule(moduleId: string) {
+    if (!moduleById.has(moduleId)) return;
+    pushLocation(moduleId, activeView);
+    setNavigationStatus("");
+    setSelectedModuleId(moduleId);
+    setUnresolvedModule(null);
+    setLocationNotice(null);
+    setCopyStatus("");
+  }
+
+  function selectView(view: ViewId) {
+    pushLocation(selectedModuleId, view, unresolvedModule?.path ?? null);
+    setNavigationStatus("");
     setActiveView(view);
+    setLocationNotice(null);
+    setCopyStatus("");
+  }
+
+  function dismissLocationNotice() {
+    setLocationNotice(null);
+    queueMicrotask(() => copyLinkRef.current?.focus());
+  }
+
+  function recoverModule() {
+    if (defaultModuleId) selectModule(defaultModuleId);
+  }
+
+  function normalizeCurrentLocation() {
+    const next = locationFor(
+      selectedModuleId,
+      activeView,
+      unresolvedModule?.path ?? null,
+    );
+    window.history.replaceState(
+      null,
+      "",
+      `${next.pathname}${next.search}${next.hash}`,
+    );
+    setLocationNotice(null);
+    setCopyStatus("");
+    queueMicrotask(() => copyLinkRef.current?.focus());
+  }
+
+  async function copyInvestigationLink() {
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard access is unavailable");
+      }
+      const location = investigationLocation(
+        selectedModuleId,
+        activeView,
+        unresolvedModule?.path ?? null,
+      );
+      const current = repositoryLocationUrl(
+        new URL(window.location.href),
+        location,
+      );
+      // The copied link is the share form: investigation parameters only,
+      // no foreign query parameters and no fragment.
+      const share = investigationShareUrl(
+        new URL(window.location.href),
+        location,
+      );
+      const sourceHref = window.location.href;
+      await navigator.clipboard.writeText(share.href);
+      if (window.location.href === sourceHref && current.href !== sourceHref) {
+        window.history.replaceState(
+          null,
+          "",
+          `${current.pathname}${current.search}${current.hash}`,
+        );
+        setLocationNotice(null);
+      }
+      setCopyStatus("Investigation link copied.");
+    } catch {
+      setCopyStatus("Investigation link could not be copied.");
+    }
+  }
+
+  function openAnalysis(view: ViewId) {
+    selectView(view);
     const dashboard = dashboardRef.current;
     if (!dashboard) return;
     dashboard.focus({ preventScroll: true });
@@ -1011,13 +1266,43 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
       <header className="repo-overview-heading">
         <div className="repo-identity"><span className="repo-avatar"><Package aria-hidden="true" /></span><div><span>{repository.host} · {availabilityText(repository.default_branch, capability.labels)}</span><strong>{repository.owner}/{repository.name}</strong></div></div>
-        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span></div>
+        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span><button ref={copyLinkRef} type="button" className="repo-copy-link" onClick={copyInvestigationLink}><Copy aria-hidden="true" /> Copy investigation link</button>{copyStatus && <span role="status" className="repo-copy-status">{copyStatus}</span>}</div>
       </header>
       <section className="repo-capability-strip" aria-label={capability.labels.product}>
         <div><ShieldCheck aria-hidden="true" /><div><strong>{capability.labels.product}</strong><span>{capability.mode}</span></div></div>
         <div className="repo-capability-flags">{Object.values(capability.languages).map((language) => <i key={language.label}>{language.label} · {language.module_join ? capability.views.history_structure_navigation.label : capability.labels.unavailable}</i>)}</div>
       </section>
-      <RepositoryTriage key={snapshot.head_sha} bundle={bundle} onOpenAnalysis={openAnalysis} />
+      <span
+        className="visually-hidden"
+        role="status"
+        aria-live="polite"
+        aria-label="Investigation navigation"
+      >
+        {navigationStatus}
+      </span>
+      {locationNotice && (
+        <aside
+          className="repo-investigation-notice"
+          role="status"
+          aria-label="Investigation link status"
+        >
+          <AlertTriangle aria-hidden="true" />
+          <span><strong>{locationNotice.title}</strong>{locationNotice.message}</span>
+          {locationNotice.action === "use-current-snapshot"
+            ? <button type="button" onClick={normalizeCurrentLocation}>Use current snapshot</button>
+            : <button type="button" onClick={dismissLocationNotice}>Dismiss</button>}
+        </aside>
+      )}
+      <RepositoryTriage
+        key={snapshot.head_sha}
+        bundle={bundle}
+        selectedModuleId={selectedModuleId}
+        unresolvedModule={unresolvedModule}
+        onSelectModule={selectModule}
+        onRecoverModule={recoverModule}
+        canRecoverModule={defaultModuleId !== null}
+        onOpenAnalysis={openAnalysis}
+      />
       <div
         className="repo-dashboard"
         data-repository-dashboard
@@ -1032,11 +1317,11 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
           {viewOrder.map((id) => {
             const view = capability.views[id];
             const Icon = viewIcons[id];
-            return <button type="button" data-view-id={id} className={activeView === id ? "active" : ""} aria-current={activeView === id ? "page" : undefined} key={id} onClick={() => setActiveView(id)}><Icon aria-hidden="true" /><span>{view.label}</span><i className={view.status} aria-hidden="true" />{view.status === "unavailable" && <span className="visually-hidden">{capability.labels.unavailable}</span>}</button>;
+            return <button type="button" data-view-id={id} className={activeView === id ? "active" : ""} aria-current={activeView === id ? "page" : undefined} key={id} onClick={() => selectView(id)}><Icon aria-hidden="true" /><span>{view.label}</span><i className={view.status} aria-hidden="true" />{view.status === "unavailable" && <span className="visually-hidden">{capability.labels.unavailable}</span>}</button>;
           })}
         </nav>
         <section className="repo-view-panel" aria-label={capability.views[activeView].label}>
-          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} onExploreStructure={() => setActiveView("structure_graph")} />
+          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} selectedModuleId={selectedModuleId} onSelectModule={selectModule} onExploreStructure={() => selectView("structure_graph")} />
         </section>
       </div>
     </article>
