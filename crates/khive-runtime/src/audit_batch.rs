@@ -439,8 +439,10 @@ impl AuditBatch {
 
     /// Process-lifetime audit-batch health counters, for the registry/
     /// runtime owner to feed into `db_diagnostics` (D8's operator surface).
-    /// Unlike [`test_internals::AuditBatchSnapshot::metrics_snapshot`],
-    /// which is test-only, this is always available.
+    /// Unlike `test_internals::AuditBatchSnapshot::metrics_snapshot`,
+    /// which is test-only (the module is cfg-gated and invisible to the
+    /// default doc build, so an intra-doc link cannot resolve), this is
+    /// always available.
     pub fn health_metrics(&self) -> AuditBatchHealthMetrics {
         let state = self.inner.state.lock();
         AuditBatchHealthMetrics {
