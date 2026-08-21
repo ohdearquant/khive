@@ -237,13 +237,19 @@ being written — its name, description, `entity_type`, and properties — with 
 the writer's state of mind or to the world at write time:
 
 - **Instance evidence (D)**: the record identifies a specific deployed or deployable
-  instance — its fields name at least one instance identifier: an endpoint or address, a
-  deployment surface (host, region, cluster), an operator, or an operational state or state
-  history. Whether the instance is up at write time is not consulted: a deployable system
-  between deployments still satisfies D when the record names the deployment. Fields that
-  identify only a codebase (repository, package, crate, source language) are step 6
-  evidence, not instance identifiers — a record carrying only codebase identity does not
-  satisfy D and continues to step 6, where it classifies `Project`.
+  instance — its fields name at least one instance identifier, each a concrete referent
+  stated in the record: an endpoint or address; a named deployment surface (a specific
+  host, region, or cluster); a named operator; or an operational state or state history
+  carried in the record's property fields (a status property, an incident record, a dated
+  transition). Bare deployment or liveness vocabulary in name or description prose —
+  `deployed`, `running`, `live`, `in production`, `down` and the like, with no concrete
+  referent beside it — is not an instance identifier and does not satisfy D; that is
+  exactly the question-note trigger's case below. Whether the instance is up at write
+  time is not consulted: a deployable system between deployments still satisfies D when
+  the record names such an identifier. Fields that identify only a codebase (repository,
+  package, crate, source language) are step 6 evidence, not instance identifiers — a
+  record carrying only codebase identity does not satisfy D and continues to step 6,
+  where it classifies `Project`.
 - **Technique identity (T)** — evaluated only when D holds: the record's own text names a
   technique as its referent. T holds exactly when the record's `entity_type` is one of
   `Concept`'s canonical subtypes (the "Initial canonical subtypes" table above), or its name or

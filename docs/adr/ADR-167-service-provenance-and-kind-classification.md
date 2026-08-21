@@ -123,10 +123,13 @@ from the record being written (its name, description, `entity_type`, and propert
 reference to the writer's state of mind or to the world at write time:
 
 - **Instance evidence (D)**: the record names at least one instance identifier — an endpoint or
-  address, a deployment surface, an operator, or an operational state or state history.
-  Liveness at write time is not consulted, so a deployable system between deployments still
-  satisfies D. Codebase identifiers (repository, package, crate, source language) are
-  explicitly step 6 evidence, not instance identifiers.
+  address, a named deployment surface, a named operator, or an operational state or state
+  history carried in the record's property fields. Bare deployment or liveness vocabulary in
+  name or description prose (`deployed`, `running`, `in production`) with no concrete referent
+  beside it is not an instance identifier and does not satisfy D. Liveness at write time is
+  not consulted, so a deployable system between deployments still satisfies D. Codebase
+  identifiers (repository, package, crate, source language) are explicitly step 6 evidence,
+  not instance identifiers.
 - **Technique identity (T)**, evaluated only when D holds: the record's own text names a
   technique as its referent — its `entity_type` is one of `Concept`'s canonical subtypes, or
   its name or description names the referent with one of ADR-001 step 8's own designators
@@ -287,11 +290,14 @@ this ADR is complete when all of the following hold:
     joined by `Service instance_of Concept`; classifying it as a single record of either
     kind is rejected by the written rule.
   - Step 9 note: name `experimental serving stack`, description `deployed somewhere in the
-    lab, details unrecorded` — deployment vocabulary (`deployed`) present, no instance
-    identifier, no codebase field (step 6 false), no technique designator (step 8's
+    lab, details unrecorded`, no properties — deployment vocabulary (`deployed`) appears
+    only as bare prose: no endpoint or address, no named host, region, cluster, or
+    operator, and no state record in any property field, so D does not hold and step 5
+    does not fire; no codebase field (step 6 false), no technique designator (step 8's
     abstract-idea test unresolved), steps 1-8 thereby exhausted without resolving. Lands
     `Concept` per step 9, with the open classification question recorded as a note
-    annotating the record.
+    annotating the record — the question-note trigger (deployment vocabulary present, no
+    instance identifier) is exactly this case.
 
 **Migration procedure (Decision 3).**
 
