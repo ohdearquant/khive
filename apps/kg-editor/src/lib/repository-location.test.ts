@@ -133,4 +133,42 @@ describe("repository investigation location", () => {
       }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
     );
   });
+
+  it("share form strips a repository value's own query and fragment", () => {
+    const url = investigationShareUrl(new URL("https://example.test/app"), {
+      repository:
+        "https://forge.example/group/repo?access_token=not-a-real-secret#token-fragment",
+      snapshotSha,
+      modulePath: "crates/khive-db/src/pool.rs",
+      view: "dependency_topology",
+    });
+
+    expect(url.searchParams.get("repo")).toBe(
+      "https://forge.example/group/repo",
+    );
+    expect(url.href).not.toContain("access_token");
+    expect(url.href).not.toContain("token-fragment");
+  });
+
+  it("share form omits a module path carrying a query or fragment delimiter", () => {
+    for (
+      const modulePath of [
+        "src/x?access_token=not-a-real-secret",
+        "src/x#token-fragment",
+      ]
+    ) {
+      const url = investigationShareUrl(new URL("https://example.test/app"), {
+        repository,
+        snapshotSha,
+        modulePath,
+        view: "dependency_topology",
+      });
+
+      expect(url.searchParams.get("module")).toBeNull();
+      expect(url.href).not.toContain("access_token");
+      expect(url.href).not.toContain("token-fragment");
+      expect(url.searchParams.get("repo")).toBe(repository);
+      expect(url.searchParams.get("at")).toBe(snapshotSha);
+    }
+  });
 });

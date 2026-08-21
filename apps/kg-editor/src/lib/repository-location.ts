@@ -197,17 +197,38 @@ export function repositoryLocationUrl(
  * disclosed to a link recipient (tokens, authorization codes, tracker
  * state). `repositoryLocationUrl` stays the in-browser history form, which
  * preserves foreign parameters locally.
+ *
+ * The boundary also applies to the parameter VALUES, not just the
+ * parameter names: a validated repository URL may legitimately carry a
+ * query string or fragment (deep-link support keeps them in-browser), so
+ * the shared copy is normalized to origin + pathname; a module path
+ * carrying a URL query or fragment delimiter is omitted entirely rather
+ * than encoded into the value, because encoding preserves — not redacts —
+ * whatever the delimiter introduced. `at` and `view` need no value
+ * boundary: their parse contracts are a 40-hex SHA and a closed id set.
  */
 export function investigationShareUrl(
   base: URL,
   location: RepositoryLocation,
 ): URL {
   const url = new URL(`${base.origin}${base.pathname}`);
-  if (location.repository) url.searchParams.append("repo", location.repository);
+  if (location.repository) {
+    const repository = shareSafeRepository(location.repository);
+    if (repository) url.searchParams.append("repo", repository);
+  }
   if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
-  if (location.modulePath) {
+  if (location.modulePath && !/[?#]/u.test(location.modulePath)) {
     url.searchParams.append("module", location.modulePath);
   }
   if (location.view) url.searchParams.append("view", location.view);
   return url;
+}
+
+function shareSafeRepository(value: string): string | null {
+  try {
+    const repository = new URL(value);
+    return `${repository.origin}${repository.pathname}`;
+  } catch {
+    return null;
+  }
 }
