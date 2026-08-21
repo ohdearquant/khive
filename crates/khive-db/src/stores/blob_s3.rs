@@ -1,7 +1,7 @@
 //! S3-compatible `BlobStore` backend (ADR-111 Amendment 2).
 //!
-//! Second implementation of the unchanged `khive_storage::blob::BlobStore`
-//! trait, beside `FsBlobStore` (`stores::blob`). Same content-addressed CAS
+//! S3 implementation of the `khive_storage::blob::BlobStore` trait, beside
+//! `FsBlobStore` (`stores::blob`). Same content-addressed CAS
 //! contract — `ContentRef`, dedup-on-identical-bytes, offline-maintenance-only
 //! `delete`/`orphan_sweep` — over an S3-compatible object store via the
 //! `object_store` crate's `aws` feature. No provider type crosses the
@@ -19,7 +19,9 @@ use object_store::{
     Error as ObjectStoreError, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutPayload,
 };
 
-use khive_storage::blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};
+use khive_storage::blob::{
+    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES,
+};
 use khive_storage::error::StorageError;
 use khive_storage::types::StorageResult;
 use khive_storage::StorageCapability;
@@ -31,7 +33,7 @@ use crate::error::SqliteError;
 /// `put` rejects a larger buffer; `get` checks metadata before collecting a
 /// larger response. A streaming amendment is required before khive supports
 /// larger blobs.
-pub const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_OBJECT_BYTES: u64 = MAX_BLOB_WHOLE_BYTES;
 
 /// Default object-key prefix when a caller doesn't override it.
 pub const DEFAULT_PREFIX: &str = "blobs";
@@ -544,6 +546,103 @@ impl BlobStore for S3BlobStore {
         }
     }
 
+    async fn get_bounded_verified(
+        &self,
+        content_ref: &ContentRef,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>> {
+        // Reject an invalid portable-envelope request before constructing or
+        // polling a provider future. This ordering is observable through the
+        // backend-spy conformance test (ADR-160 D2).
+        if max_bytes > MAX_BLOB_WHOLE_BYTES {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Blob,
+                operation: "get_bounded_verified".into(),
+                message: format!(
+                    "max_bytes {max_bytes} exceeds the {MAX_BLOB_WHOLE_BYTES}-byte portable whole-buffer envelope"
+                ),
+            });
+        }
+
+        let key = self.shard_key(content_ref);
+        // One absolute provider deadline spans both GET setup and every body
+        // poll; the body does not receive a fresh timeout window.
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let result = match tokio::time::timeout_at(deadline, self.client.get(&key)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(ObjectStoreError::NotFound { .. })) => {
+                return Err(StorageError::NotFound {
+                    capability: StorageCapability::Blob,
+                    resource: "blob",
+                    key: content_ref.to_string(),
+                });
+            }
+            Ok(Err(other)) => {
+                return Err(map_object_store_err(other, "get_bounded_verified"));
+            }
+            Err(_elapsed) => return Err(timeout_error("get_bounded_verified")),
+        };
+
+        let metadata_bytes = result.meta.size;
+        if metadata_bytes > max_bytes {
+            return Err(StorageError::BlobTooLarge {
+                content_ref: content_ref.clone(),
+                max_bytes,
+                observed_at_least: metadata_bytes,
+            });
+        }
+
+        let mut stream = result.into_stream();
+        let consume = async {
+            let mut bytes = Vec::with_capacity(metadata_bytes as usize);
+            loop {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let observed_at_least =
+                            (bytes.len() as u64).saturating_add(chunk.len() as u64);
+                        // Check before append: a false-small metadata value
+                        // cannot make the local Vec grow beyond max_bytes.
+                        if observed_at_least > max_bytes {
+                            return Err(StorageError::BlobTooLarge {
+                                content_ref: content_ref.clone(),
+                                max_bytes,
+                                observed_at_least,
+                            });
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Some(Err(e)) => {
+                        return Err(map_object_store_err(e, "get_bounded_verified"));
+                    }
+                    None => break,
+                }
+            }
+
+            let actual_bytes = bytes.len() as u64;
+            if metadata_bytes != actual_bytes {
+                return Err(StorageError::BlobSizeMismatch {
+                    content_ref: content_ref.clone(),
+                    metadata_bytes,
+                    actual_bytes,
+                });
+            }
+
+            let actual = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+            if actual != *content_ref {
+                return Err(StorageError::BlobDigestMismatch {
+                    expected: content_ref.clone(),
+                    actual,
+                });
+            }
+            Ok(bytes)
+        };
+
+        match tokio::time::timeout_at(deadline, consume).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(timeout_error("get_bounded_verified")),
+        }
+    }
+
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool> {
         let key = self.shard_key(content_ref);
         match tokio::time::timeout(self.request_timeout, self.client.head(&key)).await {
@@ -1017,7 +1116,12 @@ mod tests {
             /// granting each phase a fresh window.
             get_pre_delay: Mutex<Option<Duration>>,
             pub put_calls: AtomicUsize,
+            /// Total `get_opts` calls, retained for existing retry/error
+            /// tests whose script is shared by GET and HEAD.
             pub get_calls: AtomicUsize,
+            pub head_calls: AtomicUsize,
+            pub body_get_calls: AtomicUsize,
+            pub body_polls: Arc<AtomicUsize>,
             pub delete_calls: Arc<AtomicUsize>,
             /// How long a `Hang` outcome sleeps before resolving --
             /// deliberately far longer than the test's configured
@@ -1044,6 +1148,9 @@ mod tests {
                     get_pre_delay: Mutex::new(None),
                     put_calls: AtomicUsize::new(0),
                     get_calls: AtomicUsize::new(0),
+                    head_calls: AtomicUsize::new(0),
+                    body_get_calls: AtomicUsize::new(0),
+                    body_polls: Arc::new(AtomicUsize::new(0)),
                     delete_calls: Arc::new(AtomicUsize::new(0)),
                     hang_delay: Duration::from_secs(3600),
                 }
@@ -1134,11 +1241,12 @@ mod tests {
                 unimplemented!("not exercised by these tests")
             }
 
-            async fn get_opts(
-                &self,
-                location: &ObjectPath,
-                _opts: GetOptions,
-            ) -> Result<GetResult> {
+            async fn get_opts(&self, location: &ObjectPath, opts: GetOptions) -> Result<GetResult> {
+                if opts.head {
+                    self.head_calls.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.body_get_calls.fetch_add(1, Ordering::SeqCst);
+                }
                 let outcome = Self::next_outcome(&self.get_script, &self.get_calls);
                 if matches!(outcome, Outcome::Hang) {
                     tokio::time::sleep(self.hang_delay).await;
@@ -1148,17 +1256,25 @@ mod tests {
                     tokio::time::sleep(delay).await;
                 }
                 let override_body = self.get_body_override.lock().unwrap().clone();
+                let body_polls = Arc::clone(&self.body_polls);
                 outcome_to_result(&outcome, || {
                     let (reported_size, body_chunks, per_chunk_delay) =
                         override_body.unwrap_or((0, Vec::new(), Duration::ZERO));
-                    let chunks: Vec<Result<Bytes>> = body_chunks.into_iter().map(Ok).collect();
                     let body_stream = if per_chunk_delay.is_zero() {
-                        stream::iter(chunks).boxed()
+                        stream::iter(body_chunks.into_iter().map(move |chunk| {
+                            body_polls.fetch_add(1, Ordering::SeqCst);
+                            Ok(chunk)
+                        }))
+                        .boxed()
                     } else {
-                        stream::iter(chunks)
-                            .then(move |c| async move {
-                                tokio::time::sleep(per_chunk_delay).await;
-                                c
+                        stream::iter(body_chunks)
+                            .then(move |chunk| {
+                                let body_polls = Arc::clone(&body_polls);
+                                async move {
+                                    body_polls.fetch_add(1, Ordering::SeqCst);
+                                    tokio::time::sleep(per_chunk_delay).await;
+                                    Ok(chunk)
+                                }
                             })
                             .boxed()
                     };
@@ -1342,6 +1458,265 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_get_rejects_invalid_limit_before_provider_work() {
+        let (fake, store) = fake_store(vec![], vec![Outcome::Hang]);
+        let content_ref = ContentRef::from_hex("b".repeat(64)).unwrap();
+        let err = store
+            .get_bounded_verified(&content_ref, MAX_BLOB_WHOLE_BYTES + 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::InvalidInput { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            fake.get_calls.load(Ordering::SeqCst),
+            0,
+            "argument validation must not construct or poll a provider GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_get_not_found_precedes_object_inspection() {
+        let (_fake, store) = fake_store(vec![], vec![Outcome::NotFound]);
+        let content_ref = ContentRef::from_hex("b".repeat(64)).unwrap();
+        let err = store
+            .get_bounded_verified(&content_ref, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::NotFound { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn bounded_get_accepts_a_digest_matching_body_at_the_exact_limit() {
+        let body = b"verified body".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&body).as_bytes());
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok]).with_get_body_chunks(
+                body.len() as u64,
+                vec![
+                    Bytes::from(body[..4].to_vec()),
+                    Bytes::from(body[4..].to_vec()),
+                ],
+            ),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let result = store
+            .get_bounded_verified(&content_ref, body.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(result, body);
+        assert_eq!(fake.body_get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.head_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_get_rejects_over_limit_metadata_before_consuming_body() {
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok])
+                .with_get_body_chunks(5, vec![Bytes::from_static(b"x")]),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("c".repeat(64)).unwrap();
+
+        let err = store
+            .get_bounded_verified(&content_ref, 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobTooLarge {
+                content_ref: ref got,
+                max_bytes: 4,
+                observed_at_least: 5,
+            } if got == &content_ref
+        ));
+        assert_eq!(
+            fake.body_polls.load(Ordering::SeqCst),
+            0,
+            "over-limit metadata must refuse before the body stream is polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_get_stops_false_small_metadata_at_the_actual_byte_limit() {
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok]).with_get_body_chunks(
+                1,
+                vec![
+                    Bytes::from_static(b"abc"),
+                    Bytes::from_static(b"de"),
+                    Bytes::from_static(b"must-not-be-polled"),
+                ],
+            ),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("d".repeat(64)).unwrap();
+
+        let err = store
+            .get_bounded_verified(&content_ref, 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobTooLarge {
+                content_ref: ref got,
+                max_bytes: 4,
+                observed_at_least: 5,
+            } if got == &content_ref
+        ));
+        assert_eq!(
+            fake.body_polls.load(Ordering::SeqCst),
+            2,
+            "the stream must stop at the first chunk that crosses the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_get_reports_metadata_body_size_mismatch_before_digest() {
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok])
+                .with_get_body_chunks(3, vec![Bytes::from_static(b"four")]),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("e".repeat(64)).unwrap();
+
+        let err = store
+            .get_bounded_verified(&content_ref, 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobSizeMismatch {
+                content_ref: ref got,
+                metadata_bytes: 3,
+                actual_bytes: 4,
+            } if got == &content_ref
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_get_reports_truncated_body_size_mismatch_before_digest() {
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok])
+                .with_get_body_chunks(5, vec![Bytes::from_static(b"four")]),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("e".repeat(64)).unwrap();
+
+        let err = store
+            .get_bounded_verified(&content_ref, 5)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobSizeMismatch {
+                content_ref: ref got,
+                metadata_bytes: 5,
+                actual_bytes: 4,
+            } if got == &content_ref
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_get_reports_digest_mismatch_only_after_size_consistency() {
+        let expected_bytes = b"expected";
+        let actual_bytes = b"mutated!";
+        let expected = ContentRef::from_digest_bytes(blake3::hash(expected_bytes).as_bytes());
+        let actual = ContentRef::from_digest_bytes(blake3::hash(actual_bytes).as_bytes());
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok]).with_get_body_chunks(
+                actual_bytes.len() as u64,
+                vec![Bytes::from_static(actual_bytes)],
+            ),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let err = store
+            .get_bounded_verified(&expected, actual_bytes.len() as u64)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::BlobDigestMismatch {
+                expected: ref got_expected,
+                actual: ref got_actual,
+            } if got_expected == &expected && got_actual == &actual
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_get_deadline_spans_provider_get_and_body_consumption() {
+        let chunks = vec![
+            Bytes::from_static(b"12345678"),
+            Bytes::from_static(b"abcdefgh"),
+        ];
+        let fake = Arc::new(
+            FakeObjectStore::new(vec![], vec![Outcome::Ok])
+                .with_get_pre_delay(Duration::from_millis(80))
+                .with_get_body_chunks_delayed(16, chunks, Duration::from_millis(50)),
+        );
+        let store = S3BlobStore::from_client_for_test(
+            Arc::clone(&fake) as Arc<dyn ObjectStore>,
+            "blobs",
+            3,
+            Duration::from_millis(150),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let content_ref = ContentRef::from_hex("f".repeat(64)).unwrap();
+
+        let err = store
+            .get_bounded_verified(&content_ref, 16)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
     async fn get_rejects_body_larger_than_reported_metadata_size() {
         // ADR-111 Amendment 2: `get` must check the
         // running total against the cap BEFORE appending a chunk, not
@@ -1380,9 +1755,10 @@ mod tests {
         // must succeed — confirming the check-before-append reorder didn't
         // shift the ceiling off-by-one.
         let exact = vec![b'x'; MAX_OBJECT_BYTES as usize];
+        let exact_len = exact.len();
         let fake = Arc::new(
             FakeObjectStore::new(vec![], vec![Outcome::Ok])
-                .with_get_body_chunks(MAX_OBJECT_BYTES, vec![Bytes::from(exact.clone())]),
+                .with_get_body_chunks(MAX_OBJECT_BYTES, vec![Bytes::from(exact)]),
         );
         let store = S3BlobStore::from_client_for_test(
             Arc::clone(&fake) as Arc<dyn ObjectStore>,
@@ -1394,7 +1770,7 @@ mod tests {
         .unwrap();
         let content_ref = ContentRef::from_hex("e".repeat(64)).unwrap();
         let bytes = store.get(&content_ref).await.unwrap();
-        assert_eq!(bytes.len(), exact.len());
+        assert_eq!(bytes.len(), exact_len);
     }
 
     #[tokio::test]
