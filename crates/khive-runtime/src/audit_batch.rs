@@ -42,12 +42,16 @@ pub(crate) enum AuditProductionClass {
 }
 
 /// Every call site that can submit a row through [`AuditBatchControl`].
-/// Adding a variant here without extending [`classify`]'s match is a
-/// compile error — there is no wildcard arm.
+/// Adding a variant here without extending the crate-private `classify`
+/// function's match is a compile error — there is no wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditProducer {
     /// The gate denied a dispatch; the denial itself is audited.
     GateDenied,
+    /// The gate backend was unreachable and the dispatch failed closed; the
+    /// refusal is audited best-effort: the typed `GateUnavailable` refusal
+    /// already fails the dispatch, so a lost row degrades diagnostics only.
+    GateUnavailable,
     /// A pack dispatch returned a successful result.
     DispatchSucceeded,
     /// A pack dispatch returned an error result.
@@ -81,9 +85,9 @@ pub(crate) const fn classify(producer: AuditProducer) -> AuditProductionClass {
         | AuditProducer::DispatchFailed
         | AuditProducer::UnknownVerb
         | AuditProducer::GitDigestReceipt => AuditProductionClass::DispatchObligation,
-        AuditProducer::ConfigLocked | AuditProducer::RecallExecuted => {
-            AuditProductionClass::PureObservability
-        }
+        AuditProducer::ConfigLocked
+        | AuditProducer::RecallExecuted
+        | AuditProducer::GateUnavailable => AuditProductionClass::PureObservability,
     }
 }
 

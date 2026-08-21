@@ -1725,7 +1725,14 @@ impl VerbRegistry {
                 EventOutcome::Error,
                 Some(crate::cost_unit::base_resource_payload(request_id)),
             );
-            append_audit_event_best_effort(store, event, gate_req.verb.as_str()).await;
+            let _ = append_audit_event_best_effort(
+                self.audit_batch.as_ref(),
+                store,
+                event,
+                gate_req.verb.as_str(),
+                crate::audit_batch::AuditProducer::GateUnavailable,
+            )
+            .await;
         }
         RuntimeError::GateUnavailable {
             verb: gate_req.verb.clone(),
