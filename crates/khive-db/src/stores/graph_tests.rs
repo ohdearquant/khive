@@ -555,6 +555,91 @@ async fn batched_namespace_edge_counts_exceed_sqlite_variable_limit() {
     );
 }
 
+/// #2089 round-1 HIGH finding: `query_edges_in_namespaces` used to bind one
+/// `?N` SQL variable per visible namespace, so a caller visible in ~998+
+/// namespaces would blow past `SQLITE_LIMIT_VARIABLE_NUMBER` (999 by
+/// default) before any filter parameter was even added — well within a
+/// realistic broad `[actor]` visibility grant. The fix binds the namespace
+/// set as a single JSON-array parameter matched via `json_each`, so this
+/// must still enumerate correctly (paged, exactly, in order) even with the
+/// SQLite variable limit pinned to 999 and 1,001 distinct namespaces in the
+/// visibility set — mirroring
+/// `batched_namespace_edge_counts_exceed_sqlite_variable_limit` above, but
+/// through the paginated listing path rather than the count-only aggregate.
+#[tokio::test]
+async fn query_edges_in_namespaces_offset_paging_exceeds_sqlite_variable_limit() {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(GRAPH_DDL)
+        .unwrap();
+    let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "list-a");
+    let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "list-b");
+
+    let tied = Utc::now();
+    let mut expected: HashSet<Uuid> = HashSet::new();
+    for (store, ns) in [(&store_a, "list-a"), (&store_b, "list-b")] {
+        for _ in 0..6 {
+            let mut edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 0.5);
+            edge.namespace = ns.to_string();
+            edge.created_at = tied;
+            edge.updated_at = tied;
+            expected.insert(edge.id.into());
+            store.upsert_edge(edge).await.unwrap();
+        }
+    }
+    assert_eq!(expected.len(), 12);
+
+    pool.writer()
+        .unwrap()
+        .conn()
+        .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        .unwrap();
+
+    let mut namespaces = vec!["list-a".to_string(), "list-b".to_string()];
+    namespaces.extend((0..999).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 1_001);
+
+    let sort = vec![SortOrder {
+        field: EdgeSortField::CreatedAt,
+        direction: SortDirection::Asc,
+    }];
+    let mut seen: Vec<Uuid> = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let page = store_a
+            .query_edges_in_namespaces(
+                &namespaces,
+                EdgeFilter::default(),
+                sort.clone(),
+                PageRequest { offset, limit: 5 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(12));
+        if page.items.is_empty() {
+            break;
+        }
+        for e in &page.items {
+            seen.push(e.id.into());
+        }
+        offset += 5;
+    }
+
+    assert_eq!(seen.len(), 12, "offset paging must enumerate every row");
+    let distinct: HashSet<Uuid> = seen.iter().copied().collect();
+    assert_eq!(distinct.len(), 12, "no row may appear on two pages");
+    assert_eq!(
+        distinct, expected,
+        "enumerated set must equal the seeded set"
+    );
+}
+
 #[tokio::test]
 async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
     let config = PoolConfig {

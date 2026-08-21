@@ -816,7 +816,7 @@ fn build_edge_filter_sql_for_namespaces(
     namespaces: &[String],
     filter: &EdgeFilter,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = namespaces
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = namespaces
         .iter()
         .map(|namespace| -> Box<dyn rusqlite::types::ToSql> { Box::new(namespace.clone()) })
         .collect();
@@ -829,6 +829,37 @@ fn build_edge_filter_sql_for_namespaces(
             format!("namespace IN ({})", placeholders.join(", "))
         }
     };
+    build_edge_filter_conditions(namespace_condition, params, filter)
+}
+
+/// Same filter conditions as [`build_edge_filter_sql_for_namespaces`], but
+/// the namespace set is bound as a single pre-serialized JSON array
+/// parameter (`?1`) matched via `json_each` rather than one `?N` per
+/// namespace.
+///
+/// `namespace IN (?1, ?2, ..., ?N)` costs one bound SQLite variable per
+/// namespace; a caller with a large visible-namespace set (hundreds to
+/// thousands, e.g. a broad `[actor]` visibility grant) can exceed
+/// `SQLITE_LIMIT_VARIABLE_NUMBER` (999 by default) before any of the
+/// filter's own parameters are even added. Binding one JSON string instead
+/// keeps this at O(1) parameters regardless of namespace count, so paged
+/// enumeration (which needs one exact-order SQL statement per page — see
+/// [`SqlGraphStore::query_edges_in_namespaces`]) never has to chunk the
+/// namespace set and cannot silently corrupt paging by doing so (#2088).
+fn build_edge_filter_sql_for_namespaces_json(
+    namespaces_json: &str,
+    filter: &EdgeFilter,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(namespaces_json.to_string())];
+    let namespace_condition = "namespace IN (SELECT value FROM json_each(?1))".to_string();
+    build_edge_filter_conditions(namespace_condition, params, filter)
+}
+
+fn build_edge_filter_conditions(
+    namespace_condition: String,
+    mut params: Vec<Box<dyn rusqlite::types::ToSql>>,
+    filter: &EdgeFilter,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
     let mut conditions = vec![namespace_condition, "deleted_at IS NULL".to_string()];
 
     if !filter.ids.is_empty() {
@@ -2006,6 +2037,16 @@ impl GraphStore for SqlGraphStore {
         // per-namespace prefix fetch merged and re-sliced client-side floats
         // the offset window between calls, silently duplicating and skipping
         // rows during enumeration (#2088).
+        //
+        // The namespace set is bound as a single JSON-array parameter (see
+        // `build_edge_filter_sql_for_namespaces_json`), not one `?N` per
+        // namespace: a caller visible in hundreds-to-thousands of namespaces
+        // would otherwise blow past `SQLITE_LIMIT_VARIABLE_NUMBER` before any
+        // filter parameter is even added, and chunking the namespace set (as
+        // the count-only aggregate methods below do) is not an option here —
+        // it would reintroduce exactly the floating-offset bug this method
+        // exists to close, since a per-chunk LIMIT/OFFSET cannot be
+        // re-sliced into one globally exact page.
         let namespaces: Vec<String> = {
             let mut seen = HashSet::new();
             namespaces
@@ -2024,8 +2065,11 @@ impl GraphStore for SqlGraphStore {
             ),
         })?;
         self.with_reader("query_edges_in_namespaces", move |conn| {
+            let namespaces_json = serde_json::to_string(&namespaces)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+
             let (where_clause, filter_params) =
-                build_edge_filter_sql_for_namespaces(&namespaces, &filter);
+                build_edge_filter_sql_for_namespaces_json(&namespaces_json, &filter);
 
             let count_sql = format!("SELECT COUNT(*) FROM graph_edges{}", where_clause);
             let total: i64 = {
@@ -2038,7 +2082,7 @@ impl GraphStore for SqlGraphStore {
             let order_clause = edge_order_clause(&sort);
 
             let (_, data_filter_params) =
-                build_edge_filter_sql_for_namespaces(&namespaces, &filter);
+                build_edge_filter_sql_for_namespaces_json(&namespaces_json, &filter);
             let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
             all_params.push(Box::new(limit_i64));
             all_params.push(Box::new(offset_i64));
