@@ -5021,22 +5021,90 @@ impl KhiveRuntime {
         // between calls — pages silently duplicate and skip rows, so
         // enumeration never covers the set (#2088).
         let ns_strs: Vec<String> = visible.iter().map(|ns| ns.as_str().to_owned()).collect();
-        let page = self
-            .graph(token)?
+        let sort = vec![SortOrder {
+            field: EdgeSortField::CreatedAt,
+            direction: khive_storage::types::SortDirection::Asc,
+        }];
+        let graph = self.graph(token)?;
+        match graph
             .query_edges_in_namespaces(
                 &ns_strs,
-                filter.into(),
-                vec![SortOrder {
-                    field: EdgeSortField::CreatedAt,
-                    direction: khive_storage::types::SortDirection::Asc,
-                }],
+                filter.clone().into(),
+                sort.clone(),
                 PageRequest {
                     offset: offset.into(),
                     limit,
                 },
             )
-            .await?;
-        Ok(page.items)
+            .await
+        {
+            Ok(page) => Ok(page.items),
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "query_edges_in_namespaces" =>
+            {
+                // Backend exercises the trait default (no batched
+                // namespace query support): fall back to one `query_edges`
+                // call per namespace. Unlike the pre-image fix for #2088,
+                // this fetches an `offset + limit` prefix from every
+                // namespace and merges by the *same* `(created_at, id)` key
+                // each per-namespace fetch already orders by — the
+                // pre-image bug sorted the merged set by UUID alone, a key
+                // unrelated to the order each per-namespace prefix was cut
+                // at, which floated the offset window and silently
+                // duplicated/skipped rows across pages. Sorting by the
+                // fetch's own order key keeps the top `offset + limit` of
+                // the merge exactly equal to the true global prefix.
+                let fetch_limit = offset.saturating_add(limit);
+                let mut namespace_prefixes = Vec::new();
+                for ns in visible {
+                    let temp = NamespaceToken::for_namespace(ns.clone());
+                    let page = self
+                        .graph(&temp)?
+                        .query_edges(
+                            filter.clone().into(),
+                            sort.clone(),
+                            PageRequest {
+                                offset: 0,
+                                limit: fetch_limit,
+                            },
+                        )
+                        .await?;
+                    namespace_prefixes.push(page.items);
+                }
+                Ok(Self::merge_paged_namespace_edges(
+                    namespace_prefixes,
+                    offset,
+                    limit,
+                ))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Merge per-namespace `(created_at, id)`-ordered edge prefixes (each
+    /// already fetched up to `offset + limit` from its own namespace, as
+    /// [`Self::list_edges`]'s trait-default fallback does) into one global
+    /// `[offset, offset + limit)` page.
+    ///
+    /// Sorting by the *same key each prefix was already cut at* is what
+    /// keeps this exact: the top `offset + limit` of the merged set is then
+    /// provably equal to the true global prefix (a standard k-way merge
+    /// argument — no element beyond position `offset + limit` in any single
+    /// namespace can appear before that position in the global order). The
+    /// pre-image #2088 bug instead re-sorted the merged set by UUID alone —
+    /// a key unrelated to the order each namespace's prefix was fetched in —
+    /// which floated the offset window and silently duplicated/skipped rows
+    /// across pages.
+    fn merge_paged_namespace_edges(
+        namespace_prefixes: Vec<Vec<Edge>>,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Edge> {
+        let mut results: Vec<Edge> = namespace_prefixes.into_iter().flatten().collect();
+        results.sort_by_key(|e| (e.created_at, Uuid::from(e.id)));
+        let start = (offset as usize).min(results.len());
+        let end = (start + limit as usize).min(results.len());
+        results[start..end].to_vec()
     }
 
     /// Keyset (seek) page of edges matching `filter`, ordered by immutable
@@ -6867,9 +6935,23 @@ mod tests {
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
     }
 
-    /// #2088 regression at the runtime seam: a token whose visibility spans
-    /// two namespaces must offset-enumerate the combined edge set exactly —
-    /// no duplicates across pages, nothing skipped.
+    /// #2088 regression at the runtime seam, rebuilt deterministic per the
+    /// #2089 round-1 review (finding 3): the previous fixture created edges
+    /// through the normal `link()` path (random UUIDs, wall-clock
+    /// timestamps), so whether it exposed the pre-image bug — sorting the
+    /// per-namespace merge by UUID alone, a key unrelated to the
+    /// `created_at` order each per-namespace fetch was actually cut at —
+    /// depended on the RNG; it could pass against pre-image code by pure
+    /// luck.
+    ///
+    /// This fixture pins both: every `ns-a` edge gets a UUID numerically
+    /// greater than every `ns-b` edge, while `created_at` strictly
+    /// interleaves the two namespaces (a, b, a, b, a, b). A UUID-only sort
+    /// therefore reliably produces "every ns-b edge, then every ns-a edge"
+    /// — provably different from the true `created_at` interleaving — so
+    /// asserting this exact expected sequence (not just the resulting set)
+    /// is what a reverted pre-image implementation would fail to
+    /// reproduce.
     #[tokio::test]
     async fn list_edges_multi_namespace_offset_paging_enumerates_exactly() {
         let rt = rt();
@@ -6878,23 +6960,87 @@ mod tests {
         let tok_a = NamespaceToken::for_namespace(ns_a.clone());
         let tok_b = NamespaceToken::for_namespace(ns_b.clone());
 
-        let mut expected = std::collections::HashSet::new();
-        for (tok, n) in [(&tok_a, 15u32), (&tok_b, 15u32)] {
-            for i in 0..n {
-                let a = rt
-                    .create_entity(tok, "concept", None, &format!("S{i}"), None, None, vec![])
-                    .await
-                    .unwrap();
-                let b = rt
-                    .create_entity(tok, "concept", None, &format!("T{i}"), None, None, vec![])
-                    .await
-                    .unwrap();
-                let e = rt
-                    .link(tok, a.id, b.id, EdgeRelation::Extends, 0.5, None)
-                    .await
-                    .unwrap();
-                expected.insert(Uuid::from(e.id));
-            }
+        let source = rt
+            .create_entity(&tok_a, "concept", None, "Source", None, None, vec![])
+            .await
+            .unwrap();
+        let mut targets = Vec::new();
+        for index in 0..6 {
+            targets.push(
+                rt.create_entity(
+                    &tok_a,
+                    "concept",
+                    None,
+                    &format!("Target{index}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        // Every `a_uuids` entry is numerically greater than every
+        // `b_uuids` entry (leading nibble `f` vs `0`).
+        let a_uuids = [
+            Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffff01").unwrap(),
+            Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffff02").unwrap(),
+            Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffff03").unwrap(),
+        ];
+        let b_uuids = [
+            Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+            Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap(),
+            Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap(),
+        ];
+
+        let graph_a = rt.graph(&tok_a).unwrap();
+        let graph_b = rt.graph(&tok_b).unwrap();
+        let mut expected_order: Vec<Uuid> = Vec::new();
+        for i in 0..3usize {
+            let a_created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
+                1_000_000 + (2 * i as i64) * 1_000_000,
+            )
+            .unwrap();
+            graph_a
+                .upsert_edge(Edge {
+                    id: a_uuids[i].into(),
+                    namespace: "ns-a".into(),
+                    source_id: source.id,
+                    target_id: targets[2 * i].id,
+                    relation: EdgeRelation::Extends,
+                    weight: 0.5,
+                    created_at: a_created_at,
+                    updated_at: a_created_at,
+                    deleted_at: None,
+                    metadata: None,
+                    target_backend: None,
+                })
+                .await
+                .unwrap();
+            expected_order.push(a_uuids[i]);
+
+            let b_created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
+                2_000_000 + (2 * i as i64) * 1_000_000,
+            )
+            .unwrap();
+            graph_b
+                .upsert_edge(Edge {
+                    id: b_uuids[i].into(),
+                    namespace: "ns-b".into(),
+                    source_id: source.id,
+                    target_id: targets[2 * i + 1].id,
+                    relation: EdgeRelation::Extends,
+                    weight: 0.5,
+                    created_at: b_created_at,
+                    updated_at: b_created_at,
+                    deleted_at: None,
+                    metadata: None,
+                    target_backend: None,
+                })
+                .await
+                .unwrap();
+            expected_order.push(b_uuids[i]);
         }
 
         let multi = NamespaceToken::mint_with_visibility(ns_a, vec![ns_b], ActorRef::anonymous());
@@ -6902,23 +7048,93 @@ mod tests {
         let mut offset = 0u32;
         loop {
             let page = rt
-                .list_edges(&multi, EdgeListFilter::default(), 4, offset)
+                .list_edges(&multi, EdgeListFilter::default(), 2, offset)
                 .await
                 .unwrap();
             if page.is_empty() {
                 break;
             }
             seen.extend(page.iter().map(|e| Uuid::from(e.id)));
-            offset += 4;
+            offset += 2;
         }
 
-        assert_eq!(seen.len(), 30, "must enumerate all edges across namespaces");
-        let distinct: std::collections::HashSet<Uuid> = seen.iter().copied().collect();
-        assert_eq!(distinct.len(), 30, "no duplicates across pages");
         assert_eq!(
-            distinct, expected,
-            "enumerated set must equal the created set"
+            seen, expected_order,
+            "must enumerate in exact created_at order, not UUID order"
         );
+        let distinct: std::collections::HashSet<Uuid> = seen.iter().copied().collect();
+        assert_eq!(distinct.len(), 6, "no duplicates across pages");
+        let expected_set: std::collections::HashSet<Uuid> =
+            expected_order.iter().copied().collect();
+        assert_eq!(
+            distinct, expected_set,
+            "enumerated set must equal the seeded set"
+        );
+    }
+
+    /// #2089 round-1 MEDIUM finding 2: `list_edges`'s trait-default fallback
+    /// (taken when a `GraphStore` backend returns `Unsupported` from
+    /// `query_edges_in_namespaces` — i.e. it does not override the batched
+    /// namespace query, per [`khive_storage::GraphStore`]'s default) merges
+    /// independently-fetched per-namespace prefixes through
+    /// [`KhiveRuntime::merge_paged_namespace_edges`]. This exercises that
+    /// merge directly: `ns_a`'s edges all carry numerically-greater UUIDs
+    /// than every `ns_b` edge, while `created_at` interleaves the two
+    /// namespaces. Sorting the merge by UUID alone (the pre-image #2088 bug)
+    /// would put every `ns_b` edge before every `ns_a` edge regardless of
+    /// `created_at` — provably different from this fixture's expected
+    /// order — so an exact-sequence assertion here is sufficient to catch a
+    /// regression back to that bug.
+    #[test]
+    fn merge_paged_namespace_edges_orders_by_created_at_not_uuid() {
+        fn edge(id_hex_suffix: &str, created_at_micros: i64) -> Edge {
+            let created_at =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(created_at_micros).unwrap();
+            Edge {
+                id: Uuid::parse_str(&format!("00000000-0000-4000-8000-{id_hex_suffix}"))
+                    .unwrap()
+                    .into(),
+                namespace: "irrelevant".into(),
+                source_id: Uuid::nil(),
+                target_id: Uuid::nil(),
+                relation: EdgeRelation::Extends,
+                weight: 0.5,
+                created_at,
+                updated_at: created_at,
+                deleted_at: None,
+                metadata: None,
+                target_backend: None,
+            }
+        }
+
+        // Every `a*` UUID (leading nibble `f`) is numerically greater than
+        // every `b*` UUID (leading nibble `0`), but `created_at` interleaves
+        // them: a0 < b0 < a1 < b1.
+        let a0 = edge("ffffffffffff", 1_000_000);
+        let b0 = edge("000000000001", 2_000_000);
+        let a1 = edge("fffffffffffe", 3_000_000);
+        let b1 = edge("000000000002", 4_000_000);
+
+        let namespace_prefixes = vec![vec![a0.clone(), a1.clone()], vec![b0.clone(), b1.clone()]];
+
+        let full_page = KhiveRuntime::merge_paged_namespace_edges(namespace_prefixes.clone(), 0, 4);
+        let ids: Vec<Uuid> = full_page.iter().map(|e| Uuid::from(e.id)).collect();
+        assert_eq!(
+            ids,
+            vec![
+                Uuid::from(a0.id),
+                Uuid::from(b0.id),
+                Uuid::from(a1.id),
+                Uuid::from(b1.id)
+            ],
+            "must order the merge by created_at, not by UUID magnitude"
+        );
+
+        // Mid-window offset must slice the same globally-ordered sequence,
+        // not re-derive order per page.
+        let middle_page = KhiveRuntime::merge_paged_namespace_edges(namespace_prefixes, 1, 2);
+        let middle_ids: Vec<Uuid> = middle_page.iter().map(|e| Uuid::from(e.id)).collect();
+        assert_eq!(middle_ids, vec![Uuid::from(b0.id), Uuid::from(a1.id)]);
     }
 
     #[tokio::test]
