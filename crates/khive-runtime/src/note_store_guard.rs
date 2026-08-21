@@ -18,8 +18,17 @@
 //! and `KhiveRuntime::sql()` are embedder capabilities (pools, schema plans,
 //! diagnostics, raw SQL): an embedder holding them already holds
 //! root-equivalent access to the database file itself, so no store-layer
-//! check can bind it, and no pack code calls either for note writes (the
-//! integration suite pins where the boundary sits).
+//! check can bind it. No pack code obtains `NoteStore` objects from
+//! `backend()` (the integration suite pins where the boundary sits). Two
+//! packs do issue note DML through `sql()` as deliberate low-level writers:
+//! gtd's atomic task transition (`gtd_transition_statement` — the handler
+//! loads the row and verifies `kind == "task"` first, and the UPDATE pins
+//! the row to that verified snapshot via its `updated_at` optimistic
+//! guard) and schedule's event updates (handler pre-check plus
+//! `kind = 'scheduled_event'` in the SQL itself). Both are therefore held
+//! off `kind = "message"` transport evidence; widening either constraint,
+//! or adding a third such writer, must instead route through the typed
+//! accessor this module wraps.
 //!
 //! `try_create_note_impl` (the runtime-internal implementation backing both
 //! `try_create_note` and `try_create_note_as_trusted_ingest`) bypasses this

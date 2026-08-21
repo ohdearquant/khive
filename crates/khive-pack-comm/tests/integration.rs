@@ -5493,10 +5493,12 @@ async fn patch_guard_refuses_target_spellings_it_cannot_prove_innocent() {
 /// surface, and stores taken from it are deliberately NOT policy-wrapped —
 /// an embedder holding the backend already holds root-equivalent access to
 /// the database file, so a store-layer check there binds nobody. No pack
-/// code takes note stores from the backend surface. If this test starts
-/// failing because the raw path now refuses, the boundary was moved:
-/// update the module contract in `note_store_guard.rs` and this pin
-/// together, deliberately.
+/// code takes note stores from the backend surface (gtd and schedule issue
+/// kind-constrained note DML through `sql()`; the module doc in
+/// `note_store_guard.rs` enumerates both writers and their constraints).
+/// If this test starts failing because the raw path now refuses, the
+/// boundary was moved: update the module contract in `note_store_guard.rs`
+/// and this pin together, deliberately.
 #[tokio::test]
 async fn storage_backend_note_stores_are_an_embedder_surface_outside_the_policy_boundary() {
     let (_registry, rt) = build_registry_for_ns("local");
