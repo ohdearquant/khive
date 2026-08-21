@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { atlasReviewFixture } from "@/lib/fixtures/atlas-review";
+import { demoReviewFixture } from "@/lib/fixtures/demo-review";
 import {
   isReviewReport,
   parseReviewBundle,
@@ -17,34 +17,34 @@ import {
 
 describe("khive.review.v1", () => {
   it("keeps present identities distinct and marks an absent live proposal explicitly", () => {
-    const bundle = parseReviewBundle(atlasReviewFixture);
+    const bundle = parseReviewBundle(demoReviewFixture);
 
     expect(bundle.repository.head_sha).toHaveLength(40);
     expect(bundle.pull_request.head_sha).toBe(bundle.repository.head_sha);
     expect(bundle.snapshot_identity.hash_status).toBe("fixture");
     expect(bundle.snapshot_identity.head_hash).toMatch(/^sha256:/);
     expect(bundle.pull_request.number).toBe(184);
-    expect(bundle.change_set.envelope.batch_id).toBe("atlas-enrich-2026-08-07-184");
-    expect(bundle.change_set.envelope.producer).toBe("lambda:atlas");
+    expect(bundle.change_set.envelope.batch_id).toBe("demo-enrich-2026-08-07-184");
+    expect(bundle.change_set.envelope.producer).toBe("actor:casey");
     expect(bundle.live_proposal).toBeNull();
   });
 
   it("fails closed when the version or a full identifier is missing", () => {
     expect(() =>
-      parseReviewBundle({ ...atlasReviewFixture, schema_version: "khive.review.v2" }),
+      parseReviewBundle({ ...demoReviewFixture, schema_version: "khive.review.v2" }),
     ).toThrow();
     expect(() =>
       parseReviewBundle({
-        ...atlasReviewFixture,
-        repository: { ...atlasReviewFixture.repository, head_sha: undefined },
+        ...demoReviewFixture,
+        repository: { ...demoReviewFixture.repository, head_sha: undefined },
       }),
     ).toThrow();
   });
 
   it("represents a stale pull-request head without rejecting the review bundle", () => {
     const stale = parseReviewBundle({
-      ...atlasReviewFixture,
-      pull_request: { ...atlasReviewFixture.pull_request, head_sha: "0".repeat(40) },
+      ...demoReviewFixture,
+      pull_request: { ...demoReviewFixture.pull_request, head_sha: "0".repeat(40) },
     });
 
     expect(stale.pull_request.head_sha).not.toBe(stale.repository.head_sha);
@@ -57,9 +57,9 @@ describe("khive.review.v1", () => {
   it("does not accept verified canonical hashes before an algorithm is ratified", () => {
     expect(() =>
       parseReviewBundle({
-        ...atlasReviewFixture,
+        ...demoReviewFixture,
         snapshot_identity: {
-          ...atlasReviewFixture.snapshot_identity,
+          ...demoReviewFixture.snapshot_identity,
           hash_status: "verified",
         },
       }),
@@ -67,12 +67,12 @@ describe("khive.review.v1", () => {
   });
 
   it("bounds adapter pages and in-memory operation lists", () => {
-    const firstCheck = atlasReviewFixture.checks.items[0];
+    const firstCheck = demoReviewFixture.checks.items[0];
     expect(() =>
       parseReviewBundle({
-        ...atlasReviewFixture,
+        ...demoReviewFixture,
         checks: {
-          ...atlasReviewFixture.checks,
+          ...demoReviewFixture.checks,
           items: Array.from({ length: REVIEW_PAGE_MAX_ITEMS + 1 }, (_, index) => ({
             ...firstCheck,
             id: `bounded-check-${index}`,
@@ -81,12 +81,12 @@ describe("khive.review.v1", () => {
       }),
     ).toThrow();
 
-    const firstOperation = atlasReviewFixture.change_set.operations[0];
+    const firstOperation = demoReviewFixture.change_set.operations[0];
     expect(() =>
       parseReviewBundle({
-        ...atlasReviewFixture,
+        ...demoReviewFixture,
         change_set: {
-          ...atlasReviewFixture.change_set,
+          ...demoReviewFixture.change_set,
           operations: Array.from({ length: REVIEW_CORE_MAX_ITEMS + 1 }, (_, index) => ({
             ...firstOperation,
             index,
@@ -115,10 +115,10 @@ describe("khive.review.v1", () => {
       change_set: {
         envelope: {
           schema_version: 1,
-          producer: "lambda:atlas",
-          producer_model_family: "family:atlas",
+          producer: "actor:casey",
+          producer_model_family: "family:demo",
           staged_at: 2_000_000,
-          batch_id: "atlas-batch-7",
+          batch_id: "demo-batch-7",
         },
         operations: [
           {
@@ -155,7 +155,7 @@ describe("khive.review.v1", () => {
       findings: [],
       review_gate: {
         required: false,
-        producer_model_family: "family:atlas",
+        producer_model_family: "family:demo",
         reviewer_model_family: null,
         eligible: true,
         approval_ready: true,
@@ -177,27 +177,27 @@ describe("review gate", () => {
   it("refuses a same-family reviewer", () => {
     expect(
       canApproveReview(
-        atlasReviewFixture,
-        atlasReviewFixture.change_set.envelope.producer_model_family,
+        demoReviewFixture,
+        demoReviewFixture.change_set.envelope.producer_model_family,
       ),
     ).toEqual({
       allowed: false,
-      reason: "ADR-102 requires a reviewer outside family:atlas-frontier.",
+      reason: "ADR-102 requires a reviewer outside family:demo-frontier.",
     });
   });
 
   it("allows an independent reviewer when no required check failed", () => {
-    expect(canApproveReview(atlasReviewFixture, "family:independent-reasoner").allowed).toBe(
+    expect(canApproveReview(demoReviewFixture, "family:independent-reasoner").allowed).toBe(
       true,
     );
   });
 
   it("refuses approval when any required check fails", () => {
     const bundle = {
-      ...atlasReviewFixture,
+      ...demoReviewFixture,
       checks: {
-        ...atlasReviewFixture.checks,
-        items: atlasReviewFixture.checks.items.map((check, index) =>
+        ...demoReviewFixture.checks,
+        items: demoReviewFixture.checks.items.map((check, index) =>
           index === 0 ? { ...check, status: "fail" as const } : check,
         ),
       },
@@ -210,16 +210,16 @@ describe("review gate", () => {
   });
 
   it("blocks non-reviewer pending checks but resolves the fixture's reviewer check locally", () => {
-    expect(canApproveReview(atlasReviewFixture, "family:independent-reasoner").allowed).toBe(
+    expect(canApproveReview(demoReviewFixture, "family:independent-reasoner").allowed).toBe(
       true,
     );
 
     const pending = {
-      ...atlasReviewFixture,
+      ...demoReviewFixture,
       checks: {
-        ...atlasReviewFixture.checks,
+        ...demoReviewFixture.checks,
         items: [
-          ...atlasReviewFixture.checks.items,
+          ...demoReviewFixture.checks.items,
           {
             id: "github-required-check",
             label: "Repository policy",
@@ -239,9 +239,9 @@ describe("review gate", () => {
 
   it("respects semantic gate blockers that a local reviewer selection cannot resolve", () => {
     const blocked = {
-      ...atlasReviewFixture,
+      ...demoReviewFixture,
       review_gate: {
-        ...atlasReviewFixture.review_gate,
+        ...demoReviewFixture.review_gate,
         eligible: true,
         approval_ready: false,
         status: "blocked_by_repository_policy",
@@ -257,18 +257,18 @@ describe("review gate", () => {
 
   it("refuses stale PR heads and error-level semantic findings", () => {
     const stale = parseReviewBundle({
-      ...atlasReviewFixture,
-      pull_request: { ...atlasReviewFixture.pull_request, head_sha: "0".repeat(40) },
+      ...demoReviewFixture,
+      pull_request: { ...demoReviewFixture.pull_request, head_sha: "0".repeat(40) },
     });
     expect(canApproveReview(stale, "family:independent-reasoner").reason).toMatch(
       /head changed/i,
     );
 
     const invalid = {
-      ...atlasReviewFixture,
-      validation: { ...atlasReviewFixture.validation, passed: false, errors: 1 },
+      ...demoReviewFixture,
+      validation: { ...demoReviewFixture.validation, passed: false, errors: 1 },
       findings: [
-        ...atlasReviewFixture.findings,
+        ...demoReviewFixture.findings,
         {
           rule_id: "review-rule-coverage",
           severity: "error",
@@ -288,17 +288,17 @@ describe("review gate", () => {
 
 describe("review presentation helpers", () => {
   it("groups semantic changes without mutating source order", () => {
-    const original = atlasReviewFixture.changes.items.map((change) => change.id);
-    const grouped = groupChanges(atlasReviewFixture.changes.items);
+    const original = demoReviewFixture.changes.items.map((change) => change.id);
+    const grouped = groupChanges(demoReviewFixture.changes.items);
 
     expect(grouped.added).toHaveLength(5);
     expect(grouped.modified).toHaveLength(1);
     expect(grouped.removed).toHaveLength(1);
-    expect(atlasReviewFixture.changes.items.map((change) => change.id)).toEqual(original);
+    expect(demoReviewFixture.changes.items.map((change) => change.id)).toEqual(original);
   });
 
   it("searches semantic labels and tier metadata", () => {
-    const changedWeight = atlasReviewFixture.changes.items.find(
+    const changedWeight = demoReviewFixture.changes.items.find(
       (change) => change.change === "modified",
     );
     expect(changedWeight).toBeDefined();
@@ -308,7 +308,7 @@ describe("review presentation helpers", () => {
   });
 
   it("shortens both Git SHAs and labeled KG hashes for display only", () => {
-    expect(shortHash(atlasReviewFixture.repository.head_sha)).toBe("7ea9c6b2");
-    expect(shortHash(atlasReviewFixture.snapshot_identity.head_hash!, 10)).toBe("3f1e93775c");
+    expect(shortHash(demoReviewFixture.repository.head_sha)).toBe("7ea9c6b2");
+    expect(shortHash(demoReviewFixture.snapshot_identity.head_hash!, 10)).toBe("3f1e93775c");
   });
 });
