@@ -188,3 +188,26 @@ export function repositoryLocationUrl(
   if (location.view) url.searchParams.append("view", location.view);
   return url;
 }
+
+/**
+ * The shareable form of an investigation URL. A share link leaves the
+ * browser, so it carries ONLY the investigation parameters: every foreign
+ * query parameter and the URL fragment are dropped rather than copied,
+ * because the current address bar can hold values that must not be
+ * disclosed to a link recipient (tokens, authorization codes, tracker
+ * state). `repositoryLocationUrl` stays the in-browser history form, which
+ * preserves foreign parameters locally.
+ */
+export function investigationShareUrl(
+  base: URL,
+  location: RepositoryLocation,
+): URL {
+  const url = new URL(`${base.origin}${base.pathname}`);
+  if (location.repository) url.searchParams.append("repo", location.repository);
+  if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
+  if (location.modulePath) {
+    url.searchParams.append("module", location.modulePath);
+  }
+  if (location.view) url.searchParams.append("view", location.view);
+  return url;
+}

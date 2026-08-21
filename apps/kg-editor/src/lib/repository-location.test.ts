@@ -5,6 +5,7 @@ import {
   parseRepositoryLocation,
   REPOSITORY_VIEW_IDS,
   type RepositoryLocation,
+  investigationShareUrl,
   repositoryLocationUrl,
 } from "@/lib/repository-location";
 
@@ -104,6 +105,30 @@ describe("repository investigation location", () => {
 
     expect(url.search).toBe(
       `?keep=1&repo=${
+        encodeURIComponent(repository)
+      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
+    );
+  });
+
+  it("share form carries only investigation parameters and drops the fragment", () => {
+    const url = investigationShareUrl(
+      new URL(
+        "https://example.test/app?repo=old&access_token=not-a-real-secret&utm_source=x#token-fragment",
+      ),
+      {
+        repository,
+        snapshotSha,
+        modulePath: "crates/khive-db/src/pool.rs",
+        view: "dependency_topology",
+      },
+    );
+
+    expect(url.pathname).toBe("/app");
+    expect(url.hash).toBe("");
+    expect(url.searchParams.get("access_token")).toBeNull();
+    expect(url.searchParams.get("utm_source")).toBeNull();
+    expect(url.search).toBe(
+      `?repo=${
         encodeURIComponent(repository)
       }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
     );

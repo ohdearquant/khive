@@ -50,6 +50,7 @@ import type {
 import {
   parseRepositoryLocation,
   REPOSITORY_VIEW_IDS,
+  investigationShareUrl,
   repositoryLocationUrl,
 } from "@/lib/repository-location";
 
@@ -1129,19 +1130,30 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     snapshot.head_sha,
   ]);
 
-  function locationFor(
+  function investigationLocation(
     moduleId: string | null,
     view: ViewId,
     missingPath: string | null = null,
   ) {
-    return repositoryLocationUrl(new URL(window.location.href), {
+    return {
       repository: repository.canonical_url,
       snapshotSha: snapshot.head_sha,
       modulePath: moduleId
         ? moduleById.get(moduleId)?.source_path ?? null
         : missingPath,
       view,
-    });
+    };
+  }
+
+  function locationFor(
+    moduleId: string | null,
+    view: ViewId,
+    missingPath: string | null = null,
+  ) {
+    return repositoryLocationUrl(
+      new URL(window.location.href),
+      investigationLocation(moduleId, view, missingPath),
+    );
   }
 
   function pushLocation(
@@ -1206,13 +1218,23 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       if (!navigator.clipboard?.writeText) {
         throw new Error("Clipboard access is unavailable");
       }
-      const current = locationFor(
+      const location = investigationLocation(
         selectedModuleId,
         activeView,
         unresolvedModule?.path ?? null,
       );
+      const current = repositoryLocationUrl(
+        new URL(window.location.href),
+        location,
+      );
+      // The copied link is the share form: investigation parameters only,
+      // no foreign query parameters and no fragment.
+      const share = investigationShareUrl(
+        new URL(window.location.href),
+        location,
+      );
       const sourceHref = window.location.href;
-      await navigator.clipboard.writeText(current.href);
+      await navigator.clipboard.writeText(share.href);
       if (window.location.href === sourceHref && current.href !== sourceHref) {
         window.history.replaceState(
           null,

@@ -164,6 +164,37 @@ describe("repository showcase", () => {
     );
   });
 
+  it("never copies foreign query parameters or the fragment into the share link", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    render(<RepoShowcase bundle={golden()} />);
+
+    await waitFor(() =>
+      expect(new URL(window.location.href).searchParams.get("at")).not.toBeNull()
+    );
+    const polluted = new URL(window.location.href);
+    polluted.searchParams.set("access_token", "not-a-real-secret");
+    polluted.hash = "#fragment-value";
+    window.history.replaceState(
+      null,
+      "",
+      `${polluted.pathname}${polluted.search}${polluted.hash}`,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Copy investigation link" }),
+    );
+
+    const copied = writeText.mock.calls.at(-1)?.[0] as string;
+    expect(copied).not.toContain("not-a-real-secret");
+    expect(copied).not.toContain("fragment-value");
+    const copiedUrl = new URL(copied);
+    expect(copiedUrl.searchParams.get("repo")).not.toBeNull();
+    expect(copiedUrl.searchParams.get("at")).not.toBeNull();
+    expect(copiedUrl.searchParams.get("view")).not.toBeNull();
+  });
+
   it("preserves stale-link evidence when clipboard access fails", async () => {
     const bundle = golden();
     const staleSha = "0000000000000000000000000000000000000000";
