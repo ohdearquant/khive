@@ -3,6 +3,11 @@
 **Status**: accepted\
 **Date**: 2026-05-22\
 **Authors**: khive maintainers
+**Amended 2026-08-21 ([ADR-167](ADR-167-service-provenance-and-kind-classification.md))**:
+step 5 of the classification decision tree gains a record-observable service/concept
+sub-procedure with a mandatory split for records naming both a technique and a deployment
+of it, and step 9 gains a question-note requirement for records carrying deployment
+vocabulary without an instance identifier. See "Service/concept tie-break" below.
 
 ## Context
 
@@ -204,8 +209,10 @@ that accept a `kind` parameter.
 4. Is it a curated collection of examples/records for training, evaluation, or benchmarking?
    → Dataset
 
-5. Is it a running operational instance with endpoint, health, deployment state, or latency?
-   → Service
+5. Does the record identify a specific deployed or deployable instance (see the
+   service/concept tie-break below)?
+   → Service — or a mandatory two-record split when the record also names the
+     technique the instance embodies
 
 6. Is it a codebase, library, framework, tool, application, or repository?
    → Project
@@ -218,8 +225,44 @@ that accept a `kind` parameter.
    → Concept
 
 9. If still uncertain:
-   → Concept (with entity_type if known)
+   → Concept (with entity_type if known); if the record mentions deployment
+     vocabulary without an instance identifier, also record the open
+     classification question as a note annotating the record
 ```
+
+### Service/concept tie-break (2026-08-21 amendment, [ADR-167](ADR-167-service-provenance-and-kind-classification.md))
+
+Step 5 is evaluated as a sub-procedure over two predicates, each decidable from the record
+being written — its name, description, `entity_type`, and properties — with no reference to
+the writer's state of mind or to the world at write time:
+
+- **Instance evidence (D)**: the record identifies a specific deployed or deployable
+  instance — its fields name at least one instance identifier: an endpoint or address, a
+  deployment surface (host, region, cluster), an operator, or an operational state or state
+  history. Whether the instance is up at write time is not consulted: a deployable system
+  between deployments still satisfies D when the record names the deployment. Fields that
+  identify only a codebase (repository, package, crate, source language) are step 6
+  evidence, not instance identifiers — a record carrying only codebase identity does not
+  satisfy D and continues to step 6, where it classifies `Project`.
+- **Technique identity (T)** — evaluated only when D holds: the record's name or
+  description also denotes the technique, method, pattern, or named result the instance
+  embodies, as distinct from the instance itself.
+
+The sub-procedure:
+
+1. If D does not hold, step 5 does not fire; continue to step 6. A pure technique reaches
+   step 8 and classifies `Concept` exactly as before this amendment.
+2. If D holds and T does not, classify `Service`.
+3. If D and T both hold, **the split is mandatory**: create two records, a `Concept`
+   naming the technique and a `Service` naming the deployment, joined by
+   `Service instance_of Concept`. Classifying the single record as either kind alone is
+   out of contract; the record naming two things is the evidence that there are two things.
+
+The three arms are mutually exclusive by construction (they partition on D, then on T), so
+first-match ordering cannot mask an arm. Step 9's uncertainty default is unchanged; the
+amendment adds only the question-note requirement stated in the tree, whose trigger — the
+record mentions deployment vocabulary but carries no instance identifier — is likewise read
+off the record itself, so the classification stays revisitable instead of silently settled.
 
 ### Signal table
 

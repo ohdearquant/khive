@@ -59,20 +59,33 @@ filter `list(kind="edge", target_id=…)` does reach them: the earlier report th
 (issue #2085) has been retracted, and an integration test covering the edge-as-target case matches.
 
 What remains open is exhaustive ENUMERATION, which is a different question from whether the filter
-matches. Issue #2088 records that the multi-namespace visibility path fetches each namespace's rows
-ordered by `created_at`, re-sorts the union by UUID, and then slices `[offset, offset+limit)`: the
-window floats as the prefix grows, so successive pages both duplicate and skip rows, and a paged
-walk terminates having seen a fraction of the population while reporting nothing wrong. That defect
-is not confined to inbound reads: `source_id` and `target_id` are filter predicates on the same
-listing path (`build_edge_filter_sql` in `crates/khive-db/src/stores/graph.rs`), so a source-filtered
-walk pages through the same floating window. No direction of offset-paged enumeration is safe while
-the defect stands, and a procedure that can lose edges must not rest its completeness on offset
-paging in either direction. The runtime already carries the sound primitive: `list_edges_after`
-(`crates/khive-runtime/src/operations.rs`) walks the durable insertion-sequence ledger with an
-explicit cursor, merges every visible namespace at one sequence boundary, and fails loudly on a
-hard-deleted or out-of-scope cursor instead of hiding an incomplete traversal. The enumeration
-contract in Decision 3 is therefore stated against that cursor walk (or a transaction-scoped direct
-query executed inside the migration's own transaction), never against offset paging.
+matches. Two independent gaps stand between the listing surface and the set the purge will delete.
+
+First, offset paging is unsound. Issue #2088 records that the multi-namespace visibility path
+fetches each namespace's rows ordered by `created_at`, re-sorts the union by UUID, and then slices
+`[offset, offset+limit)`: the window floats as the prefix grows, so successive pages both duplicate
+and skip rows, and a paged walk terminates having seen a fraction of the population while reporting
+nothing wrong. The defect is not confined to inbound reads: `source_id` and `target_id` are filter
+predicates on the same listing path (`build_edge_filter_sql` in
+`crates/khive-db/src/stores/graph.rs`), so a source-filtered walk pages through the same floating
+window. No direction of offset-paged enumeration is safe while the defect stands.
+
+Second — and this holds even for a sound cursor walk — the listing surface answers a narrower
+question than the purge asks. `list_edges_after` (`crates/khive-runtime/src/operations.rs`) walks
+the durable insertion-sequence ledger correctly, but it is visibility-scoped to the caller's
+namespaces and, like every listing path, filters to live rows (`deleted_at IS NULL`). The purge is
+`DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1` — no namespace predicate, no
+tombstone predicate. An incident edge in a namespace the migrating caller cannot see, or one
+already soft-deleted, passes a visible/live enumeration and its matching count while the purge
+deletes it anyway. A completeness check scoped narrower than the destructive statement it guards
+is not a completeness check.
+
+The enumeration contract in Decision 3 is therefore stated against the purge's own predicate: the
+authoritative enumeration is a direct query executed inside the migration's own transaction using
+the same `source_id = ?1 OR target_id = ?1` predicate as the purge, with no visibility scoping and
+no live-row filter, so the enumerated set equals the destructive set by construction. The cursor
+walk remains the sound primitive for caller-facing pre-checks and planning reads; it is not the
+completeness instrument.
 
 ## Decision
 
@@ -100,35 +113,36 @@ endpoint table.
 ### 2. Amend ADR-001's decision tree with a deterministic service/concept tie-break
 
 ADR-001 §"Agent Classification Heuristics" stays the single classification source. This ADR does
-not introduce a parallel set of criteria; it amends step 5 of ADR-001's decision tree so that the
-one under-determined boundary resolves the same way for every writer. The amendment replaces
-step 5's condition with an ordered sub-procedure:
+not introduce a parallel set of criteria; it amends ADR-001 in place — this PR carries the
+ADR-001 edit, and the operative text is ADR-001's new §"Service/concept tie-break". The
+amendment replaces step 5's condition with a sub-procedure over two predicates, each decidable
+from the record being written (its name, description, `entity_type`, and properties), with no
+reference to the writer's state of mind or to the world at write time:
 
-> **5. Evaluate, in order, stopping at the first rule whose condition holds:**
->
-> 5a. It is meaningful to say the thing is currently up or down (it has, or when deployed would
-> have, an endpoint, health state, deployment surface, and an operator) → `Service`. Current
-> downtime does not disqualify: a deployable system between deployments is still a `Service`.
->
-> 5b. The name refers to an idea, technique, pattern, or named result that would still exist if
-> every deployment of it were removed, AND no record-specific deployment is being named →
-> `Concept` (continue to step 8's signals to confirm).
->
-> 5c. Both 5a and 5b hold — the name is being used for a technique AND for a deployment of it —
-> → **the split is mandatory**: create two records, a `Concept` naming the technique and a
-> `Service` naming the deployment, joined by `Service instance_of Concept`. Classifying the
-> single record either way is out of contract; the disagreement is the evidence that there are
-> two things.
->
-> 5d. Neither holds cleanly and the writer cannot state which — record it as `Concept` per
-> ADR-001 step 9's uncertainty default, and record the open question as a note annotating the
-> record, so the classification is revisitable instead of silently settled.
+- **Instance evidence (D)**: the record names at least one instance identifier — an endpoint or
+  address, a deployment surface, an operator, or an operational state or state history.
+  Liveness at write time is not consulted, so a deployable system between deployments still
+  satisfies D. Codebase identifiers (repository, package, crate, source language) are
+  explicitly step 6 evidence, not instance identifiers.
+- **Technique identity (T)**, evaluated only when D holds: the record's name or description
+  also denotes the technique the instance embodies, as distinct from the instance itself.
 
-The rules are ordered, each condition is decidable from the record being written (no "usually",
-no evidence threshold left to taste), and the disagreement case has exactly one outcome. The
-earlier draft of this section stated the liveness and independence tests without an order or a
-mandatory outcome for the disagreement case; two writers could reach different kinds for a
-currently-down deployable system, which is the drift this decision exists to stop.
+The arms partition on D, then on T, so they are mutually exclusive by construction: D absent →
+step 5 does not fire and the walk continues to step 6 (a codebase classifies `Project`, a pure
+technique reaches step 8 and classifies `Concept`); D without T → `Service`; D with T → the
+split is **mandatory** — two records, `Concept` for the technique and `Service` for the
+deployment, joined by `Service instance_of Concept`, and single-record classification either
+way is out of contract. Step 9's uncertainty default is unchanged; the amendment adds a
+question-note requirement whose trigger (deployment vocabulary present, instance identifier
+absent) is likewise read off the record.
+
+The earlier draft of this section stated the procedure as four ordered first-match rules whose
+split arm required two earlier arms to hold simultaneously — unreachable under first-match —
+and whose predicates ("meaningful to say", "when deployed would have", "the writer cannot state
+which") were not decidable from the record; its broad liveness arm could also claim a static
+codebase that ADR-001 step 6 assigns to `Project`. The partition form above closes all three
+defects: no arm can be masked by ordering, every predicate is a field-presence test on the
+record, and codebase identity is routed to step 6 before `Service` can be reached.
 
 ### 3. Kind migration: keep delete-and-recreate, and require a re-anchor plan
 
@@ -195,17 +209,23 @@ ADR exists to prevent, so an unclassifiable edge stops the migration rather than
 
 With those settled, a kind correction:
 
-1. Enumerates the record's edges in **both directions and across every namespace visible to the
-   migrating caller** before deleting anything, using the insertion-sequence cursor walk
-   (`list_edges_after`) or a direct query inside the migration's own transaction — never offset
-   paging, in either direction (see the enumeration note in Context). The walk runs to cursor
-   exhaustion, and the collected edge IDs are reconciled against an independently computed count
-   of the record's incident edges; a mismatch stops the migration before any destructive plan is
-   prepared.
-2. Enumerates the notes annotating the record's **edges**, not only those annotating the record itself.
-   A recreated edge is a new edge id, so an edge-targeting annotation is orphaned by recreation even
-   when the record's own annotations were handled correctly, and a hard delete's cascade removes those
-   rows outright. Each gets the same re-anchor-or-delete disposition as step 3.
+1. Enumerates the **complete purge set** before deleting anything: a direct query inside the
+   migration's own transaction using the purge's own predicate
+   (`source_id = ?1 OR target_id = ?1`), with **no visibility scoping and no live-row filter** —
+   every namespace, tombstoned rows included, because the purge deletes across both (see the
+   enumeration note in Context). The collected edge IDs are deduplicated (an edge matching on
+   both source and target — a self-loop — is one row and is counted once) and reconciled
+   against an independently computed `COUNT(*)` under the same predicate in the same
+   transaction; a mismatch stops the migration before any destructive plan is prepared. The
+   caller-facing cursor walk (`list_edges_after`) may be used for planning reads, but the
+   destructive plan is prepared only from the in-transaction enumeration. Offset paging is
+   out of contract in any role, in either direction.
+2. Enumerates the second-order rows under the same completeness contract: the `annotates`
+   edges whose TARGET is one of the enumerated incident edges, and the notes those edges
+   anchor — again by direct in-transaction query over the enumerated edge IDs, with no
+   visibility or live-row filter. A recreated edge is a new edge id, so an edge-targeting
+   annotation is orphaned by recreation even when the record's own annotations were handled
+   correctly. Each gets the same re-anchor-or-delete disposition as step 3.
 3. Classifies every enumerated edge as RECREATE, RE-EXPRESS or REFUSE against the endpoint matrix, and
    names for each `annotates` edge whether the annotating note is re-anchored to the new record or
    deleted with it. A note left pointing at a deleted subject is not an acceptable outcome. **Any
@@ -234,21 +254,43 @@ this ADR is complete when all of the following hold:
 
 **Classification tie-break (Decision 2).**
 
-- The ADR-001 amendment text contains the ordered 5a–5d sub-procedure, and each branch has a
-  worked fixture: a currently-down deployable system classifies `Service` (5a); a technique with
-  no named deployment classifies `Concept` (5b); a name used for both yields two records joined
-  by `Service instance_of Concept`, and classifying it as a single record of either kind is
-  rejected by the written rule (5c); an undecidable record lands `Concept` with an annotating
-  question note (5d).
+- ADR-001 itself carries the amendment in this PR's diff: its decision tree's step 5 names the
+  instance-evidence test and its §"Service/concept tie-break" states the D/T partition. A test
+  reading ADR-001 finds the operative text; ADR-167 records the decision and rationale.
+- Each arm has a worked fixture stated as record fields and an expected stored outcome:
+  - D without T → `Service`: a record whose properties name an endpoint and an operator, whose
+    description names no technique, and whose deployment is currently down (no liveness field
+    consulted) classifies `Service`.
+  - D absent, codebase identity → `Project` via step 6: a record naming only a repository and
+    source language classifies `Project`, never `Service`.
+  - D absent, technique identity → `Concept` via step 8: a record describing a method with no
+    instance identifier classifies `Concept`.
+  - D with T → split: a record whose name denotes a technique and whose properties name an
+    endpoint yields two records joined by `Service instance_of Concept`; classifying it as a
+    single record of either kind is rejected by the written rule.
+  - Step 9 note: a record whose description mentions deployment vocabulary but carries no
+    instance identifier lands `Concept` with a question note annotating the record.
 
 **Migration procedure (Decision 3).**
 
-- Enumeration: against a fixture population large enough to exercise the paging defect in issue
-  #2088 (rows spread across at least two namespaces, with interleaved creation timestamps and
-  UUID order that disagrees with `created_at` order), the cursor walk returns every incident edge
-  in both directions exactly once, and its result reconciles against the independent count. An
-  offset-paged walk over the same fixture demonstrably misses or duplicates rows — that fixture
-  is what makes this criterion a real discriminator rather than a restatement.
+- Enumeration, offset-paging discriminator: the fixture is exact, so the pre-image failure is
+  decidable rather than probabilistic. Six incident edges on the migrating record, three per
+  namespace across two namespaces (`A`: a1, a2, a3; `B`: b1, b2, b3), creation timestamps
+  strictly interleaved (a1 < b1 < a2 < b2 < a3 < b3), and edge UUIDs assigned in strictly
+  descending order of creation, so every later-created edge id sorts before every
+  earlier-created one. Page size 2. The defective offset walk (per-namespace `created_at`
+  prefix of size `offset + limit`, union re-sorted by UUID, sliced) then returns page 1 =
+  {b2, a2}, page 2 = {b2, a2} again (b3 and a3, newly exposed in the page-2 prefix, sort
+  before b2 and displace the window), page 3 = {b1, a1}: b2 and a2 are duplicated and b3 and
+  a3 are never returned. The test asserts the offset walk produces exactly that duplicate-
+  and-omission pattern while the in-transaction purge-predicate enumeration returns all six
+  edge ids exactly once and reconciles with `COUNT(*)` = 6.
+- Enumeration, destructive-scope completeness: the fixture additionally holds one incident
+  edge in a namespace NOT visible to the migrating caller and one incident edge already
+  soft-deleted. A visible/live enumeration (the cursor walk) returns neither; the
+  in-transaction purge-predicate enumeration returns both, the count reconciles, and both
+  rows receive dispositions before any plan is prepared — because the purge would delete
+  both. A migration prepared from the visible/live enumeration alone must be refused.
 - Edge-as-endpoint coverage: the fixture includes an `annotates` edge whose TARGET is itself an
   edge incident to the migrating record; the enumeration finds it, and after migration the
   annotation is re-anchored to the recreated edge's new id (or deleted with a recorded
