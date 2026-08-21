@@ -1,7 +1,10 @@
 import type { ShowcaseBundleSource } from "@/lib/adapters/preferred-showcase-source";
 import { buildModuleInsight } from "@/lib/repository-brief";
 import type { RepoBundle, ViewId } from "@/lib/repo-bundle";
-import type { StructureGraphLocation } from "@/lib/repository-location";
+import {
+  publicRepositoryUrlIssue,
+  type StructureGraphLocation,
+} from "@/lib/repository-location";
 import { structureCouplingPairKey } from "@/lib/structure-coupling-lens";
 
 export const INVESTIGATION_BRIEF_MAX_CHARS = 48 * 1_024;
@@ -23,32 +26,44 @@ const AUTHOR_TOKEN_HEX_CHARS = 10;
 //
 // The brief below is copied verbatim into an instruction-following model's
 // context, so every dynamic value it contains must fall into one of these
-// bounded classes — nothing else is permitted through untouched:
+// bounded classes — nothing else is permitted through untouched. Markdown
+// escaping/truncation (`code()`/`boundedInline()`) is presentation only; it
+// is never treated as the instruction/data boundary by itself. The boundary
+// is enforced at the source contract, in `repo-bundle.ts`:
 //
-//   1. Constrained identifiers: full/short commit SHAs (regex-validated hex
-//      in the bundle schema), ISO-8601 timestamps, and numeric stats (counts,
-//      percentages, weights) — these cannot carry instruction text by
+//   1. Constrained identifiers: full/short commit SHAs, ISO-8601 timestamps,
+//      and numeric stats (counts, percentages, weights) are regex/type
+//      validated in the bundle schema and cannot carry instruction text by
 //      construction.
-//   2. Validated repository-relative source/module paths — rendered through
-//      `code()`, which applies a hard length bound (`PATH_VALUE_LIMIT`) and
-//      Markdown-escapes the result.
-//   3. Producer-authored operational text: disclosure/unavailable reasons,
-//      pagination cursors, and `bound.order` labels. These come from the
-//      khive exporter's own fixed status vocabulary describing capture
-//      bounds/truncation — never from repository content an external
-//      contributor controls — and are still rendered through
-//      `code()`/`boundedInline()` for a hard length bound plus escaping.
-//   4. Repository-controlled free text (commit subjects, commit and
-//      ownership author identities) is NEVER copied verbatim, because a
-//      Markdown code span is presentation escaping, not an
-//      instruction/data boundary. Commit subjects are omitted from the
-//      brief entirely. Author identities are replaced by `authorToken()`,
-//      a short stable hash labeled as a hashed token so no attacker-
-//      supplied identity text reaches the model channel.
+//   2. Validated repository-relative source/module paths (`source_path`,
+//      `module_path`) and a closed `language` enum — all rejected at parse
+//      if they fall outside the contract; rendered through `code()` for a
+//      hard length bound plus escaping on top.
+//   3. Bounded identifier tokens (`producer.exporter`, SCC `cycle.id`),
+//      closed enums (`bound.order`), and opaque cursor tokens
+//      (`next_cursor`) — all schema-validated closed/bounded contracts in
+//      `repo-bundle.ts`, not free text.
+//   4. Producer-authored disclosure/unavailable-reason text has no stable
+//      status-code vocabulary in the khive exporter today, so it remains
+//      free text — residual risk the schema cannot close by enum. The
+//      schema still bounds length and rejects control characters
+//      (`reasonText` in `repo-bundle.ts`), and this module additionally
+//      renders every value through `code()`, a delimited Markdown code
+//      span, as a second, presentation-layer control.
+//   5. Repository-controlled free text (commit subjects, commit and
+//      ownership author identities) is NEVER copied verbatim. Commit
+//      subjects are omitted from the brief entirely. Author identities are
+//      replaced by `authorToken()`, a short stable hash labeled as a hashed
+//      token so no attacker-supplied identity text reaches the model
+//      channel.
+//   6. The caller-supplied `canonicalUrl` is validated at runtime with
+//      `publicRepositoryUrlIssue` (the same public-HTTP(S)-URL contract
+//      used for the bundle's own repository URL) before use; a failing
+//      value renders a bounded placeholder, never the raw string.
 //
-// Adding a new dynamic field to the brief means placing it in class 1-3
-// above, or hashing/dropping it per class 4 — never passing an unconstrained
-// repository-sourced string through untouched.
+// Adding a new dynamic field to the brief means placing it in class 1-4
+// above, or hashing/dropping/validating it per class 5-6 — never passing an
+// unconstrained repository- or caller-sourced string through untouched.
 
 // FNV-1a 32-bit, extended by re-hashing the running state until the token is
 // long enough. Deterministic across runtimes so the same author collapses to
@@ -233,6 +248,14 @@ function sourceDescription(source: ShowcaseBundleSource): string {
     : "Curated static fallback bundle";
 }
 
+const CANONICAL_URL_PLACEHOLDER = "unavailable — invalid canonical URL";
+
+function boundedCanonicalUrl(value: string): string {
+  return publicRepositoryUrlIssue(value) === null
+    ? code(value, CURRENT_URL_VALUE_LIMIT)
+    : code(CANONICAL_URL_PLACEHOLDER);
+}
+
 function appendOptionalBlocks(
   core: string,
   blocks: readonly string[],
@@ -378,7 +401,7 @@ export function buildInvestigationBrief({
     `- Snapshot captured at: ${code(bundle.meta.snapshot.ingested_at)}.`,
     `- Exporter: ${code(bundle.meta.producer.exporter)}.`,
     `- Module revision binding: all ${bundle.graph.modules.items.length} captured module rows match the recorded snapshot full SHA.`,
-    `- Canonical current URL: ${code(canonicalUrl, CURRENT_URL_VALUE_LIMIT)}.`,
+    `- Canonical current URL: ${boundedCanonicalUrl(canonicalUrl)}.`,
     "",
     "## Selected module",
     "",

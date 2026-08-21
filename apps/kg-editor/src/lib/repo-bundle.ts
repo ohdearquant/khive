@@ -13,33 +13,98 @@ const shortShaSchema = z.string().regex(/^[0-9a-f]{7,40}$/);
 const timestamp = z.iso.datetime({ offset: true });
 const boundedItems = 50_000;
 
+// Bounded identifier contract for producer/version-shaped tokens (the
+// exporter name, SCC cycle ids) that reach the model-facing investigation
+// brief verbatim: printable identifier/version characters only (no spaces,
+// so an injected natural-language sentence cannot pass), no control
+// characters, no Markdown-structural characters (backtick/hash/brackets),
+// hard length cap. Never a free-text field.
+const IDENTIFIER_MAX = 120;
+const identifierToken = z.string().max(IDENTIFIER_MAX).regex(
+  /^[A-Za-z0-9][A-Za-z0-9._:/+-]*$/,
+);
+
+// Disclosure/unavailable-reason fields are producer-authored operational
+// text describing capture bounds and truncation — the khive exporter has no
+// stable status-code vocabulary for these today, so they remain free text.
+// This bounds length and rejects control characters at the schema; the
+// model-facing brief additionally renders every value through a delimited
+// Markdown code span (see `code()` in investigation-brief.ts) rather than
+// treating this bound as a full instruction/data boundary on its own.
+const REASON_TEXT_MAX = 240;
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codePoint = value.charCodeAt(index);
+    if (codePoint <= 0x1f || codePoint === 0x7f) return true;
+  }
+  return false;
+}
+const reasonText = z.string().max(REASON_TEXT_MAX).refine(
+  (value) => !hasControlCharacter(value),
+  { message: "reason text must not contain control characters" },
+);
+
+// Pagination cursors are opaque continuation tokens the exporter emits
+// (currently `offset:<n>`); bounded length plus a restrictive token charset
+// keeps this a data value even though the exact token shape may grow.
+const CURSOR_MAX = 512;
+const opaqueCursor = z.string().max(CURSOR_MAX).regex(/^[A-Za-z0-9_:.-]+$/);
+
+// Closed set of page orderings observed across every page-shaped field the
+// khive-repo-showcase exporter emits (docs/schemas/examples/khive-repo-v1-khive.json).
+const pageOrderSchema = z.enum([
+  "module_id",
+  "package_id",
+  "symbol_id",
+  "edge_id",
+  "commit_sha,source_path",
+  "committed_at_desc,sha",
+  "issue_number_desc",
+  "pull_request_number_desc",
+  "package_id,module_id",
+  "commit_count_desc,fan_in_desc,module_id",
+  "cochange_count_desc,module_pair",
+  "dependent_count_desc,module_id",
+  "hotspot_rank",
+  "commits_desc,author",
+  "cycle_id",
+  "week_start",
+  "tag_name",
+  "scorecard_key",
+  "side,source_path,module_path",
+]);
+
+// Closed set of languages the exporter emits (mirrors `capability.languages`,
+// which typed rust/python/typescript as the only measured languages).
+const moduleLanguageSchema = z.enum(["rust", "python", "typescript"]);
+
 const granularitySchema = z.enum(["repository", "module", "module_symbol_deferred"]);
 const joinTagSchema = z.enum(["history_only", "structure_only", "join", "field_tagged"]);
 const viewStatusSchema = z.enum(["available", "unavailable"]);
 const sourceCoverageSchema = z.discriminatedUnion("state", [
   z.strictObject({ state: z.literal("completed") }),
-  z.strictObject({ state: z.literal("stopped_early"), reason: wireString }),
-  z.strictObject({ state: z.literal("skipped"), reason: wireString }),
+  z.strictObject({ state: z.literal("stopped_early"), reason: reasonText }),
+  z.strictObject({ state: z.literal("skipped"), reason: reasonText }),
   z.strictObject({ state: z.literal("unrequested") }),
-  z.strictObject({ state: z.literal("unknown"), reason: wireString }),
+  z.strictObject({ state: z.literal("unknown"), reason: reasonText }),
 ]);
 
 function availabilitySchema<T extends z.ZodType>(value: T) {
   return z.discriminatedUnion("status", [
     z.strictObject({ status: z.literal("available"), value }),
-    z.strictObject({ status: z.literal("unavailable"), reason: wireString }),
+    z.strictObject({ status: z.literal("unavailable"), reason: reasonText }),
   ]);
 }
 
 const pageBoundSchema = z.strictObject({
   kind: z.enum(["all", "top_n"]),
   max_items: z.number().int().nonnegative().max(boundedItems),
-  order: wireString,
+  order: pageOrderSchema,
 });
 
 const disclosureSchema = z.strictObject({
   status: z.enum(["complete", "truncated", "unavailable"]),
-  reason: z.string().nullable().optional(),
+  reason: reasonText.nullable().optional(),
 });
 
 function pageSchema<T extends z.ZodType>(item: T) {
@@ -47,7 +112,7 @@ function pageSchema<T extends z.ZodType>(item: T) {
     items: z.array(item).max(boundedItems),
     total_count: availabilitySchema(z.number().int().nonnegative()),
     bound: pageBoundSchema,
-    next_cursor: z.string().nullable().optional(),
+    next_cursor: opaqueCursor.nullable().optional(),
     truncated: z.boolean(),
     disclosure: disclosureSchema,
   }).superRefine((page, context) => {
@@ -80,7 +145,7 @@ const bundleMetaSchema = z.strictObject({
   repository: repositoryIdentitySchema,
   snapshot: z.strictObject({ head_sha: sha, ingested_at: timestamp }),
   producer: z.strictObject({
-    exporter: wireString,
+    exporter: identifierToken,
     kkernel_version: wireString,
     khive_pack_git_version: wireString,
     khive_pack_code_version: wireString,
@@ -121,7 +186,7 @@ const moduleNodeSchema = z.strictObject({
   id: wireString,
   package_id: wireString,
   name: wireString,
-  language: wireString,
+  language: moduleLanguageSchema,
   module_path: wireString,
   source_path: wireString,
   source_revision: sha,
@@ -251,7 +316,7 @@ const viewCapabilitySchema = z.strictObject({
   granularity: granularitySchema,
   join: joinTagSchema,
   status: viewStatusSchema,
-  unavailable_reason: z.string().nullable().optional(),
+  unavailable_reason: reasonText.nullable().optional(),
 });
 const historyViewCapabilitySchema = viewCapabilitySchema.extend({
   commit_module_facet: availabilitySchema(z.boolean()),
@@ -360,7 +425,7 @@ const analysisMetaSchema = z.strictObject({
   granularity: granularitySchema,
   join: joinTagSchema,
   status: viewStatusSchema,
-  unavailable_reason: z.string().nullable().optional(),
+  unavailable_reason: reasonText.nullable().optional(),
   inputs: z.array(wireString),
   window: analysisWindowSchema,
   bound: pageBoundSchema,
@@ -377,7 +442,7 @@ const dependencyTopologySchema = z.strictObject({
     fan_out: z.number().int().nonnegative(),
     cycle_ids: z.array(wireString),
   })),
-  cycles: pageSchema(z.strictObject({ id: wireString, module_ids: z.array(wireString) })),
+  cycles: pageSchema(z.strictObject({ id: identifierToken, module_ids: z.array(wireString) })),
 });
 const hotspotSchema = analysisSchema(z.strictObject({
   module_id: wireString,
@@ -526,6 +591,14 @@ export const repoBundleSchema = z.strictObject({
       });
     }
     sourcePaths.add(moduleNode.source_path);
+    const modulePathIssue = addressableModulePathIssue(moduleNode.module_path);
+    if (modulePathIssue) {
+      context.addIssue({
+        code: "custom",
+        path: ["graph", "modules", "items", index, "module_path"],
+        message: modulePathIssue,
+      });
+    }
   }
   for (const key of [
     "dependency_topology",
