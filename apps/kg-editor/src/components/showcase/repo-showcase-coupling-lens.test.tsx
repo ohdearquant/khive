@@ -109,6 +109,9 @@ describe("repository showcase hidden-coupling lens", () => {
       item.name === "khive-db"
     )!;
     const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    writeText.mockClear();
     const { container } = render(<RepoShowcase bundle={bundle} />);
 
     await user.selectOptions(
@@ -155,6 +158,29 @@ describe("repository showcase hidden-coupling lens", () => {
     expect(new URL(window.location.href).searchParams.getAll("pair"))
       .toEqual(focusedPair);
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+
+    await user.click(within(inspector).getByRole("button", {
+      name: "Copy evidence brief",
+    }));
+    expect(writeText).toHaveBeenCalledOnce();
+    const copied = writeText.mock.calls[0][0];
+    expect(copied).toContain("Candidate hidden coupling");
+    expect(copied).toContain("Observed co-change evidence");
+    for (const path of focusedPair) expect(copied).toContain(path);
+
+    writeText.mockClear();
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.scorecard.label,
+    }));
+    expect(new URL(window.location.href).searchParams.has("pair")).toBe(false);
+    await user.click(within(inspector).getByRole("button", {
+      name: "Copy evidence brief",
+    }));
+    expect(writeText).toHaveBeenCalledOnce();
+    const offViewCopy = writeText.mock.calls[0][0];
+    const retainedOnlyPath = focusedPair.find((path) => path !== sourcePath)!;
+    expect(offViewCopy).not.toContain("Candidate hidden coupling");
+    expect(offViewCopy).not.toContain(retainedOnlyPath);
   });
 
   it("pushes and restores the package, lens, and focused pair without relayout", async () => {

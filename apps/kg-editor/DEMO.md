@@ -19,24 +19,29 @@ npm run dev
 ```
 
 Place the report at `$KHIVE_SHOWCASE_ANALYSIS_ROOT/khive/khive.repo.v1.json`.
-Before presenting, verify that the source badge says **khive DB snapshot**, not
-**curated static fallback**.
+Before presenting, verify that the native **Repository analysis** selector lists
+the configured khive entry and that the source badge says **khive DB snapshot**,
+not **curated static fallback**.
 
-This setup requires the DB snapshot API route from the companion backend PR (or
-its merged equivalent). Without that route, this UI branch intentionally uses
-the curated static fallback. The DB-backed snapshot is always an optional
-enhancement over the bundled static asset: any failure on that path — network
-error, non-2xx status, an oversized or malformed body, or a provenance
-mismatch — falls back to the static asset rather than failing the page.
+This walkthrough assumes that the repository-catalog consumer and DB snapshot
+API route from the companion stack (for example, #1960 and its backend chain),
+or their merged equivalents, are composed with this UI branch. The native
+selector comes from that consumer. Without the composed stack, this branch
+intentionally uses the curated static fallback. The DB-backed snapshot is
+always an optional enhancement over the bundled static asset: any failure on
+that path — network error, non-2xx status, an oversized or malformed body, or a
+provenance mismatch — falls back to the static asset rather than failing the
+page.
 
 ## Five-to-seven-minute flow
 
 ### 1. Establish provenance and limits
 
-1. Open `/`, leave `https://github.com/ohdearquant/khive` in the repository
-   field, and select **Open repository**.
-2. Point to the DB-snapshot badge, pinned SHA, ingestion time, and exporter
-   identity.
+1. Open `/` and confirm that the native **Repository analysis** selector has
+   discovered `https://github.com/ohdearquant/khive`; select it if needed.
+2. Point to the configured-catalog status, DB-snapshot badge, pinned SHA,
+   ingestion time, and exporter identity. The public repository field remains a
+   local lookup, not an arbitrary ingest trigger.
 3. Point to the overview: this snapshot contains 43 packages, 658 modules, 938
    commits, and five captured dependency SCCs.
 
@@ -108,18 +113,24 @@ Say:
 3. Focus `stores/graph_tests.rs` paired with `stores/graph.rs`: they changed
    together 24 times in the 365-day window, but the complete captured structure
    edge page has no direct dependency edge between them.
-4. Open either endpoint. The shared inspector, endpoint module, URL, and active
-   Structure view stay synchronized in the current session. A shared URL restores
-   the repository, snapshot, endpoint module, and Structure view; package
-   selection, lens choice, and pair focus are not yet URL-addressed, so reselect
-   them after opening the link. Track full lens replay as follow-up work in #1887.
+4. Open either endpoint. The shared inspector and URL stay synchronized. Copy or
+   reload the URL and show that it restores the repository, pinned snapshot,
+   endpoint module, Structure view, `khive-db` package, Hidden coupling lens,
+   and canonical focused pair. Browser Back and Forward replay those transitions.
+5. In the endpoint inspector, select **Copy evidence brief**. Paste the bounded
+   Markdown into an issue, Claude, or Codex. Point out its source, full SHA,
+   capture time, exporter, canonical URL, selected module, SCC status, focused
+   pair, analysis windows, coverage/truncation disclosures, source-role caveat,
+   and final instruction to inspect the named source and confirm or refute the
+   candidate.
 
 Say:
 
 > Co-change is not a call edge or an instruction to merge files. This top pair
 > is healthy test-to-implementation coordination. The visible path and
 > source-role caveat let us falsify the scary interpretation instead of turning
-> a rank into a defect.
+> a rank into a defect. The copied brief preserves that distinction: it is a
+> reproducible handoff for source verification, not a generated defect report.
 
 If time permits, open the full **Hidden coupling** ranking: its top captured
 pair is `khive-pack-comm/tests/integration.rs` with `src/handlers.rs`, at 39
@@ -172,6 +183,9 @@ Say:
   staffing.
 - Hidden-coupling support is co-change frequency in the declared window, not
   causality.
+- The copied evidence brief contains bounded captured metadata, not repository
+  source or a live query. It is capped at 49,152 characters and explicitly
+  discloses any optional detail omitted to stay within that bound.
 - The browser receives validated JSON transport bytes. “DB-backed” describes how
   the immutable analysis is produced and selected, not live browser-side SQLite
   access.

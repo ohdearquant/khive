@@ -438,7 +438,13 @@
   border-bottom: 1px solid var(--repo-border);
   padding: 16px;
 }
-.inspectorHeader > span {
+.inspectorHeaderTop {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+.inspectorHeaderTop > span {
   align-items: center;
   color: var(--repo-green);
   display: flex;
@@ -448,9 +454,38 @@
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
-.inspectorHeader > span svg {
+.inspectorHeaderTop > span svg {
   height: 12px;
   width: 12px;
+}
+.inspectorHeaderTop button {
+  align-items: center;
+  background: color-mix(in srgb, var(--repo-green) 8%, var(--khive-color-transparent));
+  border: 1px solid color-mix(in srgb, var(--repo-green) 34%, var(--repo-border));
+  border-radius: 6px;
+  color: var(--repo-green);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 8px;
+  font-weight: 750;
+  gap: 5px;
+  padding: 6px 8px;
+}
+.inspectorHeaderTop button:hover,
+.inspectorHeaderTop button:focus-visible {
+  background: color-mix(in srgb, var(--repo-green) 14%, var(--khive-color-transparent));
+}
+.inspectorHeaderTop button svg {
+  height: 11px;
+  width: 11px;
+}
+.copyStatus {
+  color: var(--repo-muted);
+  display: block;
+  font-size: 8px;
+  line-height: 1.4;
+  margin-top: 7px;
 }
 .breadcrumb {
   align-items: center;
