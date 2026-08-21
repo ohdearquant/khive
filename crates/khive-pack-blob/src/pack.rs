@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, ParamDef, Visibility};
+use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
 use crate::{handlers, BlobPack, PACK_NAME};
 
@@ -22,6 +22,7 @@ pub(crate) static BLOB_HANDLERS: [HandlerDef; 3] = [
             param_type: "string",
             required: true,
             description: "Base64-encoded object content.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -36,6 +37,7 @@ pub(crate) static BLOB_HANDLERS: [HandlerDef; 3] = [
                 param_type: "string",
                 required: true,
                 description: "64-char lowercase-hex BLAKE3 content reference returned by blob.put.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "range",
@@ -43,6 +45,7 @@ pub(crate) static BLOB_HANDLERS: [HandlerDef; 3] = [
                 required: false,
                 description: "Optional { offset, length } byte range, applied to the fetched \
                                object (the store has no partial-read capability).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -58,6 +61,7 @@ pub(crate) static BLOB_HANDLERS: [HandlerDef; 3] = [
             param_type: "string",
             required: true,
             description: "64-char lowercase-hex BLAKE3 content reference returned by blob.put.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
 ];

@@ -23,8 +23,8 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, NoteKindSpec, NoteLifecycleSpec,
-    PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode, NoteKindSpec,
+    NoteLifecycleSpec, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
     RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
@@ -3576,6 +3576,7 @@ pub(crate) mod tests {
                 param_type: "object",
                 required: false,
                 description: "invalid collision with the request envelope",
+                resolution_mode: IdResolutionMode::NotApplicable,
             }],
         }];
     }
@@ -3712,6 +3713,7 @@ pub(crate) mod tests {
                     param_type: "string",
                     required: false,
                     description: "invalid collision with the request envelope",
+                    resolution_mode: IdResolutionMode::NotApplicable,
                 }],
             }];
         }
@@ -8373,12 +8375,14 @@ mod help_tests {
             param_type: "string",
             required: true,
             description: "Granular kind (concept | document | ...).",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
         ParamDef {
             name: "name",
             param_type: "string",
             required: false,
             description: "Human-readable name.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
     ];
 
@@ -8388,12 +8392,14 @@ mod help_tests {
             param_type: "string",
             required: true,
             description: "Semantic recall query.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
         ParamDef {
             name: "limit",
             param_type: "integer",
             required: false,
             description: "Maximum memories to return.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
     ];
 
@@ -8409,6 +8415,7 @@ mod help_tests {
         param_type: "uuid",
         required: true,
         description: "UUID of the record to fetch.",
+        resolution_mode: IdResolutionMode::NotApplicable,
     }];
 
     // Mirrors link's real source_id/target_id params (both `param_type:
@@ -8420,12 +8427,14 @@ mod help_tests {
             param_type: "uuid",
             required: true,
             description: "Source node UUID.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
         ParamDef {
             name: "target_id",
             param_type: "uuid",
             required: true,
             description: "Target node UUID.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
     ];
 

@@ -5348,6 +5348,7 @@ static FAKE_SUBHANDLER_HANDLERS: [HandlerDef; 2] = [
             param_type: "string",
             required: false,
             description: "Internal embedding input.",
+            resolution_mode: khive_types::IdResolutionMode::NotApplicable,
         }],
     },
 ];
