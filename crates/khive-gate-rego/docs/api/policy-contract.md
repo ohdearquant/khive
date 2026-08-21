@@ -74,15 +74,23 @@ assert!(gate.check(&req).unwrap().is_allow());
 
 ## Evaluation failures and fail-closed behavior
 
-Per ADR-018, a `GateError` returned from `Gate::check` is treated as a fail-open infrastructure
-failure by the dispatcher. `RegoGate` therefore converts policy evaluation uncertainty into an
-explicit `Ok(GateDecision::Deny)`:
+Per ADR-018 and ADR-129, a `GateError` returned from `Gate::check` is audited and refused as an
+infrastructure outage by the dispatcher. `RegoGate` converts policy evaluation uncertainty into
+an explicit `Ok(GateDecision::Deny)` so it remains distinguishable as a policy denial:
 
 - a poisoned engine mutex;
 - an evaluation error or missing rule;
 - an undefined result because no rule branch matched;
 - a result that cannot be serialized; or
 - JSON that is not a valid `GateDecision`.
+
+The evaluation-error and unserializable-result branches use a **static, classified deny
+reason** — `"policy evaluation failed"` and `"policy produced an unserializable decision"`
+respectively — and never interpolate the underlying `regorus` error text or echo any part of
+the input that triggered it. This crate has no access to the runtime's log masker, so the raw
+detail is dropped entirely rather than risk an unmasked leak on the wire or in `tracing`;
+operators reproduce the failing policy/input locally to debug it. The two reasons are
+deliberately distinct so the failure modes stay distinguishable to a caller.
 
 Request serialization is an internal pre-evaluation failure and remains `GateError::Internal`.
 Invalid custom entrypoints should still be rejected at construction through

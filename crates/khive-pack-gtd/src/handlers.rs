@@ -828,6 +828,10 @@ pub async fn prepare_transition(
         )));
     }
 
+    // Carries forward `note.properties`, which was already reservation-checked
+    // at task creation (`gtd.assign` writes through `KhiveRuntime::create_note`);
+    // every key inserted below is a fixed literal, so no caller input can
+    // create or replace the reserved top-level key through this merge.
     let updated_at = next_lifecycle_updated_at(note.updated_at)?;
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     let obj = props.as_object_mut().ok_or_else(|| {
@@ -929,6 +933,10 @@ pub async fn prepare_complete(
         )));
     }
 
+    // Carries forward `note.properties`, which was already reservation-checked
+    // at task creation (`gtd.assign` writes through `KhiveRuntime::create_note`);
+    // every key inserted below is a fixed literal, so no caller input can
+    // create or replace the reserved top-level key through this merge.
     let completed_at = Utc::now().to_rfc3339();
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     let obj = props.as_object_mut().ok_or_else(|| {

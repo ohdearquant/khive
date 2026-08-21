@@ -242,8 +242,7 @@ contract is shape-stable. A deployment that wants these reductions on every call
 
 In `format=auto` and `format=table`, the `full_id` field (the 36-character canonical UUID emitted
 alongside the 8-character `id` shortcode) is omitted from the output. `full_id` is retained in
-`format=json`, in `PresentationMode::Verbose`, and when the caller passes the existing
-`include_full_id=true` envelope override (ADR-045 §"`include_full_id` override").
+`format=json` and in `PresentationMode::Verbose`.
 
 **This partially supersedes the P-C1 code rule in `crates/khive-runtime/src/presentation.rs`**, which
 treated `full_id` as a stable chaining handle kept unconditionally in all modes. That rule was
@@ -435,8 +434,6 @@ retained as an extension point for cases where the generic rules produce a poor 
 - `PresentationMode` and its Agent-mode transformation rules are unchanged. Callers that set
   `presentation=verbose` receive the canonical shape regardless of `format`, because `Verbose` mode
   bypasses the redundancy-reduction pass.
-- The existing `include_full_id=true` envelope override (ADR-045 §"`include_full_id` override")
-  continues to work and takes effect before the `full_id` suppression rule in §7.1.
 - A future `yaml` variant would need a YAML emitter. `serde_yaml` is NOT currently a workspace
   dependency (verified 2026-06-27), so adding `yaml` later means either taking on `serde_yaml` as a
   new optional dependency or writing a small in-tree minimal-YAML emitter over the pruned `Value`.
@@ -474,8 +471,9 @@ resolution, when `default_output_format` is still `None`.
 
 ### Shape detection sequence
 
-The shape detector operates on the final post-presentation `serde_json::Value`, before the
-redundancy-reduction pass runs. Detection precedence:
+The shape detector operates on the final post-presentation `serde_json::Value` after the
+redundancy-reduction pass has run (or on the unreduced value when that pass is skipped — see the
+next subsection). Detection precedence:
 
 1. If the pack has registered a bespoke renderer for this verb and this format, invoke it.
 2. If the value contains a key whose value is a JSON array of two or more objects sharing a
@@ -502,12 +500,24 @@ before shape detection. The pass is skipped entirely when `format=json` or
   callers that parse must stay on `json` if they do.
 - Pack handlers require no changes. The canonical `serde_json::Value` return shape is unchanged.
 
+## Amendment 1 (2026-08-09): canonical-ID escape hatches and closed envelope
+
+The original §7.1 and Neutral text inherited an `include_full_id=true` request-envelope
+override from ADR-045. No shipped `RequestParams`, daemon frame, or rendering path ever
+implemented that field. ADR-045 Amendment 1 withdraws the phantom override; the lossless
+`format=json` default and `presentation=verbose` are the two canonical-ID retention paths.
+
+The same amendment closes the generated MCP tool schema and serde decoder to unknown
+outer-envelope fields. This makes format and presentation misspellings explicit validation
+errors instead of silent requests for the server defaults. It does not change the DSL's
+per-verb validation rules or the canonical handler result shape.
+
 ## References
 
 - ADR-016 (Request DSL) — short-UUID-prefix resolution; `$prev` chain semantics; `RequestParams`
   wire shape
 - ADR-035 (CLI Config and Auto-Embed) — `khive.toml` `[runtime]` operator config; `RuntimeSectionConfig` shape
-- ADR-045 (Verb Response Presentation Modes) — `PresentationMode`; `include_full_id` override;
+- ADR-045 (Verb Response Presentation Modes) — `PresentationMode`; canonical-ID retention;
   §3.5 error envelope invariant; Chain `$prev` invariant; partially superseded on `full_id` default
   behavior by §7.1 of this ADR
 - Measurement artifact: local output-verbosity table-flavor measurement notes.

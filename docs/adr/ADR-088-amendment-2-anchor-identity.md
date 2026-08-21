@@ -5,7 +5,7 @@
 **Amends**: [ADR-088 Amendment 1](ADR-088-amendment-1-git-digest.md)
 (anchor-resolution clause of the `project`
 parameter)
-**Tracking**: issue #1173
+**Tracking**: issues #1173, #1708
 
 ## Context
 
@@ -44,17 +44,23 @@ Every digest source resolves to one canonical **repo slug** stored in
   alternate-port ssh remote converges with its https spelling, at the cost
   of aliasing genuinely distinct git servers on different ports of one
   host — an accepted residual. Inputs that do not yield a host plus at
-  least two path segments, or that contain empty segments, do not
-  normalize (they are not silently coerced).
+  least two path segments, or that contain empty segments, do not normalize
+  to a slug. An HTTPS value accepted by the top-level `source` parser still
+  needs a stable identity in that case, so a shared fallback canonicalizer
+  strips credentials, query/fragment material, trailing slashes, and a
+  trailing `.git` suffix from its identity while retaining the original URL
+  for clone/fetch. Stored-URL reconciliation calls that same canonicalizer
+  only for values accepted by the HTTPS source grammar;
+  arbitrary malformed strings are not silently coerced into identities.
 - A local path derives the same slug from its configured `origin` remote.
 - A local repository with no `origin` remote (or an origin that does not
   normalize) uses the fallback identity `local:<canonicalized-path>`.
 
 `properties.repo_url` remains display metadata; it is never the matching key
-for new anchors. The persisted `repo_url` is credential-redacted: userinfo,
-query, and fragment components of the caller-supplied URL are stripped before
-storage, so an access token embedded in a source URL is never written into
-entity properties.
+for new anchors. The persisted `repo_url` is credential-redacted: userinfo
+from either a scheme URL or SCP-style shorthand, plus query and fragment
+components, is stripped before storage, so an access token embedded in a
+source URL is never written into entity properties.
 
 ### Resolution order (replaces the Amendment 1 clause)
 
@@ -64,19 +70,30 @@ entity properties.
    separate ingests), the handler deterministically selects the oldest by
    `created_at` and surfaces the condition as a report warning naming the
    duplicate anchor ids; it never picks arbitrarily or silently.
-2. Otherwise match on legacy `properties.repo_url` — first by exact string
-   equality, then by normalization: a legacy anchor without `repo_slug`
-   whose stored `repo_url` normalizes to the same slug also matches (this
+2. Otherwise match on stored `properties.repo_url` evidence — first by exact
+   string equality among pre-slug anchors, then by normalization among every
+   live anchor whose `repo_slug` is absent **or differs from the canonical
+   source slug**. A stored URL that normalizes to the canonical slug is
+   authoritative reconciliation evidence even when the row already carries
+   a hand-written, stale, or otherwise non-canonical slug (#1708). This
    reconciles an anchor created from one spelling with a later ingest under
-   another, e.g. a local-path anchor with a subsequent remote-URL digest).
-   Step-2 matches, exact or normalized, resolve multi-candidate cases by
-   the same rule as step 1: oldest `created_at` (id tie-break) selected
-   deterministically, with the remainder surfaced in the same report
-   warning — never an arbitrary or silent pick. On a hit, backfill
-   `properties.repo_slug` onto the matched entity, and redact its stored
-   `properties.repo_url` (userinfo, query, fragment) in the same patch —
-   the lazy-upgrade path also closes out any credential-bearing legacy URL
-   it touches. Existing anchors therefore need no migration.
+   another, including a local-path anchor with a subsequent remote-URL
+   digest. Exact and normalized tiers each select the oldest candidate by
+   `created_at` (id tie-break); exact-string resolution precedes normalized
+   resolution. The selected anchor is backfilled with the canonical
+   `properties.repo_slug`, and its stored `properties.repo_url` is redacted
+   (scheme or SCP-style userinfo, query, fragment) in the same patch. The
+   lazy-upgrade path also closes out any credential-bearing legacy URL it
+   touches. A remote-less local path's `local:<canonical-path>` fallback is a
+   canonical identity and participates in this normalized reconciliation.
+
+   A canonical step-1 winner always keeps precedence, even when a normalized
+   URL-equivalent anchor with a conflicting slug is older. Such anchors are
+   not rewritten behind the winner; they are surfaced as duplicate or
+   conflicting anchor ids in the same report warning. The same warning also
+   names unselected candidates from an exact or normalized step-2 match.
+   Candidate enumeration and warning order remain deterministic, and an id
+   is emitted at most once. Existing anchors therefore need no migration.
 3. Otherwise create the anchor with both `repo_slug` and `repo_url` set.
 
 Anchor creation carries no uniqueness constraint, so two concurrent digests
@@ -117,6 +134,8 @@ documented limitation, consistent with hard-delete cascade semantics.
 
 - All spellings of one repository converge on one anchor and one corpus;
   same-basename distinct repositories no longer collapse.
-- Legacy anchors upgrade lazily on first contact, with no migration step.
+- Legacy and present-but-noncanonical anchors upgrade lazily on first contact,
+  with no migration step; conflicts beside an existing canonical winner are
+  visible for deliberate curation.
 - Deleting an anchor while its corpus remains live is surfaced to the caller
   instead of silently duplicated around.

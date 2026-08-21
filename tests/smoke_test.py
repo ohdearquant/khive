@@ -344,7 +344,8 @@ def main():
         print(f"  [ok] get entity — flat response kind={fetched['kind']}")
 
         # 5. List entities
-        entities = call_verb(proc, "list", {"kind": "entity", "entity_kind": "concept"})
+        entity_page = call_verb(proc, "list", {"kind": "entity", "entity_kind": "concept"})
+        entities = entity_page["items"]
         assert len(entities) == 2, f"expected 2 concepts, got {len(entities)}"
         print(f"  [ok] list entities — {len(entities)} concepts")
 
@@ -389,7 +390,8 @@ def main():
         print(f"  [ok] neighbors — 1 inbound + 1 outbound to LoRA")
 
         # 9. Edge list
-        edges = call_verb(proc, "list", {"kind": "edge", "source_id": qlora_id})
+        edge_page = call_verb(proc, "list", {"kind": "edge", "source_id": qlora_id})
+        edges = edge_page["items"]
         assert len(edges) == 1
         print(f"  [ok] list edges")
 
@@ -419,7 +421,8 @@ def main():
         print(f"  [ok] create note — observation ({note_id[:8]}...)")
 
         # 13. List notes
-        notes = call_verb(proc, "list", {"kind": "note", "note_kind": "observation"})
+        note_page = call_verb(proc, "list", {"kind": "note", "note_kind": "observation"})
+        notes = note_page["items"]
         assert len(notes) == 1
         print(f"  [ok] list notes — {len(notes)} observation")
 

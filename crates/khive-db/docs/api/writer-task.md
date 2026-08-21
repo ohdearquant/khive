@@ -40,20 +40,89 @@ writer-task acquisition class once per dequeued top-level request or successful
 `PoolConfig::write_queue_capacity` resolves the default from
 `KHIVE_WRITE_QUEUE_CAPACITY`).
 
+## Proposed disk-reserve admission (#1844; not implemented)
+
+[ADR-154](../../../../docs/adr/ADR-154-sqlite-disk-reserve-admission.md) proposes
+the disk-reserve contract. This section is an implementation map, not a claim
+about current behavior.
+
+The writer task does not sample free space when a caller enters the bounded
+channel. At execution time it acquires the shared volume lease, successfully
+executes `BEGIN IMMEDIATE`, and then probes the volume before invoking the
+request closure. A refusal or probe failure runs `ROLLBACK` and replies with
+the typed capacity error; a successful rollback does not retire the task. The
+lease remains held through the ordinary `COMMIT` or `ROLLBACK`.
+
+Every path follows the same lock order: volume lease, SQLite writer
+acquisition, capacity probe, first logical write. Top-level requests acquire
+the same lease and probe immediately before their first SQLite call because
+they deliberately have no explicit `BEGIN`. Pooled/standalone writers and
+startup migrations receive equivalent admission outside this drain loop.
+Volume-lease acquisition has its own configured deadline; it does not reuse
+the queue-only `write_admission_deadline_ms` governed by ADR-131.
+
+The two current migration bootstrap writes happen before a migration
+transaction exists: `apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and
+`run_migrations_locked` executes `MIGRATION_TRACKING_TABLE`. Each acquires the
+volume lease and probes immediately before its autocommit `execute_batch`,
+skips that call on refusal, and holds the lease until the connection returns
+to autocommit. Subsequent migration transactions use the ordinary
+post-`BEGIN` probe.
+
+Transaction terminators, checkpointing, diagnostics, reader release, and
+recovery are explicit refusal bypasses. The guard therefore belongs at the
+logical-request boundary, never inside generic statement execution. Native
+`SQLITE_FULL` remains a separate higher-severity stage and is not rendered as
+a successful capacity refusal. Checkpoint bypass includes PASSIVE,
+ADR-091's scheduled threshold-armed `maybe_truncate`, and operator-authorized
+stronger checkpoints.
+
+## Writer-stage telemetry (#1849)
+
+Every completed writer-task request records a backend-scoped in-memory sample
+with four independent stages: `queue_wait_micros` starts before bounded-channel
+admission and ends when the drain loop dequeues the request;
+`transaction_acquire_micros` measures only `BEGIN IMMEDIATE`; `body_micros`
+measures the typed operation closure; and `commit_micros` measures only
+SQLite's `COMMIT`. `total_micros`, queue depth at entry, and observation time
+remain siblings. A top-level request has zero acquisition/commit stages; a
+request that fails before a stage runs likewise reports zero for that stage.
+Rollback/recovery work remains visible in the difference between the total
+and named stages rather than being falsely attributed to COMMIT.
+
+`last_writer_stage_observation(pool)` is a pure per-backend read used by the
+daemon metrics frame. When a request crosses the existing slow-write
+threshold, the durable `slow_write` sink row also carries the four stage
+fields (while retaining `elapsed_ms` and `queue_depth` for compatibility).
+Observation is completed before the oneshot reply wakes the caller, so a
+successful response cannot race ahead of its telemetry sample.
+
 ## `run_writer_task` — drain loop and failure modes
 
 See `crates/khive-db/src/writer_task.rs` — private fn `run_writer_task`.
 
-A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from lock
-contention with an unmigrated writer path still holding the pool's writer
-mutex — reachable while any write path outside the routed-call
-classification table in `writer_task.rs`'s module docs still opens its own
-writer; strict routing per ADR-136 D1 has not landed) replies the request's
-error via `AnyWriteRequest::reply_error` without ever invoking the
+A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from an explicitly
+exempt writer or a non-strict compatibility fallback still holding another
+writer connection) replies the request's error via
+`AnyWriteRequest::reply_error` without ever invoking the
 request's operation closure via `AnyWriteRequest::execute_and_reply`.
-There is no watchdog/retry story for a failed `BEGIN` (ADR-067
-Component D remains future work); the connection simply tries
-`BEGIN IMMEDIATE` fresh on the next request.
+For transaction-wrapped requests, the scoped `writer_task_tx` registry span
+is dropped before the oneshot reply wakes the caller, both after a completed
+transaction and after a failed `BEGIN`. A caller that has observed its reply
+therefore cannot still observe that request as an open SQL transaction.
+When the raw SQLite code is `SQLITE_BUSY` or `SQLITE_LOCKED`, the caller
+receives `StorageError::WriterTaskBusy` with the connection's configured busy
+timeout. This is retryable because the operation closure never ran; it does
+not mean queue admission failed. Any other `BEGIN` error retains the generic
+pool failure. The connection tries `BEGIN IMMEDIATE` fresh on the next request,
+so transient contention does not retire the writer task. Automatic internal
+retry remains outside this seam.
+
+Request-path stores refresh a missing construction-time handle at write time.
+Strict routing therefore fails closed before any store fallback, and a
+non-strict fallback emits a store-specific `direct_route_violation`. The
+strict-default flip is intentionally outside this tranche: ADR-135 F2 and
+ADR-136 D2 still gate it on accepted production A/B and release evidence.
 
 Exits normally when every `WriterTaskHandle` clone is dropped and the channel
 closes (`rx.recv()` returns `None`). A panic while executing a request, a failed

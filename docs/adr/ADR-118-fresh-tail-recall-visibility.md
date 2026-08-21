@@ -7,7 +7,8 @@
 delta-log/watermark classifier), [ADR-107](ADR-107-memory-ann-lifecycle.md) (Memory ANN
 lifecycle — eventual consistency contract)
 **References**: issue #1143 (write-to-visibility regression), issue #752 (process-local
-generation counter), issue #942 (fresh-query scoring quality — related, out of scope)
+generation counter), issue #942 (fresh-query scoring quality — related, out of scope), issue
+#1802 (process-global fresh-tail toggle race)
 
 ## Context
 
@@ -212,7 +213,9 @@ contradicted by it.
 
 No new tuning knob is introduced. One escape hatch is added for operational isolation:
 `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Values other than `0`
-are ignored.
+are ignored. The environment is sampled once during `KhiveRuntime` construction;
+memory and knowledge serving read that immutable per-runtime policy and never re-read or
+mutate process-global environment state on a request path.
 
 ### 4. Scope: both delta-log consumers
 

@@ -22,8 +22,8 @@
 //! `touch_beacon`) and the identity primitives (`is_process_alive`/
 //! `process_start_time_secs`) need to run on every platform — a Windows
 //! session still needs to report itself into the sidecar. Directory
-//! enumeration (`enumerate_live`, and the OS-derived holder census it
-//! anchors to) is Unix-only: its sole caller is the daemon's checkpoint task,
+//! enumeration (`enumerate_live`/`housekeep_live`, and the OS-derived holder
+//! census they anchor to) is Unix-only: its sole caller is the daemon's checkpoint task,
 //! and daemon mode itself requires Unix (`khive-mcp/src/serve.rs` refuses
 //! `--daemon` on non-Unix). The Unix write path is additionally
 //! **handle-bound at every path component**: reaching the sidecar directory
@@ -1063,6 +1063,16 @@ mod windows_impl {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+    #[cfg(test)]
+    std::thread_local! {
+        static OPEN_DIR_HANDLE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_dir_handle_call_count() -> usize {
+        OPEN_DIR_HANDLE_CALLS.with(std::cell::Cell::get)
+    }
+
     fn to_wide_nul(path: &Path) -> io::Result<Vec<u16>> {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         if wide.contains(&0) {
@@ -1324,6 +1334,9 @@ mod windows_impl {
     }
 
     fn open_dir_handle(dir: &Path) -> io::Result<fs::File> {
+        #[cfg(test)]
+        OPEN_DIR_HANDLE_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         lexical_prefilter(dir)?;
         let expected = fs::canonicalize(dir)?;
         let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
@@ -1463,9 +1476,9 @@ mod windows_impl {
         Ok(())
     }
 
-    pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
+    fn open_or_create_dir_handle(dir: &Path) -> io::Result<fs::File> {
         match open_dir_handle(dir) {
-            Ok(_) => Ok(()),
+            Ok(handle) => Ok(handle),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 ensure_ancestors_not_reparse(dir)?;
                 if let Err(create_error) = create_owner_only_dir(dir) {
@@ -1473,10 +1486,14 @@ mod windows_impl {
                         return Err(create_error);
                     }
                 }
-                open_dir_handle(dir).map(|_| ())
+                open_dir_handle(dir)
             }
             Err(error) => Err(error),
         }
+    }
+
+    pub(super) fn ensure_sidecar_dir(dir: &Path) -> io::Result<()> {
+        open_or_create_dir_handle(dir).map(|_| ())
     }
 
     fn open_relative(
@@ -1633,7 +1650,7 @@ mod windows_impl {
         tmp_name: &str,
         body: &[u8],
     ) -> io::Result<()> {
-        let dir_handle = open_dir_handle(dir)?;
+        let dir_handle = open_or_create_dir_handle(dir)?;
         remove_relative_if_exists(&dir_handle, tmp_name)?;
         let mut tmp_file = open_relative(
             &dir_handle,
@@ -1962,9 +1979,16 @@ const CENSUS_BUFFER_NEGOTIATION_ATTEMPTS: usize = 4;
 fn negotiate_buffer<T: Default + Clone>(
     size_call: impl Fn() -> std::os::raw::c_int,
     data_call: impl Fn(*mut std::os::raw::c_void, std::os::raw::c_int) -> std::os::raw::c_int,
+    should_stop: &impl Fn() -> bool,
 ) -> io::Result<(Vec<T>, bool)> {
     let item_size = std::mem::size_of::<T>();
     for attempt in 0..CENSUS_BUFFER_NEGOTIATION_ATTEMPTS {
+        if should_stop() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "WAL holder census cancelled",
+            ));
+        }
         let needed = size_call();
         if needed <= 0 {
             return Err(io::Error::last_os_error());
@@ -1998,6 +2022,14 @@ fn negotiate_buffer<T: Default + Clone>(
 /// listing, which only sees PIDs that already wrote something there.
 #[cfg(target_os = "macos")]
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
+    census_holders_until(db_path, || false)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn census_holders_until<C>(db_path: &Path, should_stop: C) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
     use std::os::raw::{c_int, c_void};
     use std::os::unix::fs::MetadataExt;
 
@@ -2006,6 +2038,13 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     const PROC_PIDFDVNODEPATHINFO: c_int = 2;
     const PROX_FDTYPE_VNODE: u32 = 1;
     const MAXPATHLEN: usize = 1024;
+
+    if should_stop() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WAL holder census cancelled",
+        ));
+    }
 
     #[repr(C)]
     #[derive(Clone, Default)]
@@ -2099,11 +2138,18 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
     let (pid_buf, pid_list_truncated): (Vec<i32>, bool) = negotiate_buffer(
         || unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) },
         |buf_ptr, buf_bytes| unsafe { proc_listpids(PROC_ALL_PIDS, 0, buf_ptr, buf_bytes) },
+        &should_stop,
     )?;
 
     let mut holders = std::collections::HashSet::new();
     let mut uninspectable: Vec<u32> = Vec::new();
     for &pid in &pid_buf {
+        if should_stop() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "WAL holder census cancelled",
+            ));
+        }
         if pid <= 0 {
             continue;
         }
@@ -2114,9 +2160,13 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
             |buf_ptr, buf_bytes| unsafe {
                 proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buf_ptr, buf_bytes)
             },
+            &should_stop,
         ) {
             Ok(v) => v,
             Err(e) => {
+                if e.kind() == io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
                 // A failed sizing/listing call means either the PID exited
                 // between `proc_listpids` and here (ESRCH — positively
                 // gone, safe to skip) or the inspection itself failed (most
@@ -2137,6 +2187,12 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
             uninspectable.push(pid as u32);
         }
         for fdinfo in &fd_buf {
+            if should_stop() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "WAL holder census cancelled",
+                ));
+            }
             if fdinfo.proc_fdtype != PROX_FDTYPE_VNODE {
                 continue;
             }
@@ -2338,7 +2394,22 @@ fn proc_mounts_restricted_in(mountinfo: &str) -> Option<bool> {
 /// the walk incomplete rather than being dropped via `.flatten()`.
 #[cfg(target_os = "linux")]
 pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
+    census_holders_until(db_path, || false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn census_holders_until<C>(db_path: &Path, should_stop: C) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
     use std::os::unix::fs::MetadataExt;
+
+    if should_stop() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WAL holder census cancelled",
+        ));
+    }
 
     // File-identity target, not a path target: holders are matched on
     // (device, inode) so a process that opened the database through a hard
@@ -2361,6 +2432,12 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
 
     let proc_dir = fs::read_dir("/proc")?;
     for entry_result in proc_dir {
+        if should_stop() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "WAL holder census cancelled",
+            ));
+        }
         let proc_entry = match entry_result {
             Ok(e) => e,
             Err(_) => {
@@ -2388,6 +2465,12 @@ pub fn census_holders(db_path: &Path) -> io::Result<CensusResult> {
             }
         };
         for fd_result in fds {
+            if should_stop() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "WAL holder census cancelled",
+                ));
+            }
             let fd_entry = match fd_result {
                 Ok(e) => e,
                 Err(_) => {
@@ -2445,6 +2528,22 @@ pub fn census_holders(_db_path: &Path) -> io::Result<CensusResult> {
     ))
 }
 
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+pub(crate) fn census_holders_until<C>(_db_path: &Path, should_stop: C) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
+    if should_stop() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WAL holder census cancelled",
+        ));
+    }
+    Err(io_other(
+        "OS-derived holder census has no implementation on this Unix target",
+    ))
+}
+
 /// Ensure `dir` exists and is trustworthy: a real directory (never a
 /// symlink or reparse-point component), and accessible only to its owner:
 /// Unix mode `0700`, or a protected owner-only DACL on Windows. Refuses —
@@ -2476,7 +2575,6 @@ pub fn write_heartbeat(dir: &Path, heartbeat: &WalpinHeartbeat) -> io::Result<()
     }
     #[cfg(windows)]
     {
-        windows_impl::ensure_sidecar_dir(dir)?;
         windows_impl::write_atomic(dir, &target, &tmp, &body)
     }
 }
@@ -2558,7 +2656,6 @@ pub fn write_beacon(dir: &Path, beacon: &WalpinBeacon) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        windows_impl::ensure_sidecar_dir(dir)?;
         windows_impl::write_atomic(dir, &target, &tmp, &body)
     }
 }
@@ -2806,16 +2903,43 @@ fn epoch_abs_diff(a: i64, b: i64) -> u64 {
 /// existing-but-untrustworthy one.
 #[cfg(unix)]
 pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<WalpinReport> {
-    enumerate_live_bounded(dir, sweep_interval, MAX_SIDECAR_ENTRIES)
+    enumerate_live_bounded(
+        dir,
+        sweep_interval,
+        MAX_SIDECAR_ENTRIES,
+        EnumerationPurpose::Attribution,
+    )
 }
 
-/// Ceiling on sidecar entries listed and read per enumeration. Both the
-/// `readdir` loop and the per-entry open/fstat/read/parse run while the
-/// checkpoint writer guard is held, so enumeration work is bounded by
-/// policy, not by directory content — the entry-count sibling of the
-/// per-entry `MAX_SIDECAR_ENTRY_BYTES` bound. A real population is one
-/// heartbeat/beacon pair per live process; a directory holding more than
-/// this contributes one `CAP_SENTINEL_PID` `Unknown` marker (fail-closed:
+/// Run the ordinary-tick, bounded sidecar housekeeping pass.
+///
+/// This uses the same trust checks, liveness classification, and
+/// `MAX_SIDECAR_ENTRIES` work bound as [`enumerate_live`], but removes only
+/// residue whose producer is positively dead or whose PID has been reused.
+/// Malformed, uninspectable, and live-but-stale records remain on disk so a
+/// later TRUNCATE-no-progress attribution pass can consume their `Unknown`
+/// evidence instead of observing a falsely clean directory.
+#[cfg(unix)]
+pub(crate) fn housekeep_live(
+    dir: &Path,
+    legacy_sweep_interval: Duration,
+) -> io::Result<WalpinReport> {
+    enumerate_live_bounded(
+        dir,
+        legacy_sweep_interval,
+        MAX_SIDECAR_ENTRIES,
+        EnumerationPurpose::Housekeeping,
+    )
+}
+
+/// Ceiling on sidecar entries listed and read per enumeration. After ADR-091
+/// Amendment 5 there is no checkpoint writer guard on this path. For daemon
+/// checkpoint callers, the cap instead bounds the per-tick filesystem work
+/// admitted to the awaited blocking worker, the latency attributable to that
+/// work, and memory retained by the returned report — the entry-count sibling
+/// of the per-entry `MAX_SIDECAR_ENTRY_BYTES` bound. A real population is one
+/// heartbeat/beacon pair per live process; a directory holding more than this
+/// contributes one `CAP_SENTINEL_PID` `Unknown` marker (fail-closed:
 /// unenumerated entries make the census inconclusive, never exonerated).
 #[cfg(unix)]
 const MAX_SIDECAR_ENTRIES: usize = 512;
@@ -2828,10 +2952,31 @@ const MAX_SIDECAR_ENTRIES: usize = 512;
 const CAP_SENTINEL_PID: u32 = 0;
 
 #[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnumerationPurpose {
+    /// Consume a fresh classification for a TRUNCATE-no-progress report.
+    /// Unknown trusted residue is retained in this pass's report and removed
+    /// from disk so it cannot accumulate indefinitely.
+    Attribution,
+    /// Ordinary healthy-tick collection. Only positively dead/reused-PID
+    /// residue may be removed; uncertain evidence stays available for a later
+    /// attribution pass.
+    Housekeeping,
+}
+
+#[cfg(unix)]
+impl EnumerationPurpose {
+    fn removes_uncertain_evidence(self) -> bool {
+        self == Self::Attribution
+    }
+}
+
+#[cfg(unix)]
 fn enumerate_live_bounded(
     dir: &Path,
     sweep_interval: Duration,
     max_entries: usize,
+    purpose: EnumerationPurpose,
 ) -> io::Result<WalpinReport> {
     let handle = match unix_impl::SidecarDirHandle::open_if_exists(dir) {
         Ok(Some(h)) => h,
@@ -2909,24 +3054,44 @@ fn enumerate_live_bounded(
             let heartbeat: WalpinHeartbeat = match serde_json::from_slice(&body) {
                 Ok(hb) => hb,
                 Err(_) => {
-                    // Fail closed: a malformed entry is removed so it cannot
-                    // wedge future ticks, but THIS tick's attribution for
-                    // the PID stays inconclusive — deletion is cleanup,
-                    // never exoneration.
-                    let _ = handle.unlink_tolerant(&name);
+                    if purpose.removes_uncertain_evidence() || !is_process_alive(pid) {
+                        let _ = handle.unlink_tolerant(&name);
+                    }
+                    wedged.insert(pid);
                     unknown.push((pid, "malformed walpin heartbeat entry"));
                     continue;
                 }
             };
+            if heartbeat.pid != pid {
+                if purpose.removes_uncertain_evidence() {
+                    let _ = handle.unlink_tolerant(&name);
+                }
+                wedged.insert(pid);
+                unknown.push((pid, "walpin heartbeat PID does not match its entry name"));
+                continue;
+            }
             let alive = is_process_alive(heartbeat.pid);
-            let identity_ok = alive
-                && process_start_time_secs(heartbeat.pid)
-                    .map(|actual| {
-                        epoch_abs_diff(actual, heartbeat.started_at) <= START_TIME_EPSILON_SECS
-                    })
-                    .unwrap_or(false);
+            let actual_start = if alive {
+                process_start_time_secs(heartbeat.pid)
+            } else {
+                None
+            };
+            let identity_ok = actual_start
+                .map(|actual| {
+                    epoch_abs_diff(actual, heartbeat.started_at) <= START_TIME_EPSILON_SECS
+                })
+                .unwrap_or(false);
             if !identity_ok {
-                let _ = handle.unlink_tolerant(&name);
+                let positively_dead_or_reused = !alive
+                    || actual_start.is_some_and(|actual| {
+                        epoch_abs_diff(actual, heartbeat.started_at) > START_TIME_EPSILON_SECS
+                    });
+                if purpose.removes_uncertain_evidence() || positively_dead_or_reused {
+                    let _ = handle.unlink_tolerant(&name);
+                } else {
+                    wedged.insert(pid);
+                    unknown.push((pid, "walpin heartbeat identity could not be verified"));
+                }
                 continue;
             }
             // ADR-091 Amendment 3 Plank F1: a record carrying
@@ -2946,7 +3111,9 @@ fn enumerate_live_bounded(
                 epoch_abs_diff(now, heartbeat.updated_at) <= window as u64
             };
             if !hb_fresh {
-                let _ = handle.unlink_tolerant(&name);
+                if purpose.removes_uncertain_evidence() {
+                    let _ = handle.unlink_tolerant(&name);
+                }
                 wedged.insert(pid);
                 unknown.push((pid, "stale walpin heartbeat"));
                 continue;
@@ -2956,22 +3123,42 @@ fn enumerate_live_bounded(
             let beacon: WalpinBeacon = match serde_json::from_slice(&body) {
                 Ok(b) => b,
                 Err(_) => {
-                    // Fail closed, as for a malformed heartbeat: cleanup,
-                    // never exoneration.
-                    let _ = handle.unlink_tolerant(&name);
+                    if purpose.removes_uncertain_evidence() || !is_process_alive(pid) {
+                        let _ = handle.unlink_tolerant(&name);
+                    }
+                    wedged.insert(pid);
                     unknown.push((pid, "malformed walpin beacon entry"));
                     continue;
                 }
             };
+            if beacon.pid != pid {
+                if purpose.removes_uncertain_evidence() {
+                    let _ = handle.unlink_tolerant(&name);
+                }
+                wedged.insert(pid);
+                unknown.push((pid, "walpin beacon PID does not match its entry name"));
+                continue;
+            }
             let alive = is_process_alive(beacon.pid);
-            let identity_ok = alive
-                && process_start_time_secs(beacon.pid)
-                    .map(|actual| {
-                        epoch_abs_diff(actual, beacon.started_at) <= START_TIME_EPSILON_SECS
-                    })
-                    .unwrap_or(false);
+            let actual_start = if alive {
+                process_start_time_secs(beacon.pid)
+            } else {
+                None
+            };
+            let identity_ok = actual_start
+                .map(|actual| epoch_abs_diff(actual, beacon.started_at) <= START_TIME_EPSILON_SECS)
+                .unwrap_or(false);
             if !identity_ok {
-                let _ = handle.unlink_tolerant(&name);
+                let positively_dead_or_reused = !alive
+                    || actual_start.is_some_and(|actual| {
+                        epoch_abs_diff(actual, beacon.started_at) > START_TIME_EPSILON_SECS
+                    });
+                if purpose.removes_uncertain_evidence() || positively_dead_or_reused {
+                    let _ = handle.unlink_tolerant(&name);
+                } else {
+                    wedged.insert(pid);
+                    unknown.push((pid, "walpin beacon identity could not be verified"));
+                }
                 continue;
             }
             // Beacon refresh rule: freshness is the entry's mtime (the
@@ -2981,7 +3168,9 @@ fn enumerate_live_bounded(
             let window = stale_window_secs(beacon.sweep_interval_ms, fallback_window_secs);
             let fresh = epoch_abs_diff(now, mtime_secs) <= window as u64;
             if !fresh {
-                let _ = handle.unlink_tolerant(&name);
+                if purpose.removes_uncertain_evidence() {
+                    let _ = handle.unlink_tolerant(&name);
+                }
                 wedged.insert(pid);
                 unknown.push((pid, "stale walpin beacon"));
                 continue;
@@ -2990,9 +3179,15 @@ fn enumerate_live_bounded(
         }
     }
 
+    for (pid, _) in &unknown {
+        wedged.insert(*pid);
+    }
+
     let mut entries: Vec<WalpinPidHealth> = Vec::new();
     for (pid, hb) in heartbeats {
-        entries.push(WalpinPidHealth::Reporting(hb));
+        if !wedged.contains(&pid) {
+            entries.push(WalpinPidHealth::Reporting(hb));
+        }
         beacon_pids.remove(&pid);
     }
     for pid in beacon_pids {
@@ -3477,7 +3672,13 @@ mod tests {
             write_heartbeat(&dir, &hb).unwrap();
         }
 
-        let report = enumerate_live_bounded(&dir, Duration::from_secs(5), 1).unwrap();
+        let report = enumerate_live_bounded(
+            &dir,
+            Duration::from_secs(5),
+            1,
+            EnumerationPurpose::Attribution,
+        )
+        .unwrap();
         let markers = report
             .entries
             .iter()
@@ -3517,7 +3718,13 @@ mod tests {
             std::fs::write(dir.join(format!(".junk{i}")), b"x").unwrap();
         }
 
-        let report = enumerate_live_bounded(&dir, Duration::from_secs(5), 4).unwrap();
+        let report = enumerate_live_bounded(
+            &dir,
+            Duration::from_secs(5),
+            4,
+            EnumerationPurpose::Attribution,
+        )
+        .unwrap();
         let markers = report
             .entries
             .iter()
@@ -3739,6 +3946,92 @@ mod tests {
         let report = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
         assert_eq!(report.reporting().count(), 1);
         assert_eq!(report.registered_silent_pids().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn housekeeping_uses_the_five_second_legacy_cadence_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        let mut hb = heartbeat(pid);
+        hb.oldest_tx_started_at = None;
+        hb.sweep_interval_ms = 0;
+        hb.updated_at = now_epoch_secs() - 4;
+        write_heartbeat(&dir, &hb).unwrap();
+
+        let report = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "a 4s-old legacy record is inside the ADR-091 15s fallback window; the daemon's \
+             500ms checkpoint cadence would incorrectly narrow that window to 3s: {report:?}"
+        );
+        assert!(
+            dir.join(format!("{pid}.json")).exists(),
+            "healthy housekeeping must retain a live legacy record"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn housekeeping_preserves_malformed_unknown_for_no_progress_attribution() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        write_beacon(&dir, &beacon(pid)).unwrap();
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+        fs::write(&heartbeat_path, b"{not-json").unwrap();
+
+        let housekeeping = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(housekeeping.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(housekeeping.registered_silent_pids().count(), 0);
+        assert!(
+            heartbeat_path.exists(),
+            "ordinary housekeeping must preserve malformed live-PID evidence"
+        );
+
+        let attribution = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(attribution.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(
+            attribution.registered_silent_pids().count(),
+            0,
+            "a fresh beacon must never exonerate a PID whose heartbeat is malformed"
+        );
+        assert!(!attribution.fully_attributed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn housekeeping_preserves_stale_unknown_for_no_progress_attribution() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        write_beacon(&dir, &beacon(pid)).unwrap();
+        let mut hb = heartbeat(pid);
+        hb.oldest_tx_started_at = None;
+        hb.sweep_interval_ms = 1_000;
+        hb.updated_at = now_epoch_secs() - 30;
+        write_heartbeat(&dir, &hb).unwrap();
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+
+        let housekeeping = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(housekeeping.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(housekeeping.registered_silent_pids().count(), 0);
+        assert!(
+            heartbeat_path.exists(),
+            "ordinary housekeeping must preserve a live PID's stale heartbeat evidence"
+        );
+
+        let attribution = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(attribution.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(
+            attribution.registered_silent_pids().count(),
+            0,
+            "a fresh beacon must never exonerate a PID whose heartbeat went stale"
+        );
+        assert!(!attribution.fully_attributed());
     }
 
     #[cfg(unix)]
@@ -4167,6 +4460,7 @@ mod tests {
                     (buf_bytes as usize - 4) as std::os::raw::c_int
                 }
             },
+            &|| false,
         )
         .expect("negotiation must succeed once the set stabilizes");
         assert!(
@@ -4183,9 +4477,12 @@ mod tests {
         // matter how many times negotiate_buffer retries with a larger
         // buffer — this must give up after CENSUS_BUFFER_NEGOTIATION_ATTEMPTS
         // and report `truncated = true` rather than loop forever or lie.
-        let (items, truncated) =
-            negotiate_buffer::<i32>(|| 4 as std::os::raw::c_int, |_buf_ptr, buf_bytes| buf_bytes)
-                .expect("negotiation must still return a (possibly truncated) result, not error");
+        let (items, truncated) = negotiate_buffer::<i32>(
+            || 4 as std::os::raw::c_int,
+            |_buf_ptr, buf_bytes| buf_bytes,
+            &|| false,
+        )
+        .expect("negotiation must still return a (possibly truncated) result, not error");
         assert!(
             truncated,
             "a buffer that stays exactly full across every retry must be reported truncated"
@@ -4199,6 +4496,7 @@ mod tests {
         let result = negotiate_buffer::<i32>(
             || -1 as std::os::raw::c_int,
             |_buf_ptr, buf_bytes| buf_bytes,
+            &|| false,
         );
         assert!(result.is_err(), "a non-positive size probe must error out");
     }
@@ -4559,6 +4857,26 @@ mod tests {
 
             remove_heartbeat(&dir, pid).expect("remove must succeed");
             assert!(!path.exists());
+        }
+
+        #[test]
+        fn repeated_heartbeat_write_validates_sidecar_root_once() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let first = heartbeat(pid);
+            write_heartbeat(&dir, &first).expect("initial write must create the sidecar");
+
+            let before = super::super::windows_impl::open_dir_handle_call_count();
+            let mut replacement = first;
+            replacement.oldest_tx_label = Some("replacement".to_string());
+            write_heartbeat(&dir, &replacement).expect("replacement write must succeed");
+            let validations = super::super::windows_impl::open_dir_handle_call_count() - before;
+
+            assert_eq!(
+                validations, 1,
+                "an existing sidecar root must be fully validated exactly once per record write"
+            );
         }
 
         #[test]

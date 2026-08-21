@@ -146,6 +146,8 @@ above remains the historical pre-consolidation record.
 |     V16 | ADR-019 / #1474    | gtd_dependency_cycle_guards        | shipped |
 |     V17 | ADR-142 / #1700    | agents_ddl                         | shipped |
 |     V18 | #1479              | ann_consumer_pending               | shipped |
+|     V19 | #1649              | list_cursor_backfill_repair        | shipped |
+|     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
@@ -170,11 +172,22 @@ above remains the historical pre-consolidation record.
 > direct-storage, and atomic-unit writers. The migration does not rewrite or reject existing
 > rows while installing the triggers.
 
-> **V17 record (2026-08-01)**: `ann_consumer_pending` adds timestamped lifecycle
+> **V17 record (2026-08-01, ADR-142 / #1700)**: `agents_ddl` adds the
+> agent-process registry and its supporting indexes.
+
+> **V18 record (2026-08-01, #1479)**: `ann_consumer_pending` adds timestamped lifecycle
 > metadata for the closed ANN pending watermark `-2` and translates legacy
 > zero-watermark registrations into a one-day pending grace window. Successful
 > checkpoints, including a valid checkpoint at `S = 0`, atomically remove the
 > metadata; only never-activated pending rows are eligible for retirement.
+
+> **V19 record (2026-08-08, #1649)**: `list_cursor_backfill_repair` repairs the
+> known V13/V14 list-cursor divergence and normalizes those two ledger names.
+> No other divergence is repairable by inference.
+
+> **V20 record (2026-08-09, ADR-091 / #1850)**: `blob_gc_claims` adds the
+> durable entity-write fence used by bounded transactional filesystem-blob GC.
+> The migration version is independent of ADR-091's amendment number.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
@@ -301,8 +314,11 @@ CREATE TABLE IF NOT EXISTS _schema_migrations (
 ```
 
 The table records which migrations have been applied. `run_migrations` reads
-the highest applied version and runs only newer migrations. Idempotent calls
-are no-ops.
+the highest applied version and runs only newer migrations. Once known repair
+migrations have run, both writable boot and read-only snapshot validation
+require the rows to be the exact contiguous canonical `(version, name)` prefix:
+matching `MAX(version)` does not hide a missing middle row, an unknown version,
+or a renamed migration. Idempotent calls are no-ops.
 
 ### Atomicity per migration
 

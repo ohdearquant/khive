@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::types::{
-    ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS, MAX_OPS_INPUT_LEN,
-    RESERVED_ENVELOPE_ARGS,
+    ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, TypedJsonOp, MAX_OPS,
+    MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, RESERVED_ENVELOPE_ARGS,
 };
 
 use super::parser_impl::Parser;
@@ -82,6 +82,59 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
         pos: p.pos,
         found: p.peek().unwrap(),
         expected: "'|' or end of input",
+    })
+}
+
+/// Validates an already-decoded JSON batch without reapplying the raw DSL byte cap.
+///
+/// This is the typed seam for bounded trusted transports such as
+/// `kkernel exec --ops-file`. The caller must bound the source bytes before
+/// decoding; agent-facing and HTTP/MCP inputs must continue to use
+/// [`parse_request`], which enforces [`MAX_OPS_INPUT_LEN`]. All JSON-form
+/// structural rules remain in force: 1–100 independent operations, bounded
+/// nesting, no `$prev`, and no request-envelope fields inside verb args.
+pub fn parse_typed_json_batch(ops: Vec<TypedJsonOp>) -> Result<ParsedRequest, DslError> {
+    if ops.is_empty() {
+        return Err(DslError::EmptyBatch);
+    }
+    if ops.len() > MAX_OPS {
+        return Err(DslError::TooManyOps {
+            count: ops.len(),
+            max: MAX_OPS,
+        });
+    }
+
+    let mut parsed_ops = Vec::with_capacity(ops.len());
+    for TypedJsonOp { tool, args } in ops {
+        let args_value = Value::Object(args);
+        if !crate::value_nesting_within_limit(&args_value, NESTING_DEPTH_LIMIT - 2) {
+            return Err(DslError::NestingTooDeep {
+                pos: 0,
+                depth: NESTING_DEPTH_LIMIT + 1,
+                max: NESTING_DEPTH_LIMIT,
+            });
+        }
+        let Value::Object(args) = args_value else {
+            unreachable!("typed JSON op args are constructed as an object")
+        };
+        let mut parsed_args = BTreeMap::new();
+        for (name, value) in args {
+            if json_value_contains_prev_ref(&value) {
+                return Err(DslError::PrevRefInJsonForm { arg_name: name });
+            }
+            parsed_args.insert(name, ArgValue::Value(value));
+        }
+        let op = ParsedOp {
+            tool,
+            args: parsed_args,
+        };
+        reject_reserved_args(&op)?;
+        parsed_ops.push(op);
+    }
+
+    Ok(ParsedRequest {
+        ops: parsed_ops,
+        mode: ExecutionMode::Parallel,
     })
 }
 

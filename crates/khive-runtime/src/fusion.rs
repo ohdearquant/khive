@@ -17,93 +17,175 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 pub use khive_fusion::FusionStrategy;
 
-const CANDIDATE_MULTIPLIER: u32 = 4;
+/// A single ranked candidate stream fed into a [`FusionExecutor`] — the
+/// entity/note ID keyed shape used throughout hybrid search (ADR-012
+/// `FusionStrategy::Custom` §"strategy executor").
+pub type CandidateStream = Vec<(Uuid, DeterministicScore)>;
 
-/// Fuse text and vector hits using the given strategy, returning at most `limit` results.
-/// Positional weighted strategies use `[vector, keyword]` order.
-pub fn fuse_with_strategy(
-    text_hits: Vec<TextSearchHit>,
-    vector_hits: Vec<VectorSearchHit>,
-    strategy: &FusionStrategy,
-    limit: usize,
-) -> RuntimeResult<Vec<SearchHit>> {
-    match strategy {
-        FusionStrategy::VectorOnly => fuse_sources(Vec::new(), vector_hits, strategy, limit),
-        FusionStrategy::KeywordOnly => fuse_sources(text_hits, Vec::new(), strategy, limit),
-        FusionStrategy::Rrf { .. } | FusionStrategy::Weighted { .. } | FusionStrategy::Union => {
-            fuse_sources(text_hits, vector_hits, strategy, limit)
-        }
-        FusionStrategy::Custom { ref name, .. } => {
-            Err(khive_fusion::FuseError::CustomRequiresRuntime(name.clone()).into())
-        }
-    }
+/// One fused, ranked `(id, score)` pair returned by a [`FusionExecutor`].
+pub type RankedHit = (Uuid, DeterministicScore);
+
+/// Runtime-registered custom fusion strategy (ADR-012).
+///
+/// Packs implement this to plug a strategy into `FusionStrategy::Custom { name,
+/// .. }` via [`KhiveRuntime::register_fusion_strategy`] — the seam a
+/// learned-sparse (SPLADE) retrieval leg plugs into. Async so an executor can
+/// perform I/O (e.g. a decay/posterior lookup) while fusing, and fallible so
+/// it can reject malformed `params` instead of degrading silently.
+#[async_trait::async_trait]
+pub trait FusionExecutor: Send + Sync + 'static {
+    /// Combine `streams` into a single ranked list, honoring `limit` as a
+    /// hint (the dispatch boundary re-sorts and truncates the result with the
+    /// crate's canonical comparator regardless, so an executor need not sort
+    /// or truncate defensively itself).
+    async fn fuse(
+        &self,
+        streams: Vec<CandidateStream>,
+        params: &serde_json::Value,
+        limit: usize,
+    ) -> RuntimeResult<Vec<RankedHit>>;
 }
 
+const CANDIDATE_MULTIPLIER: u32 = 4;
+
 /// RRF convenience wrapper used by operations.rs (k=60 note search path).
-pub(crate) fn rrf_fuse_k(
+pub(crate) async fn rrf_fuse_k(
+    rt: &KhiveRuntime,
     text_hits: Vec<TextSearchHit>,
     vector_hits: Vec<VectorSearchHit>,
     k: usize,
     limit: usize,
 ) -> RuntimeResult<Vec<SearchHit>> {
-    fuse_with_strategy(text_hits, vector_hits, &FusionStrategy::Rrf { k }, limit)
+    rt.fuse_with_strategy(text_hits, vector_hits, &FusionStrategy::Rrf { k }, limit)
+        .await
 }
 
-fn fuse_sources(
-    text_hits: Vec<TextSearchHit>,
-    vector_hits: Vec<VectorSearchHit>,
-    strategy: &FusionStrategy,
-    limit: usize,
-) -> RuntimeResult<Vec<SearchHit>> {
-    let mut metadata: HashMap<Uuid, SearchHit> =
-        HashMap::with_capacity(text_hits.len() + vector_hits.len());
+impl KhiveRuntime {
+    /// Fuse text and vector hits using the given strategy, returning at most
+    /// `limit` results. Positional weighted strategies use `[vector, keyword]`
+    /// order.
+    ///
+    /// `FusionStrategy::Custom { name, .. }` is resolved against this
+    /// runtime's registered executors (see
+    /// [`register_fusion_strategy`](KhiveRuntime::register_fusion_strategy)).
+    /// An unregistered name fails closed with
+    /// `RuntimeError::UnknownFusionStrategy` rather than silently falling
+    /// back to RRF.
+    pub(crate) async fn fuse_with_strategy(
+        &self,
+        text_hits: Vec<TextSearchHit>,
+        vector_hits: Vec<VectorSearchHit>,
+        strategy: &FusionStrategy,
+        limit: usize,
+    ) -> RuntimeResult<Vec<SearchHit>> {
+        match strategy {
+            FusionStrategy::VectorOnly => {
+                self.fuse_sources(Vec::new(), vector_hits, strategy, limit)
+                    .await
+            }
+            FusionStrategy::KeywordOnly => {
+                self.fuse_sources(text_hits, Vec::new(), strategy, limit)
+                    .await
+            }
+            FusionStrategy::Rrf { .. }
+            | FusionStrategy::Weighted { .. }
+            | FusionStrategy::Union
+            | FusionStrategy::Custom { .. } => {
+                self.fuse_sources(text_hits, vector_hits, strategy, limit)
+                    .await
+            }
+        }
+    }
 
-    let text_source: Vec<(Uuid, DeterministicScore)> = text_hits
-        .into_iter()
-        .map(|h| {
-            let hit = SearchHit {
-                entity_id: h.subject_id,
-                score: h.score,
-                source: SearchSource::Text,
-                title: h.title,
-                snippet: h.snippet,
-            };
-            let id = hit.entity_id;
-            let score = hit.score;
-            merge_metadata(&mut metadata, hit);
-            (id, score)
-        })
-        .collect();
+    async fn fuse_sources(
+        &self,
+        text_hits: Vec<TextSearchHit>,
+        vector_hits: Vec<VectorSearchHit>,
+        strategy: &FusionStrategy,
+        limit: usize,
+    ) -> RuntimeResult<Vec<SearchHit>> {
+        let mut metadata: HashMap<Uuid, SearchHit> =
+            HashMap::with_capacity(text_hits.len() + vector_hits.len());
 
-    let vector_source: Vec<(Uuid, DeterministicScore)> = vector_hits
-        .into_iter()
-        .map(|h| {
-            let hit = SearchHit {
-                entity_id: h.subject_id,
-                score: h.score,
-                source: SearchSource::Vector,
-                title: None,
-                snippet: None,
-            };
-            let id = hit.entity_id;
-            let score = hit.score;
-            merge_metadata(&mut metadata, hit);
-            (id, score)
-        })
-        .collect();
+        let text_source: Vec<(Uuid, DeterministicScore)> = text_hits
+            .into_iter()
+            .map(|h| {
+                let hit = SearchHit {
+                    entity_id: h.subject_id,
+                    score: h.score,
+                    source: SearchSource::Text,
+                    title: h.title,
+                    snippet: h.snippet,
+                };
+                let id = hit.entity_id;
+                let score = hit.score;
+                merge_metadata(&mut metadata, hit);
+                (id, score)
+            })
+            .collect();
 
-    // Canonical positional order is [vector, keyword]. Empty arms remain in
-    // place: removing one would shift the surviving arm onto the wrong weight.
-    let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![vector_source, text_source];
+        let vector_source: Vec<(Uuid, DeterministicScore)> = vector_hits
+            .into_iter()
+            .map(|h| {
+                let hit = SearchHit {
+                    entity_id: h.subject_id,
+                    score: h.score,
+                    source: SearchSource::Vector,
+                    title: None,
+                    snippet: None,
+                };
+                let id = hit.entity_id;
+                let score = hit.score;
+                merge_metadata(&mut metadata, hit);
+                (id, score)
+            })
+            .collect();
 
-    Ok(khive_fusion::fuse(sources, strategy, limit)?
-        .into_iter()
-        .filter_map(|(id, score)| {
-            let mut hit = metadata.remove(&id)?;
-            hit.score = score;
-            Some(hit)
-        })
-        .collect())
+        // Canonical positional order is [vector, keyword]. Empty arms remain in
+        // place: removing one would shift the surviving arm onto the wrong weight.
+        let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![vector_source, text_source];
+
+        let fused = self.dispatch_fusion(sources, strategy, limit).await?;
+
+        Ok(fused
+            .into_iter()
+            .filter_map(|(id, score)| {
+                let mut hit = metadata.remove(&id)?;
+                hit.score = score;
+                Some(hit)
+            })
+            .collect())
+    }
+
+    /// Resolve `strategy` against either the built-in `khive-fusion`
+    /// dispatcher or a registered [`FusionExecutor`], applying the crate's
+    /// canonical score-desc/id-asc ordering at the boundary either way.
+    ///
+    /// `Custom` names are resolved *before* the empty-input/zero-limit short
+    /// circuit, so a misconfigured name errors on every call -- including
+    /// zero-result ones -- rather than being indistinguishable from a valid
+    /// empty result.
+    async fn dispatch_fusion(
+        &self,
+        sources: Vec<Vec<(Uuid, DeterministicScore)>>,
+        strategy: &FusionStrategy,
+        limit: usize,
+    ) -> RuntimeResult<Vec<(Uuid, DeterministicScore)>> {
+        let FusionStrategy::Custom { name, params } = strategy else {
+            return Ok(khive_fusion::fuse(sources, strategy, limit)?);
+        };
+
+        let executor = self.fusion_executor(name)?;
+
+        if limit == 0 || sources.iter().all(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+
+        let mut hits = executor.fuse(sources, params, limit).await?;
+        hits.sort_by(khive_fusion::cmp_desc_then_id);
+        hits.truncate(limit);
+        Ok(hits)
+    }
 }
 
 fn merge_metadata(metadata: &mut HashMap<Uuid, SearchHit>, hit: SearchHit) {
@@ -169,6 +251,12 @@ impl KhiveRuntime {
     }
 
     /// Hybrid search with a caller-supplied fusion strategy.
+    ///
+    /// `FusionStrategy::Custom { name, .. }` is resolved against this
+    /// runtime's registered executors (see
+    /// [`register_fusion_strategy`](KhiveRuntime::register_fusion_strategy));
+    /// an unregistered name fails closed with
+    /// `RuntimeError::UnknownFusionStrategy`.
     pub async fn hybrid_search_with_strategy(
         &self,
         token: &NamespaceToken,
@@ -221,7 +309,9 @@ impl KhiveRuntime {
         // ranking and the alive check; truncating it first lets stale hits hide
         // live candidates from the other arm.
         let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
-        let fused = fuse_with_strategy(text_hits, vector_hits, &strategy, fusion_limit)?;
+        let fused = self
+            .fuse_with_strategy(text_hits, vector_hits, &strategy, fusion_limit)
+            .await?;
         self.retain_alive_search_hits(token, fused, limit as usize)
             .await
     }
@@ -234,6 +324,7 @@ mod tests {
     use khive_storage::types::{TextDocument, TextSearchHit, VectorSearchHit, VectorSearchRequest};
     use khive_storage::Entity;
     use lattice_embed::EmbeddingModel;
+    use std::sync::Arc;
 
     use crate::RuntimeConfig;
 
@@ -385,18 +476,23 @@ mod tests {
     }
 
     // 1. RRF with custom k produces different ordering than k=60
-    #[test]
-    fn rrf_custom_k_differs_from_k60() {
+    #[tokio::test]
+    async fn rrf_custom_k_differs_from_k60() {
+        let rt = KhiveRuntime::memory().unwrap();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         // Single-source input makes a and b tie in relative order at both k values,
         // so assert on raw score magnitude (smaller k widens the rank-1-vs-rank-2 gap)
         // rather than ordering.
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
-        let hits_k1 =
-            fuse_with_strategy(text.clone(), vec![], &FusionStrategy::Rrf { k: 1 }, 10).unwrap();
-        let hits_k60 =
-            fuse_with_strategy(text, vec![], &FusionStrategy::Rrf { k: 60 }, 10).unwrap();
+        let hits_k1 = rt
+            .fuse_with_strategy(text.clone(), vec![], &FusionStrategy::Rrf { k: 1 }, 10)
+            .await
+            .unwrap();
+        let hits_k60 = rt
+            .fuse_with_strategy(text, vec![], &FusionStrategy::Rrf { k: 60 }, 10)
+            .await
+            .unwrap();
         // Both should have a first (rank 1 always wins in single-source)
         assert_eq!(hits_k1[0].entity_id, a);
         assert_eq!(hits_k60[0].entity_id, a);
@@ -405,63 +501,73 @@ mod tests {
     }
 
     // 2. Canonical [vector, keyword] weights change ordering as documented.
-    #[test]
-    fn weighted_ordering_depends_on_weights() {
+    #[tokio::test]
+    async fn weighted_ordering_depends_on_weights() {
+        let rt = KhiveRuntime::memory().unwrap();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         // a scores high in text, b scores high in vector
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
         let vec_hits = vec![vector_hit(b, 0.9), vector_hit(a, 0.1)];
 
-        let heavy_vector = fuse_with_strategy(
-            text.clone(),
-            vec_hits.clone(),
-            &FusionStrategy::Weighted {
-                weights: vec![0.7, 0.3],
-            },
-            10,
-        )
-        .unwrap();
-        let heavy_keyword = fuse_with_strategy(
-            text,
-            vec_hits,
-            &FusionStrategy::Weighted {
-                weights: vec![0.3, 0.7],
-            },
-            10,
-        )
-        .unwrap();
+        let heavy_vector = rt
+            .fuse_with_strategy(
+                text.clone(),
+                vec_hits.clone(),
+                &FusionStrategy::Weighted {
+                    weights: vec![0.7, 0.3],
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        let heavy_keyword = rt
+            .fuse_with_strategy(
+                text,
+                vec_hits,
+                &FusionStrategy::Weighted {
+                    weights: vec![0.3, 0.7],
+                },
+                10,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(heavy_vector[0].entity_id, b);
         assert_eq!(heavy_keyword[0].entity_id, a);
     }
 
     // 3. Weighted [7.0, 3.0] = Weighted [0.7, 0.3] (normalization)
-    #[test]
-    fn weighted_scale_invariant() {
+    #[tokio::test]
+    async fn weighted_scale_invariant() {
+        let rt = KhiveRuntime::memory().unwrap();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
         let vec_hits = vec![vector_hit(b, 0.9), vector_hit(a, 0.1)];
 
-        let w1 = fuse_with_strategy(
-            text.clone(),
-            vec_hits.clone(),
-            &FusionStrategy::Weighted {
-                weights: vec![0.7, 0.3],
-            },
-            10,
-        )
-        .unwrap();
-        let w2 = fuse_with_strategy(
-            text,
-            vec_hits,
-            &FusionStrategy::Weighted {
-                weights: vec![7.0, 3.0],
-            },
-            10,
-        )
-        .unwrap();
+        let w1 = rt
+            .fuse_with_strategy(
+                text.clone(),
+                vec_hits.clone(),
+                &FusionStrategy::Weighted {
+                    weights: vec![0.7, 0.3],
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        let w2 = rt
+            .fuse_with_strategy(
+                text,
+                vec_hits,
+                &FusionStrategy::Weighted {
+                    weights: vec![7.0, 3.0],
+                },
+                10,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(w1[0].entity_id, w2[0].entity_id);
         assert_eq!(w1[1].entity_id, w2[1].entity_id);
@@ -470,58 +576,67 @@ mod tests {
     }
 
     // 4. Weighted [0.0, 0.0] falls back to equal weights
-    #[test]
-    fn weighted_zero_weights_equal_fallback() {
+    #[tokio::test]
+    async fn weighted_zero_weights_equal_fallback() {
+        let rt = KhiveRuntime::memory().unwrap();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         // Both sources agree: a > b
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
         let vec_hits = vec![vector_hit(a, 0.9), vector_hit(b, 0.1)];
 
-        let hits = fuse_with_strategy(
-            text,
-            vec_hits,
-            &FusionStrategy::Weighted {
-                weights: vec![0.0, 0.0],
-            },
-            10,
-        )
-        .unwrap();
+        let hits = rt
+            .fuse_with_strategy(
+                text,
+                vec_hits,
+                &FusionStrategy::Weighted {
+                    weights: vec![0.0, 0.0],
+                },
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(hits[0].entity_id, a);
     }
 
     // 5. Weighted with negative weight clamps to 0
-    #[test]
-    fn weighted_negative_weight_clamped() {
+    #[tokio::test]
+    async fn weighted_negative_weight_clamped() {
+        let rt = KhiveRuntime::memory().unwrap();
         let a = Uuid::new_v4();
         let text = vec![text_hit(a, 0.9, "a")];
         // Negative vector weight → only keyword/text contributes.
-        let hits = fuse_with_strategy(
-            text,
-            vec![],
-            &FusionStrategy::Weighted {
-                weights: vec![-0.5, 1.0],
-            },
-            10,
-        )
-        .unwrap();
+        let hits = rt
+            .fuse_with_strategy(
+                text,
+                vec![],
+                &FusionStrategy::Weighted {
+                    weights: vec![-0.5, 1.0],
+                },
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, a);
     }
 
-    #[test]
-    fn weighted_empty_arm_keeps_canonical_position() {
+    #[tokio::test]
+    async fn weighted_empty_arm_keeps_canonical_position() {
+        let rt = KhiveRuntime::memory().unwrap();
         let text_only = Uuid::new_v4();
-        let hits = fuse_with_strategy(
-            vec![text_hit(text_only, 0.9, "text")],
-            vec![],
-            &FusionStrategy::Weighted {
-                // Canonical [vector, keyword]: the only non-empty arm has zero weight.
-                weights: vec![1.0, 0.0],
-            },
-            10,
-        )
-        .unwrap();
+        let hits = rt
+            .fuse_with_strategy(
+                vec![text_hit(text_only, 0.9, "text")],
+                vec![],
+                &FusionStrategy::Weighted {
+                    // Canonical [vector, keyword]: the only non-empty arm has zero weight.
+                    weights: vec![1.0, 0.0],
+                },
+                10,
+            )
+            .await
+            .unwrap();
         assert!(
             hits.is_empty(),
             "dropping the empty vector arm would incorrectly rebind text to its weight"
@@ -529,47 +644,257 @@ mod tests {
     }
 
     // 6. Union returns max score per entity when same id appears in both lists
-    #[test]
-    fn union_max_score_per_entity() {
+    #[tokio::test]
+    async fn union_max_score_per_entity() {
+        let rt = KhiveRuntime::memory().unwrap();
         let a = Uuid::new_v4();
         let text = vec![text_hit(a, 0.3, "a")];
         let vec_hits = vec![vector_hit(a, 0.9)];
 
-        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::Union, 10).unwrap();
+        let hits = rt
+            .fuse_with_strategy(text, vec_hits, &FusionStrategy::Union, 10)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!((hits[0].score.to_f64() - 0.9).abs() < 1e-6);
         assert_eq!(hits[0].source, SearchSource::Both);
     }
 
     // 7. VectorOnly returns vector hits only (text hits dropped)
-    #[test]
-    fn vector_only_drops_text() {
+    #[tokio::test]
+    async fn vector_only_drops_text() {
+        let rt = KhiveRuntime::memory().unwrap();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let text = vec![text_hit(b, 0.9, "b")];
         let vec_hits = vec![vector_hit(a, 0.8)];
 
-        let hits = fuse_with_strategy(text, vec_hits, &FusionStrategy::VectorOnly, 10).unwrap();
+        let hits = rt
+            .fuse_with_strategy(text, vec_hits, &FusionStrategy::VectorOnly, 10)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, a);
         assert_eq!(hits[0].source, SearchSource::Vector);
         assert!(hits[0].title.is_none());
     }
 
-    #[test]
-    fn keyword_only_drops_vector() {
+    #[tokio::test]
+    async fn keyword_only_drops_vector() {
+        let rt = KhiveRuntime::memory().unwrap();
         let text_id = Uuid::new_v4();
         let vector_id = Uuid::new_v4();
-        let hits = fuse_with_strategy(
-            vec![text_hit(text_id, 0.8, "text")],
-            vec![vector_hit(vector_id, 0.9)],
-            &FusionStrategy::KeywordOnly,
-            10,
-        )
-        .unwrap();
+        let hits = rt
+            .fuse_with_strategy(
+                vec![text_hit(text_id, 0.8, "text")],
+                vec![vector_hit(vector_id, 0.9)],
+                &FusionStrategy::KeywordOnly,
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, text_id);
         assert_eq!(hits[0].source, SearchSource::Text);
+    }
+
+    /// Test-only executor: flattens all streams and reverses their order,
+    /// keeping each candidate's original score.
+    struct ReverseOrderExecutor;
+
+    #[async_trait::async_trait]
+    impl FusionExecutor for ReverseOrderExecutor {
+        async fn fuse(
+            &self,
+            streams: Vec<CandidateStream>,
+            _params: &serde_json::Value,
+            _limit: usize,
+        ) -> RuntimeResult<Vec<RankedHit>> {
+            let mut flat: Vec<_> = streams.into_iter().flatten().collect();
+            flat.reverse();
+            Ok(flat)
+        }
+    }
+
+    /// Test-only executor: inverts each candidate's score (`1.0 - score`) so
+    /// the fused ranking is the reverse of what score-descending built-ins
+    /// (RRF, Union, Weighted) would produce on the same fixture -- unlike a
+    /// mere insertion-order reversal, this survives the dispatch boundary's
+    /// canonical re-sort, since the *scores* (not just the order) differ.
+    struct InvertScoreExecutor;
+
+    #[async_trait::async_trait]
+    impl FusionExecutor for InvertScoreExecutor {
+        async fn fuse(
+            &self,
+            streams: Vec<CandidateStream>,
+            _params: &serde_json::Value,
+            _limit: usize,
+        ) -> RuntimeResult<Vec<RankedHit>> {
+            Ok(streams
+                .into_iter()
+                .flatten()
+                .map(|(id, score)| (id, DeterministicScore::from_f64(1.0 - score.to_f64())))
+                .collect())
+        }
+    }
+
+    /// Test-only executor: returns every candidate at an identical score, in
+    /// the arbitrary order the input streams happened to flatten to -- used
+    /// to prove the dispatch boundary re-sorts by the canonical comparator
+    /// rather than trusting executor output order.
+    struct EqualScoreExecutor;
+
+    #[async_trait::async_trait]
+    impl FusionExecutor for EqualScoreExecutor {
+        async fn fuse(
+            &self,
+            streams: Vec<CandidateStream>,
+            _params: &serde_json::Value,
+            _limit: usize,
+        ) -> RuntimeResult<Vec<RankedHit>> {
+            Ok(streams
+                .into_iter()
+                .flatten()
+                .map(|(id, _)| (id, DeterministicScore::from_f64(1.0)))
+                .collect())
+        }
+    }
+
+    // 7b. A registered custom executor dispatches and yields a different
+    // ranking than RRF on the same fixture.
+    #[tokio::test]
+    async fn custom_strategy_dispatches_through_executor_and_differs_from_rrf() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.5, "b")];
+
+        rt.register_fusion_strategy("invert", Arc::new(InvertScoreExecutor));
+        let strategy =
+            FusionStrategy::try_custom("invert".to_string(), serde_json::Value::Null).unwrap();
+
+        let custom = rt
+            .fuse_with_strategy(text.clone(), vec![], &strategy, 10)
+            .await
+            .unwrap();
+        let rrf = rt
+            .fuse_with_strategy(text, vec![], &FusionStrategy::rrf(), 10)
+            .await
+            .unwrap();
+
+        let custom_ids: Vec<_> = custom.iter().map(|h| h.entity_id).collect();
+        let rrf_ids: Vec<_> = rrf.iter().map(|h| h.entity_id).collect();
+        assert_ne!(
+            custom_ids, rrf_ids,
+            "custom and RRF must yield different orderings on this fixture"
+        );
+    }
+
+    // 7c. An unregistered Custom name fails closed rather than falling back to RRF.
+    #[tokio::test]
+    async fn custom_strategy_unknown_name_fails_closed() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let a = Uuid::new_v4();
+        let text = vec![text_hit(a, 0.9, "a")];
+        let strategy =
+            FusionStrategy::try_custom("nonexistent".to_string(), serde_json::Value::Null).unwrap();
+
+        let result = rt.fuse_with_strategy(text, vec![], &strategy, 10).await;
+        assert!(matches!(
+            result,
+            Err(RuntimeError::UnknownFusionStrategy(name)) if name == "nonexistent"
+        ));
+    }
+
+    // 7d. Unknown name errors even with empty sources -- it must not be
+    // indistinguishable from a valid empty result.
+    #[tokio::test]
+    async fn custom_strategy_unknown_name_fails_closed_even_on_empty_input() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let strategy =
+            FusionStrategy::try_custom("nonexistent".to_string(), serde_json::Value::Null).unwrap();
+
+        let result = rt.fuse_with_strategy(vec![], vec![], &strategy, 10).await;
+        assert!(matches!(
+            result,
+            Err(RuntimeError::UnknownFusionStrategy(name)) if name == "nonexistent"
+        ));
+    }
+
+    // 7e. Empty sources with a *registered* name is a valid empty result, not
+    // an error -- distinguishing "misconfigured" from "genuinely nothing".
+    #[tokio::test]
+    async fn custom_strategy_registered_name_empty_input_returns_ok_empty() {
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.register_fusion_strategy("reverse", Arc::new(ReverseOrderExecutor));
+        let strategy =
+            FusionStrategy::try_custom("reverse".to_string(), serde_json::Value::Null).unwrap();
+
+        let result = rt
+            .fuse_with_strategy(vec![], vec![], &strategy, 10)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    // 7f. Registering a custom strategy never perturbs the default (non-Custom) path.
+    #[tokio::test]
+    async fn registered_custom_strategy_leaves_default_path_unaffected() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.5, "b")];
+
+        rt.register_fusion_strategy("reverse", Arc::new(ReverseOrderExecutor));
+
+        let via_rt_with_registration = rt
+            .fuse_with_strategy(text.clone(), vec![], &FusionStrategy::rrf(), 10)
+            .await
+            .unwrap();
+        let rt2 = KhiveRuntime::memory().unwrap();
+        let via_rt_without_registration = rt2
+            .fuse_with_strategy(text, vec![], &FusionStrategy::rrf(), 10)
+            .await
+            .unwrap();
+
+        let ids_with: Vec<_> = via_rt_with_registration
+            .iter()
+            .map(|h| h.entity_id)
+            .collect();
+        let ids_without: Vec<_> = via_rt_without_registration
+            .iter()
+            .map(|h| h.entity_id)
+            .collect();
+        assert_eq!(ids_with, ids_without);
+    }
+
+    // 7g. A custom executor returning equal-score IDs in arbitrary/reversed
+    // order still yields the crate's canonical score-desc/id-asc order --
+    // the dispatch boundary re-sorts rather than trusting executor output.
+    #[tokio::test]
+    async fn custom_executor_output_is_sorted_by_canonical_comparator() {
+        let rt = KhiveRuntime::memory().unwrap();
+        // Deliberately not in ID order, so a passthrough bug would be visible.
+        let ids: Vec<Uuid> = vec![Uuid::from_u128(3), Uuid::from_u128(1), Uuid::from_u128(2)];
+        let text: Vec<TextSearchHit> = ids.iter().map(|&id| text_hit(id, 0.5, "tied")).collect();
+
+        rt.register_fusion_strategy("equal_score", Arc::new(EqualScoreExecutor));
+        let strategy =
+            FusionStrategy::try_custom("equal_score".to_string(), serde_json::Value::Null).unwrap();
+
+        let hits = rt
+            .fuse_with_strategy(text, vec![], &strategy, 10)
+            .await
+            .unwrap();
+
+        let mut expected = ids.clone();
+        expected.sort();
+        let actual: Vec<_> = hits.iter().map(|h| h.entity_id).collect();
+        assert_eq!(
+            actual, expected,
+            "equal-score executor output must be tie-broken by ascending ID"
+        );
     }
 
     // 8. Default strategy is Rrf{k:60}
@@ -582,13 +907,15 @@ mod tests {
     async fn hybrid_union_alive_filter_refills_below_complete_four_x_prefix() {
         let (rt, tok, query_text, query_vector, text_hits, vector_hits, live) =
             stale_full_prefix_fixture().await;
-        let truncated = fuse_with_strategy(
-            text_hits,
-            vector_hits,
-            &FusionStrategy::Union,
-            CANDIDATE_MULTIPLIER as usize,
-        )
-        .unwrap();
+        let truncated = rt
+            .fuse_with_strategy(
+                text_hits,
+                vector_hits,
+                &FusionStrategy::Union,
+                CANDIDATE_MULTIPLIER as usize,
+            )
+            .await
+            .unwrap();
         assert!(truncated.iter().all(|hit| !live.contains(&hit.entity_id)));
 
         let hits = rt
@@ -611,13 +938,15 @@ mod tests {
         let (rt, tok, query_text, query_vector, text_hits, vector_hits, live) =
             stale_full_prefix_fixture().await;
         let strategy = FusionStrategy::Rrf { k: 60 };
-        let truncated = fuse_with_strategy(
-            text_hits,
-            vector_hits,
-            &strategy,
-            CANDIDATE_MULTIPLIER as usize,
-        )
-        .unwrap();
+        let truncated = rt
+            .fuse_with_strategy(
+                text_hits,
+                vector_hits,
+                &strategy,
+                CANDIDATE_MULTIPLIER as usize,
+            )
+            .await
+            .unwrap();
         assert!(truncated.iter().all(|hit| !live.contains(&hit.entity_id)));
 
         let hits = rt

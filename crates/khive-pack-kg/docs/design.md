@@ -7,26 +7,27 @@
 The KG pack provides 20 verb handlers for the knowledge graph substrate: entity
 CRUD, note CRUD, edge creation/traversal, hybrid search, graph queries (GQL),
 entity-anchored graph context (ADR-089), event-sourced proposals (ADR-046),
-caller identity introspection (`whoami`), and writer-contention plus
-WAL/checkpoint operator diagnostics (`db_diagnostics`, ADR-091/ADR-135 — its
-PASSIVE probe may backfill WAL frames but never changes logical state).
+caller identity introspection (`whoami`), and writer-contention, graph-edge
+integrity, plus WAL/checkpoint operator diagnostics (`db_diagnostics`,
+ADR-091/ADR-135 — its PASSIVE probe may backfill WAL frames but never changes
+logical state).
 It is the first-party pack shipped with the khive binary.
 
 ## ADR Compliance
 
-| ADR                                                                | What it governs                                   | Status      |
-| ------------------------------------------------------------------ | ------------------------------------------------- | ----------- |
-| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | 9 entity kinds (8 base + resource per ADR-048)    | Implemented |
+| ADR                                                                | What it governs                                                   | Status      |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------- | ----------- |
+| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | 9 entity kinds (8 base + resource per ADR-048)                    | Implemented |
 | [ADR-002](../../../docs/adr/ADR-002-edge-ontology.md)              | 17 edge relations, closed set (15 base + 2 epistemic via ADR-055) | Implemented |
-| [ADR-007](../../../docs/adr/ADR-007-namespace.md)                  | KG uses shared `local` namespace                  | Implemented |
-| [ADR-013](../../../docs/adr/ADR-013-note-kind-taxonomy.md)         | 5 base note kinds                                 | Implemented |
-| [ADR-014](../../../docs/adr/ADR-014-curation-operations.md)        | UUID-only get/update/delete                       | Implemented |
-| [ADR-017](../../../docs/adr/ADR-017-pack-standard.md)              | Pack trait, vocabulary, edge rules                | Implemented |
-| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | Alias normalization (paper→document, write-time)  | Implemented |
-| [ADR-045](../../../docs/adr/ADR-045-verb-response-presentation.md) | ISO-8601 timestamps at handler boundary           | Implemented |
-| [ADR-046](../../../docs/adr/ADR-046-event-sourced-proposals.md)    | Event-sourced proposals (propose/review/withdraw) | Implemented |
-| [ADR-048](../../../docs/adr/ADR-048-knowledge-section-profiles.md) | `resource` entity kind (9th kind)                 | Implemented |
-| [ADR-089](../../../docs/adr/ADR-089-context-verb.md)               | `context` verb — entity-anchored graph context    | Implemented |
+| [ADR-007](../../../docs/adr/ADR-007-namespace.md)                  | KG uses shared `local` namespace                                  | Implemented |
+| [ADR-013](../../../docs/adr/ADR-013-note-kind-taxonomy.md)         | 5 base note kinds                                                 | Implemented |
+| [ADR-014](../../../docs/adr/ADR-014-curation-operations.md)        | UUID-only get/update/delete                                       | Implemented |
+| [ADR-017](../../../docs/adr/ADR-017-pack-standard.md)              | Pack trait, vocabulary, edge rules                                | Implemented |
+| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | Alias normalization (paper→document, write-time)                  | Implemented |
+| [ADR-045](../../../docs/adr/ADR-045-verb-response-presentation.md) | ISO-8601 timestamps at handler boundary                           | Implemented |
+| [ADR-046](../../../docs/adr/ADR-046-event-sourced-proposals.md)    | Event-sourced proposals (propose/review/withdraw)                 | Implemented |
+| [ADR-048](../../../docs/adr/ADR-048-knowledge-section-profiles.md) | `resource` entity kind (9th kind)                                 | Implemented |
+| [ADR-089](../../../docs/adr/ADR-089-context-verb.md)               | `context` verb — entity-anchored graph context                    | Implemented |
 
 ## Primary Modules
 
@@ -65,7 +66,9 @@ It is the first-party pack shipped with the khive binary.
    regardless of caller namespace (ADR-007). Note verbs use the caller namespace.
 5. Proposals follow the state machine:
    `open -> approved -> applying -> applied` or `open -> withdrawn`.
-   The `applying` state is transient and blocks concurrent withdraw.
+   The `applying` state blocks concurrent withdraw and replay. It is normally
+   transient, but remains as the reconciliation state when base changes commit
+   and a post-commit reindex or created-record read fails.
 
 ## Failure Modes
 
@@ -77,6 +80,11 @@ It is the first-party pack shipped with the khive binary.
   relations for the specific entity-kind pair.
 - **Proposal CAS miss**: returns success with `cas_hit: false`; no duplicate
   events are emitted.
+- **Proposal post-commit degradation**: once the atomic runner reports
+  `Committed`, a reindex or created-record resolution failure emits neither a
+  `ProposalApplied { Failed }` event nor an `applying -> approved` revert. The
+  durable graph changes remain visible and the proposal stays `applying` for
+  operator reconciliation; another worker pass skips it instead of replaying.
 
 ## Edge rules and the `context` verb
 

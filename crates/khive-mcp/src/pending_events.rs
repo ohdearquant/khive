@@ -3,44 +3,36 @@
 //!
 //! Scans all `scheduled_event` notes with `status="pending"` whose `trigger_at`
 //! is at or before now, dispatches scheduled actions or delivers reminders to
-//! their creating actors through `comm.send`, marks each as `"fired"`, and
-//! advances repeating events to their next occurrence. Events overdue by more
-//! than the configured grace window are never dispatched. See "Missed-event
-//! policy" below.
+//! their creating actors through `comm.send`, and durably records each action
+//! outcome before finalizing the event lifecycle. Successful one-shots become
+//! `"fired"`; failed one-shots remain `"pending"` for recovery; named repeats
+//! advance to their next occurrence. Events overdue by more than the configured
+//! grace window are never dispatched, per the missed-event policy below.
 //!
-//! This module lives in `khive-mcp` (not `kkernel`, where it originated)
-//! because the daemon tick loop needs to call it in-process from
-//! `khive-mcp::serve`, and `khive-runtime` (where the daemon's socket/accept
-//! loop lives) cannot depend back on `khive-mcp` (`khive-mcp` already depends
-//! on `khive-runtime` — a dependency the other way would cycle). `kkernel`
-//! already depends on `khive-mcp`, so its `exec --pending-events` entry point
-//! simply calls [`run_pending_events`] here instead of a local module.
+//! Full design rationale (module placement, invocation-mode tradeoffs,
+//! namespace-isolation and missed-event-policy background) lives in
+//! `crates/khive-mcp/docs/pending-events.md`; the drain's API-level contract
+//! rationale (the `rt`/`server` pair) lives in
+//! `crates/khive-mcp/docs/api/pending-events.md`.
 //!
 //! ## Invocation modes
 //!
 //! - **One-shot** (`kkernel exec --pending-events`, cron-friendly): call
-//!   [`run_pending_events`] directly. Suitable for `* * * * * kkernel exec
-//!   --pending-events` to achieve minute-granularity delivery.
+//!   [`run_pending_events`] directly.
 //! - **Daemon-resident tick** (ADR-106): [`schedule_tick_loop`] calls
-//!   [`run_pending_events_on`] against the daemon's own resolved `KhiveRuntime`
-//!   handle on a fixed interval for the lifetime of the warm `khived` daemon
-//!   process. It runs as the ADR-119 `schedule-tick` component only in daemon
-//!   role, never from a short-lived stdio client, with tracked cancellation,
-//!   bounded restart, and component health. Running both an
-//!   external cron entry and the daemon tick at once is safe: the drain's
-//!   `pending -> firing` CAS claim (`claim_pending_event`) makes concurrent or
-//!   overlapping invocations harmless by construction — at most one caller
-//!   ever wins a given row.
+//!   [`run_pending_events_on`] on a fixed interval for the lifetime of the
+//!   warm `khived` daemon process. Running both an external cron entry and
+//!   the daemon tick at once is safe: the drain's `pending -> firing` CAS
+//!   claim (`claim_pending_event`) makes concurrent or overlapping
+//!   invocations harmless by construction — at most one caller ever wins a
+//!   given row.
 //!
 //! ## Namespace isolation
 //!
-//! Each event fires in its own namespace: the action is dispatched through the
-//! MCP server's registry with the event's namespace injected as the `namespace=`
-//! parameter, so all writes land in the event's namespace. Replay derives its
-//! actor from an immutable, target-bound provenance event written by the
-//! schedule handler; `created_by_actor` note metadata is never an authorization
-//! source. Executable `scheduled_event` state is schedule-managed and rejects
-//! generic KG update/merge, so provenance cannot authorize rewritten intent. A
+//! Each event fires in its own namespace, injected as the dispatched action's
+//! `namespace=` parameter. Replay derives its actor from an immutable,
+//! target-bound provenance event written by the schedule handler;
+//! `created_by_actor` note metadata is never an authorization source. A
 //! generic legacy row without provenance fails closed instead of inheriting
 //! daemon authority.
 //!
@@ -51,27 +43,18 @@
 //! - `"weekly"`  → `trigger_at + 7 days`
 //! - `"monthly"` → `trigger_at + 1 calendar month`
 //!
-//! Five-field cron expressions (e.g. `"0 9 * * 1"`) are stored and validated but
-//! **not yet advanced** — computing the next-fire time requires a cron-parsing
-//! library that is not yet present in the codebase (STOP condition: no
-//! machine-readable next-fire semantics exist for cron form). Events with a cron
-//! `repeat` are fired and then marked `"fired"` (one-shot). See issue #14 for the
-//! tracking note.
+//! Unsupported repeat expressions are rejected at schedule creation and fail
+//! closed for legacy rows rather than silently degrading to one-shot delivery.
 //!
 //! ## Missed-event policy (ADR-106 amendment)
 //!
-//! An event is "missed" when it is discovered overdue by more than
-//! `KHIVE_FIRE_GRACE_SECS` (default 300s / 5 minutes). A missed event is
-//! **never dispatched** — it is marked `status="missed"` with `missed_at`
-//! stamped (epoch µs) and `fired_at` left null. A missed *repeating* event is
-//! skipped for this occurrence and re-armed at the next occurrence strictly
-//! after now (looping past every accumulated occurrence) — it never fires a
-//! catch-up burst. This means a daemon that was offline for a long stretch
-//! (or a first boot against a store with a large stale backlog) marks the
-//! entire overdue backlog missed on its first tick and dispatches zero of
-//! them. See the ADR-106 amendment for the full rationale and the prior-art
-//! comparison. The creator-identity fence runs first for generic actions:
-//! an unattributed legacy row becomes `failed`, not `missed`, even when stale.
+//! An event is "missed" when discovered overdue by more than
+//! `KHIVE_FIRE_GRACE_SECS` (default 300s). A missed event is **never
+//! dispatched** — it is marked `status="missed"` with `missed_at` stamped and
+//! `fired_at` left null. A missed *repeating* event is re-armed at the next
+//! occurrence strictly after now rather than firing a catch-up burst. The
+//! creator-identity fence runs first for generic actions: an unattributed
+//! legacy row becomes `failed`, not `missed`, even when stale.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, Months, Utc};
@@ -83,19 +66,244 @@ use khive_runtime::{KhiveRuntime, Namespace, VerifiedActor};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
-/// A `scheduled_event` row stuck in `status="firing"` for longer than this is
-/// considered abandoned by a drain process that crashed or was killed between
-/// the `pending -> firing` claim and the post-dispatch finalize write (issue
-/// #462). Such a row is neither retried (the pending scan only looks at
-/// `status="pending"`) nor cancellable (`schedule.cancel` only CAS-matches
-/// `status="pending"`), so it would otherwise be wedged forever. Every drain
-/// pass reclaims rows stuck past this timeout back to `"pending"` so a future
-/// drain (or a `schedule.cancel`) can act on them again.
-///
-/// 5 minutes is comfortably longer than a single dispatch (`dispatch_action`
-/// is a single in-process verb call, not a network round-trip), so a fresh,
-/// still-in-flight claim is never mistaken for an abandoned one.
-const STALE_FIRING_TIMEOUT_MICROS: i64 = 5 * 60 * 1_000_000;
+/// Default renewable dispatch-lease duration. A live invocation renews at one
+/// third of this interval, so a slow handler is never reclaimed merely because
+/// it runs for more than five minutes. A dead claimant becomes recoverable
+/// after its last durable lease deadline passes.
+const DEFAULT_DISPATCH_LEASE_SECS: u64 = 5 * 60;
+
+/// Legacy rows claimed before renewable leases existed carry only
+/// `firing_at`. Keep their historical five-minute reclaim threshold while new
+/// rows use the explicit `lease_expires_at` deadline.
+const LEGACY_STALE_FIRING_TIMEOUT_MICROS: i64 = 5 * 60 * 1_000_000;
+
+const DISPATCH_RECEIPT_VERSION: u64 = 1;
+
+#[derive(Clone, Copy, Debug)]
+struct DispatchLeaseConfig {
+    ttl: std::time::Duration,
+    renew_every: std::time::Duration,
+}
+
+impl DispatchLeaseConfig {
+    fn from_env() -> Self {
+        let ttl_secs = std::env::var("KHIVE_SCHEDULE_LEASE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_DISPATCH_LEASE_SECS);
+        let ttl = std::time::Duration::from_secs(ttl_secs);
+        let renew_micros = (ttl.as_micros() / 3).max(1).min(u128::from(u64::MAX));
+        Self {
+            ttl,
+            renew_every: std::time::Duration::from_micros(renew_micros as u64),
+        }
+    }
+
+    fn expires_at(self, now_micros: i64) -> i64 {
+        let ttl_micros = i64::try_from(self.ttl.as_micros()).unwrap_or(i64::MAX);
+        now_micros.saturating_add(ttl_micros)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DispatchClaim {
+    firing_at: i64,
+    occurrence_id: uuid::Uuid,
+    invocation_id: uuid::Uuid,
+    actor: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecoverySnapshot<'a> {
+    expired_at: i64,
+    properties: &'a str,
+}
+
+impl DispatchClaim {
+    fn claimed_receipt(&self) -> Value {
+        json!({
+            "version": DISPATCH_RECEIPT_VERSION,
+            "occurrence_id": self.occurrence_id,
+            "invocation_id": self.invocation_id,
+            "actor": self.actor.as_str(),
+            "state": DispatchReceiptState::Claimed.as_str(),
+            "claimed_at": self.firing_at,
+        })
+    }
+
+    fn completed_without_invocation_receipt(
+        &self,
+        state: DispatchReceiptState,
+        completed_at: i64,
+        error: Option<&str>,
+    ) -> Value {
+        debug_assert!(matches!(
+            state,
+            DispatchReceiptState::NotInvoked | DispatchReceiptState::Missed
+        ));
+        json!({
+            "version": DISPATCH_RECEIPT_VERSION,
+            "occurrence_id": self.occurrence_id,
+            "invocation_id": self.invocation_id,
+            "actor": self.actor.as_str(),
+            "state": state.as_str(),
+            "claimed_at": self.firing_at,
+            "completed_at": completed_at,
+            "error": error,
+            "error_payload": null,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchReceiptState {
+    Claimed,
+    Invoking,
+    Succeeded,
+    Failed,
+    Indeterminate,
+    NotInvoked,
+    Missed,
+}
+
+impl DispatchReceiptState {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claimed" => Some(Self::Claimed),
+            "invoking" => Some(Self::Invoking),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "indeterminate" => Some(Self::Indeterminate),
+            "not_invoked" => Some(Self::NotInvoked),
+            "missed" => Some(Self::Missed),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::Invoking => "invoking",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Indeterminate => "indeterminate",
+            Self::NotInvoked => "not_invoked",
+            Self::Missed => "missed",
+        }
+    }
+}
+
+struct ValidatedDispatchReceipt {
+    value: Value,
+    occurrence_id: uuid::Uuid,
+    invocation_id: uuid::Uuid,
+    actor: String,
+    state: DispatchReceiptState,
+}
+
+/// CancellationToken itself does not cancel when its last handle is dropped.
+/// Keep this guard in the dispatch future so aborting/dropping that future
+/// cannot detach a lease-renewal task that would keep an abandoned claim alive
+/// forever.
+struct CancelOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[derive(Debug)]
+enum DispatchCompletion {
+    Succeeded,
+    Failed(DispatchFailure),
+    Indeterminate(DispatchFailure),
+}
+
+#[derive(Clone, Debug)]
+struct DispatchFailure {
+    message: String,
+    /// Original structured per-op error payload, when the handler returned
+    /// one. Keeping it alongside the human-readable message preserves
+    /// correlation values such as `comm.send`'s `details.outbound_id` for
+    /// durable reconciliation.
+    payload: Option<Value>,
+}
+
+impl DispatchFailure {
+    fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            payload: None,
+        }
+    }
+
+    fn with_payload(message: impl Into<String>, payload: Value) -> Self {
+        Self {
+            message: message.into(),
+            payload: Some(payload),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for DispatchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Debug)]
+struct DispatchActionError {
+    failure: DispatchFailure,
+    outcome_uncertain: bool,
+}
+
+impl std::fmt::Display for DispatchActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(formatter)
+    }
+}
+
+impl DispatchActionError {
+    fn known(failure: DispatchFailure) -> Self {
+        Self {
+            failure,
+            outcome_uncertain: false,
+        }
+    }
+
+    fn uncertain(failure: DispatchFailure) -> Self {
+        Self {
+            failure,
+            outcome_uncertain: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalDisposition {
+    Fired,
+    Advanced,
+    RetryPending,
+    Failed,
+}
+
+#[derive(Debug, Default)]
+struct ReclaimSummary {
+    rows: u64,
+    outcomes_persisted: u64,
+    fired: u64,
+    advanced: u64,
+    retry_pending: u64,
+    indeterminate: u64,
+    finalized: u64,
+    failed: u64,
+}
 
 /// Default grace window (seconds): an event discovered overdue by more than
 /// this is "missed" rather than fired late. Overridable via
@@ -118,9 +326,21 @@ fn fire_grace_from_env() -> Duration {
 #[derive(Debug, Default)]
 pub struct DrainSummary {
     pub scanned: u64,
+    /// Dispatch futures entered during this pass. This is intentionally
+    /// separate from lifecycle finalization and durable outcome persistence.
+    pub invoked: u64,
+    /// Invocation outcomes durably written to the scheduled-event receipt,
+    /// including crash-recovery classifications produced in this pass.
+    pub outcomes_persisted: u64,
+    /// Successful claim-bound lifecycle finalizations in this pass.
+    pub finalized: u64,
     pub fired: u64,
     pub advanced: u64,
     pub failed: u64,
+    /// Failed one-shot occurrences returned to `pending` for a later retry.
+    pub retry_pending: u64,
+    /// Expired invocations whose durable receipt cannot prove an outcome.
+    pub indeterminate: u64,
     pub skipped_not_due: u64,
     pub skipped_race: u64,
     pub reclaimed: u64,
@@ -135,11 +355,13 @@ pub struct DrainSummary {
 /// - Scans for `scheduled_event` notes with `status="pending"` and
 ///   `trigger_at <= now`.
 /// - Dispatches the stored action DSL or reminder inbox delivery in the event's namespace.
-/// - Marks fired events: status → `"fired"`, `fired_at` → now.
+/// - Persists a claim-bound dispatch receipt before lifecycle finalization.
+/// - Marks successful one-shots `"fired"`; failed one-shots return to
+///   `"pending"` for a later pass.
 /// - For repeating events with named aliases (`"daily"` / `"weekly"` /
 ///   `"monthly"`), resets status to `"pending"` and advances `trigger_at`.
-///   Five-field cron repeat expressions are NOT advanced (see module-level
-///   documentation).
+///   Unsupported recurrence is rejected at creation and fails closed for
+///   legacy rows (see module-level documentation).
 ///
 /// Per-event failures accumulate in the returned [`DrainSummary`] without
 /// aborting the drain.
@@ -162,50 +384,12 @@ pub async fn run_pending_events_with_config(
     namespace: &str,
     verbose: bool,
 ) -> Result<DrainSummary> {
-    // Resolve through the SAME multi-backend-aware construction the daemon
-    // boot path uses (`khive-mcp::serve::build_server_with_explicit_namespace`),
-    // rather than a throwaway `RuntimeConfig::default()` (PR #782):
-    // `RuntimeConfig::default()`
-    // is env-only — it never consulted `khive.toml` (`[[backends]]`,
-    // `[actor] id`, `[packs.*].backend`) at all, so a project with a
-    // declared multi-backend config or a tier-3 config-file actor identity
-    // was silently invisible to this one-shot CLI path even though
-    // `kkernel mcp --daemon` (and, for ordinary ops, `kkernel exec`'s own
-    // `resolve_runtime_config` call) both resolve it. The wrapper also
-    // returns the fully-wired `KhiveMcpServer` for the resolved pack set
-    // (single- or multi-backend), so replayed actions route through the
-    // correct per-pack backend exactly like the daemon tick now does — not a
-    // single runtime standing in for every pack (the same issue this fix
-    // closes for the daemon-resident tick). An explicit `kkernel exec
-    // --config` path is forwarded unchanged; otherwise `config: None` still
-    // triggers `khive.toml`'s standard cwd/home search order inside
-    // `resolve_runtime_config`.
-    //
-    // This does NOT call `crate::serve::build_server` directly (PR #782):
-    // `build_server` derives BOTH
-    // `namespace_explicit` and `actor_explicit` from `resolve_cli_namespace`,
-    // which treats "a namespace value is present" and "the operator typed
-    // `--actor`/`--namespace`" as the same fact — true for a real CLI parse,
-    // where there is no other way a namespace value could appear. This
-    // wrapper's `namespace` argument is not a CLI flag the operator typed;
-    // it is a plain default this function was called with (`"local"` unless
-    // the caller passed something else), and `resolve_runtime_config`
-    // (`serve.rs`) treats a genuine explicit actor override as authoritative
-    // — it clears any configured `[actor] id` for the resolved-to-"local"
-    // case rather than falling through to it. Routing this default namespace
-    // through `build_server` therefore silently discarded a project's
-    // configured `[actor] id`, contradicting Amendment B's claim that this
-    // CLI path honors it, and — under strict actor mode with the comm pack —
-    // could make server construction itself fail despite a valid config.
-    // `build_server_with_explicit_namespace` is the seam that lets this
-    // caller assert the narrower, correct semantic instead: the namespace
-    // *is* a real default (`namespace_explicit: true`, so it still becomes
-    // `default_namespace` and fills `actor_id` when non-"local"), but it is
-    // NOT an actor override (`actor_explicit: false`), so a `"local"`
-    // resolution keeps falling through to the project/db/env actor tiers —
-    // exactly the shape `kkernel exec`/`kkernel reindex` already use via
-    // their own direct `resolve_runtime_config` calls (see
-    // `RuntimeConfigInputs::actor_explicit`'s field doc).
+    // Resolves through the same multi-backend-aware construction the daemon
+    // boot path uses, with the namespace marked explicit but NOT an actor
+    // override — `namespace_explicit: true, actor_explicit: false` — so a
+    // `"local"`-resolved default namespace still falls through to the
+    // project-configured actor. See "Server construction: explicit namespace,
+    // implicit actor" in `crates/khive-mcp/docs/pending-events.md`.
     let ns = Namespace::parse(namespace)
         .map_err(|e| anyhow::anyhow!("pending-events: invalid namespace {namespace:?}: {e}"))?;
     let args = crate::args::Args {
@@ -248,7 +432,7 @@ pub async fn run_pending_events_with_config(
 }
 
 /// One-shot drain against an already-constructed [`KhiveRuntime`] +
-/// [`KhiveMcpServer`] pair (ADR-106; PR #782).
+/// [`KhiveMcpServer`] pair (ADR-106).
 ///
 /// The caller supplies an already-resolved, already-validated pair — both by
 /// reference — so the drain's storage target, actor identity, and pack set
@@ -266,21 +450,36 @@ pub async fn run_pending_events_on(
     server: &KhiveMcpServer,
     verbose: bool,
 ) -> Result<DrainSummary> {
+    run_pending_events_on_with_lease(rt, server, verbose, DispatchLeaseConfig::from_env()).await
+}
+
+async fn run_pending_events_on_with_lease(
+    rt: &KhiveRuntime,
+    server: &KhiveMcpServer,
+    verbose: bool,
+    lease: DispatchLeaseConfig,
+) -> Result<DrainSummary> {
     let now = Utc::now();
     let grace = fire_grace_from_env();
     let mut summary = DrainSummary::default();
 
-    // ── Step 0: reclaim rows abandoned mid-fire by a crashed/killed drain ──
-    // Runs before namespace discovery so any row reclaimed here (firing ->
-    // pending) is picked up by the normal pending scan below in this same
-    // pass, in whichever namespace it belongs to.
-    let stale_before = now
-        .timestamp_micros()
-        .saturating_sub(STALE_FIRING_TIMEOUT_MICROS);
-    summary.reclaimed = reclaim_stale_firing_events(rt, stale_before).await?;
+    // ── Step 0: reconcile claims whose renewable lease expired ───────────
+    // A durable succeeded/failed outcome is finalized without invoking the
+    // action again. An `invoking` receipt has an ambiguous crash boundary and
+    // fails closed instead of risking a duplicate side effect. Only legacy
+    // pre-receipt claims retain the historical pending retry behavior.
+    let reclaimed = reclaim_stale_firing_events(rt, now.timestamp_micros()).await?;
+    summary.reclaimed = reclaimed.rows;
+    summary.outcomes_persisted += reclaimed.outcomes_persisted;
+    summary.fired += reclaimed.fired;
+    summary.advanced += reclaimed.advanced;
+    summary.retry_pending += reclaimed.retry_pending;
+    summary.indeterminate += reclaimed.indeterminate;
+    summary.finalized += reclaimed.finalized;
+    summary.failed += reclaimed.failed;
     if verbose && summary.reclaimed > 0 {
         eprintln!(
-            "[pending-events] reclaimed {} stale \"firing\" row(s) back to \"pending\"",
+            "[pending-events] reconciled {} expired \"firing\" row(s)",
             summary.reclaimed
         );
     }
@@ -305,65 +504,24 @@ pub async fn run_pending_events_on(
             continue;
         }
 
-        // Bounded, mutation-immune keyset pagination (PR #782,
-        // a continuation of the prior fix).
-        //
-        // The prior version snapshotted every `status="pending"` row for the namespace
-        // into one `Vec` before any mutation, which fixed the LIMIT/OFFSET
-        // skip bug (mutating a row out of the `status="pending"` predicate
-        // mid-page shifted every subsequent page) but introduced a new
-        // failure mode: the snapshot filter checked only `status`, not
-        // `trigger_at`, so a namespace with one due event buried in a large
-        // FUTURE schedule pulled the entire future backlog into memory every
-        // tick. This version instead:
-        //   1. pushes the due-ness predicate (`trigger_at <= now`) into the
-        //      SQL `WHERE` clause directly, via a raw statement (bypassing
-        //      `NoteFilter`, whose `order_by`/property-filter surface can
-        //      only express JSON-path predicates, not compare a JSON path
-        //      against a bind parameter with `<=`) — future events are never
-        //      fetched at all, so the working set is bounded by the due
-        //      backlog, not the namespace's total schedule size;
-        //   2. pages via a `(created_at, id)` keyset cursor instead of
-        //      `LIMIT/OFFSET`. Both columns are immutable — this drain never
-        //      rewrites `created_at` or `id` — so a row's claim/dispatch/
-        //      finalize mutation between pages can never shift a later
-        // page's boundary (the prior bug class), and at most
-        //      `PAGE_SIZE` rows are held in memory at once (never the whole
-        //      namespace).
+        // Bounded, mutation-immune keyset pagination: the due-ness predicate
+        // (`trigger_at <= now`) runs in SQL directly so future events are
+        // never fetched, and pages advance on the immutable `(created_at,
+        // id)` keyset rather than `LIMIT/OFFSET`, so a row mutated between
+        // pages can never shift a later page's boundary. See "Keyset
+        // pagination and due-ness comparison" in
+        // `crates/khive-mcp/docs/pending-events.md`.
         const PAGE_SIZE: u32 = 200;
         let now_rfc = now.to_rfc3339();
         let mut cursor: Option<(i64, String)> = None;
         loop {
             let (sql, params): (String, Vec<SqlValue>) = match &cursor {
-                //
-                // The due-ness predicate compares via SQLite's `datetime()`,
-                // not a raw string `<=` (PR #782): stored
-                // `trigger_at` values are NOT normalized to UTC —
-                // `khive-pack-schedule`'s `handle_remind`/`handle_schedule`
-                // deliberately round-trip the caller's original string
-                // (offset included, H5), and `validate_at` accepts any RFC
-                // 3339 offset. A raw lexicographic `<=` against a UTC
-                // `now`-string therefore mis-ranks any non-UTC-offset
-                // `trigger_at`: e.g. `"2026-07-10T02:00:00+04:00"`
-                // (chronologically `2026-07-09T22:00:00Z`, overdue) sorts
-                // AFTER a UTC `now` string like
-                // `"2026-07-10T00:47:00.123+00:00"` as raw text, so it would
-                // never be fetched — never fire, never get marked missed,
-                // forever. `datetime(...)` normalizes both sides to UTC
-                // before comparing, so the predicate is chronological
-                // regardless of the stored string's offset. Storage itself
-                // is unchanged — only this fetch-bound comparison is
-                // normalized; the original string still round-trips
-                // faithfully.
-                //
-                // `datetime()` returns NULL for a value it cannot parse, and
-                // NULL <= anything is NULL (never true) — the OR clause below
-                // keeps an unparseable `trigger_at` row in the candidate set
-                // instead of silently dropping it, so the existing Rust-side
-                // unparseable-`trigger_at` branch (which logs and advances
-                // the cursor past it) still sees it. `validate_at` rejects
-                // unparseable `trigger_at` at write time, so this only
-                // matters for a hand-written or pre-validation row.
+                // Due-ness compares via SQLite's `datetime()`, not a raw
+                // string `<=`: stored `trigger_at` values are not normalized
+                // to UTC, so a raw lexicographic compare mis-ranks non-UTC
+                // offsets. `datetime()` returns NULL for an unparseable
+                // value; the `OR ... IS NULL` clause keeps such a row in the
+                // candidate set instead of silently dropping it.
                 None => (
                     "SELECT id, content, properties, created_at FROM notes \
                      WHERE namespace = ?1 AND kind = 'scheduled_event' \
@@ -466,7 +624,7 @@ pub async fn run_pending_events_on(
                         continue;
                     }
                 };
-                let mut properties: Option<Value> = match row.get("properties") {
+                let properties: Option<Value> = match row.get("properties") {
                     Some(SqlValue::Text(s)) => match serde_json::from_str(s) {
                         Ok(v) => Some(v),
                         Err(e) => {
@@ -504,28 +662,19 @@ pub async fn run_pending_events_on(
 
                 summary.scanned += 1;
 
-                // Parse and check trigger_at.
                 let trigger_at_str = properties
                     .as_ref()
                     .and_then(|p| p.get("trigger_at"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                // Parsed as `DateTime<FixedOffset>` (not straight to
-                // `DateTime<Utc>`) so the caller's original UTC offset is
-                // retained alongside the UTC instant — `khive-pack-schedule`
-                // round-trips the caller's original `trigger_at` string
-                // verbatim, offset included, and that offset must
-                // survive repeat advancement (issue #792): rendering the
-                // advanced `trigger_at` via a bare `DateTime<Utc>::to_rfc3339`
-                // always stamps `+00:00`, silently rewriting a non-UTC
-                // schedule to UTC on its first advance.
-                //
-                // Uses the same relaxed grammar as the write boundary
-                // (`khive-pack-schedule`'s `at.parse::<DateTime<Utc>>()`),
-                // not the strict `DateTime::parse_from_rfc3339`: already
-                // persisted `trigger_at` strings can use the relaxed RFC
-                // 3339 form (space instead of `T`, offset without a colon),
-                // and the strict parser would silently skip them forever.
+                // Parsed as `DateTime<FixedOffset>`, not straight to
+                // `DateTime<Utc>`, so the caller's original offset survives
+                // repeat advancement instead of being silently rewritten to
+                // UTC. Uses the relaxed RFC 3339 grammar matching the write
+                // boundary, not the strict parser, since already-persisted
+                // strings may use the relaxed form. See "Offset preservation
+                // and relaxed RFC 3339 parsing" in
+                // `crates/khive-mcp/docs/pending-events.md`.
                 let trigger_at_fixed = match trigger_at_str.parse::<DateTime<FixedOffset>>() {
                     Ok(dt) => dt,
                     Err(_) => {
@@ -568,25 +717,24 @@ pub async fn run_pending_events_on(
                 // KG mutation fence separately prevents a valid provenance
                 // record from authorizing rewritten executable intent.
                 // Generic actions require provenance even on the missed path
-                // (legacy rows fail closed before any lifecycle transition);
-                // in-grace reminders use it for both recipient and dispatch
-                // identity. Missed reminders do not dispatch at all.
-                let creator = if event_type == "schedule" || !is_missed {
-                    match verified_creator_for_event(rt, ns_str, id, event_type).await {
-                        Ok(actor) => actor,
-                        Err(e) => {
-                            if verbose {
-                                eprintln!(
-                                    "[pending-events] creator provenance lookup failed for note \
-                                     {id}: {e}"
-                                );
-                            }
-                            summary.failed += 1;
-                            continue;
+                // (legacy rows fail closed before any lifecycle transition).
+                // Reminders also resolve provenance when missed: although no
+                // delivery occurs, the durable receipt must still identify
+                // the creator rather than whichever daemon happened to run
+                // the grace-policy transition. Only genuinely legacy rows
+                // without a provenance event use the scheduler fallback.
+                let creator = match verified_creator_for_event(rt, ns_str, id, event_type).await {
+                    Ok(actor) => actor,
+                    Err(e) => {
+                        if verbose {
+                            eprintln!(
+                                "[pending-events] creator provenance lookup failed for note \
+                                 {id}: {e}"
+                            );
                         }
+                        summary.failed += 1;
+                        continue;
                     }
-                } else {
-                    None
                 };
                 let reminder_actor = if event_type == "remind" && !is_missed {
                     match creator.as_ref() {
@@ -635,29 +783,40 @@ pub async fn run_pending_events_on(
                     .and_then(Value::as_str)
                     .map(str::to_string);
 
-                // ── Claim the row before dispatch (issue #462, fire side) ──
-                // `properties` above is a page-query snapshot; a concurrent
-                // `schedule.cancel` could have transitioned the row to
-                // "cancelled" since then. CAS-claim pending -> firing now so
-                // that: (a) a concurrent cancel's own CAS (which only
-                // matches status='pending') fails once we've claimed it, and
-                // (b) if cancel already won the race, our claim fails and we
-                // skip — the drain can no longer clobber a cancel that
-                // landed between the read and this point. The same claim
-                // guards the missed path: a missed event still needs
-                // exclusive ownership before it can be marked "missed" or
-                // re-armed to a future occurrence.
-                let claimed_firing_at = match claim_pending_event(rt, ns_str, id).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        if verbose {
-                            eprintln!("[pending-events] claim failed for note {id}: {e}");
+                // `properties` above is a page-query snapshot; CAS-claim
+                // pending -> firing now so a concurrent `schedule.cancel`
+                // cannot land between the read and this point (whichever
+                // side wins the CAS proceeds; the loser skips). The same
+                // claim gates the missed path too.
+                let occurrence_id = dispatch_occurrence_id(id, trigger_at);
+                let receipt_actor = creator
+                    .as_ref()
+                    .map(|creator| creator.audit_actor.clone())
+                    .unwrap_or_else(|| {
+                        if event_type == "remind" {
+                            server
+                                .actor_id()
+                                .filter(|actor| !actor.trim().is_empty())
+                                .map(|actor| format!("actor:{actor}"))
+                                .unwrap_or_else(|| "anonymous:local".to_string())
+                        } else {
+                            "anonymous:local".to_string()
                         }
-                        summary.failed += 1;
-                        continue;
-                    }
-                };
-                let Some(claimed_firing_at) = claimed_firing_at else {
+                    });
+                let claim =
+                    match claim_pending_event(rt, ns_str, id, occurrence_id, &receipt_actor, lease)
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("[pending-events] claim failed for note {id}: {e}");
+                            }
+                            summary.failed += 1;
+                            continue;
+                        }
+                    };
+                let Some(claim) = claim else {
                     if verbose {
                         eprintln!(
                             "[pending-events] skip note {id}: no longer pending (concurrent \
@@ -667,6 +826,35 @@ pub async fn run_pending_events_on(
                     summary.skipped_race += 1;
                     continue;
                 };
+
+                if repeat
+                    .as_deref()
+                    .is_some_and(|repeat| !matches!(repeat, "daily" | "weekly" | "monthly"))
+                {
+                    let error = "scheduled event uses an unsupported repeat expression; only daily, weekly, and monthly are executable";
+                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    props["status"] = json!("failed");
+                    let (error_key, error_at_key) = dispatch_error_property_keys(&props);
+                    props[error_key] = json!(error);
+                    props[error_at_key] = json!(Utc::now().to_rfc3339());
+                    let completed_at = Utc::now().timestamp_micros();
+                    props["dispatch_receipt"] = claim.completed_without_invocation_receipt(
+                        DispatchReceiptState::NotInvoked,
+                        completed_at,
+                        Some(error),
+                    );
+                    summary.failed += 1;
+                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim).await {
+                        Ok(true) => summary.finalized += 1,
+                        Ok(false) => summary.skipped_race += 1,
+                        Err(error) => tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %error,
+                            "pending-events: unsupported-repeat finalization failed"
+                        ),
+                    }
+                    continue;
+                }
 
                 // Generic scheduled actions must replay as the creator from
                 // immutable pack provenance, never as the daemon and never
@@ -687,17 +875,13 @@ pub async fn run_pending_events_on(
                     props["dispatch_error"] = json!(error);
                     props["dispatch_failed_at"] = json!(Utc::now().to_rfc3339());
                     let updated_at = Utc::now().timestamp_micros();
-                    match finalize_fired_event(
-                        rt,
-                        ns_str,
-                        id,
-                        &props,
+                    props["dispatch_receipt"] = claim.completed_without_invocation_receipt(
+                        DispatchReceiptState::NotInvoked,
                         updated_at,
-                        claimed_firing_at,
-                    )
-                    .await
-                    {
-                        Ok(true) => {}
+                        Some(error),
+                    );
+                    match finalize_fired_event(rt, ns_str, id, &props, updated_at, &claim).await {
+                        Ok(true) => summary.finalized += 1,
                         Ok(false) => tracing::error!(
                             scheduled_event_id = %id,
                             "pending-events: failed-identity finalization lost its firing claim"
@@ -729,32 +913,30 @@ pub async fn run_pending_events_on(
                     match advance_repeat_past_missed(&repeat, trigger_at, now) {
                         Some(next_at) => {
                             // Repeating event: skip this occurrence, re-arm
-                            // pending at the next future one. Rendered at the
-                            // original offset (issue #792), not UTC.
+                            // pending at the next future one, rendered at the
+                            // original offset, not UTC.
                             props["trigger_at"] =
                                 json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                             props["status"] = json!("pending");
                         }
                         None => {
-                            // Non-repeating (or non-advancing cron): terminal
-                            // "missed". `fired_at` stays null/untouched.
+                            // Non-repeating: terminal "missed". Unsupported
+                            // recurrence was rejected before this path.
+                            // `fired_at` stays null/untouched.
                             props["status"] = json!("missed");
                         }
                     }
                     let updated_at = Utc::now().timestamp_micros();
-
-                    match finalize_fired_event(
-                        rt,
-                        ns_str,
-                        id,
-                        &props,
+                    props["dispatch_receipt"] = claim.completed_without_invocation_receipt(
+                        DispatchReceiptState::Missed,
                         updated_at,
-                        claimed_firing_at,
-                    )
-                    .await
-                    {
+                        None,
+                    );
+
+                    match finalize_fired_event(rt, ns_str, id, &props, updated_at, &claim).await {
                         Ok(true) => {
                             summary.missed.push(id);
+                            summary.finalized += 1;
                         }
                         Ok(false) => {
                             if verbose {
@@ -776,156 +958,185 @@ pub async fn run_pending_events_on(
                 }
 
                 // ── Dispatch the action ──────────────────────────────────
-                let mut reminder_delivery_error = None;
-                let mut scheduled_dispatch_error = None;
-                if let Some(dsl) = &action_dsl {
-                    let dispatch_actor = if event_type == "schedule" {
-                        creator.clone().expect("checked above").request_actor
-                    } else {
-                        // Provenanced reminders carry the typed creator. A
-                        // legacy reminder's safe daemon-owner fallback is
-                        // re-wrapped here only after the row actor was ignored.
-                        // An unconfigured server remains anonymous (`None`),
-                        // rather than becoming authenticated `actor:local`.
-                        match creator.clone() {
-                            Some(creator) => creator.request_actor,
-                            None => server.actor_id().and_then(|actor| {
-                                (!actor.trim().is_empty()).then(|| {
-                                    VerifiedActor::new(actor.to_string())
-                                        .expect("non-blank scheduler actor was prevalidated")
-                                })
-                            }),
-                        }
-                    };
-                    let dispatch_result =
-                        dispatch_action(dsl, ns_str, dispatch_actor, server, verbose).await;
-                    if let Err(e) = dispatch_result {
+                let dispatch_actor = if event_type == "schedule" {
+                    creator.clone().expect("checked above").request_actor
+                } else {
+                    match creator.clone() {
+                        Some(creator) => creator.request_actor,
+                        None => server.actor_id().and_then(|actor| {
+                            (!actor.trim().is_empty()).then(|| {
+                                VerifiedActor::new(actor.to_string())
+                                    .expect("non-blank scheduler actor was prevalidated")
+                            })
+                        }),
+                    }
+                };
+                let Some(dsl) = action_dsl.as_deref() else {
+                    let error = "scheduled event has no executable payload";
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        event_type,
+                        "pending-events: refusing empty scheduled-event dispatch"
+                    );
+                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    let (error_key, error_at_key) = dispatch_error_property_keys(&props);
+                    props[error_key] = json!(error);
+                    props[error_at_key] = json!(Utc::now().to_rfc3339());
+                    props["status"] = json!("failed");
+                    let completed_at = Utc::now().timestamp_micros();
+                    props["dispatch_receipt"] = claim.completed_without_invocation_receipt(
+                        DispatchReceiptState::NotInvoked,
+                        completed_at,
+                        Some(error),
+                    );
+                    summary.failed += 1;
+                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim).await {
+                        Ok(true) => summary.finalized += 1,
+                        Ok(false) => summary.skipped_race += 1,
+                        Err(error) => tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %error,
+                            "pending-events: empty-payload finalization failed"
+                        ),
+                    }
+                    continue;
+                };
+                if event_type == "schedule" && stored_action_is_non_single(dsl) {
+                    let error = "scheduled action contains multiple operations or a chain; legacy batches are not replayable because partial success cannot be retried safely";
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        "pending-events: refusing non-single scheduled action"
+                    );
+                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    props["dispatch_error"] = json!(error);
+                    props["dispatch_failed_at"] = json!(Utc::now().to_rfc3339());
+                    props["status"] = json!("failed");
+                    let completed_at = Utc::now().timestamp_micros();
+                    props["dispatch_receipt"] = claim.completed_without_invocation_receipt(
+                        DispatchReceiptState::NotInvoked,
+                        completed_at,
+                        Some(error),
+                    );
+                    summary.failed += 1;
+                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim).await {
+                        Ok(true) => summary.finalized += 1,
+                        Ok(false) => summary.skipped_race += 1,
+                        Err(error) => tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %error,
+                            "pending-events: non-single-action finalization failed"
+                        ),
+                    }
+                    continue;
+                }
+                match mark_dispatch_invoking(rt, ns_str, id, &claim, lease).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        summary.failed += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %error,
+                            "pending-events: could not persist invocation-start receipt"
+                        );
+                        summary.failed += 1;
+                        continue;
+                    }
+                }
+
+                summary.invoked += 1;
+                let (completion, persisted_outcome) = dispatch_with_renewable_lease(
+                    DispatchLeaseTarget {
+                        rt,
+                        namespace: ns_str,
+                        scheduled_event_id: id,
+                        claim: &claim,
+                    },
+                    lease,
+                    dsl,
+                    dispatch_actor,
+                    server,
+                    verbose,
+                )
+                .await;
+                let completion_error = match &completion {
+                    DispatchCompletion::Succeeded => None,
+                    DispatchCompletion::Failed(error)
+                    | DispatchCompletion::Indeterminate(error) => {
                         tracing::error!(
                             scheduled_event_id = %id,
                             event_type,
                             recipient_actor = reminder_actor.as_deref(),
-                            error = %e,
+                            error = %error,
                             "pending-events: scheduled event delivery failed"
                         );
-                        if verbose {
-                            eprintln!("[pending-events] dispatch failed for note {id}: {e}");
-                        }
                         summary.failed += 1;
-                        if event_type == "remind" {
-                            let error = e.to_string();
-                            append_reminder_delivery_failure_event(
-                                server,
-                                ns_str,
-                                id,
-                                reminder_actor.as_deref().unwrap_or("local"),
-                                &error,
-                            )
-                            .await;
-                            reminder_delivery_error = Some(error);
-                        } else {
-                            scheduled_dispatch_error = Some(e.to_string());
-                        }
-                        // Per-event failure does NOT abort the drain. Continue.
-                        // Still mark as fired so the drain doesn't retry infinitely
-                        // on a permanently broken action. The error is reported
-                        // in the summary.
-                        // Callers can inspect fired_at + dispatch_error to
-                        // distinguish clean fires from error fires.
+                        Some(error.as_str().to_string())
                     }
-                }
+                };
 
-                let fired_at_rfc = Utc::now().to_rfc3339();
-                let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                // The dispatch helper keeps lease renewal active through this
+                // outcome write. No secondary audit await occurs before it.
+                let receipt = match persisted_outcome {
+                    Ok(Some(receipt)) => {
+                        summary.outcomes_persisted += 1;
+                        receipt
+                    }
+                    Ok(None) => {
+                        summary.failed += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %error,
+                            "pending-events: dispatch outcome receipt persistence failed"
+                        );
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
                 if event_type == "remind" {
-                    if let Some(error) = reminder_delivery_error {
-                        props["delivery_error"] = json!(error);
-                        props["delivery_failed_at"] = json!(fired_at_rfc);
-                    } else if let Some(obj) = props.as_object_mut() {
-                        obj.remove("delivery_error");
-                        obj.remove("delivery_failed_at");
-                    }
-                } else if event_type == "schedule" {
-                    if let Some(error) = scheduled_dispatch_error {
-                        props["dispatch_error"] = json!(error);
-                        props["dispatch_failed_at"] = json!(fired_at_rfc);
-                    } else if let Some(obj) = props.as_object_mut() {
-                        obj.remove("dispatch_error");
-                        obj.remove("dispatch_failed_at");
+                    if let Some(error) = completion_error.as_deref() {
+                        append_reminder_delivery_failure_event(
+                            server,
+                            ns_str,
+                            id,
+                            reminder_actor.as_deref().unwrap_or("local"),
+                            error,
+                        )
+                        .await;
                     }
                 }
-                let updated_at;
-
-                match next_trigger_at(&repeat, trigger_at) {
-                    Some(next_at) => {
-                        // Repeating event: advance to next occurrence.
-                        // Rendered at the original offset (issue #792), not
-                        // UTC — `next_trigger_at` computes the advanced
-                        // instant in UTC, but the caller's original
-                        // `trigger_at` offset must survive serialization.
-                        props["trigger_at"] =
-                            json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
-                        props["status"] = json!("pending");
-                        props["fired_at"] = json!(fired_at_rfc);
-                        properties = Some(props);
-                        updated_at = Utc::now().timestamp_micros();
-                        summary.advanced += 1;
-                    }
-                    None => {
-                        // Non-repeating (or cron — deferred): mark as fired.
-                        props["status"] = json!("fired");
-                        props["fired_at"] = json!(fired_at_rfc);
-                        properties = Some(props);
-                        updated_at = Utc::now().timestamp_micros();
-                        summary.fired += 1;
-                    }
-                }
-
-                // ── Persist the updated note ─────────────────────────────
-                // Conditional on status='firing' (set by the claim above)
-                // instead of a full-row `upsert_note`, so this write can never
-                // clobber a cancel that (impossibly, given the claim above,
-                // but defensively) raced in after the claim.
-                let final_props = properties.clone().unwrap_or_else(|| json!({}));
+                let (final_props, disposition) = final_properties_after_dispatch(
+                    properties.clone().unwrap_or_else(|| json!({})),
+                    receipt,
+                    &completion,
+                    trigger_at,
+                    trigger_offset,
+                    &repeat,
+                );
                 match finalize_fired_event(
                     rt,
                     ns_str,
                     id,
                     &final_props,
-                    updated_at,
-                    claimed_firing_at,
+                    Utc::now().timestamp_micros(),
+                    &claim,
                 )
                 .await
                 {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if verbose {
-                            eprintln!(
-                                "[pending-events] finalize no-op for {id}: row no longer in \
-                                 \"firing\" state"
-                            );
-                        }
+                    Ok(true) => apply_final_disposition(&mut summary, disposition),
+                    Ok(false) => summary.failed += 1,
+                    Err(error) => {
+                        tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %error,
+                            "pending-events: finalization failed after durable outcome"
+                        );
                         summary.failed += 1;
-                        if summary.fired > 0 {
-                            summary.fired -= 1;
-                        }
-                        if summary.advanced > 0 {
-                            summary.advanced -= 1;
-                        }
-                    }
-                    Err(e) => {
-                        if verbose {
-                            eprintln!("[pending-events] finalize failed for {id}: {e}");
-                        }
-                        // Count as failed; drain continues.
-                        summary.failed += 1;
-                        // Undo the advance/fired accounting since persist failed.
-                        // (fired/advanced were already incremented above — adjust back)
-                        if summary.fired > 0 {
-                            summary.fired -= 1;
-                        }
-                        if summary.advanced > 0 {
-                            summary.advanced -= 1;
-                        }
                     }
                 }
             }
@@ -939,17 +1150,192 @@ pub async fn run_pending_events_on(
     Ok(summary)
 }
 
-/// CAS-claim a pending scheduled event for firing: `pending -> firing`.
-/// Returns `Ok(Some(firing_at))` iff exactly one row transitioned; the
-/// returned `firing_at` is this drain's claim token, threaded through to
-/// `finalize_fired_event` (issue #462). See
-/// `crates/khive-mcp/docs/api/pending-events.md`.
+fn dispatch_occurrence_id(event_id: uuid::Uuid, trigger_at: DateTime<Utc>) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&event_id, trigger_at.to_rfc3339().as_bytes())
+}
+
+fn receipt_timestamp(receipt: &Value, field: &str) -> std::result::Result<i64, String> {
+    let value = receipt
+        .get(field)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("dispatch receipt {field} is missing or not an integer"))?;
+    DateTime::<Utc>::from_timestamp_micros(value).ok_or_else(|| {
+        format!("dispatch receipt {field} is outside the supported timestamp range")
+    })?;
+    Ok(value)
+}
+
+fn validate_dispatch_receipt(
+    event_id: uuid::Uuid,
+    firing_at: i64,
+    properties: &Value,
+    receipt: Value,
+) -> std::result::Result<ValidatedDispatchReceipt, String> {
+    if !receipt.is_object() {
+        return Err("dispatch receipt is not an object".to_string());
+    }
+    if properties.get("firing_at").and_then(Value::as_i64) != Some(firing_at) {
+        return Err("dispatch firing claim timestamp is missing or malformed".to_string());
+    }
+    if receipt.get("version").and_then(Value::as_u64) != Some(DISPATCH_RECEIPT_VERSION) {
+        return Err("dispatch receipt version is missing or unsupported".to_string());
+    }
+
+    let occurrence_id = receipt
+        .get("occurrence_id")
+        .and_then(Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or_else(|| "dispatch receipt occurrence_id is missing or malformed".to_string())?;
+    let invocation_id = receipt
+        .get("invocation_id")
+        .and_then(Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or_else(|| "dispatch receipt invocation_id is missing or malformed".to_string())?;
+    let actor = receipt
+        .get("actor")
+        .and_then(Value::as_str)
+        .filter(|actor| {
+            *actor == "anonymous:local"
+                || actor
+                    .strip_prefix("actor:")
+                    .is_some_and(|identity| !identity.trim().is_empty())
+        })
+        .ok_or_else(|| "dispatch receipt actor is missing or malformed".to_string())?
+        .to_string();
+    let claimed_at = receipt_timestamp(&receipt, "claimed_at")?;
+    if claimed_at != firing_at {
+        return Err("dispatch receipt claimed_at does not match the firing claim".to_string());
+    }
+
+    let trigger_at = properties
+        .get("trigger_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "scheduled event trigger_at is missing during receipt validation".to_string()
+        })?
+        .parse::<DateTime<FixedOffset>>()
+        .map_err(|_| {
+            "scheduled event trigger_at is malformed during receipt validation".to_string()
+        })?
+        .with_timezone(&Utc);
+    if occurrence_id != dispatch_occurrence_id(event_id, trigger_at) {
+        return Err(
+            "dispatch receipt occurrence_id does not match the event and scheduled instant"
+                .to_string(),
+        );
+    }
+
+    let state = receipt
+        .get("state")
+        .and_then(Value::as_str)
+        .and_then(DispatchReceiptState::parse)
+        .ok_or_else(|| "dispatch receipt state is missing or unsupported".to_string())?;
+    match state {
+        DispatchReceiptState::Claimed => {
+            if receipt
+                .get("error_payload")
+                .is_some_and(|payload| !payload.is_null())
+            {
+                return Err(
+                    "dispatch receipt state claimed cannot carry an error payload".to_string(),
+                );
+            }
+        }
+        DispatchReceiptState::Invoking => {
+            receipt_timestamp(&receipt, "invocation_started_at")?;
+            if receipt
+                .get("error_payload")
+                .is_some_and(|payload| !payload.is_null())
+            {
+                return Err(
+                    "dispatch receipt state invoking cannot carry an error payload".to_string(),
+                );
+            }
+        }
+        DispatchReceiptState::Succeeded | DispatchReceiptState::Missed => {
+            receipt_timestamp(&receipt, "completed_at")?;
+            if receipt.get("error") != Some(&Value::Null) {
+                return Err(format!(
+                    "dispatch receipt state {} requires error=null",
+                    state.as_str()
+                ));
+            }
+            if receipt
+                .get("error_payload")
+                .is_some_and(|payload| !payload.is_null())
+            {
+                return Err(format!(
+                    "dispatch receipt state {} cannot carry an error payload",
+                    state.as_str()
+                ));
+            }
+        }
+        DispatchReceiptState::Failed | DispatchReceiptState::Indeterminate => {
+            receipt_timestamp(&receipt, "completed_at")?;
+            if receipt
+                .get("error")
+                .and_then(Value::as_str)
+                .is_none_or(|error| error.trim().is_empty())
+            {
+                return Err(format!(
+                    "dispatch receipt state {} requires a non-empty error",
+                    state.as_str()
+                ));
+            }
+        }
+        DispatchReceiptState::NotInvoked => {
+            receipt_timestamp(&receipt, "completed_at")?;
+            if receipt
+                .get("error")
+                .and_then(Value::as_str)
+                .is_none_or(|error| error.trim().is_empty())
+            {
+                return Err(
+                    "dispatch receipt state not_invoked requires a non-empty error".to_string(),
+                );
+            }
+            if receipt
+                .get("error_payload")
+                .is_some_and(|payload| !payload.is_null())
+            {
+                return Err(
+                    "dispatch receipt state not_invoked cannot carry an action error payload"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(ValidatedDispatchReceipt {
+        value: receipt,
+        occurrence_id,
+        invocation_id,
+        actor,
+        state,
+    })
+}
+
+/// CAS-claim a pending scheduled event and atomically persist the occurrence
+/// and invocation identity before any action future can be polled.
 async fn claim_pending_event(
     rt: &KhiveRuntime,
     namespace: &str,
     id: uuid::Uuid,
-) -> Result<Option<i64>> {
+    occurrence_id: uuid::Uuid,
+    actor: &str,
+    lease: DispatchLeaseConfig,
+) -> Result<Option<DispatchClaim>> {
     let updated_at = Utc::now().timestamp_micros();
+    let claim = DispatchClaim {
+        firing_at: updated_at,
+        occurrence_id,
+        invocation_id: uuid::Uuid::new_v4(),
+        actor: actor.to_string(),
+    };
+    let lease_expires_at = lease.expires_at(updated_at);
+    let receipt = claim.claimed_receipt();
+    let receipt_json = serde_json::to_string(&receipt)
+        .context("pending-events: serialize dispatch claim receipt")?;
     let mut writer = rt
         .sql()
         .writer()
@@ -959,18 +1345,23 @@ async fn claim_pending_event(
         .execute(SqlStatement {
             sql: "UPDATE notes \
                   SET properties = json_set( \
-                        json_set(COALESCE(properties, '{}'), '$.status', 'firing'), \
-                        '$.firing_at', ?1 \
+                        COALESCE(properties, '{}'), \
+                        '$.status', 'firing', \
+                        '$.firing_at', ?1, \
+                        '$.lease_expires_at', ?2, \
+                        '$.dispatch_receipt', json(?3) \
                       ), \
                       updated_at = ?1 \
-                  WHERE id = ?2 \
-                    AND namespace = ?3 \
+                  WHERE id = ?4 \
+                    AND namespace = ?5 \
                     AND kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
                     AND json_extract(properties, '$.status') = 'pending'"
                 .to_string(),
             params: vec![
                 SqlValue::Integer(updated_at),
+                SqlValue::Integer(lease_expires_at),
+                SqlValue::Text(receipt_json),
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(namespace.to_string()),
             ],
@@ -978,45 +1369,745 @@ async fn claim_pending_event(
         })
         .await
         .map_err(|e| anyhow::anyhow!("pending-events: claim conditional update: {e}"))?;
-    Ok((rows == 1).then_some(updated_at))
+    Ok((rows == 1).then_some(claim))
 }
 
-/// Reclaim `scheduled_event` rows stuck in `status="firing"` whose
-/// `firing_at` predates `stale_before_micros` (epoch µs) back to
-/// `status="pending"` (issue #462). Returns the number of rows reclaimed.
-/// See `crates/khive-mcp/docs/api/pending-events.md`.
-async fn reclaim_stale_firing_events(rt: &KhiveRuntime, stale_before_micros: i64) -> Result<u64> {
+async fn mark_dispatch_invoking(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    claim: &DispatchClaim,
+    lease: DispatchLeaseConfig,
+) -> Result<bool> {
+    let now = Utc::now().timestamp_micros();
     let mut writer = rt
         .sql()
         .writer()
         .await
-        .map_err(|e| anyhow::anyhow!("pending-events: open SQL writer: {e}"))?;
+        .context("pending-events: open SQL writer for invocation receipt")?;
     let rows = writer
         .execute(SqlStatement {
             sql: "UPDATE notes \
-                  SET properties = json_set(properties, '$.status', 'pending') \
-                  WHERE kind = 'scheduled_event' \
+                  SET properties = json_set( \
+                        properties, \
+                        '$.dispatch_receipt.state', 'invoking', \
+                        '$.dispatch_receipt.invocation_started_at', ?1, \
+                        '$.lease_expires_at', ?2 \
+                      ), \
+                      updated_at = ?1 \
+                  WHERE id = ?3 \
+                    AND namespace = ?4 \
+                    AND kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
                     AND json_extract(properties, '$.status') = 'firing' \
-                    AND ( \
-                      json_extract(properties, '$.firing_at') IS NULL \
-                      OR CAST(json_extract(properties, '$.firing_at') AS INTEGER) < ?1 \
-                    )"
-            .to_string(),
-            params: vec![SqlValue::Integer(stale_before_micros)],
-            label: Some("pending_events_reclaim_stale_firing".into()),
+                    AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5 \
+                    AND json_extract(properties, '$.dispatch_receipt.invocation_id') = ?6 \
+                    AND json_extract(properties, '$.dispatch_receipt.state') = 'claimed'"
+                .to_string(),
+            params: vec![
+                SqlValue::Integer(now),
+                SqlValue::Integer(lease.expires_at(now)),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(claim.firing_at),
+                SqlValue::Text(claim.invocation_id.to_string()),
+            ],
+            label: Some("pending_events_mark_invoking".into()),
         })
         .await
-        .map_err(|e| anyhow::anyhow!("pending-events: reclaim stale firing rows: {e}"))?;
-    Ok(rows)
+        .context("pending-events: persist invocation-start receipt")?;
+    Ok(rows == 1)
+}
+
+async fn renew_dispatch_lease(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    claim: &DispatchClaim,
+    lease: DispatchLeaseConfig,
+) -> Result<bool> {
+    let now = Utc::now().timestamp_micros();
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .context("pending-events: open SQL writer for lease renewal")?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = json_set(properties, '$.lease_expires_at', ?1), \
+                      updated_at = ?2 \
+                  WHERE id = ?3 \
+                    AND namespace = ?4 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'firing' \
+                    AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5 \
+                    AND json_extract(properties, '$.dispatch_receipt.invocation_id') = ?6 \
+                    AND json_extract(properties, '$.dispatch_receipt.state') = 'invoking'"
+                .to_string(),
+            params: vec![
+                SqlValue::Integer(lease.expires_at(now)),
+                SqlValue::Integer(now),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(claim.firing_at),
+                SqlValue::Text(claim.invocation_id.to_string()),
+            ],
+            label: Some("pending_events_renew_dispatch_lease".into()),
+        })
+        .await
+        .context("pending-events: renew dispatch lease")?;
+    Ok(rows == 1)
+}
+
+async fn persist_dispatch_outcome(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    claim: &DispatchClaim,
+    completion: &DispatchCompletion,
+) -> Result<Option<Value>> {
+    let completed_at = Utc::now().timestamp_micros();
+    let (state, error, error_payload) = match completion {
+        DispatchCompletion::Succeeded => ("succeeded", Value::Null, Value::Null),
+        DispatchCompletion::Failed(error) => (
+            "failed",
+            json!(error.as_str()),
+            error.payload.clone().unwrap_or(Value::Null),
+        ),
+        DispatchCompletion::Indeterminate(error) => (
+            "indeterminate",
+            json!(error.as_str()),
+            error.payload.clone().unwrap_or(Value::Null),
+        ),
+    };
+    let receipt = json!({
+        "version": DISPATCH_RECEIPT_VERSION,
+        "occurrence_id": claim.occurrence_id,
+        "invocation_id": claim.invocation_id,
+        "actor": claim.actor.as_str(),
+        "state": state,
+        "claimed_at": claim.firing_at,
+        "completed_at": completed_at,
+        "error": error,
+        "error_payload": error_payload,
+    });
+    let receipt_json = serde_json::to_string(&receipt)
+        .context("pending-events: serialize dispatch outcome receipt")?;
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .context("pending-events: open SQL writer for dispatch outcome")?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = json_set( \
+                        properties, \
+                        '$.dispatch_receipt', json(?1), \
+                        '$.lease_expires_at', ?2 \
+                      ), \
+                      updated_at = ?2 \
+                  WHERE id = ?3 \
+                    AND namespace = ?4 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'firing' \
+                    AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5 \
+                    AND json_extract(properties, '$.dispatch_receipt.invocation_id') = ?6 \
+                    AND json_extract(properties, '$.dispatch_receipt.state') = 'invoking'"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(receipt_json),
+                SqlValue::Integer(completed_at),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(claim.firing_at),
+                SqlValue::Text(claim.invocation_id.to_string()),
+            ],
+            label: Some("pending_events_persist_dispatch_outcome".into()),
+        })
+        .await
+        .context("pending-events: persist dispatch outcome")?;
+    Ok((rows == 1).then_some(receipt))
+}
+
+fn completion_from_receipt(receipt: &Value) -> DispatchCompletion {
+    let error = || {
+        let message = receipt
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("scheduled dispatch failed without an error message")
+            .to_string();
+        let payload = receipt
+            .get("error_payload")
+            .filter(|payload| !payload.is_null())
+            .cloned();
+        DispatchFailure { message, payload }
+    };
+    match receipt.get("state").and_then(Value::as_str) {
+        Some("succeeded") => DispatchCompletion::Succeeded,
+        Some("failed") => DispatchCompletion::Failed(error()),
+        Some("indeterminate") => DispatchCompletion::Indeterminate(error()),
+        Some("claimed") => DispatchCompletion::Failed(DispatchFailure::plain(
+            "dispatch claimant expired before invocation began; occurrence is retryable",
+        )),
+        Some("invoking") => DispatchCompletion::Indeterminate(DispatchFailure::plain(
+            "dispatch lease expired without a durable outcome; refusing automatic replay because the side effect may already have occurred",
+        )),
+        other => DispatchCompletion::Indeterminate(DispatchFailure::plain(format!(
+            "dispatch receipt has unsupported state {other:?}; refusing automatic replay"
+        ))),
+    }
+}
+
+fn dispatch_error_property_keys(properties: &Value) -> (&'static str, &'static str) {
+    if properties
+        .get("event_type")
+        .and_then(Value::as_str)
+        .unwrap_or("remind")
+        == "remind"
+    {
+        ("delivery_error", "delivery_failed_at")
+    } else {
+        ("dispatch_error", "dispatch_failed_at")
+    }
+}
+
+fn mark_dispatch_receipt_indeterminate(
+    properties: &mut Value,
+    invalid_receipt: Value,
+    error: &str,
+    completed_at: i64,
+) {
+    properties["dispatch_receipt"] = json!({
+        "version": DISPATCH_RECEIPT_VERSION,
+        "state": DispatchReceiptState::Indeterminate.as_str(),
+        "completed_at": completed_at,
+        "error": error,
+        "error_payload": null,
+        "invalid_receipt": invalid_receipt,
+    });
+    properties["status"] = json!("failed");
+    let (error_key, error_at_key) = dispatch_error_property_keys(properties);
+    properties[error_key] = json!(error);
+    properties[error_at_key] = json!(Utc::now().to_rfc3339());
+}
+
+fn final_properties_after_dispatch(
+    mut properties: Value,
+    receipt: Value,
+    completion: &DispatchCompletion,
+    trigger_at: DateTime<Utc>,
+    trigger_offset: FixedOffset,
+    repeat: &Option<String>,
+) -> (Value, FinalDisposition) {
+    let completed_at = receipt
+        .get("completed_at")
+        .and_then(Value::as_i64)
+        .and_then(DateTime::<Utc>::from_timestamp_micros)
+        .unwrap_or_else(Utc::now);
+    let completed_at_rfc = completed_at.to_rfc3339();
+    properties["dispatch_receipt"] = receipt;
+    properties["last_attempted_at"] = json!(completed_at_rfc);
+
+    let (error_key, error_at_key) = dispatch_error_property_keys(&properties);
+
+    match completion {
+        DispatchCompletion::Succeeded => {
+            if let Some(object) = properties.as_object_mut() {
+                object.remove(error_key);
+                object.remove(error_at_key);
+            }
+            properties["fired_at"] = json!(completed_at_rfc);
+            match next_trigger_at(repeat, trigger_at) {
+                Some(next_at) => {
+                    properties["trigger_at"] =
+                        json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
+                    properties["status"] = json!("pending");
+                    (properties, FinalDisposition::Advanced)
+                }
+                None => {
+                    properties["status"] = json!("fired");
+                    (properties, FinalDisposition::Fired)
+                }
+            }
+        }
+        DispatchCompletion::Failed(error) => {
+            properties[error_key] = json!(error.as_str());
+            properties[error_at_key] = json!(completed_at_rfc);
+            match next_trigger_at(repeat, trigger_at) {
+                Some(next_at) => {
+                    properties["trigger_at"] =
+                        json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
+                    properties["status"] = json!("pending");
+                    (properties, FinalDisposition::Advanced)
+                }
+                None => {
+                    properties["status"] = json!("pending");
+                    (properties, FinalDisposition::RetryPending)
+                }
+            }
+        }
+        DispatchCompletion::Indeterminate(error) => {
+            properties[error_key] = json!(error.as_str());
+            properties[error_at_key] = json!(completed_at_rfc);
+            properties["status"] = json!("failed");
+            (properties, FinalDisposition::Failed)
+        }
+    }
+}
+
+fn apply_final_disposition(summary: &mut DrainSummary, disposition: FinalDisposition) {
+    summary.finalized += 1;
+    match disposition {
+        FinalDisposition::Fired => summary.fired += 1,
+        FinalDisposition::Advanced => summary.advanced += 1,
+        FinalDisposition::RetryPending => summary.retry_pending += 1,
+        FinalDisposition::Failed => summary.indeterminate += 1,
+    }
+}
+
+async fn requeue_legacy_claim(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    firing_at: i64,
+    selected_properties: &str,
+) -> Result<bool> {
+    let updated_at = Utc::now().timestamp_micros();
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .context("pending-events: open SQL writer for legacy reclaim")?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes \
+                  SET properties = json_remove( \
+                        json_set(properties, '$.status', 'pending'), \
+                        '$.firing_at', '$.lease_expires_at' \
+                      ), \
+                      updated_at = ?1 \
+                  WHERE id = ?2 \
+                    AND namespace = ?3 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'firing' \
+                    AND (json_extract(properties, '$.firing_at') IS NULL \
+                         OR CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?4) \
+                    AND json_extract(properties, '$.dispatch_receipt') IS NULL \
+                    AND properties = ?5"
+                .to_string(),
+            params: vec![
+                SqlValue::Integer(updated_at),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(firing_at),
+                SqlValue::Text(selected_properties.to_string()),
+            ],
+            label: Some("pending_events_requeue_legacy_claim".into()),
+        })
+        .await
+        .context("pending-events: requeue legacy firing claim")?;
+    Ok(rows == 1)
+}
+
+async fn finalize_corrupt_receipt(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    firing_at: i64,
+    properties: &Value,
+    expired_at: i64,
+    selected_properties: &str,
+) -> Result<bool> {
+    let mut properties = properties.clone();
+    if let Some(object) = properties.as_object_mut() {
+        object.remove("firing_at");
+        object.remove("lease_expires_at");
+    }
+    let serialized = serde_json::to_string(&properties)
+        .context("pending-events: serialize corrupt receipt failure state")?;
+    let updated_at = Utc::now().timestamp_micros();
+    let mut writer = rt
+        .sql()
+        .writer()
+        .await
+        .context("pending-events: open SQL writer for corrupt receipt")?;
+    let rows = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
+                  WHERE id = ?3 \
+                    AND namespace = ?4 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'firing' \
+                    AND (json_extract(properties, '$.firing_at') IS NULL \
+                         OR CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5) \
+                    AND ( \
+                      (json_extract(properties, '$.lease_expires_at') IS NOT NULL \
+                       AND CAST(json_extract(properties, '$.lease_expires_at') AS INTEGER) <= ?6) \
+                      OR \
+                      (json_extract(properties, '$.lease_expires_at') IS NULL \
+                       AND (json_extract(properties, '$.firing_at') IS NULL \
+                            OR CAST(json_extract(properties, '$.firing_at') AS INTEGER) < ?7)) \
+                    ) \
+                    AND properties = ?8"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(serialized),
+                SqlValue::Integer(updated_at),
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(firing_at),
+                SqlValue::Integer(expired_at),
+                SqlValue::Integer(expired_at.saturating_sub(LEGACY_STALE_FIRING_TIMEOUT_MICROS)),
+                SqlValue::Text(selected_properties.to_string()),
+            ],
+            label: Some("pending_events_finalize_corrupt_receipt".into()),
+        })
+        .await
+        .context("pending-events: finalize corrupt dispatch receipt")?;
+    Ok(rows == 1)
+}
+
+/// Reconcile expired firing leases without blindly replaying an invocation.
+/// A receipt with a durable outcome resumes finalization; `claimed` is safe to
+/// retry because invocation never began; `invoking` is terminally
+/// indeterminate because generic verb dispatch cannot prove whether its side
+/// effect committed before the claimant disappeared.
+async fn reclaim_stale_firing_events(rt: &KhiveRuntime, now_micros: i64) -> Result<ReclaimSummary> {
+    let legacy_stale_before = now_micros.saturating_sub(LEGACY_STALE_FIRING_TIMEOUT_MICROS);
+    let rows = {
+        let mut reader = rt
+            .sql()
+            .reader()
+            .await
+            .context("pending-events: open SQL reader for expired leases")?;
+        reader
+            .query_all(SqlStatement {
+                sql: "SELECT id, namespace, properties FROM notes \
+                      WHERE kind = 'scheduled_event' \
+                        AND deleted_at IS NULL \
+                        AND json_extract(properties, '$.status') = 'firing' \
+                        AND ( \
+                          (json_extract(properties, '$.lease_expires_at') IS NOT NULL \
+                           AND CAST(json_extract(properties, '$.lease_expires_at') AS INTEGER) <= ?1) \
+                          OR \
+                          (json_extract(properties, '$.lease_expires_at') IS NULL \
+                           AND (json_extract(properties, '$.firing_at') IS NULL \
+                                OR CAST(json_extract(properties, '$.firing_at') AS INTEGER) < ?2)) \
+                        ) \
+                      ORDER BY created_at ASC, id ASC"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Integer(now_micros),
+                    SqlValue::Integer(legacy_stale_before),
+                ],
+                label: Some("pending_events_expired_dispatch_leases".into()),
+            })
+            .await
+            .context("pending-events: query expired dispatch leases")?
+    };
+
+    let mut summary = ReclaimSummary::default();
+    for row in rows {
+        let id = match row.get("id") {
+            Some(SqlValue::Text(value)) => uuid::Uuid::parse_str(value)
+                .with_context(|| format!("pending-events: invalid stale event id {value:?}"))?,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "pending-events: expired lease has invalid id column {other:?}"
+                ));
+            }
+        };
+        let namespace = match row.get("namespace") {
+            Some(SqlValue::Text(value)) => value.clone(),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "pending-events: expired lease {id} has invalid namespace {other:?}"
+                ));
+            }
+        };
+        let selected_properties = match row.get("properties") {
+            Some(SqlValue::Text(value)) => value.clone(),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "pending-events: expired lease {id} has invalid properties {other:?}"
+                ));
+            }
+        };
+        let mut properties: Value = serde_json::from_str(&selected_properties)
+            .with_context(|| format!("pending-events: parse expired receipt for {id}"))?;
+        let firing_at = properties
+            .get("firing_at")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let Some(receipt) = properties.get("dispatch_receipt").cloned() else {
+            match requeue_legacy_claim(rt, &namespace, id, firing_at, &selected_properties).await {
+                Ok(true) => {
+                    summary.rows += 1;
+                    summary.retry_pending += 1;
+                    summary.finalized += 1;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        namespace,
+                        error = %error,
+                        "pending-events: legacy expired-claim recovery failed; continuing"
+                    );
+                    summary.failed += 1;
+                }
+            }
+            continue;
+        };
+
+        let validated = match validate_dispatch_receipt(id, firing_at, &properties, receipt) {
+            Ok(validated) => validated,
+            Err(validation_error) => {
+                let error = format!("{validation_error}; refusing automatic replay");
+                let invalid_receipt = properties
+                    .get("dispatch_receipt")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                mark_dispatch_receipt_indeterminate(
+                    &mut properties,
+                    invalid_receipt,
+                    &error,
+                    now_micros,
+                );
+                match finalize_corrupt_receipt(
+                    rt,
+                    &namespace,
+                    id,
+                    firing_at,
+                    &properties,
+                    now_micros,
+                    &selected_properties,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        summary.rows += 1;
+                        summary.indeterminate += 1;
+                        summary.outcomes_persisted += 1;
+                        summary.finalized += 1;
+                        summary.failed += 1;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            scheduled_event_id = %id,
+                            namespace,
+                            error = %error,
+                            "pending-events: corrupt-receipt quarantine failed; continuing"
+                        );
+                        summary.failed += 1;
+                    }
+                }
+                continue;
+            }
+        };
+        let ValidatedDispatchReceipt {
+            value: mut receipt,
+            occurrence_id,
+            invocation_id,
+            actor,
+            state,
+        } = validated;
+        let claim = DispatchClaim {
+            firing_at,
+            occurrence_id,
+            invocation_id,
+            actor,
+        };
+        if state == DispatchReceiptState::Claimed {
+            let error =
+                "dispatch claimant expired before invocation began; occurrence is retryable";
+            receipt["state"] = json!(DispatchReceiptState::NotInvoked.as_str());
+            receipt["completed_at"] = json!(now_micros);
+            receipt["error"] = json!(error);
+            receipt["error_payload"] = Value::Null;
+            properties["dispatch_receipt"] = receipt;
+            properties["status"] = json!("pending");
+            match finalize_expired_firing_event(
+                rt,
+                &namespace,
+                id,
+                &properties,
+                Utc::now().timestamp_micros(),
+                &claim,
+                RecoverySnapshot {
+                    expired_at: now_micros,
+                    properties: &selected_properties,
+                },
+            )
+            .await
+            {
+                Ok(true) => {
+                    summary.rows += 1;
+                    summary.retry_pending += 1;
+                    summary.finalized += 1;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        namespace,
+                        error = %error,
+                        "pending-events: pre-invocation expired-claim recovery failed; continuing"
+                    );
+                    summary.failed += 1;
+                }
+            }
+            continue;
+        }
+
+        if matches!(
+            state,
+            DispatchReceiptState::NotInvoked | DispatchReceiptState::Missed
+        ) {
+            let error = format!(
+                "completed dispatch receipt state {} cannot remain attached to a firing row; \
+                 refusing automatic replay",
+                state.as_str()
+            );
+            mark_dispatch_receipt_indeterminate(&mut properties, receipt, &error, now_micros);
+            match finalize_corrupt_receipt(
+                rt,
+                &namespace,
+                id,
+                firing_at,
+                &properties,
+                now_micros,
+                &selected_properties,
+            )
+            .await
+            {
+                Ok(true) => {
+                    summary.rows += 1;
+                    summary.indeterminate += 1;
+                    summary.outcomes_persisted += 1;
+                    summary.finalized += 1;
+                    summary.failed += 1;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        namespace,
+                        error = %error,
+                        "pending-events: completed pre-invocation receipt quarantine failed; continuing"
+                    );
+                    summary.failed += 1;
+                }
+            }
+            continue;
+        }
+
+        let recovery_persisted_outcome = match state {
+            DispatchReceiptState::Invoking => {
+                let completion = completion_from_receipt(&receipt);
+                receipt["state"] = json!(DispatchReceiptState::Indeterminate.as_str());
+                receipt["completed_at"] = json!(now_micros);
+                receipt["error"] = json!(match &completion {
+                    DispatchCompletion::Indeterminate(error) => error.as_str(),
+                    DispatchCompletion::Succeeded => "",
+                    DispatchCompletion::Failed(error) => error.as_str(),
+                });
+                receipt["error_payload"] = Value::Null;
+                true
+            }
+            DispatchReceiptState::Succeeded
+            | DispatchReceiptState::Failed
+            | DispatchReceiptState::Indeterminate => false,
+            DispatchReceiptState::Claimed
+            | DispatchReceiptState::NotInvoked
+            | DispatchReceiptState::Missed => unreachable!("states handled above"),
+        };
+        let completion = completion_from_receipt(&receipt);
+        let trigger_at_fixed = properties
+            .get("trigger_at")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<DateTime<FixedOffset>>().ok());
+        let repeat = properties
+            .get("repeat")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let (final_properties, disposition) = match trigger_at_fixed {
+            Some(trigger_at_fixed) => final_properties_after_dispatch(
+                properties,
+                receipt,
+                &completion,
+                trigger_at_fixed.with_timezone(&Utc),
+                *trigger_at_fixed.offset(),
+                &repeat,
+            ),
+            None => {
+                properties["dispatch_receipt"] = receipt;
+                properties["status"] = json!("failed");
+                let (error_key, error_at_key) = dispatch_error_property_keys(&properties);
+                properties[error_key] =
+                    json!("cannot recover dispatch outcome: trigger_at is invalid");
+                properties[error_at_key] = json!(Utc::now().to_rfc3339());
+                (properties, FinalDisposition::Failed)
+            }
+        };
+        match finalize_expired_firing_event(
+            rt,
+            &namespace,
+            id,
+            &final_properties,
+            Utc::now().timestamp_micros(),
+            &claim,
+            RecoverySnapshot {
+                expired_at: now_micros,
+                properties: &selected_properties,
+            },
+        )
+        .await
+        {
+            Ok(true) => {
+                summary.rows += 1;
+                if recovery_persisted_outcome {
+                    summary.outcomes_persisted += 1;
+                }
+                summary.finalized += 1;
+                match disposition {
+                    FinalDisposition::Fired => summary.fired += 1,
+                    FinalDisposition::Advanced => summary.advanced += 1,
+                    FinalDisposition::RetryPending => summary.retry_pending += 1,
+                    FinalDisposition::Failed => summary.indeterminate += 1,
+                }
+                if !matches!(completion, DispatchCompletion::Succeeded) {
+                    summary.failed += 1;
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    scheduled_event_id = %id,
+                    namespace,
+                    error = %error,
+                    "pending-events: expired dispatch outcome finalization failed; continuing"
+                );
+                summary.failed += 1;
+            }
+        }
+    }
+    Ok(summary)
 }
 
 /// CAS-persist the post-drain state of a claimed event: `firing -> {fired |
 /// pending | missed | failed}` (`pending` is an advanced repeat; `failed` is
 /// the unattributed-generic-action policy state). `claimed_firing_at` is
 /// the claim token from `claim_pending_event`; the CAS requires the row's
-/// CURRENT `firing_at` to still equal it, not merely `status='firing'`
-/// (issue #462). Clears `firing_at` on the terminal write. Returns
+/// CURRENT `firing_at` to still equal it, not merely `status='firing'`.
+/// Clears `firing_at` on the terminal write. Returns
 /// `Ok(true)` iff exactly one row was updated. See
 /// `crates/khive-mcp/docs/api/pending-events.md`.
 async fn finalize_fired_event(
@@ -1025,11 +2116,52 @@ async fn finalize_fired_event(
     id: uuid::Uuid,
     properties: &Value,
     updated_at: i64,
-    claimed_firing_at: i64,
+    claim: &DispatchClaim,
 ) -> Result<bool> {
+    finalize_firing_event(rt, namespace, id, properties, updated_at, claim, None).await
+}
+
+/// Finalize a row selected by the expired-lease recovery pass, but only while
+/// its CURRENT properties still exactly match the expired snapshot selected
+/// by that pass. A renewal or outcome write between the recovery SELECT and
+/// this CAS wins and makes recovery a no-op.
+async fn finalize_expired_firing_event(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    properties: &Value,
+    updated_at: i64,
+    claim: &DispatchClaim,
+    snapshot: RecoverySnapshot<'_>,
+) -> Result<bool> {
+    finalize_firing_event(
+        rt,
+        namespace,
+        id,
+        properties,
+        updated_at,
+        claim,
+        Some(snapshot),
+    )
+    .await
+}
+
+async fn finalize_firing_event(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    properties: &Value,
+    updated_at: i64,
+    claim: &DispatchClaim,
+    snapshot: Option<RecoverySnapshot<'_>>,
+) -> Result<bool> {
+    let expired_at = snapshot.map(|value| value.expired_at);
+    let legacy_stale_before =
+        expired_at.map(|value| value.saturating_sub(LEGACY_STALE_FIRING_TIMEOUT_MICROS));
     let mut properties = properties.clone();
     if let Some(obj) = properties.as_object_mut() {
         obj.remove("firing_at");
+        obj.remove("lease_expires_at");
     }
     let props_json = serde_json::to_string(&properties)
         .map_err(|e| anyhow::anyhow!("pending-events: serialize properties: {e}"))?;
@@ -1047,14 +2179,32 @@ async fn finalize_fired_event(
                     AND kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
                     AND json_extract(properties, '$.status') = 'firing' \
-                    AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5"
+                    AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5 \
+                    AND json_extract(properties, '$.dispatch_receipt.invocation_id') = ?6 \
+                    AND ( \
+                      ?7 IS NULL OR ( \
+                        (json_extract(properties, '$.lease_expires_at') IS NOT NULL \
+                         AND CAST(json_extract(properties, '$.lease_expires_at') AS INTEGER) <= ?7) \
+                        OR \
+                        (json_extract(properties, '$.lease_expires_at') IS NULL \
+                         AND (json_extract(properties, '$.firing_at') IS NULL \
+                              OR CAST(json_extract(properties, '$.firing_at') AS INTEGER) < ?8)) \
+                      ) \
+                    ) \
+                    AND (?9 IS NULL OR properties = ?9)"
                 .to_string(),
             params: vec![
                 SqlValue::Text(props_json),
                 SqlValue::Integer(updated_at),
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(namespace.to_string()),
-                SqlValue::Integer(claimed_firing_at),
+                SqlValue::Integer(claim.firing_at),
+                SqlValue::Text(claim.invocation_id.to_string()),
+                expired_at.map_or(SqlValue::Null, SqlValue::Integer),
+                legacy_stale_before.map_or(SqlValue::Null, SqlValue::Integer),
+                snapshot.map_or(SqlValue::Null, |value| {
+                    SqlValue::Text(value.properties.to_string())
+                }),
             ],
             label: Some("pending_events_finalize_fired".into()),
         })
@@ -1067,8 +2217,8 @@ async fn finalize_fired_event(
 /// `trigger_at` and the `repeat` spec.
 ///
 /// Returns `Some(next)` for named aliases `"daily"` / `"weekly"` / `"monthly"`.
-/// Returns `None` for five-field cron expressions (not yet supported) and for
-/// `None` / absent repeat.
+/// Returns `None` for an absent repeat. Unsupported expressions are rejected
+/// by schedule creation and fail closed before dispatch for legacy rows.
 fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<DateTime<Utc>> {
     match repeat.as_deref() {
         Some("daily") => Some(current + Duration::days(1)),
@@ -1078,34 +2228,15 @@ fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<Da
             // arithmetic (e.g. Jan 31 + 1 month = Feb 28/29).
             current.checked_add_months(Months::new(1))
         }
-        Some(expr) if is_five_field_cron(expr) => {
-            // STOP condition: five-field cron expressions require a cron-parsing
-            // library to compute the next fire time. No such library is present
-            // in the codebase. Fire as one-shot and log a warning.
-            //
-            // Future work: introduce a cron-next crate (e.g. `croner`) and
-            // implement proper next-occurrence computation. Track in issue #14.
-            tracing::warn!(
-                repeat = expr,
-                "pending-events: cron repeat expression cannot be advanced (not yet supported); \
-                 event will be marked fired (one-shot)"
-            );
-            None
-        }
         _ => None,
     }
-}
-
-/// Returns `true` if `expr` looks like a 5-field cron expression (not a named alias).
-fn is_five_field_cron(expr: &str) -> bool {
-    expr.split_whitespace().count() == 5
 }
 
 /// Advance a missed repeating event's `trigger_at` past every occurrence at
 /// or before `now`, landing on the first occurrence strictly after `now`
 /// (ADR-106 missed-event amendment) — avoids firing a catch-up burst.
-/// Returns `None` when the event does not advance at all (no `repeat`, or an
-/// unsupported cron form); the caller then marks it terminally `"missed"`.
+/// Returns `None` when the event does not repeat; the caller then marks it
+/// terminally `"missed"`.
 /// See `crates/khive-mcp/docs/api/pending-events.md` for the termination
 /// argument.
 fn advance_repeat_past_missed(
@@ -1201,6 +2332,7 @@ struct VerifiedCreator {
     /// `None`, not `Some("local")`, to preserve the actor kind.
     request_actor: Option<VerifiedActor>,
     recipient_id: String,
+    audit_actor: String,
 }
 
 async fn verified_creator_for_event(
@@ -1256,11 +2388,13 @@ async fn verified_creator_for_event(
                 Ok(Some(VerifiedCreator {
                     request_actor: Some(verified),
                     recipient_id: actor_id.to_string(),
+                    audit_actor: actor.clone(),
                 }))
             } else if actor == "anonymous:local" {
                 Ok(Some(VerifiedCreator {
                     request_actor: None,
                     recipient_id: "local".to_string(),
+                    audit_actor: actor.clone(),
                 }))
             } else {
                 Err(anyhow::anyhow!(
@@ -1276,7 +2410,8 @@ async fn verified_creator_for_event(
     }
 }
 
-/// Dispatch a DSL action string in the given namespace.
+/// Dispatch a DSL action string in the given namespace while renewing its
+/// claim through the claim-bound durable outcome write.
 ///
 /// The action is wrapped as a JSON-form batch with `namespace` injected into
 /// each op's args so the VerbRegistry mints a token scoped to the event's
@@ -1284,34 +2419,230 @@ async fn verified_creator_for_event(
 /// effective request identity and preserves public-surface visibility, so a
 /// delayed action cannot invoke an internal subhandler. Together these
 /// preserve the original authority boundary: writes land in the event's
-/// namespace and gate/audit decisions never inherit daemon authority.
+/// namespace and gate/audit decisions never inherit daemon authority. The
+/// returned receipt result is already persisted (or carries the persistence
+/// error); callers must not perform another outcome write.
+struct DispatchLeaseTarget<'a> {
+    rt: &'a KhiveRuntime,
+    namespace: &'a str,
+    scheduled_event_id: uuid::Uuid,
+    claim: &'a DispatchClaim,
+}
+
+async fn dispatch_with_renewable_lease(
+    target: DispatchLeaseTarget<'_>,
+    lease: DispatchLeaseConfig,
+    action_dsl: &str,
+    creator_actor: Option<VerifiedActor>,
+    server: &KhiveMcpServer,
+    verbose: bool,
+) -> (DispatchCompletion, Result<Option<Value>>) {
+    let DispatchLeaseTarget {
+        rt,
+        namespace,
+        scheduled_event_id,
+        claim,
+    } = target;
+    let renewal_rt = rt.clone();
+    let renewal_namespace = namespace.to_string();
+    let renewal_claim = claim.clone();
+    let renewal_cancel = tokio_util::sync::CancellationToken::new();
+    let _renewal_cancel_on_drop = CancelOnDrop(renewal_cancel.clone());
+    let renewal_stop = renewal_cancel.clone();
+    let mut renewal = Some(tokio::spawn(async move {
+        let mut renewals = tokio::time::interval_at(
+            tokio::time::Instant::now() + lease.renew_every,
+            lease.renew_every,
+        );
+        renewals.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = renewal_stop.cancelled() => return None,
+                _ = renewals.tick() => {}
+            }
+            match renew_dispatch_lease(
+                &renewal_rt,
+                &renewal_namespace,
+                scheduled_event_id,
+                &renewal_claim,
+                lease,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Some(
+                        "dispatch lease ownership was lost before the action returned".to_string(),
+                    );
+                }
+                Err(error) => {
+                    return Some(format!(
+                        "dispatch lease renewal failed before the action returned: {error}"
+                    ));
+                }
+            }
+        }
+    }));
+
+    let dispatch_result =
+        dispatch_action(action_dsl, namespace, creator_actor, server, verbose).await;
+    // If the renewal task already ended before the action did, its failure is
+    // part of the action outcome. Otherwise keep it alive while the durable
+    // outcome CAS waits for the writer; relinquishing the lease first would
+    // reopen the dispatch/finalize crash window under writer contention.
+    let early_lease_failure = if renewal.as_ref().is_some_and(|handle| handle.is_finished()) {
+        match renewal.take().expect("renewal handle exists").await {
+            Ok(failure) => failure,
+            Err(error) => Some(format!("dispatch lease renewal task failed: {error}")),
+        }
+    } else {
+        None
+    };
+    let completion = if let Some(error) = early_lease_failure {
+        DispatchCompletion::Indeterminate(DispatchFailure::plain(error))
+    } else {
+        match dispatch_result {
+            Ok(()) => DispatchCompletion::Succeeded,
+            Err(error) if error.outcome_uncertain => {
+                DispatchCompletion::Indeterminate(error.failure)
+            }
+            Err(error) => DispatchCompletion::Failed(error.failure),
+        }
+    };
+
+    let persisted =
+        persist_dispatch_outcome(rt, namespace, scheduled_event_id, claim, &completion).await;
+    let outcome_is_durable = matches!(&persisted, Ok(Some(_)));
+    renewal_cancel.cancel();
+    if let Some(renewal) = renewal {
+        let late_lease_failure = match renewal.await {
+            Ok(failure) => failure,
+            Err(error) => Some(format!("dispatch lease renewal task failed: {error}")),
+        };
+        // A renewal already in flight can observe the just-persisted receipt
+        // state and report ownership loss. Once the outcome CAS committed,
+        // that is expected and harmless; otherwise retain the diagnostic.
+        if !outcome_is_durable {
+            if let Some(error) = late_lease_failure {
+                tracing::error!(
+                    scheduled_event_id = %scheduled_event_id,
+                    error,
+                    "pending-events: lease renewal ended before outcome became durable"
+                );
+            }
+        }
+    }
+    (completion, persisted)
+}
+
+fn action_error_message(error: &Value) -> String {
+    error
+        .as_str()
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            serde_json::to_string(error)
+                .unwrap_or_else(|_| "scheduled action returned an unreadable error".to_string())
+        })
+}
+
+fn action_error_outcome_is_uncertain(error: &Value) -> bool {
+    let message = action_error_message(error).to_ascii_lowercase();
+    let kind = error
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let request_state = error
+        .get("request_state")
+        .or_else(|| error.pointer("/details/request_state"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let has_outbound_id = error
+        .pointer("/details/outbound_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok());
+
+    kind == "ambiguous"
+        || code == "side_effects_unknown"
+        || code == "ambiguous_outcome"
+        || request_state == "side_effects_unknown"
+        || message.contains("side_effects_unknown")
+        || (has_outbound_id
+            && (kind == "conflict"
+                || message.contains("outcome is uncertain")
+                || message.contains("comm.delivered")))
+}
+
+fn action_failures(failures: &[&Value]) -> DispatchActionError {
+    let errors: Vec<Value> = failures
+        .iter()
+        .map(|failure| {
+            failure
+                .get("error")
+                .cloned()
+                .unwrap_or_else(|| (*failure).clone())
+        })
+        .collect();
+    let outcome_uncertain = errors.iter().any(action_error_outcome_is_uncertain);
+    let messages = errors
+        .iter()
+        .map(action_error_message)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let payload = match errors.as_slice() {
+        [error] => error.clone(),
+        _ => Value::Array(errors),
+    };
+    let failure = DispatchFailure::with_payload(
+        format!(
+            "pending-events: action produced {} failure(s): {messages}",
+            failures.len()
+        ),
+        payload,
+    );
+    if outcome_uncertain {
+        DispatchActionError::uncertain(failure)
+    } else {
+        DispatchActionError::known(failure)
+    }
+}
+
+fn stored_action_is_non_single(action_dsl: &str) -> bool {
+    khive_request::parse_request(action_dsl).is_ok_and(|parsed| {
+        parsed.mode != khive_request::ExecutionMode::Single || parsed.ops.len() != 1
+    })
+}
+
 async fn dispatch_action(
     action_dsl: &str,
     namespace: &str,
     creator_actor: Option<VerifiedActor>,
     server: &KhiveMcpServer,
     verbose: bool,
-) -> Result<()> {
-    // Parse the stored DSL to inject namespace into each op.
-    let parsed = khive_request::parse_request(action_dsl).map_err(|e| {
-        anyhow::anyhow!("pending-events: action DSL parse error ({e}): {action_dsl:?}")
+) -> std::result::Result<(), DispatchActionError> {
+    let parsed = khive_request::parse_request(action_dsl).map_err(|error| {
+        DispatchActionError::known(DispatchFailure::plain(format!(
+            "pending-events: action DSL parse error ({error}): {action_dsl:?}"
+        )))
     })?;
 
-    // Re-serialize as JSON form with namespace injected.
-    //
-    // `$prev` references are rejected at schedule-creation time (issue #461),
-    // but legacy rows written before that guard may still carry one. Reject
-    // rather than silently drop: a dropped arg can dispatch successfully with
+    // `$prev` references are rejected at schedule-creation time, but legacy
+    // rows written before that guard may still carry one. Reject rather than
+    // silently drop: a dropped arg can dispatch successfully with
     // missing/wrong data, which is worse than a visible replay failure.
     let mut ops_json: Vec<Value> = Vec::with_capacity(parsed.ops.len());
     for op in &parsed.ops {
         let mut args = serde_json::Map::new();
         for (k, v) in &op.args {
             let khive_request::ArgValue::Value(val) = v else {
-                return Err(anyhow::anyhow!(
+                return Err(DispatchActionError::known(DispatchFailure::plain(format!(
                     "pending-events: non-literal scheduled action argument {k:?} is not \
                      replayable: {action_dsl:?}"
-                ));
+                ))));
             };
             args.insert(k.clone(), val.clone());
         }
@@ -1323,8 +2654,11 @@ async fn dispatch_action(
         ops_json.push(json!({ "tool": op.tool, "args": Value::Object(args) }));
     }
 
-    let ops_str = serde_json::to_string(&ops_json)
-        .map_err(|e| anyhow::anyhow!("pending-events: serialize ops: {e}"))?;
+    let ops_str = serde_json::to_string(&ops_json).map_err(|error| {
+        DispatchActionError::known(DispatchFailure::plain(format!(
+            "pending-events: serialize ops: {error}"
+        )))
+    })?;
 
     if verbose {
         eprintln!("[pending-events] dispatch ns={namespace}: {ops_str}");
@@ -1345,26 +2679,38 @@ async fn dispatch_action(
             creator_actor,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("pending-events: dispatch error: {e}"))?;
+        .map_err(|error| {
+            // The replay request was accepted by the in-process host, but no
+            // per-op envelope came back. Conservatively retain at-most-once
+            // behavior because the action may already have run.
+            DispatchActionError::uncertain(DispatchFailure::plain(format!(
+                "pending-events: dispatch outcome unavailable: {error}"
+            )))
+        })?;
 
     // The MCP response is a JSON string. Check for per-op failures.
-    let parsed_result: Value = serde_json::from_str(&result).unwrap_or(Value::Null);
-    if let Some(results) = parsed_result.get("results").and_then(Value::as_array) {
-        let failures: Vec<_> = results
-            .iter()
-            .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(false))
-            .collect();
-        if !failures.is_empty() {
-            let errs: Vec<String> = failures
-                .iter()
-                .filter_map(|r| r.get("error").and_then(Value::as_str).map(str::to_string))
-                .collect();
-            return Err(anyhow::anyhow!(
-                "pending-events: action produced {} failure(s): {}",
-                failures.len(),
-                errs.join("; ")
-            ));
-        }
+    let parsed_result: Value = serde_json::from_str(&result).map_err(|error| {
+        DispatchActionError::uncertain(DispatchFailure::with_payload(
+            format!("pending-events: dispatch returned invalid JSON: {error}"),
+            json!({"raw_response": result.clone()}),
+        ))
+    })?;
+    let results = parsed_result
+        .get("results")
+        .and_then(Value::as_array)
+        .filter(|results| !results.is_empty())
+        .ok_or_else(|| {
+            DispatchActionError::uncertain(DispatchFailure::with_payload(
+                "pending-events: dispatch response omitted per-op results",
+                parsed_result.clone(),
+            ))
+        })?;
+    let failures: Vec<_> = results
+        .iter()
+        .filter(|result| result.get("ok").and_then(Value::as_bool) != Some(true))
+        .collect();
+    if !failures.is_empty() {
+        return Err(action_failures(&failures));
     }
 
     Ok(())
@@ -1373,10 +2719,9 @@ async fn dispatch_action(
 /// Discover all distinct namespaces that have at least one pending, due
 /// `scheduled_event` note (i.e. `status="pending"` AND `trigger_at <= now`).
 /// The `trigger_at` comparison uses SQLite's `datetime(...)` rather than a
-/// raw string comparison, since stored offsets are not normalized to UTC
-/// (PR #782); the Rust layer downstream re-checks each candidate with
-/// `DateTime<Utc>` as the final authority. See
-/// `crates/khive-mcp/docs/api/pending-events.md`.
+/// raw string comparison, since stored offsets are not normalized to UTC;
+/// the Rust layer downstream re-checks each candidate with `DateTime<Utc>`
+/// as the final authority. See `crates/khive-mcp/docs/api/pending-events.md`.
 async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> Result<Vec<String>> {
     use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -1386,23 +2731,12 @@ async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> R
         .await
         .context("pending-events: open SQL reader")?;
 
-    // Select distinct namespaces with at least one potentially-due event.
-    // We do a broad filter on `status` here; the Rust layer applies the
-    // parsed-timestamp check. This is a pre-filter gate for the per-namespace
-    // candidate scan below, not the final due-ness decision — but a
-    // namespace excluded HERE never reaches that scan at all, so it must be
-    // held to the same correctness bar as the candidate-page queries
-    // (`datetime(...)` normalization, PR #782): comparing
-    // `trigger_at` against `now` as raw TEXT is only chronologically correct
-    // when every stored string happens to share `now`'s UTC offset.
-    // `khive-pack-schedule` round-trips the caller's original `trigger_at`
-    // string verbatim (offset included, H5), so a non-UTC-offset value can
-    // sort on the wrong side of a raw-text comparison and silently exclude
-    // its entire namespace from every future pass — not just skip one row.
-    // `datetime(...)` normalizes both sides to UTC before comparing; the `OR
-    // ... IS NULL` clause keeps a namespace with an unparseable `trigger_at`
-    // visible rather than silently dropped, matching the candidate-page
-    // queries' same NULL-safety rider.
+    // This is a pre-filter gate for the per-namespace candidate scan below,
+    // not the final due-ness decision — but a namespace excluded HERE never
+    // reaches that scan, so it is held to the same `datetime(...)`
+    // normalization and NULL-safety as the candidate-page queries. See
+    // "Keyset pagination and due-ness comparison" in
+    // `crates/khive-mcp/docs/pending-events.md`.
     let now_rfc = now.to_rfc3339();
     let rows = reader
         .query_all(SqlStatement {
@@ -1442,9 +2776,14 @@ async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> R
 pub fn print_summary(summary: &DrainSummary) {
     let json = json!({
         "scanned": summary.scanned,
+        "invoked": summary.invoked,
+        "outcomes_persisted": summary.outcomes_persisted,
+        "finalized": summary.finalized,
         "fired": summary.fired,
         "advanced": summary.advanced,
         "failed": summary.failed,
+        "retry_pending": summary.retry_pending,
+        "indeterminate": summary.indeterminate,
         "skipped_not_due": summary.skipped_not_due,
         "skipped_race": summary.skipped_race,
         "reclaimed": summary.reclaimed,
@@ -1456,11 +2795,6 @@ pub fn print_summary(summary: &DrainSummary) {
         serde_json::to_string_pretty(&json).expect("serialize")
     );
 }
-
-// ── Need a reference to `rt.sql()` — check the public API ────────────────────
-
-// KhiveRuntime exposes `sql()` as an accessor to the SqlAccess trait object.
-// We use it here for the namespace-discovery query.
 
 /// Default interval between daemon-resident schedule ticks, in seconds.
 /// Matches the cadence the module doc already documents for the external-cron
@@ -1487,7 +2821,7 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 /// daemon's own already-resolved runtime handle for the `"schedule"` pack.
 /// The host context carries the daemon's live [`KhiveMcpServer`] — never a
 /// freshly reconstructed server — or replayed actions can silently dispatch
-/// against the wrong backend (PR #782). Ticks on a fixed interval with
+/// against the wrong backend. Ticks on a fixed interval with
 /// `Skip`-missed-tick behavior so a long drain cannot make the loop drift
 /// behind. Drain-level failures are retryable component failures; individual
 /// event failures remain part of a successful drain summary and do not spend
@@ -1516,8 +2850,13 @@ pub async fn schedule_tick_loop(
                 {
                     tracing::info!(
                         scanned = summary.scanned,
+                        invoked = summary.invoked,
+                        outcomes_persisted = summary.outcomes_persisted,
+                        finalized = summary.finalized,
                         fired = summary.fired,
                         advanced = summary.advanced,
+                        retry_pending = summary.retry_pending,
+                        indeterminate = summary.indeterminate,
                         missed = summary.missed.len(),
                         failed = summary.failed,
                         reclaimed = summary.reclaimed,
@@ -1542,6 +2881,7 @@ mod tests {
     use khive_runtime::{Gate, GateDecision, GateError, GateRequest, RuntimeConfig};
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
+    use khive_types::{Details, HandlerDef, KhiveError, VerbCategory, Visibility};
     use tempfile::NamedTempFile;
     use tokio_util::sync::CancellationToken;
 
@@ -1608,28 +2948,176 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct AsyncBlockingSideEffectState {
+        invocations: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct ReleaseAsyncBlockingVerbOnDrop(std::sync::Arc<AsyncBlockingSideEffectState>);
+
+    impl Drop for ReleaseAsyncBlockingVerbOnDrop {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+        }
+    }
+
+    struct AsyncBlockingSideEffectPack {
+        runtime: KhiveRuntime,
+        marker: String,
+        state: std::sync::Arc<AsyncBlockingSideEffectState>,
+    }
+
+    impl khive_types::Pack for AsyncBlockingSideEffectPack {
+        const NAME: &'static str = "async-blocking-side-effect-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "test.async_blocking_side_effect",
+            description: "wait asynchronously, then commit one marker",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for AsyncBlockingSideEffectPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &khive_runtime::VerbRegistry,
+            token: &khive_runtime::NamespaceToken,
+        ) -> std::result::Result<Value, khive_runtime::RuntimeError> {
+            debug_assert_eq!(verb, "test.async_blocking_side_effect");
+            self.state
+                .invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.state.entered.notify_one();
+            self.state.release.notified().await;
+            let note = self
+                .runtime
+                .create_note(token, "observation", None, &self.marker, None, None, vec![])
+                .await?;
+            Ok(json!({"id": note.id}))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailFirstCreateGate {
+        invocations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Gate for FailFirstCreateGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "create" {
+                let attempt = self
+                    .invocations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    return Ok(GateDecision::deny("first scheduled create fails"));
+                }
+            }
+            Ok(GateDecision::allow())
+        }
+    }
+
+    struct AmbiguousSideEffectPack {
+        runtime: KhiveRuntime,
+        marker: String,
+        outbound_id: uuid::Uuid,
+        invocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl khive_types::Pack for AmbiguousSideEffectPack {
+        const NAME: &'static str = "ambiguous-side-effect-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "test.ambiguous_side_effect",
+            description: "commit a marker, then return a side_effects_unknown error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for AmbiguousSideEffectPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &khive_runtime::VerbRegistry,
+            token: &khive_runtime::NamespaceToken,
+        ) -> std::result::Result<Value, khive_runtime::RuntimeError> {
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.runtime
+                .create_note(token, "observation", None, &self.marker, None, None, vec![])
+                .await?;
+            Err(khive_runtime::RuntimeError::Khive(
+                KhiveError::conflict(format!(
+                    "dual_write delivery outcome is uncertain (side_effects_unknown); \
+                     call comm.delivered(id=\"{}\") before retrying",
+                    self.outbound_id
+                ))
+                .with_details(Details::new_owned([(
+                    "outbound_id",
+                    self.outbound_id.to_string(),
+                )])),
+            ))
+        }
+    }
+
     fn tmp_db() -> (NamedTempFile, String) {
         let f = NamedTempFile::new().expect("tempfile");
         let path = f.path().to_str().expect("utf8 path").to_string();
         (f, path)
     }
 
-    /// An RFC 3339 timestamp a few seconds in the past — due, but comfortably
-    /// inside the default 300s missed-event grace window (ADR-106 amendment),
-    /// so tests exercising the normal fire/advance path aren't swept into the
-    /// missed path by a fixed year-2000 sentinel. Tests exercising the missed
-    /// path itself use their own far-past or `now`-relative timestamps.
+    /// Due, but inside the default missed-event grace window, so callers land
+    /// on the normal fire/advance path rather than the missed path.
     fn due_rfc3339() -> String {
         (Utc::now() - Duration::seconds(5)).to_rfc3339()
     }
 
-    /// A UTC "now" RFC 3339 string, formatted the same way the candidate-page
-    /// query's bind parameter is (`now.to_rfc3339()` on a `DateTime<Utc>`).
-    /// Used only by the offset-sorting regressions below to assert their own
-    /// test fixtures actually exercise the raw-text lexicographic-ordering
-    /// bug class they're named for, independent of the real query's own
-    /// `now` capture (a few milliseconds of drift between the two calls is
-    /// irrelevant next to the multi-hour offset margins those tests use).
+    /// "Now" formatted like the candidate-page query's own bind parameter,
+    /// for offset-sorting regressions to assert against independently.
     fn now_rfc3339_for_ordering_check() -> String {
         Utc::now().to_rfc3339()
     }
@@ -1646,35 +3134,19 @@ mod tests {
             additional_embedding_models: vec![],
             actor_id: actor_id.map(str::to_string),
             // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
-            // from the ambient environment (#1269). kg + schedule + comm: this
-            // module's tests drive schedule.remind / schedule.cancel through the
-            // drain path and assert delivery lands in the creator's comm inbox,
-            // on top of the kg-verb fixture actions.
+            // from the ambient environment: these tests drive schedule.remind
+            // / schedule.cancel through the drain path and assert delivery
+            // lands in the creator's comm inbox.
             packs: vec!["kg".to_string(), "schedule".to_string(), "comm".to_string()],
             ..Default::default()
         };
         KhiveRuntime::new(cfg).expect("runtime")
     }
 
-    /// Drive one drain pass directly through [`run_pending_events_on`] against
-    /// a fresh `make_rt`-built runtime, bypassing [`run_pending_events`] (the
-    /// CLI-facing one-shot entrypoint this test module used to call directly).
-    ///
-    /// `run_pending_events` now resolves through `khive-mcp::serve::build_server`
-    /// (PR #782), which is
-    /// TOML-aware (`KhiveConfig::load_with_home_fallback`) so that `kkernel
-    /// exec --pending-events` honors a project's `[[backends]]`/`[actor]`
-    /// config exactly like the daemon does. That makes it depend on process
-    /// `HOME`/cwd, which the tests in this module don't isolate (unlike
-    /// `serve.rs`'s own `SeatEnv`-guarded `build_server` tests) — on a
-    /// developer machine with a real `~/.khive/config.toml` declaring
-    /// `[[backends]]`, calling `run_pending_events` with a scratch `--db` path
-    /// would hit "cannot be combined with [[backends]]" instead of exercising
-    /// the drain logic these tests actually target. These tests are about
-    /// drain semantics (claim/dispatch/finalize/pagination/cadence), not CLI
-    /// config resolution, so they build their own runtime + server directly —
-    /// exactly what `run_pending_events_on` itself already required and what
-    /// `run_pending_events` did internally before the config-resolution fix.
+    /// Drives one drain pass directly through [`run_pending_events_on`],
+    /// bypassing [`run_pending_events`]'s TOML-aware config resolution (which
+    /// depends on process `HOME`/cwd, unisolated here) since these tests
+    /// target drain semantics, not CLI config resolution.
     async fn drain_for_test(db_path: &str) -> Result<DrainSummary> {
         let rt = make_rt(db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1863,6 +3335,25 @@ mod tests {
         note.properties.unwrap_or(json!({}))
     }
 
+    async fn get_raw_note_properties(rt: &KhiveRuntime, id: uuid::Uuid) -> String {
+        let mut reader = rt.sql().reader().await.expect("open SQL reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT properties FROM notes WHERE id = ?1".to_string(),
+                params: vec![SqlValue::Text(id.to_string())],
+                label: Some("test_get_raw_note_properties".into()),
+            })
+            .await
+            .expect("query raw note properties");
+        match rows.as_slice() {
+            [row] => match row.get("properties") {
+                Some(SqlValue::Text(value)) => value.clone(),
+                other => panic!("unexpected properties column: {other:?}"),
+            },
+            other => panic!("expected one note row, got {other:?}"),
+        }
+    }
+
     async fn inbound_reminder_messages(rt: &KhiveRuntime, actor: &str) -> Vec<(String, Value)> {
         let mut reader = rt.sql().reader().await.expect("open SQL reader");
         let rows = reader
@@ -1943,6 +3434,100 @@ mod tests {
             .await
             .expect("make repeat due again");
         assert_eq!(rows, 1, "repeat fixture row updated");
+    }
+
+    async fn claim_for_test(rt: &KhiveRuntime, id: uuid::Uuid, trigger_at: &str) -> DispatchClaim {
+        let trigger_at = trigger_at
+            .parse::<DateTime<Utc>>()
+            .expect("trigger timestamp");
+        claim_pending_event(
+            rt,
+            "local",
+            id,
+            dispatch_occurrence_id(id, trigger_at),
+            "anonymous:local",
+            DispatchLeaseConfig::from_env(),
+        )
+        .await
+        .expect("claim query")
+        .expect("claim must succeed on a fresh pending row")
+    }
+
+    fn short_test_lease() -> DispatchLeaseConfig {
+        DispatchLeaseConfig {
+            ttl: std::time::Duration::from_millis(300),
+            renew_every: std::time::Duration::from_millis(30),
+        }
+    }
+
+    #[test]
+    fn final_disposition_counters_are_branch_local() {
+        let mut summary = DrainSummary {
+            fired: 7,
+            advanced: 11,
+            ..DrainSummary::default()
+        };
+        apply_final_disposition(&mut summary, FinalDisposition::Advanced);
+        assert_eq!(summary.fired, 7, "advance must not alter prior fire count");
+        assert_eq!(summary.advanced, 12);
+        assert_eq!(summary.finalized, 1);
+
+        apply_final_disposition(&mut summary, FinalDisposition::Fired);
+        assert_eq!(summary.fired, 8);
+        assert_eq!(
+            summary.advanced, 12,
+            "fire must not alter prior advance count"
+        );
+        assert_eq!(summary.finalized, 2);
+    }
+
+    async fn expire_dispatch_lease_for_test(rt: &KhiveRuntime, id: uuid::Uuid) {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set( \
+                        properties, '$.lease_expires_at', ?1) WHERE id = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Integer(Utc::now().timestamp_micros() - 1),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: Some("test_expire_dispatch_lease".into()),
+            })
+            .await
+            .expect("expire dispatch lease");
+        assert_eq!(rows, 1);
+    }
+
+    async fn overwrite_dispatch_receipt_and_expire_for_test(
+        rt: &KhiveRuntime,
+        id: uuid::Uuid,
+        receipt: &Value,
+    ) {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set( \
+                        properties, '$.dispatch_receipt', json(?1), \
+                        '$.lease_expires_at', ?2) WHERE id = ?3"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(serde_json::to_string(receipt).expect("serialize test receipt")),
+                    SqlValue::Integer(Utc::now().timestamp_micros() - 1),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: Some("test_overwrite_and_expire_dispatch_receipt".into()),
+            })
+            .await
+            .expect("overwrite and expire dispatch receipt");
+        assert_eq!(rows, 1);
+    }
+
+    async fn create_marker_directly(rt: &KhiveRuntime, content: &str) {
+        let token = rt.authorize(Namespace::local()).expect("authorize marker");
+        rt.create_note(&token, "observation", None, content, None, None, vec![])
+            .await
+            .expect("create simulated side effect");
     }
 
     #[test]
@@ -2028,26 +3613,27 @@ mod tests {
         let token = rt
             .authorize(Namespace::local())
             .expect("authorize reminder fixture");
-        rt.create_note(
-            &token,
-            "scheduled_event",
-            None,
-            "unprovenanced reminder",
-            None,
-            Some(json!({
-                "trigger_at": due_rfc3339(),
-                "repeat": null,
-                "status": "pending",
-                "event_type": "remind",
-                "created_by_actor": forged_victim,
-                "payload": null,
-                "fired_at": null,
-                "cancelled_at": null,
-            })),
-            vec![],
-        )
-        .await
-        .expect("create hand-written reminder");
+        let note = rt
+            .create_note(
+                &token,
+                "scheduled_event",
+                None,
+                "unprovenanced reminder",
+                None,
+                Some(json!({
+                    "trigger_at": due_rfc3339(),
+                    "repeat": null,
+                    "status": "pending",
+                    "event_type": "remind",
+                    "created_by_actor": forged_victim,
+                    "payload": null,
+                    "fired_at": null,
+                    "cancelled_at": null,
+                })),
+                vec![],
+            )
+            .await
+            .expect("create hand-written reminder");
 
         let summary = run_pending_events_on(&rt, &server, false)
             .await
@@ -2063,6 +3649,11 @@ mod tests {
         let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
         assert_eq!(daemon_messages.len(), 1);
         assert_eq!(daemon_messages[0].0, "unprovenanced reminder");
+        assert_eq!(
+            get_note_props(&rt, note.id).await["dispatch_receipt"]["actor"],
+            format!("actor:{daemon_actor}"),
+            "the scheduler fallback remains available only for a genuinely legacy reminder"
+        );
     }
 
     #[tokio::test]
@@ -2145,9 +3736,14 @@ mod tests {
 
         assert_eq!(summary.scanned, 2);
         assert_eq!(summary.failed, 1);
-        assert_eq!(summary.fired, 2);
+        assert_eq!(summary.fired, 1);
+        assert_eq!(summary.retry_pending, 1);
         assert!(inbound_reminder_messages(&rt, actor).await.is_empty());
         let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"], "pending",
+            "failed one-shot must remain retryable"
+        );
         assert!(
             props["delivery_error"]
                 .as_str()
@@ -2237,25 +3833,10 @@ mod tests {
         );
     }
 
-    /// A due event whose `trigger_at` carries a POSITIVE offset must still
-    /// fire (PR #782).
-    ///
-    /// `khive-pack-schedule` round-trips the caller's original `trigger_at`
-    /// string verbatim, offset included — it is never normalized to
-    /// UTC in storage. The candidate-page SQL predicate used to compare
-    /// `trigger_at` against `now` as raw TEXT (`<=`), which is only
-    /// chronologically correct when every stored string happens to share the
-    /// same offset as the bind parameter. This event is chronologically due
-    /// (10s ago, well inside the default grace window) but stored at a
-    /// `+04:00` wall-clock offset, whose string sorts LEXICOGRAPHICALLY
-    /// AFTER a UTC `now` string (a later-looking hour digit) even though it
-    /// is chronologically earlier — under the pre-fix raw-text predicate
-    /// this row would never be fetched by the candidate query at all, so it
-    /// would never fire, never even reach the Rust-side missed check: it
-    /// would sit `pending` forever. The fix wraps both sides of the SQL
-    /// predicate in `datetime(...)`, which normalizes to UTC before
-    /// comparing, making the fetch chronologically correct regardless of the
-    /// stored string's offset.
+    /// A due event stored with a positive `trigger_at` offset (whose RFC 3339
+    /// string sorts lexicographically after a UTC "now" string) must still
+    /// fire — proves the SQL due-ness predicate compares chronologically via
+    /// `datetime(...)`, not as raw text.
     #[tokio::test]
     async fn due_event_with_positive_offset_trigger_at_fires() {
         let (_tmp, db_path) = tmp_db();
@@ -2292,19 +3873,10 @@ mod tests {
         );
     }
 
-    /// A FUTURE event whose `trigger_at` carries a NEGATIVE offset — whose
-    /// RFC 3339 string sorts BEFORE a UTC `now` string as raw text, a false
-    /// POSITIVE under the pre-fix raw-text predicate — must NOT fire.
-    ///
-    /// This exercises the other direction of the same lexicographic-ordering
-    /// bug class: a negative-offset string can make a genuinely FUTURE event
-    /// look due to a raw-text `<=` comparison. The SQL predicate's
-    /// `datetime(...)` normalization correctly excludes it from the
-    /// candidate page; even if it were fetched, the retained Rust-side
-    /// `trigger_at > now` re-check is the belt-and-suspenders backstop that
-    /// already made this direction benign before the SQL fix (PR #782):
-    /// "Negative-offset strings produce false POSITIVES, which the retained
-    /// Rust re-check filters — benign").
+    /// A future event stored with a negative `trigger_at` offset (whose RFC
+    /// 3339 string sorts lexicographically before a UTC "now" string) must
+    /// NOT fire — the mirror case of the positive-offset test above, with the
+    /// Rust-side `trigger_at > now` re-check as an additional backstop.
     #[tokio::test]
     async fn future_event_with_negative_offset_trigger_at_is_not_fired() {
         let (_tmp, db_path) = tmp_db();
@@ -2421,7 +3993,7 @@ mod tests {
         );
     }
 
-    /// Issue #792: repeat advancement must preserve the original
+    /// Repeat advancement must preserve the original
     /// `trigger_at` timezone offset — not silently re-serialize the advanced
     /// occurrence as UTC. A `+04:00` schedule that fires and advances must
     /// still carry `+04:00` (and the same local wall-clock hour) on its next
@@ -2847,6 +4419,25 @@ mod tests {
             "policy error must explain why replay was refused: {props}"
         );
         assert!(props["dispatch_failed_at"].as_str().is_some(), "{props}");
+        assert_eq!(
+            props["dispatch_receipt"]["state"],
+            DispatchReceiptState::NotInvoked.as_str(),
+            "the durable claim receipt must survive provenance refusal: {props}"
+        );
+        assert_eq!(
+            props["dispatch_receipt"]["actor"], "anonymous:local",
+            "a refused generic row has no verified creator and must not inherit daemon attribution: {props}"
+        );
+        assert!(
+            props["dispatch_receipt"]["completed_at"].as_i64().is_some(),
+            "{props}"
+        );
+        assert!(
+            props["dispatch_receipt"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("immutable creator provenance")),
+            "{props}"
+        );
     }
 
     #[tokio::test]
@@ -3080,9 +4671,10 @@ mod tests {
         );
         let props = get_note_props(&rt, note_id).await;
         assert_eq!(
-            props["status"], "fired",
-            "per-event failures do not retry forever"
+            props["status"], "pending",
+            "failed one-shot remains retryable"
         );
+        assert_eq!(summary.retry_pending, 1);
         assert!(
             props["dispatch_error"]
                 .as_str()
@@ -3092,40 +4684,12 @@ mod tests {
         assert!(props["dispatch_failed_at"].as_str().is_some(), "{props}");
     }
 
-    /// Issue #461: a `schedule.schedule` payload that write-time validation
-    /// now accepts (single op, exactly-registered handler name, literal args,
-    /// all required params present) must actually dispatch successfully at
-    /// trigger time — proving write-time acceptance and trigger-time replay
-    /// agree. Before the fix, a bare-shorthand payload could pass write-time
-    /// checks yet fail replay as an unknown verb; this asserts the *positive*
-    /// case: a canonical payload produces zero dispatch failures.
-    ///
-    /// Issue #575: a single drain pass can legitimately report `failed >= 1`
-    /// for this exact payload with no logic bug involved. `claim_pending_event`
-    /// checks out the pool's single writer connection via
-    /// `WriterPool::writer()`, which is `parking_lot::Mutex::try_lock_for(
-    /// checkout_timeout)` (default 5s, `khive-db/src/pool.rs`) — a bounded
-    /// wait, not a logic gate. On a CPU-oversubscribed CI runner (`cargo test
-    /// --workspace` runs dozens of test binaries, each further parallelized,
-    /// against 2-4 physical cores), a task can be scheduled off-CPU for longer
-    /// than the checkout timeout while queued for that mutex, so the checkout
-    /// times out *before the claim's SQL `UPDATE` ever runs*: the drain loop
-    /// counts `summary.failed += 1` and the row stays in `status="pending"`,
-    /// retryable on the next cron drain. (This retryability is specific to
-    /// claim-time checkout failure. Once a claim succeeds, a later
-    /// dispatch-time error is counted as failed but the event is still
-    /// finalized — a non-repeating event is marked fired, not returned to
-    /// pending.) Confirmed live: this test passed 100/100 serial runs, 8/8
-    /// full-suite runs, and 3/3 `cargo llvm-cov` runs on a 12-core box, yet
-    /// failed on CI on a commit whose kkernel source did not change from a
-    /// passing run — the signature of scheduler contention, not a
-    /// deterministic dispatch defect.
-    ///
-    /// Rather than weakening the assertion (retries could mask a genuine
-    /// first-drain dispatch regression), remove the contention boundary
-    /// deterministically: run serially and raise the checkout timeout for
-    /// the duration of the test, keeping the original single-drain
-    /// zero-failure contract intact.
+    /// A canonical `schedule.schedule` payload that passes write-time
+    /// validation must dispatch with zero failures at trigger time, proving
+    /// write-time acceptance and trigger-time replay agree. Runs serially
+    /// with a raised writer-pool checkout timeout to remove CI scheduler
+    /// contention as a source of flakiness — see "Writer-pool checkout
+    /// contention under CI" in `crates/khive-mcp/docs/pending-events.md`.
     #[tokio::test]
     #[serial_test::serial]
     async fn replayable_action_dispatches_without_failure_at_trigger_time() {
@@ -3185,16 +4749,12 @@ mod tests {
         assert_eq!(props["status"].as_str(), Some("fired"));
     }
 
-    /// Issue #461: a legacy stored action containing a `$prev` reference
-    /// (impossible to create through the handler after this fix, but
-    /// representative of a row written before the write-time guard existed)
-    /// must be rejected by `dispatch_action` with an error naming the
-    /// non-literal argument, not silently dropped and dispatched with
-    /// missing/wrong data. Asserting the specific error text (rather than
-    /// just "some failure occurred") matters here: a downstream handler
-    /// might independently reject a dropped-but-required argument as
-    /// "missing", which would make a weaker assertion pass even if the
-    /// silent-drop bug were reintroduced.
+    /// A legacy stored action containing a `$prev` reference must be
+    /// rejected by `dispatch_action` with an error naming the non-literal
+    /// argument, not silently dropped and dispatched with missing/wrong
+    /// data — asserted on the specific error text so a downstream handler's
+    /// unrelated "missing argument" rejection can't mask a reintroduced
+    /// silent-drop bug.
     #[tokio::test]
     async fn dispatch_action_rejects_non_literal_prev_reference() {
         let (_tmp, db_path) = tmp_db();
@@ -3269,16 +4829,833 @@ mod tests {
         );
     }
 
-    /// Deterministic regression for the fire-side of issue #462: simulates
-    /// the exact interleaving where a drain claims a
-    /// row for firing (its read-then-act window), and only *after* that does
-    /// a `schedule.cancel` request arrive for the same id. Before this fix,
-    /// the drain read a `pending` snapshot and later did a full-row
-    /// `upsert_note` unconditionally, so a cancel landing in between would be
-    /// silently clobbered back to "fired". With the `pending -> firing` CAS
-    /// claim in place, the drain's claim (standing in for "drain read the row
-    /// before the cancel") must make the *subsequent* cancel fail — proving
-    /// cancel can no longer be lost to a fire that was already in flight.
+    #[tokio::test]
+    async fn legacy_multi_op_action_is_terminally_refused_without_partial_replay() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let marker = "legacy-batch-success-must-never-run";
+        let action = json!([
+            {
+                "tool": "create",
+                "args": {"kind": "observation", "content": marker}
+            },
+            {"tool": "this_verb_does_not_exist", "args": {}}
+        ])
+        .to_string();
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some(&action),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let first = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("first drain");
+        assert_eq!(
+            first.invoked, 0,
+            "a stored batch must be refused pre-invocation"
+        );
+        assert_eq!(first.failed, 1);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 0);
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "failed", "{props}");
+        assert_eq!(
+            props["dispatch_receipt"]["state"],
+            DispatchReceiptState::NotInvoked.as_str(),
+            "{props}"
+        );
+        assert!(props["dispatch_receipt"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("multiple operations")));
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("second drain");
+        assert_eq!(second.invoked, 0);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn renewable_lease_prevents_live_overrun_reclaim_and_double_dispatch() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let marker = "renewable-lease-single-invocation";
+        let state = std::sync::Arc::new(AsyncBlockingSideEffectState::default());
+        let _release_verb_on_unwind = ReleaseAsyncBlockingVerbOnDrop(state.clone());
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(AsyncBlockingSideEffectPack {
+            runtime: rt.clone(),
+            marker: marker.to_string(),
+            state: state.clone(),
+        });
+        let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
+        let action = "test.async_blocking_side_effect()";
+        let id =
+            create_scheduled_event(&rt, "local", &due_rfc3339(), Some(action), None, "schedule")
+                .await;
+        let lease = short_test_lease();
+        let entered = state.entered.notified();
+        let drain_rt = rt.clone();
+        let drain_server = server.clone();
+        let first = tokio::spawn(async move {
+            run_pending_events_on_with_lease(&drain_rt, &drain_server, false, lease).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+            .await
+            .expect("dispatch entered async blocking verb");
+
+        let invoking_props = get_note_props(&rt, id).await;
+        assert_eq!(invoking_props["status"], "firing");
+        let invocation_started_at = invoking_props["dispatch_receipt"]["invocation_started_at"]
+            .as_i64()
+            .expect("invocation start timestamp");
+        let ttl_micros = i64::try_from(lease.ttl.as_micros()).expect("test TTL fits in i64");
+        let original_deadline = invocation_started_at
+            .checked_add(ttl_micros)
+            .expect("test lease deadline fits in i64");
+        let proof_horizon = original_deadline
+            .checked_add(ttl_micros)
+            .expect("multi-TTL proof horizon fits in i64");
+        let renewal_margin_micros = i64::try_from(lease.renew_every.as_micros())
+            .expect("test renewal interval fits in i64");
+        let (live_props, observed_at, live_deadline) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let props = get_note_props(&rt, id).await;
+                    let observed_at = Utc::now().timestamp_micros();
+                    let future_margin = observed_at
+                        .checked_add(renewal_margin_micros)
+                        .expect("future-margin timestamp fits in i64");
+                    let deadline = props["lease_expires_at"].as_i64().unwrap_or(i64::MIN);
+                    if observed_at > proof_horizon && deadline > future_margin {
+                        break (props, observed_at, deadline);
+                    }
+                    tokio::time::sleep(lease.renew_every.min(std::time::Duration::from_millis(10)))
+                        .await;
+                }
+            })
+            .await
+            .expect("live dispatch lease did not remain renewable beyond two lease durations");
+        assert_eq!(live_props["status"], "firing");
+        assert!(
+            observed_at > proof_horizon,
+            "proof must observe the dispatch after two original lease durations"
+        );
+        assert!(
+            live_deadline
+                > observed_at
+                    .checked_add(renewal_margin_micros)
+                    .expect("future-margin timestamp fits in i64"),
+            "live dispatch must retain a future lease after the multi-TTL horizon: {live_props}"
+        );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_pending_events_on_with_lease(&rt, &server, false, lease),
+        )
+        .await
+        .expect("competing drain blocked, indicating a duplicate invocation")
+        .expect("second drain");
+        assert_eq!(second.reclaimed, 0, "live lease must not be reclaimed");
+        assert_eq!(second.invoked, 0, "second drain must not invoke the action");
+
+        state.release.notify_one();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), first)
+            .await
+            .expect("first drain completes")
+            .expect("first drain task joins")
+            .expect("first drain succeeds");
+        assert_eq!(first.invoked, 1);
+        assert_eq!(first.outcomes_persisted, 1);
+        assert_eq!(first.finalized, 1);
+        assert_eq!(first.fired, 1);
+        assert_eq!(
+            state.invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the target verb must be entered exactly once"
+        );
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+        let final_props = get_note_props(&rt, id).await;
+        assert_eq!(final_props["dispatch_receipt"]["state"], "succeeded");
+        assert!(final_props.get("firing_at").is_none());
+        assert!(final_props.get("lease_expires_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn renewal_between_reclaim_scan_and_finalize_preserves_live_owner() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let trigger = due_rfc3339();
+        let id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        let lease = short_test_lease();
+        assert!(mark_dispatch_invoking(&rt, "local", id, &claim, lease)
+            .await
+            .expect("mark invoking"));
+        expire_dispatch_lease_for_test(&rt, id).await;
+
+        // Model a reclaim pass that selected the expired row and retained its
+        // stale snapshot, then lost the writer race to the live owner's
+        // renewal. Recovery must re-check the deadline in its final CAS.
+        let observed_expired_at = Utc::now().timestamp_micros();
+        let selected_properties = get_raw_note_properties(&rt, id).await;
+        let mut stale_properties: Value =
+            serde_json::from_str(&selected_properties).expect("selected properties JSON");
+        let mut stale_receipt = stale_properties["dispatch_receipt"].clone();
+        let stale_completion = completion_from_receipt(&stale_receipt);
+        stale_receipt["state"] = json!("indeterminate");
+        stale_receipt["completed_at"] = json!(observed_expired_at);
+        stale_receipt["error"] = json!(match &stale_completion {
+            DispatchCompletion::Indeterminate(error) => error.as_str(),
+            _ => "unexpected stale receipt state",
+        });
+        let trigger_fixed = trigger
+            .parse::<DateTime<FixedOffset>>()
+            .expect("fixed-offset trigger");
+        let (stale_final, _) = final_properties_after_dispatch(
+            std::mem::take(&mut stale_properties),
+            stale_receipt,
+            &stale_completion,
+            trigger_fixed.with_timezone(&Utc),
+            *trigger_fixed.offset(),
+            &None,
+        );
+
+        assert!(renew_dispatch_lease(&rt, "local", id, &claim, lease)
+            .await
+            .expect("live owner renews"));
+        assert!(
+            !finalize_expired_firing_event(
+                &rt,
+                "local",
+                id,
+                &stale_final,
+                Utc::now().timestamp_micros(),
+                &claim,
+                RecoverySnapshot {
+                    expired_at: observed_expired_at,
+                    properties: &selected_properties,
+                },
+            )
+            .await
+            .expect("stale recovery finalize"),
+            "a renewal newer than the recovery snapshot must fence stale finalization"
+        );
+        let live = get_note_props(&rt, id).await;
+        assert_eq!(live["status"], "firing");
+        assert_eq!(live["dispatch_receipt"]["state"], "invoking");
+        assert!(live["lease_expires_at"]
+            .as_i64()
+            .is_some_and(|deadline| deadline > observed_expired_at));
+
+        let receipt =
+            persist_dispatch_outcome(&rt, "local", id, &claim, &DispatchCompletion::Succeeded)
+                .await
+                .expect("persist live outcome")
+                .expect("owner still holds receipt");
+        let (final_properties, _) = final_properties_after_dispatch(
+            live,
+            receipt,
+            &DispatchCompletion::Succeeded,
+            trigger_fixed.with_timezone(&Utc),
+            *trigger_fixed.offset(),
+            &None,
+        );
+        assert!(finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &final_properties,
+            Utc::now().timestamp_micros(),
+            &claim,
+        )
+        .await
+        .expect("live owner finalizes"));
+        assert_eq!(get_note_props(&rt, id).await["status"], "fired");
+    }
+
+    #[tokio::test]
+    async fn durable_success_after_reclaim_scan_fences_stale_recovery_finalize() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let trigger = due_rfc3339();
+        let id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", id, &claim, short_test_lease())
+                .await
+                .expect("mark invoking")
+        );
+        expire_dispatch_lease_for_test(&rt, id).await;
+
+        let selected_properties = get_raw_note_properties(&rt, id).await;
+        let mut stale_properties: Value =
+            serde_json::from_str(&selected_properties).expect("selected properties JSON");
+        let mut stale_receipt = stale_properties["dispatch_receipt"].clone();
+        let stale_completion = completion_from_receipt(&stale_receipt);
+
+        let durable_receipt =
+            persist_dispatch_outcome(&rt, "local", id, &claim, &DispatchCompletion::Succeeded)
+                .await
+                .expect("persist success")
+                .expect("claim still owned");
+        let observed_expired_at = Utc::now().timestamp_micros();
+        stale_receipt["state"] = json!(DispatchReceiptState::Indeterminate.as_str());
+        stale_receipt["completed_at"] = json!(observed_expired_at);
+        stale_receipt["error"] = json!(match &stale_completion {
+            DispatchCompletion::Indeterminate(error) => error.as_str(),
+            _ => "unexpected selected receipt state",
+        });
+        stale_receipt["error_payload"] = Value::Null;
+        let trigger_fixed = trigger
+            .parse::<DateTime<FixedOffset>>()
+            .expect("fixed-offset trigger");
+        let (stale_final, _) = final_properties_after_dispatch(
+            std::mem::take(&mut stale_properties),
+            stale_receipt,
+            &stale_completion,
+            trigger_fixed.with_timezone(&Utc),
+            *trigger_fixed.offset(),
+            &None,
+        );
+
+        assert!(
+            !finalize_expired_firing_event(
+                &rt,
+                "local",
+                id,
+                &stale_final,
+                Utc::now().timestamp_micros(),
+                &claim,
+                RecoverySnapshot {
+                    expired_at: observed_expired_at,
+                    properties: &selected_properties,
+                },
+            )
+            .await
+            .expect("stale recovery finalize"),
+            "recovery selected an invoking snapshot and must not overwrite a later durable success"
+        );
+        let current = get_note_props(&rt, id).await;
+        assert_eq!(current["status"], "firing", "{current}");
+        assert_eq!(current["dispatch_receipt"], durable_receipt, "{current}");
+    }
+
+    #[tokio::test]
+    async fn persisted_success_outcome_resumes_finalization_without_reinvocation() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let marker = "success-receipt-crash-marker";
+        let trigger = due_rfc3339();
+        let action = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let id =
+            create_scheduled_event(&rt, "local", &trigger, Some(&action), None, "schedule").await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", id, &claim, short_test_lease())
+                .await
+                .expect("mark invoking")
+        );
+        create_marker_directly(&rt, marker).await;
+        assert!(
+            persist_dispatch_outcome(&rt, "local", id, &claim, &DispatchCompletion::Succeeded,)
+                .await
+                .expect("persist outcome")
+                .is_some()
+        );
+
+        let recovered = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("recover finalized outcome");
+        assert_eq!(recovered.reclaimed, 1);
+        assert_eq!(recovered.invoked, 0);
+        assert_eq!(recovered.fired, 1);
+        assert_eq!(recovered.finalized, 1);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "fired");
+        assert_eq!(props["dispatch_receipt"]["state"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn expired_row_finalize_failure_does_not_wedge_later_due_work() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let poison_trigger = due_rfc3339();
+        let poison_id = create_scheduled_event(
+            &rt,
+            "local",
+            &poison_trigger,
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+        let poison_claim = claim_for_test(&rt, poison_id, &poison_trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", poison_id, &poison_claim, short_test_lease())
+                .await
+                .expect("mark poison invoking")
+        );
+        assert!(persist_dispatch_outcome(
+            &rt,
+            "local",
+            poison_id,
+            &poison_claim,
+            &DispatchCompletion::Succeeded,
+        )
+        .await
+        .expect("persist poison success")
+        .is_some());
+
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let marker = "due-work-after-poison-expired-row";
+        let action = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let later_id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some(&action),
+            None,
+            "schedule",
+        )
+        .await;
+
+        {
+            let mut writer = rt.sql().writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: format!(
+                        "CREATE TRIGGER test_fail_expired_outcome_finalize \
+                         BEFORE UPDATE OF properties ON notes \
+                         WHEN OLD.id = '{poison_id}' \
+                           AND json_extract(OLD.properties, '$.status') = 'firing' \
+                         BEGIN \
+                           SELECT RAISE(FAIL, 'injected expired finalization failure'); \
+                         END"
+                    ),
+                    params: vec![],
+                    label: Some("test_install_expired_finalize_failure".into()),
+                })
+                .await
+                .expect("install expired finalization failure trigger");
+        }
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("row-local recovery failure is absorbed");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert_eq!(summary.fired, 1, "later due work must still fire");
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+        assert_eq!(get_note_props(&rt, poison_id).await["status"], "firing");
+        assert_eq!(get_note_props(&rt, later_id).await["status"], "fired");
+    }
+
+    #[tokio::test]
+    async fn malformed_terminal_receipts_fail_indeterminate_without_replay() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let marker = "malformed-terminal-receipt-must-not-dispatch";
+        let action = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let mut ids = Vec::new();
+
+        for case in 0..5 {
+            let trigger = due_rfc3339();
+            let id =
+                create_scheduled_event(&rt, "local", &trigger, Some(&action), None, "schedule")
+                    .await;
+            claim_for_test(&rt, id, &trigger).await;
+            let mut receipt = get_note_props(&rt, id).await["dispatch_receipt"].clone();
+            match case {
+                0 => {
+                    receipt["state"] = json!(DispatchReceiptState::Succeeded.as_str());
+                    receipt["error"] = Value::Null;
+                    receipt
+                        .as_object_mut()
+                        .expect("receipt object")
+                        .remove("completed_at");
+                }
+                1 => {
+                    receipt["state"] = json!(DispatchReceiptState::Succeeded.as_str());
+                    receipt["completed_at"] = json!("not-a-timestamp");
+                    receipt["error"] = Value::Null;
+                }
+                2 => {
+                    receipt["state"] = json!(DispatchReceiptState::Failed.as_str());
+                    receipt["error"] = json!("simulated dispatch failure");
+                    receipt
+                        .as_object_mut()
+                        .expect("receipt object")
+                        .remove("completed_at");
+                }
+                3 => {
+                    receipt["state"] = json!(DispatchReceiptState::Failed.as_str());
+                    receipt["completed_at"] = json!(Utc::now().timestamp_micros());
+                    receipt
+                        .as_object_mut()
+                        .expect("receipt object")
+                        .remove("error");
+                }
+                4 => {
+                    receipt["state"] = json!(DispatchReceiptState::Succeeded.as_str());
+                    receipt["completed_at"] = json!(Utc::now().timestamp_micros());
+                    receipt["error"] = Value::Null;
+                    receipt["occurrence_id"] = json!(uuid::Uuid::new_v4());
+                }
+                _ => unreachable!(),
+            }
+            overwrite_dispatch_receipt_and_expire_for_test(&rt, id, &receipt).await;
+            ids.push(id);
+        }
+
+        let recovered = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("malformed receipts are quarantined per row");
+        assert_eq!(recovered.reclaimed, 5);
+        assert_eq!(recovered.invoked, 0);
+        assert_eq!(recovered.outcomes_persisted, 5);
+        assert_eq!(recovered.indeterminate, 5);
+        assert_eq!(recovered.finalized, 5);
+        assert_eq!(recovered.fired, 0);
+        assert_eq!(recovered.retry_pending, 0);
+        assert_eq!(recovered.failed, 5);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 0);
+
+        for id in ids {
+            let props = get_note_props(&rt, id).await;
+            assert_eq!(props["status"], "failed", "{props}");
+            assert_eq!(
+                props["dispatch_receipt"]["state"],
+                DispatchReceiptState::Indeterminate.as_str(),
+                "{props}"
+            );
+            assert!(
+                props["dispatch_receipt"]["completed_at"].as_i64().is_some(),
+                "{props}"
+            );
+            assert!(
+                props["dispatch_receipt"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("refusing automatic replay")),
+                "{props}"
+            );
+            assert!(
+                props["dispatch_receipt"]["invalid_receipt"].is_object(),
+                "the malformed source receipt must remain available for diagnosis: {props}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_invoking_receipt_fails_indeterminate_without_double_dispatch() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let marker = "indeterminate-crash-marker";
+        let trigger = due_rfc3339();
+        let action = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let id =
+            create_scheduled_event(&rt, "local", &trigger, Some(&action), None, "schedule").await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", id, &claim, short_test_lease())
+                .await
+                .expect("mark invoking")
+        );
+        create_marker_directly(&rt, marker).await;
+        expire_dispatch_lease_for_test(&rt, id).await;
+
+        let recovered = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("reconcile ambiguous crash");
+        assert_eq!(recovered.reclaimed, 1);
+        assert_eq!(recovered.invoked, 0);
+        assert_eq!(recovered.outcomes_persisted, 1);
+        assert_eq!(recovered.indeterminate, 1);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "failed", "ambiguous outcome fails closed");
+        assert_eq!(props["dispatch_receipt"]["state"], "indeterminate");
+
+        let again = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("terminal row is not replayed");
+        assert_eq!(again.invoked, 0);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_one_shot_is_retryable_and_succeeds_once_on_later_drain() {
+        let (_tmp, db_path) = tmp_db();
+        let gate = std::sync::Arc::new(FailFirstCreateGate::default());
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: gate.clone(),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("runtime");
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let marker = "failed-one-shot-recovery-marker";
+        let action = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some(&action),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let first = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("first drain");
+        assert_eq!(first.invoked, 1);
+        assert_eq!(first.outcomes_persisted, 1);
+        assert_eq!(first.retry_pending, 1);
+        assert_eq!(first.fired, 0);
+        let first_props = get_note_props(&rt, id).await;
+        assert_eq!(first_props["status"], "pending");
+        let first_occurrence = first_props["dispatch_receipt"]["occurrence_id"]
+            .as_str()
+            .expect("occurrence receipt")
+            .to_string();
+        let first_invocation = first_props["dispatch_receipt"]["invocation_id"]
+            .as_str()
+            .expect("invocation receipt")
+            .to_string();
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 0);
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("retry drain");
+        assert_eq!(second.invoked, 1);
+        assert_eq!(second.outcomes_persisted, 1);
+        assert_eq!(second.fired, 1);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+        let second_props = get_note_props(&rt, id).await;
+        assert_eq!(second_props["status"], "fired");
+        assert_eq!(
+            second_props["dispatch_receipt"]["occurrence_id"].as_str(),
+            Some(first_occurrence.as_str()),
+            "retries share one deterministic occurrence identity"
+        );
+        assert_ne!(
+            second_props["dispatch_receipt"]["invocation_id"].as_str(),
+            Some(first_invocation.as_str()),
+            "each retry receives a distinct invocation identity"
+        );
+        assert_eq!(
+            gate.invocations.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one failed invocation and one successful retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_side_effect_is_indeterminate_and_never_blindly_retried() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let marker = "ambiguous-outcome-single-side-effect";
+        let outbound_id = uuid::Uuid::new_v4();
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(AmbiguousSideEffectPack {
+            runtime: rt.clone(),
+            marker: marker.to_string(),
+            outbound_id,
+            invocations: invocations.clone(),
+        });
+        let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("test.ambiguous_side_effect()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let first = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("first drain");
+        assert_eq!(first.invoked, 1);
+        assert_eq!(first.outcomes_persisted, 1);
+        assert_eq!(first.indeterminate, 1);
+        assert_eq!(first.retry_pending, 0);
+        assert_eq!(first.fired, 0);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "failed", "{props}");
+        assert_eq!(props["dispatch_receipt"]["state"], "indeterminate");
+        assert_eq!(
+            props["dispatch_receipt"]["error_payload"]["details"]["outbound_id"],
+            outbound_id.to_string(),
+            "the durable receipt must retain the comm.delivered correlation id: {props}"
+        );
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("second drain");
+        assert_eq!(second.invoked, 0);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an ambiguous committed side effect must never be retried automatically"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_cron_row_fails_closed_before_action_invocation() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let marker = "legacy-cron-must-not-dispatch";
+        let action = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some(&action),
+            Some("0 9 * * 1"),
+            "schedule",
+        )
+        .await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("legacy cron reconciliation");
+        assert_eq!(summary.invoked, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.finalized, 1);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 0);
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "failed");
+        assert!(props["dispatch_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unsupported repeat")));
+        assert_eq!(
+            props["dispatch_receipt"]["state"],
+            DispatchReceiptState::NotInvoked.as_str(),
+            "the durable claim receipt must survive unsupported-repeat refusal: {props}"
+        );
+        assert!(props["dispatch_receipt"]["occurrence_id"]
+            .as_str()
+            .is_some());
+        assert!(props["dispatch_receipt"]["invocation_id"]
+            .as_str()
+            .is_some());
+        assert!(props["dispatch_receipt"]["completed_at"].as_i64().is_some());
+    }
+
+    #[tokio::test]
+    async fn empty_payload_finalization_retains_not_invoked_receipt() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let id = create_scheduled_event(&rt, "local", &due_rfc3339(), None, None, "schedule").await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("empty payload is finalized per row");
+        assert_eq!(summary.invoked, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.finalized, 1);
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "failed", "{props}");
+        assert_eq!(
+            props["dispatch_receipt"]["state"],
+            DispatchReceiptState::NotInvoked.as_str(),
+            "{props}"
+        );
+        assert!(props["dispatch_receipt"]["completed_at"].as_i64().is_some());
+        assert!(props["dispatch_receipt"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("no executable payload")));
+    }
+
+    #[tokio::test]
+    async fn unsupported_repeat_finalize_failure_does_not_abort_later_rows() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let cron_id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            Some("0 9 * * 1"),
+            "schedule",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let marker = "row-after-cron-finalize-failure";
+        let action = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let later_id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some(&action),
+            None,
+            "schedule",
+        )
+        .await;
+
+        {
+            let mut writer = rt.sql().writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: format!(
+                        "CREATE TRIGGER test_fail_unsupported_repeat_finalize \
+                         BEFORE UPDATE OF properties ON notes \
+                         WHEN OLD.id = '{cron_id}' \
+                           AND json_extract(OLD.properties, '$.status') = 'firing' \
+                           AND json_extract(NEW.properties, '$.status') = 'failed' \
+                         BEGIN \
+                           SELECT RAISE(FAIL, 'injected cron finalization failure'); \
+                         END"
+                    ),
+                    params: vec![],
+                    label: Some("test_install_cron_finalize_failure".into()),
+                })
+                .await
+                .expect("install finalization failure trigger");
+        }
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("one row-level finalization failure must not abort the drain");
+        assert_eq!(summary.scanned, 2);
+        assert_eq!(summary.invoked, 1);
+        assert_eq!(summary.fired, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
+        assert_eq!(get_note_props(&rt, cron_id).await["status"], "firing");
+        assert_eq!(get_note_props(&rt, later_id).await["status"], "fired");
+    }
+
+    /// A `schedule.cancel` arriving after the drain has already CAS-claimed
+    /// the row for firing must fail — proves a cancel can never be lost to a
+    /// fire that was already in flight.
     #[tokio::test]
     async fn fire_claim_wins_race_against_concurrent_cancel() {
         let (_tmp, db_path) = tmp_db();
@@ -3291,10 +5668,7 @@ mod tests {
 
         // Simulate the drain's claim (pending -> firing), which in the real
         // drain happens right after the page read and before dispatch.
-        let claimed_firing_at = claim_pending_event(&rt, "local", id)
-            .await
-            .expect("claim query")
-            .expect("claim must succeed on a fresh pending row");
+        let claim = claim_for_test(&rt, id, past).await;
 
         // A `schedule.cancel` arriving after the claim in this race window
         // must now fail instead of clobbering the
@@ -3343,7 +5717,7 @@ mod tests {
                 "cancelled_at": null,
             }),
             Utc::now().timestamp_micros(),
-            claimed_firing_at,
+            &claim,
         )
         .await
         .expect("finalize query");
@@ -3378,13 +5752,10 @@ mod tests {
         assert_eq!(rows, 1, "test setup: row must exist");
     }
 
-    /// Issue #462 (stale-`firing` recovery), case (a): a row claimed by a
-    /// drain that then crashed before finalizing — `status="firing"` with a
-    /// `firing_at` older than the documented timeout — must be reclaimed back
-    /// to `pending` and fired on the next drain pass, instead of being
-    /// wedged forever (the old behavior: only `status="pending"` rows are
-    /// ever scanned, so a stranded `firing` row was invisible to every future
-    /// drain).
+    /// A row claimed by a drain that then crashed before finalizing —
+    /// `status="firing"` with a `firing_at` older than the stale timeout —
+    /// must be reclaimed back to `pending` and fired on the next pass,
+    /// instead of being wedged forever.
     #[tokio::test]
     async fn stale_firing_row_is_reclaimed_and_fired() {
         let (_tmp, db_path) = tmp_db();
@@ -3396,7 +5767,8 @@ mod tests {
 
         // Simulate a drain claiming the row, then crashing before finalize:
         // status="firing" with a firing_at well past the stale timeout.
-        let stale_firing_at = Utc::now().timestamp_micros() - (STALE_FIRING_TIMEOUT_MICROS * 2);
+        let stale_firing_at =
+            Utc::now().timestamp_micros() - (LEGACY_STALE_FIRING_TIMEOUT_MICROS * 2);
         force_set_properties(
             &rt,
             id,
@@ -3434,9 +5806,9 @@ mod tests {
         );
     }
 
-    /// Issue #462, case (b): a row claimed *recently* (fresh `firing_at`,
-    /// well within the stale timeout) must NOT be reclaimed — a live drain's
-    /// in-flight claim is never stolen by the reclaim sweep.
+    /// A row claimed *recently* (fresh `firing_at`, well within the stale
+    /// timeout) must NOT be reclaimed — a live drain's in-flight claim is
+    /// never stolen by the reclaim sweep.
     #[tokio::test]
     async fn fresh_firing_row_is_not_reclaimed() {
         let (_tmp, db_path) = tmp_db();
@@ -3447,10 +5819,7 @@ mod tests {
             create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
 
         // Fresh claim: firing_at = now, well under the stale threshold.
-        let _claimed_firing_at = claim_pending_event(&rt, "local", id)
-            .await
-            .expect("claim query")
-            .expect("claim must succeed on a fresh pending row");
+        let _claim = claim_for_test(&rt, id, past).await;
 
         let summary = drain_for_test(&db_path).await.expect("drain");
 
@@ -3472,17 +5841,10 @@ mod tests {
         );
     }
 
-    /// Regression: finalize must be bound to the owning claim. This
-    /// reproduces the exact stale-claimant-resumes
-    /// interleaving. Drain A claims and (simulated) crashes/stalls past the
-    /// stale timeout with its own `firing_at` token recorded. A reclaim pass
-    /// then runs, and drain B re-claims the row, minting a fresh `firing_at`
-    /// token distinct from A's. A now resumes and attempts to finalize using
-    /// its stale token: before this fix, `finalize_fired_event` matched on
-    /// `status='firing'` alone and would have clobbered B's live claim with
-    /// A's stale final state. With the claim-token CAS in place, A's
-    /// finalize must be a no-op and B's claim (and eventual finalize) must
-    /// survive untouched.
+    /// Finalize must be bound to the owning claim token, not just
+    /// `status='firing'`: a stale claimant (A) that resumes after a reclaim
+    /// pass has already let a fresh claimant (B) re-claim the row must have
+    /// its finalize become a no-op, leaving B's claim untouched.
     #[tokio::test]
     async fn stale_claimant_cannot_finalize_over_a_fresh_reclaim() {
         let (_tmp, db_path) = tmp_db();
@@ -3492,43 +5854,57 @@ mod tests {
         let id =
             create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
 
-        // Drain A claims, then (simulated) stalls: fabricate a status="firing"
-        // row whose firing_at predates the stale threshold — this stands in
-        // for "A really did claim it, then never got back to finalize".
-        let a_claimed_firing_at = Utc::now().timestamp_micros() - (STALE_FIRING_TIMEOUT_MICROS * 2);
-        force_set_properties(
-            &rt,
-            id,
-            &json!({
-                "trigger_at": past,
-                "repeat": null,
-                "status": "firing",
-                "event_type": "schedule",
-                "payload": "stats()",
-                "fired_at": null,
-                "cancelled_at": null,
-                "firing_at": a_claimed_firing_at,
-            }),
-        )
-        .await;
+        let a_claim = claim_for_test(&rt, id, past).await;
+        let mut writer = rt.sql().writer().await.expect("writer");
+        assert_eq!(
+            writer
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET properties = json_set( \
+                            properties, '$.lease_expires_at', ?1) WHERE id = ?2"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Integer(Utc::now().timestamp_micros() - 1),
+                        SqlValue::Text(id.to_string()),
+                    ],
+                    label: Some("test_expire_a_dispatch_lease".into()),
+                })
+                .await
+                .expect("expire A lease"),
+            1
+        );
+        drop(writer);
 
         // A reclaim pass runs (as a live drain's periodic sweep would),
         // moving the row back to "pending" since A's firing_at is stale.
-        let stale_before = Utc::now().timestamp_micros() - STALE_FIRING_TIMEOUT_MICROS;
-        let reclaimed = reclaim_stale_firing_events(&rt, stale_before)
+        let reclaimed = reclaim_stale_firing_events(&rt, Utc::now().timestamp_micros())
             .await
             .expect("reclaim query");
-        assert_eq!(reclaimed, 1, "A's stale claim must be reclaimed");
+        assert_eq!(reclaimed.rows, 1, "A's stale claim must be reclaimed");
+        assert_eq!(reclaimed.retry_pending, 1);
+        assert_eq!(
+            reclaimed.failed, 0,
+            "an expired claimant that never began invocation is retryable, not a failed action"
+        );
+        let reclaimed_props = get_note_props(&rt, id).await;
+        assert_eq!(reclaimed_props["status"], "pending", "{reclaimed_props}");
+        assert_eq!(
+            reclaimed_props["dispatch_receipt"]["state"],
+            DispatchReceiptState::NotInvoked.as_str(),
+            "claim expiry before invocation must be recorded truthfully: {reclaimed_props}"
+        );
+        assert!(
+            reclaimed_props["dispatch_receipt"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("before invocation began")),
+            "the durable receipt must explain why no invocation occurred: {reclaimed_props}"
+        );
 
         // Drain B re-claims the now-pending row, minting a fresh firing_at
         // token that differs from A's stale one.
-        let b_claimed_firing_at = claim_pending_event(&rt, "local", id)
-            .await
-            .expect("claim query")
-            .expect("B's claim must succeed on the reclaimed row");
+        let b_claim = claim_for_test(&rt, id, past).await;
         assert_ne!(
-            a_claimed_firing_at, b_claimed_firing_at,
-            "B's claim token must differ from A's stale token"
+            a_claim.invocation_id, b_claim.invocation_id,
+            "B's invocation token must differ from A's stale token"
         );
 
         // A resumes (unaware it was reclaimed) and attempts to finalize using
@@ -3548,7 +5924,7 @@ mod tests {
                 "cancelled_at": null,
             }),
             Utc::now().timestamp_micros(),
-            a_claimed_firing_at,
+            &a_claim,
         )
         .await
         .expect("finalize query must not error");
@@ -3567,7 +5943,7 @@ mod tests {
         );
         assert_eq!(
             props_after_a["firing_at"].as_i64(),
-            Some(b_claimed_firing_at),
+            Some(b_claim.firing_at),
             "B's firing_at token must be unchanged by A's stale finalize attempt"
         );
 
@@ -3587,7 +5963,7 @@ mod tests {
                 "cancelled_at": null,
             }),
             Utc::now().timestamp_micros(),
-            b_claimed_firing_at,
+            &b_claim,
         )
         .await
         .expect("finalize query must not error");
@@ -3608,14 +5984,9 @@ mod tests {
         );
     }
 
-    /// Issue #462, case (c): `schedule.cancel` on a row that is currently
-    /// `status="firing"` — even a *stale* one — must still fail cleanly.
-    /// Reclaim only happens as part of a drain pass; cancel itself never
-    /// reclaims, so a cancel that races a still-technically-firing (if
-    /// abandoned) row gets the same "not pending" rejection it would against
-    /// a live in-flight fire. This confirms the reclaim path does not weaken
-    /// the fire/cancel CAS contract asserted by
-    /// `fire_claim_wins_race_against_concurrent_cancel`.
+    /// `schedule.cancel` on a row that is currently `status="firing"` — even
+    /// a *stale* one — must still fail cleanly: reclaim only happens as part
+    /// of a drain pass, so cancel itself never reclaims.
     #[tokio::test]
     async fn cancel_on_stale_firing_row_still_fails_cleanly() {
         let (_tmp, db_path) = tmp_db();
@@ -3626,7 +5997,8 @@ mod tests {
         let id =
             create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
 
-        let stale_firing_at = Utc::now().timestamp_micros() - (STALE_FIRING_TIMEOUT_MICROS * 2);
+        let stale_firing_at =
+            Utc::now().timestamp_micros() - (LEGACY_STALE_FIRING_TIMEOUT_MICROS * 2);
         force_set_properties(
             &rt,
             id,
@@ -3715,7 +6087,7 @@ mod tests {
     #[test]
     fn next_trigger_at_cron_returns_none() {
         let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
-        // 5-field cron: not supported → returns None (one-shot fire)
+        // Write-time validation rejects cron; legacy rows fail closed before dispatch.
         assert!(next_trigger_at(&Some("0 9 * * 1".to_string()), base).is_none());
     }
 
@@ -3742,8 +6114,7 @@ mod tests {
         );
     }
 
-    /// No `repeat` (or an unsupported cron form) never advances — the caller
-    /// must fall back to marking the event terminally `"missed"`.
+    /// No `repeat` never advances, so the caller marks a stale one-shot missed.
     #[test]
     fn advance_repeat_past_missed_no_repeat_returns_none() {
         let now: DateTime<Utc> = "2026-06-15T09:00:00Z".parse().unwrap();
@@ -3751,19 +6122,52 @@ mod tests {
         assert!(advance_repeat_past_missed(&None, original, now).is_none());
     }
 
-    /// The headline regression: 9 non-repeating events overdue well beyond
-    /// the default grace window (300s) must ALL be marked `"missed"` and
-    /// NONE dispatched. This is the first-boot-against-a-large-backlog
-    /// scenario the ADR-106 amendment calls out explicitly. The action DSL is
-    /// deliberately a genuinely side-effecting verb (`create`, writing a
-    /// distinctively-tagged `observation` note) rather than the read-only
-    /// `stats()`, and the test asserts that note is ABSENT after the drain —
-    /// not just that `summary.fired`/`summary.advanced` read zero. A
-    /// regression that accidentally fires the missed path would otherwise be
-    /// caught only by the summary counters, which is weaker evidence than
-    /// confirming the action's own write never landed (PR #782):
-    /// the previous fixture used `stats()`, contradicting this
-    /// comment's claim of a side-effecting action).
+    #[tokio::test]
+    async fn missed_reminder_receipt_retains_creator_not_daemon_actor() {
+        let (_tmp, db_path) = tmp_db();
+        let creator_rt = make_rt_with_actor(&db_path, Some("lambda:reminder-owner")).await;
+        let id = create_scheduled_event(
+            &creator_rt,
+            "local",
+            "2000-01-01T00:00:00Z",
+            None,
+            None,
+            "remind",
+        )
+        .await;
+
+        let daemon_rt = make_rt_with_actor(&db_path, Some("lambda:scheduler-daemon")).await;
+        let server = KhiveMcpServer::new(daemon_rt.clone()).expect("daemon server");
+        let summary = run_pending_events_on(&daemon_rt, &server, false)
+            .await
+            .expect("missed reminder drain");
+        assert_eq!(summary.invoked, 0);
+        assert_eq!(summary.missed, vec![id]);
+
+        let props = get_note_props(&daemon_rt, id).await;
+        assert_eq!(props["status"], "missed", "{props}");
+        assert_eq!(
+            props["dispatch_receipt"]["actor"], "actor:lambda:reminder-owner",
+            "a grace-policy receipt is still creator-attributed: {props}"
+        );
+        assert!(
+            inbound_reminder_messages(&daemon_rt, "lambda:reminder-owner")
+                .await
+                .is_empty(),
+            "a missed reminder must not dispatch"
+        );
+        assert!(
+            inbound_reminder_messages(&daemon_rt, "lambda:scheduler-daemon")
+                .await
+                .is_empty(),
+            "the daemon actor must neither receive nor own the missed reminder"
+        );
+    }
+
+    /// 9 non-repeating events overdue well beyond the default grace window
+    /// (the first-boot-against-a-large-backlog scenario) must ALL be marked
+    /// `"missed"` and NONE dispatched — asserted by the absence of the
+    /// side-effecting action's write, not just zeroed summary counters.
     #[tokio::test]
     async fn nine_overdue_events_beyond_grace_are_missed_with_zero_dispatch() {
         let (_tmp, db_path) = tmp_db();
@@ -3822,6 +6226,13 @@ mod tests {
                 props["fired_at"].is_null(),
                 "note {id} must never have fired_at set (never dispatched), got {props:?}"
             );
+            assert_eq!(
+                props["dispatch_receipt"]["state"],
+                DispatchReceiptState::Missed.as_str(),
+                "the durable claim receipt must survive missed finalization: {props}"
+            );
+            assert!(props["dispatch_receipt"]["completed_at"].as_i64().is_some());
+            assert!(props["dispatch_receipt"]["error"].is_null());
         }
 
         // Strongest evidence: the side-effecting action's own output record
@@ -4002,13 +6413,7 @@ mod tests {
 
     /// A backlog larger than the drain's internal page size (200) must be
     /// fully processed in ONE drain pass, not silently truncated at the page
-    /// boundary (PR #782): the previous
-    /// implementation paged `status="pending"` with `LIMIT/OFFSET` while
-    /// simultaneously mutating rows out of that predicate, so once the first
-    /// page's 200 rows left `"pending"`, the page-2 query at `OFFSET 200`
-    /// undercounted and silently skipped every row beyond the first page).
-    /// 201 rows — one more than `PAGE_SIZE` — reproduces the exact boundary
-    /// this fix addressed.
+    /// boundary — 201 rows exercises the exact boundary.
     #[tokio::test]
     async fn backlog_larger_than_page_size_is_fully_drained_in_one_pass() {
         let (_tmp, db_path) = tmp_db();
@@ -4054,21 +6459,11 @@ mod tests {
     }
 
     /// Two concurrent drain passes over the same store must never double-fire
-    /// a row: the `pending -> firing` CAS claim (`claim_pending_event`) makes
-    /// exactly one of the two concurrent callers win each row. PR #782
-    /// Amendment B requires Acceptance Criterion 2 to hold, but no regression
-    /// exercised concurrent drains until now.
-    ///
-    /// Each row's action is a genuinely side-effecting `create` writing a
-    /// row-distinct marker `observation` note, rather than the read-only
-    /// `stats()` an earlier version of this test used (PR #782):
-    /// a read-only action makes the summary
-    /// counters the ONLY signal, which cannot distinguish "claimed once,
-    /// dispatched once" from "claimed once, dispatched TWICE, only one
-    /// finalize succeeded" — the exact double-dispatch-one-finalize
-    /// regression this test exists to catch). After both drains, the test
-    /// asserts exactly ONE marker note per scheduled event exists — not just
-    /// that the summary counters sum to `ROW_COUNT`.
+    /// a row: the `pending -> firing` CAS claim makes exactly one of the two
+    /// concurrent callers win each row. Each action is a genuinely
+    /// side-effecting write (not a read-only op) so the test can assert
+    /// exactly ONE marker note per event exists, rather than trusting summary
+    /// counters alone to catch a double-dispatch-one-finalize regression.
     #[tokio::test]
     async fn concurrent_drains_fire_each_row_exactly_once() {
         let (_tmp, db_path) = tmp_db();
@@ -4157,22 +6552,14 @@ mod tests {
         }
     }
 
-    // ── PR #782: `run_pending_events`'s wrapper
-    //    seam must not misread a default namespace as an explicit actor
-    //    override ──────────────────────────────────────────────────────────
-    //
-    // These tests exercise the REAL config-discovery path (process cwd /
-    // `HOME`), exactly like `serve.rs`'s own ADR-096 Fork 2 regressions —
-    // that module's `SeatEnv`/`write_config` helpers are private to its own
-    // `#[cfg(test)]` module, so this module carries its own copies rather
-    // than exporting test-only scaffolding across a crate boundary that
-    // doesn't otherwise exist between these two files.
+    // `run_pending_events`'s wrapper seam must not misread a default
+    // namespace as an explicit actor override. These tests exercise the real
+    // config-discovery path (process cwd / `HOME`); the helpers below mirror
+    // `serve.rs`'s own equivalents, kept local since they are test-only.
 
-    /// RAII guard: temporarily redirects process cwd to `project_root` and
-    /// `HOME` to an isolated, empty tempdir (so tier 4 — `~/.khive/config.toml`
-    /// — never reaches whatever the real machine running this suite happens
-    /// to have configured globally). Restores both on drop, even on
-    /// panic/unwind. Mirrors `serve.rs`'s own `SeatEnv`.
+    /// RAII guard: redirects process cwd and `HOME` to isolated locations so
+    /// the real machine's global `~/.khive/config.toml` never leaks into a
+    /// test. Restores both on drop, even on panic/unwind.
     struct SeatEnv {
         original_cwd: std::path::PathBuf,
         original_home: Option<std::ffi::OsString>,
@@ -4293,12 +6680,9 @@ mod tests {
         );
     }
 
-    /// Sibling regression for the explicit-tier half of the same seam: an
-    /// explicit `--config` naming a MISSING file must fail loud, not run the
-    /// drain with defaults. The loader enforces the explicit tier
-    /// (`KhiveConfig::load_with_home_fallback_and_source` returns
-    /// `ExplicitConfigMissing`), and the error surfaces wrapped in the
-    /// generic build context — it is NOT a `DatabaseOverrideConflict`.
+    /// An explicit `--config` naming a MISSING file must fail loud, not run
+    /// the drain with defaults; the error surfaces wrapped in the generic
+    /// build context, not as a `DatabaseOverrideConflict`.
     #[tokio::test]
     #[serial_test::serial]
     async fn run_pending_events_fails_loud_for_missing_explicit_config() {
@@ -4336,19 +6720,11 @@ mod tests {
         );
     }
 
-    /// The wrapper seam (`build_server_with_explicit_namespace`, called by
-    /// `run_pending_events` with `namespace_explicit: true, actor_explicit:
-    /// false`) must let a `"local"`-resolved default namespace fall through
-    /// to the project-configured actor — never clear it the way a genuine
-    /// `--actor`/`--namespace` CLI override would (`build_server`'s own,
-    /// correctly-narrower semantic). Regression for PR #782:
-    /// before this fix, `run_pending_events` called
-    /// `build_server` directly with a synthesized `namespace: Some("local")`,
-    /// which `resolve_cli_namespace` reported as `explicit = true` and
-    /// `build_server` then fed into BOTH `namespace_explicit` AND
-    /// `actor_explicit`, tripping the "genuinely explicit actor tier
-    /// requesting anonymous" branch in `resolve_runtime_config` and silently
-    /// discarding the configured `[actor] id`.
+    /// The wrapper seam (`build_server_with_explicit_namespace`, called with
+    /// `namespace_explicit: true, actor_explicit: false`) must let a
+    /// `"local"`-resolved default namespace fall through to the
+    /// project-configured actor — never clear it the way a genuine
+    /// `--actor`/`--namespace` CLI override would.
     #[test]
     #[serial_test::serial]
     fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
@@ -4392,12 +6768,11 @@ mod tests {
         );
     }
 
-    /// Positive control for the failure mode the fix above closes: routing
-    /// the same inputs through `build_server` (the genuine CLI-flag seam,
-    /// unchanged by this fix) DOES clear the actor, because there a
-    /// present namespace value really does mean "the operator typed
-    /// --namespace". This documents why `run_pending_events` must not reuse
-    /// that entry point for a synthesized, non-CLI-parsed namespace default.
+    /// Positive control: routing the same inputs through `build_server` (the
+    /// genuine CLI-flag seam) DOES clear the actor, because there a present
+    /// namespace value really does mean "the operator typed --namespace" —
+    /// why `run_pending_events` must not reuse that entry point for a
+    /// synthesized, non-CLI-parsed namespace default.
     #[test]
     #[serial_test::serial]
     fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {

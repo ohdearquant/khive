@@ -1,6 +1,8 @@
 use super::*;
 use async_trait::async_trait;
-use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
+use khive_runtime::{
+    EdgeListFilter, EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder,
+};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_types::{Id128, NoteDraft, ProposalChangeset, ProposalCreatedPayload};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
@@ -82,6 +84,41 @@ async fn ensure_schema(rt: &KhiveRuntime) {
         })
         .await
         .expect("create table");
+}
+
+async fn replace_fts_entities_with_incompatible_table(rt: &KhiveRuntime) {
+    let sql = rt.sql();
+    let mut writer = sql.writer().await.expect("writer for FTS fault setup");
+    writer
+        .execute_script(
+            "DROP TABLE fts_entities; \
+             CREATE TABLE fts_entities (broken_column TEXT);"
+                .to_string(),
+        )
+        .await
+        .expect("replace FTS table to inject post-commit reindex failure");
+}
+
+async fn install_committed_edge_resolution_fault(rt: &KhiveRuntime) {
+    let sql = rt.sql();
+    let mut writer = sql
+        .writer()
+        .await
+        .expect("writer for edge-resolution fault setup");
+    writer
+        .execute_script(
+            "CREATE TRIGGER test_rewrite_committed_edge \
+             AFTER INSERT ON graph_edges \
+             WHEN NEW.relation = 'extends' \
+             BEGIN \
+               UPDATE graph_edges \
+               SET relation = 'variant_of', updated_at = updated_at + 1 \
+               WHERE namespace = NEW.namespace AND id = NEW.id; \
+             END;"
+                .to_string(),
+        )
+        .await
+        .expect("install edge-resolution fault trigger");
 }
 
 async fn insert_projection_row(
@@ -316,6 +353,267 @@ async fn apply_worker_returns_atomic_update_truncation_report() {
 
     assert_eq!(report.truncated, 1);
     assert!(report.discarded_bytes > 0);
+}
+
+#[tokio::test]
+async fn committed_post_commit_failure_stays_applying_and_is_not_replayed() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let entity = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "CommittedBeforeReindexFailure",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let proposal_id = Uuid::new_v4();
+    seed_proposal_created_event(
+        &rt,
+        &tok,
+        proposal_id,
+        ProposalChangeset::UpdateEntity {
+            id: Id128::from_u128(entity.id.as_u128()),
+            patch: khive_types::ProposalEntityPatch {
+                name: Some("CommittedAfterReindexFailure".to_string()),
+                description: None,
+                properties: None,
+                tags: None,
+            },
+        },
+    )
+    .await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    // The base entity plan never touches FTS. An incompatible ordinary table
+    // occupies the name so the store's IF NOT EXISTS setup cannot repair it;
+    // the real deferred reindex fails only after run_atomic_unit reports
+    // Committed.
+    replace_fts_entities_with_incompatible_table(&rt).await;
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("committed degradation is reconciled, not returned as retryable failure");
+
+    let committed = rt
+        .get_entity(&tok, entity.id)
+        .await
+        .expect("committed entity row");
+    assert_eq!(committed.name, "CommittedAfterReindexFailure");
+    let committed_updated_at = committed.updated_at;
+
+    let projection = ProposalsProjectionWorker::new(rt.clone());
+    let row = projection
+        .get_proposal_row(&tok, proposal_id)
+        .await
+        .expect("get proposal row")
+        .expect("proposal row");
+    assert_eq!(
+        row.status, "applying",
+        "durable mutation requiring reconciliation must never return to approved"
+    );
+
+    let event_store = rt.events(&tok).expect("event store");
+    let applied_events = event_store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query applied events");
+    assert!(
+        applied_events.items.is_empty(),
+        "post-commit degradation must publish neither Failed nor premature Success"
+    );
+
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("repeated worker pass must skip applying proposal");
+    let after_repeat = rt
+        .get_entity(&tok, entity.id)
+        .await
+        .expect("entity after repeated worker pass");
+    assert_eq!(after_repeat.name, "CommittedAfterReindexFailure");
+    assert_eq!(
+        after_repeat.updated_at, committed_updated_at,
+        "an applying proposal must not replay its durable changeset"
+    );
+    let applied_events = event_store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query applied events after repeat");
+    assert!(applied_events.items.is_empty());
+}
+
+#[tokio::test]
+async fn committed_created_record_resolution_failure_is_not_reverted_or_replayed() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let source = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "ResolutionFaultSource",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source");
+    let target = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "ResolutionFaultTarget",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+    let proposal_id = Uuid::new_v4();
+    seed_proposal_created_event(
+        &rt,
+        &tok,
+        proposal_id,
+        ProposalChangeset::AddEdge {
+            source: Id128::from_u128(source.id.as_u128()),
+            target: Id128::from_u128(target.id.as_u128()),
+            relation: khive_types::EdgeRelation::Extends,
+            weight: Some(1.0),
+        },
+    )
+    .await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    // The trigger runs inside the real atomic commit and rewrites only the
+    // just-inserted natural key. The edge remains durably present, while the
+    // post-commit lookup by the requested key deterministically returns none.
+    install_committed_edge_resolution_fault(&rt).await;
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("created-record reconciliation failure is non-retryable");
+
+    let edges = rt
+        .list_edges(
+            &tok,
+            EdgeListFilter {
+                source_id: Some(source.id),
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .await
+        .expect("list committed edge");
+    assert_eq!(edges.len(), 1, "the base edge insert must be durable");
+    assert_eq!(edges[0].relation.as_str(), "variant_of");
+    let committed_updated_at = edges[0].updated_at;
+
+    let projection = ProposalsProjectionWorker::new(rt.clone());
+    let row = projection
+        .get_proposal_row(&tok, proposal_id)
+        .await
+        .expect("get proposal row")
+        .expect("proposal row");
+    assert_eq!(row.status, "applying");
+
+    let event_store = rt.events(&tok).expect("event store");
+    let applied_events = event_store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query applied events");
+    assert!(
+        applied_events.items.is_empty(),
+        "resolution degradation must emit neither Failed nor Success"
+    );
+
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("repeated worker pass must skip applying proposal");
+    let edges_after_repeat = rt
+        .list_edges(
+            &tok,
+            EdgeListFilter {
+                source_id: Some(source.id),
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .await
+        .expect("list edge after repeated worker pass");
+    assert_eq!(edges_after_repeat.len(), 1);
+    assert_eq!(edges_after_repeat[0].updated_at, committed_updated_at);
+    let row = projection
+        .get_proposal_row(&tok, proposal_id)
+        .await
+        .expect("get proposal row after repeat")
+        .expect("proposal row after repeat");
+    assert_eq!(
+        row.status, "applying",
+        "a replay attempt would fail/revert this injected write"
+    );
+    let applied_events = event_store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query applied events after repeat");
+    assert!(
+        applied_events.items.is_empty(),
+        "repeat must emit neither the success nor failure a replay would produce"
+    );
 }
 
 #[tokio::test]

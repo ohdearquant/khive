@@ -84,6 +84,9 @@ pub(crate) enum SelectedMessage {
         /// it from.
         imap_external_id: String,
         reason: MalformedReason,
+        /// RFC 822 bytes returned by IMAP, when a body was present but could
+        /// not be parsed. `None` means the server returned no body at all.
+        raw_bytes: Option<Vec<u8>>,
     },
 }
 
@@ -492,6 +495,7 @@ pub(crate) fn process_selected_page(
                     uid,
                     imap_external_id,
                     reason: MalformedReason::MissingBody,
+                    raw_bytes: None,
                 }
             }
             Some(raw) => match parse_raw_bytes(uid, &raw, host, uid_validity.get()) {
@@ -506,6 +510,7 @@ pub(crate) fn process_selected_page(
                         uid,
                         imap_external_id,
                         reason: MalformedReason::ParseFailure,
+                        raw_bytes: Some(raw),
                     }
                 }
             },
@@ -627,6 +632,7 @@ pub(crate) fn parse_raw_bytes(
 
     Some(RawEmail {
         uid,
+        raw_bytes: raw.to_vec(),
         imap_external_id,
         from_addrs,
         sender_addr,
@@ -751,6 +757,7 @@ mod tests {
     fn make_email(uid: u32, imap_id: &str, from_addr: &str) -> RawEmail {
         RawEmail {
             uid,
+            raw_bytes: Vec::new(),
             imap_external_id: imap_id.to_string(),
             from_addrs: vec![from_addr.to_string()],
             sender_addr: None,
@@ -953,6 +960,7 @@ mod tests {
         headers.insert("x-khive-thread-id".to_string(), "some-uuid".to_string());
         let email = RawEmail {
             uid: 1,
+            raw_bytes: Vec::new(),
             imap_external_id: "imap:host:1:1".to_string(),
             from_addrs: vec!["a@example.com".to_string()],
             sender_addr: None,
@@ -1265,11 +1273,12 @@ mod tests {
                 SelectedMessage::Malformed {
                     uid: 1,
                     reason: MalformedReason::ParseFailure,
+                    raw_bytes: Some(bytes),
                     ..
-                }
+                } if bytes.is_empty()
             ),
-            "malformed selected RFC822 bytes must quarantine, not fail the whole page \
-             or silently advance without a record"
+            "malformed selected RFC822 bytes must remain available for replay while the page \
+             advances to quarantine"
         );
     }
 
@@ -1405,6 +1414,7 @@ mod tests {
         headers.insert("in-reply-to".to_string(), "<orig@example.com>".to_string());
         let email = RawEmail {
             uid: 2,
+            raw_bytes: Vec::new(),
             imap_external_id: "imap:host:1:2".to_string(),
             from_addrs: vec!["b@example.com".to_string()],
             sender_addr: None,

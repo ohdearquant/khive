@@ -47,8 +47,9 @@ def test_create_list_get_each_entity_kind(
     assert result.get("name") == f"e_{entity_kind}", f"name mismatch: {result}"
 
     # list filtered by entity_kind must include the new id
-    listed = khive_session.verb("list", {"kind": "entity", "entity_kind": entity_kind,
-                                         "namespace": temp_namespace})
+    page = khive_session.verb("list", {"kind": "entity", "entity_kind": entity_kind,
+                                       "namespace": temp_namespace})
+    listed = page["items"]
     assert isinstance(listed, list), f"list returned non-list: {listed!r}"
     ids = [e.get("id") for e in listed]
     assert entity_id in ids, (

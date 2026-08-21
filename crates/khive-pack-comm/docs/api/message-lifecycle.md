@@ -22,6 +22,13 @@ full `outbound_id` as `details.outbound_id`, so an automated caller can read
 the correlation id back out of the MCP error object instead of parsing prose,
 and use it for an exact `comm.delivered` lookup before retry.
 
+`WriterTaskBusy` is preserved unchanged. In that case the queue accepted the
+request but SQLite never entered the transaction and the dual-write operation
+never ran, so the failed `comm.send`/`comm.reply` operation is safe to retry.
+It carries no `outbound_id` and does not instruct the caller to use
+`comm.delivered`. In a chain or parallel batch, retry only that failed per-op
+entry; successful sibling operations may already have committed.
+
 ## `message.rs::dual_write_message`
 
 Writes an outbound copy (caller namespace) and an inbound copy (recipient

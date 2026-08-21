@@ -2405,8 +2405,8 @@ async fn test_search_normal_query_counts_exactly_one_fts_pass() {
 }
 
 #[tokio::test]
-async fn test_cancelled_search_continuation_counts_issued_fts_pass() {
-    let store = setup_memory_store("cancelled_search_counts");
+async fn test_cancelled_search_does_not_issue_fts_pass() {
+    let store = Arc::new(setup_memory_store("cancelled_search_counts"));
     store
         .upsert_document(make_document(
             Uuid::new_v4(),
@@ -2419,8 +2419,9 @@ async fn test_cancelled_search_continuation_counts_issued_fts_pass() {
     let pool = Arc::clone(&store.pool);
     let reader_blocker = pool.writer().unwrap();
     let ctx = khive_storage::usage::UsageContext::new();
+    let blocked_store = Arc::clone(&store);
     let task = tokio::spawn(khive_storage::usage::scope(ctx.clone(), async move {
-        store
+        blocked_store
             .search(TextSearchRequest {
                 query: "continuation".to_string(),
                 mode: TextQueryMode::Plain,
@@ -2435,16 +2436,34 @@ async fn test_cancelled_search_continuation_counts_issued_fts_pass() {
     task.abort();
     let joined = task.await;
     assert!(joined.unwrap_err().is_cancelled());
+    assert!(
+        ctx.snapshot().get("fts_passes").is_none(),
+        "a search cancelled during reader checkout must not issue an FTS pass"
+    );
     drop(reader_blocker);
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while ctx.snapshot().get("fts_passes").is_none() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    let hits = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .search(TextSearchRequest {
+                query: "continuation".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "the pool must remain usable after cancellation"
+    );
     assert_eq!(
         ctx.snapshot()["fts_passes"],
         1,
-        "the blocking query continues after caller cancellation and must count when issued"
+        "only the follow-up search may issue an FTS pass after cancellation"
     );
 }
 
@@ -2527,7 +2546,7 @@ async fn test_search_rank_within_cap_counts_two_fts_passes() {
 /// `upsert_documents_routes_through_writer_task_when_flag_enabled` above (a
 /// `writer_task_spawn_count() == 1` assertion alone is a false positive:
 /// `upsert_document` setup calls already spawn/use the task). Red-proof:
-/// reverting the `if let Some(writer_task) = &self.writer_task` branch in
+/// reverting the `current_writer_task("fts_rename_namespace")` branch in
 /// `rename_namespace` (forcing every call through `with_writer_unmanaged`)
 /// makes `saw_enqueued` stay `false` and this test fail — see the impl
 /// report for the exact revert/run/restore transcript.
@@ -2663,7 +2682,7 @@ async fn rename_namespace_strict_routing_fails_closed_without_writer_task() {
 /// Deliberately `#[test]`, not `#[tokio::test]`: construction must happen
 /// with no ambient runtime, which a `#[tokio::test]` function body would
 /// not give it (the whole test body already runs on a Tokio worker thread).
-/// Red-proof: reverting `with_writer`'s `self.current_writer_task()` check
+/// Red-proof: reverting `with_writer`'s `self.current_writer_task(op)` check
 /// back to `&self.writer_task` makes `saw_enqueued` stay `false` and this
 /// test fail — the write takes the direct-connection path immediately
 /// instead of ever appearing in the writer task's channel.

@@ -36,9 +36,10 @@
 //! from ordinary ticks, the dedicated-connection invariant, and why Plank 1
 //! is a sweep rather than the ADR's originally-described per-statement guard).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::pool::ConnectionPool;
@@ -47,8 +48,8 @@ use crate::pool::ConnectionPool;
 // Read-only process-wide gauges (never reset outside #[cfg(test)]). See
 // crates/khive-db/docs/api/checkpoint.md#metrics-read-surface-loadperf-harness
 
-/// Last-observed WAL page count (`query_wal_pages`'s return value on its
-/// most recent call, from either `checkpoint_once` or `maybe_truncate`).
+/// Last-observed WAL page count (the routine PASSIVE row's `log` value, or a
+/// rare post-TRUNCATE observation from `maybe_truncate`).
 /// `u64::MAX` is the "never observed" sentinel — no checkpoint tick has run
 /// yet in this process — distinct from a genuine zero-page WAL.
 static LAST_WAL_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -79,6 +80,105 @@ static CHECKPOINT_CONSECUTIVE_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// moment a skip occurs. `u64::MAX` is the "no skip has recorded a snapshot
 /// yet" sentinel, mirroring `LAST_WAL_PAGES`.
 static CHECKPOINT_LAST_SKIP_WAL_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Elevated checkpoint observations aggregated in memory instead of written
+/// as one primary-store lifecycle row per tick (#1838).
+static CHECKPOINT_PRESSURE_ELEVATED_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Below-to-above `warn_pages` transitions observed by checkpoint tasks.
+static CHECKPOINT_PRESSURE_EPISODES_STARTED: AtomicU64 = AtomicU64::new(0);
+
+/// Above-to-below `warn_pages` transitions observed by checkpoint tasks.
+static CHECKPOINT_PRESSURE_EPISODES_RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+/// Primary-store append calls actually made by checkpoint lifecycle workers.
+static CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Checkpoint lifecycle append calls that returned a storage error.
+static CHECKPOINT_LIFECYCLE_APPEND_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Lifecycle transitions rejected before append because the bounded handoff
+/// was full, closed, or could not serialize the payload.
+static CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// One backend-scoped observation produced by the periodic checkpoint task's
+/// own PASSIVE pass. Logical frame counts and the physical `-wal` allocation
+/// are intentionally separate: SQLite may retain/reuse the sidecar after the
+/// logical backlog drains (#1849).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutineWalObservation {
+    pub busy: i64,
+    pub log_frames: u64,
+    pub checkpointed_frames: u64,
+    pub pending_frames: u64,
+    pub physical_wal_bytes: Option<u64>,
+    pub observed_at_unix_ms: u64,
+}
+
+/// Latest routine observation by canonical database identity. Checkpoint
+/// tasks fan out per backend, so a single process-global "last task wins"
+/// gauge would misattribute a secondary backend to the main metrics frame.
+static ROUTINE_WAL_OBSERVATIONS: OnceLock<Mutex<HashMap<Option<PathBuf>, RoutineWalObservation>>> =
+    OnceLock::new();
+
+fn routine_wal_observations() -> &'static Mutex<HashMap<Option<PathBuf>, RoutineWalObservation>> {
+    ROUTINE_WAL_OBSERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn checkpoint_db_key_from_path(path: Option<&Path>) -> Option<PathBuf> {
+    path.map(Path::to_path_buf)
+}
+
+fn checkpoint_db_key(pool: &ConnectionPool) -> Option<PathBuf> {
+    checkpoint_db_key_from_path(pool.canonical_path())
+}
+
+fn observed_at_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn physical_wal_bytes(pool: &ConnectionPool) -> Option<u64> {
+    let path = pool.canonical_path()?;
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push("-wal");
+    std::fs::metadata(PathBuf::from(sidecar))
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
+fn record_routine_wal_observation(
+    pool: &ConnectionPool,
+    raw: RawCheckpointObservation,
+) -> RoutineWalObservation {
+    let log_frames = raw.log_frames.max(0) as u64;
+    let checkpointed_frames = raw.checkpointed_frames.max(0) as u64;
+    let observation = RoutineWalObservation {
+        busy: raw.busy,
+        log_frames,
+        checkpointed_frames,
+        pending_frames: log_frames.saturating_sub(checkpointed_frames),
+        physical_wal_bytes: physical_wal_bytes(pool),
+        observed_at_unix_ms: observed_at_unix_ms(),
+    };
+    routine_wal_observations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(checkpoint_db_key(pool), observation.clone());
+    observation
+}
+
+/// Latest periodic checkpoint sample for this exact backend. This is a pure
+/// in-memory read: it never issues `wal_checkpoint` or stats the filesystem.
+pub fn routine_wal_observation(pool: &ConnectionPool) -> Option<RoutineWalObservation> {
+    routine_wal_observations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&checkpoint_db_key(pool))
+        .cloned()
+}
 
 /// Last-observed WAL page count, if any checkpoint tick has run yet in this
 /// process. Read surface for the daemon-frame metrics snapshot.
@@ -119,6 +219,36 @@ pub fn checkpoint_last_skip_wal_pages() -> Option<u64> {
     }
 }
 
+/// Total at/above-`warn_pages` observations aggregated in memory.
+pub fn checkpoint_pressure_elevated_ticks() -> u64 {
+    CHECKPOINT_PRESSURE_ELEVATED_TICKS.load(Ordering::Relaxed)
+}
+
+/// Total pressure episodes observed to start in this process.
+pub fn checkpoint_pressure_episodes_started() -> u64 {
+    CHECKPOINT_PRESSURE_EPISODES_STARTED.load(Ordering::Relaxed)
+}
+
+/// Total pressure episodes observed to recover in this process.
+pub fn checkpoint_pressure_episodes_recovered() -> u64 {
+    CHECKPOINT_PRESSURE_EPISODES_RECOVERED.load(Ordering::Relaxed)
+}
+
+/// Total primary-store append calls made by checkpoint lifecycle workers.
+pub fn checkpoint_lifecycle_append_attempts() -> u64 {
+    CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS.load(Ordering::Relaxed)
+}
+
+/// Total checkpoint lifecycle append calls that returned a storage error.
+pub fn checkpoint_lifecycle_append_failures() -> u64 {
+    CHECKPOINT_LIFECYCLE_APPEND_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Total checkpoint lifecycle transitions rejected before append.
+pub fn checkpoint_lifecycle_enqueue_drops() -> u64 {
+    CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.load(Ordering::Relaxed)
+}
+
 /// A tick's dedicated checkpoint connection was unavailable: bump the
 /// lifetime and consecutive-skip counters and snapshot the last-known WAL
 /// pressure so an operator can see how bad the WAL was heading into the skip
@@ -139,6 +269,17 @@ fn note_checkpoint_observed(_wal_pages: u64) {
     CHECKPOINT_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
 }
 
+fn note_checkpoint_pressure_observation(above_warn: bool, was_above_warn: bool) {
+    if above_warn {
+        CHECKPOINT_PRESSURE_ELEVATED_TICKS.fetch_add(1, Ordering::Relaxed);
+        if !was_above_warn {
+            CHECKPOINT_PRESSURE_EPISODES_STARTED.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if was_above_warn {
+        CHECKPOINT_PRESSURE_EPISODES_RECOVERED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Reset the checkpoint-pressure atomics between tests. Process-wide gauges
 /// are otherwise shared across every test in this binary; tests that assert
 /// on them must reset first and run under a shared `#[serial(...)]` group.
@@ -147,6 +288,12 @@ pub(crate) fn reset_checkpoint_metrics_for_tests() {
     CHECKPOINT_SKIPPED_TICKS.store(0, Ordering::Relaxed);
     CHECKPOINT_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
     CHECKPOINT_LAST_SKIP_WAL_PAGES.store(u64::MAX, Ordering::Relaxed);
+    CHECKPOINT_PRESSURE_ELEVATED_TICKS.store(0, Ordering::Relaxed);
+    CHECKPOINT_PRESSURE_EPISODES_STARTED.store(0, Ordering::Relaxed);
+    CHECKPOINT_PRESSURE_EPISODES_RECOVERED.store(0, Ordering::Relaxed);
+    CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS.store(0, Ordering::Relaxed);
+    CHECKPOINT_LIFECYCLE_APPEND_FAILURES.store(0, Ordering::Relaxed);
+    CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.store(0, Ordering::Relaxed);
 }
 
 /// Outcome of a single checkpoint attempt.
@@ -398,13 +545,34 @@ fn tx_age_thresholds_from_env(
     (warn_secs, max_age_secs)
 }
 
+#[cfg(unix)]
+const DEFAULT_WALPIN_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct CachedWalpinAttribution {
+    report: crate::walpin::WalpinReport,
+    census: Result<crate::walpin::CensusResult, String>,
+    captured_at: Instant,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum WalpinFullScanPlan {
+    Refresh {
+        previous_last_attempt: Option<Instant>,
+    },
+    Cached(CachedWalpinAttribution),
+    Suppressed,
+}
+
 /// Mutable escalation state carried across ticks by the caller (ADR-091 Plank 2).
 ///
 /// Kept separate from [`CheckpointConfig`] because it is *state*, not
 /// configuration: `last_attempt` and `consecutive_failures` mutate every tick,
 /// while `CheckpointConfig` is parsed once and held immutable for the life of
 /// the task.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TruncateState {
     /// When the last TRUNCATE *attempt* ran (armed + writer held), regardless
     /// of whether it succeeded in reclaiming pages. `None` means no attempt
@@ -415,6 +583,123 @@ pub struct TruncateState {
     /// `warn_pages`; used to fire a one-shot escalated WARN at exactly 3
     /// consecutive failures (does not repeat every subsequent attempt).
     consecutive_failures: u32,
+    /// Fallback freshness cadence for legacy sidecar records that do not
+    /// declare their producer interval. Captured once when the daemon task
+    /// starts; this is ADR-091's compiled 5000 ms session-sweep default, never
+    /// the daemon's faster checkpoint cadence or a local environment override.
+    #[cfg(unix)]
+    legacy_walpin_fallback_interval: Duration,
+    /// Minimum spacing between full sidecar/OS-holder enumeration attempts.
+    /// The attempt timestamp advances before blocking work starts, so an I/O
+    /// failure or worker panic cannot turn sustained pressure into a hot retry
+    /// loop. A successful report is retained only for diagnostic reuse.
+    #[cfg(unix)]
+    walpin_full_scan_interval: Duration,
+    #[cfg(unix)]
+    walpin_full_scan_last_attempt: Option<Instant>,
+    #[cfg(unix)]
+    walpin_cached_attribution: Option<CachedWalpinAttribution>,
+    /// Whether the no-progress attribution arm already attempted the one
+    /// bounded sidecar enumeration allowed for this checkpoint tick.
+    #[cfg(unix)]
+    sidecar_attribution_attempted_this_tick: bool,
+}
+
+impl Default for TruncateState {
+    fn default() -> Self {
+        Self {
+            last_attempt: None,
+            consecutive_failures: 0,
+            #[cfg(unix)]
+            legacy_walpin_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+            #[cfg(unix)]
+            walpin_full_scan_interval: DEFAULT_WALPIN_FULL_SCAN_INTERVAL,
+            #[cfg(unix)]
+            walpin_full_scan_last_attempt: None,
+            #[cfg(unix)]
+            walpin_cached_attribution: None,
+            #[cfg(unix)]
+            sidecar_attribution_attempted_this_tick: false,
+        }
+    }
+}
+
+impl TruncateState {
+    #[cfg(unix)]
+    fn with_legacy_walpin_fallback(interval: Duration) -> Self {
+        Self {
+            legacy_walpin_fallback_interval: interval,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_walpin_full_scan_cadence(interval: Duration) -> Self {
+        Self {
+            walpin_full_scan_interval: interval,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn begin_tick(&mut self) {
+        self.sidecar_attribution_attempted_this_tick = false;
+    }
+
+    #[cfg(unix)]
+    fn housekeeping_due(&self) -> bool {
+        !self.sidecar_attribution_attempted_this_tick
+            && self.walpin_full_scan_due_at(Instant::now())
+    }
+
+    #[cfg(unix)]
+    fn walpin_full_scan_due_at(&self, now: Instant) -> bool {
+        self.walpin_full_scan_last_attempt.is_none_or(|last| {
+            now.saturating_duration_since(last) >= self.walpin_full_scan_interval
+        })
+    }
+
+    #[cfg(unix)]
+    fn claim_walpin_full_scan_at(&mut self, now: Instant) -> bool {
+        if !self.walpin_full_scan_due_at(now) {
+            return false;
+        }
+        self.walpin_full_scan_last_attempt = Some(now);
+        true
+    }
+
+    #[cfg(unix)]
+    fn plan_walpin_attribution_at(&mut self, now: Instant) -> WalpinFullScanPlan {
+        if self.walpin_full_scan_due_at(now) {
+            let previous_last_attempt = self.walpin_full_scan_last_attempt.replace(now);
+            WalpinFullScanPlan::Refresh {
+                previous_last_attempt,
+            }
+        } else if let Some(cached) = self.walpin_cached_attribution.clone() {
+            WalpinFullScanPlan::Cached(cached)
+        } else {
+            WalpinFullScanPlan::Suppressed
+        }
+    }
+
+    #[cfg(unix)]
+    fn restore_walpin_full_scan_reservation(&mut self, previous_last_attempt: Option<Instant>) {
+        self.walpin_full_scan_last_attempt = previous_last_attempt;
+    }
+
+    #[cfg(unix)]
+    fn cache_walpin_attribution(
+        &mut self,
+        report: crate::walpin::WalpinReport,
+        census: Result<crate::walpin::CensusResult, String>,
+        captured_at: Instant,
+    ) {
+        self.walpin_cached_attribution = Some(CachedWalpinAttribution {
+            report,
+            census,
+            captured_at,
+        });
+    }
 }
 
 /// ADR-091 graduated severity rung for sustained WAL pressure.
@@ -781,6 +1066,40 @@ impl WalpinSidecarState {
         }
     }
 
+    /// Run one bounded housekeeping pass independently of WAL pressure. The
+    /// collector removes only positively dead/reused-PID residue; uncertain
+    /// evidence remains for a no-progress attribution pass. Directory work
+    /// and report memory are capped, and all blocking filesystem operations
+    /// stay off the async runtime worker.
+    #[cfg(unix)]
+    async fn reap_dead_entries_bounded(
+        &self,
+        legacy_fallback_interval: Duration,
+    ) -> Option<crate::walpin::WalpinReport> {
+        let dir = self.dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::walpin::housekeep_live(&dir, legacy_fallback_interval)
+        })
+        .await;
+        match result {
+            Ok(Ok(report)) => Some(report),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "ADR-091 Amendment 6: bounded walpin sidecar cleanup failed"
+                );
+                None
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    error = %join_err,
+                    "ADR-091 Amendment 6: walpin sidecar cleanup task panicked"
+                );
+                None
+            }
+        }
+    }
+
     /// ADR-091 Amendment 2 beacon refresh rule: a metadata-only mtime touch
     /// of this process's already-registered beacon, performed on every
     /// sweep tick except one where an over-threshold heartbeat write failed
@@ -1034,6 +1353,28 @@ impl WalpinSidecarState {
     }
 }
 
+#[cfg(unix)]
+async fn run_walpin_housekeeping_if_due(
+    sidecar: &WalpinSidecarState,
+    state: &mut TruncateState,
+    legacy_fallback_interval: Duration,
+) -> bool {
+    if !state.housekeeping_due() || !state.claim_walpin_full_scan_at(Instant::now()) {
+        return false;
+    }
+    if let Some(report) = sidecar
+        .reap_dead_entries_bounded(legacy_fallback_interval)
+        .await
+    {
+        state.cache_walpin_attribution(
+            report,
+            Err("OS holder census is unavailable for a housekeeping-only scan".to_string()),
+            Instant::now(),
+        );
+    }
+    true
+}
+
 fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1045,6 +1386,8 @@ fn now_epoch_secs() -> i64 {
 /// sweep. Sessions never checkpoint — that stays daemon-owned so N session
 /// processes never compete for the writer mutex — this only watches
 /// `tx_registry` (and, Plank B, refreshes this process's walpin heartbeat).
+const DEFAULT_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug)]
 pub struct SessionSweepConfig {
     /// How often a session polls the registry. Coarser than the daemon's
@@ -1061,7 +1404,7 @@ pub struct SessionSweepConfig {
 impl Default for SessionSweepConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(5),
+            interval: DEFAULT_SESSION_SWEEP_INTERVAL,
             tx_warn_secs: Duration::from_secs(30),
             tx_max_age_secs: Duration::from_secs(120),
         }
@@ -1073,15 +1416,10 @@ impl SessionSweepConfig {
     /// `KHIVE_TX_MAX_AGE_SECS` (the same knobs the daemon's checkpoint task
     /// reads) so a session and the daemon agree on the same thresholds.
     pub fn from_env() -> Self {
-        let mut cfg = Self::default();
-
-        if let Ok(ms) = std::env::var("KHIVE_SESSION_SWEEP_INTERVAL_MS") {
-            if let Ok(v) = ms.parse::<u64>() {
-                if v > 0 {
-                    cfg.interval = Duration::from_millis(v);
-                }
-            }
-        }
+        let mut cfg = Self {
+            interval: session_sweep_interval_from_env(),
+            ..Self::default()
+        };
         // Shares `tx_age_thresholds_from_env` with `CheckpointConfig::from_env`
         // (minor, ADR-091 Amendment 2) so a session and the daemon
         // parse and validate `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS`
@@ -1091,6 +1429,15 @@ impl SessionSweepConfig {
 
         cfg
     }
+}
+
+fn session_sweep_interval_from_env() -> Duration {
+    std::env::var("KHIVE_SESSION_SWEEP_INTERVAL_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_SESSION_SWEEP_INTERVAL)
 }
 
 /// One file-backed backend the session sweep observes (ADR-091 Amendment 3
@@ -1227,6 +1574,26 @@ impl CheckpointLifecycleOwner {
 /// without allowing sustained writer contention to grow memory without bound.
 const CHECKPOINT_LIFECYCLE_QUEUE_CAPACITY: usize = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointPressureEpisode {
+    elevated_ticks: u64,
+    peak_wal_pages: u64,
+}
+
+impl CheckpointPressureEpisode {
+    fn start(wal_pages: u64) -> Self {
+        Self {
+            elevated_ticks: 1,
+            peak_wal_pages: wal_pages,
+        }
+    }
+
+    fn observe(&mut self, wal_pages: u64) {
+        self.elevated_ticks = self.elevated_ticks.saturating_add(1);
+        self.peak_wal_pages = self.peak_wal_pages.max(wal_pages);
+    }
+}
+
 /// Zero-wait handoff from the checkpoint scheduler to its lifecycle sink.
 ///
 /// The worker serializes appends, preserving the order of every event that is
@@ -1259,7 +1626,9 @@ impl CheckpointLifecycleEmitter {
         let worker = tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
                 let kind = event.kind;
+                CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                 if let Err(err) = owner.event_store.append_event(event).await {
+                    CHECKPOINT_LIFECYCLE_APPEND_FAILURES.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         error = %err,
                         event_kind = %kind.name(),
@@ -1291,8 +1660,13 @@ impl CheckpointLifecycleEmitter {
                     event_kind = %kind.name(),
                     "failed to serialize checkpoint lifecycle event payload"
                 );
+                CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
+        };
+        let payload_schema_version = match kind {
+            khive_types::EventKind::CheckpointOutcomeRecorded => 2,
+            _ => 1,
         };
         let event = khive_storage::Event::new(
             namespace,
@@ -1301,7 +1675,8 @@ impl CheckpointLifecycleEmitter {
             khive_types::SubstrateKind::Event,
             "daemon:checkpoint_task",
         )
-        .with_payload(payload_value);
+        .with_payload(payload_value)
+        .with_payload_schema_version(payload_schema_version);
 
         match sender.try_send(event) {
             Ok(()) => {
@@ -1309,6 +1684,7 @@ impl CheckpointLifecycleEmitter {
                 true
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
                 if !self.busy_warning_emitted {
                     tracing::warn!(
                         event_kind = %event.kind.name(),
@@ -1320,6 +1696,7 @@ impl CheckpointLifecycleEmitter {
                 false
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
+                CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     event_kind = %event.kind.name(),
                     "checkpoint lifecycle event dropped because the append worker stopped"
@@ -1434,6 +1811,19 @@ impl CheckpointConnection {
         if self.conn.is_none() {
             match pool.open_standalone_writer_untracked() {
                 Ok(conn) => {
+                    // This is the dedicated owner's own connection: disable
+                    // autocheckpoint on it unconditionally, independent of
+                    // whether the pool-level ownership claim has landed yet
+                    // (the standalone open applies the claim-dependent
+                    // value; this connection must never run an implicit
+                    // checkpoint inside its own PASSIVE/TRUNCATE work).
+                    if let Err(e) = conn.pragma_update(None, "wal_autocheckpoint", 0) {
+                        tracing::warn!(
+                            error = %e,
+                            "could not disable autocheckpoint on the dedicated checkpoint \
+                             connection"
+                        );
+                    }
                     if self.consecutive_open_failures > 0 {
                         tracing::info!(
                             prior_consecutive_failures = self.consecutive_open_failures,
@@ -1496,10 +1886,12 @@ impl CheckpointConnection {
 ///
 /// `lifecycle_owner` (ADR-094): exactly one task in a multi-backend fan-out
 /// should receive `Some`. That task appends a best-effort
-/// `CheckpointOutcomeRecorded` event on every at/above-`warn_pages` tick,
-/// plus one drain row when pressure falls back below `warn_pages`. `None`
-/// explicitly marks a non-owner. See `crates/khive-db/docs/api/checkpoint.md`
-/// for the full shutdown-mechanism and event-emission design history.
+/// `CheckpointOutcomeRecorded` event on the elevation transition and one
+/// recovery summary when pressure falls back below `warn_pages`. Sustained
+/// elevated ticks aggregate in memory and in `db_diagnostics`; they never
+/// write one primary-store row per checkpoint attempt. `None` explicitly
+/// marks a non-owner. See `crates/khive-db/docs/api/checkpoint.md` for the
+/// full shutdown-mechanism and event-emission design history.
 ///
 /// `is_main` (ADR-091 Amendment 3): whether `pool` is the deployment's main
 /// backend. A daemon owning several file-backed backends spawns one task per
@@ -1514,19 +1906,56 @@ pub async fn run_checkpoint_task(
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
     is_main: bool,
 ) {
+    // This task IS the dedicated checkpoint owner: claim the pool so writer
+    // connections drop the bounded autocheckpoint fallback and routine
+    // checkpoint I/O stays off application commit paths. Pools without a
+    // running checkpoint task never claim and keep SQLite's bounded WAL
+    // reclamation. A failed claim leaves connections on the bounded fallback
+    // — safe, just not the low-latency posture — so it warns and continues.
+    match pool.claim_checkpoint_ownership() {
+        Ok(()) => {
+            if let Err(e) = pool.propagate_checkpoint_claim_to_writer_task().await {
+                tracing::warn!(
+                    error = %e,
+                    "checkpoint task could not reach the writer task's connection; it keeps the \
+                     bounded autocheckpoint fallback"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "checkpoint task could not re-apply the ownership pragma on the pooled writer; \
+                 writer connections keep the bounded autocheckpoint fallback unless ownership is \
+                 claimed later"
+            );
+        }
+    }
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut severity_state = CheckpointSeverityState::default();
     let mut tx_age_state = TxAgeSweepState::default();
     let mut was_above_high_water = false;
+    #[cfg(unix)]
+    let legacy_walpin_fallback_interval = DEFAULT_SESSION_SWEEP_INTERVAL;
+    #[cfg(unix)]
+    let mut truncate_state =
+        TruncateState::with_legacy_walpin_fallback(legacy_walpin_fallback_interval);
+    #[cfg(not(unix))]
     let mut truncate_state = TruncateState::default();
     let mut lifecycle_emitter = CheckpointLifecycleEmitter::new(lifecycle_owner);
-    // Independent of `severity_state` (which owns the WARN-episode ladder
-    // internally): this tracks whether an accepted elevated lifecycle row
-    // still needs its matching drain row. A full queue leaves it unchanged,
-    // so a dropped drain is retried on the next healthy tick rather than
-    // leaving consumers with a permanently open elevation episode.
+    // Independent of `severity_state` (which owns the WARN ladder): this
+    // tracks the lifecycle sink's accepted elevation state. A full queue
+    // leaves it unchanged, so an opening or recovery transition is retried
+    // without admitting more than one primary-store write for that edge.
     let mut event_elevation_open = false;
+    let mut pressure_episode: Option<CheckpointPressureEpisode> = None;
+    // A recovery row whose `try_emit` lost the race against a full queue.
+    // Retried on later ticks (before that tick's own transition handling)
+    // instead of leaving `pressure_episode` open for a stale episode to
+    // absorb the next, genuinely separate, pressure incident (#1857).
+    let mut pending_recovery: Option<khive_storage::CheckpointOutcomeRecordedPayload> = None;
+    let mut was_observed_above_warn = false;
     // ADR-091 Amendment 3: this task's own backend-scoped view of the
     // registry. `is_main` selects which `TxOriginFilter` variant applies —
     // the caller passes `true` for exactly the one checkpoint task covering
@@ -1577,13 +2006,27 @@ pub async fn run_checkpoint_task(
             _ = shutdown_rx.changed() => break,
         }
 
+        #[cfg(unix)]
+        truncate_state.begin_tick();
+
+        #[cfg(unix)]
+        let mut pending_sidecar_attribution = None;
+
         let tick = match checkpoint_conn.ensure_open(&pool) {
             None => {
                 note_checkpoint_skipped();
                 CheckpointTick::Skipped
             }
-            Some(conn) => match checkpoint_once(&pool, conn, &config, &mut truncate_state) {
-                Ok(wal_pages) => CheckpointTick::Observed(wal_pages),
+            Some(conn) => match checkpoint_once_core(&pool, conn, &config, &mut truncate_state) {
+                Ok(outcome) => {
+                    #[cfg(unix)]
+                    {
+                        pending_sidecar_attribution = outcome.sidecar_attribution;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = outcome.sidecar_attribution;
+                    CheckpointTick::Observed(outcome.wal_pages)
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -1596,6 +2039,25 @@ pub async fn run_checkpoint_task(
                 }
             },
         };
+
+        // A successful no-progress TRUNCATE returns a bounded attribution
+        // request alongside the core outcome. Consume it before any
+        // report-derived decision or ordinary housekeeping for this tick.
+        // The await is intentional: enumeration may perform up to 512
+        // filesystem reads/classifications, so none of that work is allowed
+        // to run on this Tokio worker, while one-pass-per-tick ordering still
+        // requires the result (or an honest worker/enumeration failure) before
+        // the fallback housekeeping arm is considered.
+        #[cfg(unix)]
+        if let Err(error) =
+            complete_walpin_attribution(pending_sidecar_attribution, &mut truncate_state).await
+        {
+            tracing::warn!(
+                error = %error,
+                failure_kind = error.kind(),
+                "ADR-091 Amendment 2 Plank B: no-progress sidecar attribution failed"
+            );
+        }
 
         // ADR-091 Plank 1: age-based sweep over the registry's oldest entry
         // MUST run on every tick, including a Skipped one — deliberately
@@ -1629,6 +2091,12 @@ pub async fn run_checkpoint_task(
             sidecar
                 .observe(oldest_tx.clone(), config.tx_warn_secs)
                 .await;
+            let _ = run_walpin_housekeeping_if_due(
+                sidecar,
+                &mut truncate_state,
+                legacy_walpin_fallback_interval,
+            )
+            .await;
         }
 
         // Skipped ticks leave crossing state unchanged — a busy tick must not
@@ -1641,6 +2109,8 @@ pub async fn run_checkpoint_task(
         let above_warn = wal_pages >= config.warn_pages;
         let above_high_water = wal_pages >= config.high_water_pages;
         let above_truncate_high_water = wal_pages >= config.truncate_high_water_pages;
+        note_checkpoint_pressure_observation(above_warn, was_observed_above_warn);
+        was_observed_above_warn = above_warn;
 
         // Per-tick debug for the oldest open entry always fires (cheap —
         // reuses this tick's already-computed `oldest_tx`); the two
@@ -1688,25 +2158,25 @@ pub async fn run_checkpoint_task(
             );
         }
 
-        // ADR-094: emit every elevated tick, plus exactly one drain row on
-        // the tick that observes the episode end — never on every ordinary
-        // below-warn tick.
-        if checkpoint_outcome_should_emit(above_warn, event_elevation_open) {
-            let payload = khive_storage::CheckpointOutcomeRecordedPayload {
-                wal_pages,
-                warn_pages: config.warn_pages,
-                high_water_pages: config.high_water_pages,
-                truncate_high_water_pages: config.truncate_high_water_pages,
-                above_warn,
-                above_high_water,
-                above_truncate_high_water,
-            };
-            if lifecycle_emitter
-                .try_emit(khive_types::EventKind::CheckpointOutcomeRecorded, payload)
-            {
-                event_elevation_open = above_warn;
-            }
-        }
+        // ADR-094/#1838, #1857: one elevation row and one recovery summary
+        // per genuinely continuous episode. Sustained elevated ticks update
+        // only the bounded in-memory aggregate and process diagnostics
+        // above; a dropped recovery handoff must not fold the next,
+        // separate, pressure incident into this episode's aggregate.
+        observe_checkpoint_pressure_tick(
+            above_warn,
+            wal_pages,
+            above_high_water,
+            above_truncate_high_water,
+            &config,
+            &mut event_elevation_open,
+            &mut pressure_episode,
+            &mut pending_recovery,
+            |payload| {
+                lifecycle_emitter
+                    .try_emit(khive_types::EventKind::CheckpointOutcomeRecorded, payload)
+            },
+        );
     }
 
     lifecycle_emitter.shutdown().await;
@@ -1717,13 +2187,124 @@ pub async fn run_checkpoint_task(
     }
 }
 
-/// Whether a `CheckpointOutcomeRecorded` event should be emitted for this
-/// tick: every elevated (`above_warn`) tick, plus exactly one drain row on
-/// the first tick that observes a return to below-warn after an elevated
-/// episode (`was_elevated`). An ordinary below-warn tick following another
-/// below-warn tick emits nothing.
+/// Whether a `CheckpointOutcomeRecorded` transition should be enqueued for
+/// this tick. Repeated observations in either state aggregate in memory;
+/// only elevation and recovery edges reach the primary store.
 fn checkpoint_outcome_should_emit(above_warn: bool, was_elevated: bool) -> bool {
-    above_warn || was_elevated
+    above_warn != was_elevated
+}
+
+/// Advance the pressure-episode/lifecycle-emission state machine for one
+/// observed tick. `try_emit` mirrors [`CheckpointLifecycleEmitter::try_emit`]
+/// — `true` means the row was handed off, `false` means the queue was full
+/// or closed.
+///
+/// #1857: on a dropped recovery handoff (`try_emit` returns `false` while
+/// `above_warn` is `false`), the closed episode's summary is stashed in
+/// `pending_recovery` for retry on later ticks — flushed here before this
+/// tick's own transition is evaluated — instead of leaving
+/// `event_elevation_open` and `pressure_episode` open for the next elevated
+/// tick to silently extend, which would report two separate pressure
+/// incidents as one merged episode.
+#[allow(clippy::too_many_arguments)]
+fn observe_checkpoint_pressure_tick(
+    above_warn: bool,
+    wal_pages: u64,
+    above_high_water: bool,
+    above_truncate_high_water: bool,
+    config: &CheckpointConfig,
+    event_elevation_open: &mut bool,
+    pressure_episode: &mut Option<CheckpointPressureEpisode>,
+    pending_recovery: &mut Option<khive_storage::CheckpointOutcomeRecordedPayload>,
+    mut try_emit: impl FnMut(khive_storage::CheckpointOutcomeRecordedPayload) -> bool,
+) {
+    // An undelivered recovery summary is a BARRIER, not merely a retry:
+    // lifecycle consumers assert on the ordered event history (ADR-094), so
+    // a later episode's opening must never be appended ahead of an earlier
+    // episode's recovery. If the retry fails, the in-memory aggregate still
+    // advances below, but no other emission is attempted this tick — a
+    // deferred opening or recovery re-derives from state on a later tick,
+    // after the pending summary has been delivered in order.
+    let pending_blocks_emission = if let Some(payload) = pending_recovery.clone() {
+        if try_emit(payload) {
+            *pending_recovery = None;
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+
+    if above_warn {
+        match pressure_episode.as_mut() {
+            Some(episode) => episode.observe(wal_pages),
+            None => *pressure_episode = Some(CheckpointPressureEpisode::start(wal_pages)),
+        }
+    } else if !*event_elevation_open {
+        // No elevation row reached the bounded handoff, so from any
+        // consumer's view this episode never opened; discarding it keeps
+        // the delivered history self-consistent. When the discard happens
+        // because the barrier suppressed the opening attempt entirely, the
+        // loss would otherwise be invisible even to the drop counters that
+        // record failed attempts, so it is counted and logged here.
+        if pending_blocks_emission && pressure_episode.is_some() {
+            CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                wal_pages,
+                "checkpoint pressure episode elapsed unreported behind an undelivered recovery summary"
+            );
+        }
+        *pressure_episode = None;
+    }
+
+    if pending_blocks_emission || !checkpoint_outcome_should_emit(above_warn, *event_elevation_open)
+    {
+        return;
+    }
+    let Some(episode) = *pressure_episode else {
+        tracing::warn!(
+            above_warn,
+            event_elevation_open = *event_elevation_open,
+            "checkpoint pressure transition has no episode aggregate"
+        );
+        return;
+    };
+    let payload = khive_storage::CheckpointOutcomeRecordedPayload {
+        wal_pages,
+        warn_pages: config.warn_pages,
+        high_water_pages: config.high_water_pages,
+        truncate_high_water_pages: config.truncate_high_water_pages,
+        above_warn,
+        above_high_water,
+        above_truncate_high_water,
+        episode_elevated_ticks: Some(episode.elevated_ticks),
+        episode_peak_wal_pages: Some(episode.peak_wal_pages),
+    };
+    if try_emit(payload.clone()) {
+        *event_elevation_open = above_warn;
+        if !above_warn {
+            *pressure_episode = None;
+        }
+    } else if !above_warn {
+        // The recovery handoff was dropped. Close this episode locally
+        // anyway — `event_elevation_open` MUST NOT stay true, or the next
+        // elevated tick would extend this (already finished) episode's
+        // aggregate instead of starting a fresh one for what is genuinely a
+        // new pressure incident. The dropped summary itself isn't thrown
+        // away: it is stashed in `pending_recovery` and delivered on a
+        // later tick, ahead of (and as a barrier to) every subsequent
+        // emission, so lifecycle ordering survives the retry. The slot is
+        // structurally empty here: a tick that entered with an undelivered
+        // summary returned at the barrier above and never reached this arm.
+        debug_assert!(
+            pending_recovery.is_none(),
+            "recovery emission attempted while an earlier summary was still pending"
+        );
+        *event_elevation_open = false;
+        *pressure_episode = None;
+        *pending_recovery = Some(payload);
+    }
 }
 
 /// ADR-091 Plank 0 (Amendment 3: takes the tick's already-computed,
@@ -1779,6 +2360,17 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
     }
 }
 
+/// Internal result of the synchronous SQLite checkpoint core. Keeping the
+/// no-progress attribution request next to (but distinct from) `wal_pages`
+/// makes the async handoff explicit and gives deferred work one caller-owned
+/// lifetime instead of leaving it in mutable cross-tick state.
+#[derive(Debug)]
+#[must_use]
+struct CheckpointCoreOutcome {
+    wal_pages: u64,
+    sidecar_attribution: Option<WalpinAttributionRequest>,
+}
+
 /// Issue one checkpoint cycle against the task's dedicated checkpoint
 /// connection (`conn` — see `CheckpointConnection`; NEVER the pool's writer
 /// mutex).
@@ -1795,24 +2387,69 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
 ///
 /// ADR-091 Plank 2: after the PASSIVE pass, this is also the single point
 /// that may escalate to TRUNCATE (`maybe_truncate`) — on the SAME dedicated
-/// connection, never a second connection or a pool checkout.
+/// connection, never a second connection or a pool checkout. A no-progress
+/// result produces a separate cross-process attribution request; the
+/// synchronous core never walks the sidecar directory. Production's
+/// [`run_checkpoint_task`] consumes that request through an awaited
+/// `spawn_blocking` before continuing the tick. This compatibility wrapper
+/// intentionally returns only the historical page-count surface; the daemon
+/// calls `checkpoint_once_core` so it cannot discard the request.
 pub fn checkpoint_once(
     pool: &ConnectionPool,
     conn: &rusqlite::Connection,
     config: &CheckpointConfig,
     truncate_state: &mut TruncateState,
 ) -> Result<u64, rusqlite::Error> {
-    let wal_pages = query_wal_pages(conn);
+    checkpoint_once_core(pool, conn, config, truncate_state).map(|outcome| outcome.wal_pages)
+}
 
-    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
-        tracing::warn!(error = %e, "WAL checkpoint failed");
-        return Err(e);
+/// Synchronous PASSIVE/TRUNCATE core used by the async task. Unlike the
+/// compatibility wrapper [`checkpoint_once`], this preserves the explicit
+/// no-progress attribution request for the caller to complete off-runtime.
+fn checkpoint_once_core(
+    pool: &ConnectionPool,
+    conn: &rusqlite::Connection,
+    config: &CheckpointConfig,
+    truncate_state: &mut TruncateState,
+) -> Result<CheckpointCoreOutcome, rusqlite::Error> {
+    #[cfg(unix)]
+    truncate_state.begin_tick();
+    let raw_observation = match query_checkpoint_observation(conn) {
+        Ok(observation) => observation,
+        Err(e) => {
+            tracing::warn!(error = %e, "WAL checkpoint failed");
+            return Err(e);
+        }
+    };
+    let observation = record_routine_wal_observation(pool, raw_observation);
+    let wal_pages = observation.log_frames;
+    LAST_WAL_PAGES.store(wal_pages, Ordering::Relaxed);
+    note_checkpoint_observed(wal_pages);
+
+    if raw_observation.busy != 0 {
+        tracing::debug!(
+            busy = raw_observation.busy,
+            wal_log_frames = raw_observation.log_frames,
+            wal_checkpointed_frames = raw_observation.checkpointed_frames,
+            wal_pending_frames = observation.pending_frames,
+            wal_physical_bytes = ?observation.physical_wal_bytes,
+            "WAL PASSIVE checkpoint reported incomplete progress"
+        );
     }
-    tracing::debug!(wal_pages, "WAL checkpoint issued");
+    tracing::debug!(
+        wal_pages,
+        wal_checkpointed_frames = observation.checkpointed_frames,
+        wal_pending_frames = observation.pending_frames,
+        wal_physical_bytes = ?observation.physical_wal_bytes,
+        "WAL checkpoint issued"
+    );
 
-    maybe_truncate(pool, conn, config, wal_pages, truncate_state);
+    let sidecar_attribution = maybe_truncate(pool, conn, config, wal_pages, truncate_state);
 
-    Ok(wal_pages)
+    Ok(CheckpointCoreOutcome {
+        wal_pages,
+        sidecar_attribution,
+    })
 }
 
 /// Evaluate and, if due, attempt a TRUNCATE escalation on the same dedicated
@@ -1826,14 +2463,14 @@ fn maybe_truncate(
     config: &CheckpointConfig,
     wal_pages_before: u64,
     truncate_state: &mut TruncateState,
-) {
+) -> Option<WalpinAttributionRequest> {
     if wal_pages_before < config.truncate_high_water_pages {
-        return;
+        return None;
     }
 
     if let Some(last) = truncate_state.last_attempt {
         if last.elapsed() < config.truncate_min_interval {
-            return;
+            return None;
         }
     }
 
@@ -1850,11 +2487,15 @@ fn maybe_truncate(
         // for the full `truncate_min_interval` on a path that never touched
         // the WAL at all.
         tracing::warn!(error = %e, "failed to lower busy_timeout for TRUNCATE attempt; skipping");
-        return;
+        return None;
     }
 
     #[cfg(unix)]
-    let holder_census = capture_wal_holder_census(pool);
+    let mut holder_attribution = capture_walpin_attribution_request(pool, truncate_state);
+    #[cfg(unix)]
+    let mut sidecar_attribution = None;
+    #[cfg(not(unix))]
+    let sidecar_attribution = None;
 
     // Only now is this a genuine attempt: the writer is held, the threshold
     // and interval gates passed, and the busy_timeout override is in effect
@@ -1895,7 +2536,15 @@ fn maybe_truncate(
                     truncate_report_test_sync::after_no_progress_before_report(path);
                 }
                 #[cfg(unix)]
-                log_walpin_sidecar_report(pool, holder_census);
+                {
+                    // The census above had to be captured before TRUNCATE so
+                    // a transient holder remains attributable. The bounded
+                    // sidecar walk itself must not run here: this synchronous
+                    // core is called directly from `run_checkpoint_task` on a
+                    // Tokio worker. Hand the immutable request back to that
+                    // async owner for an awaited `spawn_blocking` pass.
+                    sidecar_attribution = holder_attribution.take();
+                }
                 log_wal_pin_depth(conn);
             }
 
@@ -1907,6 +2556,15 @@ fn maybe_truncate(
             note_truncate_outcome(config, wal_pages_before, truncate_state);
         }
     }
+    #[cfg(unix)]
+    if let Some(WalpinAttributionRequest::Fresh {
+        previous_last_attempt,
+        ..
+    }) = holder_attribution.as_ref()
+    {
+        truncate_state.restore_walpin_full_scan_reservation(*previous_last_attempt);
+    }
+    sidecar_attribution
 }
 
 #[cfg(test)]
@@ -1958,6 +2616,119 @@ mod truncate_report_test_sync {
     }
 }
 
+/// Deterministic seam for the async-attribution regressions below. The hook
+/// executes inside the actual `spawn_blocking` closure, so a current-thread
+/// Tokio test can prove both thread displacement and awaited ordering without
+/// relying on sleeps or scheduler timing.
+#[cfg(all(test, unix))]
+mod walpin_attribution_test_sync {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::{Arc, Mutex};
+
+    enum Behavior {
+        Pause {
+            reached_tx: tokio::sync::oneshot::Sender<std::thread::ThreadId>,
+            proceed_rx: Receiver<()>,
+        },
+        Panic,
+    }
+
+    struct Hook {
+        dir: PathBuf,
+        behavior: Behavior,
+    }
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static REPORT_COUNTER: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
+
+    pub(crate) fn install_pause(
+        dir: PathBuf,
+    ) -> (
+        tokio::sync::oneshot::Receiver<std::thread::ThreadId>,
+        SyncSender<()>,
+        Arc<AtomicUsize>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed_rx) = sync_channel(0);
+        let report_counter = Arc::new(AtomicUsize::new(0));
+        let replaced = HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(Hook {
+                dir,
+                behavior: Behavior::Pause {
+                    reached_tx,
+                    proceed_rx,
+                },
+            });
+        assert!(
+            replaced.is_none(),
+            "walpin attribution hook already installed"
+        );
+        *REPORT_COUNTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&report_counter));
+        (reached_rx, proceed_tx, report_counter)
+    }
+
+    pub(crate) fn install_panic(dir: PathBuf) {
+        let replaced = HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(Hook {
+                dir,
+                behavior: Behavior::Panic,
+            });
+        assert!(
+            replaced.is_none(),
+            "walpin attribution hook already installed"
+        );
+    }
+
+    pub(crate) fn uninstall() {
+        *HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *REPORT_COUNTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    pub(crate) fn before_enumeration(dir: &Path) {
+        let hook = {
+            let mut guard = HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.as_ref() {
+                Some(hook) if hook.dir == dir => guard.take(),
+                _ => None,
+            }
+        };
+        let Some(hook) = hook else {
+            return;
+        };
+        match hook.behavior {
+            Behavior::Pause {
+                reached_tx,
+                proceed_rx,
+            } => {
+                if reached_tx.send(std::thread::current().id()).is_ok() {
+                    let _ = proceed_rx.recv();
+                }
+            }
+            Behavior::Panic => panic!("injected walpin attribution worker panic"),
+        }
+    }
+
+    pub(crate) fn report_used() {
+        if let Some(counter) = REPORT_COUNTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// ADR-091 Plank 2: track consecutive TRUNCATE attempts that fail to bring
 /// `wal_pages` back below `warn_pages`, firing a one-shot escalated WARN at
 /// exactly the third consecutive failure (does not repeat every attempt
@@ -1990,26 +2761,191 @@ fn note_truncate_outcome(
     TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
 }
 
-/// ADR-091 Amendment 2 Plank B: capture the OS holder census immediately
-/// before a TRUNCATE attempt so a holder that releases during the bounded wait
-/// remains attributable if the attempt reports no progress. A no-op if the
-/// sidecar is disabled or this backend has no on-disk path.
+/// Immutable work captured around an armed TRUNCATE and consumed by the
+/// async checkpoint owner only when that attempt makes no progress.
+///
+/// The holder census belongs here because it must precede the bounded
+/// TRUNCATE wait. The sidecar directory walk does not: it remains deferred
+/// until after the outcome is known and is executed through an awaited
+/// `spawn_blocking` by [`complete_walpin_attribution`].
 #[cfg(unix)]
-fn capture_wal_holder_census(
+#[derive(Debug)]
+enum WalpinAttributionRequest {
+    Fresh {
+        dir: PathBuf,
+        census: Result<crate::walpin::CensusResult, String>,
+        legacy_fallback_interval: Duration,
+        previous_last_attempt: Option<Instant>,
+    },
+    Cached(CachedWalpinAttribution),
+    Suppressed,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalpinReportFreshness {
+    Fresh,
+    Cached { age: Duration },
+}
+
+#[cfg(unix)]
+impl WalpinReportFreshness {
+    fn is_fresh(self) -> bool {
+        self == Self::Fresh
+    }
+}
+
+/// Non-Unix placeholder keeps the synchronous core's outcome shape stable;
+/// daemon sidecar attribution itself is Unix-only.
+#[cfg(not(unix))]
+type WalpinAttributionRequest = ();
+
+/// Honest failure surface for an attempted no-progress attribution pass.
+/// Both variants suppress same-tick housekeeping because a panicked blocking
+/// worker may already have partially enumerated the directory; retrying a
+/// second pass would violate the one-pass-per-tick bound.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalpinAttributionFailure {
+    Enumeration(String),
+    Worker(String),
+}
+
+#[cfg(unix)]
+impl WalpinAttributionFailure {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Enumeration(_) => "enumeration",
+            Self::Worker(_) => "blocking_worker",
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for WalpinAttributionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Enumeration(error) => write!(
+                formatter,
+                "sidecar directory failed the trust-boundary enumeration; cross-process \
+                 WAL-pin attribution is unestablished for this tick: {error}"
+            ),
+            Self::Worker(error) => write!(
+                formatter,
+                "sidecar attribution blocking worker failed; cross-process WAL-pin \
+                 attribution is unestablished for this tick: {error}"
+            ),
+        }
+    }
+}
+
+/// Capture the pre-TRUNCATE OS holder census and stable sidecar inputs. A
+/// no-op if the sidecar is disabled or this backend has no on-disk path.
+#[cfg(unix)]
+fn capture_walpin_attribution_request(
     pool: &ConnectionPool,
-) -> Option<Result<crate::walpin::CensusResult, String>> {
+    state: &mut TruncateState,
+) -> Option<WalpinAttributionRequest> {
     let path = pool.canonical_path()?;
     if !crate::walpin::sidecar_enabled(true) {
         return None;
     }
-    Some(crate::walpin::census_holders(path).map_err(|e| e.to_string()))
+    let legacy_fallback_interval = state.legacy_walpin_fallback_interval;
+    Some(match state.plan_walpin_attribution_at(Instant::now()) {
+        WalpinFullScanPlan::Refresh {
+            previous_last_attempt,
+        } => WalpinAttributionRequest::Fresh {
+            dir: crate::walpin::sidecar_dir_for(path),
+            census: crate::walpin::census_holders(path).map_err(|error| error.to_string()),
+            legacy_fallback_interval,
+            previous_last_attempt,
+        },
+        WalpinFullScanPlan::Cached(cached) => WalpinAttributionRequest::Cached(cached),
+        WalpinFullScanPlan::Suppressed => WalpinAttributionRequest::Suppressed,
+    })
+}
+
+/// Consume this tick's no-progress attribution request off the async runtime
+/// worker and await it before any report or fallback housekeeping is used.
+/// Returns `Ok(false)` when no pass was requested. Once a request exists the
+/// state is marked attempted before spawning, so worker panic/cancellation
+/// cannot accidentally authorize a second directory scan in the same tick.
+#[cfg(unix)]
+async fn complete_walpin_attribution(
+    request: Option<WalpinAttributionRequest>,
+    state: &mut TruncateState,
+) -> Result<bool, WalpinAttributionFailure> {
+    let Some(request) = request else {
+        return Ok(false);
+    };
+    match request {
+        WalpinAttributionRequest::Suppressed => Ok(false),
+        WalpinAttributionRequest::Cached(cached) => {
+            log_walpin_sidecar_report(
+                &cached.report,
+                cached.census,
+                WalpinReportFreshness::Cached {
+                    age: Instant::now().saturating_duration_since(cached.captured_at),
+                },
+            );
+            Ok(true)
+        }
+        WalpinAttributionRequest::Fresh {
+            dir,
+            census,
+            legacy_fallback_interval,
+            previous_last_attempt: _,
+        } => {
+            state.sidecar_attribution_attempted_this_tick = true;
+            if state.walpin_full_scan_last_attempt.is_none() {
+                state.walpin_full_scan_last_attempt = Some(Instant::now());
+            }
+            let fallback = state.walpin_cached_attribution.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                walpin_attribution_test_sync::before_enumeration(&dir);
+                crate::walpin::enumerate_live(&dir, legacy_fallback_interval)
+            })
+            .await
+            .map_err(|error| WalpinAttributionFailure::Worker(error.to_string()))
+            .and_then(|result| {
+                result.map_err(|error| WalpinAttributionFailure::Enumeration(error.to_string()))
+            });
+
+            match result {
+                Ok(report) => {
+                    let captured_at = Instant::now();
+                    log_walpin_sidecar_report(
+                        &report,
+                        census.clone(),
+                        WalpinReportFreshness::Fresh,
+                    );
+                    state.cache_walpin_attribution(report, census, captured_at);
+                    Ok(true)
+                }
+                Err(error) => {
+                    if let Some(cached) = fallback {
+                        log_walpin_sidecar_report(
+                            &cached.report,
+                            cached.census,
+                            WalpinReportFreshness::Cached {
+                                age: Instant::now().saturating_duration_since(cached.captured_at),
+                            },
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        }
+    }
 }
 
 /// When a TRUNCATE attempt makes no progress, enumerate the walpin sidecar and
 /// combine it with the holder census captured immediately before that attempt.
-/// Sidecar enumeration remains deferred until this consumed diagnostic path;
-/// holder identity cannot be deferred because a transient blocker may have
-/// released by then.
+/// This pass consumes the classifications for attribution and returns whether
+/// enumeration was attempted; the caller uses that marker to suppress the
+/// ordinary housekeeping pass later in the same tick. Holder identity cannot
+/// be deferred because a transient blocker may have released by then.
 ///
 /// Sidecar-health attribution (ADR-091 Amendment 2):
 /// the sharper "unregistered/native mechanism" conclusion is licensed only
@@ -2020,32 +2956,12 @@ fn capture_wal_holder_census(
 /// instead of silently exonerating them.
 #[cfg(unix)]
 fn log_walpin_sidecar_report(
-    pool: &ConnectionPool,
-    census: Option<Result<crate::walpin::CensusResult, String>>,
+    report: &crate::walpin::WalpinReport,
+    census: Result<crate::walpin::CensusResult, String>,
+    freshness: WalpinReportFreshness,
 ) {
-    let Some(census) = census else {
-        return;
-    };
-    let Some(path) = pool.canonical_path() else {
-        return;
-    };
-    let dir = crate::walpin::sidecar_dir_for(path);
-    // Each record carries its producer's own sweep cadence
-    // (`sweep_interval_ms`), which is what freshness is judged against; the
-    // interval passed here is only the fallback for records written before
-    // that field existed.
-    let sweep_interval = SessionSweepConfig::from_env().interval;
-    let report = match crate::walpin::enumerate_live(&dir, sweep_interval) {
-        Ok(report) => report,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "ADR-091 Amendment 2 Plank B: sidecar directory failed the trust-boundary \
-                 check; cross-process WAL-pin attribution is unestablished for this tick"
-            );
-            return;
-        }
-    };
+    #[cfg(test)]
+    walpin_attribution_test_sync::report_used();
     let now = now_epoch_secs();
     for hb in report.reporting() {
         // ADR-091 Amendment 3 Plank F2 fail-closed reading rule: the
@@ -2060,6 +2976,7 @@ fn log_walpin_sidecar_report(
             walpin_oldest_tx_label = hb.oldest_tx_label.as_deref().unwrap_or("<unlabeled>"),
             walpin_attribution_basis = hb.attribution_basis.as_deref().unwrap_or("<unspecified>"),
             walpin_attribution_evidence_backed = hb.attribution_is_evidence_backed(),
+            walpin_attribution_fresh = freshness.is_fresh(),
             walpin_health = "reporting",
             "ADR-091 Amendment 2 Plank B: live cross-process WAL-pin attribution report"
         );
@@ -2068,10 +2985,19 @@ fn log_walpin_sidecar_report(
         tracing::debug!(
             walpin_pid = pid,
             walpin_health = "registered_silent",
+            walpin_attribution_fresh = freshness.is_fresh(),
             "ADR-091 Amendment 2 Plank B: process affirmatively reports no over-threshold span"
         );
     }
     let mut unknown_pids: Vec<u32> = report.unknown_pids().collect();
+    if let WalpinReportFreshness::Cached { age } = freshness {
+        tracing::warn!(
+            walpin_cache_age_ms = age.as_millis() as u64,
+            "cached WAL-pin attribution is diagnostic-only; fully-attributed \
+             conclusion is not licensed"
+        );
+        unknown_pids.push(0);
+    }
 
     // The sidecar directory alone can only speak for PIDs that wrote
     // something there. Widen the universe to every PID the OS reports as
@@ -2137,6 +3063,8 @@ fn log_walpin_sidecar_report(
         }
     }
 
+    unknown_pids.sort_unstable();
+    unknown_pids.dedup();
     if !unknown_pids.is_empty() {
         tracing::warn!(
             ?unknown_pids,
@@ -2203,21 +3131,36 @@ fn crossing_warn(now_above: bool, was_above: &mut bool) -> bool {
     fire
 }
 
-/// Query the current WAL frame count via `PRAGMA wal_checkpoint`.
+#[derive(Debug, Clone, Copy)]
+struct RawCheckpointObservation {
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+}
+
+/// Issue one PASSIVE checkpoint and retain the complete SQLite result row.
+/// This is the periodic task's one routine checkpoint call: the same row
+/// drives thresholds and the logical-backlog monitoring sample (#1849).
+fn query_checkpoint_observation(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<RawCheckpointObservation> {
+    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+        Ok(RawCheckpointObservation {
+            busy: row.get(0)?,
+            log_frames: row.get(1)?,
+            checkpointed_frames: row.get(2)?,
+        })
+    })
+}
+
+/// Query the current WAL frame count with one PASSIVE checkpoint.
 ///
-/// The pragma returns a 3-column row `(busy, log, checkpointed)`, where `log`
-/// (column index 1) is the number of frames currently in the WAL file — the
-/// backlog the high-water threshold keys off. (Column 2 is `checkpointed`, the
-/// frames moved *by this call*, which is not the WAL size.) The no-arg pragma
-/// also performs a PASSIVE checkpoint as a side effect; the subsequent explicit
-/// `PRAGMA wal_checkpoint(PASSIVE)` in `checkpoint_once` is a deliberate second
-/// pass that can checkpoint any frames written between the two calls.
-///
-/// Returns 0 on any error (e.g. in-memory DB where WAL is not active, which
-/// reports `log = -1`).
+/// Used only for rare post-TRUNCATE outcome measurement. The ordinary
+/// periodic path calls [`query_checkpoint_observation`] directly and stores
+/// its complete row, avoiding the former double-checkpoint pass.
 fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
-    let pages = conn
-        .query_row("PRAGMA wal_checkpoint", [], |row| row.get::<_, i64>(1))
+    let pages = query_checkpoint_observation(conn)
+        .map(|observation| observation.log_frames)
         .unwrap_or(0)
         .max(0) as u64;
     // Metrics read-surface (load/perf harness): mirror every observation into
@@ -2232,6 +3175,8 @@ fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
+    use crate::writer_task::WriterTaskHandle;
+    use rusqlite::hooks::{AuthAction, Authorization};
     use serial_test::serial;
     use tracing::field::{Field, Visit};
 
@@ -2473,6 +3418,19 @@ mod tests {
         Arc::new(ConnectionPool::new(cfg).expect("pool open"))
     }
 
+    async fn writer_task_wal_autocheckpoint_pages(handle: &WriterTaskHandle) -> u32 {
+        handle
+            .send_top_level(|conn| {
+                conn.pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, u32>(0))
+                    .map_err(|error| khive_storage::error::StorageError::Pool {
+                        operation: "test_wal_autocheckpoint".into(),
+                        message: error.to_string(),
+                    })
+            })
+            .await
+            .expect("query writer-task connection pragma")
+    }
+
     /// Test helper: open the same dedicated standalone connection
     /// `run_checkpoint_task` opens in production, for tests that drive
     /// `checkpoint_once` directly.
@@ -2487,6 +3445,209 @@ mod tests {
         fn drop(&mut self) {
             truncate_report_test_sync::uninstall();
         }
+    }
+
+    #[cfg(unix)]
+    struct WalpinAttributionHookGuard;
+
+    #[cfg(unix)]
+    impl Drop for WalpinAttributionHookGuard {
+        fn drop(&mut self) {
+            walpin_attribution_test_sync::uninstall();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn walpin_full_scan_cadence_refreshes_first_then_reuses_until_boundary() {
+        let cadence = Duration::from_secs(30);
+        let started_at = Instant::now();
+        let mut state = TruncateState::with_walpin_full_scan_cadence(cadence);
+
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at),
+            WalpinFullScanPlan::Refresh { .. }
+        ));
+        state.cache_walpin_attribution(
+            crate::walpin::WalpinReport::default(),
+            Ok(crate::walpin::CensusResult::default()),
+            started_at,
+        );
+
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at + cadence - Duration::from_nanos(1)),
+            WalpinFullScanPlan::Cached(_)
+        ));
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at + cadence),
+            WalpinFullScanPlan::Refresh { .. }
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn walpin_full_scan_failure_retries_only_after_cadence() {
+        let cadence = Duration::from_secs(30);
+        let started_at = Instant::now();
+        let mut state = TruncateState::with_walpin_full_scan_cadence(cadence);
+
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at),
+            WalpinFullScanPlan::Refresh { .. }
+        ));
+        // No cache update models either an enumeration error or a panicked
+        // blocking worker. The attempt itself still owns the cadence slot.
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at + cadence - Duration::from_nanos(1)),
+            WalpinFullScanPlan::Suppressed
+        ));
+        assert!(matches!(
+            state.plan_walpin_attribution_at(started_at + cadence),
+            WalpinFullScanPlan::Refresh { .. }
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cached_walpin_report_is_diagnostic_only_even_when_fully_attributed() {
+        let report = crate::walpin::WalpinReport::default();
+        assert!(
+            report.fully_attributed(),
+            "the fixture must otherwise license the sharp conclusion"
+        );
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_walpin_sidecar_report(
+                &report,
+                Ok(crate::walpin::CensusResult::default()),
+                WalpinReportFreshness::Cached {
+                    age: Duration::from_secs(1),
+                },
+            );
+        });
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.message.as_deref()
+                    == Some(
+                        "cached WAL-pin attribution is diagnostic-only; fully-attributed \
+                         conclusion is not licensed",
+                    )
+            }),
+            "cached attribution must declare its fail-closed status: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.message.as_deref().is_some_and(|message| {
+                    message.starts_with("ADR-091 Amendment 2 Plank B: every live PID is reporting")
+                })
+            }),
+            "cached attribution must never authorize the fully-attributed conclusion: {events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn progressing_truncate_releases_full_scan_reservation_to_housekeeping() {
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walpin-progress-reservation.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        let conn = checkpoint_conn(&pool);
+        let mut state = TruncateState::default();
+        let config = CheckpointConfig {
+            truncate_high_water_pages: 0,
+            truncate_min_interval: Duration::ZERO,
+            ..CheckpointConfig::default()
+        };
+
+        assert!(
+            maybe_truncate(&pool, &conn, &config, u64::MAX, &mut state).is_none(),
+            "a progressing TRUNCATE must not schedule no-progress attribution"
+        );
+        assert!(
+            state.housekeeping_due(),
+            "unused pre-TRUNCATE reservation must be restored before housekeeping"
+        );
+        let sidecar =
+            WalpinSidecarState::new(pool.canonical_path(), true, "daemon", config.interval)
+                .expect("file-backed test sidecar");
+        assert!(
+            run_walpin_housekeeping_if_due(&sidecar, &mut state, DEFAULT_SESSION_SWEEP_INTERVAL,)
+                .await,
+            "the production housekeeping arm must consume one full scan"
+        );
+        assert!(state.walpin_cached_attribution.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn erroring_truncate_releases_full_scan_reservation_to_housekeeping() {
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walpin-error-reservation.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        let conn = checkpoint_conn(&pool);
+        conn.authorizer(Some(
+            |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                AuthAction::Pragma { pragma_name, .. }
+                    if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
+                {
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            },
+        ))
+        .unwrap();
+        let mut state = TruncateState::default();
+        let config = CheckpointConfig {
+            truncate_high_water_pages: 0,
+            truncate_min_interval: Duration::ZERO,
+            ..CheckpointConfig::default()
+        };
+
+        assert!(
+            maybe_truncate(&pool, &conn, &config, u64::MAX, &mut state).is_none(),
+            "an erroring TRUNCATE must not schedule no-progress attribution"
+        );
+        conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        assert!(
+            state.housekeeping_due(),
+            "failed TRUNCATE must restore its unused full-scan reservation"
+        );
+        let sidecar =
+            WalpinSidecarState::new(pool.canonical_path(), true, "daemon", config.interval)
+                .expect("file-backed test sidecar");
+        assert!(
+            run_walpin_housekeeping_if_due(&sidecar, &mut state, DEFAULT_SESSION_SWEEP_INTERVAL,)
+                .await,
+            "the production housekeeping arm must consume one full scan"
+        );
+        assert!(state.walpin_cached_attribution.is_some());
     }
 
     struct ReaderProcess {
@@ -2578,10 +3739,17 @@ mod tests {
             .expect("helper releases read snapshot");
     }
 
-    #[test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg(unix)]
-    #[serial(checkpoint_skip_metrics, walpin_report_seam)]
-    fn no_progress_report_keeps_holder_released_after_truncate_timeout() {
+    #[serial(
+        checkpoint_skip_metrics,
+        khive_walpin_sidecar_env,
+        walpin_attribution_async,
+        walpin_report_seam
+    )]
+    async fn no_progress_report_keeps_holder_released_after_truncate_timeout() {
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("transient-reader.db");
         let pool = file_pool(&path);
@@ -2610,26 +3778,22 @@ mod tests {
         let (reached_rx, proceed_tx) = truncate_report_test_sync::install(canonical_path.clone());
         let _hook_guard = TruncateReportHookGuard;
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let thread_buffer = std::sync::Arc::clone(&buffer);
         let checkpoint_pool = Arc::clone(&pool);
         let dedicated_conn = checkpoint_conn(&checkpoint_pool);
         let checkpoint = std::thread::spawn(move || {
-            let subscriber = CaptureSubscriber {
-                events: thread_buffer,
-            };
-            tracing::subscriber::with_default(subscriber, || {
-                checkpoint_once(
-                    &checkpoint_pool,
-                    &dedicated_conn,
-                    &CheckpointConfig {
-                        truncate_high_water_pages: 0,
-                        truncate_min_interval: Duration::ZERO,
-                        truncate_busy_timeout: Duration::from_millis(50),
-                        ..CheckpointConfig::default()
-                    },
-                    &mut TruncateState::default(),
-                )
-            })
+            let mut state = TruncateState::default();
+            let result = checkpoint_once_core(
+                &checkpoint_pool,
+                &dedicated_conn,
+                &CheckpointConfig {
+                    truncate_high_water_pages: 0,
+                    truncate_min_interval: Duration::ZERO,
+                    truncate_busy_timeout: Duration::from_millis(50),
+                    ..CheckpointConfig::default()
+                },
+                &mut state,
+            );
+            (result, state)
         });
 
         reached_rx
@@ -2645,7 +3809,30 @@ mod tests {
         proceed_tx
             .send(())
             .expect("allow no-progress reporting to continue");
-        let _ = checkpoint.join().expect("checkpoint thread");
+        let (checkpoint_result, mut state) = checkpoint.join().expect("checkpoint thread");
+        let outcome = checkpoint_result.expect("checkpoint succeeds");
+        assert!(
+            outcome.sidecar_attribution.is_some(),
+            "the synchronous checkpoint result must carry a separate attribution request"
+        );
+        assert!(
+            !state.sidecar_attribution_attempted_this_tick,
+            "capturing a request is not the same as attempting its directory enumeration"
+        );
+
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let attribution_attempted =
+            complete_walpin_attribution(outcome.sidecar_attribution, &mut state)
+                .await
+                .expect("deferred attribution succeeds");
+        assert!(
+            attribution_attempted,
+            "a no-progress attribution pass must suppress the redundant healthy-housekeeping \
+             pass for the same tick"
+        );
 
         let events = buffer.lock().expect("captured events");
         assert!(
@@ -2656,6 +3843,213 @@ mod tests {
                     .is_some_and(|pids| pids.contains(&reader_pid.to_string()))
             }),
             "the no-progress report must retain PID {reader_pid} from the pre-attempt census: {events:?}"
+        );
+    }
+
+    /// The 512-entry attribution walk must run on Tokio's blocking pool and
+    /// the async owner must await it before the report is consumed. A paused
+    /// real enumeration proves all three facts without a timing sleep: its
+    /// thread differs from the current-thread runtime, the completion future
+    /// remains pending, and the report-use counter stays zero until release.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(walpin_attribution_async)]
+    async fn no_progress_attribution_is_off_runtime_and_awaited_before_report_use() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sidecar_dir = dir.path().join("checkpoint.db.walpin");
+        let (reached_rx, proceed_tx, report_counter) =
+            walpin_attribution_test_sync::install_pause(sidecar_dir.clone());
+        let _hook_guard = WalpinAttributionHookGuard;
+
+        let runtime_thread = std::thread::current().id();
+        let mut state = TruncateState::default();
+        let request = Some(WalpinAttributionRequest::Fresh {
+            dir: sidecar_dir,
+            census: Ok(crate::walpin::CensusResult::default()),
+            legacy_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+            previous_last_attempt: None,
+        });
+        let completion = tokio::spawn(async move {
+            let result = complete_walpin_attribution(request, &mut state).await;
+            (result, state)
+        });
+
+        let blocking_thread = reached_rx
+            .await
+            .expect("spawn_blocking attribution reached test seam");
+        assert_ne!(
+            blocking_thread, runtime_thread,
+            "sidecar enumeration must not execute on the current-thread Tokio runtime worker"
+        );
+        assert!(
+            !completion.is_finished(),
+            "the async attribution owner must await the still-paused blocking enumeration"
+        );
+        assert_eq!(
+            report_counter.load(Ordering::SeqCst),
+            0,
+            "the attribution report must not be consumed before enumeration completes"
+        );
+
+        proceed_tx
+            .send(())
+            .expect("release blocking attribution enumeration");
+        let (result, state) = completion.await.expect("attribution task joins");
+        assert_eq!(result, Ok(true));
+        assert_eq!(
+            report_counter.load(Ordering::SeqCst),
+            1,
+            "the completed enumeration must feed exactly one report use"
+        );
+        assert!(state.sidecar_attribution_attempted_this_tick);
+        assert!(
+            !state.housekeeping_due(),
+            "completed attribution must suppress same-tick housekeeping"
+        );
+    }
+
+    /// A panicked blocking worker is not flattened into success. The tick is
+    /// still marked attempted because the worker may have partially walked
+    /// the directory before failing, so starting housekeeping afterward
+    /// would violate the one-pass bound.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(walpin_attribution_async)]
+    async fn no_progress_attribution_join_failure_is_honest_and_suppresses_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sidecar_dir = dir.path().join("checkpoint.db.walpin");
+        walpin_attribution_test_sync::install_panic(sidecar_dir.clone());
+        let _hook_guard = WalpinAttributionHookGuard;
+
+        let mut state = TruncateState::default();
+        let request = Some(WalpinAttributionRequest::Fresh {
+            dir: sidecar_dir,
+            census: Ok(crate::walpin::CensusResult::default()),
+            legacy_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+            previous_last_attempt: None,
+        });
+
+        let error = complete_walpin_attribution(request, &mut state)
+            .await
+            .expect_err("injected worker panic must surface as failure");
+        assert!(
+            matches!(error, WalpinAttributionFailure::Worker(_)),
+            "join failure must retain its worker classification: {error:?}"
+        );
+        assert!(state.sidecar_attribution_attempted_this_tick);
+        assert!(
+            !state.housekeeping_due(),
+            "an indeterminate partial pass must not authorize a second scan"
+        );
+    }
+
+    /// Structural guard for the accepted ADR split: the synchronous SQLite
+    /// checkpoint core only schedules attribution, the sole direct
+    /// `enumerate_live` call is nested in an awaited `spawn_blocking`, and the
+    /// task completes it before either housekeeping or lifecycle outcome use.
+    #[test]
+    #[cfg(unix)]
+    #[serial(checkpoint_skip_metrics)]
+    fn async_checkpoint_source_keeps_enumeration_behind_awaited_spawn_blocking() {
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing source marker {start:?}"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing source marker {end:?}"))
+                .0
+        }
+
+        let source = include_str!("checkpoint.rs");
+        let checkpoint_core = section(
+            source,
+            "fn checkpoint_once_core(",
+            "/// Evaluate and, if due, attempt a TRUNCATE escalation",
+        );
+        let truncate_core = section(
+            source,
+            "fn maybe_truncate(",
+            "#[cfg(test)]\nmod truncate_report_test_sync",
+        );
+        let report_logger = section(
+            source,
+            "fn log_walpin_sidecar_report(",
+            "/// ADR-091 Amendment 2 Plank C",
+        );
+        for (name, body) in [
+            ("checkpoint_once_core", checkpoint_core),
+            ("maybe_truncate", truncate_core),
+            ("log_walpin_sidecar_report", report_logger),
+        ] {
+            assert!(
+                !body.contains("enumerate_live("),
+                "{name} must not perform direct sidecar enumeration"
+            );
+        }
+
+        let async_completion = section(
+            source,
+            "async fn complete_walpin_attribution(",
+            "/// When a TRUNCATE attempt makes no progress",
+        );
+        let spawn = async_completion
+            .find("tokio::task::spawn_blocking")
+            .expect("completion must spawn blocking work");
+        let enumerate = async_completion
+            .find("crate::walpin::enumerate_live")
+            .expect("blocking closure must perform the attribution enumeration");
+        let awaited = async_completion[enumerate..]
+            .find(".await")
+            .map(|offset| enumerate + offset)
+            .expect("blocking worker must be awaited");
+        assert!(spawn < enumerate && enumerate < awaited);
+
+        let task = section(
+            source,
+            "pub async fn run_checkpoint_task(",
+            "/// Whether a `CheckpointOutcomeRecorded` transition should be enqueued",
+        );
+        let checkpoint = task
+            .find("checkpoint_once_core(")
+            .expect("checkpoint core call");
+        let completion = task
+            .find("complete_walpin_attribution(")
+            .expect("awaited attribution completion");
+        let housekeeping = task
+            .find("run_walpin_housekeeping_if_due(")
+            .expect("fallback housekeeping");
+        let outcome = task
+            .find("observe_checkpoint_pressure_tick(")
+            .expect("lifecycle outcome use");
+        assert!(
+            checkpoint < completion && completion < housekeeping && housekeeping < outcome,
+            "tick ordering must be checkpoint -> awaited attribution -> housekeeping decision -> outcome"
+        );
+        let housekeeping_helper = section(
+            source,
+            "async fn run_walpin_housekeeping_if_due(",
+            "fn now_epoch_secs()",
+        );
+        assert!(
+            housekeeping_helper.contains("reap_dead_entries_bounded(legacy_fallback_interval)"),
+            "the ordered housekeeping arm must retain the bounded full scan"
+        );
+
+        // The outcome decision itself moved into the extracted per-tick
+        // helper; the emit gate must still be consulted there, so the
+        // ordering assertion above remains transitively about the same
+        // lifecycle decision it always pinned.
+        let pressure_tick = section(
+            source,
+            "fn observe_checkpoint_pressure_tick(",
+            "/// ADR-091 Plank 0",
+        );
+        assert!(
+            pressure_tick.contains("checkpoint_outcome_should_emit"),
+            "extracted pressure tick helper must gate on the lifecycle emit decision"
         );
     }
 
@@ -2746,6 +4140,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkpoint_connection_disables_wal_autocheckpoint_on_open_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_autocheckpoint.db");
+        let pool = file_pool(&path);
+        let mut checkpoint_conn = CheckpointConnection::new();
+
+        let initial: u32 = checkpoint_conn
+            .ensure_open(&pool)
+            .expect("dedicated checkpoint connection must open")
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .expect("read initial autocheckpoint setting");
+        assert_eq!(initial, 0);
+
+        checkpoint_conn.conn = None;
+        let reopened: u32 = checkpoint_conn
+            .ensure_open(&pool)
+            .expect("dedicated checkpoint connection must reopen")
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .expect("read reopened autocheckpoint setting");
+        assert_eq!(reopened, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(checkpoint_skip_metrics)]
+    async fn failed_checkpoint_claim_keeps_existing_writer_task_on_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed_claim_writer_task.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                checkout_timeout: Duration::from_millis(1),
+                write_queue_enabled: Some(true),
+                ..PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("writer-task resolution")
+            .expect("writer task enabled");
+        assert_eq!(
+            writer_task_wal_autocheckpoint_pages(&writer_task).await,
+            crate::pool::FALLBACK_WAL_AUTOCHECKPOINT_PAGES
+        );
+
+        let legacy_conn = pool.legacy_conn();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _held_writer = legacy_conn.lock();
+            held_tx.send(()).expect("signal held pooled writer");
+            release_rx.recv().expect("release held pooled writer");
+        });
+        held_rx.await.expect("pooled writer holder started");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        drop(shutdown_tx);
+        run_checkpoint_task(
+            Arc::clone(&pool),
+            CheckpointConfig {
+                interval: Duration::from_secs(60),
+                ..CheckpointConfig::default()
+            },
+            None,
+            shutdown_rx,
+            true,
+        )
+        .await;
+
+        assert_eq!(pool.writer_acquisition_snapshot().timeouts, 1);
+        assert_eq!(
+            writer_task_wal_autocheckpoint_pages(&writer_task).await,
+            crate::pool::FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+            "failed pooled-writer claim must not partially propagate ownership"
+        );
+        release_tx.send(()).expect("release pooled writer");
+        holder.await.expect("pooled writer holder joined");
+    }
+
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_exits_on_shutdown_signal() {
@@ -2768,6 +4241,54 @@ mod tests {
             .await
             .expect("checkpoint task should exit within 1s")
             .expect("checkpoint task panicked");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn healthy_checkpoint_tick_reaps_a_dead_walpin_beacon_without_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("healthy_sidecar_reap.db");
+        let pool = file_pool(&path);
+        let sidecar_dir =
+            crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed pool"));
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let dead_pid = 2_000_000_000;
+        let dead_beacon = crate::walpin::WalpinBeacon {
+            pid: dead_pid,
+            process_role: "session".to_string(),
+            started_at: 1,
+            sweep_interval_ms: 5_000,
+        };
+        crate::walpin::write_beacon(&sidecar_dir, &dead_beacon)
+            .expect("seed a crashed process's orphan beacon");
+        let dead_beacon_path = crate::walpin::beacon_path(&sidecar_dir, dead_pid);
+        assert!(dead_beacon_path.exists(), "orphan fixture must exist");
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: u64::MAX,
+            high_water_pages: u64::MAX,
+            truncate_high_water_pages: u64::MAX,
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(pool, cfg, None, shutdown_rx, true));
+
+        let reaped = wait_for(Duration::from_secs(2), || !dead_beacon_path.exists()).await;
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        assert!(
+            reaped,
+            "the ordinary healthy tick must reap positively dead sidecar residue independently of \
+             TRUNCATE diagnostics"
+        );
     }
 
     /// Regression #774: exits via watch-signal even with a live event_store
@@ -3352,8 +4873,9 @@ mod tests {
     }
 
     /// Regression guard for #845 (a recurrence of the #828 shared-statics
-    /// race): every test in this module that calls `checkpoint_once` or
-    /// `run_checkpoint_task` — both funnel through `query_wal_pages`, which
+    /// race): every test in this module that calls `checkpoint_once`,
+    /// `checkpoint_once_core`, or `run_checkpoint_task` — all funnel through
+    /// `query_wal_pages`, which
     /// writes the process-wide `LAST_WAL_PAGES` / `CHECKPOINT_*` atomics —
     /// must be tagged with a `#[serial(...)]` group that includes
     /// `checkpoint_skip_metrics`. Before #828, six such call sites carried no
@@ -3366,6 +4888,7 @@ mod tests {
     /// a future test that calls either function without the tag fails this
     /// assertion instead of flaking on a loaded CI runner.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn all_checkpoint_metrics_callers_are_serial_tagged() {
         const SELF_SRC: &str = include_str!("checkpoint.rs");
         let lines: Vec<&str> = SELF_SRC.lines().collect();
@@ -3386,16 +4909,35 @@ mod tests {
             let end = attr_starts.get(idx + 1).copied().unwrap_or(lines.len());
             let span = &lines[start..end];
 
-            let touches_shared_metrics = span
-                .iter()
-                .any(|l| l.contains("checkpoint_once(") || l.contains("run_checkpoint_task("));
+            let touches_shared_metrics = span.iter().any(|l| {
+                l.contains("checkpoint_once(")
+                    || l.contains("checkpoint_once_core(")
+                    || l.contains("run_checkpoint_task(")
+            });
             if !touches_shared_metrics {
                 continue;
             }
 
-            let has_group_tag = span
-                .iter()
-                .any(|l| l.contains("#[serial") && l.contains("checkpoint_skip_metrics"));
+            // Rustfmt splits long multi-key attributes across lines, so scan
+            // the whole attribute instead of requiring the group on `#[serial(`.
+            let mut in_serial_attr = false;
+            let has_group_tag = span.iter().any(|line| {
+                let trimmed = line.trim();
+                if !in_serial_attr {
+                    in_serial_attr = trimmed.starts_with("#[serial(");
+                }
+                if !in_serial_attr {
+                    return false;
+                }
+
+                let has_group = trimmed
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .any(|token| token == "checkpoint_skip_metrics");
+                if trimmed.ends_with(")]") {
+                    in_serial_attr = false;
+                }
+                has_group
+            });
 
             if !has_group_tag {
                 let name = span
@@ -3415,7 +4957,7 @@ mod tests {
 
         assert!(
             offenders.is_empty(),
-            "these tests call checkpoint_once/run_checkpoint_task (which write the \
+            "these tests call checkpoint_once/checkpoint_once_core/run_checkpoint_task (which write the \
              process-wide LAST_WAL_PAGES/CHECKPOINT_* atomics via query_wal_pages) but \
              are not tagged #[serial(checkpoint_skip_metrics)] (or a group including it); \
              an untagged caller running concurrently on cargo's default test thread pool \
@@ -4265,9 +5807,8 @@ mod tests {
     }
 
     /// Pure decision-table coverage for every input combination
-    /// `checkpoint_outcome_should_emit` can see: a first elevated tick, a
-    /// sustained elevated tick, the single drain row, and the ordinary
-    /// healthy tick that must emit nothing.
+    /// `checkpoint_outcome_should_emit` can see: elevation, sustained
+    /// pressure, recovery, and repeated healthy observations.
     #[test]
     fn checkpoint_outcome_should_emit_covers_all_transitions() {
         assert!(
@@ -4275,8 +5816,8 @@ mod tests {
             "first elevated tick must emit"
         );
         assert!(
-            checkpoint_outcome_should_emit(true, true),
-            "sustained elevated tick must emit"
+            !checkpoint_outcome_should_emit(true, true),
+            "sustained elevated ticks must aggregate in memory instead of writing the WAL"
         );
         assert!(
             checkpoint_outcome_should_emit(false, true),
@@ -4288,9 +5829,281 @@ mod tests {
         );
     }
 
+    /// Regression #1838: under a persistent WAL pin, lifecycle persistence
+    /// must scale with pressure-state transitions, not checkpoint attempts.
+    #[test]
+    fn persistent_pressure_lifecycle_rows_are_o_state_transitions() {
+        let observations = [true; 128].into_iter().chain([false]).chain([false; 128]);
+        let mut was_elevated = false;
+        let writes = observations
+            .filter(|above_warn| {
+                let emit = checkpoint_outcome_should_emit(*above_warn, was_elevated);
+                if emit {
+                    was_elevated = *above_warn;
+                }
+                emit
+            })
+            .count();
+
+        assert_eq!(
+            writes, 2,
+            "one elevation row plus one recovery summary must cover any number of attempts"
+        );
+    }
+
+    #[test]
+    fn checkpoint_pressure_episode_retains_recovery_summary() {
+        let mut episode = CheckpointPressureEpisode::start(2_500);
+        episode.observe(2_300);
+        episode.observe(8_100);
+        episode.observe(4_000);
+
+        assert_eq!(episode.elevated_ticks, 4);
+        assert_eq!(episode.peak_wal_pages, 8_100);
+    }
+
+    /// Drives [`observe_checkpoint_pressure_tick`] through a fixed sequence
+    /// of `(above_warn, wal_pages)` ticks, faking `try_emit` per call index
+    /// (0-based across the whole sequence) via `fail_on`. Returns every
+    /// payload that was reported as successfully delivered, in delivery
+    /// order.
+    fn drive_pressure_ticks(
+        config: &CheckpointConfig,
+        ticks: &[(bool, u64)],
+        mut fail_on: impl FnMut(usize) -> bool,
+    ) -> Vec<khive_storage::CheckpointOutcomeRecordedPayload> {
+        let mut event_elevation_open = false;
+        let mut pressure_episode: Option<CheckpointPressureEpisode> = None;
+        let mut pending_recovery: Option<khive_storage::CheckpointOutcomeRecordedPayload> = None;
+        let mut delivered = Vec::new();
+        let mut call_index = 0usize;
+        for &(above_warn, wal_pages) in ticks {
+            observe_checkpoint_pressure_tick(
+                above_warn,
+                wal_pages,
+                false,
+                false,
+                config,
+                &mut event_elevation_open,
+                &mut pressure_episode,
+                &mut pending_recovery,
+                |payload| {
+                    let idx = call_index;
+                    call_index += 1;
+                    if fail_on(idx) {
+                        false
+                    } else {
+                        delivered.push(payload);
+                        true
+                    }
+                },
+            );
+        }
+        delivered
+    }
+
+    /// #1857 regression: a dropped recovery handoff must not fold the next,
+    /// separate, pressure incident into the closed episode's aggregate — and
+    /// the undelivered recovery is a BARRIER, so episode 2's opening must not
+    /// be delivered ahead of episode 1's recovery (ADR-094: consumers assert
+    /// on the ordered event history).
+    ///
+    /// Sequence: episode 1 opens and sustains for 3 ticks, then its recovery
+    /// row is dropped (call index 1) and two retries are also dropped (call
+    /// indices 2 and 3) — the second of them on the tick where episode 2
+    /// begins, so the barrier defers episode 2's opening. Once the worker
+    /// frees up, episode 1's delayed recovery delivers first, then episode
+    /// 2's opening (reflecting its state at emission time), then episode 2's
+    /// recovery.
+    #[test]
+    fn dropped_recovery_handoff_does_not_merge_pressure_episodes() {
+        let config = CheckpointConfig {
+            warn_pages: 1_000,
+            ..CheckpointConfig::default()
+        };
+        let ticks = [
+            (true, 1_500), // call 0: episode 1 opens — delivered
+            (true, 1_800), // sustained, no emit attempt
+            (true, 2_000), // sustained, no emit attempt
+            (false, 500),  // call 1: episode 1 recovery — DROPPED
+            (false, 400),  // call 2: retry episode 1 recovery — DROPPED
+            (true, 3_000), // call 3: retry — DROPPED; barrier defers episode 2's opening
+            (true, 3_500), // call 4: retry — delivered; call 5: episode 2 opens — delivered
+            (false, 300),  // call 6: episode 2 recovery — delivered
+        ];
+
+        let delivered = drive_pressure_ticks(&config, &ticks, |idx| matches!(idx, 1..=3));
+
+        assert_eq!(
+            delivered.len(),
+            4,
+            "expected episode-1 open, episode-1 delayed recovery, episode-2 open, \
+             episode-2 recovery: {delivered:?}"
+        );
+
+        let ep1_open = &delivered[0];
+        assert!(ep1_open.above_warn);
+        assert_eq!(ep1_open.episode_elevated_ticks, Some(1));
+        assert_eq!(ep1_open.episode_peak_wal_pages, Some(1_500));
+
+        let ep1_recovery = &delivered[1];
+        assert!(
+            !ep1_recovery.above_warn,
+            "episode 1's recovery must be delivered BEFORE episode 2's opening; \
+             an opening in this slot means the barrier failed: {delivered:?}"
+        );
+        assert_eq!(
+            ep1_recovery.episode_elevated_ticks,
+            Some(3),
+            "episode 1's delayed recovery must report only its own 3 elevated ticks, \
+             not ticks absorbed from episode 2"
+        );
+        assert_eq!(ep1_recovery.episode_peak_wal_pages, Some(2_000));
+
+        let ep2_open = &delivered[2];
+        assert!(ep2_open.above_warn);
+        assert_eq!(
+            ep2_open.episode_elevated_ticks,
+            Some(2),
+            "episode 2 opens fresh (never continuing episode 1's count), deferred one \
+             tick by the barrier, so its opening reports 2 elevated ticks"
+        );
+        assert_eq!(ep2_open.episode_peak_wal_pages, Some(3_500));
+
+        let ep2_recovery = &delivered[3];
+        assert!(!ep2_recovery.above_warn);
+        assert_eq!(
+            ep2_recovery.episode_elevated_ticks,
+            Some(2),
+            "episode 2's recovery must report only its own 2 elevated ticks"
+        );
+        assert_eq!(ep2_recovery.episode_peak_wal_pages, Some(3_500));
+    }
+
+    /// Degenerate barrier arm: an episode whose entire lifetime falls inside
+    /// the window where an earlier recovery is still undelivered is discarded
+    /// rather than reported out of order — from any consumer's view it never
+    /// opened, so no stale opening or recovery for it may surface after the
+    /// queue frees. The loss itself is counted and logged at the discard
+    /// site; this test pins the delivered-history shape.
+    #[test]
+    fn episode_elapsed_entirely_behind_barrier_is_discarded_not_reordered() {
+        let config = CheckpointConfig {
+            warn_pages: 1_000,
+            ..CheckpointConfig::default()
+        };
+        let ticks = [
+            (true, 1_500), // call 0: episode 1 opens — delivered
+            (false, 500),  // call 1: episode 1 recovery — DROPPED
+            (true, 9_000), // call 2: retry — DROPPED; barrier defers episode 2's opening
+            (false, 400),  // call 3: retry — DROPPED; episode 2 discarded behind barrier
+            (false, 300),  // call 4: retry — delivered
+            (true, 2_500), // call 5: episode 3 opens — delivered
+            (false, 200),  // call 6: episode 3 recovery — delivered
+        ];
+
+        let delivered = drive_pressure_ticks(&config, &ticks, |idx| matches!(idx, 1..=3));
+
+        let peaks: Vec<_> = delivered
+            .iter()
+            .map(|payload| (payload.above_warn, payload.episode_peak_wal_pages))
+            .collect();
+        assert_eq!(
+            peaks,
+            vec![
+                (true, Some(1_500)),  // episode 1 open
+                (false, Some(1_500)), // episode 1 delayed recovery
+                (true, Some(2_500)),  // episode 3 open — episode 2 (peak 9_000) never surfaces
+                (false, Some(2_500)), // episode 3 recovery
+            ],
+            "an episode elapsed entirely behind the barrier must not surface late or \
+             out of order: {delivered:?}"
+        );
+    }
+
+    /// ASCII-simple control for the regression above: the identical tick
+    /// sequence with no queue drops must report the same two episodes
+    /// separately (and promptly), confirming the merge in the drop case is
+    /// caused by the drop, not by the tick sequence itself.
+    #[test]
+    fn no_dropped_handoff_reports_two_separate_episodes() {
+        let config = CheckpointConfig {
+            warn_pages: 1_000,
+            ..CheckpointConfig::default()
+        };
+        let ticks = [
+            (true, 1_500),
+            (true, 1_800),
+            (true, 2_000),
+            (false, 500),
+            (false, 400),
+            (true, 3_000),
+            (true, 3_500),
+            (false, 300),
+        ];
+
+        let delivered = drive_pressure_ticks(&config, &ticks, |_idx| false);
+
+        assert_eq!(delivered.len(), 4, "{delivered:?}");
+        assert_eq!(
+            (
+                delivered[0].above_warn,
+                delivered[0].episode_elevated_ticks,
+                delivered[0].episode_peak_wal_pages
+            ),
+            (true, Some(1), Some(1_500)),
+            "episode 1 open"
+        );
+        assert_eq!(
+            (
+                delivered[1].above_warn,
+                delivered[1].episode_elevated_ticks,
+                delivered[1].episode_peak_wal_pages
+            ),
+            (false, Some(3), Some(2_000)),
+            "episode 1 recovery"
+        );
+        assert_eq!(
+            (
+                delivered[2].above_warn,
+                delivered[2].episode_elevated_ticks,
+                delivered[2].episode_peak_wal_pages
+            ),
+            (true, Some(1), Some(3_000)),
+            "episode 2 open"
+        );
+        assert_eq!(
+            (
+                delivered[3].above_warn,
+                delivered[3].episode_elevated_ticks,
+                delivered[3].episode_peak_wal_pages
+            ),
+            (false, Some(2), Some(3_500)),
+            "episode 2 recovery"
+        );
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn pressure_diagnostics_count_observations_and_transitions_separately() {
+        reset_checkpoint_metrics_for_tests();
+
+        note_checkpoint_pressure_observation(true, false);
+        note_checkpoint_pressure_observation(true, true);
+        note_checkpoint_pressure_observation(true, true);
+        note_checkpoint_pressure_observation(false, true);
+        note_checkpoint_pressure_observation(false, false);
+
+        assert_eq!(checkpoint_pressure_elevated_ticks(), 3);
+        assert_eq!(checkpoint_pressure_episodes_started(), 1);
+        assert_eq!(checkpoint_pressure_episodes_recovered(), 1);
+        assert_eq!(checkpoint_lifecycle_append_attempts(), 0);
+    }
+
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
-    async fn checkpoint_task_emits_outcome_events_while_elevated_and_stops_after_drain() {
+    async fn checkpoint_task_emits_one_opening_for_persistent_pressure() {
+        reset_checkpoint_metrics_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_emit.db");
         let pool = file_pool(&path);
@@ -4314,8 +6127,10 @@ mod tests {
             true,
         ));
 
-        // Poll for the first emitted event instead of a fixed sleep (same
-        // slowdown-flake class as the stale-sweep test above).
+        let progressed = wait_for(Duration::from_secs(10), || {
+            checkpoint_pressure_elevated_ticks() >= 10
+        })
+        .await;
         let emitted = wait_for(Duration::from_secs(10), || {
             !store.events.lock().unwrap().is_empty()
         })
@@ -4328,9 +6143,25 @@ mod tests {
 
         let events = store.events.lock().unwrap();
         assert!(
+            progressed,
+            "the simulated persistent-pressure episode must span at least ten checkpoint ticks"
+        );
+        assert!(
             emitted,
-            "an always-elevated config must append at least one CheckpointOutcomeRecorded event \
+            "an always-elevated config must append one CheckpointOutcomeRecorded event \
              within the poll deadline"
+        );
+        assert_eq!(
+            checkpoint_lifecycle_append_attempts(),
+            1,
+            "primary-store lifecycle writes must stay O(state transitions), not O(attempts)"
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload_schema_version, 2);
+        assert_eq!(events[0].payload["episode_elevated_ticks"], 1);
+        assert_eq!(
+            events[0].payload["episode_peak_wal_pages"],
+            events[0].payload["wal_pages"]
         );
         assert!(
             events
@@ -4344,15 +6175,13 @@ mod tests {
         );
     }
 
-    /// Regression #1434: the event sink's ordinary writer checkout can wait
-    /// five seconds, but a full lifecycle queue must drop telemetry while the
-    /// checkpoint scheduler continues through later elevated ticks. The
-    /// separate in-memory event backend makes that writer contention
-    /// deterministic without also preventing `checkpoint_once` from
-    /// observing the file-backed checkpoint pool.
+    /// Regression #1434/#1838: a lifecycle append may wait five seconds for
+    /// its sink writer, while checkpoint observations must continue without
+    /// enqueueing one new row per elevated tick.
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_cycles_and_task_shutdown_do_not_wait_for_a_contended_lifecycle_writer() {
+        reset_checkpoint_metrics_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_contended_sink.db");
         let checkpoint_pool = file_pool(&path);
@@ -4381,12 +6210,6 @@ mod tests {
             .try_writer()
             .expect("hold the event-store writer");
 
-        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber {
-            events: std::sync::Arc::clone(&buffer),
-        };
-        let _tracing_guard = tracing::subscriber::set_default(subscriber);
-
         let cfg = CheckpointConfig {
             interval: Duration::from_millis(10),
             warn_pages: 0,
@@ -4401,19 +6224,16 @@ mod tests {
             true,
         ));
 
-        let dropped = wait_for(Duration::from_secs(2), || {
-            buffer.lock().unwrap().iter().any(|event| {
-                event.message.as_deref()
-                    == Some("checkpoint lifecycle event dropped because the append worker is busy")
-            })
+        let progressed = wait_for(Duration::from_secs(2), || {
+            checkpoint_pressure_elevated_ticks() >= 10
         })
         .await;
         assert!(
-            dropped,
-            "later elevated ticks must reach the non-blocking enqueue while the first append is \
-             still waiting for the held event writer; got: {:?}",
-            buffer.lock().unwrap()
+            progressed,
+            "checkpoint observations must continue while the lifecycle append is contended"
         );
+        assert_eq!(checkpoint_lifecycle_append_attempts(), 1);
+        assert_eq!(checkpoint_lifecycle_enqueue_drops(), 0);
 
         shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
@@ -4431,11 +6251,12 @@ mod tests {
         drop(held_event_writer);
     }
 
-    /// A sink error is observable, and the worker remains alive to accept a
-    /// later checkpoint outcome instead of terminating the scheduler.
+    /// A sink error is observable without turning a sustained pressure
+    /// episode into a retrying primary-store write loop.
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_continues_after_lifecycle_append_failure() {
+        reset_checkpoint_metrics_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_failing_sink.db");
         let pool = file_pool(&path);
@@ -4462,11 +6283,8 @@ mod tests {
             true,
         ));
 
-        let retried = wait_for(Duration::from_secs(2), || {
-            store
-                .append_attempts
-                .load(std::sync::atomic::Ordering::Relaxed)
-                >= 2
+        let progressed = wait_for(Duration::from_secs(2), || {
+            checkpoint_pressure_elevated_ticks() >= 10
         })
         .await;
         shutdown_tx.send(()).expect("send shutdown signal");
@@ -4476,9 +6294,18 @@ mod tests {
             .expect("checkpoint task panicked");
 
         assert!(
-            retried,
-            "a failed append must not terminate the worker or checkpoint task"
+            progressed,
+            "a failed append must not terminate or stall the checkpoint task"
         );
+        assert_eq!(
+            store
+                .append_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a persistent pressure state must not retry one primary-store append per tick"
+        );
+        assert_eq!(checkpoint_lifecycle_append_attempts(), 1);
+        assert_eq!(checkpoint_lifecycle_append_failures(), 1);
         let captured = buffer.lock().unwrap().clone();
         assert!(
             captured.iter().any(|event| event.message.as_deref()
@@ -4744,6 +6571,23 @@ mod tests {
                 .conn()
                 .execute_batch("CREATE TABLE IF NOT EXISTS t (x INTEGER);")
                 .unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
         }
 
         let pool = Arc::new(
@@ -5418,5 +7262,137 @@ mod tests {
         // Either an explicit error or a nonsensical negative `log` value is
         // acceptable here — the requirement is just "does not panic".
         let _ = query_wal_pin_depth(writer.conn());
+    }
+
+    /// #1849: a canonical filesystem identity is an OS path, not a display
+    /// label. Distinct non-UTF-8 Unix paths can render to the same lossy
+    /// string and must still occupy distinct backend telemetry slots.
+    #[cfg(unix)]
+    #[test]
+    fn routine_wal_backend_key_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_a = PathBuf::from(OsString::from_vec(b"/tmp/khive-wal-\x80.db".to_vec()));
+        let path_b = PathBuf::from(OsString::from_vec(b"/tmp/khive-wal-\x81.db".to_vec()));
+        assert_eq!(
+            path_a.display().to_string(),
+            path_b.display().to_string(),
+            "fixture must reproduce the lossy display-label collision"
+        );
+        assert_ne!(
+            checkpoint_db_key_from_path(Some(&path_a)),
+            checkpoint_db_key_from_path(Some(&path_b)),
+            "backend keys must retain the canonical path's exact OS bytes"
+        );
+    }
+
+    /// #1849: the periodic checkpoint's own PASSIVE row is the monitoring
+    /// sample. One tick must not issue the old no-arg probe followed by a
+    /// second PASSIVE, and the stored sample must distinguish logical
+    /// backlog from the physical sidecar high-water mark.
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn routine_checkpoint_records_one_pass_logical_and_physical_wal_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routine_wal_sample.db");
+        let pool = file_pool(&path);
+
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "PRAGMA wal_autocheckpoint=0; \
+                     CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT); \
+                     INSERT INTO t VALUES (0, 'seed');",
+                )
+                .unwrap();
+        }
+
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+            for id in 1..=256_i64 {
+                writer
+                    .conn()
+                    .execute("INSERT INTO t VALUES (?1, printf('%.*c', 2048, 'x'))", [id])
+                    .unwrap();
+            }
+            writer.conn().execute_batch("COMMIT").unwrap();
+        }
+
+        let checkpoint_conn = pool.open_standalone_writer().unwrap();
+        let pragma_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pragma_calls_from_hook = Arc::clone(&pragma_calls);
+        checkpoint_conn
+            .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Pragma { pragma_name, .. }
+                        if pragma_name.eq_ignore_ascii_case("wal_checkpoint")
+                ) {
+                    pragma_calls_from_hook.fetch_add(1, Ordering::SeqCst);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+
+        checkpoint_once(
+            &pool,
+            &checkpoint_conn,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        )
+        .unwrap();
+        checkpoint_conn
+            .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
+            .unwrap();
+
+        assert_eq!(
+            pragma_calls.load(Ordering::SeqCst),
+            1,
+            "one routine tick must issue exactly one PASSIVE checkpoint"
+        );
+        let pinned = routine_wal_observation(&pool).expect("routine sample");
+        assert!(pinned.log_frames > 0, "the test must create WAL frames");
+        assert!(
+            pinned.pending_frames > 0,
+            "the old reader must leave a logical backlog: {pinned:?}"
+        );
+        assert_eq!(
+            pinned.pending_frames,
+            pinned.log_frames.saturating_sub(pinned.checkpointed_frames)
+        );
+        assert!(
+            pinned.physical_wal_bytes.is_some_and(|bytes| bytes > 0),
+            "the physical sidecar high-water must be reported separately: {pinned:?}"
+        );
+
+        reader.execute_batch("COMMIT").unwrap();
+        checkpoint_once(
+            &pool,
+            &checkpoint_conn,
+            &CheckpointConfig::default(),
+            &mut TruncateState::default(),
+        )
+        .unwrap();
+        let drained = routine_wal_observation(&pool).expect("drained routine sample");
+        assert_eq!(drained.pending_frames, 0, "unpinned PASSIVE must drain");
+        assert!(
+            drained.physical_wal_bytes.is_some_and(|bytes| bytes > 0),
+            "PASSIVE may reuse rather than shrink the physical WAL; the two gauges must remain \
+             independently visible: {drained:?}"
+        );
     }
 }

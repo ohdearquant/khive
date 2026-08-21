@@ -30,6 +30,10 @@
 //! reconciliation manifest. An aborted manifest names confirmed committed
 //! chunks and any dispatched chunk whose response could not be verified.
 //! Without `--save-file`, validated row payloads are discarded after aggregation.
+//! `--serial` keeps the same logical chunks and one warm server/model instance,
+//! but runs each full chunk through the same batch path with handler concurrency
+//! capped at one. The default remains bounded parallel execution; `--serial`
+//! conflicts with `--atomic`.
 //! `--dry-run` validates every line and prints a per-verb summary without writes.
 
 use std::collections::BTreeMap;
@@ -45,11 +49,11 @@ use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
     enforce_strict_actor_mode, install_resolved_blob_store,
     normalize_redundant_db_override_with_source, reject_conflicting_db_override_with_source,
-    RuntimeConfigInputs,
+    validate_declared_backend_access_modes, RuntimeConfigInputs,
 };
-#[cfg(unix)]
-use khive_mcp::server::compute_config_id;
 use khive_mcp::server::KhiveMcpServer;
+#[cfg(unix)]
+use khive_mcp::server::{compute_config_id, compute_config_id_with_storage_mode};
 use khive_mcp::tools::request::RequestParams;
 #[cfg(unix)]
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
@@ -226,18 +230,29 @@ type ForwardFuture<'a> = std::pin::Pin<
 
 /// Function pointer type for the daemon-forwarding seam.
 #[cfg(unix)]
-type ForwardFnPtr =
-    for<'a> fn(&'a DaemonRequestFrame, Option<PathBuf>, Option<&'a str>) -> ForwardFuture<'a>;
+type ForwardFnPtr = for<'a> fn(
+    &'a DaemonRequestFrame,
+    Option<PathBuf>,
+    Option<&'a str>,
+    Vec<String>,
+) -> ForwardFuture<'a>;
 
-/// Adapts the real `forward_or_spawn` to the `ForwardFnPtr` signature.
+/// Adapts the real `forward_or_spawn_with_config_and_packs` to the `ForwardFnPtr` signature.
 #[cfg(unix)]
 fn forward_or_spawn_boxed<'a>(
     frame: &'a DaemonRequestFrame,
     config: Option<PathBuf>,
     db: Option<&'a str>,
+    packs: Vec<String>,
 ) -> ForwardFuture<'a> {
     Box::pin(async move {
-        khive_mcp::daemon::forward_or_spawn_with_config(frame, config.as_deref(), db).await
+        khive_mcp::daemon::forward_or_spawn_with_config_and_packs(
+            frame,
+            config.as_deref(),
+            db,
+            Some(&packs),
+        )
+        .await
     })
 }
 
@@ -353,6 +368,18 @@ const MAX_OPS_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 const MAX_OPS_FILE_FAILURE_DETAILS: usize = 1_000;
 const MAX_OPS_FILE_FAILURE_ERROR_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpsFileDispatchMode {
+    BoundedParallel,
+    Serial,
+}
+
+impl OpsFileDispatchMode {
+    const fn is_serial(self) -> bool {
+        matches!(self, Self::Serial)
+    }
+}
 
 /// Arguments for `kkernel exec` — execute a verb DSL expression against a chosen
 /// database and namespace, the same syntax accepted by the MCP `request` tool.
@@ -478,6 +505,9 @@ pub struct ExecArgs {
     /// prints its ordinary manifest. A later failure leaves database effects
     /// incremental, discards the incomplete temp file, and prints an aborted
     /// reconciliation manifest before returning non-zero.
+    /// Pass `--serial` to retain those logical chunks while awaiting every
+    /// handler before starting the next; this keeps one warm server/model and
+    /// limits handler concurrency to one.
     ///
     /// Mutually exclusive with the positional `ops` argument.
     #[arg(long, value_name = "PATH")]
@@ -487,6 +517,20 @@ pub struct ExecArgs {
     /// without writing anything.  Only valid with `--ops-file`.
     #[arg(long, requires = "ops_file")]
     pub dry_run: bool,
+
+    /// Await each JSON op to completion before dispatching the next one.
+    ///
+    /// This keeps one in-process server and its loaded models warm while
+    /// limiting handler concurrency to exactly one. It is intended for
+    /// resource-constrained backends where an ordinary parallel ops-file batch
+    /// can exhaust a reader or model resource. Only valid with `--ops-file` and
+    /// mutually exclusive with both positional inline ops and `--atomic`.
+    #[arg(
+        long,
+        requires = "ops_file",
+        conflicts_with_all = ["atomic", "ops"]
+    )]
+    pub serial: bool,
 
     /// Run the whole ops-file as ONE cross-op atomic unit (ADR-099): every op
     /// commits or the whole file rolls back, with zero partial state either
@@ -686,6 +730,94 @@ where
     Ok(ops)
 }
 
+/// Validate every decoded JSON op in the stable snapshot before the first
+/// handler can mutate state.
+///
+/// This is deliberately a bounded second pass: at most one ordinary logical
+/// chunk is materialized, and one over-target physical line may stand alone.
+/// It pins the typed parser's nesting, `$prev`, and reserved-envelope guards
+/// across the whole file rather than discovering a later invalid op after an
+/// earlier serial dispatch has committed.
+fn preflight_typed_validated_snapshot<R>(snapshot: &mut R, expected_total: usize) -> Result<()>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    snapshot
+        .rewind()
+        .context("rewind validated ops-file snapshot for typed preflight")?;
+    let result: Result<()> = (|| {
+        let mut reader = std::io::BufReader::new(&mut *snapshot);
+        let mut processed = 0_usize;
+        let mut line_number = 1_usize;
+        let mut chunk_number = 0_usize;
+        let mut pending: Option<(OpsFileEntry, usize)> = None;
+        let mut eof = false;
+
+        while !eof {
+            let mut chunk = Vec::with_capacity(OPS_FILE_CHUNK_SIZE);
+            let mut chunk_bytes = 0_usize;
+            if let Some((op, bytes)) = pending.take() {
+                chunk_bytes = bytes;
+                chunk.push(op);
+            }
+            while chunk.len() < OPS_FILE_CHUNK_SIZE {
+                let Some(raw) = read_bounded_ops_line(&mut reader, line_number)? else {
+                    eof = true;
+                    break;
+                };
+                let physical_bytes = raw.len().saturating_add(1);
+                if let Some(op) = parse_ops_file_line(&raw, line_number)? {
+                    if should_defer_chunk_entry(chunk.len(), chunk_bytes, physical_bytes) {
+                        pending = Some((op, physical_bytes));
+                        line_number += 1;
+                        break;
+                    }
+                    chunk_bytes = chunk_bytes.saturating_add(physical_bytes);
+                    chunk.push(op);
+                }
+                line_number += 1;
+            }
+            if chunk.is_empty() {
+                break;
+            }
+
+            chunk_number += 1;
+            let chunk_len = chunk.len();
+            let typed_ops = chunk
+                .into_iter()
+                .map(|op| {
+                    let serde_json::Value::Object(args) = op.args else {
+                        unreachable!("validated ops-file args are always JSON objects")
+                    };
+                    khive_request::TypedJsonOp {
+                        tool: op.tool,
+                        args,
+                    }
+                })
+                .collect();
+            khive_request::parse_typed_json_batch(typed_ops).map_err(|error| {
+                refusal_error(
+                    RefusalReason::ParseError,
+                    format!("ops-file typed preflight chunk {chunk_number}: {error}"),
+                )
+            })?;
+            processed += chunk_len;
+        }
+
+        if processed != expected_total {
+            anyhow::bail!(
+                "validated ops-file snapshot changed during typed preflight: expected \
+                 {expected_total} ops, read {processed}"
+            );
+        }
+        Ok(())
+    })();
+    snapshot
+        .rewind()
+        .context("rewind typed-preflighted ops-file snapshot")?;
+    result
+}
+
 fn validated_tool_names<R>(snapshot: &mut R) -> Result<Vec<String>>
 where
     R: std::io::Read + std::io::Seek,
@@ -874,20 +1006,20 @@ fn required_summary_count(parsed: &serde_json::Value, field: &str) -> Result<usi
 }
 
 fn classify_ordered_chunk(
-    chunk: &[OpsFileEntry],
+    expected_tools: &[String],
     results: &[serde_json::Value],
 ) -> Result<(usize, usize, usize)> {
-    if results.len() != chunk.len() {
+    if results.len() != expected_tools.len() {
         anyhow::bail!(
             "ordered chunk result count {} does not match input count {}",
             results.len(),
-            chunk.len()
+            expected_tools.len()
         );
     }
     let mut succeeded = 0_usize;
     let mut failed = 0_usize;
     let mut aborted = 0_usize;
-    for (index, (op, row)) in chunk.iter().zip(results).enumerate() {
+    for (index, (expected_tool, row)) in expected_tools.iter().zip(results).enumerate() {
         let object = row
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} is not a JSON object"))?;
@@ -895,10 +1027,10 @@ fn classify_ordered_chunk(
             .get("tool")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("dispatch result row {index} has no string tool"))?;
-        if returned_tool != op.tool {
+        if returned_tool != expected_tool {
             anyhow::bail!(
                 "dispatch result row {index} tool mismatch: expected {:?}, got {:?}",
-                op.tool,
+                expected_tool,
                 returned_tool
             );
         }
@@ -955,7 +1087,7 @@ fn classify_ordered_chunk(
 }
 
 fn validate_ordered_chunk_envelope(
-    chunk: &[OpsFileEntry],
+    expected_tools: &[String],
     parsed: &serde_json::Value,
     chunk_number: usize,
 ) -> Result<(usize, usize, usize)> {
@@ -970,15 +1102,15 @@ fn validate_ordered_chunk_envelope(
     let chunk_failed = required_summary_count(parsed, "failed")?;
     let chunk_aborted = required_summary_count(parsed, "aborted")?;
     let (derived_succeeded, derived_failed, derived_aborted) =
-        classify_ordered_chunk(chunk, results)?;
-    if chunk_total != chunk.len()
+        classify_ordered_chunk(expected_tools, results)?;
+    if chunk_total != expected_tools.len()
         || chunk_succeeded != derived_succeeded
         || chunk_failed != derived_failed
         || chunk_aborted != derived_aborted
     {
         anyhow::bail!(
             "dispatch chunk {chunk_number} summary disagrees with ordered rows: expected total {}, summary total {}, derived/summary succeeded {derived_succeeded}/{chunk_succeeded}, failed {derived_failed}/{chunk_failed}, aborted {derived_aborted}/{chunk_aborted}",
-            chunk.len(),
+            expected_tools.len(),
             chunk_total,
         );
     }
@@ -1075,6 +1207,7 @@ fn emit_aborted_ops_file_manifest(
 /// Apply a parsed ops-file against the given server, printing progress to
 /// stderr and either the final summary or a success/aborted save manifest.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn apply_ops_file_reader<R: std::io::BufRead>(
     server: &KhiveMcpServer,
     reader: R,
@@ -1084,7 +1217,7 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
     save_file: Option<String>,
     strict: bool,
 ) -> Result<serde_json::Value> {
-    apply_ops_file_reader_with_response_transform(
+    apply_ops_file_reader_with_dispatch_mode(
         server,
         reader,
         total,
@@ -1092,13 +1225,68 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
         _output_format,
         save_file,
         strict,
+        OpsFileDispatchMode::BoundedParallel,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_reader_with_dispatch_mode<R: std::io::BufRead>(
+    server: &KhiveMcpServer,
+    reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
+) -> Result<serde_json::Value> {
+    apply_ops_file_reader_with_response_transform_and_dispatch_mode(
+        server,
+        reader,
+        total,
+        presentation,
+        _output_format,
+        save_file,
+        strict,
+        dispatch_mode,
         |_, raw| raw,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn apply_ops_file_reader_with_response_transform<R, F>(
+    server: &KhiveMcpServer,
+    reader: R,
+    total: usize,
+    presentation: Option<String>,
+    _output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    response_transform: F,
+) -> Result<serde_json::Value>
+where
+    R: std::io::BufRead,
+    F: FnMut(usize, String) -> String,
+{
+    apply_ops_file_reader_with_response_transform_and_dispatch_mode(
+        server,
+        reader,
+        total,
+        presentation,
+        _output_format,
+        save_file,
+        strict,
+        OpsFileDispatchMode::BoundedParallel,
+        response_transform,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_reader_with_response_transform_and_dispatch_mode<R, F>(
     server: &KhiveMcpServer,
     mut reader: R,
     total: usize,
@@ -1106,6 +1294,7 @@ async fn apply_ops_file_reader_with_response_transform<R, F>(
     _output_format: Option<String>,
     save_file: Option<String>,
     strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
     mut response_transform: F,
 ) -> Result<serde_json::Value>
 where
@@ -1141,6 +1330,8 @@ where
 
     let execution_result: Result<()> = async {
         while !eof {
+            // `--serial` changes handler concurrency, not the established
+            // logical chunk/progress/reconciliation boundary.
             let mut chunk = Vec::with_capacity(OPS_FILE_CHUNK_SIZE);
             let mut chunk_bytes = 0_usize;
             if let Some((op, bytes)) = pending.take() {
@@ -1169,41 +1360,54 @@ where
             }
             let applied_before = processed;
 
-            // Serialize the typed entries directly; avoid a second Value tree that
-            // would clone every base64 argument before producing the request text.
-            let batch_json = serde_json::to_string(&chunk).context("serialize chunk to JSON")?;
-
-            let params = RequestParams {
-                ops: batch_json,
-                presentation: presentation.clone(),
-                presentation_per_op: None,
-                save_to: None,
-                // Inline --save-file writes raw results before format rendering.
-                // Reproduce that lossless shape for the combined bulk save. The
-                // no-save path deliberately preserves its pre-PR behavior, which
-                // did not forward the CLI output-format override to each chunk.
-                format: if save_sink.is_some() {
-                    Some("json".to_string())
-                } else {
-                    None
-                },
-                format_per_op: None,
-                request_id: None,
-            };
+            let chunk_len = chunk.len();
+            let expected_tools: Vec<String> = chunk.iter().map(|op| op.tool.clone()).collect();
+            let typed_ops: Vec<khive_request::TypedJsonOp> = chunk
+                .into_iter()
+                .map(|op| {
+                    let serde_json::Value::Object(args) = op.args else {
+                        unreachable!("validated ops-file args are always JSON objects")
+                    };
+                    khive_request::TypedJsonOp {
+                        tool: op.tool,
+                        args,
+                    }
+                })
+                .collect();
 
             let chunk_number = chunk_idx + 1;
             dispatched_chunk = Some(chunk_number);
-            let raw = server
-                .dispatch_request_local(params)
-                .await
-                .map_err(|e| anyhow::anyhow!("dispatch chunk {chunk_number}: {e}"))?;
+            let output_format = save_sink.is_some().then(|| "json".to_string());
+            let raw = if dispatch_mode.is_serial() {
+                server
+                    .dispatch_typed_json_batch_serial_local_for_exec(
+                        typed_ops,
+                        presentation.clone(),
+                        output_format,
+                        strict,
+                    )
+                    .await
+            } else {
+                server
+                    .dispatch_typed_json_batch_local_for_exec(
+                        typed_ops,
+                        presentation.clone(),
+                        // Inline --save-file writes raw results before format
+                        // rendering. Reproduce that lossless shape for combined
+                        // bulk save. No-save preserves its legacy behavior.
+                        output_format,
+                        strict,
+                    )
+                    .await
+            }
+            .map_err(|error| anyhow::anyhow!("dispatch chunk {chunk_number}: {error}"))?;
             let raw = response_transform(chunk_number, raw);
 
             let mut parsed: serde_json::Value =
                 serde_json::from_str(&raw).context("parse dispatch result")?;
             annotate_and_emit_refusals(&mut parsed, strict);
             let (chunk_succeeded, chunk_failed, chunk_aborted) =
-                validate_ordered_chunk_envelope(&chunk, &parsed, chunk_number)?;
+                validate_ordered_chunk_envelope(&expected_tools, &parsed, chunk_number)?;
             let chunk_results = parsed["results"]
                 .as_array()
                 .expect("validated ordered results array");
@@ -1211,7 +1415,7 @@ where
             total_succeeded += chunk_succeeded;
             total_failed += chunk_failed;
             total_aborted += chunk_aborted;
-            confirmed_ops += chunk.len();
+            confirmed_ops += chunk_len;
             committed_chunks.push(chunk_number);
             dispatched_chunk = None;
 
@@ -1228,7 +1432,7 @@ where
                     &mut failures,
                     &mut failure_details_omitted,
                 ) {
-                    eprintln!("op {} ({}) failed: {reason}", op_index, tool,);
+                    eprintln!("op {} ({}) failed: {reason}", op_index, tool);
                 }
             }
 
@@ -1238,7 +1442,7 @@ where
                 }
             }
 
-            processed += chunk.len();
+            processed += chunk_len;
             let applied_now = processed;
             eprintln!(
                 "{}",
@@ -1389,6 +1593,40 @@ async fn apply_ops_file(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
+async fn apply_ops_file_with_dispatch_mode(
+    server: &KhiveMcpServer,
+    ops: Vec<OpsFileEntry>,
+    presentation: Option<String>,
+    output_format: Option<String>,
+    save_file: Option<String>,
+    strict: bool,
+    dispatch_mode: OpsFileDispatchMode,
+) -> Result<serde_json::Value> {
+    let total = ops.len();
+    let mut encoded = Vec::new();
+    for op in ops {
+        serde_json::to_writer(
+            &mut encoded,
+            &serde_json::json!({"tool": op.tool, "args": op.args}),
+        )
+        .context("serialize test ops-file entry")?;
+        encoded.push(b'\n');
+    }
+    apply_ops_file_reader_with_dispatch_mode(
+        server,
+        std::io::Cursor::new(encoded),
+        total,
+        presentation,
+        output_format,
+        save_file,
+        strict,
+        dispatch_mode,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn apply_ops_file_with_response_transform<F>(
     server: &KhiveMcpServer,
     ops: Vec<OpsFileEntry>,
@@ -1442,6 +1680,14 @@ where
 /// skipped entirely, and all ops are dispatched through the in-process runtime
 /// in chunks (see module-level docs).
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
+    // Clap enforces these relations for normal CLI entry. Keep the same
+    // boundary for library callers that construct `ExecArgs` directly.
+    if args.serial && (args.ops_file.is_none() || args.ops.is_some() || args.atomic) {
+        anyhow::bail!(
+            "--serial requires --ops-file and conflicts with positional ops and --atomic"
+        );
+    }
+
     // ── pending-events drain ─────────────────────────────────────────────────
     if args.pending_events {
         let summary = pending_events::run_pending_events_with_config(
@@ -1471,7 +1717,6 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         (Some(ops), None) => ExecMode::Inline(ops.clone()),
         (None, Some(path)) => ExecMode::OpsFile(path.clone()),
     };
-
     // Parsing is the invocation boundary, before identity/configuration guards
     // choose a competing refusal. This makes malformed inline DSL and malformed
     // JSONL deterministically report `parse-error` regardless of whether strict
@@ -1570,6 +1815,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 args.save_file,
                 args.dry_run,
                 db_context,
+                args.serial,
                 args.atomic,
                 args.atomic_max_ops,
                 args.strict,
@@ -1970,8 +2216,10 @@ async fn run_exec_inline_with_forward(
     // correctly rejects it. A matching concrete override is redundant, so its
     // fingerprint and captured construction anchor are normalized to the same
     // values used when no override is supplied.
-    if !khive_cfg.backends.is_empty() {
-        normalize_redundant_db_override_with_source(
+    let force_memory = if khive_cfg.backends.is_empty() {
+        false
+    } else {
+        let force_memory = normalize_redundant_db_override_with_source(
             &mut cfg,
             db_context.raw.as_deref(),
             &khive_cfg.backends,
@@ -1980,6 +2228,11 @@ async fn run_exec_inline_with_forward(
         if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
             db_context.anchor = cfg.db_path.clone();
         }
+        force_memory
+    };
+
+    if !force_memory {
+        validate_declared_backend_access_modes(&khive_cfg.backends)?;
     }
 
     disclose_resolved_database(&cfg, &khive_cfg);
@@ -2006,8 +2259,16 @@ async fn run_exec_inline_with_forward(
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
             // Fold the SAME backends topology the daemon folds (`Some(&khive_cfg)`)
-            // instead of `None` — see the `khive_cfg` load above.
-            config_id: compute_config_id(&cfg, Some(&khive_cfg)),
+            // instead of `None` — see the `khive_cfg` load above. A force-memory
+            // override also supplies the effective writable mode explicitly:
+            // the declaration can say `main.read_only = true`, but the runtime
+            // the child opens is writable memory and fingerprints that captured
+            // mode after construction.
+            config_id: if force_memory {
+                compute_config_id_with_storage_mode(&cfg, Some(&khive_cfg), false)
+            } else {
+                compute_config_id(&cfg, Some(&khive_cfg))
+            },
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
             metrics_only: false,
@@ -2061,7 +2322,12 @@ async fn run_exec_inline_with_forward(
             }
             _ => None,
         };
-        if let Some(res) = forward_fn(&frame, spawn_config, spawn_db).await {
+        // Forward this client's already-resolved pack list unconditionally so
+        // a daemon this call spawns matches `cfg`'s `config_id` fingerprint
+        // (which folds `packs`) instead of re-deriving its own selection from
+        // ambient env/config and risking a mismatch (khive-oss#1941).
+        let spawn_packs = cfg.packs.clone();
+        if let Some(res) = forward_fn(&frame, spawn_config, spawn_db, spawn_packs).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             let output = prepare_exec_output(&output, strict);
             println!("{output}");
@@ -2138,6 +2404,45 @@ fn build_local_fallback_server(
     }
 }
 
+struct AtomicSavePublishFailure {
+    stdout: String,
+    error: anyhow::Error,
+}
+
+/// Render the authoritative atomic stdout value. A save sink is preflighted
+/// before execution, but its writes/flush/rename necessarily happen after the
+/// database outcome is known. If that publication fails after a commit, keep
+/// the process failure while returning a reconciliation envelope that makes
+/// the durable, non-retryable outcome explicit.
+fn render_atomic_output(
+    envelope: &mut serde_json::Value,
+    save_sink: Option<khive_mcp::save_sink::JsonlSaveSink>,
+) -> std::result::Result<String, AtomicSavePublishFailure> {
+    let Some(save_sink) = save_sink else {
+        return Ok(serde_json::to_string_pretty(envelope).expect("serialize atomic envelope"));
+    };
+
+    match save_sink.write_envelope(envelope) {
+        Ok(manifest) => {
+            Ok(serde_json::to_string(&manifest).expect("serialize atomic save manifest"))
+        }
+        Err(error) => {
+            let committed = crate::atomic_apply::record_save_file_publish_failure(envelope, &error);
+            let stdout = serde_json::to_string_pretty(envelope)
+                .expect("serialize atomic save failure reconciliation envelope");
+            let error = if committed {
+                error.context(
+                    "atomic database changes committed but --save-file publication failed; \
+                     do not replay the mutation (inspect stdout for reconciliation details)",
+                )
+            } else {
+                error.context("atomic --save-file publication failed")
+            };
+            Err(AtomicSavePublishFailure { stdout, error })
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
@@ -2147,10 +2452,15 @@ async fn run_exec_ops_file(
     save_file: Option<String>,
     dry_run: bool,
     db_context: ExecDbContext,
+    serial: bool,
     atomic: bool,
     atomic_max_ops: Option<usize>,
     strict: bool,
 ) -> Result<()> {
+    if serial && atomic {
+        anyhow::bail!("--serial conflicts with --atomic");
+    }
+
     // Validate the whole file and spool a stable bounded snapshot before any
     // runtime construction or writes. Non-atomic dispatch retains only one
     // request chunk plus ordered result envelopes in memory.
@@ -2169,6 +2479,20 @@ async fn run_exec_ops_file(
 
     if validated.total == 0 {
         anyhow::bail!("ops-file is empty (no non-blank lines): {}", path.display());
+    }
+
+    if serial {
+        if let Err(error) =
+            preflight_typed_validated_snapshot(&mut validated.snapshot, validated.total)
+        {
+            if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
+                return Err(report_unscoped_refusal(
+                    refusal.reason,
+                    refusal.message.as_str(),
+                ));
+            }
+            return Err(error);
+        }
     }
 
     if dry_run {
@@ -2245,11 +2569,15 @@ async fn run_exec_ops_file(
                 }
             };
         annotate_and_emit_refusals(&mut envelope, strict);
-        let output = if let Some(save_sink) = save_sink {
-            let manifest = save_sink.write_envelope(&envelope)?;
-            serde_json::to_string(&manifest).expect("serialize atomic save manifest")
-        } else {
-            serde_json::to_string_pretty(&envelope).expect("serialize atomic envelope")
+        let output = match render_atomic_output(&mut envelope, save_sink) {
+            Ok(output) => output,
+            Err(failure) => {
+                // stdout is the machine reconciliation channel. Emit it before
+                // returning the non-zero sink error so callers never infer that
+                // silence means the atomic database unit is safe to replay.
+                println!("{}", failure.stdout);
+                return Err(failure.error);
+            }
         };
         println!("{output}");
         return Ok(());
@@ -2266,7 +2594,7 @@ async fn run_exec_ops_file(
         .snapshot
         .rewind()
         .context("rewind validated ops-file snapshot for dispatch")?;
-    apply_ops_file_reader(
+    apply_ops_file_reader_with_dispatch_mode(
         &server,
         std::io::BufReader::new(validated.snapshot),
         validated.total,
@@ -2274,6 +2602,11 @@ async fn run_exec_ops_file(
         output_format,
         save_file,
         strict,
+        if serial {
+            OpsFileDispatchMode::Serial
+        } else {
+            OpsFileDispatchMode::BoundedParallel
+        },
     )
     .await
     .map(|_| ())
@@ -2285,6 +2618,7 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
     use tempfile::NamedTempFile;
+    use uuid::Uuid;
 
     // ── collect_op_failures: per-op error surfacing (#1228) ───────────────────
 
@@ -2536,6 +2870,28 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// RAII guard restoring `KHIVE_PACKS`, `HOME`, and the working directory
+    /// to their pre-test values on every exit path, including an unwinding
+    /// panic — a bare cleanup call at the end of a test function only runs
+    /// when every earlier statement (setup and assertions alike) succeeds,
+    /// which leaks process-globals to later `#[serial]` tests otherwise.
+    struct EnvAndCwdGuard {
+        original_packs: Option<std::ffi::OsString>,
+        original_home: Option<std::ffi::OsString>,
+        original_cwd: std::path::PathBuf,
+    }
+
+    impl Drop for EnvAndCwdGuard {
+        fn drop(&mut self) {
+            match self.original_packs.take() {
+                Some(v) => std::env::set_var("KHIVE_PACKS", v),
+                None => std::env::remove_var("KHIVE_PACKS"),
+            }
+            restore_home(self.original_home.take());
+            let _ = std::env::set_current_dir(&self.original_cwd);
         }
     }
 
@@ -2919,6 +3275,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn serial_requires_ops_file_conflicts_with_inline_and_atomic_and_defaults_off() {
+        let serial =
+            ExecArgs::try_parse_from(["exec", "--ops-file", "/tmp/batch.jsonl", "--serial"])
+                .expect("--serial must be accepted for a non-atomic ops-file");
+        assert!(serial.serial);
+
+        let default_parallel = ExecArgs::parse_from(["exec", "--ops-file", "/tmp/batch.jsonl"]);
+        assert!(!default_parallel.serial);
+
+        assert!(
+            ExecArgs::try_parse_from(["exec", "stats()", "--serial"]).is_err(),
+            "--serial without --ops-file must fail during CLI parsing"
+        );
+        assert!(
+            ExecArgs::try_parse_from([
+                "exec",
+                "stats()",
+                "--ops-file",
+                "/tmp/batch.jsonl",
+                "--serial",
+            ])
+            .is_err(),
+            "--serial must not compose with inline positional ops"
+        );
+        assert!(
+            ExecArgs::try_parse_from([
+                "exec",
+                "--ops-file",
+                "/tmp/batch.jsonl",
+                "--atomic",
+                "--serial",
+            ])
+            .is_err(),
+            "--serial and --atomic are distinct execution contracts and must conflict"
+        );
+    }
+
     // ── isolated DB helpers ────────────────────────────────────────────────────
 
     /// Build an isolated in-process runtime using a temp-file SQLite database.
@@ -2937,6 +3331,117 @@ mod tests {
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
         KhiveMcpServer::new(rt).expect("server on temp db")
+    }
+
+    struct OpsFileConcurrencyProbePack {
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        reject_overlap: bool,
+    }
+
+    impl khive_types::Pack for OpsFileConcurrencyProbePack {
+        const NAME: &'static str = "ops-file-concurrency-probe";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+            name: "reader_probe",
+            description: "records test-only handler concurrency",
+            visibility: khive_runtime::Visibility::Verb,
+            category: khive_runtime::VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    struct ProbeInFlightGuard {
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for ProbeInFlightGuard {
+        fn drop(&mut self) {
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for OpsFileConcurrencyProbePack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            params: serde_json::Value,
+            _registry: &khive_runtime::VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> std::result::Result<serde_json::Value, khive_runtime::RuntimeError> {
+            let current = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let _guard = ProbeInFlightGuard {
+                in_flight: self.in_flight.clone(),
+            };
+            self.max_in_flight
+                .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            if params["fail"].as_bool().unwrap_or(false) {
+                return Err(khive_runtime::RuntimeError::Internal(
+                    "requested probe failure".to_string(),
+                ));
+            }
+            if self.reject_overlap && current > 1 {
+                return Err(khive_runtime::RuntimeError::Internal(
+                    "sql_bridge.reader_open constrained-reader overlap".to_string(),
+                ));
+            }
+            Ok(serde_json::json!({"sequence": params["sequence"]}))
+        }
+    }
+
+    fn concurrency_probe_server(
+        reject_overlap: bool,
+    ) -> (
+        KhiveMcpServer,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(OpsFileConcurrencyProbePack {
+            in_flight: in_flight.clone(),
+            max_in_flight: max_in_flight.clone(),
+            reject_overlap,
+        });
+        (
+            KhiveMcpServer::from_registry(builder.build().expect("probe registry")),
+            in_flight,
+            max_in_flight,
+        )
+    }
+
+    fn reader_probe_ops(count: usize) -> Vec<OpsFileEntry> {
+        (0..count)
+            .map(|sequence| OpsFileEntry {
+                tool: "reader_probe".to_string(),
+                args: serde_json::json!({"sequence": sequence}),
+            })
+            .collect()
     }
 
     // ── isolated_server ignores ambient KHIVE_PACKS (#1276) ───────────────────
@@ -2975,6 +3480,33 @@ mod tests {
         let _server = isolated_server(&db_path);
     }
 
+    fn rerun_in_command_scoped_empty_home(child_marker: &str, test_name: &str) -> bool {
+        if std::env::var_os(child_marker).is_some() {
+            return false;
+        }
+
+        let calling_process_home = std::env::var_os("HOME");
+        let empty_home = tempfile::tempdir().expect("isolated child HOME");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg(test_name)
+                .arg("--exact")
+                .env("HOME", empty_home.path())
+                .env_remove("KHIVE_EMBEDDING_MODEL")
+                .env_remove("KHIVE_ADDITIONAL_EMBEDDING_MODELS")
+                .env_remove("KHIVE_ACTOR")
+                .env(child_marker, "1")
+                .status()
+                .expect("spawn isolated config-discovery test process");
+        assert_eq!(
+            std::env::var_os("HOME"),
+            calling_process_home,
+            "command-scoped HOME must not mutate the calling test process"
+        );
+        assert!(status.success(), "isolated child test failed: {status}");
+        true
+    }
+
     // ── exec-path / serve-path config_id parity (#581) ────────────────────────
     //
     // `run_exec`'s cfg construction (above) and `kkernel mcp`'s `build_server`
@@ -2992,9 +3524,12 @@ mod tests {
     #[test]
     #[serial]
     fn exec_config_id_matches_serve_config_id_for_project_toml_actor() {
-        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
-        std::env::remove_var("KHIVE_ACTOR");
+        const CHILD_MARKER: &str = "KKERNEL_EXEC_PROJECT_CONFIG_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::exec_config_id_matches_serve_config_id_for_project_toml_actor";
+        if rerun_in_command_scoped_empty_home(CHILD_MARKER, TEST_NAME) {
+            return;
+        }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -3101,9 +3636,12 @@ default = true
     #[test]
     #[serial]
     fn actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback() {
-        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
-        std::env::remove_var("KHIVE_ACTOR");
+        const CHILD_MARKER: &str = "KKERNEL_ACTOR_PIN_CONFIG_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback";
+        if rerun_in_command_scoped_empty_home(CHILD_MARKER, TEST_NAME) {
+            return;
+        }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -3497,7 +4035,7 @@ id = "lambda:fallback"
                 .await
                 .expect("list must dispatch");
             let resp: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-            resp["results"][0]["result"]
+            resp["results"][0]["result"]["items"]
                 .as_array()
                 .map(|a| a.len())
                 .unwrap_or(0)
@@ -3984,19 +4522,10 @@ id = "lambda:fallback"
 
     #[test]
     fn ordered_chunk_contract_rejects_tool_or_summary_drift() {
-        let ops = vec![
-            OpsFileEntry {
-                tool: "first".to_string(),
-                args: serde_json::json!({}),
-            },
-            OpsFileEntry {
-                tool: "second".to_string(),
-                args: serde_json::json!({}),
-            },
-            OpsFileEntry {
-                tool: "third".to_string(),
-                args: serde_json::json!({}),
-            },
+        let tools = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
         ];
         let valid = serde_json::json!({
             "results": [
@@ -4008,18 +4537,18 @@ id = "lambda:fallback"
             "status":"partial"
         });
         assert_eq!(
-            validate_ordered_chunk_envelope(&ops, &valid, 1).unwrap(),
+            validate_ordered_chunk_envelope(&tools, &valid, 1).unwrap(),
             (1, 1, 1)
         );
 
         let mut wrong_tool = valid.clone();
         wrong_tool["results"][1]["tool"] = serde_json::json!("third");
-        assert!(validate_ordered_chunk_envelope(&ops, &wrong_tool, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &wrong_tool, 1).is_err());
 
         let mut lying_summary = valid;
         lying_summary["summary"]["succeeded"] = serde_json::json!(2);
         lying_summary["summary"]["failed"] = serde_json::json!(0);
-        assert!(validate_ordered_chunk_envelope(&ops, &lying_summary, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &lying_summary, 1).is_err());
 
         let mut missing_result = serde_json::json!({
             "results": [
@@ -4030,13 +4559,13 @@ id = "lambda:fallback"
             "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
             "status":"partial"
         });
-        assert!(validate_ordered_chunk_envelope(&ops, &missing_result, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &missing_result, 1).is_err());
         missing_result["results"][0]["result"] = serde_json::Value::Null;
         missing_result["results"][1]
             .as_object_mut()
             .unwrap()
             .remove("error");
-        assert!(validate_ordered_chunk_envelope(&ops, &missing_result, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &missing_result, 1).is_err());
 
         let mut contradictory = serde_json::json!({
             "results": [
@@ -4047,26 +4576,17 @@ id = "lambda:fallback"
             "summary":{"total":3,"succeeded":1,"failed":1,"aborted":1},
             "status":"partial"
         });
-        assert!(validate_ordered_chunk_envelope(&ops, &contradictory, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &contradictory, 1).is_err());
         contradictory["results"][0]
             .as_object_mut()
             .unwrap()
             .remove("error");
-        assert!(validate_ordered_chunk_envelope(&ops, &contradictory, 1).is_err());
+        assert!(validate_ordered_chunk_envelope(&tools, &contradictory, 1).is_err());
     }
 
-    fn status_contract_fixture(status: &str) -> (Vec<OpsFileEntry>, serde_json::Value) {
+    fn status_contract_fixture(status: &str) -> (Vec<String>, serde_json::Value) {
         (
-            vec![
-                OpsFileEntry {
-                    tool: "first".to_string(),
-                    args: serde_json::json!({}),
-                },
-                OpsFileEntry {
-                    tool: "second".to_string(),
-                    args: serde_json::json!({}),
-                },
-            ],
+            vec!["first".to_string(), "second".to_string()],
             serde_json::json!({
                 "results": [
                     {"ok":true,"tool":"first","result":{}},
@@ -4136,15 +4656,490 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // Agent presentation: `{"results":[{"ok":true,"result":[...],"tool":"list"}],...}`.
-        // The `list` verb returns an array of entities directly under `result`.
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
         assert_eq!(
             count, 3,
             "all 3 entities should be present after apply\nraw: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_ops_file_max_in_flight_is_one_while_default_remains_parallel() {
+        let op_count = OPS_FILE_CHUNK_SIZE;
+        let (parallel_server, parallel_in_flight, parallel_max) = concurrency_probe_server(false);
+        let parallel_summary = apply_ops_file(
+            &parallel_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+        )
+        .await
+        .expect("the ordinary bounded-parallel batch must succeed");
+        assert_eq!(parallel_summary["succeeded"], op_count);
+        let observed_parallel_max = parallel_max.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed_parallel_max, 8,
+            "default dispatch must retain the server's bounded parallelism"
+        );
+        assert_eq!(
+            parallel_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let (serial_server, serial_in_flight, serial_max) = concurrency_probe_server(false);
+        let serial_summary = apply_ops_file_with_dispatch_mode(
+            &serial_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("serial dispatch must succeed");
+        assert_eq!(serial_summary["succeeded"], op_count);
+        assert_eq!(
+            serial_max.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "--serial must await every handler before starting the next"
+        );
+        assert_eq!(
+            serial_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_ops_file_succeeds_with_a_reader_that_refuses_overlap() {
+        let op_count = 4;
+        let (parallel_server, _, parallel_max) = concurrency_probe_server(true);
+        let parallel_summary = apply_ops_file(
+            &parallel_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+        )
+        .await
+        .expect("one parallel probe succeeds, so partial failure remains in-band");
+        assert_eq!(parallel_summary["succeeded"], 1);
+        assert_eq!(parallel_summary["failed"], op_count - 1);
+        assert_eq!(
+            parallel_max.load(std::sync::atomic::Ordering::SeqCst),
+            op_count
+        );
+        assert!(parallel_summary["failures"]
+            .as_array()
+            .expect("failure rows")
+            .iter()
+            .all(|failure| failure["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sql_bridge.reader_open")));
+
+        let (serial_server, _, serial_max) = concurrency_probe_server(true);
+        let serial_summary = apply_ops_file_with_dispatch_mode(
+            &serial_server,
+            reader_probe_ops(op_count),
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("serial dispatch must avoid constrained-reader overlap");
+        assert_eq!(serial_summary["succeeded"], op_count);
+        assert_eq!(serial_summary["failed"], 0);
+        assert_eq!(serial_max.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn serial_ops_file_preserves_order_save_rows_and_strict_failure() {
+        let (server, _, max_in_flight) = concurrency_probe_server(false);
+        let mut ops = reader_probe_ops(3);
+        ops[1].args["fail"] = serde_json::json!(true);
+        let output_dir = tempfile::tempdir().expect("output dir");
+        let save_path = output_dir.path().join("serial-ordered.jsonl");
+
+        let error = apply_ops_file_with_dispatch_mode(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect_err("strict mode must report the middle handler failure");
+        assert!(error.to_string().contains("--strict"), "{error:#}");
+        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(save_path)
+            .expect("strict failure still publishes all confirmed ordered rows")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON result row"))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["tool"], "reader_probe");
+        assert_eq!(rows[0]["ok"], true);
+        assert_eq!(rows[0]["result"]["sequence"], 0);
+        assert_eq!(rows[1]["tool"], "reader_probe");
+        assert_eq!(rows[1]["ok"], false);
+        assert_eq!(rows[1]["reason"], "strict-op-failure");
+        assert_eq!(rows[2]["tool"], "reader_probe");
+        assert_eq!(rows[2]["ok"], true);
+        assert_eq!(rows[2]["result"]["sequence"], 2);
+    }
+
+    #[tokio::test]
+    async fn serial_dispatch_consumes_the_preflighted_stable_snapshot() {
+        use std::io::{Seek as _, Write as _};
+
+        let mut source = NamedTempFile::new().expect("ops source");
+        for sequence in 0..2 {
+            serde_json::to_writer(
+                source.as_file_mut(),
+                &serde_json::json!({
+                    "tool": "reader_probe",
+                    "args": {"sequence": sequence},
+                }),
+            )
+            .expect("write source op");
+            source.write_all(b"\n").expect("write newline");
+        }
+        let mut validated = validate_ops_file(source.path()).expect("preflight source");
+
+        source.as_file_mut().set_len(0).expect("truncate source");
+        source
+            .as_file_mut()
+            .rewind()
+            .expect("rewind replacement source");
+        source
+            .write_all(b"{malformed replacement\n")
+            .expect("replace source after preflight");
+        source.flush().expect("flush replacement");
+
+        let (server, _, max_in_flight) = concurrency_probe_server(false);
+        let summary = apply_ops_file_reader_with_dispatch_mode(
+            &server,
+            std::io::BufReader::new(&mut validated.snapshot),
+            validated.total,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            OpsFileDispatchMode::Serial,
+        )
+        .await
+        .expect("dispatch must consume the immutable validated snapshot");
+        assert_eq!(summary["total"], 2);
+        assert_eq!(summary["succeeded"], 2);
+        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn serial_typed_preflight_rejects_later_prev_before_first_write() {
+        use std::io::Write as _;
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let mut source = NamedTempFile::new().expect("ops source");
+        source
+            .write_all(
+                b"{\"tool\":\"create\",\"args\":{\"kind\":\"concept\",\"name\":\"must-not-land\"}}\n",
+            )
+            .expect("write valid first op");
+        source
+            .write_all(b"{\"tool\":\"stats\",\"args\":{\"probe\":\"$prev.id\"}}\n")
+            .expect("write typed-invalid later op");
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from(&db_path)),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            cfg,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(db_path.clone()),
+                anchor: Some(PathBuf::from(&db_path)),
+                config: Some(config_path),
+            },
+            true,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("later $prev must fail before the first serial handler starts");
+        assert!(error.to_string().contains("$prev"), "{error:#}");
+
+        let server = isolated_server(&db_path);
+        let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([]),
+            "whole-snapshot typed preflight must prevent the valid first write"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_whole_snapshot_preflight_does_not_change_default_chunk_commit_parity() {
+        use std::io::Write as _;
+
+        let mut source = NamedTempFile::new().expect("ops source");
+        for sequence in 0..OPS_FILE_CHUNK_SIZE {
+            serde_json::to_writer(
+                source.as_file_mut(),
+                &serde_json::json!({
+                    "tool": "create",
+                    "args": {
+                        "kind": "concept",
+                        "name": format!("default-first-chunk-{sequence}"),
+                    },
+                }),
+            )
+            .expect("write valid first-chunk op");
+            source.write_all(b"\n").expect("write newline");
+        }
+        source
+            .write_all(b"{\"tool\":\"stats\",\"args\":{\"probe\":\"$prev.id\"}}\n")
+            .expect("write typed-invalid second-chunk op");
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config_path = config_dir.path().join("khive.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+
+        let default_db = NamedTempFile::new().expect("default db");
+        let default_db_path = default_db.path().to_str().expect("utf8").to_string();
+        let default_error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            RuntimeConfig {
+                db_path: Some(PathBuf::from(&default_db_path)),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            },
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(default_db_path.clone()),
+                anchor: Some(PathBuf::from(&default_db_path)),
+                config: Some(config_path.clone()),
+            },
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("default mode must reject the typed-invalid second chunk");
+        assert!(
+            default_error.to_string().contains("$prev"),
+            "{default_error:#}"
+        );
+        let default_server = isolated_server(&default_db_path);
+        let default_response =
+            dispatch_json(&default_server, r#"list(kind="concept", limit=200)"#).await;
+        assert_eq!(
+            default_response["results"][0]["result"]["items"]
+                .as_array()
+                .expect("default concept rows")
+                .len(),
+            OPS_FILE_CHUNK_SIZE,
+            "backward-compatible default mode must commit its first logical chunk"
+        );
+
+        let serial_db = NamedTempFile::new().expect("serial db");
+        let serial_db_path = serial_db.path().to_str().expect("utf8").to_string();
+        let serial_error = run_exec_ops_file(
+            source.path().to_path_buf(),
+            RuntimeConfig {
+                db_path: Some(PathBuf::from(&serial_db_path)),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            },
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            ExecDbContext {
+                raw: Some(serial_db_path.clone()),
+                anchor: Some(PathBuf::from(&serial_db_path)),
+                config: Some(config_path),
+            },
+            true,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("serial mode must reject the later invalid op before dispatch");
+        assert!(
+            serial_error.to_string().contains("$prev"),
+            "{serial_error:#}"
+        );
+        let serial_server = isolated_server(&serial_db_path);
+        let serial_response =
+            dispatch_json(&serial_server, r#"list(kind="concept", limit=200)"#).await;
+        assert_eq!(
+            serial_response["results"][0]["result"]["items"],
+            serde_json::json!([]),
+            "serial whole-snapshot preflight must reject before its first write"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_single_ops_file_reaches_handler_validation() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let ops = vec![OpsFileEntry {
+            tool: "stats".to_string(),
+            args: serde_json::json!({
+                "payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1),
+            }),
+        }];
+        let mut observed_handler_error = false;
+
+        let error = apply_ops_file_with_response_transform(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            None,
+            false,
+            |_, raw| {
+                let response: serde_json::Value =
+                    serde_json::from_str(&raw).expect("handler response must be JSON");
+                assert_eq!(response["results"][0]["tool"], "stats");
+                assert_eq!(response["results"][0]["ok"], false);
+                assert!(
+                    response["results"][0]["error"]
+                        .to_string()
+                        .contains("payload"),
+                    "the oversized typed op must reach stats argument validation: {response}"
+                );
+                observed_handler_error = true;
+                raw
+            },
+        )
+        .await
+        .expect_err("the only op is intentionally invalid at the handler boundary");
+
+        assert!(
+            observed_handler_error,
+            "ops-file dispatch must not reapply the public 1 MiB raw-DSL limit"
+        );
+        assert!(error.to_string().contains("every op failed"));
+    }
+
+    #[tokio::test]
+    async fn oversized_multi_op_chunk_preserves_order_save_and_strict() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let payload = "x".repeat(600 * 1024);
+        let ops = vec![
+            OpsFileEntry {
+                tool: "create".to_string(),
+                args: serde_json::json!({
+                    "kind": "concept",
+                    "name": "oversized ordered success",
+                    "description": payload,
+                }),
+            },
+            OpsFileEntry {
+                tool: "stats".to_string(),
+                args: serde_json::json!({
+                    "payload": "y".repeat(600 * 1024),
+                }),
+            },
+        ];
+        let encoded_len = serde_json::to_vec(&ops).unwrap().len();
+        assert!(encoded_len > khive_request::MAX_OPS_INPUT_LEN);
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("oversized-ordered.jsonl");
+
+        let error = apply_ops_file(
+            &server,
+            ops,
+            Some("verbose".to_string()),
+            Some("json".to_string()),
+            Some(save_path.to_string_lossy().into_owned()),
+            true,
+        )
+        .await
+        .expect_err("strict mode must report the handler-level stats failure");
+
+        assert!(error.to_string().contains("--strict"), "{error:#}");
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&save_path)
+            .expect("strict failure still publishes the complete ordered result file")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["tool"], "create");
+        assert_eq!(rows[0]["ok"], true);
+        assert_eq!(rows[1]["tool"], "stats");
+        assert_eq!(rows[1]["ok"], false);
+        assert_eq!(rows[1]["reason"], "strict-op-failure");
+    }
+
+    #[tokio::test]
+    async fn public_dispatch_still_rejects_oversized_raw_ops() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+        let params = RequestParams {
+            ops: serde_json::json!({
+                "tool": "stats",
+                "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
+            })
+            .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        };
+
+        let error = server
+            .dispatch_request_local(params)
+            .await
+            .expect_err("the raw request surface must retain its 1 MiB safety bound");
+        assert!(
+            error.to_string().contains("ops input is")
+                && error.to_string().contains(&format!(
+                    "max is {} bytes",
+                    khive_request::MAX_OPS_INPUT_LEN
+                )),
+            "unexpected public dispatch error: {error}"
         );
     }
 
@@ -4278,8 +5273,8 @@ id = "lambda:fallback"
         // if chunk 1's writes had been rolled back or never reached storage, because
         // the bookkeeping would simply agree with itself. Read it back through the
         // same server so the reconciliation record is checked against the database
-        // it describes. The requested limit stays under the entity list cap, so the
-        // handler returns a bare array rather than a clamp-wrapped object.
+        // it describes. The stable list contract wraps rows in `items` whether or
+        // not the requested limit reaches the entity cap.
         let params = RequestParams {
             ops: r#"list(kind="concept", limit=200)"#.to_string(),
             presentation: None,
@@ -4291,11 +5286,11 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let rows = response["results"][0]["result"]
+        let rows = response["results"][0]["result"]["items"]
             .as_array()
             .unwrap_or_else(|| {
                 panic!(
-                    "read-back must return a bare array under the entity list cap; got {}",
+                    "read-back list result must contain an items array; got {}",
                     response["results"][0]["result"]
                 )
             });
@@ -4377,7 +5372,10 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(response["results"][0]["result"], serde_json::json!([]));
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
@@ -4757,6 +5755,7 @@ id = "lambda:fallback"
             true,
             ExecDbContext::default(),
             false,
+            false,
             None,
             false,
         )
@@ -4776,7 +5775,7 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -5005,6 +6004,62 @@ id = "lambda:fallback"
         );
     }
 
+    // ── adapter-boundary regression (cross-crate member) ──────────────────────
+    //
+    // The exec-side `forward_or_spawn_boxed` in this file converts `cfg.packs`
+    // into `Some(&packs)` at its own `forward_or_spawn_with_config_and_packs` call site
+    // (line ~249). Every spy-based test in this file replaces
+    // `forward_or_spawn_boxed` itself via `run_exec_inline_with_forward`'s
+    // `ForwardFnPtr` seam, so none of them execute that conversion. This test
+    // instead drives `run_exec_inline` — the real production entry point,
+    // which always calls the real `forward_or_spawn_boxed` on Unix — and
+    // observes the argument via a one-shot capture hook armed at the entry of
+    // `khive_mcp::daemon::forward_or_spawn_with_config_and_packs` itself, reached
+    // cross-crate via khive-mcp's `test-forward-seam` feature (enabled from
+    // this crate's `[dev-dependencies]` re-declaration of khive-mcp).
+    // Changing the adapter's `Some(&packs)` argument to `None` reddens this
+    // test.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn resolved_pack_list_reaches_real_exec_adapter_boundary() {
+        let (prev_home, _home_dir) = isolate_home_for_test();
+
+        khive_mcp::daemon::test_forward_seam::arm();
+
+        let cfg = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string(), "gtd".to_string()],
+            actor_id: None,
+            ..RuntimeConfig::default()
+        };
+
+        let result = run_exec_inline(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+        )
+        .await;
+
+        restore_home(prev_home);
+
+        assert!(
+            result.is_ok(),
+            "the intercepted dispatch through the real production entry point must \
+             succeed: {result:?}"
+        );
+        assert_eq!(
+            khive_mcp::daemon::test_forward_seam::take_captured(),
+            Some(Some(vec!["kg".to_string(), "gtd".to_string()])),
+            "the real forward_or_spawn_boxed adapter in this crate must convert cfg.packs \
+             into Some(&packs) at the forward_or_spawn_with_config_and_packs call boundary"
+        );
+    }
+
     // ── spy-based isomorphism guard (Unix only) ───────────────────────────────
     //
     // The three tests above use KHIVE_NO_DAEMON=1, which disables the daemon
@@ -5040,6 +6095,7 @@ id = "lambda:fallback"
         _frame: &'a DaemonRequestFrame,
         _config: Option<PathBuf>,
         _db: Option<&'a str>,
+        _packs: Vec<String>,
     ) -> super::ForwardFuture<'a> {
         SPY_WAS_CALLED.with(|c| c.set(true));
         Box::pin(async { None })
@@ -5176,6 +6232,8 @@ id = "lambda:fallback"
             const { std::cell::RefCell::new(None) };
         static SPY_CAPTURED_DB: std::cell::RefCell<Option<String>> =
             const { std::cell::RefCell::new(None) };
+        static SPY_CAPTURED_PACKS: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(unix)]
@@ -5183,10 +6241,12 @@ id = "lambda:fallback"
         frame: &'a DaemonRequestFrame,
         config: Option<PathBuf>,
         db: Option<&'a str>,
+        packs: Vec<String>,
     ) -> super::ForwardFuture<'a> {
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
         SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config);
         SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = db.map(str::to_string));
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
         Box::pin(async { None })
     }
 
@@ -5195,10 +6255,12 @@ id = "lambda:fallback"
         frame: &'a DaemonRequestFrame,
         config: Option<PathBuf>,
         db: Option<&'a str>,
+        packs: Vec<String>,
     ) -> super::ForwardFuture<'a> {
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
         SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config);
         SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = db.map(str::to_string));
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
         Box::pin(async {
             Some(Ok(
                 r#"{"results":[{"ok":true,"tool":"stats","result":{}}],"summary":{"total":1,"succeeded":1,"failed":0}}"#
@@ -5317,6 +6379,308 @@ id = "lambda:fallback"
         );
     }
 
+    /// A declared read-only SQLite `main` backend becomes a writable memory
+    /// backend when `--db :memory:` forces the whole topology ephemeral. The
+    /// pre-open exec frame must fingerprint that effective runtime mode, not
+    /// the superseded declaration, or the freshly spawned daemon rejects its
+    /// very first request as a config mismatch.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn force_memory_exec_frame_matches_opened_read_only_topology_runtime() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().expect("force-memory config tempdir");
+        let config_path = fixture.path().join("read-only-topology.toml");
+        let declared_main = fixture.path().join("declared-main.db");
+        let declared_archive = fixture.path().join("declared-archive.db");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+read_only = true
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+"#,
+                declared_main.display(),
+                declared_archive.display(),
+            ),
+        )
+        .expect("write read-only topology config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&config_path),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve force-memory exec config");
+        assert_eq!(
+            cfg.db_path, None,
+            "the force-memory anchor must be in-memory"
+        );
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(result.is_ok(), "force-memory dispatch failed: {result:?}");
+
+        let frame_config_id = SPY_CAPTURED_CONFIG_ID
+            .with(|captured| captured.borrow_mut().take())
+            .expect("spy must capture the forwarded config id");
+        let khive_cfg = KhiveConfig::load_with_home_fallback(Some(&config_path), None)
+            .expect("load force-memory topology")
+            .expect("explicit config must exist");
+        let opened =
+            khive_mcp::serve::build_registry_for_multi_backend(cfg, &khive_cfg, Some(":memory:"))
+                .expect("force-memory runtime must build");
+        restore_home(prev_home);
+
+        assert!(
+            !opened.default_runtime.is_read_only(),
+            "force-memory replaces the declared read-only SQLite main with writable memory"
+        );
+        assert_eq!(
+            frame_config_id, opened.config_id,
+            "the pre-open exec frame and opened force-memory runtime must have identical config ids"
+        );
+        assert!(
+            !declared_main.exists() && !declared_archive.exists(),
+            "force-memory parity setup must not materialize either declared SQLite path"
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_writable_multi_backend_config(
+        config_path: &Path,
+        main_path: &Path,
+        secondary_path: &Path,
+    ) {
+        std::fs::write(
+            config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+"#,
+                main_path.display(),
+                secondary_path.display(),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn chmod_read_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(path, permissions).unwrap();
+
+        // A writable fixture's connections can close asynchronously and leave
+        // `-wal`/`-shm` sidecars behind; read-only admission rejects a writable
+        // `-shm` as potentially live. Freeze any lingering sidecars so the
+        // snapshot takes the documented frozen form.
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().unwrap().to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().unwrap().join(name);
+            if sidecar.exists() {
+                let mut sidecar_permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+                sidecar_permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, sidecar_permissions).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn runtime_config_for_explicit_multi_backend(
+        config_path: &Path,
+        db: Option<&str>,
+    ) -> RuntimeConfig {
+        resolve_runtime_config(RuntimeConfigInputs {
+            db,
+            config: Some(config_path),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .unwrap()
+    }
+
+    /// A client must not reuse a daemon that retained a write-capable handle
+    /// after the declared main file was chmod'd into snapshot mode. The
+    /// filesystem-mode refusal belongs before the forwarding seam.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_main_chmod_refuses_before_daemon_forward() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"main snapshot fixture").unwrap();
+        std::fs::write(&archive_path, b"archive fixture").unwrap();
+        chmod_read_only(&main_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, None),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        let error = result.expect_err("an undeclared main snapshot mode must fail closed");
+        assert!(error.to_string().contains("read_only = true"), "{error}");
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_none()),
+            "the retained writable daemon must never receive the frame"
+        );
+    }
+
+    /// The topology fingerprint includes secondary modes too; apply the same
+    /// pre-forward refusal to every declared SQLite backend, not only `main`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_secondary_chmod_refuses_before_daemon_forward() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"main fixture").unwrap();
+        std::fs::write(&archive_path, b"archive snapshot fixture").unwrap();
+        chmod_read_only(&archive_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, None),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        let error = result.expect_err("an undeclared secondary snapshot mode must fail closed");
+        assert!(error.to_string().contains("archive"), "{error}");
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_none()),
+            "the retained writable daemon must never receive the frame"
+        );
+    }
+
+    /// `--db :memory:` supersedes every declared file. Its pre-open/runtime
+    /// parity must therefore skip filesystem-mode checks on those unused paths.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn force_memory_skips_declared_chmod_preflight_and_forwards() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().unwrap();
+        let config_path = fixture.path().join("khive.toml");
+        let main_path = fixture.path().join("main.db");
+        let archive_path = fixture.path().join("archive.db");
+        std::fs::write(&main_path, b"unused main snapshot fixture").unwrap();
+        std::fs::write(&archive_path, b"unused archive snapshot fixture").unwrap();
+        chmod_read_only(&main_path);
+        chmod_read_only(&archive_path);
+        write_writable_multi_backend_config(&config_path, &main_path, &archive_path);
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            runtime_config_for_explicit_multi_backend(&config_path, Some(":memory:")),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "force-memory forwarding must remain valid: {result:?}"
+        );
+        assert!(
+            SPY_CAPTURED_CONFIG_ID.with(|captured| captured.borrow().is_some()),
+            "the force-memory frame must reach the forwarding seam"
+        );
+    }
+
     /// A CONCRETE override on a single-backend invocation (no `[[backends]]`
     /// declared) must reach the spawn seam: the spawned daemon has no
     /// config-declared database path and would otherwise bind
@@ -5378,6 +6742,167 @@ id = "lambda:fallback"
             Some(override_path.display().to_string()),
             "the single-backend concrete override must reach the daemon spawn seam so a \
              spawned daemon binds the operator's file instead of the default database"
+        );
+    }
+
+    /// khive-oss#1941: a client whose environment sets `KHIVE_PACKS` must
+    /// forward that resolved pack list to any daemon it spawns, or the fresh
+    /// daemon defaults to the built-in pack set, its `config_id` disagrees
+    /// with every caller expecting the wider selection, and those callers
+    /// permanently fall back to in-process dispatch instead of the warm
+    /// daemon.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn env_khive_packs_reaches_daemon_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        std::env::set_var("KHIVE_PACKS", "kg,gtd,memory");
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config from KHIVE_PACKS env");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        std::env::remove_var("KHIVE_PACKS");
+
+        assert!(
+            result.is_ok(),
+            "forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_PACKS.with(|captured| captured.borrow_mut().take()),
+            Some(vec![
+                "kg".to_string(),
+                "gtd".to_string(),
+                "memory".to_string()
+            ]),
+            "the KHIVE_PACKS-resolved pack list must reach the daemon spawn seam so a \
+             spawned daemon serves the same packs this client resolved"
+        );
+    }
+
+    /// Control for `env_khive_packs_reaches_daemon_spawn_seam`: with no
+    /// `KHIVE_PACKS` (or other pack-selection input) set, the client resolves
+    /// the built-in production pack set and forwards exactly that — a
+    /// spawned daemon re-deriving the same built-in default independently
+    /// would reach the identical outcome, so this proves the fix is additive
+    /// and does not change the unconfigured default path's effective result.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn no_env_control_forwards_built_in_default_packs_to_spawn_seam() {
+        let original_cwd = std::env::current_dir().expect("read cwd");
+        let original_packs = std::env::var_os("KHIVE_PACKS");
+        let original_home = std::env::var_os("HOME");
+
+        // Declared first so it drops LAST (reverse declaration order):
+        // constructing the guard here, before either tempdir is created and
+        // before any process-global mutation, means every panic from this
+        // point on — including a `tempdir()`/`set_current_dir()` setup panic,
+        // not just a later assertion — has a live guard whose Drop restores
+        // KHIVE_PACKS/HOME/cwd. Because it drops last, `home_dir` and
+        // `empty_project_root` are removed BEFORE that restore runs, i.e.
+        // `empty_project_root` is removed while it is still the process cwd
+        // (verified empirically below: `TempDir::drop` tolerates removing the
+        // current working directory on macOS and ignores its own errors).
+        let _guard = EnvAndCwdGuard {
+            original_packs,
+            original_home,
+            original_cwd,
+        };
+
+        // Isolate both HOME and cwd: with `db: None` config discovery falls
+        // through to tier-2 (`<cwd>/khive.toml`) then tier-4
+        // (`~/.khive/config.toml`) — either one declaring `[runtime].packs`
+        // would satisfy this control incidentally instead of proving the
+        // built-in-default path, so neither may be the ambient machine's.
+        // Creating these tempdirs mutates nothing process-global by itself
+        // (a panic here would be caught by the guard above, harmlessly
+        // restoring values that were never changed).
+        let home_dir = tempfile::tempdir().expect("tempdir for isolated HOME");
+        let empty_project_root = tempfile::tempdir().expect("empty project-root tempdir");
+
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::set_var("HOME", home_dir.path());
+        std::env::set_current_dir(empty_project_root.path())
+            .expect("chdir into isolated project root with no discoverable config");
+
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config with no pack-selection input");
+
+        // Isolating HOME/cwd only keeps the ambient machine's config from
+        // leaking in; it does not by itself prove resolution landed on the
+        // built-in set rather than some other value. Certify that directly
+        // before the forwarding seam is exercised.
+        assert_eq!(
+            cfg.packs,
+            RuntimeConfig::built_in_packs(),
+            "the isolated no-selection environment must resolve to the built-in default \
+             pack set before the forwarding seam is exercised"
+        );
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_PACKS.with(|captured| captured.borrow_mut().take()),
+            Some(RuntimeConfig::built_in_packs()),
+            "with no pack-selection input the client must forward exactly the built-in \
+             default pack set — identical to what an independently-spawned daemon would \
+             have defaulted to on its own"
         );
     }
 
@@ -5970,7 +7495,7 @@ backend = "sessions"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -6020,6 +7545,20 @@ backend = "sessions"
             packs: vec!["kg".to_string()],
             ..Default::default()
         }
+    }
+
+    async fn replace_fts_entities_with_incompatible_table(db_path: &str) {
+        let runtime = KhiveRuntime::new(atomic_cfg(db_path)).expect("runtime for FTS fault setup");
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.expect("writer for FTS fault setup");
+        writer
+            .execute_script(
+                "DROP TABLE fts_entities; \
+                 CREATE TABLE fts_entities (broken_column TEXT);"
+                    .to_string(),
+            )
+            .await
+            .expect("replace FTS table to inject post-commit reindex failure");
     }
 
     #[tokio::test]
@@ -6152,6 +7691,125 @@ backend = "sessions"
         assert_eq!(y_resp["results"][0]["result"]["name"], "AtomicY-renamed");
     }
 
+    #[tokio::test]
+    async fn atomic_post_commit_reindex_failure_returns_committed_non_retryable_envelope() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="PostCommitReindexBefore")"#,
+            )
+            .await;
+            response["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        // Migration state remains current, but an incompatible ordinary table
+        // occupies the post-commit FTS name. Store initialization cannot
+        // recreate the virtual table through IF NOT EXISTS; prepare and base
+        // DML do not touch it, so the failure occurs at the real reindex seam.
+        replace_fts_entities_with_incompatible_table(&db_path).await;
+
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![atomic_op(
+                "update",
+                serde_json::json!({"id": entity_id, "name": "PostCommitReindexAfter"}),
+            )],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("post-commit failure must return a reconciliation envelope");
+
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["atomic"]["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["degradations"][0]["stage"], "post_commit_reindex",
+            "{envelope}"
+        );
+        assert_eq!(envelope["summary"]["succeeded"], 1, "{envelope}");
+
+        let runtime =
+            KhiveRuntime::new(atomic_cfg(&db_path)).expect("runtime for committed-row check");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let entity = runtime
+            .get_entity(&token, Uuid::parse_str(&entity_id).unwrap())
+            .await
+            .expect("committed entity row");
+        assert_eq!(entity.name, "PostCommitReindexAfter");
+    }
+
+    #[tokio::test]
+    async fn atomic_result_read_failure_keeps_later_committed_delete_non_retryable() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="RenderThenDelete")"#,
+            )
+            .await;
+            response["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string()
+        };
+
+        // Both plans prepare against the same live row. The unit then updates
+        // and hard-deletes it atomically. Rendering op 0 performs its real
+        // post-commit read and cannot find the row removed by op 1.
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({"id": entity_id, "name": "NeverRendered"}),
+                ),
+                atomic_op("delete", serde_json::json!({"id": entity_id, "hard": true})),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("render failure after commit must be a reconciliation envelope");
+
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["atomic"]["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["atomic"]["degradations"][0]["stage"], "result_rendering",
+            "{envelope}"
+        );
+        assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+        assert_eq!(
+            envelope["results"][0]["status"], "committed_degraded",
+            "{envelope}"
+        );
+        assert_eq!(envelope["results"][0]["retryable"], false, "{envelope}");
+        assert_eq!(envelope["results"][1]["result"]["deleted"], true);
+
+        let runtime =
+            KhiveRuntime::new(atomic_cfg(&db_path)).expect("runtime for deleted-row check");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let deleted = runtime
+            .get_entity(&token, Uuid::parse_str(&entity_id).unwrap())
+            .await;
+        assert!(deleted.is_err(), "hard delete must remain committed");
+    }
+
     /// Acceptance test 1b: a mid-unit failure rolls the WHOLE unit back —
     /// zero partial state, including the op that "succeeded" before the
     /// failing one.
@@ -6274,6 +7932,7 @@ backend = "sessions"
             None,
             false,
             db_context(),
+            false,
             true,
             None,
             true,
@@ -6291,6 +7950,7 @@ backend = "sessions"
             Some(save_path.to_string_lossy().into_owned()),
             false,
             db_context(),
+            false,
             true,
             None,
             true,
@@ -6300,6 +7960,56 @@ backend = "sessions"
         assert_eq!(
             std::fs::read_to_string(save_path).unwrap().lines().count(),
             2
+        );
+    }
+
+    #[test]
+    fn atomic_save_persist_failure_returns_committed_reconciliation_stdout() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let save_path = output_dir.path().join("publish-race.jsonl");
+        let sink = khive_mcp::save_sink::JsonlSaveSink::new(&save_path, false)
+            .expect("preflight save sink");
+        // Deterministic post-preflight publication failure: a directory wins
+        // the destination path after the sibling temp file has been created,
+        // so row writes and flush succeed but the final atomic rename fails.
+        std::fs::create_dir(&save_path).expect("occupy destination with a directory");
+        let mut envelope = serde_json::json!({
+            "results": [{
+                "ok": true,
+                "tool": "update",
+                "op_index": 0,
+                "result": {"id": Uuid::new_v4()}
+            }],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0},
+            "atomic": {
+                "committed": true,
+                "rolled_back": false,
+                "failed_op_index": null,
+                "error": null
+            }
+        });
+
+        let failure = render_atomic_output(&mut envelope, Some(sink))
+            .expect_err("persist failure must remain a non-zero CLI outcome");
+        let stdout: serde_json::Value =
+            serde_json::from_str(&failure.stdout).expect("structured stdout envelope");
+
+        assert_eq!(stdout["atomic"]["committed"], true, "{stdout}");
+        assert_eq!(stdout["atomic"]["status"], "committed_degraded", "{stdout}");
+        assert_eq!(stdout["atomic"]["retryable"], false, "{stdout}");
+        assert_eq!(
+            stdout["atomic"]["degradations"][0]["stage"], "save_file_publish",
+            "{stdout}"
+        );
+        assert!(
+            stdout["atomic"]["degradations"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("persist temp file")),
+            "{stdout}"
+        );
+        assert!(
+            format!("{:#}", failure.error).contains("do not replay the mutation"),
+            "terminal error must point automation at reconciliation"
         );
     }
 
@@ -6334,6 +8044,7 @@ backend = "sessions"
                 anchor: Some(PathBuf::from(&db_path)),
                 config: Some(config_path),
             },
+            false,
             true,
             None,
             true,
@@ -6346,7 +8057,10 @@ backend = "sessions"
 
         let server = isolated_server(&db_path);
         let response = dispatch_json(&server, r#"list(kind="concept")"#).await;
-        assert_eq!(response["results"][0]["result"], serde_json::json!([]));
+        assert_eq!(
+            response["results"][0]["result"]["items"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
@@ -6383,6 +8097,7 @@ backend = "sessions"
                 anchor: Some(PathBuf::from(db_file.path())),
                 config: Some(config_path),
             },
+            false,
             true,
             Some(1),
             true,
@@ -6803,7 +8518,13 @@ backend = "sessions"
             );
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
-            assert_eq!(resp["results"][0]["result"].as_array().unwrap().len(), 0);
+            assert_eq!(
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
         }
 
         // (b) read verb.
@@ -6904,7 +8625,10 @@ backend = "sessions"
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
             assert_eq!(
-                resp["results"][0]["result"].as_array().unwrap().len(),
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
                 0,
                 "no write must have landed for {verb:?}"
             );
@@ -6938,7 +8662,10 @@ backend = "sessions"
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
             assert_eq!(
-                resp["results"][0]["result"].as_array().unwrap().len(),
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
                 0,
                 "no write must have landed for merge"
             );

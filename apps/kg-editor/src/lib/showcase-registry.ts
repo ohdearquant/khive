@@ -5,6 +5,7 @@ export type ShowcaseRegistryEntry = Readonly<{
   canonicalUrl: string;
   aliases: readonly string[];
   assetPath: string;
+  analysisId?: string;
 }>;
 
 export type ShowcaseLookup =
@@ -22,6 +23,7 @@ export const SHOWCASE_REGISTRY: readonly ShowcaseRegistryEntry[] = [
       "https://www.github.com/ohdearquant/khive",
     ],
     assetPath: "/showcase/khive-repo-v1-khive.json",
+    analysisId: "khive",
   },
 ] as const;
 
@@ -97,4 +99,15 @@ export function isAllowedShowcaseAsset(
 ): boolean {
   return assetPath.startsWith(SHOWCASE_ASSET_PREFIX) &&
     registry.some((entry) => entry.assetPath === assetPath);
+}
+
+export function isAllowedShowcaseAnalysis(
+  entry: ShowcaseRegistryEntry,
+  registry: readonly ShowcaseRegistryEntry[] = SHOWCASE_REGISTRY,
+): entry is ShowcaseRegistryEntry & Readonly<{ analysisId: string }> {
+  return typeof entry.analysisId === "string" &&
+    /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(entry.analysisId) &&
+    registry.some((candidate) =>
+      candidate.id === entry.id && candidate.analysisId === entry.analysisId
+    );
 }

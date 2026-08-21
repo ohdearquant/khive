@@ -274,22 +274,25 @@ impl MemoryPack {
 
         // Retrieval caps all note kinds, so re-gather after hydration when non-memory rows
         // starve eligible memories; widening remains round- and server-cap bounded.
+        // The candidate future contains the complete text/vector fan-out,
+        // including the 1/2/N embedding and ANN branches. Keep it behind a
+        // pointer at both await sites so its state is not inlined into this
+        // already-large pipeline and then into the MCP dispatch poll stack.
         let mut current_candidate_limit = candidate_limit;
-        let mut candidates = self
-            .collect_recall_candidates(
-                query_trimmed,
-                token,
-                RecallCandidateParams {
-                    candidate_limit: current_candidate_limit,
-                    embedding_model: p.embedding_model.as_deref(),
-                    cjk_fts_bypass,
-                    snippet_policy: TextSnippetPolicy::Omit,
-                    fts_gather: &effective_fts_gather,
-                    ann_overfetch_max_rounds,
-                    ann_ready_timeout_ms,
-                },
-            )
-            .await?;
+        let mut candidates = Box::pin(self.collect_recall_candidates(
+            query_trimmed,
+            token,
+            RecallCandidateParams {
+                candidate_limit: current_candidate_limit,
+                embedding_model: p.embedding_model.as_deref(),
+                cjk_fts_bypass,
+                snippet_policy: TextSnippetPolicy::Omit,
+                fts_gather: &effective_fts_gather,
+                ann_overfetch_max_rounds,
+                ann_ready_timeout_ms,
+            },
+        ))
+        .await?;
         let (mut memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
 
@@ -312,21 +315,20 @@ impl MemoryPack {
                 break;
             }
             current_candidate_limit = widened;
-            candidates = self
-                .collect_recall_candidates(
-                    query_trimmed,
-                    token,
-                    RecallCandidateParams {
-                        candidate_limit: current_candidate_limit,
-                        embedding_model: p.embedding_model.as_deref(),
-                        cjk_fts_bypass,
-                        snippet_policy: TextSnippetPolicy::Omit,
-                        fts_gather: &effective_fts_gather,
-                        ann_overfetch_max_rounds,
-                        ann_ready_timeout_ms,
-                    },
-                )
-                .await?;
+            candidates = Box::pin(self.collect_recall_candidates(
+                query_trimmed,
+                token,
+                RecallCandidateParams {
+                    candidate_limit: current_candidate_limit,
+                    embedding_model: p.embedding_model.as_deref(),
+                    cjk_fts_bypass,
+                    snippet_policy: TextSnippetPolicy::Omit,
+                    fts_gather: &effective_fts_gather,
+                    ann_overfetch_max_rounds,
+                    ann_ready_timeout_ms,
+                },
+            ))
+            .await?;
             (memory_ids, notes_by_id) =
                 self.load_memory_candidate_notes(token, &candidates).await?;
         }
@@ -397,6 +399,7 @@ impl MemoryPack {
         }
 
         if fused.is_empty() {
+            khive_storage::ensure_request_read_active("memory.recall")?;
             self.track_recall_serve(
                 token,
                 registry,
@@ -417,6 +420,7 @@ impl MemoryPack {
             if ann_degraded {
                 let reason = ann_degraded_reason
                     .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
+                khive_storage::ensure_request_read_active("memory.recall")?;
                 return to_json(&json!({
                     "results": Vec::<Value>::new(),
                     "degraded": true,
@@ -425,6 +429,7 @@ impl MemoryPack {
                     "degraded_reason": reason,
                 }));
             }
+            khive_storage::ensure_request_read_active("memory.recall")?;
             return to_json(&Vec::<Value>::new());
         }
 
@@ -461,6 +466,7 @@ impl MemoryPack {
                         }
                     }
                     Err(e) => {
+                        khive_storage::ensure_request_read_active("memory.recall")?;
                         tracing::warn!(
                             error = %e,
                             "ADR-104 §5: entity-anchored candidate lookup failed; \
@@ -712,6 +718,7 @@ impl MemoryPack {
                             SUPERSEDES_EDGE_PAGE_SIZE,
                         )
                         .await?;
+                    khive_storage::ensure_request_read_active("memory.recall")?;
                     for edge in &edges.items {
                         superseded_by_edge.insert(edge.target_id);
                     }
@@ -911,6 +918,7 @@ impl MemoryPack {
             } else {
                 0
             };
+            khive_storage::ensure_request_read_active("memory.recall")?;
             return to_json(&json!({
                 "results": results,
                 "candidates": {
@@ -953,6 +961,7 @@ impl MemoryPack {
                 // collect_model_ann_hits_inner / collect_model_ann_hits).
                 envelope["degraded_reason"] = json!(reason);
             }
+            khive_storage::ensure_request_read_active("memory.recall")?;
             return to_json(&envelope);
         }
 
@@ -966,6 +975,7 @@ impl MemoryPack {
             // array).
             let reason = ann_degraded_reason
                 .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
+            khive_storage::ensure_request_read_active("memory.recall")?;
             return to_json(&json!({
                 "results": results,
                 "degraded": true,
@@ -975,6 +985,7 @@ impl MemoryPack {
             }));
         }
 
+        khive_storage::ensure_request_read_active("memory.recall")?;
         to_json(&results)
     }
 
@@ -1157,6 +1168,12 @@ mod tests {
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    fn memory_runtime_with_fresh_tail(ann_fresh_tail_enabled: bool) -> KhiveRuntime {
+        KhiveRuntime::memory()
+            .expect("in-memory runtime")
+            .with_ann_fresh_tail_enabled(ann_fresh_tail_enabled)
+    }
 
     #[derive(Clone, Debug, Default)]
     struct CapturedWarning {
@@ -1389,7 +1406,7 @@ mod tests {
         const DIMS: usize = 16;
         const NOTE_TEXT: &str = "issue 836 normal path recall without any ann contention";
 
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = memory_runtime_with_fresh_tail(true);
         rt.register_embedder(HashVecProvider {
             model_name: MODEL.to_owned(),
             dims: DIMS,
@@ -1431,31 +1448,8 @@ mod tests {
         }
     }
 
-    /// Guards a mutated `KHIVE_ANN_FRESH_TAIL` value, restoring whatever value
-    /// (present or absent) it held before the guard was created, even if the
-    /// test panics.
-    struct FreshTailEnvGuard {
-        prior: Option<String>,
-    }
-
-    impl FreshTailEnvGuard {
-        fn disable() -> Self {
-            let prior = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
-            std::env::set_var("KHIVE_ANN_FRESH_TAIL", "0");
-            Self { prior }
-        }
-    }
-
-    impl Drop for FreshTailEnvGuard {
-        fn drop(&mut self) {
-            match self.prior.take() {
-                Some(v) => std::env::set_var("KHIVE_ANN_FRESH_TAIL", v),
-                None => std::env::remove_var("KHIVE_ANN_FRESH_TAIL"),
-            }
-        }
-    }
-
-    /// #1477: an exceptional fresh-tail skip (here, the exact leg disabled via
+    /// #1477: an exceptional fresh-tail skip (here, the runtime's exact leg is
+    /// disabled, as production can request via construction-time
     /// `KHIVE_ANN_FRESH_TAIL=0`) forfeits read-your-writes visibility on the
     /// warm-index path — that is degraded serving, not an ordinary healthy
     /// response, and must be disclosed on a non-empty response the same way
@@ -1469,9 +1463,7 @@ mod tests {
         const DIMS: usize = 16;
         const NOTE_TEXT: &str = "issue 1477 fresh tail disabled recall degradation note";
 
-        let _env_guard = FreshTailEnvGuard::disable();
-
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = memory_runtime_with_fresh_tail(false);
         rt.register_embedder(HashVecProvider {
             model_name: MODEL.to_owned(),
             dims: DIMS,
@@ -1547,9 +1539,7 @@ mod tests {
         const DIMS: usize = 16;
         const NOTE_TEXT: &str = "budget capped degraded disclosure note body";
 
-        let _env_guard = FreshTailEnvGuard::disable();
-
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = memory_runtime_with_fresh_tail(false);
         rt.register_embedder(HashVecProvider {
             model_name: MODEL.to_owned(),
             dims: DIMS,

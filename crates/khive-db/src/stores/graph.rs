@@ -499,10 +499,10 @@ impl SqlGraphStore {
         namespace: impl Into<String>,
     ) -> Self {
         // Enabled by default for file-backed pools; explicit off/degraded
-        // fallback remains possible (ADR-067 Component A, mirrors
-        // entity.rs policy): a missing writer task degrades to the legacy
-        // pool-mutex / standalone-connection path rather than failing
-        // construction.
+        // construction remains synchronous (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task is cached without failing
+        // construction. Every write re-resolves it and applies
+        // strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
@@ -519,28 +519,33 @@ impl SqlGraphStore {
             .map_err(|e| map_sqlite_err(e, "open_graph_writer"))
     }
 
-    fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<WriterTaskHandle>, StorageError> {
         self.pool
-            .open_standalone_reader()
-            .map_err(|e| map_sqlite_err(e, "open_graph_reader"))
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
     }
 
     /// Route a single-row write through the pool-wide `WriterTask` when
-    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
-    /// to the legacy standalone-connection / pool-mutex path (ADR-067
-    /// Component A, Fork C slice 2). `f` must be DML-only. See
+    /// the write queue is enabled and a handle is available. Strict mode
+    /// refuses a missing handle; compatibility mode falls back to the legacy
+    /// standalone-connection / pool-mutex path (ADR-067 Component A, Fork C
+    /// slice 2). `f` must be DML-only. See
     /// `crates/khive-db/docs/api/graph.md` for the per-caller routing rules.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteGraphGeneralWrite);
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
             let db = crate::timeout_sink::db_label(&self.pool);
@@ -573,18 +578,35 @@ impl SqlGraphStore {
         R: Send + 'static,
     {
         if self.is_file_backed {
-            let conn = self.open_standalone_reader()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
+            let pool = Arc::clone(&self.pool);
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Graph,
+                op,
+                move |scope| {
+                    scope.ensure_active()?;
+                    let conn = pool
+                        .open_standalone_reader()
+                        .map_err(|error| map_sqlite_err(error, op))?;
+                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
+                },
+            )
+            .await
         } else {
             let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.reader().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Graph,
+                op,
+                move |scope| {
+                    let mut guard = pool
+                        .reader_until(|| scope.should_stop())
+                        .map_err(|e| map_sqlite_err(e, op))?
+                        .ok_or_else(|| StorageError::Timeout {
+                            operation: op.into(),
+                        })?;
+                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
+                },
+            )
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
         }
     }
 }
@@ -1111,6 +1133,9 @@ fn run_bounded_traversal(
     conn.progress_handler(
         1_000,
         Some(move || {
+            if crate::read_cancellation::current_read_should_interrupt() {
+                return true;
+            }
             #[cfg(test)]
             if tests::traverse_progress_seam::hook(progress_seam_root) {
                 callback_timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1292,7 +1317,7 @@ impl GraphStore for SqlGraphStore {
         // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
         // owns the transaction (a bare BEGIN IMMEDIATE here would violate
         // SQLite's nested-transaction rule).
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("upsert_edges")? {
             return writer_task
                 .send_bounded(move |conn| {
                     batch_upsert_edges(conn, &edges, attempted)
@@ -1352,7 +1377,7 @@ impl GraphStore for SqlGraphStore {
         // insert and the missing-endpoint probe below already run inside
         // one write-locked transaction; a bare `BEGIN IMMEDIATE` here would
         // violate SQLite's nested-transaction rule.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("upsert_edge_guarded")? {
             return writer_task
                 .send_bounded(move |conn| {
                     edge_insert_guarded(conn, &statement, source_id, target_id)
@@ -1400,7 +1425,7 @@ impl GraphStore for SqlGraphStore {
         // Same WriterTask routing as `upsert_edges` — the guard's pre-check
         // runs inside the WriterTask's own `BEGIN IMMEDIATE`, so a missing
         // endpoint is caught before any `INSERT` in this batch runs at all.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("upsert_edges_guarded")? {
             return writer_task
                 .send_bounded(move |conn| {
                     batch_upsert_edges_guarded(conn, &edges, attempted)

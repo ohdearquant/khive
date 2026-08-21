@@ -247,6 +247,11 @@ impl KhiveRuntime {
         // write time because they depend on mutable target state.
         for (index, entity) in archive.entities.iter().enumerate() {
             self.validate_entity_kind(&entity.kind)?;
+            // Archive content is caller-controlled input: the runtime-owned
+            // `khive:secret_gate` property key is reservation-only on import,
+            // exactly as on every other properties-bearing write path
+            // (ADR-115 Amendment 1 §3). Import never consumes exemptions.
+            crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
             if entity.name.trim().is_empty() {
                 return Err(RuntimeError::InvalidInput(format!(
                     "archive entity {index} ({}) name must be non-blank",
@@ -709,6 +714,47 @@ mod tests {
                 "error message should mention the unsupported version, got: {msg:?}"
             );
         }
+    }
+
+    /// ADR-115 Amendment 1 §3: an archive entity carrying the reserved
+    /// `khive:secret_gate` property key must be rejected before any upsert —
+    /// import is a caller-controlled write path and stays reservation-only.
+    #[tokio::test]
+    async fn import_entity_with_reserved_secret_gate_property_is_rejected() {
+        let rt = make_rt().await;
+        let tok = NamespaceToken::local();
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![ExportedEntity {
+                id: Uuid::new_v4(),
+                kind: "concept".to_string(),
+                entity_type: None,
+                name: "ReservedKeyImport".to_string(),
+                description: None,
+                properties: Some(serde_json::json!({
+                    "khive:secret_gate": "exempted:content-sha256-manifest-v1"
+                })),
+                tags: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            edges: vec![],
+        };
+
+        let err = rt.import_kg(&archive, &tok).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
+            "expected a reservation rejection, got {err:?}"
+        );
+
+        let entities = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert!(
+            !entities.iter().any(|e| e.name == "ReservedKeyImport"),
+            "rejected archive import must not create the entity"
+        );
     }
 
     /// 6. Invalid relation in archive → InvalidInput.

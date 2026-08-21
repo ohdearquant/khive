@@ -1,9 +1,10 @@
 //! Weighted linear combination fusion with per-source min-max normalization.
 
 use khive_score::{weighted_sum, DeterministicScore};
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
+
+use crate::ordering::cmp_desc_then_id;
 
 /// Min-max normalize scores to `[0, 1]`; equal/single-element sources map to 1.0.
 const SCORE_SCALE: i128 = 4_294_967_296; // 2^32 — represents 1.0 in DeterministicScore
@@ -107,12 +108,7 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
 
     let mut fused: Vec<(Id, DeterministicScore)> = combined.into_iter().collect();
 
-    fused.sort_by(
-        |(id_a, score_a), (id_b, score_b)| match score_b.cmp(score_a) {
-            Ordering::Equal => id_a.cmp(id_b),
-            other => other,
-        },
-    );
+    fused.sort_by(cmp_desc_then_id);
     fused
 }
 

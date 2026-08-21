@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,10 +16,67 @@ use khive_storage::types::Direction;
 use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
 
+use super::dispatch::bounded_backend_cause_for_log;
 use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordinatorService};
 
 fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
+}
+
+#[derive(Clone, Default)]
+struct CoordinatorLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CoordinatorLogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CoordinatorLogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).expect("captured logs are UTF-8")
+    }
+}
+
+struct MakeCoordinatorLogCapture(CoordinatorLogCapture);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeCoordinatorLogCapture {
+    type Writer = CoordinatorLogCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.clone()
+    }
+}
+
+#[derive(Debug)]
+struct DenyWithCauseGate {
+    cause: String,
+}
+
+impl khive_runtime::Gate for DenyWithCauseGate {
+    fn check(
+        &self,
+        _req: &khive_runtime::GateRequest,
+    ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+        Ok(khive_runtime::GateDecision::deny(self.cause.clone()))
+    }
+}
+
+fn memory_runtime_denied_with(cause: String) -> Arc<KhiveRuntime> {
+    Arc::new(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            gate: Arc::new(DenyWithCauseGate { cause }),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime with denying gate"),
+    )
 }
 
 fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
@@ -539,6 +597,80 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
     );
 }
 
+/// Every backend task starts together and therefore shares one absolute
+/// request deadline. Joining several hung handles sequentially must not renew
+/// the five-second budget for each handle (N hung backends must still cost one
+/// timeout window, not N windows).
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
+    let mut registry = BackendRegistry::new();
+    for backend in ["hung-a", "hung-b", "hung-c"] {
+        registry.register(BackendId::new(backend), memory_runtime());
+    }
+    let coord =
+        SubstrateCoordinator::new(registry).with_hanging_backends(["hung-a", "hung-b", "hung-c"]);
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "shared absolute timeout",
+        "limit": 10,
+    }));
+    let started = tokio::time::Instant::now();
+
+    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &Namespace::local()).await;
+
+    assert!(hits.is_empty());
+    assert!(note_hits.is_empty());
+    assert_eq!(per_backend.len(), 3);
+    assert!(per_backend.iter().all(|entry| entry
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("timed out"))));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
+        "three concurrently-started hung backends renewed the request budget; elapsed={elapsed:?}"
+    );
+}
+
+/// A sibling that finishes only while the coordinator is draining an earlier
+/// hung task has missed the shared request deadline. `JoinHandle::is_finished`
+/// must not relabel that late result as healthy merely because it is polled
+/// after the grace window.
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() {
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("a-hung"), memory_runtime());
+    registry.register(BackendId::new("b-late"), memory_runtime());
+    let coord = SubstrateCoordinator::new(registry)
+        .with_hanging_backend("a-hung")
+        .with_delayed_backend("b-late", Duration::from_millis(5_100));
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "late sibling",
+        "limit": 10,
+    }));
+
+    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &Namespace::local()).await;
+
+    assert!(hits.is_empty());
+    assert!(note_hits.is_empty());
+    assert_eq!(per_backend.len(), 2);
+    for backend in ["a-hung", "b-late"] {
+        let report = per_backend
+            .iter()
+            .find(|entry| entry.backend_id.as_str() == backend)
+            .expect("every backend is reported");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")),
+            "{backend} completed outside the absolute deadline but was accepted: {:?}",
+            report.error
+        );
+    }
+}
+
 /// Same guarantee as the spawned multi-backend hung-backend test above, but
 /// for the single-backend early-return path (`entries.len() == 1`), which
 /// has no spawned task for the fan-out timeout loop above to bound — the
@@ -587,6 +719,106 @@ async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate()
         err.contains("timed out"),
         "single-backend timeout error must be timeout-specific, got: {err:?}"
     );
+}
+
+/// Backend names are configuration strings, not trusted identifiers.  A
+/// credential-shaped name must be masked at the coordinator WARN site itself,
+/// before the later MCP envelope sanitizer ever receives the result.
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_timeout_masks_backend_credentials_in_coordinator_warning() {
+    let secret = format!("archive auth token sk_live_{}", "z".repeat(32));
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new(secret.clone()), memory_runtime());
+    let coord = SubstrateCoordinator::new(registry).with_hanging_backend(&secret);
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "credential-safe timeout",
+        "limit": 10,
+    }));
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    let (_hits, _note_hits, per_backend) =
+        coord.fan_out_search(&request, &Namespace::local()).await;
+    drop(guard);
+    let logs = captured.contents();
+
+    assert_eq!(per_backend.len(), 1);
+    assert!(per_backend[0].error.is_some());
+    assert!(
+        !logs.contains("sk_live_"),
+        "coordinator WARN leaked backend credential: {logs}"
+    );
+    assert!(
+        logs.contains("***MASKED***"),
+        "coordinator WARN omitted masked backend identity: {logs}"
+    );
+    assert!(logs.contains("backend search task timed out"));
+}
+
+#[test]
+fn coordinator_warning_cause_masker_is_bounded_and_fail_closed() {
+    let secret = format!("authorization token sk_live_{} denied", "q".repeat(32));
+    let masked = bounded_backend_cause_for_log(&secret);
+    assert!(masked.contains("***MASKED***"));
+    assert!(!masked.contains("sk_live_"));
+
+    let oversized = "x".repeat(5_000);
+    let bounded = bounded_backend_cause_for_log(&oversized);
+    assert_eq!(bounded.chars().count(), 1_025);
+    assert!(bounded.ends_with('…'));
+    assert_eq!(
+        bounded_backend_cause_for_log(" \t\n"),
+        "backend search failed without diagnostic detail"
+    );
+}
+
+#[tokio::test]
+async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() {
+    let secret = format!("authorization token sk_live_{} denied", "r".repeat(32));
+    let mut registry = BackendRegistry::new();
+    registry.register(
+        BackendId::new("archive"),
+        memory_runtime_denied_with(secret.clone()),
+    );
+    let coord = SubstrateCoordinator::new(registry);
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "credential-safe authorization",
+        "limit": 10,
+    }));
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    let (_hits, _note_hits, per_backend) =
+        coord.fan_out_search(&request, &Namespace::local()).await;
+    drop(guard);
+    let logs = captured.contents();
+
+    assert_eq!(per_backend.len(), 1);
+    assert!(
+        per_backend[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("sk_live_")),
+        "internal result should retain the raw cause until the MCP sanitizer"
+    );
+    assert!(
+        !logs.contains("sk_live_"),
+        "coordinator WARN leaked authorization credential: {logs}"
+    );
+    assert!(logs.contains("***MASKED***"));
+    assert!(logs.contains("authorization denied for namespace"));
 }
 
 /// Same as the entity-substrate test above, for the `search_notes` await at
@@ -1120,7 +1352,16 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
         "limit": 10,
     }));
 
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
     let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    drop(guard);
+    let logs = captured.contents();
     assert_eq!(per_backend.len(), 2, "every spawned backend is reported");
 
     let panicked = per_backend
@@ -1135,6 +1376,8 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
         error.contains("join failed") && error.contains("panic"),
         "join error should identify the task panic, got {error:?}"
     );
+    assert!(logs.contains("backend search task failed"));
+    assert!(logs.contains("join failed") && logs.contains("panic"));
 
     let healthy = per_backend
         .iter()
@@ -1442,6 +1685,295 @@ async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
     assert!(
         lore_neighbors.is_empty(),
         "T2b: no edge must be written on the target backend after rejection"
+    );
+}
+
+// ---- T2c: Cross-backend link's authorize() gate error stays sanitized on the wire ----
+
+/// A gate that allows its first four checks — the test's own entity-setup
+/// authorize call, the MCP dispatch's own top-level namespace authorize check
+/// (`VerbRegistry::dispatch_intercepted_with_metadata_with_identity`, which
+/// runs once before the coordinator ever sees the request), and the two
+/// `locate_endpoint` probe-authorize calls `link_cross_backend` issues
+/// against this backend for the source and target ids before it authorizes
+/// the link itself — and then fails every subsequent check with a backend
+/// error carrying connection-string-shaped detail, simulating a gate backend
+/// outage discovered during `link_cross_backend`'s own
+/// `src_runtime.authorize(...)` call (`crates/kkernel/src/coordinator/dispatch.rs`).
+#[derive(Debug)]
+struct ErrorAfterSetupCallsGate {
+    cause: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl khive_runtime::Gate for ErrorAfterSetupCallsGate {
+    fn check(
+        &self,
+        _req: &khive_runtime::GateRequest,
+    ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call < 4 {
+            Ok(khive_runtime::GateDecision::allow())
+        } else {
+            Err(khive_runtime::GateError::Internal(self.cause.clone()))
+        }
+    }
+}
+
+fn memory_runtime_gate_erroring_after_first_call_with(cause: String) -> Arc<KhiveRuntime> {
+    Arc::new(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            gate: Arc::new(ErrorAfterSetupCallsGate {
+                cause,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime with gate-erroring-after-setup-calls gate"),
+    )
+}
+
+/// Regression for a second production disclosure path, exercised through the
+/// real MCP wire boundary rather than the coordinator's Rust API directly: a
+/// `GateError` raised inside `link_cross_backend`'s own `authorize()` call on
+/// the source backend must never put backend `Display` text (which can embed
+/// connection strings or credentials) into the per-operation error a caller
+/// receives from `request(ops="link(...)")`. Only the stable classified
+/// `wire_reason()` may cross that boundary; the full error must still land in
+/// the server-side `tracing::warn!` emitted by `KhiveRuntime::authorize`.
+///
+/// Dispatches through `KhiveMcpServer::dispatch_request_local`, which routes
+/// `link` through `dispatch_via_coordinator_inner` ->
+/// `VerbRegistry::dispatch_intercepted_with_identity` ->
+/// `SubstrateCoordinatorService::link` -> `DispatchFailure::from_runtime` ->
+/// the serialized MCP response — the same chain a real MCP client's `link`
+/// call goes through in multi-backend mode.
+#[tokio::test]
+async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wire() {
+    const CANARY: &str = "postgres://svc:not-a-real-secret@internal-host";
+
+    let rt_main = memory_runtime_gate_erroring_after_first_call_with(CANARY.to_string());
+    let rt_lore = memory_runtime();
+    let ns = Namespace::local();
+
+    // Entity creation on "main" consumes the gate's first free `Allow` call.
+    let tok_main = rt_main.authorize(ns.clone()).expect("setup authorize");
+    let src = rt_main
+        .create_entity(
+            &tok_main,
+            "project",
+            None,
+            "SourceProject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T2c: create source on main");
+
+    let tok_lore = rt_lore.authorize(ns.clone()).expect("setup authorize lore");
+    let tgt = rt_lore
+        .create_entity(
+            &tok_lore,
+            "concept",
+            None,
+            "TargetConcept",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T2c: create target on lore");
+
+    let server = two_backend_server_with_packs(Arc::clone(&rt_main), Arc::clone(&rt_lore), &["kg"]);
+
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    // The gate's four free `Allow` calls are already spent by this point:
+    // entity setup, this dispatch's own top-level namespace check, and
+    // `locate_endpoint`'s probe-authorize for source and target. The real
+    // `src_runtime.authorize(...)` inside `link_cross_backend` is the fifth
+    // call on "main" and now errors.
+    let ops = format!(
+        r#"link(source_id="{}", target_id="{}", relation="implements")"#,
+        src.id, tgt.id
+    );
+    let raw = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops,
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("T2c: dispatch must produce a response envelope");
+    drop(guard);
+    let logs = captured.contents();
+
+    let response: serde_json::Value =
+        serde_json::from_str(&raw).expect("T2c: response must be valid JSON");
+    let op = &response["results"][0];
+    assert_eq!(
+        op["ok"].as_bool(),
+        Some(false),
+        "T2c: link op must fail closed on the wire: {response}"
+    );
+    let wire_err = op["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("T2c: MCP-visible error must be a string: {response}"))
+        .to_string();
+
+    assert!(
+        !wire_err.contains(CANARY),
+        "T2c: MCP-visible link error must not embed backend error text: {wire_err:?}"
+    );
+    assert!(
+        !wire_err.contains("svc") && !wire_err.contains("internal-host"),
+        "T2c: MCP-visible link error must not embed backend error fragments: {wire_err:?}"
+    );
+    assert!(
+        wire_err.contains("gate backend unavailable"),
+        "T2c: MCP-visible link error must carry the stable classified reason: {wire_err:?}"
+    );
+
+    assert!(
+        !logs.contains(CANARY),
+        "T2c: backend error text must not reach the server-side log unmasked: {logs}"
+    );
+    assert!(
+        !logs.contains("not-a-real-secret"),
+        "T2c: the credential fragment must not reach the server-side log: {logs}"
+    );
+    assert!(
+        logs.contains("***MASKED***"),
+        "T2c: the gate failure log must still record the masked backend error: {logs}"
+    );
+}
+
+// ---- T2d: Real RegoGate evaluator failure stays sanitized on the wire ----
+
+/// Regression for the rego-backed `Gate` sanitization fix: `RegoGate::check`
+/// used to fold `regorus`'s raw evaluator-error text directly into a
+/// `GateDecision::deny(...)` reason, which crossed both the MCP wire and the
+/// server-side log unmasked whenever the offending value happened to be
+/// caller-supplied. It now returns `Ok(GateDecision::Deny)` with a static
+/// classified reason that never embeds evaluator output, so the failure
+/// surfaces on the wire as an ordinary `RuntimeError::PermissionDenied` and
+/// the audit log records only that static reason — there is nothing
+/// secret-bearing left to mask on this path.
+///
+/// Dispatches through `KhiveMcpServer::dispatch_request_local` with no
+/// coordinator attached (single-backend), the same real MCP wire boundary as
+/// T2c, but with a genuine `RegoGate` instead of a synthetic `Gate` impl —
+/// this is what actually exercises `khive-gate-rego/src/gate.rs`'s
+/// evaluator-failure branch rather than the generic classify+mask plumbing
+/// T2c already covers.
+#[tokio::test]
+async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
+    use khive_gate_rego::RegoGate;
+
+    // FAKE key: real AKIA/AWS shape, invented suffix — matches the masking
+    // detector so a leak would be caught either as raw canary text or as a
+    // missing "***MASKED***" marker (see khive-gate-rego's own tests for the
+    // convention).
+    const CANARY: &str = "AKIAFAKEKEY000000000";
+
+    // `input.args.canary` is a string; `1 + <string>` is a regorus type
+    // error raised at eval time whose message embeds the offending value
+    // verbatim — exactly the evaluator-failure shape this fix must sanitize.
+    let policy = r#"
+        package khive.gate
+        import rego.v1
+        decision := 1 + input.args.canary
+    "#;
+    let gate = Arc::new(RegoGate::from_policy_str(policy).expect("policy compiles"));
+    let rt = Arc::new(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            gate,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("T2d: memory runtime with rego gate"),
+    );
+
+    let server = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+        packs_registry(Arc::clone(&rt), &["kg"]),
+        "local",
+        "test-rego-evaluator-failure",
+    );
+
+    let captured = CoordinatorLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(MakeCoordinatorLogCapture(captured.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    let ops = format!(r#"list(kind="entity", canary="{CANARY}")"#);
+    let raw = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops,
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("T2d: dispatch must produce a response envelope");
+    drop(guard);
+    let logs = captured.contents();
+
+    let response: serde_json::Value =
+        serde_json::from_str(&raw).expect("T2d: response must be valid JSON");
+    let op = &response["results"][0];
+    assert_eq!(
+        op["ok"].as_bool(),
+        Some(false),
+        "T2d: list op must fail closed on the wire: {response}"
+    );
+    let wire_err = op["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("T2d: MCP-visible error must be a string: {response}"))
+        .to_string();
+
+    assert!(
+        !wire_err.contains(CANARY),
+        "T2d: MCP-visible error must not embed the evaluator's raw error text: {wire_err:?}"
+    );
+    assert!(
+        wire_err.contains("policy evaluation failed"),
+        "T2d: MCP-visible error must carry the static classified reason: {wire_err:?}"
+    );
+    // A `RegoGate` evaluator failure is a policy denial (`Ok(GateDecision::Deny)`), not a
+    // gate infrastructure outage — it must surface as `RuntimeError::PermissionDenied`'s
+    // wire shape ("permission denied for verb ..."), never
+    // `RuntimeError::GateUnavailable`'s ("gate unavailable for verb ...").
+    assert!(
+        wire_err.starts_with("permission denied for verb"),
+        "T2d: MCP-visible error must have the PermissionDenied shape, not GateUnavailable: {wire_err:?}"
+    );
+
+    // Nothing secret-bearing is emitted on this path anymore — the deny
+    // reason is a static string, so there is no masked-marker expectation
+    // here. The masking machinery itself stays covered by T2c above.
+    assert!(
+        !logs.contains(CANARY),
+        "T2d: canary must not reach the server-side log: {logs}"
     );
 }
 
@@ -2184,6 +2716,89 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
             entity_kind.and_then(|v| v.as_str()),
             Some("concept"),
             "T7a: entity_kind must be 'concept', got: {hit}"
+        );
+    }
+}
+
+/// #1676 acceptance: row-shape parity is a symmetric contract.
+///
+/// A one-way "coordinator contains the currently known fields" assertion does
+/// not catch a later field added only to the direct handler. Drive both server
+/// routes over the same primary runtime and require their complete key sets to
+/// be identical for both substrates.
+#[tokio::test]
+async fn multi_backend_and_direct_search_rows_have_exact_key_set_parity() {
+    async fn first_hit_keys(
+        server: &khive_mcp::server::KhiveMcpServer,
+        ops: &str,
+    ) -> BTreeSet<String> {
+        let raw = server
+            .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+                ops: ops.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("search dispatch must succeed");
+        let response: serde_json::Value =
+            serde_json::from_str(&raw).expect("search response must be valid JSON");
+        response["results"][0]["result"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("search must return an object row: {response}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    let primary = memory_runtime();
+    let empty_secondary = memory_runtime();
+    let namespace = RuntimeNamespace::local();
+    let token = primary.authorize(namespace).expect("authorize primary");
+    primary
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "ExactShapeEntityProbe",
+            Some("entity used to compare direct and coordinator row keys"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity shape probe");
+    primary
+        .create_note(
+            &token,
+            "observation",
+            Some("Exact shape note probe"),
+            "exactshapenoteprobe content used to compare search row keys",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note shape probe");
+
+    let direct = khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
+        packs_registry(Arc::clone(&primary), &["kg"]),
+        "local",
+        "test-direct-shape",
+    );
+    let coordinated = two_backend_server(Arc::clone(&primary), empty_secondary);
+
+    for ops in [
+        r#"search(kind="concept", query="ExactShapeEntityProbe")"#,
+        r#"search(kind="observation", query="exactshapenoteprobe")"#,
+    ] {
+        let direct_keys = first_hit_keys(&direct, ops).await;
+        let coordinated_keys = first_hit_keys(&coordinated, ops).await;
+        assert_eq!(
+            coordinated_keys, direct_keys,
+            "neither search route may add or omit a row field for {ops}"
         );
     }
 }

@@ -51,6 +51,22 @@ JSON form never represents a chain. The parser recursively rejects string values
 
 Before invoking `serde_json`, a quote-aware linear scan bounds `[`/`{` nesting because the untyped `Value` deserializer exposes no depth setting. This prevents deeply nested input from reaching unbounded native recursion (CWE-674).
 
+## Typed local JSON batches
+
+`parse_typed_json_batch` is an additive Rust API for a trusted transport that has
+already decoded and independently bounded its input, currently
+`kkernel exec --ops-file`. It accepts `TypedJsonOp` values and returns the same
+ordered `ParsedOp` representation in `Parallel` mode. It preserves JSON-form
+operation-count, nesting, `$prev`, and reserved-envelope validation, but does not
+reapply `MAX_OPS_INPUT_LEN`: the original raw byte representation no longer
+exists at this layer, and the ops-file endpoint has stricter endpoint-specific
+96 MiB line, 512 MiB file, and 32 MiB chunk bounds.
+
+This is not an alternate MCP, HTTP, daemon, or inline-exec parser. Those
+untrusted string surfaces continue to call `parse_request`, reject oversized raw
+input before expensive parsing, and retain the 1 MiB limit. Callers of the typed
+API must establish their own raw and aggregate limits before JSON decoding.
+
 ## Envelope-only arguments
 
 `presentation` and `presentation_per_op` belong to the outer request envelope. If either appears inside an operation argument bag, parsing returns `ReservedEnvelopeArg` naming the field and verb.

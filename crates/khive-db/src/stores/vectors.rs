@@ -22,37 +22,6 @@ use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 
-/// ADR-136 D1 gate 3: called immediately before a `with_writer_unmanaged`
-/// fallback so this store's two remaining direct-writer call sites
-/// (`vec_delete_subjects`, `orphan_sweep`) fail closed under strict routing
-/// instead of silently bypassing an enabled queue. Under non-strict routing
-/// this is a no-op except for a `direct_route_violation` sink row when the
-/// queue is enabled (ADR-136 D1 gate 6c) — observable, but not yet fatal.
-fn refuse_direct_route_if_strict(
-    pool: &ConnectionPool,
-    site: crate::timeout_sink::Site,
-    op: &'static str,
-) -> Result<(), StorageError> {
-    if pool.config().write_routing_strict {
-        return Err(StorageError::Pool {
-            operation: op.into(),
-            message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is available; \
-                      refusing to fall back to a direct connection"
-                .into(),
-        });
-    }
-    if pool.write_queue_active() {
-        // In-memory pools never spawn a writer task by documented design
-        // (explicit `Some(true)` degrades), so a violation row there would
-        // be noise, not signal.
-        crate::timeout_sink::emit_direct_route_violation(
-            &crate::timeout_sink::db_label(pool),
-            site,
-        );
-    }
-    Ok(())
-}
-
 /// The exact `DELETE` this store's `delete` issues, for a given vector table
 /// (ADR-099 B3 r6 structural cut — see `stores::entity`'s sibling block).
 /// `table` must already be a trusted, sanitized table name (mirrors
@@ -325,10 +294,10 @@ impl SqliteVecStore {
     ) -> Result<Self, SqliteError> {
         validate_model_key(&model_key)?;
         let table_name = format!("vec_{}", model_key);
-        // Enabled by default for file-backed pools; explicit off/degraded
-        // fallback remains possible (ADR-067 Component A, mirrors
-        // entity.rs policy): a missing writer task degrades to the legacy
-        // pool-mutex path rather than failing construction.
+        // Enabled by default for file-backed pools. Construction stays
+        // synchronous (ADR-067 Component A, mirrors entity.rs policy): a
+        // missing writer task is cached without failing construction. Every
+        // write re-resolves it and applies strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Ok(Self {
             pool,
@@ -342,31 +311,6 @@ impl SqliteVecStore {
         })
     }
 
-    fn open_standalone_reader(&self) -> Result<rusqlite::Connection, StorageError> {
-        let config = self.pool.config();
-        let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-            operation: "vec_reader".into(),
-            message: "in-memory databases do not support standalone connections".into(),
-        })?;
-
-        let conn = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| map_err(e, "open_vec_reader"))?;
-
-        conn.busy_timeout(config.busy_timeout)
-            .map_err(|e| map_err(e, "open_vec_reader"))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| map_err(e, "open_vec_reader"))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| map_err(e, "open_vec_reader"))?;
-
-        Ok(conn)
-    }
-
     /// Re-derive writer-task availability at write time instead of trusting
     /// only the field cached at construction (ADR-136 D1 gate 3 amendment).
     /// `self.writer_task` permanently caches `None` when this store was
@@ -374,12 +318,14 @@ impl SqliteVecStore {
     /// `Err(WriterTaskNoRuntime)`, which construction collapses via
     /// `.ok().flatten()`) — every later write, even ones running inside a
     /// runtime, would otherwise silently keep bypassing an enabled queue.
-    /// `ConnectionPool::writer_task_handle()` is a cheap `OnceCell` read once
-    /// resolved, so re-checking here costs nothing on the hot path.
-    fn current_writer_task(&self) -> Option<crate::writer_task::WriterTaskHandle> {
-        self.writer_task
-            .clone()
-            .or_else(|| self.pool.writer_task_handle().ok().flatten())
+    /// The pool helper also enforces strict fail-closed routing and preserves
+    /// a typed `WriterTaskNoRuntime` error when no runtime is available.
+    fn current_writer_task(
+        &self,
+        operation: &'static str,
+    ) -> Result<Option<crate::writer_task::WriterTaskHandle>, StorageError> {
+        self.pool
+            .writer_task_for_write(self.writer_task.as_ref(), operation)
     }
 
     /// Route a single-row DML-only write through the pool-wide `WriterTask`
@@ -390,17 +336,14 @@ impl SqliteVecStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
-        refuse_direct_route_if_strict(
-            &self.pool,
-            crate::timeout_sink::Site::DirectRouteVecGeneralWrite,
-            op,
-        )?;
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteVecGeneralWrite);
         self.with_writer_unmanaged(op, f).await
     }
 
@@ -428,19 +371,125 @@ impl SqliteVecStore {
         R: Send + 'static,
     {
         if self.is_file_backed {
-            let conn = self.open_standalone_reader()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Vectors, op, e))?
+            let pool = Arc::clone(&self.pool);
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Vectors,
+                op,
+                move |scope| {
+                    scope.ensure_active()?;
+                    let conn = pool
+                        .open_standalone_reader()
+                        .map_err(|error| map_sqlite_err(error, op))?;
+                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
+                },
+            )
+            .await
         } else {
             let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.reader().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
+            crate::read_cancellation::run_declared_interruptible_read(
+                StorageCapability::Vectors,
+                op,
+                move |scope| {
+                    let mut guard = pool
+                        .reader_until(|| scope.should_stop())
+                        .map_err(|e| map_sqlite_err(e, op))?
+                        .ok_or_else(|| StorageError::Timeout {
+                            operation: op.into(),
+                        })?;
+                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
+                },
+            )
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Vectors, op, e))?
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_one(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+        record_ann_delta: bool,
+        operation: &'static str,
+        savepoint_name: &'static str,
+    ) -> Result<(), StorageError> {
+        if vectors.len() != 1 {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: operation.into(),
+                message: "sqlite-vec supports exactly one vector per record".into(),
+            });
+        }
+        let embedding = vectors.into_iter().next().expect("len checked");
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        let namespace = namespace.to_string();
+        let field = field.to_string();
+        let kind_str = kind.to_string();
+        let embedding_model = self.embedding_model.clone();
+
+        if embedding.len() == dims {
+            if let Some(index) = non_finite_index(&embedding) {
+                return Err(non_finite_vector_error(operation, index, embedding[index]));
+            }
+        }
+
+        let failpoint_flag = current_failpoint();
+        if let Some(writer_task) = self.current_writer_task(operation)? {
+            let table_for_write = table.clone();
+            let namespace_for_write = namespace.clone();
+            let field_for_write = field.clone();
+            let kind_for_write = kind_str.clone();
+            let model_for_write = embedding_model.clone();
+            let embedding_for_write = embedding.clone();
+            return writer_task
+                .send_bounded(move |connection| {
+                    vec_upsert_atomic_dml(
+                        connection,
+                        &table_for_write,
+                        dims,
+                        subject_id,
+                        &kind_for_write,
+                        &namespace_for_write,
+                        &field_for_write,
+                        &model_for_write,
+                        &embedding_for_write,
+                        savepoint_name,
+                        record_ann_delta,
+                        failpoint_flag,
+                    )
+                    .map_err(|error| map_err(error, operation))
+                })
+                .await;
+        }
+
+        let origin = self.pool.origin();
+        self.with_writer(operation, move |connection| {
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some(format!("{operation}_tx")),
+                origin,
+            );
+            let transaction = connection.unchecked_transaction()?;
+            replace_vector_row_dml(
+                &transaction,
+                &table,
+                dims,
+                VectorRowRef {
+                    subject_id,
+                    namespace: &namespace,
+                    kind: &kind_str,
+                    field: &field,
+                    embedding_model: &embedding_model,
+                    embedding: &embedding,
+                },
+                record_ann_delta,
+                failpoint_flag,
+            )?;
+            transaction.commit()
+        })
+        .await
     }
 }
 
@@ -464,6 +513,7 @@ fn replace_vector_row_dml(
     table: &str,
     dims: usize,
     row: VectorRowRef<'_>,
+    record_ann_delta: bool,
     failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), rusqlite::Error> {
     if row.embedding.len() != dims {
@@ -493,8 +543,14 @@ fn replace_vector_row_dml(
         ],
     )?;
     if deleted_same_identity == 0 {
-        let logged = log_vector_deletes(conn, table, "subject_id = ?1", &[&subject_id])?;
-        if logged > 0 {
+        if record_ann_delta {
+            let logged = log_vector_deletes(conn, table, "subject_id = ?1", &[&subject_id])?;
+            if logged > 0 {
+                let delete_prior_identity_sql =
+                    format!("DELETE FROM {table} WHERE subject_id = ?1");
+                conn.execute(&delete_prior_identity_sql, rusqlite::params![&subject_id])?;
+            }
+        } else {
             let delete_prior_identity_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
             conn.execute(&delete_prior_identity_sql, rusqlite::params![&subject_id])?;
         }
@@ -531,19 +587,21 @@ fn replace_vector_row_dml(
         ],
     )?;
 
-    // Delta record for the ANN restart classifier; rides the caller's
-    // savepoint/transaction so a rolled-back upsert leaves no log row.
-    conn.execute(
-        "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')",
-        rusqlite::params![
-            row.namespace,
-            row.embedding_model,
-            row.kind,
-            row.field,
-            &subject_id
-        ],
-    )?;
+    if record_ann_delta {
+        // Delta record for the ANN restart classifier; rides the caller's
+        // savepoint/transaction so a rolled-back upsert leaves no log row.
+        conn.execute(
+            "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'upsert')",
+            rusqlite::params![
+                row.namespace,
+                row.embedding_model,
+                row.kind,
+                row.field,
+                &subject_id
+            ],
+        )?;
+    }
 
     Ok(())
 }
@@ -695,6 +753,7 @@ fn batch_insert_vectors_dml(
                 embedding_model: store_embedding_model,
                 embedding,
             },
+            true,
             failpoint_flag.clone(),
         );
         match result {
@@ -741,6 +800,7 @@ fn vec_upsert_atomic_dml(
     embedding_model: &str,
     embedding: &[f32],
     savepoint_name: &'static str,
+    record_ann_delta: bool,
     failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), rusqlite::Error> {
     conn.execute_batch(&format!("SAVEPOINT {savepoint_name}"))?;
@@ -756,6 +816,7 @@ fn vec_upsert_atomic_dml(
             embedding_model,
             embedding,
         },
+        record_ann_delta,
         failpoint_flag,
     );
 
@@ -907,99 +968,37 @@ impl VectorStore for SqliteVecStore {
         field: &str,
         vectors: Vec<Vec<f32>>,
     ) -> Result<(), StorageError> {
-        if vectors.len() != 1 {
-            return Err(StorageError::Unsupported {
-                capability: StorageCapability::Vectors,
-                operation: "vec_insert".into(),
-                message: "sqlite-vec supports exactly one vector per record".into(),
-            });
-        }
-        let embedding = vectors.into_iter().next().expect("len checked");
+        self.insert_one(
+            subject_id,
+            kind,
+            namespace,
+            field,
+            vectors,
+            true,
+            "vec_insert",
+            "vec_insert_atomic",
+        )
+        .await
+    }
 
-        let table = self.table_name.clone();
-        let dims = self.dimensions;
-        let namespace = namespace.to_string();
-        let field = field.to_string();
-        let kind_str = kind.to_string();
-        let embedding_model = self.embedding_model.clone();
-
-        if embedding.len() == dims {
-            if let Some(idx) = non_finite_index(&embedding) {
-                return Err(non_finite_vector_error("vec_insert", idx, embedding[idx]));
-            }
-        }
-
-        // Capture the failpoint Arc (if any) from the thread-local on the
-        // calling thread before handing the closure to spawn_blocking.
-        let failpoint_flag = current_failpoint();
-
-        // ADR-067 Component A (Fork C slice 2): when the write queue is
-        // enabled, route through the pool-wide WriterTask. DML-only
-        // closure — atomicity is provided by `vec_upsert_atomic_dml`'s
-        // named SAVEPOINT rather than `conn.unchecked_transaction()`,
-        // which would attempt a nested `BEGIN` and fail under the
-        // WriterTask's already-open transaction.
-        if let Some(writer_task) = self.current_writer_task() {
-            let table2 = table.clone();
-            let namespace2 = namespace.clone();
-            let field2 = field.clone();
-            let kind_str2 = kind_str.clone();
-            let embedding_model2 = embedding_model.clone();
-            let embedding2 = embedding.clone();
-            return writer_task
-                .send_bounded(move |conn| {
-                    vec_upsert_atomic_dml(
-                        conn,
-                        &table2,
-                        dims,
-                        subject_id,
-                        &kind_str2,
-                        &namespace2,
-                        &field2,
-                        &embedding_model2,
-                        &embedding2,
-                        "vec_insert_atomic",
-                        failpoint_flag,
-                    )
-                    .map_err(|e| map_err(e, "vec_insert"))
-                })
-                .await;
-        }
-
-        // Explicitly disabled or degraded fallback path: the closure owns its own transaction via
-        // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
-        // shared helper the WriterTask/batch paths use (#546), so this path
-        // now also exercises the post-delete failpoint in tests.
-        let origin = self.pool.origin();
-        self.with_writer("vec_insert", move |conn| {
-            // ADR-091 Plank 0: register the span before opening the transaction so
-            // the handle (declared first) drops AFTER `tx` (declared second) —
-            // locals drop in reverse declaration order, so `tx`'s own Drop (which
-            // rolls back if uncommitted) runs while the registry entry is still
-            // present.
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("vec_insert_tx".to_string()),
-                origin,
-            );
-            let tx = conn.unchecked_transaction()?;
-
-            replace_vector_row_dml(
-                &tx,
-                &table,
-                dims,
-                VectorRowRef {
-                    subject_id,
-                    namespace: &namespace,
-                    kind: &kind_str,
-                    field: &field,
-                    embedding_model: &embedding_model,
-                    embedding: &embedding,
-                },
-                failpoint_flag,
-            )?;
-
-            tx.commit()
-        })
+    async fn insert_exact_only(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<(), StorageError> {
+        self.insert_one(
+            subject_id,
+            kind,
+            namespace,
+            field,
+            vectors,
+            false,
+            "vec_insert_exact_only",
+            "vec_insert_exact_only_atomic",
+        )
         .await
     }
 
@@ -1023,7 +1022,7 @@ impl VectorStore for SqliteVecStore {
         // `SAVEPOINT vec_batch_record` is preserved unchanged — only the
         // OUTER BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's
         // run loop owns the enclosing transaction).
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task("vec_insert_batch")? {
             let table2 = table.clone();
             let store_embedding_model2 = store_embedding_model.clone();
             return writer_task
@@ -1109,7 +1108,7 @@ impl VectorStore for SqliteVecStore {
         // named SAVEPOINT rather than `conn.unchecked_transaction()`,
         // which would attempt a nested `BEGIN` and fail under the
         // WriterTask's already-open transaction.
-        if let Some(writer_task) = self.current_writer_task() {
+        if let Some(writer_task) = self.current_writer_task("vec_update")? {
             let table2 = table.clone();
             let namespace2 = namespace.clone();
             let field2 = field.clone();
@@ -1129,6 +1128,7 @@ impl VectorStore for SqliteVecStore {
                         &embedding_model2,
                         &embedding2,
                         "vec_update_atomic",
+                        true,
                         failpoint_flag,
                     )
                     .map_err(|e| map_err(e, "vec_update"))
@@ -1161,6 +1161,7 @@ impl VectorStore for SqliteVecStore {
                     embedding_model: &embedding_model,
                     embedding: &embedding,
                 },
+                true,
                 failpoint_flag,
             )?;
 
@@ -1373,7 +1374,7 @@ impl VectorStore for SqliteVecStore {
         // The WriterTask owns one BEGIN IMMEDIATE/COMMIT/ROLLBACK around each
         // request. Submit the complete chunk loop as one DML-only request so a
         // failure in any chunk makes the task roll back the complete input.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("vec_delete_subjects")? {
             let table_for_error = table.clone();
             return writer_task
                 .send_bounded(move |conn| {
@@ -1391,11 +1392,8 @@ impl VectorStore for SqliteVecStore {
         // outermost SAVEPOINT. `Transaction` rolls back on early DML errors and
         // also when COMMIT fails while SQLite leaves the transaction open,
         // preventing a poisoned transaction from returning to the pool.
-        refuse_direct_route_if_strict(
-            &self.pool,
-            crate::timeout_sink::Site::DirectRouteVecDeleteSubjects,
-            "vec_delete_subjects",
-        )?;
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteVecDeleteSubjects);
         let table_for_error = table.clone();
         let origin = self.pool.origin();
         self.with_writer_unmanaged("vec_delete_subjects", move |conn| {
@@ -1509,7 +1507,7 @@ impl VectorStore for SqliteVecStore {
         // IMMEDIATE` here would violate SQLite's nested-transaction rule and
         // fail with `SQLITE_ERROR: cannot start a transaction within a
         // transaction` (ADR-067 lines 271-276).
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task("orphan_sweep")? {
             let table2 = table.clone();
             let ns_json2 = ns_json.clone();
             let kind_json2 = kind_json.clone();
@@ -1533,11 +1531,8 @@ impl VectorStore for SqliteVecStore {
         // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own transaction via
         // `Transaction::new_unchecked`.
-        refuse_direct_route_if_strict(
-            &self.pool,
-            crate::timeout_sink::Site::DirectRouteOrphanSweep,
-            "orphan_sweep",
-        )?;
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteOrphanSweep);
         let origin = self.pool.origin();
         self.with_writer_unmanaged("orphan_sweep", move |conn| {
             // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
@@ -1795,6 +1790,80 @@ mod batch_exists_tests {
             .unwrap();
         assert_eq!(search_hits.len(), 1);
         assert_eq!(search_hits[0].score, DeterministicScore::from_f64(-1.0));
+    }
+
+    #[tokio::test]
+    async fn exact_only_insert_replaces_rows_without_ann_deltas() {
+        let pool = make_vec_pool();
+        let raw_pool = Arc::clone(&pool);
+        let model_key = "exact_only_no_ann_delta";
+        let namespace = "ns:exact-only";
+        create_vec_table(&pool, model_key, 2);
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            2,
+            namespace.to_string(),
+        )
+        .unwrap();
+        let exact_id = Uuid::from_u128(1);
+
+        store
+            .insert_exact_only(
+                exact_id,
+                SubstrateKind::Entity,
+                namespace,
+                "visual.descriptor",
+                vec![vec![1.0, 0.0]],
+            )
+            .await
+            .unwrap();
+        store
+            .insert_exact_only(
+                exact_id,
+                SubstrateKind::Entity,
+                "ns:exact-only-repaired",
+                "visual.descriptor",
+                vec![vec![0.0, 1.0]],
+            )
+            .await
+            .unwrap();
+
+        let writer = raw_pool.try_writer().expect("pool writer");
+        let deltas: i64 = writer
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(deltas, 0);
+        let repaired_namespace: String = writer
+            .conn()
+            .query_row(
+                &format!("SELECT namespace FROM vec_{model_key} WHERE subject_id = ?1"),
+                [exact_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired_namespace, "ns:exact-only-repaired");
+        drop(writer);
+
+        store
+            .insert(
+                Uuid::from_u128(2),
+                SubstrateKind::Entity,
+                namespace,
+                "body",
+                vec![vec![1.0, 0.0]],
+            )
+            .await
+            .unwrap();
+        let writer = raw_pool.try_writer().expect("pool writer");
+        let deltas: i64 = writer
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(deltas, 1, "generic inserts must retain ANN logging");
     }
 
     /// sqlite-vec's own `distance_cosine_float` (sqlite-vec.c) accumulates
@@ -4758,8 +4827,8 @@ mod write_queue_tests {
     /// `orphan_sweep_routes_through_writer_task_when_flag_enabled` above (a
     /// `writer_task_spawn_count() == 1` assertion alone is a false positive:
     /// `SqliteVecStore::new` and the setup insert already spawn/use the
-    /// task). Red-proof: reverting the `if let Some(writer_task) =
-    /// &self.writer_task` branch in `vec_delete_subjects` (forcing every
+    /// task). Red-proof: reverting the
+    /// `current_writer_task("vec_delete_subjects")` branch (forcing every
     /// call through `with_writer_unmanaged`) makes `saw_enqueued` stay
     /// `false` and this test fail — see the impl report for the exact
     /// revert/run/restore transcript.
@@ -4977,10 +5046,10 @@ mod write_queue_tests {
     /// happen with no ambient runtime, which a `#[tokio::test]` function
     /// body would not give it (the whole test body already runs on a Tokio
     /// worker thread). Red-proof: reverting `with_writer`'s
-    /// `self.current_writer_task()` check back to `&self.writer_task` makes
-    /// `saw_enqueued` stay `false` and this test fail — the write takes the
-    /// direct-connection path immediately instead of ever appearing in the
-    /// writer task's channel.
+    /// `self.current_writer_task(operation)` check back to the cached handle
+    /// makes `saw_enqueued` stay `false` and this test fail — the write takes
+    /// the direct-connection path immediately instead of ever appearing in
+    /// the writer task's channel.
     #[test]
     fn general_write_routes_through_writer_task_when_store_built_outside_runtime() {
         crate::extension::ensure_extensions_loaded();

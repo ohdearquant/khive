@@ -1695,6 +1695,35 @@ crate-b = 1
         }
     }
 
+    #[cfg(unix)]
+    fn freeze_snapshot_sidecars(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().expect("db file name").to_os_string();
+            name.push(suffix);
+            let sidecar = path.parent().expect("db parent dir").join(name);
+            if sidecar.exists() {
+                let mut permissions = std::fs::metadata(&sidecar)
+                    .expect("sidecar metadata")
+                    .permissions();
+                permissions.set_mode(0o444);
+                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+            }
+        }
+    }
+
+    /// `generate_report` behind the frozen-snapshot form its read-only open
+    /// accepts. SQLite connection close is deferred, so a fixture seeded and
+    /// dropped just above can still hold writable `-wal`/`-shm` sidecars when
+    /// the report's read-only open runs; freeze them at the read boundary
+    /// (not inside the seeder — several tests reopen the fixture writably to
+    /// add rows after seeding).
+    async fn frozen_generate_report(request: &AuditRequest) -> Result<AuditReport> {
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&request.map_db);
+        generate_report(request).await
+    }
+
     #[tokio::test]
     async fn layering_violation_flags_upward_dependency() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1702,7 +1731,9 @@ crate-b = 1
         build_fixture(&db, [0, 1]).await;
         let policy = test_policy(tmp.path());
 
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         // crate-a (rank 0) depends_on crate-b (rank 1): a lower-ranked,
         // more-foundational crate depending on a higher-ranked crate is the
         // violating direction. The reverse edge in the fixture (crate-b ->
@@ -1743,7 +1774,7 @@ crate-b = 1
 
         let mut with_dev = base_request(tmp.path().join("map.db"), test_policy(tmp.path()));
         with_dev.include_dev_dependencies = true;
-        let report_with_dev = generate_report(&with_dev).await.unwrap();
+        let report_with_dev = frozen_generate_report(&with_dev).await.unwrap();
         let unmapped = report_with_dev
             .signals
             .iter()
@@ -1759,7 +1790,9 @@ crate-b = 1
         build_fixture(&db, [0, 1]).await;
         let policy = test_policy(tmp.path());
 
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         let project_cycle = report.signals.iter().any(|s| {
             s.id == "dependency_cycle"
                 && s.subject_id.starts_with("project_production:")
@@ -1798,7 +1831,9 @@ crate-b = 1
         build_fixture(&db, [0, 1]).await;
         let policy = test_policy(tmp.path());
 
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
 
         // Subject is now the module's own ID (not its display name), so the
         // two same-named `crate_a::lib` modules each get an independent,
@@ -1839,7 +1874,9 @@ crate-b = 1
         build_fixture(&db, [0, 1]).await;
         let policy = test_policy(tmp.path());
 
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         // crate-a itself carries no `unresolved_specifiers` property; the
         // one unresolved import lives on its `crate_a::orphan` MODULE
         // (source_ingest.rs:776-784). The pre-fix code read only the
@@ -1884,7 +1921,9 @@ crate-b = 1
 "#,
         );
 
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         let orphan = report
             .signals
             .iter()
@@ -1907,7 +1946,9 @@ crate-b = 1
         build_fixture(&db, [0, 1]).await;
         let policy = test_policy(tmp.path());
 
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         for id in ["churn_hotspot", "dead_file", "orphan_test_file"] {
             assert!(
                 report
@@ -1930,14 +1971,14 @@ crate-b = 1
 
         let db_a = tmp.path().join("map_a.db");
         build_fixture(&db_a, [0, 1]).await;
-        let report_a = generate_report(&base_request(db_a, policy.clone()))
+        let report_a = frozen_generate_report(&base_request(db_a, policy.clone()))
             .await
             .unwrap();
         let json_a = serde_json::to_string_pretty(&report_a).unwrap();
 
         let db_b = tmp.path().join("map_b.db");
         build_fixture(&db_b, [1, 0]).await;
-        let report_b = generate_report(&base_request(db_b, policy.clone()))
+        let report_b = frozen_generate_report(&base_request(db_b, policy.clone()))
             .await
             .unwrap();
         let json_b = serde_json::to_string_pretty(&report_b).unwrap();
@@ -1949,7 +1990,9 @@ crate-b = 1
 
         let db_c = tmp.path().join("map_c.db");
         build_fixture(&db_c, [0, 1]).await;
-        let report_c = generate_report(&base_request(db_c, policy)).await.unwrap();
+        let report_c = frozen_generate_report(&base_request(db_c, policy))
+            .await
+            .unwrap();
         let json_c = serde_json::to_string_pretty(&report_c).unwrap();
         assert_eq!(
             json_a, json_c,
@@ -2050,7 +2093,9 @@ cargo-dev-dep = 1
 undeclared-dep = 1
 "#,
         );
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
 
         let flagged: Vec<&Signal> = report
             .signals
@@ -2075,7 +2120,7 @@ undeclared-dep = 1
         let tmp = tempfile::TempDir::new().unwrap();
         let db = tmp.path().join("does-not-exist.db");
         let policy = test_policy(tmp.path());
-        let err = generate_report(&base_request(db, policy))
+        let err = frozen_generate_report(&base_request(db, policy))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"));
@@ -2098,7 +2143,9 @@ undeclared-dep = 1
 
         // H1: a partial map missing an entire table must still produce a
         // report — not abort the whole command.
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         assert!(report
             .errors
             .iter()
@@ -2144,7 +2191,9 @@ undeclared-dep = 1
         }
         let policy = test_policy(tmp.path());
 
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         assert!(report
             .errors
             .iter()
@@ -2183,7 +2232,9 @@ undeclared-dep = 1
         // must not suppress them — only the dependency-kind-classification
         // signals (layering, manifest/import mismatch, dependency cycles)
         // may degrade.
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         assert!(report
             .errors
             .iter()
@@ -2272,7 +2323,9 @@ undeclared-dep = 1
         // ONLY that column must not suppress them — only the signals that
         // read `id` (layering, manifest/import mismatch, dependency cycles)
         // may degrade.
-        let report = generate_report(&base_request(db, policy)).await.unwrap();
+        let report = frozen_generate_report(&base_request(db, policy))
+            .await
+            .unwrap();
         assert!(report
             .errors
             .iter()

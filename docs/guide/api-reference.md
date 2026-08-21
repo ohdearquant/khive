@@ -48,6 +48,10 @@ three schedule verbs remain available without `comm`.
 manifest + L1.5 import-scan source ingest, ADR-085 Amendment 2 — see below); its
 `findings.json` batch ingest still runs only through the `kkernel code-ingest` admin CLI
 path, not the MCP verb surface.
+That admin path is history-preserving: a deterministic entity, finding-note,
+or annotation-edge ID is skipped even when its row is soft-deleted, so neither
+real re-ingest nor `--dry-run` treats a tombstone as a new record or resurrects
+it.
 
 `blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
 `blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
@@ -155,6 +159,32 @@ its siblings (chain failures do abort the remainder of the chain):
 `aborted` counts ops skipped after an earlier failure in a `|` chain; it is always 0 for
 parallel batches, since parallel failures do not cascade.
 
+A successful entry can also carry a transport-owned `advisories` array beside `result`.
+These warnings describe execution context without changing the verb's canonical result or
+the batch summary. Presentation and output-format transforms apply only to `result`, and
+frame-budget degradation preserves advisories. For example, inspecting a read-only snapshot
+returns normal verb data while making the missing durable dispatch audit explicit:
+
+```json
+{
+  "ok": true,
+  "tool": "stats",
+  "result": { "entities": 42 },
+  "advisories": [
+    {
+      "code": "audit_persistence_skipped_read_only",
+      "severity": "warning",
+      "component": "audit_event_store",
+      "reason": "read_only_backend",
+      "message": "operation completed, but its dispatch audit event was not persisted because the audit backend is read-only"
+    }
+  ]
+}
+```
+
+That advisory appears on successful non-help operations only. Failed, aborted, and
+`help=true` entries do not claim that an audit write was skipped.
+
 ---
 
 ## `kg` pack — 20 verbs
@@ -223,7 +253,7 @@ List records with optional filtering.
 | `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `tags`                       | array\<string\>          | no       | Case-insensitive OR-match over entity tags or note `properties.tags`; valid for `kind="entity"` and `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -241,13 +271,13 @@ List records with optional filtering.
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
 
-Requests within the kind's server-side row cap keep the existing array response. If `limit`
-exceeds the cap, the response is `{"items": [...], "requested_limit": N,
-"effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
-the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
-1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
+Offset-mode responses always use `{"items": [...], "requested_limit": N,
+"effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the
+server-side cap binds. Advance `offset` by `items.length`, not by either limit field;
+`effective_limit` discloses the server cap but is not a guaranteed row count. The caps are entity
+500, note 200, edge 1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
 `{"entities": [...], "next_after": ...}`, `{"notes": [...], "next_after": ...}`, or
-`{"edges": [...], "next_after": ...}` and add the same limit metadata when clamped.
+`{"edges": [...], "next_after": ...}` and always include the same limit metadata.
 
 Set `after=""` to begin a stable cursor walk, then pass each non-null `next_after` value into the
 next request with the same filters. The cursor's public value is a UUID; storage resolves it to an
@@ -260,11 +290,16 @@ extend the walk. After a substrate/namespace query returns `next_after: null`, r
 that terminal query require a new walk from `after=""`. Updates and deletes can change whether an
 unvisited row matches the filters. A cursor that was hard-deleted, is outside the caller's visible
 namespaces, or otherwise cannot be resolved returns an error instead of silently restarting. Cursor
-mode and `offset` are mutually exclusive. Filtered message walks may additionally return
-`scan_incomplete: true` with a continuation cursor when their 10,000-row safety ceiling is reached
-before another matching message is proven.
+mode and `offset` are mutually exclusive. Filtered note cursor walks may additionally return
+`scan_incomplete: true` with the last safe continuation cursor when their 10,000-row safety
+ceiling is reached before another matching note is proven.
 
-Row shape (each item in the array or cursor/clamp envelope) depends on `kind`.
+Outcome-filtered event offset pages may also set `scan_incomplete: true` when their bounded
+post-filter scan cannot prove exhaustion. Such a short page is not terminal: advance only by the
+rows actually returned, and treat an incomplete empty page as non-resumable without a narrower
+filter or a larger effective limit.
+
+Row shape (each item in the offset or cursor envelope) depends on `kind`.
 For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
 for that substrate, listed below in its **verbose** form (the shape returned with
 `presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).
@@ -412,11 +447,15 @@ fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
 
-In multi-backend mode a backend failure yields the successful hits from the
-remaining backends and adds `partial: true` plus `missing_backends` to that
-operation's request envelope. These fields sit beside `result` rather than
-inside the search result array, and remain present through presentation and
-response-frame compaction.
+In multi-backend mode a backend failure with surviving hits yields those hits
+with `status: "partial"`, deprecated `partial: true`, `missing_backends`, and a
+`backend_errors` object mapping each retained failed backend to its bounded,
+credential-masked backend id and cause. Masked backend ids use a stable hash
+suffix so distinct failed legs remain distinguishable. These fields sit beside `result` and survive
+presentation and response-frame compaction. If no hit survives filtering, the
+operation is `ok: false` with `error.kind="search_incomplete"`; the structured
+error carries the same diagnostics. `backend_errors_truncated` plus
+`backend_errors_omitted` explicitly report causes omitted by safety bounds.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
@@ -738,9 +777,9 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report writer-contention and WAL/checkpoint diagnostics for the main database: build identity,
-the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a
-WAL-pin holder census. Takes no parameters.
+Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
+database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
+sidecar file size, and a WAL-pin holder census. Takes no parameters.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
@@ -754,6 +793,12 @@ process-wide best-effort audit appends whose storage error was logged and swallo
 checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
 connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
 and reused across ticks) do not inflate the write-traffic acquisition total.
+
+`checkpoint_counters` reports checkpoint pressure without making its telemetry another source of
+WAL pressure. `checkpoint_pressure_elevated_ticks` and the episode start/recovery totals are
+in-memory observations; `checkpoint_lifecycle_append_attempts`, append failures, and handoff drops
+describe actual persistence work. The checkpoint task appends only episode elevation and recovery
+transitions, so sustained pressure does not produce one primary-store write per checkpoint tick.
 
 A finite-wait pooled checkout failure retains its compatibility display text in `message`, but
 the MCP error is a stable object rather than a string:
@@ -781,6 +826,16 @@ deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded
 `unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
 `unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
 holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are cleanup-enumeration
+measurements: this request deliberately does not run that mutating enumeration, so both fields are
+omitted rather than reporting fabricated `false`/`0` values.
+
+`graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
+`graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
+count is the legacy cross-namespace duplicate-ID state that can make a multi-namespace edge cursor
+walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
+intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
+live edge table. `graph_edge_integrity_error` explains a missing integrity section.
 Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
 explicit reasons rather than being silently omitted.
 
@@ -1506,11 +1561,11 @@ Time-triggered reminders and deferred verb dispatch. Optional; load with
 
 Create a time-triggered reminder.
 
-| Param     | Type   | Required | Notes                                                                                                                                            |
-| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `content` | string | yes      | Non-empty reminder message.                                                                                                                      |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                                                            |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, or a limited 5-field cron form using only `*` or one in-range integer per field (steps/ranges/lists not accepted). |
+| Param     | Type   | Required | Notes                                                                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
+| `content` | string | yes      | Non-empty reminder message.                                                                           |
+| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                 |
+| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`. Cron expressions are rejected because the executor cannot advance them. |
 
 ```
 request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
@@ -1522,7 +1577,7 @@ Schedule a future verb dispatch.
 
 | Param    | Type   | Required | Notes                                                               |
 | -------- | ------ | -------- | ------------------------------------------------------------------- |
-| `action` | string | yes      | Verb dispatch payload, e.g. `"schedule.remind(content=\"hello\")"`. |
+| `action` | string | yes      | One replayable verb call, e.g. `"gtd.assign(title=\"follow up\")"`. |
 | `at`     | string | yes      | RFC 3339 trigger time.                                              |
 | `repeat` | string | no       | Same recurrence grammar as `schedule.remind`.                       |
 
@@ -1749,17 +1804,25 @@ request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\
 
 ### `knowledge.import` — Commissive
 
-Ingest atlas markdown file(s) as atoms with parsed sections.
+Validate and ingest atlas markdown file(s) with stable root-relative identity.
 
-| Param            | Type   | Required | Notes                                                                         |
-| ---------------- | ------ | -------- | ----------------------------------------------------------------------------- |
-| `path`           | string | yes      | Filesystem path to a markdown file or directory.                              |
-| `format`         | string | no       | Only `atlas_md` supported (default).                                          |
-| `chunk_strategy` | string | no       | `section` (default, one section per atom) or `atom` (whole file as one atom). |
+| Param            | Type   | Required | Notes                                                                           |
+| ---------------- | ------ | -------- | ------------------------------------------------------------------------------- |
+| `path`           | string | yes      | Filesystem path to a `.md` file or bounded directory tree.                      |
+| `format`         | string | no       | Only `atlas_md` supported (default).                                            |
+| `chunk_strategy` | string | no       | `section` (atom plus section rows) or `atom` (whole markdown, no section rows). |
 
 ```
 request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
 ```
+
+Directory slugs use normalized root-relative components joined by `--`; source paths are
+retained in `properties.source_path`. Traversal and source validation complete before writes,
+normalization collisions fail closed, and symlinks are not followed. Root directory symlinks are
+rejected with or without a trailing separator. Entry, depth, and file-limit errors include the
+exact failing path plus current and configured traversal counts. Successful responses add
+`entries_visited`, `files_discovered`, `files_skipped`, `traversal_errors`, `sections_discovered`,
+and `sections_skipped` to the existing import counters.
 
 ### `knowledge.challenge` — Commissive
 
@@ -1919,8 +1982,10 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ## `git` pack — 4 verbs
 
-Git-history ingester plus a hardened write surface (ADR-088, ADR-088 Amendment 1,
-ADR-108). Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
+Git-history ingester plus a hardened write surface (ADR-088,
+[ADR-088 Amendment 1](../adr/ADR-088-amendment-1-git-digest.md),
+[ADR-088 Amendment 2](../adr/ADR-088-amendment-2-anchor-identity.md), ADR-108).
+Optional; load with `KHIVE_PACKS=kg,git`. Also registers the `commit` /
 `issue` / `pull_request` note kinds, used by `git.digest` below and by the `kkernel
 git-ingest` CLI (both drive the same underlying ingest core, so ingest enrichment —
 readable `name`s, `Closes #N` reference edges, parent→child commit `precedes` edges —
@@ -1935,12 +2000,12 @@ resolving or auto-creating the repo-anchor
 `project` entity. Bounded and cursor-resumable: call again with the same
 `source`/`project` while the response's `done` field is `false`.
 
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                         |
-| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
-| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                                                                                                            |
-| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                              |
-| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                 |
+| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                 |
+| ----------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected.         |
+| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolution is slug-first through `properties.repo_slug`, then exact and normalized `properties.repo_url` reconciliation; a new anchor is created only when no identity evidence matches. Names are never a match key. See `project_id` and `project_created`. |
+| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                                      |
+| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                         |
 
 ```
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
@@ -2063,10 +2128,10 @@ request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.p
 
 ## `code` pack — 1 verb
 
-Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Optional; load
-with `KHIVE_PACKS=kg,code`. Also registers the `finding` note kind used by the
-`kkernel code-ingest` admin CLI's `findings.json` batch ingest (not reachable via this
-MCP verb surface).
+Deterministic source-code map ingest (ADR-085 Amendment 2, PR #1039). Loaded by default;
+set `KHIVE_PACKS=kg,code` to select only the base and code packs. Also registers the
+`finding` note kind used by the `kkernel code-ingest` admin CLI's `findings.json` batch
+ingest (not reachable via this MCP verb surface).
 
 ### `code.ingest` — Commissive
 
@@ -2084,15 +2149,19 @@ becomes known.
 | ----------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `path`      | string          | yes      | Folder to ingest — a monorepo subtree (a single crate/package) is first-class, not a special case of whole-repo ingest.                                                                                                                      |
 | `db`        | string          | no       | Target map database path. Defaults to `<path>/.khive/code-map.db`. The shared production database — its default `$HOME/.khive/khive.db` location and the calling server's actual configured database — is always rejected, with no override. |
-| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Defaults to all three (auto-detected from manifests found under `path`).                                                                                                  |
+| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Omission accepts all three; the success report lists only languages observed under `path`.                                                                                |
+| `tiers`     | array\<string\> | no       | Select any of `l1` \| `l1.5` \| `l2`. Defaults to L1 and L1.5; L2 is opt-in and currently scans Rust sources only.                                                                                                                           |
 
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
 
-The success report includes `fts_indexed`, the number of entity documents written to the map's
-full-text index. Entity and FTS writes are a single success postcondition for this verb: an FTS
-failure makes the ingest fail rather than returning a structurally populated but unsearchable map.
+The argument object is closed: unknown names are rejected before filesystem or database access.
+The success report's sorted `languages` array describes languages observed by a selected tier,
+rather than echoing the caller's filter. It also includes `fts_indexed`, the number of entity
+documents written to the map's full-text index. Entity and FTS writes are a single success
+postcondition for this verb: an FTS failure makes the ingest fail rather than returning a
+structurally populated but unsearchable map.
 
 The map database uses the ordinary khive schema. To explore it with the generic KG read verbs,
 select it as a backend in a dedicated config:

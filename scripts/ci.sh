@@ -39,6 +39,9 @@ phase_lint() {
 
     echo "=== Local Build Artifact Verification Tests ==="
     python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"
+
+    echo "=== Writer Census Contract Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_writer_census.py"
 }
 
 phase_no_stubs_scan() {
@@ -214,7 +217,7 @@ phase_tests_doc() {
 }
 
 phase_channel_email() {
-    echo "=== Channel-Email Feature Tests (channel-email feature) ==="
+    echo "=== Channel Feature Tests (email + Telegram features) ==="
     # `--workspace` alone never runs any of the several `#[cfg(feature =
     # "channel-email")]` test modules in khive-mcp (ADR-094 channel lifecycle
     # sequencing, issue #449 cursor_commit gating, bootstrap-floor regressions,
@@ -222,8 +225,11 @@ phase_channel_email() {
     # name filter here (`channel_lifecycle`) ran only one of those modules and
     # silently skipped the rest, including the daemon's durable-cursor
     # regression tests. Run the whole crate under the feature, unfiltered, so
-    # every one of those modules fails CI on a regression.
-    cargo test -p khive-mcp --features channel-email
+    # every one of those modules fails CI on a regression. Keep Telegram in
+    # the same feature job: its poll/outbox admission is equally capable of
+    # external side effects and must execute tests, not merely type-check in
+    # the all-features clippy pass.
+    cargo test -p khive-mcp --features channel-email,channel-telegram
 }
 
 run_daemon_recovery_repeats() {

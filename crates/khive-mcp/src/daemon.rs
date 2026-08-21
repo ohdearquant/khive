@@ -30,8 +30,8 @@ mod test_harness;
 
 #[cfg(test)]
 use test_harness::{
-    reset_counters, DAEMON_DISPATCH, FORCE_PID_IS_DAEMON, FORCE_PID_IS_FOREIGN, KILL_COUNT,
-    RECOVERY_RACE_BARRIER, SPAWN_COUNT,
+    reset_counters, DAEMON_DISPATCH, FORCED_CONNECT_ERROR, FORCE_PID_IS_DAEMON,
+    FORCE_PID_IS_FOREIGN, KILL_COUNT, RECOVERY_RACE_BARRIER, SPAWN_COUNT,
 };
 
 // ── local-dispatch fallback telemetry ─────────────────────────────────────────
@@ -105,8 +105,9 @@ impl FallbackReason {
             FallbackReason::ProtocolMismatch | FallbackReason::ParseFailure => {
                 FallbackSeverity::RolloutTransient
             }
-            // No daemon reachable at all — the ADR-049-mandated fallback
-            // path (CI, `KHIVE_NO_DAEMON=1`, read-only FS, spawn failure).
+            // The socket is definitively absent/refused — the ADR-049-mandated
+            // fallback path. Access-denied/indeterminate connect failures are
+            // terminal and never enter this metrics tier (#1242).
             FallbackReason::NoSocket => FallbackSeverity::NoDaemon,
         }
     }
@@ -211,6 +212,7 @@ struct ConfigIdFields<'a> {
     db: &'a str,
     embed: &'a str,
     extra: &'a str,
+    fresh_tail: &'a str,
     backend: &'a str,
     outbound: &'a str,
     git_write: &'a str,
@@ -234,6 +236,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
     let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
     let outbound = outbound.strip_suffix(']')?;
     let (rest, backend) = rest.rsplit_once(";backend=")?;
+    let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
     let (rest, extra) = rest.rsplit_once(";extra=[")?;
     let extra = extra.strip_suffix(']')?;
     let (db, embed) = rest.rsplit_once(";embed=")?;
@@ -243,6 +246,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         db,
         embed,
         extra,
+        fresh_tail,
         backend,
         outbound,
         git_write,
@@ -267,6 +271,8 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "embed"
     } else if client.extra != daemon.extra {
         "extra"
+    } else if client.fresh_tail != daemon.fresh_tail {
+        "fresh_tail"
     } else if client.backend != daemon.backend {
         "backend"
     } else if client.outbound != daemon.outbound {
@@ -451,8 +457,16 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
 enum ForwardOutcome {
     /// Successfully received and decoded a response frame.
     Response(Box<DaemonResponseFrame>),
-    /// Socket was unreachable (connection refused / no file).
+    /// The socket is absent/refused, or the frame failed before it could reach
+    /// dispatch. These outcomes are safe to route through recovery.
     NoSocket,
+    /// This process could not establish whether a daemon is listening. An OS
+    /// access/policy failure is not proof that the daemon is absent, so it must
+    /// never enter lifecycle recovery or local fallback (#1242).
+    Unreachable {
+        kind: std::io::ErrorKind,
+        os_error_code: Option<i32>,
+    },
     /// Connected but the response could not be decoded — most likely a stale
     /// daemon speaking a different wire format.
     ParseFailure,
@@ -466,11 +480,32 @@ enum ForwardOutcome {
     ProtocolMismatch,
 }
 
+fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) {
+        ForwardOutcome::NoSocket
+    } else {
+        ForwardOutcome::Unreachable {
+            kind: error.kind(),
+            os_error_code: error.raw_os_error(),
+        }
+    }
+}
+
 async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
     let sock = socket_path();
+    #[cfg(test)]
+    {
+        let forced_error = FORCED_CONNECT_ERROR.load(std::sync::atomic::Ordering::SeqCst);
+        if forced_error != 0 {
+            return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
+        }
+    }
     let mut stream = match UnixStream::connect(&sock).await {
         Ok(s) => s,
-        Err(_) => return ForwardOutcome::NoSocket,
+        Err(error) => return classify_socket_connect_error(error),
     };
     let payload = match serde_json::to_vec(frame) {
         Ok(p) => p,
@@ -672,13 +707,14 @@ fn spawn_daemon() -> std::io::Result<std::process::Child> {
 }
 
 fn spawn_daemon_with_exe(exe: &std::path::Path) -> std::io::Result<std::process::Child> {
-    spawn_daemon_with_exe_and_config(exe, None, None)
+    spawn_daemon_with_exe_and_config(exe, None, None, None)
 }
 
 fn spawn_daemon_with_exe_and_config(
     exe: &std::path::Path,
     config: Option<&std::path::Path>,
     db: Option<&str>,
+    packs: Option<&[String]>,
 ) -> std::io::Result<std::process::Child> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -712,6 +748,20 @@ fn spawn_daemon_with_exe_and_config(
     //   fingerprint from the normalized frame.
     if let Some(db) = db {
         cmd.arg("--db").arg(db);
+    }
+    // Forward the spawning client's already-resolved pack set explicitly
+    // rather than relying on ambient `KHIVE_PACKS` env inheritance: the
+    // client may have resolved packs from a CLI `--pack` flag or a
+    // discovered `[runtime].packs` config entry, neither of which travels
+    // through `Command::new`'s default env inheritance. Without this, a
+    // freshly spawned daemon falls back to the built-in default pack set,
+    // its `config_id` fingerprint disagrees with every caller expecting the
+    // wider set, and those callers permanently fall back to in-process
+    // dispatch instead of the warm daemon (khive-oss#1941).
+    if let Some(packs) = packs {
+        for pack in packs {
+            cmd.arg("--pack").arg(pack);
+        }
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::null());
     // The daemon's tracing (including WAL/checkpoint telemetry) goes to
@@ -1106,6 +1156,18 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
             | ForwardOutcome::ParseFailure
             | ForwardOutcome::ProtocolMismatch,
         ) => ProbeOutcome::Dead,
+        Ok(ForwardOutcome::Unreachable {
+            kind,
+            os_error_code,
+        }) => {
+            tracing::debug!(
+                ?kind,
+                ?os_error_code,
+                "under-lock probe could not reach the daemon socket; treating its state as \
+                 uncertain and suppressing lifecycle recovery"
+            );
+            ProbeOutcome::Timeout
+        }
     }
 }
 
@@ -1433,6 +1495,31 @@ fn ambiguous_forward_error() -> McpError {
         "daemon response lost after request was sent; not retrying or locally \
          dispatching to avoid duplicate execution",
         None,
+    )
+}
+
+fn daemon_unreachable_error(
+    frame: &DaemonRequestFrame,
+    kind: std::io::ErrorKind,
+    os_error_code: Option<i32>,
+) -> McpError {
+    let config_id = opaque_config_id(&frame.config_id);
+    tracing::error!(
+        reason = "daemon_unreachable",
+        config_id = %config_id,
+        namespace = %frame.namespace,
+        ?kind,
+        ?os_error_code,
+        "daemon socket is unreachable from this process; lifecycle recovery suppressed"
+    );
+    McpError::internal_error(
+        "cannot reach daemon socket from this process; refusing daemon lifecycle recovery \
+         because the daemon may still be healthy",
+        Some(serde_json::json!({
+            "reason": "daemon_unreachable",
+            "os_error_kind": format!("{kind:?}"),
+            "os_error_code": os_error_code,
+        })),
     )
 }
 
@@ -1952,13 +2039,13 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// Forward a request to the daemon, auto-spawning it if absent.
 ///
 /// Returns `None` only when nothing was ever written to the daemon and local
-/// dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or no daemon socket
-/// could be reached (`NoSocket`) — never after the real frame has been
-/// written. `Some(Ok)` / `Some(Err)` both mean the request's fate is already
-/// decided at the daemon and the caller must not dispatch locally. Under
-/// `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes
-/// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit
-/// caller opt-out, not a fallback).
+/// dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or the socket is
+/// definitively absent/refused (`NoSocket`) — never when connection access is
+/// denied (`Unreachable`) and never after the real frame has been written.
+/// `Some(Ok)` / `Some(Err)` both mean the caller must not dispatch locally.
+/// Under `KHIVE_DAEMON_STRICT=1` the `NoSocket` case instead becomes
+/// `Some(Err(..))` (`KHIVE_NO_DAEMON` is unaffected — it is an explicit caller
+/// opt-out, not a fallback).
 ///
 /// The real (possibly mutating) request frame is written to the daemon
 /// socket at most once per call; a `NoSocket` outcome never writes anything,
@@ -1980,16 +2067,99 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
 /// --daemon` against automatic discovery and immediately disagree with the
 /// request it was spawned to serve, and `kkernel exec --db :memory:` would
 /// bind the fresh daemon to the config's declared persistent files.
+///
+/// `packs`, when given, is the caller's already-resolved pack list (whatever
+/// mix of CLI `--pack`, `KHIVE_PACKS`, or config-file `[runtime].packs`
+/// produced it) forwarded verbatim as explicit `--pack` args on the spawned
+/// daemon — see the doc comment on `spawn_daemon_with_exe_and_config`.
+pub async fn forward_or_spawn_with_config_and_packs(
+    frame: &DaemonRequestFrame,
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+    packs: Option<&[String]>,
+) -> Option<Result<String, McpError>> {
+    #[cfg(any(test, feature = "test-forward-seam"))]
+    if let Some(intercepted) = test_forward_seam::intercept(packs) {
+        return intercepted;
+    }
+    let spawn = || {
+        let exe = std::env::current_exe()?;
+        spawn_daemon_with_exe_and_config(&exe, config, db, packs)
+    };
+    forward_or_spawn_with(frame, &spawn).await
+}
+
+/// Forward a request, spawning the daemon if needed, without an explicit
+/// pack list: the spawned daemon falls back to its own pack resolution
+/// (config-file `[runtime].packs` or the built-in default set), exactly as
+/// it did before pack forwarding existed.
+///
+/// Thin compatibility wrapper over
+/// [`forward_or_spawn_with_config_and_packs`] preserving the pre-existing
+/// three-argument public signature, so external callers of the published
+/// crate keep compiling unchanged.
 pub async fn forward_or_spawn_with_config(
     frame: &DaemonRequestFrame,
     config: Option<&std::path::Path>,
     db: Option<&str>,
 ) -> Option<Result<String, McpError>> {
-    let spawn = || {
-        let exe = std::env::current_exe()?;
-        spawn_daemon_with_exe_and_config(&exe, config, db)
-    };
-    forward_or_spawn_with(frame, &spawn).await
+    forward_or_spawn_with_config_and_packs(frame, config, db, None).await
+}
+
+/// Test-only capture hook armed at the real entry of
+/// `forward_or_spawn_with_config_and_packs` — the actual adapter-boundary conversion
+/// site (`packs.as_deref()` at each production call site) production code
+/// runs through, as opposed to a `ForwardFnPtr` spy that stands in for the
+/// whole adapter and never executes its conversion. Unarmed, `intercept`
+/// costs one thread-local read and returns `None` immediately: the
+/// production path is byte-for-byte unaffected.
+///
+/// Gated by `cfg(any(test, feature = "test-forward-seam"))` so both the
+/// in-crate `khive-mcp` test suite (plain `cfg(test)`) and a cross-crate
+/// `kkernel` test (which cannot see `khive-mcp`'s `cfg(test)` items, so it
+/// enables the `test-forward-seam` feature via a `[dev-dependencies]`
+/// re-declaration instead) can reach it.
+#[cfg(any(test, feature = "test-forward-seam"))]
+pub mod test_forward_seam {
+    use super::McpError;
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static CAPTURED: std::cell::RefCell<Option<Option<Vec<String>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Arm the one-shot hook. The next call into
+    /// `forward_or_spawn_with_config_and_packs` on this thread records its `packs`
+    /// argument and returns a canned success without touching a socket or
+    /// spawning a process; the hook then disarms itself.
+    pub fn arm() {
+        CAPTURED.with(|c| *c.borrow_mut() = None);
+        ARMED.with(|a| a.set(true));
+    }
+
+    /// Take the captured `packs` argument from the most recent armed call,
+    /// if any, and disarm the hook. Disarming here means a hook armed for a
+    /// call that never reached `intercept` cannot survive to intercept a
+    /// later, unrelated call on the same thread.
+    pub fn take_captured() -> Option<Option<Vec<String>>> {
+        ARMED.with(|a| a.set(false));
+        CAPTURED.with(|c| c.borrow_mut().take())
+    }
+
+    pub(super) fn intercept(packs: Option<&[String]>) -> Option<Option<Result<String, McpError>>> {
+        let was_armed = ARMED.with(|a| a.replace(false));
+        if !was_armed {
+            return None;
+        }
+        CAPTURED.with(|c| *c.borrow_mut() = Some(packs.map(<[String]>::to_vec)));
+        Some(Some(Ok(serde_json::json!({
+            "results": [{"ok": true, "tool": "stats", "result": {}}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0},
+        })
+        .to_string())))
+    }
 }
 
 #[cfg(test)]
@@ -2020,6 +2190,10 @@ where
             // Nothing was written; fall through to the spawn/recover-then-send
             // path below.
         }
+        ForwardOutcome::Unreachable {
+            kind,
+            os_error_code,
+        } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
         ForwardOutcome::ParseFailure => {
             let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
@@ -2177,6 +2351,10 @@ where
                     None,
                 )));
             }
+            ForwardOutcome::Unreachable {
+                kind,
+                os_error_code,
+            } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
             ForwardOutcome::NoSocket => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -2554,17 +2732,43 @@ mod tests {
 
     #[test]
     fn first_config_mismatch_field_follows_fingerprint_order() {
-        let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];\
+        let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=client-policy";
-        let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];\
+        let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=daemon-policy";
 
         assert_eq!(first_config_mismatch_field(client, Some(daemon)), "packs");
     }
 
     #[test]
+    fn first_config_mismatch_field_names_fresh_tail_from_computed_ids() {
+        let config = RuntimeConfig::no_embeddings();
+        let enabled = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, true);
+        let disabled = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, false);
+
+        assert_eq!(
+            first_config_mismatch_field(&enabled, Some(&disabled)),
+            "fresh_tail"
+        );
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_later_field_from_computed_ids() {
+        let config = RuntimeConfig::no_embeddings();
+        let mut changed = config.clone();
+        changed.allowed_outbound_namespaces = vec![Namespace::parse("remote").unwrap()];
+        let client = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, true);
+        let daemon = crate::server::compute_config_id_with_ann_fresh_tail(&changed, None, true);
+
+        assert_eq!(
+            first_config_mismatch_field(&client, Some(&daemon)),
+            "outbound"
+        );
+    }
+
+    #[test]
     fn first_config_mismatch_field_names_backend_topology_without_values() {
-        let base = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main;\
+        let base = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;backend=main;\
                     outbound=[];git_write=policy";
         let client =
             format!("{base};backends=[main:Sqlite:/private/client.db];pack_backends=[kg=main]");
@@ -2578,12 +2782,29 @@ mod tests {
     }
 
     #[test]
+    fn first_config_mismatch_field_recognizes_read_only_runtime_mode() {
+        let config = RuntimeConfig::no_embeddings();
+        let writable =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, false);
+        let read_only =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, true);
+
+        assert_eq!(
+            first_config_mismatch_field(&read_only, Some(&writable)),
+            "backend",
+            "storage-mode separation must retain a structured mismatch field"
+        );
+    }
+
+    #[test]
     #[serial]
     fn map_response_config_mismatch_logs_opaque_ids_and_field_without_values() {
         reset_fallback_counters();
-        let client = "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];\
+        let client =
+            "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=same-policy";
-        let daemon = "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];\
+        let daemon =
+            "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];fresh_tail=true;\
                       backend=main;outbound=[];git_write=same-policy";
         let response = DaemonResponseFrame {
             ok: false,
@@ -2941,6 +3162,105 @@ mod tests {
         }
     }
 
+    #[test]
+    fn socket_connect_error_classification_distinguishes_absence_from_denial() {
+        for error_code in [libc::ENOENT, libc::ECONNREFUSED] {
+            assert!(matches!(
+                classify_socket_connect_error(std::io::Error::from_raw_os_error(error_code)),
+                ForwardOutcome::NoSocket
+            ));
+        }
+
+        for error_code in [libc::EACCES, libc::EPERM] {
+            match classify_socket_connect_error(std::io::Error::from_raw_os_error(error_code)) {
+                ForwardOutcome::Unreachable {
+                    kind,
+                    os_error_code,
+                } => {
+                    assert_eq!(kind, std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(os_error_code, Some(error_code));
+                }
+                _ => panic!("EACCES/EPERM must be unreachable, never safe-to-recover NoSocket"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn permission_denied_socket_fails_without_lifecycle_or_local_fallback() {
+        clear_daemon_env();
+        reset_counters();
+        reset_fallback_counters();
+        let _cleanup = RecoveryTestGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::set_var(
+            "KHIVE_RECOVERER_LOCK",
+            dir.path().join("khived.recoverer.lock"),
+        );
+        FORCED_CONNECT_ERROR.store(libc::EPERM, std::sync::atomic::Ordering::SeqCst);
+
+        let config_id = crate::server::compute_config_id(&memory_runtime_config(), None);
+        let result = forward_or_spawn(&unreachable_daemon_frame(&config_id)).await;
+
+        assert_eq!(
+            KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unreachable socket must never trigger a kill"
+        );
+        assert_eq!(
+            SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unreachable socket must never trigger a spawn"
+        );
+        assert_eq!(
+            fallback_total(),
+            0,
+            "an unreachable socket must return an error, not local fallback"
+        );
+        match result {
+            Some(Err(error)) => {
+                assert!(
+                    error.message.contains("cannot reach daemon socket"),
+                    "the caller-visible error must name the unreachable socket: {}",
+                    error.message
+                );
+                let data = error.data.as_ref().expect("unreachable error data");
+                assert_eq!(data["reason"], "daemon_unreachable");
+                assert_eq!(data["os_error_kind"], "PermissionDenied");
+                assert_eq!(data["os_error_code"], libc::EPERM);
+            }
+            other => panic!(
+                "unreachable must be Some(Err), never None/local fallback or success: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_socket_connection_refused_remains_safe_to_recover() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+
+        {
+            let listener = tokio::net::UnixListener::bind(&sock).expect("bind stale socket");
+            drop(listener);
+        }
+        assert!(sock.exists(), "dropped listener must leave a stale socket");
+
+        let config_id = crate::server::compute_config_id(&memory_runtime_config(), None);
+        assert!(matches!(
+            try_forward_inner(&unreachable_daemon_frame(&config_id)).await,
+            ForwardOutcome::NoSocket
+        ));
+
+        clear_daemon_env();
+    }
+
     struct RespawnDisclosureFixture {
         original_home: Option<std::ffi::OsString>,
         _home: tempfile::TempDir,
@@ -2965,7 +3285,7 @@ mod tests {
         path
     }
 
-    /// The config path threaded through `forward_or_spawn_with_config` must
+    /// The config path threaded through `forward_or_spawn_with_config_and_packs` must
     /// actually appear on the spawned daemon's command line; a script
     /// fixture records its argv so the assertion observes the real child
     /// invocation (`crates/kkernel/src/exec.rs`'s spy seam proves the exec
@@ -2981,7 +3301,7 @@ mod tests {
         );
 
         let config_path = dir.path().join("selected.toml");
-        let mut child = spawn_daemon_with_exe_and_config(&exe, Some(&config_path), None)
+        let mut child = spawn_daemon_with_exe_and_config(&exe, Some(&config_path), None, None)
             .expect("spawn argv-recording fixture");
         let status = child.wait().expect("wait for argv-recording fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
@@ -2991,6 +3311,62 @@ mod tests {
             recorded.trim_end(),
             format!("mcp --daemon --config {}", config_path.display()),
             "the explicit config selection must reach the daemon command line"
+        );
+    }
+
+    /// The pack list threaded through `forward_or_spawn_with_config_and_packs` must
+    /// reach the spawned daemon's command line as explicit `--pack` flags —
+    /// the fix for the auto-spawn dropping a client's resolved `KHIVE_PACKS`
+    /// (or `--pack`-flag, or config-file `[runtime].packs`) selection when it
+    /// spawns a fresh daemon (khive-oss#1941).
+    #[test]
+    fn spawn_daemon_with_exe_and_config_appends_pack_flags_to_command_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("argv.txt");
+        let exe = daemon_script_fixture(
+            &dir,
+            "record-argv.sh",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
+        );
+
+        let packs = vec!["kg".to_string(), "gtd".to_string(), "formal".to_string()];
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None, Some(&packs))
+            .expect("spawn argv-recording fixture");
+        let status = child.wait().expect("wait for argv-recording fixture");
+        assert!(status.success(), "fixture must exit 0: {status}");
+
+        let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
+        assert_eq!(
+            recorded.trim_end(),
+            "mcp --daemon --pack kg --pack gtd --pack formal",
+            "the caller's resolved pack set must reach the daemon command line as --pack flags"
+        );
+    }
+
+    /// A `None` pack list (the default, backward-compatible shape used by
+    /// bare `forward_or_spawn`/`spawn_daemon`) must append no `--pack` flags
+    /// at all — the spawned daemon falls through to its own env/config
+    /// resolution exactly as before this fix.
+    #[test]
+    fn spawn_daemon_with_exe_and_config_omits_pack_flags_when_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("argv.txt");
+        let exe = daemon_script_fixture(
+            &dir,
+            "record-argv.sh",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
+        );
+
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None, None)
+            .expect("spawn argv-recording fixture");
+        let status = child.wait().expect("wait for argv-recording fixture");
+        assert!(status.success(), "fixture must exit 0: {status}");
+
+        let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
+        assert_eq!(
+            recorded.trim_end(),
+            "mcp --daemon",
+            "no packs supplied must mean no --pack flags on the daemon command line"
         );
     }
 
@@ -3010,7 +3386,7 @@ mod tests {
 
         let config_path = dir.path().join("selected.toml");
         let mut child =
-            spawn_daemon_with_exe_and_config(&exe, Some(&config_path), Some(":memory:"))
+            spawn_daemon_with_exe_and_config(&exe, Some(&config_path), Some(":memory:"), None)
                 .expect("spawn argv-recording fixture");
         let status = child.wait().expect("wait for argv-recording fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
@@ -3047,7 +3423,7 @@ mod tests {
             &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
         );
 
-        let mut child = spawn_daemon_with_exe_and_config(&exe, None, Some("/tmp/main.db"))
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, Some("/tmp/main.db"), None)
             .expect("spawn argv-recording fixture");
         let status = child.wait().expect("wait for argv-recording fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
@@ -3077,7 +3453,7 @@ mod tests {
             drop(writer);
         });
 
-        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None)
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None, None)
             .expect("transient ETXTBSY must be retried");
         release.join().expect("fixture writer release thread");
         let status = child.wait().expect("wait for executable fixture");
@@ -3540,7 +3916,31 @@ mod tests {
             })
             .await
             .expect("local dispatch of stats() must succeed");
-        assert_eq!(resp.result.as_deref(), Some(reference_result.as_str()));
+        let mut daemon_result: serde_json::Value = serde_json::from_str(
+            resp.result
+                .as_deref()
+                .expect("daemon dispatch of stats() must return JSON"),
+        )
+        .expect("daemon stats response must be valid JSON");
+        let mut local_result: serde_json::Value = serde_json::from_str(&reference_result)
+            .expect("local stats response must be valid JSON");
+        // Usage counters are request-local. The daemon dispatch may count its
+        // own audit event before serializing while the direct reference call
+        // observes a different event boundary, so they are not an equivalence
+        // oracle for the transport round trip exercised by this test.
+        for result in [&mut daemon_result, &mut local_result] {
+            if let Some(entries) = result
+                .get_mut("results")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for entry in entries {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.remove("usage");
+                    }
+                }
+            }
+        }
+        assert_eq!(daemon_result, local_result);
         assert!(reference_result.contains("\"entities\""));
 
         // (b) ADR-096 Fork 1: a different namespace, same config_id, is no
@@ -4009,10 +4409,9 @@ mod tests {
                 first["ok"], true,
                 "list op must succeed inside daemon result: {first}"
             );
-            let rows = first["result"]
+            let rows = first["result"]["items"]
                 .as_array()
-                .or_else(|| first["result"]["items"].as_array())
-                .expect("list result must be an array or object with items");
+                .expect("list result must contain the stable items array");
             rows.iter()
                 .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
                 .collect()

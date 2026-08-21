@@ -130,6 +130,45 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
     Ok(())
 }
 
+// ─── Reserved property key (ADR-115 Amendment 1) ────────────────────────────
+
+/// Top-level JSON property key reserved for runtime-owned exemption state.
+///
+/// No caller may create, replace, merge, or remove this key through any
+/// properties-bearing write path — ADR-115 Amendment 1 §3. Reservation binds
+/// unconditionally: the runtime does not yet stamp any record with this key
+/// (the finalizer that would do so is a separate, later increment), so no
+/// caller-supplied occurrence of it can ever be a legitimate echo of
+/// persisted state. Only the exact top-level key is reserved; the same
+/// spelling nested inside an object *value* is ordinary content and remains
+/// subject to [`check_json`], never a posture mutation.
+pub const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
+
+/// Reject a caller-supplied top-level `khive:secret_gate` property key.
+///
+/// Call this before any diff, merge, or storage preparation touches
+/// caller-supplied `properties` on any properties-bearing write path —
+/// create, patch update, or full replace. Returns `Ok(())` when `properties`
+/// is absent, is not a JSON object, or does not name the reserved key at the
+/// top level.
+///
+/// This is the one shared validator for the reservation rule (ADR-115
+/// Amendment 1 §3); every properties-bearing write path across every crate
+/// must call this instead of re-implementing the check.
+pub fn reject_reserved_secret_gate_property(
+    properties: Option<&serde_json::Value>,
+) -> RuntimeResult<()> {
+    if let Some(serde_json::Value::Object(map)) = properties {
+        if map.contains_key(RESERVED_SECRET_GATE_KEY) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "property key `{RESERVED_SECRET_GATE_KEY}` is runtime-owned and cannot be \
+                 created, replaced, merged, or removed by callers"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn scan_json_value(value: &serde_json::Value) -> RuntimeResult<()> {
     match value {
         serde_json::Value::String(s) => check(s),
@@ -278,6 +317,157 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
         cursor = end.max(cursor);
     }
     out.push_str(&text[cursor..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Maximum characters of raw error text admitted to the masking pass.
+///
+/// This is NOT a tight bound like [`MAX_LOG_TEXT_OUTPUT_CHARS`] below — it exists only to
+/// stop a truly pathological input (gigabytes of attacker-controlled text funneled into one
+/// error/log line) from making the masking scan unbounded. It is a pure compute bound, not a
+/// safety bound: [`find_url_userinfo`] has no length limit on the password it recognizes, so
+/// no finite value of this constant can guarantee a credential never straddles it — a
+/// password longer than whatever this is set to always has a crossing case. The actual
+/// safety invariant lives in [`redact_crossing_boundary_url_userinfo`], the fallback
+/// [`bounded_masked_log_text`] runs after [`mask_secrets`]: it redacts any `scheme://user:`
+/// opening whose password run reaches this cut point without a terminating `@`, regardless
+/// of how long that password is. 1 MiB just keeps the scan itself cheap.
+const MAX_LOG_TEXT_MASK_INPUT_CHARS: usize = 1_048_576;
+/// Maximum characters of masked error text emitted to a log record.
+const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
+
+/// Bound and mask arbitrary error text for log emission.
+///
+/// Log records are a disclosure surface the same way wire errors are: they are
+/// shipped, aggregated, and read by consumers outside the process. Backend
+/// error text (gate backends included) can embed connection strings or
+/// credentials, so the FULL text (up to `MAX_LOG_TEXT_MASK_INPUT_CHARS`, a
+/// pure compute bound — see its doc comment) is masked with the canonical
+/// detector set before any truncation happens. Masking after truncation would
+/// let a secret whose tail sits past the bound lose the context (e.g. a URL's
+/// terminating `@`) a detector needs to recognize it, leaving its head
+/// unmasked in the log — truncate-then-mask must never replace
+/// mask-then-truncate here. Because `MAX_LOG_TEXT_MASK_INPUT_CHARS` is
+/// finite and `find_url_userinfo` has no bound on password length, a
+/// password long enough still crosses the cut before its terminating `@`
+/// ever appears; `redact_crossing_boundary_url_userinfo` closes that gap
+/// by redacting the unterminated opening directly, so no credential prefix
+/// survives regardless of secret length. Control (`Cc`) and format
+/// (`Cf`) Unicode codepoints in the masked text are then escaped: a log line
+/// is plain text read by tooling outside this process, and an embedded CR/LF
+/// or bidi/format override could forge or visually disguise part of the
+/// record. The result is bounded again for the emitted record. A truncation
+/// in either the masking pass or the output pass appends `…` so the record
+/// declares its own incompleteness.
+pub fn bounded_masked_log_text(text: &str) -> String {
+    let mask_input_truncated = text.chars().nth(MAX_LOG_TEXT_MASK_INPUT_CHARS).is_some();
+    let bounded_input: std::borrow::Cow<'_, str> = if mask_input_truncated {
+        std::borrow::Cow::Owned(text.chars().take(MAX_LOG_TEXT_MASK_INPUT_CHARS).collect())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+    let masked = mask_secrets(&bounded_input);
+    let masked = if mask_input_truncated {
+        redact_crossing_boundary_url_userinfo(&masked)
+    } else {
+        masked
+    };
+    let neutralized = neutralize_log_unsafe_chars(&masked);
+
+    let mut chars = neutralized.chars();
+    let mut bounded: String = chars.by_ref().take(MAX_LOG_TEXT_OUTPUT_CHARS).collect();
+    if chars.next().is_some() || mask_input_truncated {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Fallback for a `scheme://user:<password>` credential whose password run
+/// collided with [`bounded_masked_log_text`]'s truncation of the mask-scan
+/// input at [`MAX_LOG_TEXT_MASK_INPUT_CHARS`]. [`find_url_userinfo`] only
+/// recognizes a credential once it sees the terminating `@`; when that `@`
+/// sits past the truncation point, [`mask_secrets`] never sees the shape at
+/// all and the raw `scheme://user:<password prefix>` reaches the log. No
+/// finite value of [`MAX_LOG_TEXT_MASK_INPUT_CHARS`] can rule this out — the
+/// detector is unbounded, so any cap has a crossing case — so the invariant
+/// has to come from this fallback, not from the cap's size.
+///
+/// Only called when `bounded_masked_log_text` actually truncated the input.
+/// It scans `://` occurrences left to right and redacts at the EARLIEST
+/// unterminated `user:<password-run>` opening: a colon splits the tail into
+/// two non-empty pieces and no `@`, space, or newline appears anywhere from
+/// that occurrence to the end of the truncated text. An occurrence whose
+/// tail does contain one of those terminators is a complete URL or ordinary
+/// prose that ends inside the text (e.g. two URLs logged side by side) and
+/// is skipped, not redacted. The anchor must be the earliest such opening,
+/// never the last: a later `://` can sit INSIDE the crossing password
+/// itself (passwords may contain `://`), and anchoring there would leave
+/// the real `user:<password prefix>` before it in the emitted log. From the
+/// earliest unterminated opening's colon onward everything is redacted —
+/// zero password characters survive, no matter how long the password
+/// actually is.
+fn redact_crossing_boundary_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find("://") {
+        let scheme_pos = search_from + rel;
+        let rest = &text[scheme_pos + 3..];
+        let terminated =
+            rest.contains('@') || rest.contains(' ') || rest.contains('\n') || rest.contains('\r');
+        if !terminated {
+            if let Some(colon) = rest.find(':') {
+                let user = &rest[..colon];
+                let pass = &rest[colon + 1..];
+                if !user.is_empty() && !pass.is_empty() {
+                    let redact_from = scheme_pos + 3 + colon;
+                    let mut out = String::with_capacity(redact_from + REDACTION_MARKER.len());
+                    out.push_str(&text[..redact_from]);
+                    out.push_str(REDACTION_MARKER);
+                    return std::borrow::Cow::Owned(out);
+                }
+            }
+        }
+        search_from = scheme_pos + 3;
+    }
+    std::borrow::Cow::Borrowed(text)
+}
+
+/// `true` for a Unicode control (`Cc`) or format (`Cf`) codepoint, tab excepted.
+///
+/// Classification is by Unicode general category rather than an ASCII byte range so that
+/// multi-byte control/format characters (bidi overrides, zero-width joiners, line/paragraph
+/// separators encoded as UTF-8) are caught the same way as single-byte C0 controls like
+/// CR/LF — a byte-range check would only ever see the latter. Tab is excepted: it is
+/// visually inert in a log line and common in legitimately reformatted prose.
+fn is_log_unsafe_char(c: char) -> bool {
+    if c == '\t' {
+        return false;
+    }
+    matches!(
+        unicode_general_category::get_general_category(c),
+        unicode_general_category::GeneralCategory::Control
+            | unicode_general_category::GeneralCategory::Format
+    )
+}
+
+/// Escape every [`is_log_unsafe_char`] codepoint in `text` as `\u{XXXX}`.
+///
+/// Returns `Cow::Borrowed` when nothing needs escaping (the common case), avoiding an
+/// allocation. This runs on already-masked text: it must never be skipped for text that
+/// bypassed [`mask_secrets`], since a control character can sit inside a would-be secret
+/// span and is a distinct disclosure vector from the credential detectors (log injection /
+/// forgery, not credential leakage).
+fn neutralize_log_unsafe_chars(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_log_unsafe_char) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if is_log_unsafe_char(c) {
+            out.push_str(&format!("\\u{{{:04x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
     std::borrow::Cow::Owned(out)
 }
 
@@ -606,40 +796,16 @@ const TRIGGER_WINDOW: usize = 120;
 /// [`contains_normalized_hex_credential`].
 const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
 
-/// Largest number of tokenizer fragments (inclusive of the anchor token)
-/// [`bridge_fragment_chain`] will concatenate when checking whether a
-/// trigger-adjacent short token is one piece of a delimiter-split credential.
-/// The bound is on FRAGMENT COUNT, deliberately NOT on gap byte length:
-/// a byte-length gap bound is defeated outright by
-/// repeating the delimiter (e.g. three U+200B in a row instead of one), while
-/// a fragment count cannot be bypassed that way — repeating the delimiter
-/// inside a single gap never creates a new fragment. This still bounds the
-/// reconstruction to a small local neighborhood (never a document-wide scan):
-/// each extension consumes one real fragment plus up to
-/// [`MAX_BRIDGE_GLUE_TOKENS`] delimiter-only glue tokens crossed to reach it,
-/// and the walk stops the moment a gap contains an ASCII alphanumeric character.
+/// Max fragments [`bridge_fragment_chain`] concatenates per credential (fragment-count bound,
+/// not gap byte length — see docs/api/secret_gate.md#bridge-fragment-reconstruction).
 const MAX_BRIDGE_FRAGMENTS: usize = 6;
 
-/// Maximum number of delimiter-only tokens (see [`is_delimiter_only_token`])
-/// the walk may absorb as glue, in ONE direction, while searching for the
-/// next real fragment across them. Glue tokens do
-/// not count against [`MAX_BRIDGE_FRAGMENTS`] — they carry none of the
-/// credential's own characters — but the search across them still needs its
-/// own bound, or a document seeded with a long run of punctuation-only
-/// tokens (`--- --- --- ...`) could turn the walk into a document-wide scan
-/// instead of the small local neighborhood the module doc promises.
+/// Max delimiter-only glue tokens absorbed per direction while bridging fragments; see
+/// docs/api/secret_gate.md#bridge-fragment-reconstruction.
 const MAX_BRIDGE_GLUE_TOKENS: usize = 6;
 
-/// Shortest bare token treated as a plausible FRAGMENT of a separator-split
-/// credential (see the `is_bridge_candidate` check in
-/// [`check_entropy_heuristic`]). Below this, common short words (`dead`,
-/// `beef`, `cafe`, or their base64-alphabet equivalents) would let ordinary
-/// prose feed the bridge checks. Applies to hex AND generic alphanumeric
-/// fragments alike — a
-/// base64/base64url-shaped credential half is exactly as plausible a bridge
-/// candidate as a hex half; the entropy/length decision made over the
-/// reconstructed chain, not this floor, is what keeps ordinary short prose
-/// fragments from being flagged.
+/// Shortest bare token treated as a plausible bridge fragment; see
+/// docs/api/secret_gate.md#bridge-fragment-reconstruction.
 const MIN_BRIDGE_FRAGMENT_LEN: usize = 8;
 
 /// Largest index `<= i` that lies on a UTF-8 char boundary of `s`. Stable
@@ -658,13 +824,10 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
 /// `text`. This lets [`mask_secrets`] advance past an earlier redaction without
 /// losing a trigger word that sat to the left of it.
 fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static str)> {
-    // Tokenize into maximal ASCII non-whitespace runs, recording each run's byte
-    // offset.  Non-ASCII characters are delimiters (alongside ASCII whitespace):
-    // real base64/hex/base64url credentials are ASCII, so splitting on non-ASCII
-    // isolates an ASCII credential glued to CJK text/punctuation/fullwidth
-    // whitespace, while a run of natural-language CJK yields no ASCII run long
-    // enough to trip the length floor below.  On pure-ASCII input this is
-    // identical to `split_ascii_whitespace`.
+    // Tokenize into maximal ASCII non-whitespace runs; non-ASCII chars are also
+    // delimiters (see docs/api/secret_gate.md#module-level-detection-algorithm,
+    // "non-ASCII token delimiting"). Identical to `split_ascii_whitespace` on
+    // pure-ASCII input.
     let tokens: Vec<(usize, &str)> = text
         .split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
         .filter(|t| !t.is_empty())
@@ -683,20 +846,9 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         if token_offset < from {
             continue;
         }
-        // A token below MIN_ENTROPY_LEN is still let through when it is
-        // itself a plausible FRAGMENT of a separator-split credential (a
-        // bare alphanumeric run of at least MIN_BRIDGE_FRAGMENT_LEN) — see
-        // the normalized-hex-concatenation and fragment-chain-bridge checks
-        // below. Gating on hex-only fragments would let a base64/base64url-shaped
-        // credential half through untouched: neither half of a Unicode-split
-        // base64-like secret is pure hex, so both would be skipped here before
-        // ever reaching the near-trigger checks. Gating on "any alphanumeric run"
-        // instead of
-        // "any run" still keeps ordinary prose out: a token containing
-        // spaces, punctuation, or other separators already split into
-        // smaller pieces by the tokenizer above, and the bridge/entropy
-        // decision applied to the reconstructed chain below is what actually
-        // filters unrelated short fragments — not this length floor.
+        // A token below MIN_ENTROPY_LEN still passes through when it's a plausible
+        // bridge FRAGMENT (see docs/api/secret_gate.md#bridge-fragment-reconstruction);
+        // gating on alphanumeric runs (not hex-only) covers base64/base64url halves too.
         let is_bridge_candidate = is_bridge_fragment_shape(token);
         if token.len() < MIN_ENTROPY_LEN && !is_bridge_candidate {
             continue;
@@ -714,45 +866,16 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         let raw_start = tok_offset - window_start;
         let raw_end = raw_start + raw_token.len();
 
-        // A high-entropy candidate must not provide its own surrounding
-        // trigger context. This matters for paths whose slugs contain a real
-        // trigger token, such as `ADR-051-cli-auth-and-kg-git-workflow.md`.
-        // Search the prose on either side independently, then preserve inline
-        // credential shapes through a focused assignment/config check.
+        // Must not provide its own trigger context (e.g. a path slug like
+        // `ADR-051-cli-auth-and-kg-git-workflow.md`); see
+        // docs/api/secret_gate.md#check_entropy_heuristic--per-token-flagging-sequence.
         let near_trigger = contains_trigger(&window[..raw_start])
             || contains_trigger(&window[raw_end..])
             || has_inline_credential_trigger(raw_token);
 
-        // UUID canonical form and sha-prefixed base64 content hashes (SRI /
-        // npm lockfile integrity) are allowlisted only outside trigger
-        // context. Near a trigger, both shapes fall through to detection
-        // below instead of being silently passed.
-        //
-        // A UUID's own character entropy cannot be relied on to catch it once
-        // it falls through: hex digits cap at log2(16) = 4.0 bits/char, which
-        // never reaches ENTROPY_THRESHOLD (4.5) regardless of token length.
-        // The explicit checks immediately below are what actually block a
-        // UUID-shaped or hash-shaped token in trigger context; letting it run
-        // into the generic entropy computation at the bottom of this loop
-        // would silently readmit it. A corpus replay of ~19k real notes/docs
-        // measured exactly one benign token (an internal task `area_id` UUID
-        // co-occurring with the word "auth" inside `authorized_write`) newly
-        // blocked by this rule — an accepted false positive, not a systemic
-        // regression.
-        //
-        // Both exact-shape checkers require the WHOLE token to match, so a
-        // credential glued to ordinary storage syntax (`api_key=<uuid>`,
-        // `(<uuid>)`, `{"api_key":"<uuid>"}`, a trailing sentence period,
-        // a doubled assignment, or a label itself containing `:`/`=`)
-        // would otherwise never reach them: `strip_delimiters` above only
-        // trims `"'`:=,;` at the token's OUTER ends, not braces/parens, and
-        // not an internal `=`/`:` from an assignment form. `value_candidates`
-        // enumerates every plausible value extraction from those glued forms
-        // specifically for this pair of checks — it does not replace `token`
-        // for any other check in this loop (entropy, hex, structured-
-        // identifier), none of which require an exact shape match. This is a
-        // small bounded iteration over separator positions in one token, not
-        // an allocation-heavy scan.
+        // Step 1 (see doc: per-token flagging sequence). UUID/content-hash checks fall
+        // through to detection near a trigger rather than being silently passed —
+        // hex-shaped entropy alone (<=4.0 bits/char) can never reach ENTROPY_THRESHOLD.
         if near_trigger && value_candidates(token).any(is_uuid_canonical) {
             return Some((token, "uuid-near-trigger"));
         }
@@ -763,31 +886,14 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             continue;
         }
 
-        // Pure hex tokens (git SHA, checksum digests) are allowlisted when they
-        // are not near a trigger. Trigger-adjacent Git revisions require an
-        // explicit VCS coordinate marker.
+        // Step 2. Pure hex off-trigger is allowlisted; trigger-adjacent hex needs an
+        // explicit VCS coordinate marker (see doc).
         if !near_trigger && is_pure_hex(token) {
             continue;
         }
 
-        // A 40-hex value attached to a VCS coordinate marker (`commit`,
-        // `revision`, `rev`, `sha`) is a public VCS coordinate, not a
-        // credential — but ONLY when the surrounding clause carries no
-        // credential label ("api key value is commit <hex>" is a labeled
-        // credential wearing a marker). The exemption is a flag, not an early
-        // `continue`: it must skip ONLY the hex-credential-shape checks
-        // below, never fragment reconstruction — an exempted anchor that
-        // skipped reconstruction would let a marker-adjacent fragment hide a
-        // split credential (the same anchor-ordering rule the file-path
-        // exemption pins via
-        // `blocks_unicode_split_hex_credential_with_path_shaped_anchor`).
-        // Marker-word form: the token IS a bare `commit`/`revision`/`rev`/
-        // `sha` whose next token is the 40-hex value. A fixed marker word is
-        // not attacker-controlled credential material, so a full `continue`
-        // is safe here — without it the marker would anchor fragment
-        // reconstruction and re-accumulate its own legitimate neighboring
-        // revision. The hex value itself is a separate token and receives
-        // the full check sequence on its own iteration.
+        // VCS-marker exemption is a flag over the hex-credential-shape checks only,
+        // never an early skip of fragment reconstruction below (see doc).
         if is_vcs_marker_before_hex(text, raw_token)
             && !has_clause_credential_label(
                 text,
@@ -807,14 +913,8 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
                 ClauseValueKind::VcsReference,
             );
 
-        // Hex API keys (AWS secret access key, Stripe test keys, random hex
-        // tokens) are pure hex yet are real credentials.  The entropy heuristic
-        // cannot catch them — hex alphabet maxes at log2(16) = 4.0 bits/char,
-        // which is always below ENTROPY_THRESHOLD (4.5).  A credential-shaped
-        // hex token (32 / 40 / 64 / 128 chars) near a trigger word is always
-        // flagged. Generic "sha" or "hash" prose does not rescue a token;
-        // `is_git_revision_reference` requires a 40-hex value attached to a
-        // VCS coordinate marker.
+        // Step 3. Hex API keys aren't caught by the entropy heuristic (hex tops out at
+        // 4.0 bits/char, below ENTROPY_THRESHOLD 4.5); flag credential-shaped hex directly.
         if !vcs_reference_exempt
             && near_trigger
             && is_pure_hex(token)
@@ -823,28 +923,13 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             return Some((token, "hex-credential-token"));
         }
 
-        // A genuine credential can be diluted below the WHOLE-TOKEN-AVERAGE
-        // entropy/hex checks above by low-entropy filler segments sharing the
-        // same whitespace token (issue #1044) — e.g. a 40-char hex payload or
-        // a random run as one `/`-delimited path segment among several short
-        // filler segments (`vault/<payload>/rotate.md`,
-        // `a/b/c/d/<payload>/e/f.rs`). Decomposing on every non-alphanumeric
-        // separator — the same run split `is_structured_identifier` uses —
-        // and re-running the hex-credential-length and entropy checks against
-        // each individual run independently of its surrounding filler closes
-        // that gap. Only `MIN_ENTROPY_LEN`+ runs are considered, so short
-        // natural-language path segments (the common case, verified against
-        // the #1040 measurement corpus: none of its real path false positives
-        // contain a single run this long) never trip it. This does NOT touch
-        // the `is_structured_identifier` exemption itself, which stays scoped
-        // to `!near_trigger` per the module doc's soundness argument — a run
-        // this long clearing its own entropy/hex check is evidence independent
-        // of that exemption's word-shape rule.
+        // Step 4 (issue #1044): a credential can dilute below the whole-token-average
+        // checks above via low-entropy filler sharing its whitespace token
+        // (`vault/<payload>/rotate.md`); re-check each `/`-split run independently.
+        // See doc for the #1040 corpus rationale behind the MIN_ENTROPY_LEN floor.
         if near_trigger {
-            // `vcs_reference_exempt` also covers the single-token forms these
-            // per-token shape checks would re-flag (`rev:<hex>` is one token
-            // whose 40-hex run and normalized-hex accumulation both match);
-            // it does NOT cover fragment reconstruction below.
+            // vcs_reference_exempt also covers single-token forms below (`rev:<hex>`);
+            // it does not cover fragment reconstruction.
             for run in token.split(|c: char| !c.is_ascii_alphanumeric()) {
                 if run.len() < MIN_ENTROPY_LEN {
                     continue;
@@ -860,101 +945,19 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
                 }
             }
 
-            // #1062: the per-run loop above still misses a credential hex
-            // payload split into MULTIPLE runs each individually below
-            // MIN_ENTROPY_LEN — e.g. `0123456789abcdef0123/456789abcdef01234567`
-            // (two 20-char hex runs joined by `/`): neither run alone reaches
-            // the 24-char floor or a HEX_CREDENTIAL_LENGTHS value, the whole
-            // token is not pure hex (the `/` breaks it), and the whole-token
-            // entropy is capped below ENTROPY_THRESHOLD by the small
-            // hex-plus-separator alphabet. Concatenating consecutive pure-hex
-            // runs (dropping the separators) and re-checking the combined
-            // length against the same HEX_CREDENTIAL_LENGTHS allowlist closes
-            // this gap without widening the allowlist itself. Bounded to the
-            // runs inside this one token, not a document-wide scan.
+            // Step 5 (#1062): concatenate consecutive pure-hex runs (dropping
+            // separators) and re-check against HEX_CREDENTIAL_LENGTHS — catches a
+            // hex payload split into multiple sub-floor runs. See doc.
             if !vcs_reference_exempt && contains_normalized_hex_credential(token) {
                 return Some((token, "hex-credential-token"));
             }
 
-            // Unicode/multi-fragment variant of the same bypass (#1062): a
-            // non-ASCII separator (e.g. U+200B) is a TOKENIZER delimiter (see
-            // the tokenizer comment above `tokens`), so it splits the payload
-            // into SEPARATE tokens instead of surviving inside one — the
-            // concatenation check above never sees the halves together.
-            // Bridging only ONE adjacent pair (`idx` with `idx + 1`, or `idx`
-            // with `idx - 1`) and bounding the gap by raw byte length is
-            // insufficient: repeating the delimiter (e.g. three U+200B in a
-            // row) exceeds any small fixed byte-length gap bound, and a
-            // three-token split means no single adjacent pair ever reaches
-            // the full credential length. `bridge_fragment_chain` fixes both:
-            // it walks outward in BOTH directions across a bounded CHAIN of
-            // fragments (MAX_BRIDGE_FRAGMENTS, not a byte-length gap), so
-            // repeating the delimiter cannot buy an attacker anything. A
-            // delimiter-only token sitting between two Unicode gaps (`---`
-            // glue) is itself transparent to the walk — see
-            // [`is_delimiter_only_token`] — so it is absorbed as gap material
-            // rather than treated as a chain-terminating non-fragment token.
-            // Every token found while extending from the anchor must itself
-            // be [`is_bridge_fragment_shape`] (alphanumeric,
-            // MIN_BRIDGE_FRAGMENT_LEN+): this is what stops the walk at a
-            // short trigger/glue word (`key`, `api`, `for`, 3-4 chars) rather
-            // than dragging prose into the reconstruction. The anchor is
-            // included unconditionally, so shape exemptions that can admit a
-            // long non-fragment anchor must run after this reconstruction.
-            //
-            // ACTUAL GUARANTEE (not "every three-or-more-way split is
-            // reconstructed", which this function does NOT provide):
-            // reconstruction covers splits of
-            // up to MAX_BRIDGE_FRAGMENTS real fragments (each individually
-            // meeting MIN_BRIDGE_FRAGMENT_LEN), where a single gap between
-            // two fragments may be any byte length but spans at most
-            // MAX_BRIDGE_GLUE_TOKENS delimiter-only intermediary tokens per
-            // probe direction. A split into MORE than MAX_BRIDGE_FRAGMENTS
-            // real fragments, into fragments individually below
-            // MIN_BRIDGE_FRAGMENT_LEN, or across MORE than
-            // MAX_BRIDGE_GLUE_TOKENS delimiter-only tokens in one gap, is an
-            // accepted residual limitation of the local-neighborhood bound,
-            // not a soundness gap to close here: per ADR-096 / ADR-115, this
-            // gate is accidental-persistence hygiene on a single-principal
-            // same-uid host, not defense against a same-uid adversary
-            // hand-splitting a credential to evade it — that adversary can
-            // write the DB directly. This module does not itself establish
-            // that the host is same-uid; it inherits that from the daemon's
-            // accept-site refusal of any peer uid other than its own
-            // (`khive-runtime/src/daemon.rs`, peer-credential check before the
-            // first frame is read). If that refusal is ever removed or
-            // weakened, the residual limitation documented here stops being
-            // residual. See
-            // `allows_seven_way_hex_split_beyond_fragment_cap_documented_limitation`
-            // and `allows_six_way_sub_floor_hex_split_documented_limitation`.
-            //
-            // The chain is checked two ways. `contains_normalized_hex_credential`
-            // runs over the fragments joined by a plain space — a non-
-            // alphanumeric separator the function already treats as a run
-            // boundary, so it accumulates only genuinely-adjacent hex runs
-            // exactly as it does for a single token's internal `/`-split
-            // runs. Separately, the fragments are
-            // concatenated WITHOUT a separator and the SAME whole-token
-            // entropy decision a genuine single-token high-entropy candidate
-            // must clear is applied to that reconstruction — this catches
-            // the case where a base64/base64url-shaped credential split by the same
-            // tokenizer-delimiter mechanism is not pure hex, so the
-            // hex-length check alone never catches it, but its reconstructed
-            // entropy does. Unrelated short fragments near a trigger (e.g.
-            // two short git SHAs cited in the same sentence) either fail the
-            // per-fragment shape gate or reconstruct to well under
-            // MIN_ENTROPY_LEN, so they stay allowed; see
-            // `blocks_separator_split_three_way_hex_credential_mixed_case`
-            // and `allows_unrelated_short_fragments_cited_near_a_trigger_word`.
-            // A vcs-exempt anchor skips reconstruction FROM ITSELF: the chain
-            // would re-accumulate the anchor's own legitimate 40-hex (any
-            // adjacent prose word is fragment-shaped enough to open a chain)
-            // and re-flag every benign marker-adjacent revision. A genuinely
-            // split credential hiding one fragment behind a marker is still
-            // caught: every OTHER fragment anchors its own chain, walks both
-            // directions, and accumulates the exempted fragment's hex into
-            // the total (see
-            // `blocks_split_hex_credential_with_marker_adjacent_fragment`).
+            // Step 6 (#1062, Unicode variant): bridge fragments split across non-ASCII
+            // tokenizer delimiters (e.g. U+200B) via `bridge_fragment_chain`, which walks
+            // both directions across a bounded chain (MAX_BRIDGE_FRAGMENTS,
+            // MAX_BRIDGE_GLUE_TOKENS) rather than one adjacent pair — see
+            // docs/api/secret_gate.md#check_entropy_heuristic--per-token-flagging-sequence
+            // for the exact guarantee and its accepted residual (same-uid-host) limits.
             if !vcs_reference_exempt && tokens.len() > 1 {
                 let fragments = bridge_fragment_chain(&tokens, text, idx);
                 if fragments.len() > 1 {
@@ -984,15 +987,9 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             }
         }
 
-        // Other structured identifiers (branch names, doc slugs, snake_case
-        // identifiers) are exempted from the entropy check — see the module
-        // doc and `is_structured_identifier`. Must come after the
-        // UUID/content-hash and hex-credential-token checks above (neither of
-        // which it weakens) and before the entropy computation, since a
-        // identifier can exceed ENTROPY_THRESHOLD on Shannon entropy alone.
-        // This general exemption applies only outside trigger context; the
-        // narrower file-path exemption above also requires the absence of an
-        // immediate credential label.
+        // Step 8: structured-identifier exemption, off-trigger only. Must run after the
+        // UUID/hex checks and before the entropy computation (an identifier can exceed
+        // ENTROPY_THRESHOLD on Shannon entropy alone).
         if !near_trigger && is_structured_identifier(token) {
             continue;
         }
@@ -2625,6 +2622,75 @@ mod tests {
         );
     }
 
+    // ── Reserved secret-gate property key (ADR-115 Amendment 1) ─────────────
+
+    #[test]
+    fn reject_reserved_key_passes_absent_properties() {
+        assert!(reject_reserved_secret_gate_property(None).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_passes_unrelated_properties() {
+        let props = serde_json::json!({"name": "value", "tags": ["a", "b"]});
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_passes_non_object_properties() {
+        // Non-object properties cannot name a top-level key at all.
+        let props = serde_json::json!("just a string");
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+        let arr = serde_json::json!(["a", "b"]);
+        assert!(reject_reserved_secret_gate_property(Some(&arr)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_top_level_key_creation() {
+        let props = serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"});
+        let err = reject_reserved_secret_gate_property(Some(&props)).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_regardless_of_value_shape() {
+        // Presence alone is rejected — arbitrary value, null (explicit removal
+        // shape), and a value that happens to match the real stamp format are
+        // all rejected identically; a caller can never legitimately write this
+        // key by any value.
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!({"nested": "object"}),
+            serde_json::json!("exempted:content-sha256-manifest-v1"),
+        ] {
+            let props = serde_json::json!({"khive:secret_gate": value});
+            assert!(
+                reject_reserved_secret_gate_property(Some(&props)).is_err(),
+                "must reject value shape: {props:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_reserved_key_allows_nested_non_top_level_occurrence() {
+        // The same spelling nested inside a value is ordinary content, not a
+        // posture mutation — only the exact top-level key is reserved.
+        let props = serde_json::json!({"notes": {"khive:secret_gate": "not-a-stamp"}});
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_alongside_other_legitimate_keys() {
+        let props = serde_json::json!({
+            "name": "value",
+            "khive:secret_gate": "exempted:content-sha256-manifest-v1",
+        });
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_err());
+    }
+
     #[test]
     fn check_json_passes_safe_properties() {
         let props = serde_json::json!({
@@ -2880,18 +2946,9 @@ mod tests {
     }
 
     // ── Hex allowlist is not applied when trigger context is present ────────
-    //
-    // Pure hex strings have a theoretical maximum entropy of log2(16) = 4.0 bits/char,
-    // which is below the ENTROPY_THRESHOLD of 4.5.  That means pure hex tokens cannot
-    // reach the entropy threshold and will never be flagged by the heuristic alone.
-    //
-    // However, the hex allowlist was previously applied BEFORE the trigger window was
-    // computed, meaning a future threshold reduction or edge case could silently
-    // skip credential-context hex.  The fix: compute trigger context first; only
-    // apply the hex allowlist when NOT near a trigger.  The tests below verify the
-    // structural change is in place by confirming that non-pure-hex high-entropy
-    // tokens near triggers are caught (showing the trigger path is live), and that
-    // purely hex tokens near triggers still correctly pass (entropy too low to flag).
+    // Pure hex tops out at log2(16) = 4.0 bits/char, below ENTROPY_THRESHOLD (4.5), so
+    // the entropy heuristic alone never flags it. The hex allowlist must only apply
+    // when NOT near a trigger; the tests below guard that ordering.
 
     #[test]
     fn hex_near_key_blocked_in_credential_context() {
@@ -3797,6 +3854,250 @@ mod tests {
     // ── mask_secrets: in-place redaction reusing the canonical detector ───────
 
     #[test]
+    fn bounded_masked_log_text_masks_connection_string_credentials() {
+        let raw =
+            "gate backend probe failed: postgres://svc:not-a-real-secret@internal-host refused"; // gitleaks:allow
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains("not-a-real-secret"),
+            "credential must be masked: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "masked marker must record that detail was redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("gate backend probe failed"),
+            "non-secret diagnostic prose must survive: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_bounds_pathological_input() {
+        let raw = "x".repeat(MAX_LOG_TEXT_OUTPUT_CHARS + 500);
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            rendered.chars().count() <= MAX_LOG_TEXT_OUTPUT_CHARS + 1,
+            "output must be bounded: {} chars",
+            rendered.chars().count()
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated output must declare its own truncation"
+        );
+
+        let short = "gate policy file unreadable";
+        assert_eq!(
+            bounded_masked_log_text(short),
+            short,
+            "short clean text passes through unchanged"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_masks_low_entropy_password_past_old_truncation_bound() {
+        // Regression: masking used to run AFTER truncating the raw input to a
+        // few KB, so a connection string whose password ran past that bound
+        // lost its terminating `@` before the url-userinfo detector (a
+        // shape match, not an entropy one) ever saw it — a low-entropy
+        // password can't trip the entropy heuristic either, so it leaked
+        // verbatim into the log. Masking now runs on the full input first,
+        // so a password far longer than the old 4096-char bound is still
+        // caught.
+        let long_low_entropy_password = "a".repeat(5_000);
+        let raw = format!(
+            "gate backend probe failed: postgres://svc:{long_low_entropy_password}@internal-host refused"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "long low-entropy password must not survive in the log: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "masked marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression for the crossing-boundary leak: a password longer than
+    /// [`MAX_LOG_TEXT_MASK_INPUT_CHARS`] never gets a chance to show its
+    /// terminating `@` to `find_url_userinfo` inside the truncated scan
+    /// input, so the shape detector alone can never catch it — and it's
+    /// deliberately low-entropy so the entropy heuristic can't catch it
+    /// either. Only `redact_crossing_boundary_url_userinfo` can close this.
+    #[test]
+    fn bounded_masked_log_text_redacts_password_crossing_mask_input_cap() {
+        let huge_low_entropy_password = "a".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw =
+            format!("gate backend probe failed: postgres://svc:{huge_low_entropy_password}@internal-host refused");
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "no password fragment may survive when the password crosses the mask-input cap: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated record must declare its own incompleteness: {rendered:?}"
+        );
+    }
+
+    /// Regression: a crossing password that itself contains `://` must not
+    /// let the fallback anchor at that nested delimiter. Anchoring at the
+    /// last `://` would redact only from the nested span onward, leaving
+    /// the real `user:<password prefix>` before it in the emitted log. The
+    /// fallback must anchor at the earliest unterminated credential
+    /// opening, so zero password characters survive.
+    #[test]
+    fn bounded_masked_log_text_redacts_crossing_password_containing_nested_scheme() {
+        let mut password = "a".repeat(1000);
+        password.push_str("://h:");
+        password.push_str(&"b".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000));
+        let raw =
+            format!("gate backend probe failed: postgres://svc:{password}@internal-host refused");
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "password prefix before the nested delimiter must not survive: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&"b".repeat(50)),
+            "password tail after the nested delimiter must not survive: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression: a complete URL earlier in the text must not stop the
+    /// fallback from catching a later credential run that crosses the cap.
+    /// The earlier URL's span terminates inside the text (whitespace after
+    /// it), so it is skipped; the later unterminated `user:<password-run>`
+    /// is the one redacted.
+    #[test]
+    fn bounded_masked_log_text_redacts_crossing_credential_after_complete_url() {
+        let huge_low_entropy_password = "c".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw = format!(
+            "probe of https://ok-host/health failed; retry hit postgres://svc:{huge_low_entropy_password}@internal-host refused"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            rendered.contains("ok-host"),
+            "the earlier complete URL must survive untouched: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&"c".repeat(50)),
+            "no password fragment may survive: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression: the crossing-boundary fallback must not fire when the
+    /// password's terminating `@` sits safely inside the (untruncated)
+    /// bounded input — the existing `find_url_userinfo` arm alone must
+    /// still catch and mask it, with exactly one mask marker.
+    #[test]
+    fn bounded_masked_log_text_masks_password_just_under_cap_with_terminating_at() {
+        let password_under_cap = "a".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS - 1000);
+        let raw = format!(
+            "gate backend probe failed: postgres://svc:{password_under_cap}@internal-host refused"
+        );
+        assert!(
+            raw.chars().count() < MAX_LOG_TEXT_MASK_INPUT_CHARS,
+            "test precondition: whole input must stay under the mask-input cap so no truncation occurs"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "terminated credential must still be masked normally: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches("***MASKED***").count(),
+            1,
+            "exactly one mask marker — the crossing fallback must not fire early: {rendered:?}"
+        );
+    }
+
+    /// Regression: giant truncated text with no `://user:` shape at all must
+    /// pass through unmodified by the crossing-boundary fallback — it must
+    /// not manufacture a false redaction out of ordinary non-credential
+    /// prose that happens to be long enough to hit the mask-input cap.
+    #[test]
+    fn bounded_masked_log_text_giant_non_credential_text_unaffected_by_crossing_fallback() {
+        let raw = "x".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains("***MASKED***"),
+            "non-credential text must never be redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated record must still declare its own incompleteness: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("xxxx"),
+            "non-credential content must survive verbatim up to the output bound: {rendered:?}"
+        );
+    }
+
+    /// Regression: an ordinary short connection string (well under both
+    /// caps) must keep being masked exactly as before — the crossing
+    /// fallback is gated on truncation and must never touch this path.
+    #[test]
+    fn bounded_masked_log_text_masks_ordinary_short_connection_string() {
+        let raw = "gate backend probe failed: postgres://svc:hunter2pw@internal-host refused"; // gitleaks:allow
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains("hunter2pw"),
+            "credential must be masked: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches("***MASKED***").count(),
+            1,
+            "exactly one mask marker for the one credential: {rendered:?}"
+        );
+        assert!(
+            !rendered.ends_with('…'),
+            "short untruncated text must not declare truncation: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_neutralizes_control_and_format_chars() {
+        let raw = "line one\r\ninjected: \u{1b}[31mFAKE ALERT\u{1b}[0m line two";
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains('\r') && !rendered.contains('\n'),
+            "CR/LF must be neutralized so a single log line cannot be split/forged: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC control character must be neutralized: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("line one") && rendered.contains("line two"),
+            "surrounding prose must survive neutralization: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_keeps_accented_and_cjk_text_unchanged() {
+        let raw = "café résumé 日本語のテキスト 数据库连接管理";
+        assert_eq!(
+            bounded_masked_log_text(raw),
+            raw,
+            "accented and CJK prose must pass through unmodified"
+        );
+    }
+
+    #[test]
     fn mask_secrets_borrows_clean_text() {
         let clean = "The FlashAttention paper introduces IO-aware tiling.";
         let masked = mask_secrets(clean);
@@ -4082,25 +4383,12 @@ mod tests {
     }
 
     // ── Credential-labeled structured identifiers remain blocked ────────────
-    //
-    // Narrower fixes that keep some exemption alive in trigger context (e.g.
-    // requiring a trailing file-extension run, or requiring >= 2 path-shaped
-    // runs with a low average per-run letters-only entropy) are all
-    // attacker-defeatable: a random credential can be extension-suffixed, or
-    // split/padded into short runs that drive each run's own entropy toward
-    // its length ceiling (log2(run_len)), which real short path words already
-    // sit at. Shannon entropy over an attacker-chosen run boundary cannot
-    // distinguish "distinct letters that spell an English word" from
-    // "distinct letters chosen adversarially" — both hit the same
-    // log2(length) ceiling — an upper bound shared by every string of that
-    // length, not a claim that entropy is content-independent at a fixed
-    // length (two different N-character strings can and do score
-    // differently; neither is distinguishable from the other by a threshold
-    // alone once both sit near that shared ceiling). So no aggregation is
-    // sound. Plausible file paths are therefore exempt only after their
-    // individual runs have passed the entropy and normalized-hex checks, and
-    // only when the path is not immediately labeled as a credential value.
-    // The tests below guard that credential-label boundary.
+    // Shannon entropy over an attacker-chosen run boundary cannot distinguish an
+    // English word from adversarially-chosen letters at the same length ceiling
+    // (log2(run_len)), so no run-shape exemption is sound near a trigger. File paths
+    // are exempt only after their runs pass the entropy/hex checks AND the path is
+    // not immediately labeled as a credential value. The tests below guard that
+    // credential-label boundary.
 
     #[test]
     fn blocks_separator_secret_access_key_bypass() {
@@ -4363,18 +4651,10 @@ mod tests {
 
     #[test]
     fn blocks_punctuation_glue_between_two_unicode_gaps() {
-        // Two 20-char hex fragments separated by a
-        // punctuation-only token (`---`) sandwiched between two U+200B
-        // gaps. `adjacent_gap_is_bridgeable` already accepts any
-        // non-alphanumeric GAP between tokens; before this fix, `---` was
-        // tokenized as its own TOKEN (not gap text), failed
-        // `is_bridge_fragment_shape` (not alphanumeric), and stopped the
-        // walk before it ever reached the second hex fragment — the two
-        // real fragments were never joined, contradicting the bridge's own
-        // stated intent that delimiter-only material is transparent to
-        // reconstruction. `is_delimiter_only_token` now lets the walk
-        // absorb `---` as glue and continue to the fragment on its far
-        // side, without counting it against `MAX_BRIDGE_FRAGMENTS`.
+        // Two 20-char hex fragments separated by a punctuation-only token (`---`)
+        // sandwiched between two U+200B gaps: `is_delimiter_only_token` must let the
+        // walk absorb `---` as glue (without counting it against MAX_BRIDGE_FRAGMENTS)
+        // rather than stopping at it as a non-fragment token.
         let content = "api key 0123456789abcdef0123\u{200B}---\u{200B}456789abcdef01234567";
         assert!(
             check(content).is_err(),
@@ -5088,19 +5368,9 @@ mod tests {
     }
 
     // ── Underscore is a BOUNDARY for bare TRIGGER_WORDS, not a continuation ─
-    //
-    // Bare TRIGGER_WORDS are word-boundary-aware, but underscore must be
-    // treated as a boundary rather than a word character (continuation) for
-    // this set specifically: the opposite of `has_standalone_token`'s rule
-    // for `token`. Treating underscore as a continuation would silently drop
-    // detection of extremely common underscore-joined credential-config
-    // compounds (`SECRET_KEY=`, `auth_token=`, `signing_key=`,
-    // `session_secret_...`), since `secret`/`key`/`auth` would never be
-    // bounded by `_` under that rule. Fixed by treating `_` as a boundary for
-    // the bare `TRIGGER_WORDS` check specifically (see `contains_word`'s
-    // `underscore_is_word_char` parameter), while leaving
-    // `has_standalone_token`'s `token`-specific underscore-as-continuation
-    // rule (the `tokenizer`/`next_token`/`token_count` exemption) unchanged.
+    // Opposite of `has_standalone_token`'s rule for `token`: treating underscore as a
+    // boundary here is what keeps `SECRET_KEY=`/`auth_token=`/`signing_key=` detected
+    // (`contains_word`'s `underscore_is_word_char` parameter controls this per caller).
 
     #[test]
     fn blocks_secret_key_assignment_when_underscore_bounds_trigger() {
@@ -5304,18 +5574,12 @@ mod corpus_replay {
         }
     }
 
-    /// Generates the sanitized aggregate corpus manifest checked in at
-    /// `tests/data/secret_gate_corpus_manifest.md` (#1062): per-
-    /// detector block counts plus a sha256 of each blocked candidate's
-    /// content — never the candidate text itself, so the manifest carries no
-    /// production data. This is a POINT-IN-TIME generator, not a CI check:
-    /// re-run it manually (`KHIVE_REPLAY_DB=... cargo test -p khive-runtime
-    /// --release -- --ignored --nocapture generate_corpus_manifest`) and
-    /// hand-update the checked-in file when the detector set changes enough
-    /// to warrant a fresh snapshot. `replay_against_corpus` above stays the
-    /// human-readable spot-check with a few truncated samples; this is the
-    /// reproducible-evidence counterpart the #1040/#1056 drop rationale in
-    /// the PR body cites.
+    /// Generates the sanitized corpus manifest at
+    /// `tests/data/secret_gate_corpus_manifest.md`: per-detector block counts plus a
+    /// sha256 of each blocked candidate, never the candidate text itself. Point-in-time
+    /// generator, not a CI check — re-run manually (`KHIVE_REPLAY_DB=... cargo test -p
+    /// khive-runtime --release -- --ignored --nocapture generate_corpus_manifest`) and
+    /// hand-update the checked-in file when the detector set changes.
     #[test]
     #[ignore]
     fn generate_corpus_manifest() {

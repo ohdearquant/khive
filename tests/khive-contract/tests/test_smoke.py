@@ -75,8 +75,9 @@ def test_kg_smoke(
     assert fetched.get("name") == "SmokeLoRA", f"get name mismatch: {fetched}"
 
     # list entities
-    concepts = khive_session.verb("list", {"kind": "entity", "entity_kind": "concept",
-                                            "namespace": ns})
+    concept_page = khive_session.verb("list", {"kind": "entity", "entity_kind": "concept",
+                                                "namespace": ns})
+    concepts = concept_page["items"]
     assert isinstance(concepts, list), "list must return a list"
     concept_ids = [e["id"] for e in concepts]
     assert lora_id in concept_ids, "SmokeLoRA must appear in concept list"
@@ -118,8 +119,9 @@ def test_kg_smoke(
     assert len(nbrs_out) >= 1, f"LoRA must have >=1 outbound neighbors (paper), got: {nbrs_out}"
 
     # edge list
-    edges_from_qlora = khive_session.verb("list", {"kind": "edge", "source_id": qlora_id,
-                                                    "namespace": ns})
+    edge_page = khive_session.verb("list", {"kind": "edge", "source_id": qlora_id,
+                                             "namespace": ns})
+    edges_from_qlora = edge_page["items"]
     assert isinstance(edges_from_qlora, list), "list edges must return a list"
     assert len(edges_from_qlora) >= 1, "QLoRA must have >=1 outbound edge"
 
@@ -153,8 +155,9 @@ def test_kg_smoke(
     note_id = note["id"]
 
     # list notes
-    notes = khive_session.verb("list", {"kind": "note", "note_kind": "observation",
-                                         "namespace": ns})
+    note_page = khive_session.verb("list", {"kind": "note", "note_kind": "observation",
+                                             "namespace": ns})
+    notes = note_page["items"]
     assert isinstance(notes, list), "list notes must return a list"
     note_ids = [n["id"] for n in notes]
     assert note_id in note_ids, "created observation note must appear in list"

@@ -5,6 +5,9 @@ test("dogfoods every repository analysis from the curated static bundle", async 
   page.on("console", (message) => {
     if (message.type() === "error") consoleErrors.push(message.text());
   });
+  await page.route("**/api/showcase/analyses/khive", async (route) => {
+    await route.fulfill({ status: 404 });
+  });
 
   await page.goto("/");
   const overview = page.locator(".repo-overview");
@@ -66,7 +69,9 @@ test("dogfoods every repository analysis from the curated static bundle", async 
     await expect(page.locator(".repo-view-panel h2")).not.toBeEmpty();
   }
 
-  expect(consoleErrors).toEqual([]);
+  expect(consoleErrors).toEqual([
+    expect.stringMatching(/failed to load resource.*404/i),
+  ]);
 });
 
 test("a valid repository miss stays local and renders an honest state", async ({ page }) => {
@@ -82,7 +87,7 @@ test("a valid repository miss stays local and renders an honest state", async ({
   observing = true;
   await page.locator(".repo-url-form button[type=submit]").click();
 
-  await expect(page.locator(".repo-state-card.miss")).toBeVisible();
+  await expect(page.locator(".repo-state-card[data-state='empty']")).toBeVisible();
   await page.waitForTimeout(100);
   expect(requestedAfterSubmit).toEqual([]);
 });

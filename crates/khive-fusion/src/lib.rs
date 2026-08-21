@@ -1,6 +1,7 @@
 //! Rank fusion strategies (RRF, Weighted, Union, VectorOnly, KeywordOnly, Custom) for hybrid search.
 
 mod fuse;
+mod ordering;
 mod rrf;
 mod strategy;
 mod union;
@@ -11,6 +12,7 @@ mod tests;
 
 // Re-export public types and functions
 pub use fuse::{fuse, FuseError};
+pub use ordering::cmp_desc_then_id;
 pub use rrf::reciprocal_rank_fusion;
 pub use strategy::{FusionStrategy, FusionStrategyError, DEFAULT_RRF_K};
 pub use union::union_fusion;

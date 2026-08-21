@@ -34,9 +34,22 @@ import {
   Upload,
   X,
   XCircle,
-} from "lucide-react";
+} from "@/icons";
 import { useMemo, useRef, useState } from "react";
 
+import {
+  edgeDirectionMark,
+  edgeHueStyle,
+  EntityKindMark,
+  kindHueStyle,
+  NoteKindMark,
+  OntologyKindMark,
+  OntologyLegend,
+  RelationMark,
+} from "@/components/ontology-mark";
+import { DataState } from "@/components/data-state";
+import { settleGraphLayout } from "@/lib/graph-layout";
+import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import {
   isReviewReport,
   parseReviewInput,
@@ -66,7 +79,7 @@ const viewLabels: Record<View, string> = {
 };
 
 const reviewerFamilies = [
-  "family:atlas-frontier",
+  "family:demo-frontier",
   "family:independent-reasoner",
   "family:human-curator",
 ];
@@ -102,14 +115,39 @@ function TierPill({ tier }: { tier: "tier_1" | "tier_2" }) {
   return <span className={`tier-pill ${tier}`}>{tier === "tier_1" ? "T1 fast path" : "T2 review"}</span>;
 }
 
-function PageNotice({ page, label }: { page: { next_cursor: string | null; truncated: boolean }; label: string }) {
-  if (!page.next_cursor && !page.truncated) return null;
+type CapturedPage = Readonly<{
+  items: readonly unknown[];
+  next_cursor: string | null;
+  truncated: boolean;
+}>;
+
+function isCompletePage(page: CapturedPage): boolean {
+  return !page.truncated && page.next_cursor === null;
+}
+
+function isKnownEmptyPage(page: CapturedPage): boolean {
+  return page.items.length === 0 && isCompletePage(page);
+}
+
+function PageNotice({
+  page,
+  label,
+}: {
+  page: CapturedPage;
+  label: string;
+}) {
+  if (isCompletePage(page)) return null;
   return (
-    <div className="page-notice" role="status">
-      <Info aria-hidden="true" />
-      <span>{label} are bounded to this page.{page.truncated ? " A configured budget truncated collection." : " More results are available."}</span>
-      {page.next_cursor && <code>cursor available</code>}
-    </div>
+    <DataState
+      className="page-notice"
+      state="truncated"
+      title={`${label} are truncated`}
+      shown={page.items.length}
+      reason={page.truncated
+        ? "A configured export budget truncated this collection."
+        : "The bundle declares another page, but this static review surface only displays the captured page."}
+      context={page.next_cursor !== null ? ["cursor available"] : undefined}
+    />
   );
 }
 
@@ -345,6 +383,26 @@ function FieldDiff({ field }: { field: ReviewChange["fields"][number] }) {
   );
 }
 
+function ChangeOntologyMark({ change }: { change: ReviewChange }) {
+  const valueAt = (path: string) => {
+    const field = change.fields.find((candidate) => candidate.path === path);
+    return field?.after ?? field?.before;
+  };
+  if (change.substrate === "entity") {
+    const value = valueAt("entity_kind") ?? valueAt("kind");
+    const kind = typeof value === "string" ? value : "entity";
+    return <EntityKindMark className="substrate-chip" kind={kind} />;
+  }
+  if (change.substrate === "note") {
+    const value = valueAt("note_kind") ?? valueAt("kind");
+    const kind = typeof value === "string" ? value : "note";
+    return <NoteKindMark className="substrate-chip" kind={kind} />;
+  }
+  const value = valueAt("relation");
+  const relation = typeof value === "string" ? value : "edge";
+  return <RelationMark className="substrate-chip edge" relation={relation} />;
+}
+
 function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; selected: boolean; onSelect: () => void }) {
   return (
     <article className={`change-card ${change.change} ${selected ? "selected" : ""}`}>
@@ -356,7 +414,7 @@ function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; sele
           <strong>{change.title}</strong>
           <span>{change.subtitle}</span>
         </div>
-        <span className={`substrate-chip ${change.substrate}`}>{change.substrate}</span>
+        <ChangeOntologyMark change={change} />
         <TierPill tier={change.tier} />
         <ChevronDown className={selected ? "rotated" : ""} aria-hidden="true" />
       </button>
@@ -374,7 +432,17 @@ function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; sele
   );
 }
 
-function ChangesView({ bundle, query, onQuery }: { bundle: ReviewBundle; query: string; onQuery: (value: string) => void }) {
+function ChangesView({
+  bundle,
+  query,
+  onQuery,
+  onImport,
+}: {
+  bundle: ReviewBundle;
+  query: string;
+  onQuery: (value: string) => void;
+  onImport: () => void;
+}) {
   const filtered = bundle.changes.items.filter((change) => matchesReviewQuery(change, query));
   const grouped = groupChanges(filtered);
   const [selectedId, setSelectedId] = useState(bundle.changes.items.at(0)?.id ?? "");
@@ -389,7 +457,7 @@ function ChangesView({ bundle, query, onQuery }: { bundle: ReviewBundle; query: 
         <label className="filter-input">
           <Search aria-hidden="true" />
           <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Filter entities, edges, tiers…" />
-          {query && <button type="button" onClick={() => onQuery("")} aria-label="Clear filter"><X /></button>}
+          {query && <button type="button" onClick={() => onQuery("")} aria-label="Clear filter text"><X /></button>}
         </label>
       </div>
       <div className="diff-legend">
@@ -407,8 +475,16 @@ function ChangesView({ bundle, query, onQuery }: { bundle: ReviewBundle; query: 
             onSelect={() => setSelectedId((current) => current === change.id ? "" : change.id)}
           />
         ))}
-        {filtered.length === 0 && (
-          <div className="empty-state"><Search aria-hidden="true" /><strong>No changes match “{query}”</strong><span>Try a relation, entity kind, or tier.</span></div>
+        {filtered.length === 0 && isCompletePage(bundle.changes) && (
+          <DataState
+            className="empty-state"
+            state="empty"
+            title={query ? `No graph changes match “${query}”` : "No graph changes in this review bundle"}
+            message="Graph changes matching the selected relation, entity kind, or tier belong here."
+            action={query
+              ? { label: "Clear filter", onClick: () => onQuery("") }
+              : { label: "Import another review bundle", onClick: onImport }}
+          />
         )}
       </div>
       <PageNotice page={bundle.changes} label="Graph changes" />
@@ -416,11 +492,51 @@ function ChangesView({ bundle, query, onQuery }: { bundle: ReviewBundle; query: 
   );
 }
 
-function GraphView({ bundle }: { bundle: ReviewBundle }) {
-  const [selectedId, setSelectedId] = useState(bundle.graph.nodes.items[0]?.id ?? "");
-  const selected = bundle.graph.nodes.items.find((node) => node.id === selectedId) ?? bundle.graph.nodes.items[0];
+type GraphSelection = { type: "node" | "edge"; id: string };
 
-  const nodeById = useMemo(() => new Map(bundle.graph.nodes.items.map((node) => [node.id, node])), [bundle.graph.nodes.items]);
+function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
+  const [selection, setSelection] = useState<GraphSelection>({
+    type: "node",
+    id: bundle.graph.nodes.items[0]?.id ?? "",
+  });
+
+  const settledNodes = useMemo(
+    () => settleGraphLayout(bundle.graph.nodes.items, bundle.graph.edges.items),
+    [bundle.graph.edges.items, bundle.graph.nodes.items],
+  );
+
+  const nodeById = useMemo(
+    () => new Map(settledNodes.map((node) => [node.id, node])),
+    [settledNodes],
+  );
+  const edgeById = useMemo(() => new Map(bundle.graph.edges.items.map((edge) => [edge.id, edge])), [bundle.graph.edges.items]);
+
+  const selectNode = (id: string) => setSelection({ type: "node", id });
+  const selectEdge = (id: string) => setSelection({ type: "edge", id });
+
+  const selected = selection.type === "node"
+    ? settledNodes.find((node) => node.id === selection.id) ?? settledNodes[0]
+    : undefined;
+  const selectedEdge = selection.type === "edge" ? edgeById.get(selection.id) : undefined;
+  const selectedEdgeSource = selectedEdge ? nodeById.get(selectedEdge.source) : undefined;
+  const selectedEdgeTarget = selectedEdge ? nodeById.get(selectedEdge.target) : undefined;
+
+  if (settledNodes.length === 0) {
+    const graphKnownEmpty = isKnownEmptyPage(bundle.graph.nodes) && isKnownEmptyPage(bundle.graph.edges);
+    return (
+      <div className="view-stack">
+        {graphKnownEmpty && <DataState
+          className="empty-state"
+          state="empty"
+          title="No affected graph nodes in this review bundle"
+          message="Affected graph nodes and their relationships belong here."
+          action={{ label: "Import another review bundle", onClick: onImport }}
+        />}
+        <PageNotice page={bundle.graph.nodes} label="Graph nodes" />
+        <PageNotice page={bundle.graph.edges} label="Graph edges" />
+      </div>
+    );
+  }
 
   return (
     <div className="view-stack">
@@ -429,35 +545,79 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
           <span className="eyebrow">Bounded 2-hop context</span>
           <h2>Affected subgraph</h2>
         </div>
-        <div className="graph-legend">
-          <span><i className="added" /> Added</span>
-          <span><i className="modified" /> Changed</span>
-          <span><i className="context" /> Context</span>
+        <div className="graph-legend-block">
+          <div className="graph-legend">
+            <span><i className="added" /> Added</span>
+            <span><i className="modified" /> Changed</span>
+            <span><i className="context" /> Context</span>
+          </div>
+          <OntologyLegend
+            className="graph-ontology-legend"
+            presentEntityKinds={bundle.graph.nodes.items.map((node) => node.kind)}
+            presentRelations={bundle.graph.edges.items.map((edge) => edge.relation)}
+          />
         </div>
       </div>
       <div className="graph-stage">
         <svg className="graph-lines" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <marker id="studio-ontology-arrow" markerHeight="6" markerWidth="6" orient="auto" refX="5" refY="3" viewBox="0 0 6 6">
+              <path d="M 0 0 L 6 3 L 0 6 z" fill="context-stroke" />
+            </marker>
+          </defs>
           {bundle.graph.edges.items.map((edge) => {
             const source = nodeById.get(edge.source);
             const target = nodeById.get(edge.target);
             if (!source || !target) return null;
+            const legend = edgeLegendFor(edge.relation);
+            const direction = edgeDirectionMark(legend, source, target);
             return (
               <g key={edge.id} className={edge.state}>
-                <line x1={source.x} y1={source.y} x2={target.x} y2={target.y} vectorEffect="non-scaling-stroke" />
-                <circle cx={(source.x + target.x) / 2} cy={(source.y + target.y) / 2} r="1.2" vectorEffect="non-scaling-stroke" />
+                <line
+                  className="ontology-edge"
+                  data-edge-family={legend.family}
+                  data-edge-treatment={legend.treatment}
+                  data-edge-variant={legend.variant}
+                  data-edge-origin="ingested"
+                  markerEnd={legend.directed ? "url(#studio-ontology-arrow)" : undefined}
+                  style={edgeHueStyle(legend)}
+                  x1={source.x}
+                  y1={source.y}
+                  x2={target.x}
+                  y2={target.y}
+                  vectorEffect="non-scaling-stroke"
+                />
+                <text
+                  className="ontology-edge-glyph"
+                  data-edge-directed={legend.directed}
+                  style={edgeHueStyle(legend)}
+                  x={(source.x + target.x) / 2}
+                  y={(source.y + target.y) / 2}
+                >
+                  {legend.glyph}
+                </text>
+                {direction && (
+                  <text
+                    className="ontology-direction-glyph"
+                    style={edgeHueStyle(legend)}
+                    transform={direction.transform}
+                    x={direction.x}
+                    y={direction.y}
+                  >›</text>
+                )}
               </g>
             );
           })}
         </svg>
-        {bundle.graph.nodes.items.map((node) => (
+        {settledNodes.map((node) => (
           <button
             type="button"
-            className={`graph-node ${node.state} ${node.id === selectedId ? "selected" : ""}`}
-            style={{ left: `${node.x}%`, top: `${node.y}%` }}
+            className={`graph-node ${node.state} ${selection.type === "node" && node.id === selection.id ? "selected" : ""}`}
+            style={{ left: `${node.x}%`, top: `${node.y}%`, ...kindHueStyle(entityLegendFor(node.kind)) }}
             key={node.id}
-            onClick={() => setSelectedId(node.id)}
+            onClick={() => selectNode(node.id)}
           >
-            <span className="node-kind">{node.kind}</span>
+            <EntityKindMark className="node-kind" kind={node.kind} />
             <strong>{node.label}</strong>
           </button>
         ))}
@@ -466,43 +626,74 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
           const target = nodeById.get(edge.target);
           if (!source || !target) return null;
           return (
-            <span
+            <button
+              type="button"
               key={`${edge.id}-label`}
-              className={`edge-label ${edge.state}`}
+              className={`edge-label ${edge.state} ${selection.type === "edge" && edge.id === selection.id ? "selected" : ""}`}
               style={{ left: `${(source.x + target.x) / 2}%`, top: `${(source.y + target.y) / 2}%` }}
+              aria-pressed={selection.type === "edge" && edge.id === selection.id}
+              onClick={() => selectEdge(edge.id)}
             >
-              {edge.relation} · {edge.weight.toFixed(2)}
-            </span>
+              <RelationMark relation={edge.relation} /> · {edge.weight.toFixed(2)}
+            </button>
           );
         })}
       </div>
       <section className="graph-edge-summary" aria-label="Affected graph relationships">
         <h3>Relationships</h3>
-        <ul>
+        {isKnownEmptyPage(bundle.graph.edges) ? (
+          <DataState
+            className="empty-state"
+            state="empty"
+            title="No affected graph relationships in this review bundle"
+            message="Relationships between affected graph nodes belong here."
+            action={{ label: "Import another review bundle", onClick: onImport }}
+          />
+        ) : <ul>
           {bundle.graph.edges.items.map((edge) => {
             const source = nodeById.get(edge.source);
             const target = nodeById.get(edge.target);
             if (!source || !target) return null;
             return (
               <li key={`${edge.id}-summary`}>
-                <strong>{source.label}</strong>
-                <span>{edge.relation} · {edge.weight.toFixed(2)}</span>
-                <strong>{target.label}</strong>
-                <em>{edge.state}</em>
+                <button
+                  type="button"
+                  className={selection.type === "edge" && edge.id === selection.id ? "selected" : ""}
+                  aria-pressed={selection.type === "edge" && edge.id === selection.id}
+                  onClick={() => selectEdge(edge.id)}
+                >
+                  <strong>{source.label}</strong>
+                  <span><RelationMark relation={edge.relation} /><span className="visually-hidden">{edge.relation}</span> · {edge.weight.toFixed(2)}</span>
+                  <strong>{target.label}</strong>
+                  <em>{edge.state}</em>
+                </button>
               </li>
             );
           })}
-        </ul>
+        </ul>}
       </section>
       {selected && (
-        <div className="node-inspector">
+        <div className="node-inspector" style={kindHueStyle(entityLegendFor(selected.kind))}>
           <div className={`node-state-dot ${selected.state}`} />
           <div>
-            <span>{selected.kind} · {selected.state}</span>
+            <EntityKindMark className="node-inspector-kind" kind={selected.kind} showLabel={false} />
+            <span>{entityLegendFor(selected.kind).label} · {selected.state}</span>
             <strong>{selected.label}</strong>
             <p>{selected.description}</p>
           </div>
           <code>{shortHash(selected.id)}</code>
+        </div>
+      )}
+      {selectedEdge && selectedEdgeSource && selectedEdgeTarget && (
+        <div className="node-inspector edge-inspector" style={edgeHueStyle(edgeLegendFor(selectedEdge.relation))}>
+          <div className={`node-state-dot ${selectedEdge.state}`} />
+          <div>
+            <RelationMark className="node-inspector-kind" relation={selectedEdge.relation} showLabel={false} />
+            <span>{edgeLegendFor(selectedEdge.relation).label} · {selectedEdge.state}</span>
+            <strong>{selectedEdgeSource.label} → {selectedEdgeTarget.label}</strong>
+            <p>Weight {selectedEdge.weight.toFixed(2)}</p>
+          </div>
+          <code>{shortHash(selectedEdge.id)}</code>
         </div>
       )}
       <PageNotice page={bundle.graph.nodes} label="Graph nodes" />
@@ -511,7 +702,7 @@ function GraphView({ bundle }: { bundle: ReviewBundle }) {
   );
 }
 
-function ChecksView({ bundle }: { bundle: ReviewBundle }) {
+function ChecksView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
   const failed = bundle.checks.items.filter((check) => check.status === "fail").length;
   return (
     <div className="view-stack">
@@ -519,7 +710,15 @@ function ChecksView({ bundle }: { bundle: ReviewBundle }) {
         <div><span className="eyebrow">Stage-time validation</span><h2>Semantic checks</h2></div>
         <span className="checks-runtime">{bundle.checks.items.reduce((total, check) => total + check.duration_ms, 0)} ms total</span>
       </div>
-      <div className="checks-hero">
+      {isKnownEmptyPage(bundle.checks) ? (
+        <DataState
+          className="empty-state"
+          state="empty"
+          title="No semantic checks in this review bundle"
+          message="Stage-time validation checks belong here."
+          action={{ label: "Import another review bundle", onClick: onImport }}
+        />
+      ) : bundle.checks.items.length > 0 ? <><div className="checks-hero">
         {failed > 0 ? <XCircle aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}
         <div>
           <strong>{failed > 0 ? `${failed} required check${failed === 1 ? "" : "s"} failed` : "No error-level findings"}</strong>
@@ -536,19 +735,28 @@ function ChecksView({ bundle }: { bundle: ReviewBundle }) {
           </article>
         ))}
       </div>
+      </> : null}
       <PageNotice page={bundle.checks} label="Checks" />
     </div>
   );
 }
 
-function ProvenanceView({ bundle }: { bundle: ReviewBundle }) {
+function ProvenanceView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
   return (
     <div className="view-stack">
       <div className="surface-toolbar">
         <div><span className="eyebrow">Evidence contract</span><h2>Why these edits exist</h2></div>
         <span className="immutable-pill"><LockKeyhole aria-hidden="true" /> append-only anchors</span>
       </div>
-      <div className="provenance-grid">
+      {isKnownEmptyPage(bundle.evidence) ? (
+        <DataState
+          className="empty-state"
+          state="empty"
+          title="No evidence anchors in this review bundle"
+          message="Evidence supporting the captured edits belongs here."
+          action={{ label: "Import another review bundle", onClick: onImport }}
+        />
+      ) : <div className="provenance-grid">
         {bundle.evidence.items.map((evidence) => (
           <article className="evidence-card" key={evidence.id}>
             <div className="evidence-icon"><BookOpen aria-hidden="true" /></div>
@@ -562,6 +770,7 @@ function ProvenanceView({ bundle }: { bundle: ReviewBundle }) {
           </article>
         ))}
       </div>
+      }
       <PageNotice page={bundle.evidence} label="Evidence anchors" />
       <div className="provenance-chain">
         <span className="eyebrow">Attribution chain</span>
@@ -579,7 +788,7 @@ function ProvenanceView({ bundle }: { bundle: ReviewBundle }) {
   );
 }
 
-function RetrievalView({ bundle }: { bundle: ReviewBundle }) {
+function RetrievalView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
   const [mode, setMode] = useState<"search" | "recall" | "traverse">("search");
   const activePage = mode === "traverse" ? bundle.retrieval.traversal : bundle.retrieval[mode];
   return (
@@ -600,27 +809,36 @@ function RetrievalView({ bundle }: { bundle: ReviewBundle }) {
         <span>assertion provenance review auditability</span>
         <kbd>{mode}</kbd>
       </div>
-      {mode === "search" && (
+      {isKnownEmptyPage(activePage) && (
+        <DataState
+          className="empty-state"
+          state="empty"
+          title={`No ${mode} results in this review bundle`}
+          message="Captured khive retrieval context belongs here."
+          action={{ label: "Import another review bundle", onClick: onImport }}
+        />
+      )}
+      {activePage.items.length > 0 && mode === "search" && (
         <div className="retrieval-results">
           {bundle.retrieval.search.items.map((result, index) => (
-            <article key={result.id}><span className="result-rank">{index + 1}</span><div><strong>{result.title}</strong><span>{result.kind} · score {result.score}</span><p>{result.snippet}</p></div><code>{result.id}</code></article>
+            <article key={result.id}><span className="result-rank">{index + 1}</span><div><strong>{result.title}</strong><span><OntologyKindMark kind={result.kind} /> · score {result.score}</span><p>{result.snippet}</p></div><code>{result.id}</code></article>
           ))}
         </div>
       )}
-      {mode === "recall" && (
+      {activePage.items.length > 0 && mode === "recall" && (
         <div className="retrieval-results">
           {bundle.retrieval.recall.items.map((result, index) => (
             <article key={result.id}><span className="result-rank memory">{index + 1}</span><div><strong>{result.memory_type} memory</strong><span>decay-aware score {result.score.toFixed(3)}</span><p>{result.content}</p></div><code>{result.id}</code></article>
           ))}
         </div>
       )}
-      {mode === "traverse" && (
+      {activePage.items.length > 0 && mode === "traverse" && (
         <div className="traversal-list">
           {bundle.retrieval.traversal.items.map((node, index) => (
             <div className={`traversal-row depth-${node.depth}`} key={`${node.id}-${index}`}>
               <span className="traversal-line" aria-hidden="true" />
-              <span className="traversal-node"><Circle /></span>
-              <div><strong>{node.name}</strong><span>{node.kind}{node.via ? ` · ${node.via}` : " · root"}</span></div>
+              <span className="traversal-node"><EntityKindMark kind={node.kind} showLabel={false} /></span>
+              <div><strong>{node.name}</strong><span><EntityKindMark kind={node.kind} />{node.via ? <> · <RelationMark relation={node.via} /></> : " · root"}</span></div>
               <code>{node.id}</code>
             </div>
           ))}
@@ -631,7 +849,7 @@ function RetrievalView({ bundle }: { bundle: ReviewBundle }) {
   );
 }
 
-function ActivityView({ bundle }: { bundle: ReviewBundle }) {
+function ActivityView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
   const [draft, setDraft] = useState("");
   const [localNotes, setLocalNotes] = useState<string[]>([]);
 
@@ -645,7 +863,15 @@ function ActivityView({ bundle }: { bundle: ReviewBundle }) {
   return (
     <div className="view-stack">
       <div className="surface-toolbar"><div><span className="eyebrow">Replayable review thread</span><h2>Conversation</h2></div></div>
-      <div className="activity-list">
+      {isKnownEmptyPage(bundle.activity) && localNotes.length === 0 ? (
+        <DataState
+          className="empty-state"
+          state="empty"
+          title="No conversation events in this review bundle"
+          message="Captured review activity and local session notes belong here."
+          action={{ label: "Import another review bundle", onClick: onImport }}
+        />
+      ) : <div className="activity-list">
         {bundle.activity.items.map((item) => (
           <article key={item.id} className={item.tone}>
             <div className="avatar">{item.actor.split(":").at(-1)?.slice(0, 1).toUpperCase()}</div>
@@ -662,6 +888,7 @@ function ActivityView({ bundle }: { bundle: ReviewBundle }) {
           </article>
         ))}
       </div>
+      }
       <PageNotice page={bundle.activity} label="Conversation events" />
       <div className="comment-composer">
         <div className="avatar">Y</div>
@@ -739,7 +966,19 @@ function ReviewRail({
   );
 }
 
-function ViewSurface({ activeView, bundle, query, onQuery }: { activeView: View; bundle: ReviewBundle; query: string; onQuery: (value: string) => void }) {
+function ViewSurface({
+  activeView,
+  bundle,
+  query,
+  onQuery,
+  onImport,
+}: {
+  activeView: View;
+  bundle: ReviewBundle;
+  query: string;
+  onQuery: (value: string) => void;
+  onImport: () => void;
+}) {
   const unavailable =
     (activeView === "changes" && bundle.enrichment_status.semantic_changes === "unavailable") ||
     (activeView === "graph" && bundle.enrichment_status.affected_graph === "unavailable") ||
@@ -748,19 +987,42 @@ function ViewSurface({ activeView, bundle, query, onQuery }: { activeView: View;
     (activeView === "activity" && bundle.enrichment_status.activity === "unavailable");
   if (unavailable) {
     return (
-      <div className="unavailable-surface">
-        <Box aria-hidden="true" />
-        <strong>{viewLabels[activeView]} unavailable</strong>
-        <span>This review bundle did not claim or invent that enrichment.</span>
-      </div>
+      <DataState
+        className="unavailable-surface"
+        state="unavailable"
+        title={`${viewLabels[activeView]} unavailable`}
+        message="This review bundle did not claim or invent that enrichment."
+      />
     );
   }
-  if (activeView === "graph") return <GraphView bundle={bundle} />;
-  if (activeView === "checks") return <ChecksView bundle={bundle} />;
-  if (activeView === "provenance") return <ProvenanceView bundle={bundle} />;
-  if (activeView === "retrieval") return <RetrievalView bundle={bundle} />;
-  if (activeView === "activity") return <ActivityView bundle={bundle} />;
-  return <ChangesView bundle={bundle} query={query} onQuery={onQuery} />;
+  if (activeView === "graph") return <GraphView bundle={bundle} onImport={onImport} />;
+  if (activeView === "checks") return <ChecksView bundle={bundle} onImport={onImport} />;
+  if (activeView === "provenance") return <ProvenanceView bundle={bundle} onImport={onImport} />;
+  if (activeView === "retrieval") return <RetrievalView bundle={bundle} onImport={onImport} />;
+  if (activeView === "activity") return <ActivityView bundle={bundle} onImport={onImport} />;
+  return <ChangesView bundle={bundle} query={query} onQuery={onQuery} onImport={onImport} />;
+}
+
+function OperationOntologyMark({
+  operation,
+}: {
+  operation: ReviewReport["change_set"]["operations"][number];
+}) {
+  const record = operation.after ?? operation.before;
+  const stringField = (...names: string[]) => {
+    for (const name of names) {
+      const value = record?.[name];
+      if (typeof value === "string") return value;
+    }
+    return undefined;
+  };
+  if (operation.target === "entity") {
+    return <EntityKindMark className="substrate-chip" kind={stringField("entity_kind", "kind") ?? "entity"} />;
+  }
+  if (operation.target === "note") {
+    return <NoteKindMark className="substrate-chip" kind={stringField("note_kind", "kind") ?? "note"} />;
+  }
+  return <RelationMark className="substrate-chip edge" relation={stringField("relation") ?? "edge"} />;
 }
 
 function CoreReviewStudio({
@@ -825,7 +1087,7 @@ function CoreReviewStudio({
                     <div className="change-summary core-operation-summary">
                       <span className="change-sign">{operation.index + 1}</span>
                       <div className="change-title"><strong>{operation.summary}</strong><span>{operation.reason}</span></div>
-                      <span className={`substrate-chip ${operation.target}`}>{operation.target}</span>
+                      <OperationOntologyMark operation={operation} />
                       <TierPill tier={operation.tier} />
                     </div>
                     <div className="change-detail core-operation-detail">
@@ -1001,6 +1263,7 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
                 bundle={bundle}
                 query={query}
                 onQuery={setQuery}
+                onImport={() => fileInput.current?.click()}
               />
             </section>
             <ReviewRail

@@ -1,6 +1,7 @@
 //! Warm ANN bridge: wraps `VamanaIndex` per model to cache memory-note vector search.
 //! One index per model covers all namespaces; namespace filtering is applied at recall time.
-//! See `crates/khive-pack-memory/docs/api/ann-lifecycle.md` for lifecycle and race handling.
+//! See `crates/khive-pack-memory/docs/api/ann-lifecycle.md` for lifecycle and race handling,
+//! and `crates/khive-pack-memory/docs/ann.md` for the restart classifier and ADR-118 design.
 
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
@@ -381,26 +382,21 @@ impl AnnBridge {
     }
 
     /// Apply a coalesced final-state tail (ADR-079 Amendment 1) to this
-    /// bridge: `Some(embedding)` replays a final upsert (tombstone the mapped
-    /// old ordinal, then exactly one insert); `None` replays a final delete
-    /// (tombstone if mapped, no-op otherwise). `new_s` is the highest tail
-    /// seq, stamped as the new applied watermark.
-    ///
-    /// A delete whose mapped ordinal has been reassigned by an earlier
-    /// upsert in the same batch is skipped with a warning, not an error:
-    /// the old subject's vector was already tombstoned when the slot was
-    /// reused, so there is nothing left to delete. Any other id-map
-    /// contradiction returns `Err` — the caller escalates to Cold.
+    /// bridge: `Some(embedding)` replays a final upsert; `None` replays a
+    /// final delete. `new_s` is stamped as the new applied watermark. A
+    /// delete whose ordinal was reassigned by an earlier same-batch upsert
+    /// is skipped with a warning, not an error; any other id-map
+    /// contradiction returns `Err` (caller escalates to Cold). See
+    /// `docs/ann.md` for the ownership-rule rationale (#1150).
     pub(crate) fn apply_final_ops(
         &mut self,
         ops: Vec<(Uuid, Option<Vec<f32>>)>,
         new_s: u64,
     ) -> Result<(), String> {
-        // A tombstoned ordinal has no owner (ADR-079 Amendment 1 id-map
-        // ownership rule) — `id_map` entries for already-tombstoned slots
-        // are stale (tombstoning never clears them) and must be excluded
-        // here, or a reused slot's new owner can be tombstoned by a replay
-        // op for the old, already-deleted subject (#1150).
+        // Exclude already-tombstoned slots: `id_map` entries for them are
+        // stale (tombstoning never clears them), and including them lets a
+        // reused slot's new owner be tombstoned by a replay for the old,
+        // already-deleted subject (#1150).
         let mut reverse: HashMap<Uuid, u32> = HashMap::with_capacity(self.index.live_count());
         for (ordinal, uuid) in self.id_map.iter().enumerate() {
             if self.index.is_tombstoned(ordinal as u32) {
@@ -413,10 +409,8 @@ impl AnnBridge {
             match op {
                 None => {
                     if let Some(&ordinal) = reverse.get(&uuid) {
-                        // Fail closed on ownership contradictions: if the
-                        // slot's current id-map owner is no longer this
-                        // subject (a same-batch upsert already reused the
-                        // slot), skip the tombstone rather than delete
+                        // Fail closed: if a same-batch upsert already reused
+                        // this slot, skip the tombstone instead of deleting
                         // someone else's live vector.
                         if self.id_map.get(ordinal as usize) != Some(&uuid) {
                             tracing::warn!(
@@ -463,11 +457,10 @@ impl AnnBridge {
         Ok(())
     }
 
-    /// Save this bridge to `dir` atomically: v2 Vamana segments (the commit
-    /// record is the gate), then the id-map sidecar bound to the blake3 digest
-    /// of the just-committed record. A crash between the two writes leaves the
-    /// sidecar's stored digest mismatched against the on-disk commit record,
-    /// which `load` detects as a torn pair.
+    /// Save this bridge to `dir` atomically: v2 Vamana segments (commit
+    /// record is the gate), then the id-map sidecar bound to the blake3
+    /// digest of that record. A crash between the two writes leaves a
+    /// digest mismatch that `load` detects as a torn pair.
     pub(crate) fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
         let count = self.id_map.len();
         if count != self.index.num_vectors() {
@@ -672,7 +665,11 @@ pub(crate) async fn ensure_ann_background(
     ann: &SharedAnn,
     model: &str,
 ) -> bool {
-    if model.is_empty() {
+    // Request-time recall and mutation hooks share this entry point with
+    // daemon warm. A snapshot may use an already-loaded bridge or the exact
+    // sqlite-vec fallback, but it must never enqueue registration,
+    // checkpoint, or compaction work against its read-only backend.
+    if rt.is_read_only() || model.is_empty() {
         return false;
     }
     let key = AnnKey::from_token(model);
@@ -826,12 +823,9 @@ pub(crate) async fn ensure_ann_for_model(
     }
     let key = AnnKey::from_token(model);
 
-    // Cross-process registry state is checked before the in-memory fast path.
-    // A pending row can be retired by a peer compactor; after that point an
-    // already-loaded bridge is no longer protected by a complete write-log
-    // tail and must not be served.  Pending (`-2`) likewise means no first
-    // checkpoint has ever activated this registration, so this process joins
-    // the full-rebuild path instead of trusting a persisted or cached bridge.
+    // Cross-process registry state is checked before the in-memory fast
+    // path: a peer compactor can retire a pending row, after which an
+    // already-loaded bridge is no longer protected and must not be served.
     let mut force_full_rebuild = match read_own_watermark(rt, model).await {
         Ok(Some(watermark)) if watermark >= 0 => false,
         Ok(Some(PENDING_WATERMARK)) => {
@@ -1145,13 +1139,10 @@ async fn compute_memory_fingerprint(
     })
 }
 
-/// Build a graph from live model vectors, capturing both the retained-log high
-/// water and this consumer's nonnegative active floor in the same statement —
-/// and therefore the same SQLite read snapshot — as the corpus rows (ADR-079
-/// Amendment 1: watermark capture and corpus read are linearized). The active
-/// floor preserves monotonic publication after compaction removes the retained
-/// prefix. The corpus predicate is global-scope and join-filtered: every
-/// namespace, live notes only.
+/// Build a graph from live model vectors, capturing the corpus watermark in
+/// the same statement as the scan (ADR-079 Amendment 1 linearization; see
+/// `docs/api/ann-lifecycle.md`). Global-scope, join-filtered: every namespace,
+/// live notes only.
 async fn load_and_build_from_vector_store(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1267,12 +1258,9 @@ async fn load_and_build_from_vector_store(
 
 // ── ADR-079 Amendment 1: segments, registry, classifier (global scope) ────────
 
-/// Filesystem directory for v2 Vamana segment files for this consumer's
-/// global-scope index for `model`: `<db-file>.ann/<hex(snapshot_key)>`, rooted
-/// beside the backing database file so co-located databases can never adopt
-/// each other's segments. The `memory_vamana` marker in the key keeps memory
-/// segment dirs disjoint from knowledge's `{ns}::vamana::{model}` dirs.
-/// `None` for in-memory backends.
+/// Global-scope v2 segment directory for `model`: `<db-file>.ann/<hex(snapshot_key)>`
+/// (see `docs/api/ann-lifecycle.md` for the segment-root layout). `None` for
+/// in-memory backends.
 fn ann_segment_dir(rt: &KhiveRuntime, model: &str) -> Option<std::path::PathBuf> {
     let ann_root = rt.backend_ann_root()?;
     let key = snapshot_key("global", model);
@@ -1308,14 +1296,9 @@ async fn acquire_bridge_checkpoint_lock_async(
         .map_err(|error| format!("memory ANN lock task failed: {error}"))?
 }
 
-/// Install `candidate`, replacing an equal-generation incumbent but never a
-/// strictly newer one. All install sites run under the single-flight model
-/// lock, so an equal generation means an ordered step within one warm task
-/// (mmap reopen of the just-persisted build, or a completed rebuild replacing
-/// the served stale segment) — the later product is always the right one to
-/// keep. A strictly newer incumbent means a fresher build already landed and
-/// must survive a slow candidate finishing late.
-/// Returns whether `candidate` became the installed bridge.
+/// Install `candidate`, replacing an equal-or-newer-generation incumbent but
+/// never a strictly newer one (see `docs/api/ann-lifecycle.md` for why equal
+/// generations still replace). Returns whether `candidate` was installed.
 async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) -> bool {
     match ann.indexes.write().await.entry(key.clone()) {
         std::collections::hash_map::Entry::Occupied(mut e)
@@ -1368,12 +1351,9 @@ fn ann_rebuild_threshold() -> f64 {
 async fn register_consumer(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
     let sql = rt.sql();
     if ann_segment_dir(rt, model).is_none() {
-        // `SqlBridge::atomic_unit` cannot keep its manual transaction pinned
-        // across calls on an in-memory pool: each PoolBackedWriter operation
-        // checks the one shared connection back out independently. A
-        // background warm could therefore leave `BEGIN IMMEDIATE` visible to
-        // an overlapping remember. Pathless runtimes have no durable consumer
-        // to age-retire, so the single-statement pending fence is sufficient.
+        // Pooled in-memory writers can't hold a manual transaction across
+        // calls, so this stays a single statement; pathless runtimes have no
+        // durable consumer to age-retire, so that's sufficient here.
         let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
         writer
             .execute(SqlStatement {
@@ -1490,12 +1470,10 @@ async fn raise_watermark(rt: &KhiveRuntime, model: &str, s: u64) -> Result<(), S
     raise_watermark_with_authority(rt, model, s, WatermarkAuthority::Active).await
 }
 
-/// Compact the write log for `model` across every namespace this global
-/// consumer's checkpoint just covered, each namespace bounded by its own
-/// wildcard-inclusive registry minimum (ADR-079 Amendment 1 §A step 3,
-/// universal form; correlated because per-namespace consumers may hold
-/// different minima). The subquery yields NULL for a namespace with no
-/// registered rows, and `seq <= NULL` matches nothing.
+/// Compact the write log for `model` across every namespace, each bounded by
+/// its own wildcard-inclusive registry minimum (ADR-079 Amendment 1 §A step
+/// 3). A namespace with no registered rows yields `seq <= NULL`, which
+/// matches nothing.
 async fn compact_log(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
     let sql = rt.sql();
     if ann_segment_dir(rt, model).is_none() {
@@ -1569,11 +1547,9 @@ async fn scope_counts(rt: &KhiveRuntime, model: &str, s: u64) -> Result<(u64, u6
     Ok((get("live")?, get("tail")?))
 }
 
-/// Log-table-only probe: does any write-log row exist above `s` for this
-/// consumer's scope? Touches no corpus table, so the Hot path (empty tail)
-/// adopts with zero corpus I/O (ADR-079 Amendment 1, rule 5/6 evaluation
-/// order: with an empty tail the committed segment reflects every op ≤ S, so
-/// adoption serves exactly what Empty would serve even when live = 0).
+/// Log-table-only probe: does any write-log row exist above `s`? Touches no
+/// corpus table, so the Hot path (empty tail) adopts with zero corpus I/O
+/// (ADR-079 Amendment 1 restart classifier, rule 6; see `docs/ann.md`).
 async fn tail_exists(rt: &KhiveRuntime, model: &str, s: u64) -> Result<bool, String> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
@@ -1599,13 +1575,12 @@ async fn tail_exists(rt: &KhiveRuntime, model: &str, s: u64) -> Result<bool, Str
 }
 
 /// Fetch the scope's tail (rows above `s`, all namespaces, ordered), coalesce
-/// to the final op per subject, and point-read embeddings for final upserts.
-/// Two distinct outcomes for a final upsert (ADR-079 Amendment 1,
-/// join-filtered corpora): a vec row that is absent or out of scope
-/// contradicts the committed log (same-transaction writes) → `Err` → Cold;
-/// a row that is present but whose note fails the join predicate
-/// (soft-deleted, or gone) replays as a delete — its final corpus state is
-/// absence. Returns the ops and the new watermark.
+/// to the final op per subject, and hydrate embeddings for final upserts. A
+/// missing vector row is a log/corpus contradiction (`Err` → Cold); a present
+/// row whose note fails the join predicate replays as a delete (see
+/// `docs/ann.md` for the full replay-outcome table). One statement is the
+/// snapshot boundary, including for pool-backed readers. Returns the ops and
+/// the new watermark.
 pub(crate) async fn fetch_final_tail(
     rt: &KhiveRuntime,
     model: &str,
@@ -1617,33 +1592,29 @@ pub(crate) async fn fetch_final_tail(
     fetch_final_tail_on(reader.as_mut(), model, s, live_threshold).await
 }
 
-/// Same as [`fetch_final_tail`] but runs every read through a caller-supplied
-/// reader instead of acquiring its own connection — used by the ADR-118 §1
-/// "Compaction linearization" fix to keep the registry-minimum guard and this
-/// scan inside one read snapshot (see [`fresh_tail_serving`]).
+/// Same as [`fetch_final_tail`] but runs its single snapshot statement through
+/// a caller-supplied reader instead of acquiring its own handle. Serving paths
+/// also use this seam while coordinating the ADR-118 §1 registry guard.
 async fn fetch_final_tail_on(
     reader: &mut dyn khive_storage::SqlReader,
     model: &str,
     s: u64,
     live_threshold: Option<f64>,
 ) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
-    // `live_threshold` (ADR-118 §3, Cold/Empty tier): cap the scan to
-    // ceil(threshold × live corpus) newest log rows. The live count and log
-    // suffix are selected by one SQL statement so they describe one snapshot,
-    // matching the knowledge consumer's equivalent fallback. The DESC+LIMIT
-    // rows are reversed below so final-op-per-subject coalescing still sees
-    // ascending sequence order (insert-overwrite = last write wins).
+    // `live_threshold` (ADR-118 §3): caps the scan to ceil(threshold × live
+    // corpus) newest rows in one statement snapshot; the outer ORDER BY
+    // restores ascending order so coalescing stays last-write-wins.
     let table_name = format!("vec_{}", sanitize_model_key(model));
     let (live_cte, order_limit) = match live_threshold {
         Some(_) => (
             format!(
-                "WITH live AS (\
+                "live AS (\
                    SELECT COUNT(*) AS live_count FROM {table_name} v \
                    JOIN notes n ON n.id = v.subject_id \
                    WHERE v.embedding_model = ?1 \
                      AND v.kind = 'note' AND v.field = 'note.content' \
                      AND n.deleted_at IS NULL\
-                 ) "
+                 ), "
             ),
             "ORDER BY seq DESC \
              LIMIT (SELECT CAST(live_count * ?3 AS INTEGER) + \
@@ -1663,24 +1634,40 @@ async fn fetch_final_tail_on(
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "{live_cte}SELECT seq, subject_id, op FROM ann_write_log \
-                  WHERE embedding_model = ?1 \
-                    AND kind = 'note' AND field = 'note.content' AND seq > ?2 \
-                  {order_limit}"
+                "WITH {live_cte}selected AS (\
+                   SELECT seq, subject_id, op FROM ann_write_log \
+                   WHERE embedding_model = ?1 \
+                     AND kind = 'note' AND field = 'note.content' AND seq > ?2 \
+                   {order_limit}\
+                 ) \
+                 SELECT selected.seq, selected.subject_id, selected.op, \
+                        vectors.embedding_model AS vector_model, \
+                        vectors.kind AS vector_kind, \
+                        vectors.field AS vector_field, vectors.embedding, \
+                        live_note.id AS live_note_id \
+                 FROM selected \
+                 LEFT JOIN {table_name} AS vectors \
+                   ON vectors.subject_id = selected.subject_id \
+                 LEFT JOIN notes AS live_note \
+                   ON live_note.id = selected.subject_id \
+                  AND live_note.deleted_at IS NULL \
+                 ORDER BY selected.seq"
             ),
             params,
-            label: Some("memory_ann_fetch_tail".into()),
+            label: Some("memory_ann_fresh_tail_snapshot".into()),
         })
         .await
         .map_err(|e| e.to_string())?;
-    let mut rows = rows;
-    if live_threshold.is_some() {
-        rows.reverse();
-    }
 
     let mut new_s = s;
+    type RawVector = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    );
     // Ordered iteration + insert-overwrite = final op per subject wins.
-    let mut finals: Vec<(Uuid, bool)> = Vec::new();
+    let mut finals: Vec<(Uuid, bool, RawVector, bool)> = Vec::new();
     let mut index_of: HashMap<Uuid, usize> = HashMap::new();
     for row in &rows {
         let seq = match row.get("seq") {
@@ -1698,120 +1685,84 @@ async fn fetch_final_tail_on(
             Some(SqlValue::Text(t)) => t == "delete",
             _ => return Err("ann_write_log.op: unexpected value".into()),
         };
+        let raw_vector = (
+            match row.get("vector_model") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("vector_kind") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("vector_field") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("embedding") {
+                Some(SqlValue::Blob(value)) => Some(value.clone()),
+                _ => None,
+            },
+        );
+        let is_live = matches!(
+            row.get("live_note_id"),
+            Some(SqlValue::Text(id)) if Uuid::parse_str(id).ok() == Some(uuid)
+        );
         match index_of.get(&uuid) {
-            Some(&i) => finals[i].1 = is_delete,
+            Some(&i) => finals[i] = (uuid, is_delete, raw_vector, is_live),
             None => {
                 index_of.insert(uuid, finals.len());
-                finals.push((uuid, is_delete));
-            }
-        }
-    }
-
-    let upsert_ids: Vec<Uuid> = finals
-        .iter()
-        .filter(|(_, is_delete)| !is_delete)
-        .map(|(u, _)| *u)
-        .collect();
-
-    // Per-subject point reads: the vec0 vtable plans a point lookup only for a
-    // single PRIMARY KEY equality constraint — an `IN (...)` batch or any extra
-    // predicate degrades to a full scan. Scope is therefore checked in Rust.
-    // A vec row that is absent, or present but out of this consumer's scope,
-    // contradicts the log's committed final upsert (vec writes and log appends
-    // are same-transaction) → Err, which the caller treats as Cold.
-    let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::with_capacity(upsert_ids.len());
-    for subject in &upsert_ids {
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: format!(
-                    "SELECT embedding_model, kind, field, embedding \
-                     FROM {table_name} WHERE subject_id = ?1"
-                ),
-                params: vec![SqlValue::Text(subject.to_string())],
-                label: Some("memory_ann_tail_point_read".into()),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        let Some(row) = rows.first() else {
-            return Err(format!(
-                "tail upsert {subject}: vector row absent (log/corpus contradiction)"
-            ));
-        };
-        let in_scope = matches!(row.get("embedding_model"), Some(SqlValue::Text(m)) if m == model)
-            && matches!(row.get("kind"), Some(SqlValue::Text(k)) if k == "note")
-            && matches!(row.get("field"), Some(SqlValue::Text(f)) if f == "note.content");
-        if !in_scope {
-            return Err(format!(
-                "tail upsert {subject}: vector row out of consumer scope (log/corpus contradiction)"
-            ));
-        }
-        let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
-            return Err(format!("tail upsert {subject}: embedding is not a blob"));
-        };
-        let vec: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        embeddings.insert(*subject, vec);
-    }
-
-    // Join-predicate check on the regular notes table (batched IN is fine
-    // there). A subject whose vec row exists but whose note fails the
-    // join-filtered corpus predicate (soft-deleted, or gone) is not a
-    // contradiction: its final corpus state is absence → replay as delete
-    // (ADR-079 Amendment 1, join-filtered corpora).
-    let mut live_notes: HashSet<Uuid> = HashSet::with_capacity(upsert_ids.len());
-    for chunk in upsert_ids.chunks(500) {
-        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
-        let params: Vec<SqlValue> = chunk
-            .iter()
-            .map(|u| SqlValue::Text(u.to_string()))
-            .collect();
-        let rows = reader
-            .query_all(SqlStatement {
-                sql: format!(
-                    "SELECT id FROM notes WHERE deleted_at IS NULL AND id IN ({})",
-                    placeholders.join(", ")
-                ),
-                params,
-                label: Some("memory_ann_tail_live_notes".into()),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        for row in &rows {
-            if let Some(SqlValue::Text(id_str)) = row.get("id") {
-                if let Ok(uuid) = Uuid::parse_str(id_str) {
-                    live_notes.insert(uuid);
-                }
+                finals.push((uuid, is_delete, raw_vector, is_live));
             }
         }
     }
 
     let mut ops: Vec<(Uuid, Option<Vec<f32>>)> = Vec::with_capacity(finals.len());
-    for (uuid, is_delete) in finals {
+    for (subject, is_delete, (vector_model, vector_kind, vector_field, embedding), is_live) in
+        finals
+    {
         if is_delete {
-            ops.push((uuid, None));
-        } else if live_notes.contains(&uuid) {
-            let embedding = embeddings
-                .remove(&uuid)
-                .ok_or_else(|| format!("tail upsert {uuid}: embedding vanished mid-replay"))?;
-            ops.push((uuid, Some(embedding)));
+            ops.push((subject, None));
+            continue;
+        }
+        // A vec row that is absent or outside this consumer's scope
+        // contradicts the committed upsert. The LEFT JOIN keeps that absence
+        // visible to this check instead of silently dropping the log row.
+        if vector_model.is_none()
+            && vector_kind.is_none()
+            && vector_field.is_none()
+            && embedding.is_none()
+        {
+            return Err(format!(
+                "tail upsert {subject}: vector row absent (log/corpus contradiction)"
+            ));
+        }
+        let in_scope = vector_model.as_deref() == Some(model)
+            && vector_kind.as_deref() == Some("note")
+            && vector_field.as_deref() == Some("note.content");
+        if !in_scope {
+            return Err(format!(
+                "tail upsert {subject}: vector row out of consumer scope (log/corpus contradiction)"
+            ));
+        }
+        let Some(bytes) = embedding else {
+            return Err(format!("tail upsert {subject}: embedding is not a blob"));
+        };
+        let vector: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        if is_live {
+            ops.push((subject, Some(vector)));
         } else {
-            ops.push((uuid, None));
+            // A vector whose note is soft-deleted or gone is a valid
+            // join-filtered absence, represented as a delete in the replay.
+            ops.push((subject, None));
         }
     }
     Ok((ops, new_s))
 }
 
 // ── ADR-118: fresh-tail exact leg (read-your-writes recall visibility) ─────────
-
-/// `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg (default enabled). Any
-/// other value, including unset, leaves it enabled.
-fn fresh_tail_enabled() -> bool {
-    std::env::var("KHIVE_ANN_FRESH_TAIL")
-        .map(|v| v != "0")
-        .unwrap_or(true)
-}
 
 /// Read the currently-installed bridge's fresh-tail watermark for `key`: the
 /// `ann_write_log` seq its corpus state reflects, or `None` if no bridge is
@@ -1826,11 +1777,9 @@ pub(crate) async fn bridge_applied_seq(ann: &SharedAnn, key: &AnnKey) -> Option<
         .map(|b| b.index.last_applied_seq().unwrap_or(0))
 }
 
-/// The pair's wildcard-inclusive registry minimum (ADR-118 §1 "Compaction
-/// linearization"): the same subselect `compact_log` uses to bound deletion,
-/// evaluated at this consumer's own registered namespace (`'*'`). If this
-/// exceeds a bridge's watermark, the log may no longer retain every row
-/// above that watermark — completeness above it is unprovable.
+/// The wildcard-inclusive registry minimum (ADR-118 §1 "Compaction
+/// linearization"; see `docs/ann.md`): the same bound `compact_log` uses. If
+/// this exceeds a bridge's watermark, completeness above it is unprovable.
 async fn registry_min_watermark_on(
     reader: &mut dyn khive_storage::SqlReader,
     model: &str,
@@ -1854,12 +1803,10 @@ async fn registry_min_watermark_on(
     }))
 }
 
-/// Open an explicit read transaction so every subsequent query through
-/// `reader` observes one consistent snapshot (ADR-118 §1 "Compaction
-/// linearization") instead of each `query_all` call taking its own implicit
-/// per-statement snapshot (the default for a connection with no open
-/// transaction). `BEGIN DEFERRED` is valid on a read-only connection: it
-/// starts a read transaction, not a write.
+/// Open an explicit read transaction so a reader keeps one connection across
+/// calls (ADR-118 §1). Load-bearing corpus hydration still uses one
+/// statement (see [`fetch_final_tail_on`]) since a pool-backed reader may
+/// reacquire a connection per call. `BEGIN DEFERRED` is valid read-only.
 async fn begin_read_snapshot(reader: &mut dyn khive_storage::SqlReader) -> Result<(), String> {
     reader
         .query_all(SqlStatement {
@@ -1904,13 +1851,10 @@ pub(crate) fn exact_cosine(query: &[f32], embedding: &[f32]) -> f32 {
         .max(0.0)
 }
 
-/// Merge a fresh-tail's coalesced final ops into an existing ANN candidate
-/// list (ADR-118 §2): deduplicated by `subject_id` with the tail winning
-/// (its embedding is at least as fresh as the segment's), then re-sorted by
-/// score. A `None` op (final delete) drops the subject from the merged list
-/// even if it was present in `best_raw` — the tail is authoritative for
-/// every subject it names. An empty `ops` returns `best_raw` unchanged, so
-/// fusion is byte-identical whenever there is nothing to merge.
+/// Merge a fresh-tail's coalesced final ops into an ANN candidate list
+/// (ADR-118 §2): deduplicated by `subject_id` with the tail winning, then
+/// re-sorted by score. A `None` op (delete) drops the subject even if it was
+/// in `best_raw` — the tail is authoritative for every subject it names.
 pub(crate) fn merge_fresh_tail(
     best_raw: Vec<(Uuid, f32)>,
     query: &[f32],
@@ -1940,14 +1884,10 @@ pub(crate) fn merge_fresh_tail(
     merged
 }
 
-/// Fold a [`FreshTailOutcome`] into the candidate set a recall handler will
-/// serve, plus the degradation disclosure the caller owes when fresh-tail
-/// visibility was lost. `Ops` merges into `prior` with no disclosure;
-/// `Replace` swaps the candidate set and discloses only when the re-resolved
-/// tail could not be assembled; `Skipped` keeps `prior` and always
-/// discloses. Every recall path that consumes an outcome goes through this
-/// single mapping so no exceptional class can be silently treated as
-/// healthy.
+/// Fold a [`FreshTailOutcome`] into the candidates a recall handler serves
+/// plus the degradation disclosure it owes the caller. Every recall path
+/// goes through this single mapping so no exceptional class is silently
+/// treated as healthy; see `docs/ann.md` for the per-variant disclosure rule.
 pub(crate) fn outcome_into_candidates(
     outcome: FreshTailOutcome,
     prior: Vec<(Uuid, f32)>,
@@ -1960,45 +1900,30 @@ pub(crate) fn outcome_into_candidates(
     }
 }
 
-/// Outcome of [`fresh_tail_leg`].
+/// Outcome of [`fresh_tail_leg`]. Full semantics and the disclosure contract
+/// for each variant: `docs/ann.md`.
 pub(crate) enum FreshTailOutcome {
-    /// Coalesced final tail ops (ADR-118 §1/§2), valid against the
-    /// candidate list the caller already has (`best_raw` unchanged) — merge
-    /// via [`merge_fresh_tail`]. The common case.
+    /// Coalesced final tail ops, valid against the caller's existing
+    /// candidates (`best_raw` unchanged) — merge via [`merge_fresh_tail`].
+    /// The common case.
     Ops(Vec<(Uuid, Option<Vec<f32>>)>),
-    /// A compaction mismatch forced re-resolution to the currently published
-    /// segment (ADR-118 §1 "mismatch re-resolution"): these candidates
-    /// REPLACE the caller's `best_raw` outright — they are already a
-    /// self-consistent (new candidates, new watermark) pair, exact-scored
-    /// against that segment's own tail. Never merge them with the stale set.
-    ///
-    /// The second field is `Some(reason)` when the re-resolved candidates
-    /// are served WITHOUT their fresh-tail merge (reader/snapshot/registry
-    /// or tail-fetch failure after re-resolution): the candidate set is
-    /// still coherent, but read-your-writes visibility was lost, and the
-    /// caller must disclose that. `None` means the full re-resolved
-    /// (candidates, tail) pair was assembled — no degradation. Same
-    /// diagnostic-text contract as [`FreshTailOutcome::Skipped`].
+    /// A compaction mismatch forced re-resolution: these candidates REPLACE
+    /// `best_raw` outright (never merge them with the stale set). `Some(reason)`
+    /// discloses when read-your-writes visibility was lost after
+    /// re-resolution; `None` means the full pair was assembled.
     Replace(Vec<(Uuid, f32)>, Option<&'static str>),
-    /// The leg sat out this query entirely (disabled, unregistered
-    /// consumer, or an unrecoverable read failure); the caller's candidates
-    /// are unaffected. The payload is a non-empty, failure-site diagnostic
-    /// identifying which exceptional class caused the skip — diagnostic
-    /// text for degraded-response disclosure, not a stable public enum;
+    /// The leg sat out this query entirely; the caller's candidates are
+    /// unaffected. The payload is a non-empty failure-site diagnostic —
     /// callers may depend on its presence, not its exact wording.
     Skipped(&'static str),
 }
 
-/// The ADR-118 fresh-tail exact leg. `s = Some(watermark)` is the first
-/// (and primary) tier: a serving bridge exists, and every committed write
-/// above its watermark is merged in, giving read-your-writes visibility.
-/// `s = None` is the second tier (§3): no serving index is available at all,
-/// so the leg caps its scan at a corpus-relative newest suffix of the log
-/// instead of the entire scope, guaranteeing visibility of only the caller's
-/// most recent writes until a serving index exists again.
-/// `query`/`k` are the recall vector and fetch limit — needed only by the
-/// serving tier's mismatch re-resolution path, which must run a fresh ANN
-/// search against a newly loaded segment.
+/// The ADR-118 fresh-tail exact leg, giving read-your-writes visibility.
+/// `s = Some(watermark)` is the primary tier: merges every committed write
+/// above the serving bridge's watermark. `s = None` is the no-index tier
+/// (§3): caps the scan at a corpus-relative newest suffix instead of the
+/// full scope. `query`/`k` serve only the primary tier's mismatch
+/// re-resolution path. See `docs/ann.md` for both tiers in full.
 pub(crate) async fn fresh_tail_leg(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -2017,12 +1942,9 @@ pub(crate) async fn fresh_tail_leg(
         && ann_segment_dir(rt, model).is_none()
         && matches!(registry_state, Ok(Some(PENDING_WATERMARK)))
     {
-        // A pathless first checkpoint replaces the in-process bridge before
-        // activating its pending row. If this query observes that publication
-        // window, wait for the same per-model lock held by the checkpoint and
-        // then revalidate. Otherwise the closed-state guard could evict the
-        // just-built bridge between install and activation, leaving the
-        // successfully activated consumer with no serving index.
+        // Wait out the pathless install-before-activation window (see
+        // `docs/ann.md`) and revalidate, or the closed-state guard below
+        // could evict a just-built, about-to-activate bridge.
         let lock = model_warm_lock(ann, key).await;
         #[cfg(test)]
         ann.pathless_pending_publication_wait.notify_one();
@@ -2063,8 +1985,10 @@ pub(crate) async fn fresh_tail_leg(
         }
     }
 
-    if !fresh_tail_enabled() {
-        return FreshTailOutcome::Skipped("fresh-tail leg disabled via KHIVE_ANN_FRESH_TAIL");
+    if !rt.ann_fresh_tail_enabled() {
+        return FreshTailOutcome::Skipped(
+            "fresh-tail leg disabled by runtime policy (KHIVE_ANN_FRESH_TAIL is sampled at construction)",
+        );
     }
 
     match s {
@@ -2074,9 +1998,8 @@ pub(crate) async fn fresh_tail_leg(
 }
 
 /// Tier 1: a serving bridge exists at watermark `s`. The registry-minimum
-/// guard, the tail scan, and the tail's embedding point-reads run inside ONE
-/// read transaction (ADR-118 §1 "Compaction linearization") so compaction
-/// cannot strike between the guard and the fetch it is meant to justify.
+/// guard and tail statement share one read transaction (ADR-118 §1
+/// "Compaction linearization"; see `docs/ann.md`).
 async fn fresh_tail_serving(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -2107,18 +2030,15 @@ async fn fresh_tail_serving(
         }
     };
 
-    // Negative minima are closed states which block compaction below every
-    // real log sequence. They cannot indicate that compaction outran `s` and
-    // must never be lossily cast to a huge u64 floor.
+    // Negative (closed-state) minima must never be lossily cast to a huge
+    // u64 floor — they cannot indicate that compaction outran `s`.
     if let Some(m) = registry_min.and_then(|value| u64::try_from(value).ok()) {
         if m > s {
             if ann_segment_dir(rt, model).is_none() {
-                // A pathless checkpoint installs its bridge before raising
-                // and compacting. A recall may nevertheless have captured
-                // the old bridge just before that swap. Re-resolve against
-                // the currently installed bridge while this SQL snapshot
-                // pins the observed registry/log state, then replace (never
-                // merge with) the stale candidates captured by the caller.
+                // Pathless mismatch (docs/ann.md): re-resolve against the
+                // currently installed bridge under this snapshot's pinned
+                // registry/log state, then replace (never merge) the stale
+                // candidates the caller captured.
                 let resolved = search_loaded_with_seq(ann, key, query, k).await;
                 let outcome = match resolved {
                     Ok(Some((candidates, resolved_s))) if resolved_s >= m => {
@@ -2163,27 +2083,23 @@ async fn fresh_tail_serving(
             }
 
             // Mismatch (ADR-118 §1): the log may no longer retain every row
-            // above `s`. Real re-resolution needs no DB read (a filesystem
-            // commit-record read), so it can be checked before deciding
-            // whether the floor fallback needs this same snapshot.
+            // above `s`. A filesystem commit-record read (no DB access)
+            // decides whether re-resolution is possible before this
+            // snapshot's floor fallback is needed.
             let resolved_new_s = ann_segment_dir(rt, model)
                 .and_then(|dir| read_commit_info(&dir).ok().flatten())
                 .and_then(|info| info.last_applied_seq)
                 .filter(|new_s| *new_s >= m);
             return match resolved_new_s {
                 Some(new_s) => {
-                    // Re-resolution is possible: this snapshot's floor fetch
-                    // is not needed. Close it and read fresh, self-consistent
-                    // state anchored at the re-resolved segment instead.
                     end_read_snapshot(reader.as_mut()).await;
                     drop(reader);
                     fresh_tail_reresolve(rt, ann, key, model, query, k, new_s).await
                 }
                 None => {
-                    // Re-resolution genuinely not possible within this
-                    // query: floor at the same-snapshot registry minimum
-                    // rather than dropping the leg (ADR-118 §1) — a
-                    // coherent (old candidates, registry minimum) pair.
+                    // Re-resolution isn't possible: floor at the
+                    // same-snapshot registry minimum instead of dropping the
+                    // leg — a coherent (old candidates, registry minimum) pair.
                     let outcome = fetch_final_tail_on(reader.as_mut(), model, m, None).await;
                     end_read_snapshot(reader.as_mut()).await;
                     // Force re-adoption so a future query gets a fresh bridge.
@@ -2211,39 +2127,18 @@ async fn fresh_tail_serving(
     }
 }
 
-/// Bound on the re-resolution convergence loop below. Compaction through a
-/// registry minimum implies every registered watermark — including this
-/// consumer's own — is at or above it, so the currently published segment
-/// is always re-available at (or past) a newly observed minimum: reloading
-/// it converges. Three peers landing a checkpoint back-to-back inside a
-/// single query's read window would be pathological; the bound exists so a
-/// pathological run degrades to the ADR's floored fallback instead of
-/// looping unboundedly.
+/// Bound on the re-resolution convergence loop below; three back-to-back peer
+/// checkpoints inside one query's read window would be pathological. See
+/// `docs/ann.md` for the convergence argument.
 const FRESH_TAIL_RERESOLVE_MAX_ROUNDS: u32 = 3;
 
-/// Real mismatch re-resolution (ADR-118 §1 "mismatch re-resolution"): load
-/// the currently published segment, search IT for candidates, and merge in
-/// ITS own tail above ITS own watermark — a self-consistent pair that never
-/// borrows a newer watermark while serving older (stale-bridge) candidates.
-/// This load is local to the query (not installed into `ann`'s served map);
-/// `bump_generation` still forces the existing background machinery to
-/// adopt this segment for future queries.
-///
-/// A peer checkpoint can advance the registry minimum past the just-loaded
-/// segment's own watermark in the window between the load and the
-/// re-validation read below — the same compaction race the primary path
-/// (`fresh_tail_serving`) already guards against for its own tail fetch.
-/// Unlike that primary-path guard, this one can *reload*: the segment this
-/// function loads is always the currently published one, and compaction
-/// through a minimum M implies the published segment already covers M (see
-/// [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`]). So a mismatch here re-loops instead
-/// of immediately falling back to a floored scan — flooring on the first
-/// mismatch would leave the (old watermark, new minimum] window in neither
-/// the (stale) candidate set nor the (floored) tail, silently dropping
-/// committed writes. Only [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`] consecutive
-/// mismatches — peers advancing the minimum faster than this leg can load a
-/// segment for it, which should not happen at normal checkpoint cadence —
-/// fall back to that floor.
+/// Real mismatch re-resolution (ADR-118 §1): load the currently published
+/// segment, search it, and merge in its own tail above its own watermark — a
+/// self-consistent pair that never borrows a newer watermark while serving
+/// stale-bridge candidates. Reloads on a further mismatch instead of
+/// immediately flooring, up to [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`]; see
+/// `docs/ann.md` for why that reload converges and why flooring immediately
+/// would silently drop committed writes.
 async fn fresh_tail_reresolve(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -2278,8 +2173,8 @@ async fn fresh_tail_reresolve(
                 return FreshTailOutcome::Skipped("fresh-tail: re-resolved segment search failed");
             }
         };
-        // Force re-adoption so the background warm path installs this segment
-        // for future queries too — this load served only the current query.
+        // This load served only the current query; force re-adoption so the
+        // background warm path installs it for future ones too.
         bump_generation(ann, key).await;
 
         #[cfg(test)]
@@ -2293,14 +2188,9 @@ async fn fresh_tail_reresolve(
             }
         }
 
-        // The filesystem commit-info read that produced this segment and
-        // the tail scan below are not otherwise ordered against a
-        // concurrent checkpoint: a peer can raise the registry watermark
-        // past `s_loaded` and compact the now-covered log rows in between,
-        // silently dropping a committed write from a `> s_loaded` scan.
         // Re-validate the registry minimum and run the tail scan inside one
-        // snapshot so no compaction can strike between the guard and the
-        // fetch.
+        // snapshot so a concurrent checkpoint can't compact past `s_loaded`
+        // between the load above and this fetch (docs/ann.md).
         let mut reader = match rt.sql().reader().await {
             Ok(r) => r,
             Err(e) => {
@@ -2357,13 +2247,9 @@ async fn fresh_tail_reresolve(
         let m = registry_min.expect("coherent=false implies registry_min is Some");
 
         if round == FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
-            // ADR-118 §1 terminal mismatch-window branch: peers advanced
-            // the registry minimum faster than this leg could converge on
-            // a published segment for it. Serve the last loaded candidates
-            // with the scan floored at the last observed minimum — a
-            // coherent (these candidates, this floor) pair, at the cost of
-            // the (s_loaded, m] window not being provably retained in the
-            // log — and force re-adoption so a future query closes it.
+            // Terminal round (ADR-118 §1): serve the last loaded candidates
+            // floored at the last observed minimum — coherent, at the cost
+            // of the (s_loaded, m] window not being provably retained.
             tracing::warn!(
                 model,
                 rounds = round,
@@ -2397,8 +2283,9 @@ async fn fresh_tail_reresolve(
 
 /// Tier 2 (§3): no serving index at all. A cheap, log-only existence probe
 /// (no corpus join) fast-paths the common empty-tail case; a non-empty tail
-/// is capped at ceil(`ann_rebuild_threshold() * live corpus`) rows. The live
-/// count and selected newest suffix share one SQL statement/snapshot.
+/// is capped at ceil(`ann_rebuild_threshold() * live corpus`) rows. After the
+/// probe, one statement/snapshot computes that live count, selects the newest
+/// suffix, and hydrates its current vectors and note liveness.
 async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
     fresh_tail_capped_at_threshold(rt, model, ann_rebuild_threshold()).await
 }
@@ -2432,16 +2319,12 @@ struct CheckpointPublication {
     authority: WatermarkAuthority,
 }
 
-/// Persist `bridge` at its applied watermark, raise the wildcard registry row,
-/// compact the log across namespaces, then reopen the just-written segment via
-/// the mmap load path and swap it in for the Owned build product (ADR-079
-/// Amendment 1 §B). Pending registration precedes the full scan (§A step 1).
-/// A failed persistence or fenced watermark publication never installs the
-/// candidate; a reopen failure after a successful publication may serve the
-/// equivalent Owned bridge. In-memory backends install the Owned candidate
-/// before raising/compacting: the registry guard rejects it while pending,
-/// and that ordering ensures no old bridge remains observable after the
-/// watermark advances and its intervening tail can be deleted.
+/// Persist `bridge`, raise the wildcard registry row, compact the log, then
+/// reopen the just-written segment via mmap and swap it in for the Owned
+/// build product (ADR-079 Amendment 1 §B; see `docs/ann.md`). A failed
+/// persistence or fenced publication never installs the candidate.
+/// In-memory backends install the Owned candidate before raising/compacting
+/// instead, since they have no segment to reopen.
 async fn checkpoint_raise_compact_readopt(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -2461,11 +2344,9 @@ async fn checkpoint_raise_compact_readopt(
         |b: AnnBridge| -> AnnBridge { b.with_generation(generation).with_epoch_baseline(epoch) };
 
     let Some(dir) = ann_segment_dir(rt, model) else {
-        // There is no filesystem commit record a concurrent recall could use
-        // to re-resolve a bridge/watermark mismatch. Publish the replacement
-        // bridge first; until the conditional raise succeeds, fresh-tail's
-        // durable registry check rejects and evicts it. If retirement won,
-        // this task likewise evicts before returning.
+        // No filesystem commit record exists to re-resolve against, so
+        // publish the bridge first; fresh-tail's registry check rejects and
+        // evicts it until the conditional raise below succeeds.
         if !install_replacing(ann, key, stamp(bridge)).await {
             // A post-scan generation already installed something newer. Do
             // not advance the registry past log rows that rejected candidate
@@ -2568,10 +2449,9 @@ enum SegmentOutcome {
     Cold,
 }
 
-/// ADR-079 Amendment 1 restart classifier (the 8-rule first-match decision
-/// table) for the memory pack's global-scope note index, followed by the
-/// matching adoption action. Replaces the retired JSON-snapshot
-/// content-hash gate.
+/// ADR-079 Amendment 1 restart classifier: the 8-rule first-match decision
+/// table for the memory pack's global-scope note index, followed by the
+/// matching adoption action. Full table and rationale: `docs/ann.md`.
 async fn classify_and_adopt_segment(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -2630,13 +2510,10 @@ async fn classify_and_adopt_segment(
         }
     }
 
-    // Rule 6, tested first (ADR-079 Amendment 1, "Evaluation order of rules 5
-    // and 6"): no tail above S → Hot: mmap load with zero corpus I/O. The
-    // probe touches only the log table; with an empty tail the committed
-    // segment reflects every op ≤ S, so live = 0 would imply an empty segment
-    // and adoption serves exactly what Empty serves. The namespace set stays
-    // empty — the documented conservative default (recall assumes non-visible
-    // namespaces may exist) — rather than paying an O(N) DISTINCT corpus scan.
+    // Rule 6, tested before rule 5 (docs/ann.md: "Evaluation order of rules
+    // 5 and 6"): no tail above S → Hot, mmap load with zero corpus I/O. The
+    // namespace set stays empty (conservative default) rather than paying an
+    // O(N) DISTINCT corpus scan.
     match tail_exists(rt, model, s).await {
         Ok(false) => {
             return match AnnBridge::load(seg_dir) {
@@ -2747,13 +2624,147 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    struct InterleavingTailReader {
+        subject: Uuid,
+        calls: Vec<String>,
+    }
+
+    impl InterleavingTailReader {
+        fn row(columns: Vec<(&str, SqlValue)>) -> khive_storage::SqlRow {
+            khive_storage::SqlRow {
+                columns: columns
+                    .into_iter()
+                    .map(|(name, value)| khive_storage::types::SqlColumn {
+                        name: name.to_owned(),
+                        value,
+                    })
+                    .collect(),
+            }
+        }
+
+        fn embedding(values: &[f32]) -> SqlValue {
+            SqlValue::Blob(
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for InterleavingTailReader {
+        async fn query_row(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Option<khive_storage::SqlRow>> {
+            panic!("fresh-tail replay must use query_all")
+        }
+
+        async fn query_all(
+            &mut self,
+            statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Vec<khive_storage::SqlRow>> {
+            let label = statement.label.unwrap_or_default();
+            self.calls.push(label.clone());
+            let id = SqlValue::Text(self.subject.to_string());
+            Ok(match label.as_str() {
+                // The coherent snapshot: the suffix and its matching current
+                // vector are both the pre-commit state.
+                "memory_ann_fresh_tail_snapshot" => {
+                    assert!(
+                        statement.sql.contains("COUNT(*) AS live_count"),
+                        "the snapshot statement must derive the corpus-relative cap"
+                    );
+                    assert!(
+                        statement.sql.contains("LIMIT (SELECT"),
+                        "the snapshot statement must apply the derived newest-suffix cap"
+                    );
+                    assert!(
+                        statement.sql.contains("LEFT JOIN vec_snapshot_race_model"),
+                        "the snapshot statement must hydrate the selected suffix's vectors"
+                    );
+                    assert!(
+                        statement.sql.contains("LEFT JOIN notes"),
+                        "the snapshot statement must evaluate note liveness"
+                    );
+                    vec![Self::row(vec![
+                        ("seq", SqlValue::Integer(1)),
+                        ("subject_id", id),
+                        ("op", SqlValue::Text("upsert".into())),
+                        ("vector_model", SqlValue::Text("snapshot-race-model".into())),
+                        ("vector_kind", SqlValue::Text("note".into())),
+                        ("vector_field", SqlValue::Text("note.content".into())),
+                        ("embedding", Self::embedding(&[1.0, 0.0])),
+                        ("live_note_id", SqlValue::Text(self.subject.to_string())),
+                    ])]
+                }
+                // Legacy multi-query behavior: a writer commits immediately
+                // after suffix selection, so the next pooled read observes a
+                // newer vector than the selected log row described.
+                "memory_ann_fetch_tail" => vec![Self::row(vec![
+                    ("seq", SqlValue::Integer(1)),
+                    ("subject_id", id),
+                    ("op", SqlValue::Text("upsert".into())),
+                ])],
+                "memory_ann_tail_point_read" => vec![Self::row(vec![
+                    (
+                        "embedding_model",
+                        SqlValue::Text("snapshot-race-model".into()),
+                    ),
+                    ("kind", SqlValue::Text("note".into())),
+                    ("field", SqlValue::Text("note.content".into())),
+                    ("embedding", Self::embedding(&[0.0, 1.0])),
+                ])],
+                "memory_ann_tail_live_notes" => vec![Self::row(vec![(
+                    "id",
+                    SqlValue::Text(self.subject.to_string()),
+                )])],
+                other => panic!("unexpected fresh-tail query label: {other}"),
+            })
+        }
+
+        async fn query_scalar(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Option<SqlValue>> {
+            panic!("fresh-tail replay must use query_all")
+        }
+
+        async fn explain(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Vec<khive_storage::SqlRow>> {
+            panic!("fresh-tail replay must not issue EXPLAIN")
+        }
+    }
+
+    /// A pool-backed reader must see a racing commit as entirely visible or entirely invisible, never mixed.
+    #[tokio::test]
+    async fn fresh_tail_snapshot_cannot_return_a_torn_log_vector_pair() {
+        let subject = Uuid::new_v4();
+        let mut reader = InterleavingTailReader {
+            subject,
+            calls: Vec::new(),
+        };
+
+        let (ops, watermark) =
+            fetch_final_tail_on(&mut reader, "snapshot-race-model", 0, Some(0.20))
+                .await
+                .expect("fresh-tail snapshot");
+
+        assert_eq!(watermark, 1);
+        assert_eq!(ops, vec![(subject, Some(vec![1.0, 0.0]))]);
+        assert_eq!(
+            reader.calls,
+            vec!["memory_ann_fresh_tail_snapshot"],
+            "one logical no-index replay must execute exactly one SQLite statement"
+        );
+    }
+
     #[test]
     fn outcome_into_candidates_replace_with_reason_discloses_degradation() {
-        // Re-resolution failure classes (reader open, snapshot begin,
-        // registry-min read, tail fetch, floored-fallback tail fetch)
-        // serve coherent candidates but lose read-your-writes visibility:
-        // the mapping must surface the failure-site reason, not report
-        // the response as healthy.
+        // A reasoned Replace must surface its failure-site reason, not report healthy.
         let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
         let replaced = vec![(Uuid::from_u128(2), 0.8_f32)];
         let (candidates, disclosure) = outcome_into_candidates(
@@ -2856,9 +2867,7 @@ mod tests {
         assert!(result.is_err(), "wrong dimension must return Err");
     }
 
-    /// #1150 regression: a tombstoned ordinal's stale id-map entry must not
-    /// let a later replay op for the old (already-deleted) subject tombstone
-    /// the slot a same-batch upsert just reused for a different subject.
+    /// A stale id-map entry must not let a delete replay tombstone a slot a same-batch upsert reused (#1150).
     #[test]
     fn replay_does_not_tombstone_slot_reused_by_same_batch_upsert() {
         let id_a = Uuid::new_v4();
@@ -2988,10 +2997,7 @@ mod tests {
             .with_generation(generation)
     }
 
-    /// A candidate with a STRICTLY OLDER generation than the currently
-    /// installed entry must never replace it. This is the exact shape of
-    /// the pre-#750 bug: a slow build (older generation) finishing after a
-    /// faster, newer-generation build already installed.
+    /// A strictly older generation than the installed entry must never replace it (pre-#750 bug shape).
     #[tokio::test]
     async fn install_replacing_rejects_older_generation_candidate() {
         let ann = new_shared();
@@ -3012,10 +3018,7 @@ mod tests {
         );
     }
 
-    /// Pathless runtimes have no durable commit record from which recall can
-    /// re-resolve a bridge/watermark mismatch. If a post-scan generation has
-    /// already installed a newer bridge, the rejected build must not advance
-    /// its watermark or compact the intervening tail.
+    /// A pathless build rejected by a newer post-scan generation must not advance the watermark or compact the tail.
     #[tokio::test]
     async fn pathless_rejected_candidate_does_not_raise_or_compact() {
         let rt = KhiveRuntime::memory().expect("runtime");
@@ -3094,9 +3097,7 @@ mod tests {
         assert_eq!(bridge.id_map, vec![newer_id]);
     }
 
-    /// A pathless full scan after compaction still covers the compacted
-    /// prefix even though `MAX(ann_write_log.seq)` has fallen back to zero.
-    /// Its bridge and registry publication must retain the active floor.
+    /// A pathless full scan after compaction must retain the active floor even though the log's MAX(seq) reset to zero.
     #[tokio::test]
     async fn pathless_full_checkpoint_inherits_compacted_active_floor() {
         const MODEL: &str = "pathless-compacted-active-floor";
@@ -3180,13 +3181,13 @@ mod tests {
         );
     }
 
-    /// A recall that observes the install-before-activation window must wait
-    /// for the pathless publication lock and revalidate the now-active row,
-    /// not evict the candidate that the checkpoint is about to publish.
+    /// A recall in the pathless install-before-activation window must wait and revalidate, not evict the pending candidate.
     #[tokio::test]
+    #[serial(adr118_fresh_tail)]
     async fn pathless_pending_reader_waits_for_checkpoint_activation() {
         const MODEL: &str = "pathless-pending-publication-wait";
         let rt = KhiveRuntime::memory().expect("runtime");
+        provision_test_vector_store(&rt, MODEL, 4);
         let ann = new_shared();
         let key = AnnKey::new(MODEL);
         register_consumer(&rt, MODEL)
@@ -3239,10 +3240,9 @@ mod tests {
         assert_eq!(bridge.id_map, vec![candidate_id]);
     }
 
-    /// Waiting is not permission to trust a closed candidate: if publication
-    /// loses its registration while the reader is blocked, revalidation must
-    /// still evict and return an empty replacement leg.
+    /// If publication loses its registration while a reader waits, revalidation must still evict and return empty.
     #[tokio::test]
+    #[serial(adr118_fresh_tail)]
     async fn pathless_pending_reader_evicts_after_registration_loss() {
         const MODEL: &str = "pathless-pending-publication-loss";
         let rt = KhiveRuntime::memory().expect("runtime");
@@ -3319,10 +3319,7 @@ mod tests {
         );
     }
 
-    /// A slower process must check the durable watermark while holding the
-    /// cross-process segment lock, before it writes any files. Otherwise it can
-    /// overwrite a newer commit and then lose its conditional registry raise,
-    /// leaving the registry ahead of the segment restart will adopt.
+    /// A slower process must check the durable watermark under the segment lock before writing files, or it can overwrite a newer commit.
     #[tokio::test]
     async fn file_backed_stale_checkpoint_does_not_overwrite_newer_segment() {
         const MODEL: &str = "file-backed-stale-checkpoint";
@@ -3387,8 +3384,7 @@ mod tests {
         );
     }
 
-    /// A failed replacement persist must not discard the still-protected
-    /// incumbent that stale-serving relies on while the retained tail remains.
+    /// A failed replacement persist must not discard the still-protected incumbent while the retained tail remains.
     #[tokio::test]
     async fn file_backed_persist_failure_preserves_active_incumbent() {
         const MODEL: &str = "file-backed-persist-failure-fallback";
@@ -3456,9 +3452,7 @@ mod tests {
         assert_eq!(bridge.id_map, vec![newer_id]);
     }
 
-    /// Equal generations replace: install sites run under the single-flight
-    /// model lock, so a tie is an ordered later step of the SAME warm task
-    /// (e.g. the mmap reopen of the build just persisted) and must win.
+    /// Equal generations replace: under the single-flight model lock a tie is an ordered later step of the same warm task.
     #[tokio::test]
     async fn install_replacing_replaces_on_equal_generation() {
         let ann = new_shared();
@@ -3508,9 +3502,7 @@ mod tests {
         );
     }
 
-    /// `is_current` on an absent key is false (a genuine cache miss), so
-    /// callers correctly fall through to the ensure/build path rather than
-    /// treating "no entry" as "no problem."
+    /// `is_current` on an absent key is false, a genuine cache miss that falls through to the ensure/build path.
     #[tokio::test]
     async fn is_current_false_when_absent() {
         let ann = new_shared();
@@ -3893,6 +3885,23 @@ mod tests {
         }
     }
 
+    /// Provision the real sqlite-vec store that backs a manually installed
+    /// test bridge. Production bridges are built from an existing store; tests
+    /// that install one directly must preserve that schema invariant.
+    fn provision_test_vector_store(rt: &KhiveRuntime, model: &str, dims: usize) {
+        rt.register_embedder(HashVecProvider {
+            model_name: model.to_owned(),
+            dims,
+        });
+        let token = rt
+            .authorize(Namespace::local())
+            .expect("authorize vector-store fixture");
+        drop(
+            rt.vectors_for_model(&token, model)
+                .expect("provision vector-store fixture"),
+        );
+    }
+
     fn test_runtime_with_hash_embedder(model: &str, dims: usize) -> KhiveRuntime {
         let tmp = tempfile::Builder::new()
             .prefix("khive-memory-ann-test-")
@@ -3992,9 +4001,7 @@ mod tests {
 
     // ── ADR-079 Amendment 1: write-log restart classification ──────────────
 
-    /// A same-cardinality replacement (soft-delete + new note) leaves a log
-    /// tail, so a restart classifies Stale-tail and replays instead of
-    /// trusting the segment Hot (the case the retired content hash caught).
+    /// A same-cardinality replacement must classify Stale-tail and replay, never trust the segment Hot.
     #[tokio::test]
     async fn ensure_ann_for_model_restart_same_cardinality_replacement_replays_tail() {
         const MODEL: &str = "ann-warm-restart-signal-test-model";
@@ -4087,9 +4094,7 @@ mod tests {
         );
     }
 
-    /// A vector-only re-embed appends its contract-mandated log row (ADR-107
-    /// supersession note: every write path, including reindex overwrites), so
-    /// a restart replays the new bytes instead of classifying Hot on stale ones.
+    /// A vector-only re-embed's log row (ADR-107) must make a restart replay the new bytes, not classify Hot on stale ones.
     #[tokio::test]
     async fn ensure_ann_for_model_restart_detects_vector_only_reindex() {
         const MODEL: &str = "ann-warm-restart-vector-only-reindex-model";
@@ -4201,9 +4206,7 @@ mod tests {
         );
     }
 
-    /// A final tail upsert whose note fails the join-filtered corpus predicate
-    /// (soft-deleted without vector cleanup) is NOT a contradiction: its final
-    /// corpus state is absence, so replay tombstones it instead of going Cold.
+    /// A final tail upsert whose note fails the join predicate is not a contradiction; replay tombstones it instead of going Cold.
     #[tokio::test]
     async fn restart_tail_upsert_for_soft_deleted_note_replays_as_delete() {
         const MODEL: &str = "ann-warm-restart-join-predicate-model";
@@ -4292,9 +4295,7 @@ mod tests {
         );
     }
 
-    /// A final tail upsert with NO vector row at all contradicts the committed
-    /// log (vec writes and log appends are same-transaction), so replay must
-    /// refuse and the classifier must fall through to a Cold rebuild.
+    /// A final tail upsert with no vector row at all contradicts the committed log, so replay must fall through to a Cold rebuild.
     #[tokio::test]
     async fn restart_tail_upsert_with_absent_vector_row_goes_cold() {
         const MODEL: &str = "ann-warm-restart-contradiction-model";
@@ -4583,10 +4584,7 @@ mod tests {
 
     // ── ADR-118: fresh-tail exact leg ───────────────────────────────────────
 
-    /// #1161 regression: the no-index fallback follows ADR-118's
-    /// ceil(threshold × live corpus) ceiling instead of a flat 20,000-row
-    /// suffix. Six live vectors at 0.20 admit exactly the two newest raw log
-    /// rows; this also pins ceil rounding rather than truncation.
+    /// The no-index fallback follows ADR-118's ceil(threshold × live corpus) ceiling, not a flat row cap (#1161).
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_no_index_cap_tracks_live_corpus_fraction() {
@@ -4631,9 +4629,7 @@ mod tests {
         );
     }
 
-    /// A subject present in the stale warm ANN index whose final tail op is
-    /// `delete` must be dropped from the merged candidate list — the tail is
-    /// authoritative for every subject it names.
+    /// A subject in the stale warm index whose final tail op is delete must be dropped from the merged list (#1828).
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_leg_drops_subject_whose_final_tail_op_is_delete() {
@@ -4706,7 +4702,9 @@ mod tests {
         let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
             FreshTailOutcome::Ops(ops) => ops,
             FreshTailOutcome::Replace(..) => panic!("fresh-tail leg unexpectedly re-resolved"),
-            FreshTailOutcome::Skipped(_) => panic!("fresh-tail leg unexpectedly skipped"),
+            FreshTailOutcome::Skipped(reason) => {
+                panic!("fresh-tail leg unexpectedly skipped: {reason}")
+            }
         };
         let merged = merge_fresh_tail(raw, &query, ops);
         assert!(
@@ -4717,9 +4715,7 @@ mod tests {
         );
     }
 
-    /// A subject present in both the stale ANN candidates and the tail
-    /// appears exactly once in the merged list, carrying the tail's exact
-    /// (fresher) score rather than the segment's quantized one.
+    /// A subject in both the stale candidates and the tail must appear once, carrying the tail's exact score.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_leg_dedups_with_tail_winning() {
@@ -4817,10 +4813,7 @@ mod tests {
         );
     }
 
-    /// A pathless recall can capture an old bridge immediately before a
-    /// checkpoint installs a replacement, raises the registry, and compacts
-    /// the old tail. It must re-search the installed replacement rather than
-    /// merging a floored tail into the already-captured stale candidates.
+    /// A pathless recall racing a checkpoint must re-search the installed replacement, not merge a floored tail into stale candidates.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_pathless_mismatch_replaces_pre_checkpoint_candidates() {
@@ -4906,9 +4899,7 @@ mod tests {
         );
     }
 
-    /// Pending/recovering minima are below every real sequence and therefore
-    /// block compaction. They must not wrap to `u64::MAX` and suppress a real
-    /// tail that remains fully retained above the active bridge watermark.
+    /// A negative (pending/recovering) registry minimum must not wrap to `u64::MAX` and suppress a real, fully-retained tail.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_negative_peer_minimum_keeps_real_tail_visible() {
@@ -4972,14 +4963,7 @@ mod tests {
         );
     }
 
-    /// The compaction-linearization guard: if the registry minimum has
-    /// advanced past the serving bridge's watermark, the log may no longer
-    /// retain every row above it. The leg must detect the mismatch in the
-    /// same snapshot and never silently drop it — it re-resolves the
-    /// published segment (not possible here: the only persisted segment is
-    /// exactly as stale as the in-memory bridge) or floors the scan at the
-    /// same-snapshot registry minimum, which here finds nothing above it
-    /// (compacted away) but still runs — never `Skipped`.
+    /// When the registry minimum outpaces the bridge watermark and no newer segment exists, the leg must floor its scan, never `Skipped`.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_leg_floors_when_registry_minimum_outpaces_bridge_watermark() {
@@ -5072,13 +5056,7 @@ mod tests {
         );
     }
 
-    /// Real mismatch re-resolution (ADR-118 §1 "mismatch re-resolution"): a
-    /// peer process's checkpoint re-persists a NEWER segment (watermark at
-    /// least the registry minimum) that this process's in-memory bridge
-    /// never observed. The leg must load that segment, search IT directly,
-    /// and return a `Replace` outcome carrying a coherent (new candidates,
-    /// new watermark) pair — never merging the re-resolved tail into the
-    /// stale bridge's candidates.
+    /// A peer's newer persisted segment must be loaded, searched directly, and returned as `Replace`, never merged with stale candidates.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_leg_reresolves_to_a_newer_persisted_segment_on_mismatch() {
@@ -5181,16 +5159,7 @@ mod tests {
         );
     }
 
-    /// A re-resolution that assembles its candidates but then loses the SQL
-    /// leg that would prove tail completeness (reader open, snapshot begin,
-    /// registry-min re-read, tail fetch) must return a REASONED `Replace`:
-    /// the coherent re-resolved candidates are served, and the lost
-    /// read-your-writes visibility is disclosed via `Some(reason)` — never
-    /// reported healthy (`None`) and never degraded to a `Skipped` that
-    /// would resurrect the stale candidate set. Drives the earliest
-    /// post-re-resolution failure site (the registry-minimum re-read) by
-    /// removing its table while the leg is paused at the test barrier
-    /// between its segment search and that re-read.
+    /// A re-resolution that loses its post-search SQL leg must return a reasoned `Replace`, not `None` or a stale-resurrecting `Skipped`.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_leg_post_reresolution_sql_failure_is_a_reasoned_replace() {
@@ -5333,20 +5302,9 @@ mod tests {
         }
     }
 
-    /// ADR-118 §1 "Compaction linearization" applied to re-resolution itself:
-    /// a peer checkpoint can advance the registry minimum PAST the segment
-    /// `fresh_tail_reresolve` just loaded, in the window between that load
-    /// and its tail scan. The fix re-validates the registry minimum inside a
-    /// fresh snapshot before scanning and, on a mismatch, RELOADS the
-    /// currently published segment instead of immediately flooring the scan
-    /// — flooring on the first mismatch would leave the (old watermark, new
-    /// minimum] window in neither the stale candidate set nor the floored
-    /// tail, silently dropping a committed write in exactly that range. The
-    /// reload converges because compaction through the new minimum implies
-    /// the published segment already covers it. A write compacted into the
-    /// interleaved window must surface via the reloaded segment's own
-    /// search, and a write committed above the (now coherent) watermark
-    /// must still surface through its tail scan.
+    /// A peer checkpoint that advances the registry minimum past the just-loaded
+    /// segment must make `fresh_tail_reresolve` reload rather than floor the
+    /// interleaved window (see `docs/ann.md` for the convergence argument).
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_reresolve_revalidates_registry_minimum_against_interleaved_compaction() {
@@ -5542,14 +5500,7 @@ mod tests {
         );
     }
 
-    /// [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`]'s terminal branch: three peer
-    /// checkpoints land back-to-back, one inside each round's pause, so the
-    /// registry minimum keeps outrunning the reload before it can converge.
-    /// The first two mismatches must still recover via reload (their gap
-    /// writes are compacted INTO the next reloaded segment); only the third
-    /// — exhausting the bound — falls back to the floored scan, which
-    /// cannot see its own round's gap write but must still surface a write
-    /// that lands above the final floor.
+    /// Exhausting [`FRESH_TAIL_RERESOLVE_MAX_ROUNDS`] under back-to-back peer checkpoints must fall back to the floored scan.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_reresolve_falls_back_to_floor_after_max_rounds() {
@@ -5800,10 +5751,7 @@ mod tests {
         );
     }
 
-    /// Registration precondition: absent a durable registry row for this
-    /// consumer, the leg must not trust `S = 0` as an entire-scope tail (a
-    /// registered peer consumer may have already compacted rows this one
-    /// never saw) — it registers pending and drops the stale candidates.
+    /// Absent a durable registry row, the leg must not trust `S = 0` as complete — it registers pending and drops stale candidates.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
     async fn fresh_tail_leg_drops_candidates_and_reregisters_when_consumer_row_absent() {

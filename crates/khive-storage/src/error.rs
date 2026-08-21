@@ -118,6 +118,15 @@ pub enum StorageError {
     #[error("write queue full: timed out after {timeout_ms}ms waiting for writer task capacity")]
     WriteQueueFull { timeout_ms: u64 },
 
+    /// SQLite refused the writer task's `BEGIN IMMEDIATE` with
+    /// `SQLITE_BUSY`/`SQLITE_LOCKED` until the configured busy timeout. The
+    /// queue accepted the request, but its operation closure was never
+    /// invoked, so retrying that one failed operation is safe.
+    #[error(
+        "writer task could not begin within {timeout_ms}ms because SQLite remained busy; request was not executed"
+    )]
+    WriterTaskBusy { timeout_ms: u64 },
+
     /// A single-writer execution seam has terminated permanently. This is the
     /// historical writer-task variant and display name; the fail-closed
     /// pool-mutex fallback also uses it when transaction finalization becomes
@@ -188,6 +197,7 @@ impl StorageError {
             | Self::Timeout { .. }
             | Self::Transaction { .. }
             | Self::WriteQueueFull { .. }
+            | Self::WriterTaskBusy { .. }
             | Self::WriterTaskTerminated { .. }
             | Self::Internal(..)
             | Self::WriterTaskNoRuntime => None,
@@ -202,6 +212,7 @@ impl StorageError {
                 | Self::Timeout { .. }
                 | Self::Transaction { .. }
                 | Self::WriteQueueFull { .. }
+                | Self::WriterTaskBusy { .. }
         )
     }
 
@@ -312,6 +323,17 @@ mod tests {
             WriterTaskRequestState::SideEffectsUnknown.to_string(),
             "side_effects_unknown"
         );
+    }
+
+    #[test]
+    fn writer_task_busy_is_retryable_without_claiming_queue_rejection() {
+        let error = StorageError::WriterTaskBusy { timeout_ms: 175 };
+        assert!(error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "writer task could not begin within 175ms because SQLite remained busy; request was not executed"
+        );
+        assert_eq!(error.capability(), None);
     }
 
     #[test]

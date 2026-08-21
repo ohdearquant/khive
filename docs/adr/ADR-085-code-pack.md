@@ -757,10 +757,14 @@ subcommand (`crates/kkernel/src/code_ingest.rs`), following the same shape as
 set, validates the whole document before any write (Amendment 1 A3's
 fail-closed, all-or-nothing contract, unchanged), and persists the resulting
 entity/note/edge batch by content-derived id: a record whose id already
-exists is reported as skipped, never overwritten, so re-running the same
-sweep is a no-op and a `finding`'s curated lifecycle state (`kind_status`) is
-never reset by re-ingestion. `--dry-run` runs the same validation and
-existence checks and reports what would happen without writing.
+exists is reported as skipped, never overwritten. "Exists" is
+history-preserving here: a soft-deleted row has already consumed its id and
+is skipped by both the real path and `--dry-run`; re-ingestion never clears
+its `deleted_at` marker or otherwise resurrects it. Thus re-running the same
+sweep is a no-op and a `finding`'s curated lifecycle state (`kind_status`)
+and deletion state are never reset by re-ingestion. `--dry-run` runs the same
+including-tombstones existence checks and reports what would happen without
+writing.
 
 No MCP verb calls this path, and none is added. Agents that participate in
 an audit never hold a bulk-ingest verb; only the CLI, run by the audit
@@ -1553,3 +1557,64 @@ one identity.
    advances.
 4. Both endpoints of every fixture `project contains module` edge expose the
    same non-empty `source_project` value.
+
+## Amendment 6 (2026-08-09): repository-scoped findings identity v2
+
+Amendment 1 A1's tolerated free-form posture remains in force for producer content fields. The
+following fields are instead the structural identity envelope and are now governed as non-blank
+strings: `audit.date`, `audit.scope`, `audit.repo`, `audit.branch`, `audit.commit`,
+`audit.standards_file`, and `findings[].id`. This is the future amendment A1 required before stricter
+ingest validation; it is justified because blank identity material collapses unrelated producer
+runs and makes provenance unqueryable. Validation preserves the original non-blank string bytes.
+
+The project UUID remains the v1 tuple over namespace, repository, and scope. Finding identity moves
+to schema version 2 and adds both `audit.repo` and the computed project UUID to the recursively
+canonicalized content tuple. Observation time remains excluded. Consequently:
+
+- the same input in the same namespace/repository/project scope remains idempotent;
+- equal producer IDs/content/source runs in different repositories produce different finding notes
+  and annotation edges; and
+- substantive finding content changes still produce new notes rather than overwriting curated
+  history.
+
+### V1 compatibility and migration decision
+
+V1 finding UUIDs omitted repository/project scope and may already denote evidence from multiple
+repositories. The runtime must not guess their ownership or rewrite/merge them automatically. New
+ingest creates the correctly scoped v2 row and leaves every v1 note and lifecycle state immutable.
+Each v2 note records `identity_schema_version=2`, `repo`, `project_id`, and `legacy_id_v1`, where the
+last field is the exact UUID the same input would have produced under v1. An operator or future
+migration may join that witness to the v1 note and the current annotation target, then explicitly
+merge only after provenance is unambiguous. This one-time coexistence is preferred to silently
+attaching a colliding legacy finding to the wrong project.
+
+Acceptance:
+
+1. Every governed identity string rejects whitespace-only input before record construction.
+2. Equal findings under two `audit.repo` values have disjoint project, note, and edge UUIDs.
+3. Repeated same-repository input and changes only to `observed_at` retain stable v2 UUIDs.
+4. A v2 note exposes its schema version, repository, project UUID, and parseable deterministic v1
+   UUID witness; ingest does not mutate or claim an existing v1 row.
+
+## Amendment 7 (2026-08-11): strict ingest arguments and observed languages
+
+`code.ingest` now validates its complete public argument object before any filesystem or database
+access. The closed argument set is `path`, `db`, `languages`, and `tiers`; deserialization rejects
+every unknown field by name and reports the accepted field names. This brings the code-pack tranche
+of the public verb surface into the same typo-detecting posture as the typed KG, GTD, memory, comm,
+knowledge, brain, schedule, and session handlers. Git- and blob-pack argument strictness remains a
+separate implementation tranche.
+
+The request's `languages` value remains an allow-list: omission permits every supported language,
+while an explicit array restricts discovery. The success report's `languages` field no longer
+echoes that allow-list. It is the sorted, deduplicated set actually observed by at least one selected
+tier: a discovered manifest counts for L1/L1.5, a discovered source file counts for L1.5, and an
+accepted Rust source file counts for L2. A language with no accepted manifest or source file is
+absent, and selecting no tiers reports an empty set.
+
+Acceptance:
+
+1. A valid call carrying an unknown argument fails before its target database is created, and the
+   error names both the unknown argument and the four accepted fields.
+2. An omitted language filter over a Rust-only fixture reports exactly `["rust"]`, never the full
+   supported-language allow-list.

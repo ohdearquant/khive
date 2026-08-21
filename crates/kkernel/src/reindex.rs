@@ -1285,6 +1285,12 @@ mod tests {
     use khive_storage::types::{SqlStatement, SqlValue};
     use serial_test::serial;
 
+    fn write_empty_test_config(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("empty-khive-config.toml");
+        std::fs::write(&path, "").expect("write isolated empty config");
+        path
+    }
+
     #[test]
     fn allocation_free_embedding_eligibility_matches_canonical_text() {
         let entities = [
@@ -2415,12 +2421,14 @@ mod tests {
         // verification pass share the same on-disk state.
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
         let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let config = write_empty_test_config(config_dir.path());
 
         // Seed notes via a runtime opened on the same file BEFORE calling run_reindex.
         {
             let cfg = resolve_runtime_config(RuntimeConfigInputs {
                 db: Some(&db_path),
-                config: None,
+                config: Some(&config),
                 namespace: Namespace::parse("local").expect("ns"),
                 namespace_explicit: true,
                 actor_explicit: false,
@@ -2449,7 +2457,7 @@ mod tests {
         // run_reindex with no embedding model and --no-knowledge.
         let args = ReindexArgs {
             db: Some(db_path.clone()),
-            config: None,
+            config: Some(config.clone()),
             model: None,
             batch_size: 100,
             keep_existing: false,
@@ -2466,7 +2474,7 @@ mod tests {
         // Verify FTS was populated by re-opening the db.
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(&db_path),
-            config: None,
+            config: Some(&config),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: true,
             actor_explicit: false,
@@ -2686,12 +2694,14 @@ mod tests {
 
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
         let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let config = write_empty_test_config(config_dir.path());
 
         // Seed entities via EntityStore (bypassing runtime FTS write).
         {
             let cfg = resolve_runtime_config(RuntimeConfigInputs {
                 db: Some(&db_path),
-                config: None,
+                config: Some(&config),
                 namespace: Namespace::parse("local").expect("ns"),
                 namespace_explicit: true,
                 actor_explicit: false,
@@ -2719,7 +2729,7 @@ mod tests {
 
         let args = ReindexArgs {
             db: Some(db_path.clone()),
-            config: None,
+            config: Some(config.clone()),
             model: None,
             batch_size: 100,
             keep_existing: false,
@@ -2736,7 +2746,7 @@ mod tests {
         // Verify entity FTS was populated.
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(&db_path),
-            config: None,
+            config: Some(&config),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: true,
             actor_explicit: false,

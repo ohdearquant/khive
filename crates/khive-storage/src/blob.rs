@@ -218,8 +218,8 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
         })
     }
 
-    /// Select live entity references and sweep orphaned blobs in one database
-    /// writer transaction.
+    /// Select live entity references and sweep orphaned blobs behind a
+    /// database-coordinated, bounded claim protocol.
     ///
     /// Unlike [`Self::orphan_sweep`], this operation obtains liveness itself
     /// from `sql`; callers do not assemble a stale snapshot. `sql` must be the
@@ -227,7 +227,16 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// references. Implementations must also ensure an object published after
     /// the sweep's candidate set is captured cannot be mistaken for an orphan,
     /// including when it is published between selecting live references and
-    /// physical deletion.
+    /// physical deletion. Implementations must not perform filesystem or
+    /// other external I/O while holding the database writer transaction;
+    /// durable claims/triggers or an equivalently fail-closed fence must keep
+    /// entity writes safe after each short transaction commits. Claim/result
+    /// materialization and cleanup must have an explicit per-transaction
+    /// cardinality bound rather than scale one writer hold with the complete
+    /// object population. A file-backed `sql` implementation must expose its
+    /// canonical [`SqlAccess::database_path`] so crash recovery can retain
+    /// cross-process database ownership independently of mutable blob-root
+    /// spelling or relocation.
     /// Coordination may be advisory, so callers must publish through the
     /// backend rather than mutate its physical storage directly.
     /// Backends that cannot provide both guarantees return

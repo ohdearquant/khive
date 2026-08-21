@@ -1,9 +1,4 @@
-//! Smoke tests for the comm pack.
-//!
-//! INLINE TEST JUSTIFICATION: the public comm verbs share a
-//! single in-memory runtime fixture. Splitting into per-verb files would require duplicating
-//! the fixture and lose cross-verb invariant tests (e.g. send→inbox→read→reply→thread
-//! roundtrip and thread-isolation assertions) that exercise interactions between verbs.
+//! Smoke tests for the comm pack. See `docs/integration-tests.md` for why this stays one file.
 
 use std::sync::Arc;
 
@@ -14,6 +9,12 @@ use khive_runtime::{
 };
 use khive_storage::types::{SqlRow, SqlValue};
 use khive_types::Pack;
+
+fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
+    response["items"]
+        .as_array()
+        .expect("list response must contain an items array")
+}
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -165,11 +166,14 @@ fn comm_pack_requires_kg() {
     assert_eq!(CommPack::REQUIRES, &["kg"]);
 }
 
+/// Self-send (`to: "local"`) dual-writes an outbound record plus an inbound sibling, and
+/// the inbound copy's read status depends on delivery ordering — so the inbox query uses
+/// `status: "all"` (not the unread default) and asserts only that a `count` field is
+/// present, since a count of zero is a legal outcome of this fixture.
 #[tokio::test]
 async fn send_and_inbox_roundtrip() {
     let (registry, _rt) = build_registry();
 
-    // Send a message to self (same namespace) — creates outbound + inbound notes.
     let result = registry
         .dispatch(
             "comm.send",
@@ -179,7 +183,6 @@ async fn send_and_inbox_roundtrip() {
         .expect("send succeeds");
     assert!(result.get("id").is_some(), "send returns id: {result}");
 
-    // Inbox with status=all returns the sent message (outbound notes are not listed by default).
     let inbox = registry
         .dispatch(
             "comm.inbox",
@@ -187,14 +190,10 @@ async fn send_and_inbox_roundtrip() {
         )
         .await
         .expect("inbox succeeds");
-    // We sent an outbound message; inbox only lists inbound by default.
-    // status=all also includes outbound, but direction filter still applies.
-    // The test verifies inbox runs without error; count may be 0 for outbound.
     assert!(inbox.get("count").is_some(), "inbox returns count: {inbox}");
 }
 
-/// #1447: a successful dual-write is confirmed by the inbound sibling's
-/// correlation property, independent of message content.
+/// #1447: a successful dual-write is confirmed by the inbound sibling's correlation property, independent of message content.
 #[tokio::test]
 async fn delivered_confirms_successful_actor_send() {
     let (registry, _rt) = build_registry();
@@ -221,8 +220,7 @@ async fn delivered_confirms_successful_actor_send() {
     assert_eq!(result["inbound_count"], 1);
 }
 
-/// Confirmation is a sender operation: another actor in the same namespace
-/// cannot use a known outbound correlation UUID to inspect the sender's result.
+/// Confirmation is a sender operation: another actor in the same namespace cannot use a known outbound correlation UUID to inspect the sender's result.
 #[tokio::test]
 async fn delivered_is_scoped_to_the_sending_actor() {
     let backend = shared_backend();
@@ -256,9 +254,7 @@ async fn delivered_is_scoped_to_the_sending_actor() {
     assert_eq!(recipient_result["inbound_count"], 0);
 }
 
-/// #1447: an outbound-only row is explicitly undelivered even when its body
-/// is identical to another message that did arrive. Content is never used as
-/// a delivery heuristic.
+/// #1447: an outbound-only row is explicitly undelivered even when its body is identical to another message that did arrive.
 #[tokio::test]
 async fn delivered_rejects_outbound_only_identical_body() {
     let (registry, rt) = build_registry();
@@ -303,9 +299,7 @@ async fn delivered_rejects_outbound_only_identical_body() {
     assert_eq!(result["inbound_count"], 0);
 }
 
-/// #1447: confirmation must report delivered from the inbound correlation
-/// alone. It must not require an outbound row to resolve first, which keeps
-/// the read useful for legacy/imported states and direct ambiguity fixtures.
+/// #1447: confirmation must report delivered from the inbound correlation alone.
 #[tokio::test]
 async fn delivered_confirms_inbound_after_outbound_disappears() {
     let (registry, rt) = build_registry();
@@ -343,8 +337,7 @@ async fn delivered_confirms_inbound_after_outbound_disappears() {
     assert_eq!(result["inbound_count"], 1);
 }
 
-/// Confirmation is sender-namespace scoped. An unrelated namespace cannot
-/// manufacture a positive result for the caller by reusing its UUID.
+/// Confirmation is sender-namespace scoped.
 #[tokio::test]
 async fn delivered_ignores_matching_inbound_in_another_namespace() {
     let (registry, rt) = build_registry();
@@ -380,8 +373,7 @@ async fn delivered_ignores_matching_inbound_in_another_namespace() {
     assert_eq!(result["inbound_count"], 0);
 }
 
-/// A display prefix is not a stable correlation key and may have no outbound
-/// row to resolve, so the public contract requires the surfaced full UUID.
+/// A display prefix is not a stable correlation key and may have no outbound row to resolve, so the public contract requires the surfaced full UUID.
 #[tokio::test]
 async fn delivered_rejects_short_or_malformed_ids() {
     let (registry, _rt) = build_registry();
@@ -812,8 +804,6 @@ async fn inbox_long_poll_with_offset_wakes_and_pages() {
 async fn read_marks_message_as_read() {
     let (registry, rt) = build_registry_for_ns("local");
 
-    // Send to self so both an outbound AND an inbound copy land in the same
-    // "local" namespace. read() is only valid on inbound messages.
     registry
         .dispatch(
             "comm.send",
@@ -822,7 +812,6 @@ async fn read_marks_message_as_read() {
         .await
         .expect("send succeeds");
 
-    // Find the inbound copy in the caller namespace.
     let caller_token = rt
         .authorize(khive_runtime::Namespace::parse("local").unwrap())
         .unwrap();
@@ -881,7 +870,6 @@ async fn reply_creates_threaded_message() {
         .and_then(|v| v.as_str())
         .expect("send returns full_id");
 
-    // Reply to the original message.
     let reply = registry
         .dispatch(
             "comm.reply",
@@ -893,15 +881,12 @@ async fn reply_creates_threaded_message() {
         .await
         .expect("reply succeeds");
 
-    // reply must return an id (the new message).
     assert!(reply.get("id").is_some(), "reply returns id: {reply}");
-    // thread_id must be set to the original message's UUID.
     assert_eq!(
         reply.get("thread_id").and_then(|v| v.as_str()),
         Some(original_full_id),
         "reply thread_id matches original full_id: {reply}"
     );
-    // subject should be prefixed with "Re: ".
     assert_eq!(
         reply.get("subject").and_then(|v| v.as_str()),
         Some("Re: Hello"),
@@ -953,8 +938,6 @@ async fn test_full_id_returns_36_char() {
 
 #[tokio::test]
 async fn test_read_accepts_short_id() {
-    // Send to self so the inbound copy lands in the same "local" namespace.
-    // read() is only valid on inbound messages.
     let (registry, rt) = build_registry_for_ns("local");
 
     registry
@@ -965,7 +948,6 @@ async fn test_read_accepts_short_id() {
         .await
         .expect("send succeeds");
 
-    // Locate the inbound copy.
     let caller_token = rt
         .authorize(khive_runtime::Namespace::parse("local").unwrap())
         .unwrap();
@@ -1064,7 +1046,6 @@ async fn test_short_id_collision_errors_clearly() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
-    // Construct two UUIDs that share the first 8 hex chars (before the first '-').
     let base = "aabbccdd";
     let uuid_a = Uuid::parse_str(&format!("{base}-1111-4000-8000-000000000001")).unwrap();
     let uuid_b = Uuid::parse_str(&format!("{base}-2222-4000-8000-000000000002")).unwrap();
@@ -1111,7 +1092,6 @@ async fn test_short_id_collision_errors_clearly() {
         .await
         .expect("insert b");
 
-    // Now call read with the ambiguous 8-char prefix.
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
     builder.register(khive_pack_comm::CommPack::new(rt.clone()));
@@ -1160,12 +1140,8 @@ async fn test_short_id_collision_errors_clearly() {
         "ambiguity error must name distinguishable full UUIDs: got {msg:?}"
     );
 }
-// ── UE6 Critical F-C3: dual-write delivery tests ─────────────────────────────
 
 /// send() within the same namespace writes one outbound note in the caller's namespace.
-///
-/// Cross-namespace sends are denied (issue #481 fix).
-/// Same-namespace sends must produce both outbound and inbound copies.
 #[tokio::test]
 async fn test_send_writes_outbound_in_caller_ns() {
     let (registry, rt) = build_registry_for_ns("lambda:khive");
@@ -1178,7 +1154,6 @@ async fn test_send_writes_outbound_in_caller_ns() {
         .await
         .expect("same-namespace send succeeds");
 
-    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
     let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
@@ -1200,8 +1175,6 @@ async fn test_send_writes_outbound_in_caller_ns() {
         1,
         "local namespace must have exactly 1 outbound note (ADR-007 all-local); got {outbound:?}"
     );
-    // ADR-007 Rev 2: `to_actor` carries the intended recipient ("lambda:khive").
-    // The `to` property is caller_ns ("local") per dual_write_message's actor-addressed path.
     assert_eq!(
         outbound[0]
             .properties
@@ -1214,9 +1187,6 @@ async fn test_send_writes_outbound_in_caller_ns() {
 }
 
 /// send() within the same namespace writes one inbound note alongside the outbound copy.
-///
-/// Cross-namespace sends are denied (issue #481 fix).
-/// Same-namespace send creates both copies in the caller's namespace.
 #[tokio::test]
 async fn test_send_writes_inbound_in_recipient_ns() {
     let (registry, rt) = build_registry_for_ns("lambda:khive");
@@ -1229,7 +1199,6 @@ async fn test_send_writes_inbound_in_recipient_ns() {
         .await
         .expect("same-namespace send succeeds");
 
-    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
     let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
@@ -1252,11 +1221,9 @@ async fn test_send_writes_inbound_in_recipient_ns() {
         "local namespace must have exactly 1 inbound note (ADR-007 all-local); got {inbound:?}"
     );
     let props = inbound[0].properties.as_ref().unwrap();
-    // ADR-007 Rev 2: token.namespace() is always "local", so from = "local".
     assert_eq!(props.get("from").and_then(|v| v.as_str()), Some("local"));
     assert_eq!(props.get("to").and_then(|v| v.as_str()), Some("local"));
     assert_eq!(inbound[0].content, "meeting at 3pm");
-    // inbound copy must carry an outbound_ref back to the outbound copy.
     assert!(
         props.get("outbound_ref").is_some(),
         "inbound note must carry outbound_ref"
@@ -1264,12 +1231,8 @@ async fn test_send_writes_inbound_in_recipient_ns() {
 }
 
 /// inbox() returns the inbound message after a self-send with configured actor identity.
-///
-/// A session with actor_id="lambda:khive" sends to itself; the inbound copy has
-/// to_actor="lambda:khive" and is visible to the same registry's inbox (filter matches).
 #[tokio::test]
 async fn test_inbox_returns_inbound_for_recipient() {
-    // Self-send: actor_id configured so inbox filter matches to_actor="lambda:khive".
     let (registry, _rt) = build_actor_registry(shared_backend(), "lambda:khive");
     registry
         .dispatch(
@@ -1279,7 +1242,6 @@ async fn test_inbox_returns_inbound_for_recipient() {
         .await
         .expect("self-send with actor identity succeeds");
 
-    // inbox() on the same registry must surface the inbound copy.
     let inbox = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
         .await
@@ -1296,7 +1258,6 @@ async fn test_inbox_returns_inbound_for_recipient() {
 
     let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
     let props = msgs[0].get("properties").unwrap();
-    // from_actor is "lambda:khive" (configured actor_id, not anonymous "local").
     assert_eq!(
         props.get("from_actor").and_then(|v| v.as_str()),
         Some("lambda:khive")
@@ -1331,9 +1292,7 @@ async fn test_inbox_returns_inbound_for_recipient() {
     );
 }
 
-/// send-to-self writes exactly TWO notes (one outbound, one inbound) in the caller's
-/// namespace.  The inbound copy is required so that `inbox()` can surface the message
-/// to the sender when they are also the recipient.
+/// send-to-self writes exactly TWO notes (one outbound, one inbound) in the caller's namespace.  The inbound copy is required so that `inbox()` can surface the message to the sender when they are also the recipient.
 #[tokio::test]
 async fn test_send_to_self_writes_two_notes() {
     let (registry, rt) = build_registry_for_ns("lambda:khive");
@@ -1346,7 +1305,6 @@ async fn test_send_to_self_writes_two_notes() {
         .await
         .expect("send-to-self succeeds");
 
-    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
     let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
@@ -1377,21 +1335,11 @@ async fn test_send_to_self_writes_two_notes() {
     );
 }
 
-// ── UE6-H1: reply routes to the "other party" based on metadata, not namespace ─
-
 /// Sender replies to their own outbound message → reply `to` equals original `to`.
-///
-/// Within the same namespace: A sends to self (from=A, to=A). Sender replies to
-/// the outbound copy. Because from==to, the reply routes back to the same namespace
-/// (which is correct — there is no other party in a self-send).
-///
-/// Cross-namespace send is denied (issue #481 fix).
 #[tokio::test]
 async fn test_reply_from_sender_routes_to_recipient() {
-    // Registry scoped to lambda:khive (sender == recipient in same-namespace mode).
     let (registry, _rt) = build_registry_for_ns("lambda:khive");
 
-    // Same-namespace send: from=lambda:khive, to=lambda:khive.
     let sent = registry
         .dispatch(
             "comm.send",
@@ -1405,7 +1353,6 @@ async fn test_reply_from_sender_routes_to_recipient() {
         .and_then(|v| v.as_str())
         .expect("send returns full_id");
 
-    // Sender replies to their own outbound message.
     let reply = registry
         .dispatch(
             "comm.reply",
@@ -1414,7 +1361,6 @@ async fn test_reply_from_sender_routes_to_recipient() {
         .await
         .expect("reply succeeds");
 
-    // ADR-007 Rev 2: reply_to = original to_actor = "lambda:khive".
     let reply_to = reply
         .get("to")
         .and_then(|v| v.as_str())
@@ -1423,7 +1369,6 @@ async fn test_reply_from_sender_routes_to_recipient() {
         reply_to, "lambda:khive",
         "UE6-H1: self-send reply routes back to to_actor; got {reply_to}"
     );
-    // ADR-007 Rev 2: from = token.namespace() = "local".
     let reply_from = reply
         .get("from")
         .and_then(|v| v.as_str())
@@ -1434,17 +1379,9 @@ async fn test_reply_from_sender_routes_to_recipient() {
     );
 }
 
-/// Recipient replies to an inbound message → reply routes back to the original sender
-/// metadata field, not the caller's namespace.
-///
-/// Within same-namespace: both are the same namespace so the routing is always self.
-/// This test verifies reply() works on an inbound message and preserves the metadata.
-///
-/// Cross-namespace send is denied (issue #481 fix).
+/// Recipient replies to an inbound message → reply routes back to the original sender metadata field, not the caller's namespace.
 #[tokio::test]
 async fn test_reply_from_recipient_routes_to_sender() {
-    // lambda:khive (configured actor_id) sends to itself, then replies.
-    // This tests that reply routing works correctly with proper actor attribution.
     let backend = shared_backend();
     let (registry, _rt) = build_actor_registry(backend, "lambda:khive");
 
@@ -1456,7 +1393,6 @@ async fn test_reply_from_recipient_routes_to_sender() {
         .await
         .expect("self-send with actor identity succeeds");
 
-    // Find the inbound copy via inbox (actor filter matches to_actor="lambda:khive").
     let inbox = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
         .await
@@ -1471,7 +1407,6 @@ async fn test_reply_from_recipient_routes_to_sender() {
         .and_then(|v| v.as_str())
         .expect("full_id on inbound message");
 
-    // Reply to the inbound message.
     let reply = registry
         .dispatch(
             "comm.reply",
@@ -1480,7 +1415,6 @@ async fn test_reply_from_recipient_routes_to_sender() {
         .await
         .expect("reply succeeds");
 
-    // UE6-H1: reply routes to original to_actor = "lambda:khive".
     let reply_to = reply
         .get("to")
         .and_then(|v| v.as_str())
@@ -1489,7 +1423,6 @@ async fn test_reply_from_recipient_routes_to_sender() {
         reply_to, "lambda:khive",
         "UE6-H1: reply routes to original to_actor; got {reply_to}"
     );
-    // from_actor is the configured actor_id, not anonymous "local".
     let reply_from = reply
         .get("from")
         .and_then(|v| v.as_str())
@@ -1500,8 +1433,7 @@ async fn test_reply_from_recipient_routes_to_sender() {
     );
 }
 
-/// reply() to an inbound message marks the original read — callers previously
-/// chained `reply | read`; the read is now folded into reply itself.
+/// reply() to an inbound message marks the original read — callers previously chained `reply | read`; the read is now folded into reply itself.
 #[tokio::test]
 async fn test_reply_marks_inbound_original_read() {
     let backend = shared_backend();
@@ -1559,8 +1491,7 @@ async fn test_reply_marks_inbound_original_read() {
     );
 }
 
-/// reply() to an outbound original performs no read-marking (read is a
-/// recipient action); `marked_read` is null.
+/// reply() to an outbound original performs no read-marking (read is a recipient action); `marked_read` is null.
 #[tokio::test]
 async fn test_reply_to_outbound_original_does_not_mark_read() {
     let (registry, _rt) = build_registry();
@@ -1593,10 +1524,7 @@ async fn test_reply_to_outbound_original_does_not_mark_read() {
     );
 }
 
-/// A legacy message carrying no `direction` property is still markable —
-/// reply() skips only an explicitly outbound original, exactly as read() does.
-/// Before this, requiring a literal "inbound" made a directionless legacy
-/// record report `marked_read: null`, which is specified to mean "outbound".
+/// A legacy message carrying no `direction` property is still markable — reply() skips only an explicitly outbound original, exactly as read() does.
 #[tokio::test]
 async fn test_reply_marks_directionless_legacy_original() {
     use khive_storage::note::Note;
@@ -1618,7 +1546,6 @@ async fn test_reply_marks_directionless_legacy_original() {
             salience: None,
             decay_factor: None,
             expires_at: None,
-            // No `direction` — the pre-ADR-057 shape.
             properties: Some(serde_json::json!({ "from": "x", "to": "local" })),
             created_at: now,
             updated_at: now,
@@ -1656,9 +1583,7 @@ async fn test_reply_marks_directionless_legacy_original() {
     );
 }
 
-/// The read patch must not clobber an unrelated property. Both writes use the
-/// storage layer's one-statement JSON-property setter, so the invariant does
-/// not depend on a best-effort re-read immediately before replacement.
+/// The read patch must not clobber an unrelated property.
 #[tokio::test]
 async fn test_reply_read_patch_preserves_concurrent_properties() {
     use khive_storage::note::Note;
@@ -1728,8 +1653,7 @@ async fn test_reply_read_patch_preserves_concurrent_properties() {
     );
 }
 
-/// A non-participant may reach a message id, but replying must be rejected
-/// without flipping someone else's message to read.
+/// A non-participant may reach a message id, but replying must be rejected without flipping someone else's message to read.
 #[tokio::test]
 async fn test_reply_by_non_participant_is_rejected_without_marking_read() {
     let backend = shared_backend();
@@ -1790,7 +1714,6 @@ async fn test_reply_by_non_participant_is_rejected_without_marking_read() {
         "the original must remain unread after a rejected reply"
     );
 
-    // The real addressee replying still marks it.
     let by_b = registry_b
         .dispatch(
             "comm.reply",
@@ -1804,8 +1727,6 @@ async fn test_reply_by_non_participant_is_rejected_without_marking_read() {
         "the addressee's reply must still mark the original read; got {by_b}"
     );
 }
-
-// ── UE6-H2: reply thread_id must be full 36-char UUID ───────────────────────
 
 /// reply thread_id must be the full 36-char hyphenated UUID of the root message.
 #[tokio::test]
@@ -1850,7 +1771,6 @@ async fn test_reply_thread_id_is_full_uuid() {
         thread_id, original_full_id,
         "thread_id must equal the original message's full UUID"
     );
-    // Parse as UUID to confirm it's valid.
     thread_id
         .parse::<uuid::Uuid>()
         .unwrap_or_else(|e| panic!("thread_id must be a valid UUID: {thread_id} — {e}"));
@@ -1873,7 +1793,6 @@ async fn test_reply_chain_preserves_full_uuid_thread_id() {
         .and_then(|v| v.as_str())
         .expect("full_id");
 
-    // First reply — creates the thread.
     let reply1 = registry
         .dispatch(
             "comm.reply",
@@ -1887,7 +1806,6 @@ async fn test_reply_chain_preserves_full_uuid_thread_id() {
         .expect("thread_id on reply1");
     assert_eq!(thread_id_1.len(), 36, "reply1 thread_id must be 36-char");
 
-    // Second reply to the first reply — must carry the same root thread_id.
     let reply1_full_id = reply1
         .get("full_id")
         .and_then(|v| v.as_str())
@@ -1911,10 +1829,6 @@ async fn test_reply_chain_preserves_full_uuid_thread_id() {
 }
 
 /// inbound write failure rolls back the outbound note (atomicity).
-///
-/// We simulate inbound failure by passing an invalid recipient namespace string
-/// (khive namespace syntax forbids control characters). The outbound note must
-/// not be persisted either.
 #[tokio::test]
 async fn test_send_inbound_failure_rolls_back_outbound() {
     // ADR-057 Q1: control characters are rejected by validate_actor_label.
@@ -1952,11 +1866,7 @@ async fn test_send_inbound_failure_rolls_back_outbound() {
     );
 }
 
-// ── CC-2 C3 regression: inbox() returns self-sent messages ───────────────────
-
 /// After a self-send, inbox(status="all") must return at least the inbound copy.
-/// Before the fix, inbox always returned 0 for self-sends because no inbound
-/// note was written.
 #[tokio::test]
 async fn test_inbox_returns_self_send_as_inbound() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -1983,7 +1893,6 @@ async fn test_inbox_returns_self_send_as_inbound() {
         "CC-2 C3 regression: inbox(status=all) must return at least 1 message after self-send; got count={count}"
     );
 
-    // Verify the message is marked as inbound.
     let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
     assert!(
         msgs.iter().any(|m| m
@@ -1995,17 +1904,11 @@ async fn test_inbox_returns_self_send_as_inbound() {
     );
 }
 
-// ── CC-2 C1 regression: list(kind=message, thread_id=X) filters correctly ────
-
 /// list(kind="message", thread_id=X) must return only messages in that thread.
-/// Before the fix, thread_id was silently ignored and all messages were returned.
 #[tokio::test]
 async fn test_list_message_thread_id_filter() {
     let (send_registry, rt) = build_registry_for_ns("lambda:khive");
 
-    // Establish a real thread root, then send one message onto it and one
-    // outside it (a fabricated thread_id is rejected at the send boundary,
-    // so the filter fixture must thread onto an existing root).
     let root = send_registry
         .dispatch(
             "comm.send",
@@ -2039,7 +1942,6 @@ async fn test_list_message_thread_id_filter() {
         .await
         .expect("send msg2 succeeds");
 
-    // Build a kg-scoped registry in the same ns for list() (list is a KG verb).
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
     builder.register(CommPack::new(rt.clone()));
@@ -2057,7 +1959,7 @@ async fn test_list_message_thread_id_filter() {
         .await
         .expect("list with thread_id filter succeeds");
 
-    let items = result.as_array().expect("list returns an array");
+    let items = list_items(&result);
     // The filter must actually select rows (a vacuously empty pass proves
     // nothing) and every returned message must carry the requested thread_id.
     assert!(
@@ -2077,15 +1979,11 @@ async fn test_list_message_thread_id_filter() {
     }
 }
 
-// ── CC-2 C2 regression: list(kind=message, direction=inbound) filters ────────
-
 /// list(kind="message", direction="inbound") must return only inbound messages.
-/// Before the fix, direction was silently ignored and all messages were returned.
 #[tokio::test]
 async fn test_list_message_direction_filter() {
     let (registry, rt) = build_registry_for_ns("local");
 
-    // Self-send creates one outbound and one inbound copy.
     registry
         .dispatch(
             "comm.send",
@@ -2100,7 +1998,6 @@ async fn test_list_message_direction_filter() {
     builder.with_default_namespace("local");
     let list_registry = builder.build().expect("list registry builds");
 
-    // Filter for inbound only.
     let inbound = list_registry
         .dispatch(
             "list",
@@ -2108,7 +2005,7 @@ async fn test_list_message_direction_filter() {
         )
         .await
         .expect("list(direction=inbound) succeeds");
-    let inbound_items = inbound.as_array().expect("list returns array");
+    let inbound_items = list_items(&inbound);
     assert!(
         !inbound_items.is_empty(),
         "CC-2 C2 regression: list(direction=inbound) must return at least 1 message; got empty"
@@ -2125,7 +2022,6 @@ async fn test_list_message_direction_filter() {
         );
     }
 
-    // Filter for outbound only.
     let outbound = list_registry
         .dispatch(
             "list",
@@ -2133,7 +2029,7 @@ async fn test_list_message_direction_filter() {
         )
         .await
         .expect("list(direction=outbound) succeeds");
-    let outbound_items = outbound.as_array().expect("list returns array");
+    let outbound_items = list_items(&outbound);
     assert!(
         !outbound_items.is_empty(),
         "CC-2 C2 regression: list(direction=outbound) must return at least 1 message; got empty"
@@ -2151,19 +2047,11 @@ async fn test_list_message_direction_filter() {
     }
 }
 
-// ── ue-comm-sched C2 regression: read() rejects outbound messages ─────────────
-
 /// read() on an outbound message must return an error.
-/// Before the fix, read() silently mutated outbound messages, corrupting
-/// the read/unread invariant.
-///
-/// Cross-namespace send is denied (issue #481 fix).
-/// Same-namespace send is used here; the outbound copy stays in lambda:khive.
 #[tokio::test]
 async fn test_read_rejects_outbound_message() {
     let (registry, _rt) = build_registry_for_ns("lambda:khive");
 
-    // Same-namespace send — the outbound copy is in lambda:khive.
     let sent = registry
         .dispatch(
             "comm.send",
@@ -2177,7 +2065,6 @@ async fn test_read_rejects_outbound_message() {
         .and_then(|v| v.as_str())
         .expect("send returns full_id");
 
-    // read() on the outbound copy must be rejected.
     let result = registry
         .dispatch("comm.read", serde_json::json!({ "id": outbound_full_id }))
         .await;
@@ -2193,11 +2080,7 @@ async fn test_read_rejects_outbound_message() {
     );
 }
 
-// ── #87 regression: read() is restricted to the message's addressee ─────────
-
-/// A caller whose actor label does not match a message's `to_actor` must not be
-/// able to flip it to read — read-state is delivery state owned by the addressee.
-/// The message must stay unread after the rejected attempt.
+/// A caller whose actor label does not match a message's `to_actor` must not be able to flip it to read — read-state is delivery state owned by the addressee.
 #[tokio::test]
 async fn t87_non_addressee_read_rejected_and_stays_unread() {
     let backend = shared_backend();
@@ -2230,7 +2113,6 @@ async fn t87_non_addressee_read_rejected_and_stays_unread() {
         .map(|n| n.id.as_hyphenated().to_string())
         .expect("inbound copy addressed to lambda:b must exist");
 
-    // A (not the addressee) attempts to mark B's inbound message as read.
     let result = registry_a
         .dispatch("comm.read", serde_json::json!({ "id": inbound_id }))
         .await;
@@ -2245,7 +2127,6 @@ async fn t87_non_addressee_read_rejected_and_stays_unread() {
          addressee; got {err_msg:?}"
     );
 
-    // The message must remain unread.
     let refetched = rt_b
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
@@ -2262,7 +2143,6 @@ async fn t87_non_addressee_read_rejected_and_stays_unread() {
         "#87: message must stay unread after a rejected non-addressee read attempt"
     );
 
-    // B (the true addressee) can still mark it read.
     let ok = registry_b
         .dispatch("comm.read", serde_json::json!({ "id": inbound_id }))
         .await
@@ -2274,8 +2154,7 @@ async fn t87_non_addressee_read_rejected_and_stays_unread() {
     );
 }
 
-/// The anonymous/"local" single-actor deployment (no actor.id configured) must keep
-/// working: caller and to_actor both resolve to "local", so the equality check passes.
+/// The anonymous/"local" single-actor deployment (no actor.id configured) must keep working: caller and to_actor both resolve to "local", so the equality check passes.
 #[tokio::test]
 async fn t87_anonymous_local_single_actor_read_still_works() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -2320,11 +2199,7 @@ async fn t87_anonymous_local_single_actor_read_still_works() {
     );
 }
 
-/// Pre-ADR-057 legacy messages may carry no `to_actor` at all. Decision: fail-open
-/// (with a tracing warning) — mirrors the inbox `EqOrMissing` filter precedent (#199),
-/// where legacy to_actor-less messages stay visible to any caller. Failing closed here
-/// would leave such messages permanently unreadable and stuck "unread", defeating the
-/// unread-based wake/sweep logic this fix protects.
+/// Pre-ADR-057 legacy messages may carry no `to_actor` at all.
 #[tokio::test]
 async fn t87_legacy_message_without_to_actor_reads_fail_open() {
     let (_registry, rt) = build_registry_for_ns("lambda:legacy");
@@ -2332,7 +2207,6 @@ async fn t87_legacy_message_without_to_actor_reads_fail_open() {
         .authorize(khive_runtime::Namespace::parse("local").unwrap())
         .unwrap();
 
-    // Simulate a pre-ADR-057 row: kind=message, direction=inbound, no `to_actor` field.
     let legacy_note = rt
         .create_note(
             &token,
@@ -2371,15 +2245,11 @@ async fn t87_legacy_message_without_to_actor_reads_fail_open() {
     );
 }
 
-// ── H3 regression: thread verb is registered and returns thread messages ──────
-
 /// thread(id=X) must return all messages in the thread in chronological order.
-/// Before the fix, the thread verb was not registered, causing "unknown verb" error.
 #[tokio::test]
 async fn test_thread_verb_returns_threaded_messages() {
     let (registry, _rt) = build_registry_for_ns("local");
 
-    // Send the root message to self.
     let root = registry
         .dispatch(
             "comm.send",
@@ -2393,7 +2263,6 @@ async fn test_thread_verb_returns_threaded_messages() {
         .and_then(|v| v.as_str())
         .expect("root full_id");
 
-    // Reply to create a threaded child.
     registry
         .dispatch(
             "comm.reply",
@@ -2402,7 +2271,6 @@ async fn test_thread_verb_returns_threaded_messages() {
         .await
         .expect("reply succeeds");
 
-    // Thread verb must return at least the root + the reply.
     let thread_result = registry
         .dispatch("comm.thread", serde_json::json!({ "id": root_full_id }))
         .await
@@ -2421,8 +2289,6 @@ async fn test_thread_verb_returns_threaded_messages() {
         .get("messages")
         .and_then(|v| v.as_array())
         .expect("thread returns messages array");
-    // Messages must be in chronological order (created_at ascending).
-    // created_at is an ISO 8601 string; compare lexicographically (not as_i64).
     let timestamps: Vec<&str> = msgs
         .iter()
         .map(|m| {
@@ -2439,19 +2305,9 @@ async fn test_thread_verb_returns_threaded_messages() {
     );
 }
 
-// ── reply() delivers inbound copy alongside the outbound copy ────────────────
-
 /// reply() must write both an outbound copy and an inbound copy within the same namespace.
-///
-/// Before the fix, reply() created only an outbound note via a single
-/// create_note call, so inbox() would not surface the reply.
-///
-/// Cross-namespace send is denied (issue #481 fix).
-/// Same-namespace send is used here — both copies land in the caller's namespace.
 #[tokio::test]
 async fn test_reply_delivers_inbound_to_recipient() {
-    // lambda:khive (configured actor_id) sends to itself and replies.
-    // With proper actor attribution, inbox filters correctly and reply inbounds are visible.
     let backend = shared_backend();
     let (registry, _rt) = build_actor_registry(backend, "lambda:khive");
 
@@ -2463,7 +2319,6 @@ async fn test_reply_delivers_inbound_to_recipient() {
         .await
         .expect("self-send with actor identity succeeds");
 
-    // Find the inbound copy via inbox (actor filter matches to_actor="lambda:khive").
     let inbox = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
@@ -2472,7 +2327,6 @@ async fn test_reply_delivers_inbound_to_recipient() {
     assert_eq!(msgs.len(), 1, "must have 1 inbound message");
     let inbound_id = msgs[0].get("full_id").and_then(|v| v.as_str()).unwrap();
 
-    // Reply to the inbound message.
     registry
         .dispatch(
             "comm.reply",
@@ -2481,8 +2335,6 @@ async fn test_reply_delivers_inbound_to_recipient() {
         .await
         .expect("reply succeeds");
 
-    // After reply, inbox must contain at least 2 inbound messages
-    // (the original inbound + the reply's inbound copy, both with to_actor="lambda:khive").
     let inbox_after = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
@@ -2497,7 +2349,6 @@ async fn test_reply_delivers_inbound_to_recipient() {
          inbox count={count_after} (expected >= 2)"
     );
 
-    // All inbox items must have direction=inbound.
     let msgs_after = inbox_after
         .get("messages")
         .and_then(|v| v.as_array())
@@ -2513,10 +2364,7 @@ async fn test_reply_delivers_inbound_to_recipient() {
     );
 }
 
-// ── thread() rejects nonexistent or non-message root ─────────────────────────
-
 /// thread(id=X) with a nonexistent UUID must return an error, not a silent empty result.
-/// Before the fix, thread() accepted any resolvable UUID and returned Ok with count=0.
 #[tokio::test]
 async fn test_thread_rejects_nonexistent_root() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -2539,7 +2387,6 @@ async fn test_thread_rejects_nonexistent_root() {
 async fn test_thread_rejects_non_message_root() {
     let (registry, rt) = build_registry_for_ns("local");
 
-    // Create a non-message note (kind=observation) using the KG verb.
     let obs = registry
         .dispatch(
             "create",
@@ -2553,9 +2400,7 @@ async fn test_thread_rejects_non_message_root() {
         .and_then(|v| v.as_str())
         .expect("observation has id");
 
-    // Resolve the short id to full UUID if needed.
     let full_id = if obs_full_id.len() == 8 {
-        // Need to get the full UUID from the note store.
         let tok = rt
             .authorize(khive_runtime::Namespace::parse("local").unwrap())
             .unwrap();
@@ -2587,15 +2432,7 @@ async fn test_thread_rejects_non_message_root() {
     );
 }
 
-// ── Medium regression: inbox paginated scan works past the old prefetch window ─
-
-/// inbox() must return matching inbound messages even when more than the old
-/// prefetch window (limit*4) of non-matching messages precede them.
-///
-/// Before the fix, inbox() fetched at most limit*4 notes and applied in-memory
-/// filtering — if all newest notes were outbound, older inbound messages were
-/// invisible. This test creates 25 outbound-only messages before the inbound
-/// message to push it outside the old window.
+/// inbox() must return matching inbound messages even when more than the old prefetch window (limit*4) of non-matching messages precede them.
 #[tokio::test]
 async fn test_inbox_paginated_scan_finds_message_beyond_prefetch_window() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -2606,7 +2443,6 @@ async fn test_inbox_paginated_scan_finds_message_beyond_prefetch_window() {
     builder.with_default_namespace("local");
     let registry = builder.build().expect("registry");
 
-    // Send 1 self-send (creates both inbound and outbound copies).
     registry
         .dispatch(
             "comm.send",
@@ -2615,12 +2451,7 @@ async fn test_inbox_paginated_scan_finds_message_beyond_prefetch_window() {
         .await
         .expect("first send succeeds");
 
-    // Now send 25 cross-namespace messages — these produce outbound copies in "local"
-    // but inbound copies in "lambda:other".  The "local" namespace then has 25 outbound
-    // notes that post-date the original inbound copy.
     for i in 0..25u32 {
-        // Cross-namespace send: outbound stays in "local", inbound goes to "lambda:other".
-        // We need a second runtime/registry scoped to "local" to write outbound notes.
         let tok = rt
             .authorize(khive_runtime::Namespace::parse("local").unwrap())
             .unwrap();
@@ -2644,8 +2475,6 @@ async fn test_inbox_paginated_scan_finds_message_beyond_prefetch_window() {
             .expect("noise send succeeds");
     }
 
-    // With default limit=5, the old code fetched limit*4=20 notes (all outbound noise)
-    // and would return 0 inbound messages.  The paginated scan must find the 1 inbound.
     let inbox = registry
         .dispatch(
             "comm.inbox",
@@ -2665,8 +2494,6 @@ async fn test_inbox_paginated_scan_finds_message_beyond_prefetch_window() {
     );
 }
 
-// ── Regressions: inbox limit schema + invalid status ────────────────
-
 /// inbox(limit=200) must succeed — 200 is the documented and enforced maximum.
 #[tokio::test]
 async fn test_inbox_limit_200_succeeds() {
@@ -2677,7 +2504,6 @@ async fn test_inbox_limit_200_succeeds() {
     builder.with_default_namespace("local");
     let registry = builder.build().expect("registry");
 
-    // Provide one message so the store is non-empty.
     registry
         .dispatch(
             "comm.send",
@@ -2717,7 +2543,6 @@ async fn test_inbox_limit_201_clamps_to_200() {
         .await
         .expect("send succeeds");
 
-    // The handler uses .clamp(1, 200), so 201 is silently capped — not rejected.
     let result = registry
         .dispatch(
             "comm.inbox",
@@ -2756,20 +2581,7 @@ async fn test_inbox_invalid_status_banana_rejected() {
     );
 }
 
-// ── H1 regression: thread query finds reply within same namespace ─────────────
-
-/// A sends to self, A replies via the inbound copy, comm.thread(id=outbound_id)
-/// must return both the outbound and the reply.
-///
-/// Before the fix, dual_write_message did not stamp the outbound copy with a
-/// canonical thread_id. The reply's thread_id was then set to the inbound copy
-/// UUID, causing thread(id=outbound_id) to miss the reply.
-///
-/// After the fix, both copies share the same canonical thread_id (outbound UUID),
-/// and all replies carry that thread_id so the thread query finds them.
-///
-/// Cross-namespace send is denied (issue #481 fix).
-/// Same-namespace send is used to test the canonical thread_id invariant.
+/// A sends to self, A replies via the inbound copy, comm.thread(id=outbound_id) must return both the outbound and the reply.
 #[tokio::test]
 async fn test_cross_namespace_thread_query_finds_reply() {
     let (registry, rt) = build_registry_for_ns("lambda:khive");
@@ -2787,8 +2599,6 @@ async fn test_cross_namespace_thread_query_finds_reply() {
         .and_then(|v| v.as_str())
         .expect("send returns full_id");
 
-    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
-    // Find the inbound copy — it has a different UUID from the outbound copy.
     let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
@@ -2807,7 +2617,6 @@ async fn test_cross_namespace_thread_query_finds_reply() {
         .expect("inbound copy must exist after self-send");
     let inbound_full_id = inbound_note.id.as_hyphenated().to_string();
 
-    // Both copies must share the same canonical thread_id (= outbound UUID).
     let inbound_thread_id = inbound_note
         .properties
         .as_ref()
@@ -2821,7 +2630,6 @@ async fn test_cross_namespace_thread_query_finds_reply() {
          inbound_thread_id={inbound_thread_id}"
     );
 
-    // Reply to the inbound copy.
     registry
         .dispatch(
             "comm.reply",
@@ -2830,7 +2638,6 @@ async fn test_cross_namespace_thread_query_finds_reply() {
         .await
         .expect("reply succeeds");
 
-    // comm.thread(id=outbound_full_id) must find the reply.
     let thread_result = registry
         .dispatch("comm.thread", serde_json::json!({ "id": outbound_full_id }))
         .await
@@ -2847,8 +2654,7 @@ async fn test_cross_namespace_thread_query_finds_reply() {
     );
 }
 
-/// comm.thread resolves correctly when called with the inbound copy UUID (id_B)
-/// instead of the outbound UUID (id_A).
+/// comm.thread resolves correctly when called with the inbound copy UUID (id_B) instead of the outbound UUID (id_A).
 #[tokio::test]
 async fn test_thread_resolves_from_inbound_copy_uuid() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -2859,7 +2665,6 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
     khive_builder.with_default_namespace("lambda:khive");
     let khive_reg = khive_builder.build().expect("khive registry");
 
-    // Self-send so both copies land in the same namespace.
     let sent = khive_reg
         .dispatch(
             "comm.send",
@@ -2872,8 +2677,6 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
         .and_then(|v| v.as_str())
         .expect("outbound full_id");
 
-    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); data lives in "local".
-    // Find the inbound copy (direction=inbound) — it has a different UUID.
     let caller_token = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
@@ -2892,7 +2695,6 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
         .expect("inbound copy must exist");
     let inbound_full_id = inbound_note.id.as_hyphenated().to_string();
 
-    // Reply so there is at least one threaded message.
     khive_reg
         .dispatch(
             "comm.reply",
@@ -2901,7 +2703,6 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
         .await
         .expect("reply succeeds");
 
-    // Query thread via the inbound copy UUID.  Must return all thread messages.
     let thread_via_inbound = khive_reg
         .dispatch("comm.thread", serde_json::json!({ "id": inbound_full_id }))
         .await
@@ -2912,7 +2713,6 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
         .and_then(|v| v.as_u64())
         .expect("count");
 
-    // Query thread via the outbound copy UUID for comparison.
     let thread_via_outbound = khive_reg
         .dispatch("comm.thread", serde_json::json!({ "id": outbound_full_id }))
         .await
@@ -2933,30 +2733,13 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
     );
 }
 
-// ── M1 regression: list(kind=message) paginated scan past backlog ─────────────
-
-/// list(kind=message, direction=inbound) must find a matching message even when
-/// more than 1000 non-matching outbound messages precede it in the store.
-///
-/// Before the fix, the handler fetched at most (limit*10).min(1000) rows and
-/// applied an in-memory filter — a single matching message buried beyond 1000
-/// non-matching rows would be silently missed.
-///
-/// After the fix, the handler paginates through the store in 200-row chunks until
-/// either `limit` filtered matches are collected or the scan ceiling (10000) is
-/// reached.
+/// list(kind=message, direction=inbound) must find a matching message even when more than 1000 non-matching outbound messages precede it in the store.
 #[tokio::test]
 async fn test_list_message_finds_match_beyond_1000_backlog() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
 
-    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); write directly to "local"
-    // so that list(kind=message) dispatched through the registry sees the same data.
     let tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
 
-    // Write the inbound target FIRST so it is stored with the earliest created_at.
-    // Notes are returned newest-first by the DB; if the target were written last it
-    // would land at position 0 and be visible without paginating past the backlog —
-    // defeating the regression this test guards against.
     let target = rt
         .create_note(
             &tok,
@@ -2977,8 +2760,6 @@ async fn test_list_message_finds_match_beyond_1000_backlog() {
         .expect("create inbound target");
     let target_id = target.id.to_string();
 
-    // Write 1001 outbound noise rows AFTER the target so they sort before it
-    // (newest-first) and bury the target beyond the old 1000-row prefetch cap.
     for i in 0..1001u32 {
         rt.create_note(
             &tok,
@@ -2999,7 +2780,6 @@ async fn test_list_message_finds_match_beyond_1000_backlog() {
         .expect("create outbound note");
     }
 
-    // Build a kg-scoped registry in the same namespace for list().
     let mut list_builder = VerbRegistryBuilder::new();
     list_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
     list_builder.register(CommPack::new(rt.clone()));
@@ -3014,7 +2794,7 @@ async fn test_list_message_finds_match_beyond_1000_backlog() {
         .await
         .expect("list(direction=inbound) succeeds");
 
-    let items = result.as_array().expect("list returns array");
+    let items = list_items(&result);
     assert_eq!(
         items.len(),
         1,
@@ -3031,20 +2811,12 @@ async fn test_list_message_finds_match_beyond_1000_backlog() {
         dir, "inbound",
         "M1: returned message must have direction=inbound; got {dir}"
     );
-    // Confirm the returned item is the exact target we wrote (not some other inbound row).
     let returned_id = items[0].get("id").and_then(|v| v.as_str()).unwrap_or("");
     assert_eq!(
         returned_id, target_id,
         "M1: returned item id={returned_id} must match the target id={target_id}"
     );
 }
-
-// ── ADR-057: actor-addressed send allows lambda↔lambda messaging ──────────────
-//
-// Before ADR-057, comm.send(to="lambda:leo") from lambda:khive was denied by the
-// cross-namespace ACL gate (#481 fix). ADR-057 supersedes that gate for actor-
-// addressed sends: both copies land in the caller's namespace (lambda:khive).
-// The recipient namespace (lambda:leo) receives nothing — isolation is preserved.
 
 #[tokio::test]
 async fn test_cross_namespace_send_denied_issue_481() {
@@ -3064,8 +2836,6 @@ async fn test_cross_namespace_send_denied_issue_481() {
         "ADR-057: actor-addressed send from lambda:khive to lambda:leo must succeed; got err: {result:?}"
     );
 
-    // ADR-007 Rev 2: dispatch pins token to Namespace::local(); no write to lambda:leo ns.
-    // Verify isolation: lambda:leo namespace has no notes.
     let recipient_token = rt
         .authorize(khive_runtime::Namespace::parse("lambda:leo").unwrap())
         .unwrap();
@@ -3079,7 +2849,6 @@ async fn test_cross_namespace_send_denied_issue_481() {
         "ADR-057: no note in recipient (lambda:leo) namespace; both copies land in local ns"
     );
 
-    // ADR-007 Rev 2: both copies land in "local" (not lambda:khive).
     let local_token = rt
         .authorize(khive_runtime::Namespace::parse("local").unwrap())
         .unwrap();
@@ -3097,7 +2866,6 @@ async fn test_cross_namespace_send_denied_issue_481() {
         "ADR-057: both outbound and inbound copies must land in local ns (ADR-007 all-local); got {alive:?}"
     );
 
-    // One outbound, one inbound.
     let directions: Vec<&str> = alive
         .iter()
         .filter_map(|n| {
@@ -3116,8 +2884,6 @@ async fn test_cross_namespace_send_denied_issue_481() {
         "ADR-057: local ns must have an inbound copy; got {directions:?}"
     );
 
-    // Actor labels must be stored on both copies.
-    // ADR-007 Rev 2: from_actor = token.namespace() = "local".
     for note in &alive {
         let props = note.properties.as_ref().unwrap();
         assert_eq!(
@@ -3154,8 +2920,6 @@ async fn test_same_namespace_send_succeeds_issue_481() {
         "#481 regression: same-namespace send must return an id; got {id:?}"
     );
 }
-
-// ── #485 regression: thread sort must use ISO string comparison, not as_i64 ──
 
 #[tokio::test]
 async fn test_thread_sort_is_not_a_noop_issue_485() {
@@ -3231,8 +2995,6 @@ async fn test_thread_sort_is_not_a_noop_issue_485() {
     );
 }
 
-// ── schema_plan regression: CommPack declares comm message indexes ────────────
-
 #[tokio::test]
 async fn comm_pack_exposes_non_empty_schema_plan() {
     use khive_runtime::PackRuntime;
@@ -3267,8 +3029,6 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         combined.contains("CREATE INDEX IF NOT EXISTS"),
         "schema plan DDL must be idempotent; got: {combined}"
     );
-    // Indexes now use WHERE deleted_at IS NULL so the parameterized kind = ?N
-    // predicate can use the index (literal WHERE kind = 'message' blocks this).
     assert!(
         combined.contains("deleted_at IS NULL"),
         "schema plan indexes must use WHERE deleted_at IS NULL partial condition; got: {combined}"
@@ -3294,13 +3054,11 @@ async fn verb_registry_aggregates_comm_schema_plan() {
     );
 }
 
-/// thread isolation: comm.thread returns only messages belonging to the requested thread,
-/// not messages from other threads in the same namespace.
+/// thread isolation: comm.thread returns only messages belonging to the requested thread, not messages from other threads in the same namespace.
 #[tokio::test]
 async fn test_thread_returns_only_requested_thread_messages() {
     let (registry, _rt) = build_registry_for_ns("local");
 
-    // Send two independent root messages (thread A and thread B).
     let msg_a = registry
         .dispatch(
             "comm.send",
@@ -3321,7 +3079,6 @@ async fn test_thread_returns_only_requested_thread_messages() {
         .await
         .expect("send thread B root");
 
-    // Reply to thread A.
     registry
         .dispatch(
             "comm.reply",
@@ -3330,9 +3087,6 @@ async fn test_thread_returns_only_requested_thread_messages() {
         .await
         .expect("reply to A");
 
-    // Fetch thread A — must contain exactly the root + 1 reply (the inbound copy of each).
-    // With self-send, each comm.send creates outbound + inbound, and reply creates outbound + inbound.
-    // SQL filter ensures only thread-A messages are returned.
     let thread = registry
         .dispatch("comm.thread", serde_json::json!({ "id": thread_a_id }))
         .await
@@ -3343,7 +3097,6 @@ async fn test_thread_returns_only_requested_thread_messages() {
         .and_then(|v| v.as_array())
         .expect("messages array");
 
-    // All returned messages must have thread_id == thread_a_id.
     for msg in messages {
         let props = msg.get("properties").expect("has properties");
         let stored_tid = props
@@ -3356,7 +3109,6 @@ async fn test_thread_returns_only_requested_thread_messages() {
         );
     }
 
-    // Must have at least 2 messages (root + reply, inbound copies).
     assert!(
         messages.len() >= 2,
         "thread must contain at least root + reply; got {}",
@@ -3365,8 +3117,6 @@ async fn test_thread_returns_only_requested_thread_messages() {
 }
 
 /// read filter 5-case truth table: json_type-based filter matches old as_bool().unwrap_or(false).
-/// Seeds messages with $.read set to: missing, bool false, bool true, string "true", integer 1.
-/// Verifies that inbox(status=unread) and inbox(status=read) classify each case correctly.
 #[tokio::test]
 async fn test_inbox_read_filter_json_type_truth_table() {
     use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
@@ -3378,7 +3128,6 @@ async fn test_inbox_read_filter_json_type_truth_table() {
         .unwrap();
     let store = rt.notes(&token).expect("note store");
 
-    // Seed 5 inbound message notes directly (bypassing send) to control $.read exactly.
     let make_msg = |read_val: serde_json::Value, label: &str| -> Note {
         Note::new("local", "message", label).with_properties(serde_json::json!({
             "direction": "inbound",
@@ -3389,7 +3138,6 @@ async fn test_inbox_read_filter_json_type_truth_table() {
         }))
     };
 
-    // missing: don't set read at all in properties
     let note_missing = Note::new("local", "message", "read=missing").with_properties(
         serde_json::json!({ "direction": "inbound", "from": "local", "to": "local" }),
     );
@@ -3404,7 +3152,6 @@ async fn test_inbox_read_filter_json_type_truth_table() {
     store.upsert_note(note_str_true).await.unwrap();
     store.upsert_note(note_int_1).await.unwrap();
 
-    // Query unread: missing, false, "true" (string), 1 (integer) → all count as unread.
     let unread_filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters: vec![
@@ -3453,7 +3200,6 @@ async fn test_inbox_read_filter_json_type_truth_table() {
         "JSON bool true must NOT be unread; got {unread_contents:?}"
     );
 
-    // Query read: only JSON boolean true → exactly 1 result.
     let read_filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters: vec![
@@ -3488,8 +3234,6 @@ async fn test_inbox_read_filter_json_type_truth_table() {
     assert_eq!(read_page.items[0].content, "read=true");
 }
 
-// ── COMM-AUD-003: thread_id validation at verb boundary ───────────────────────
-
 /// send with a malformed thread_id must return InvalidInput, not persist garbage.
 #[tokio::test]
 async fn send_rejects_malformed_thread_id() {
@@ -3523,9 +3267,7 @@ async fn send_rejects_thread_prefix_with_resolution_consequence() {
     assert!(message.contains("explicit stable reference"), "{message}");
 }
 
-/// `comm.send` reports the persisted thread root so a continuation send can
-/// reuse it without fetching the message first (#1482). A root send reports
-/// the note's own UUID; a continuation send echoes the caller-supplied root.
+/// `comm.send` reports the persisted thread root so a continuation send can reuse it without fetching the message first (#1482).
 #[tokio::test]
 async fn send_response_thread_id_round_trips_root_and_continuation() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -3570,8 +3312,7 @@ async fn send_response_thread_id_round_trips_root_and_continuation() {
     );
 }
 
-/// send with a UUID-shaped but unresolvable thread_id must fail closed (issue
-/// #1673): the error names the unresolvable id and no message row is persisted.
+/// send with a UUID-shaped but unresolvable thread_id must fail closed (issue #1673): the error names the unresolvable id and no message row is persisted.
 #[tokio::test]
 async fn send_rejects_unresolvable_thread_id() {
     use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
@@ -3632,8 +3373,7 @@ async fn send_rejects_unresolvable_thread_id() {
     );
 }
 
-/// send with a thread_id that resolves to an existing thread must still
-/// thread correctly (issue #1673 must not regress legitimate threading).
+/// send with a thread_id that resolves to an existing thread must still thread correctly (issue #1673 must not regress legitimate threading).
 #[tokio::test]
 async fn send_accepts_resolvable_thread_id() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -3683,13 +3423,11 @@ async fn send_accepts_resolvable_thread_id() {
     );
 }
 
-/// `send` accepts UUID parser variants but stores only the v1 hyphenated form,
-/// so later exact-string thread queries cannot split the conversation.
+/// `send` accepts UUID parser variants but stores only the v1 hyphenated form, so later exact-string thread queries cannot split the conversation.
 #[tokio::test]
 async fn send_canonicalizes_compact_and_braced_thread_ids_for_thread_lookup() {
     let (registry, _rt) = build_registry_for_ns("local");
 
-    // First send to get a real thread root UUID.
     let root = registry
         .dispatch(
             "comm.send",
@@ -3754,14 +3492,11 @@ async fn send_canonicalizes_compact_and_braced_thread_ids_for_thread_lookup() {
     }
 }
 
-// ── COMM-AUD-004: ThreadParams deny_unknown_fields ────────────────────────────
-
 /// comm.thread with an unknown argument must return an error, not silently ignore it.
 #[tokio::test]
 async fn thread_rejects_unknown_field() {
     let (registry, _rt) = build_registry_for_ns("local");
 
-    // Send a root message so there is a valid id to use.
     let root = registry
         .dispatch(
             "comm.send",
@@ -3786,15 +3521,7 @@ async fn thread_rejects_unknown_field() {
     );
 }
 
-// ── T1-T12: cross-namespace delivery allowlist (allowed_outbound_namespaces) ─────
-
 /// Build a KhiveRuntime + VerbRegistry for cross-ns tests.
-///
-/// `dispatch_ns` — the default namespace used for dispatch (the caller identity).
-/// `allowed_outbound` — namespaces this sender may deliver into cross-namespace.
-///
-/// Both registries in a cross-ns pair must share the same `Arc<khive_db::StorageBackend>`
-/// so that outbound notes written in one namespace are visible via the other's token.
 fn build_crossns_registry(
     backend: Arc<khive_db::StorageBackend>,
     dispatch_ns: &str,
@@ -3832,8 +3559,6 @@ fn shared_backend() -> Arc<khive_db::StorageBackend> {
     Arc::new(backend)
 }
 
-// T1 — within-namespace send unchanged by the allowlist feature.
-// ADR-007 Rev 2: all storage routes to "local". Both copies land in "local".
 #[tokio::test]
 async fn t1_send_within_namespace_unchanged() {
     let backend = shared_backend();
@@ -3854,7 +3579,6 @@ async fn t1_send_within_namespace_unchanged() {
         "T1: within-ns send must succeed; got {result:?}"
     );
 
-    // ADR-007 Rev 2: dispatch pins storage to "local" regardless of default_namespace.
     let tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt.list_notes(&tok, Some("message"), 100, 0).await.unwrap();
     let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
@@ -3866,9 +3590,6 @@ async fn t1_send_within_namespace_unchanged() {
     );
 }
 
-// T2 — cross-ns send is actor-addressed (ADR-057): succeeds regardless of allowlist.
-// ADR-007 Rev 2: both copies land in "local" (the shared storage namespace).
-// Actor labels (from_actor/to_actor) in note properties distinguish sender and recipient.
 #[tokio::test]
 async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     let backend = shared_backend();
@@ -3876,7 +3597,6 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     let (_registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    // ADR-057: actor-addressed sends always succeed; allowlist no longer gates comm.send.
     let result = registry_leo
         .dispatch(
             "comm.send",
@@ -3888,7 +3608,6 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
         "T2: actor-addressed send must succeed even with empty allowlist; got {result:?}"
     );
 
-    // ADR-007 Rev 2: both outbound + inbound copies land in "local" (all-local model).
     let local_tok = rt_leo
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -3907,8 +3626,6 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
         alive.len()
     );
 
-    // Verify actor labels on both copies.
-    // ADR-007 Rev 2: from_actor is "local" (token.namespace()), to_actor is the "to" argument.
     for note in &alive {
         let from_actor = note
             .properties
@@ -3933,8 +3650,6 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     }
 }
 
-// T3 — actor-addressed send (ADR-057): both copies land in "local" (ADR-007 Rev 2).
-// Actor labels from_actor/to_actor in note properties identify routing participants.
 #[tokio::test]
 async fn t3_send_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
@@ -3958,7 +3673,6 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         "T3: response must carry full_id"
     );
 
-    // ADR-007 Rev 2: all notes land in "local", not the sender's configured namespace.
     let local_tok = rt_leo
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -3986,7 +3700,6 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         .map(|s| s.to_string())
         .expect("T3: outbound note must have thread_id");
 
-    // ADR-057: inbound copy also lands in "local" (ADR-007 all-local; not separate sender ns).
     let inbound: Vec<_> = local_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
@@ -4004,7 +3717,6 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         "T3: expect 1 inbound note in local ns — ADR-007 all-local + ADR-057 actor-addressed"
     );
     let inbound_note = inbound[0];
-    // Actor labels identify routing participants; from_actor = "local" (token.namespace()).
     assert_eq!(
         inbound_note
             .properties
@@ -4040,8 +3752,6 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
     );
 }
 
-// T4 — inbound note's namespace column is "local" (ADR-007 Rev 2 all-local model).
-// ADR-057 actor-addressed delivery: both copies land in "local", identified by actor labels.
 #[tokio::test]
 async fn t4_inbound_note_namespace_is_recipient() {
     let backend = shared_backend();
@@ -4057,7 +3767,6 @@ async fn t4_inbound_note_namespace_is_recipient() {
         .await
         .expect("T4: send must succeed");
 
-    // ADR-007 Rev 2: inbound note is in "local" (not the configured sender namespace).
     let local_tok = rt_leo
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -4081,7 +3790,6 @@ async fn t4_inbound_note_namespace_is_recipient() {
         "local",
         "T4: inbound note namespace must be 'local' (ADR-007 Rev 2 all-local model)"
     );
-    // Actor label distinguishes the intended recipient.
     assert_eq!(
         inbound_note
             .properties
@@ -4093,22 +3801,13 @@ async fn t4_inbound_note_namespace_is_recipient() {
     );
 }
 
-// T5 — ADR-057 §(c): actor-addressed delivery with configured identity.
-//
-// A sender with actor_id="lambda:khive" sends to "lambda:leo". Both copies land in
-// the "local" namespace (ADR-007 all-local). The recipient (actor_id="lambda:leo")
-// sees the message in their inbox because the to_actor filter matches.
-//
-// An anonymous caller on the same backend sees 0 messages (inbox leak closed, #199).
 #[tokio::test]
 async fn t5_recipient_inbox_sees_message() {
     let backend = shared_backend();
     let (registry_sender, rt_local) = build_actor_registry(Arc::clone(&backend), "lambda:khive");
-    // Recipient configured with actor_id="lambda:leo" to receive messages addressed to them.
     let (registry_recipient, _rt_recipient) =
         build_actor_registry(Arc::clone(&backend), "lambda:leo");
 
-    // Send from lambda:khive to actor label "lambda:leo".
     let send_result = registry_sender
         .dispatch(
             "comm.send",
@@ -4120,7 +3819,6 @@ async fn t5_recipient_inbox_sees_message() {
         "T5: send from 'lambda:khive' to 'lambda:leo' must succeed; got {send_result:?}"
     );
 
-    // The inbound note has to_actor="lambda:leo" and lives in namespace "local".
     let local_tok = rt_local
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -4161,7 +3859,6 @@ async fn t5_recipient_inbox_sees_message() {
         "T5: inbound note must have to_actor='lambda:leo'"
     );
 
-    // The configured recipient (actor_id="lambda:leo") sees the message in their inbox.
     let inbox = registry_recipient
         .dispatch("comm.inbox", serde_json::json!({}))
         .await
@@ -4172,7 +3869,6 @@ async fn t5_recipient_inbox_sees_message() {
         "T5: 'lambda:leo' inbox must see the inbound message; got count={count}"
     );
 
-    // Namespace isolation: both outbound + inbound copies are in "local" (ADR-007).
     let local_alive = all_notes.iter().filter(|n| n.deleted_at.is_none()).count();
     assert_eq!(
         local_alive, 2,
@@ -4180,22 +3876,11 @@ async fn t5_recipient_inbox_sees_message() {
     );
 }
 
-// T5b — ADR-057: comm.reply always writes same-namespace.
-//
-// Reply on a configured-actor setup proves the fail-closed reply path: after the fix,
-// handle_reply ALWAYS passes caller_ns as both `from` and `to` to dual_write_message
-// and always sets from_actor/to_actor. No path through handle_reply can cause
-// dual_write_message to mint a token in a foreign namespace.
-//
-// We use actor_id="lambda:khive" (self-send to "lambda:khive") so that the inbox
-// filter correctly surfaces both the original inbound and the reply inbound, both
-// of which have to_actor="lambda:khive".
 #[tokio::test]
 async fn t5b_reply_always_writes_same_namespace() {
     let backend = shared_backend();
     let (registry_local, rt_local) = build_actor_registry(Arc::clone(&backend), "lambda:khive");
 
-    // Self-send from lambda:khive to lambda:khive — both copies in "local".
     let send_val = registry_local
         .dispatch(
             "comm.send",
@@ -4213,7 +3898,6 @@ async fn t5b_reply_always_writes_same_namespace() {
         .map(|s| s.to_string())
         .expect("T5b: send must return full_id");
 
-    // Find the inbound note in "local".
     let local_tok = rt_local
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -4234,7 +3918,6 @@ async fn t5b_reply_always_writes_same_namespace() {
         .map(|n| n.id.as_hyphenated().to_string())
         .expect("T5b: must find inbound note in 'local'");
 
-    // Reply from the same registry.
     let reply_result = registry_local
         .dispatch(
             "comm.reply",
@@ -4247,7 +3930,6 @@ async fn t5b_reply_always_writes_same_namespace() {
     );
     let reply_val = reply_result.unwrap();
 
-    // Reply carries the same thread_id as the original send.
     let reply_thread_id = reply_val
         .get("thread_id")
         .and_then(|v| v.as_str())
@@ -4258,8 +3940,6 @@ async fn t5b_reply_always_writes_same_namespace() {
         "T5b: reply thread_id must equal original outbound UUID"
     );
 
-    // All four notes (outbound1, inbound1, outbound2, inbound2) are in "local".
-    // No note exists in any other namespace.
     let notes_after = rt_local
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
@@ -4281,7 +3961,6 @@ async fn t5b_reply_always_writes_same_namespace() {
         );
     }
 
-    // The inbox (actor_id="lambda:khive") sees the inbound messages (to_actor="lambda:khive").
     let inbox_after = registry_local
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
@@ -4296,13 +3975,6 @@ async fn t5b_reply_always_writes_same_namespace() {
     );
 }
 
-// T6 — inbox isolation: sender does NOT see inbound copy addressed to another actor.
-//
-// An anonymous sender (no actor_id) sends from "lambda:leo" namespace to "lambda:khive".
-// The inbound note has to_actor="lambda:khive". The sender's inbox uses EqOrMissing("local")
-// filter (anonymous), so it sees 0 messages. The inbound copy is invisible to the sender.
-//
-// This is the CORRECT post-#199-fix behavior. The old behavior (seeing 1) was the leak.
 #[tokio::test]
 async fn t6_sender_inbox_does_not_see_inbound_copy() {
     let backend = shared_backend();
@@ -4320,8 +3992,6 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
         .await
         .expect("T6: send must succeed");
 
-    // After fix #199: anonymous sender's inbox does NOT see the inbound copy addressed
-    // to "lambda:khive". EqOrMissing("local") filter returns 0 (no matching to_actor).
     let inbox = registry_leo
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
@@ -4333,23 +4003,6 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
     );
 }
 
-// T7 — white-box: with_namespace token scoping (realigned to ADR-007 by-ID contract, #148).
-//
-// `NamespaceToken::with_namespace(recipient)` produces a token scoped to the
-// recipient namespace.  It is an ordinary NamespaceToken — NOT a type-enforced
-// write-only capability.
-//
-// Under ADR-007 rule 2 (PR #148), by-ID operations are namespace-blind: the token's
-// namespace is used for WRITE attribution and multi-record LIST filtering only.
-// A `get_note_including_deleted` call resolves a globally-unique UUID and returns
-// the record regardless of which namespace the token carries.
-//
-//   (a) The minted token CAN read the SENDER-namespace note by UUID (by-ID reads are
-//       namespace-blind; the gate, not the token's visible set, is the auth boundary).
-//   (b) The minted token CAN read the RECIPIENT-namespace note by UUID (same contract).
-//
-// The security boundary remains the sender-side allowlist check on comm.send;
-// the token type does not enforce read isolation on by-ID fetches.
 #[tokio::test]
 async fn t7_with_namespace_token_scoping() {
     let backend = shared_backend();
@@ -4361,7 +4014,6 @@ async fn t7_with_namespace_token_scoping() {
     let (_registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    // Create a note in lambda:leo (sender) namespace.
     let leo_tok = rt_leo
         .authorize(Namespace::parse("lambda:leo").unwrap())
         .unwrap();
@@ -4378,7 +4030,6 @@ async fn t7_with_namespace_token_scoping() {
         .await
         .expect("T7: create sender note");
 
-    // Create a note in lambda:khive (recipient) namespace.
     let khive_tok = rt_khive
         .authorize(Namespace::parse("lambda:khive").unwrap())
         .unwrap();
@@ -4395,20 +4046,14 @@ async fn t7_with_namespace_token_scoping() {
         .await
         .expect("T7: create recipient note");
 
-    // Mint the kind of token that with_namespace produces (recipient-scoped).
     let recipient_tok: NamespaceToken =
         leo_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
 
-    // (a) By-ID reads are namespace-blind (ADR-007 rule 2, PR #148): the minted
-    // token CAN read a sender-namespace note by UUID. The stored namespace of
-    // the returned note must still reflect where it was created (lambda:leo).
     let can_see_sender = rt_leo
         .get_note_including_deleted(&recipient_tok, sender_note.id)
         .await;
     match can_see_sender {
         Ok(Some(note)) => {
-            // Expected: by-ID fetch ignores the token's namespace; record is returned.
-            // The note's own namespace must be the write namespace it was created in.
             assert_eq!(
                 note.namespace, "lambda:leo",
                 "T7(a): stored namespace must be the sender's write namespace"
@@ -4421,14 +4066,11 @@ async fn t7_with_namespace_token_scoping() {
         Err(e) => panic!("T7(a): unexpected error {e:?}"),
     }
 
-    // (b) Minted token CAN read the recipient-ns note — it is a full read+write token
-    // for the recipient ns; by-ID reads are namespace-blind in any case (#148).
     let can_see_recipient = rt_khive
         .get_note_including_deleted(&recipient_tok, recipient_note.id)
         .await;
     match can_see_recipient {
         Ok(Some(note)) => {
-            // Expected: the minted token can read from its own namespace (lambda:khive).
             assert_eq!(
                 note.namespace, "lambda:khive",
                 "T7(b): stored namespace must be the recipient's write namespace"
@@ -4439,9 +4081,6 @@ async fn t7_with_namespace_token_scoping() {
     }
 }
 
-// T8 — ADR-007 Rev 2: inbound note is in "local" (all-local model).
-// A local-namespace token CAN read the inbound note. No separate recipient namespace exists.
-// Recipient isolation is provided by actor labels (to_actor), not namespace partitioning.
 #[tokio::test]
 async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
     let backend = shared_backend();
@@ -4457,7 +4096,6 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .await
         .expect("T8: send must succeed");
 
-    // ADR-007 Rev 2: inbound note is in "local" (not the configured sender namespace).
     let local_tok = rt_leo
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -4478,7 +4116,6 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .map(|n| n.id)
         .expect("T8: must find inbound note in local ns (ADR-007 all-local)");
 
-    // A local-namespace token CAN read the inbound note (it lives in local).
     let can_read = rt_leo
         .get_note_including_deleted(&local_tok, inbound_id)
         .await;
@@ -4488,7 +4125,6 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         Err(e) => panic!("T8: unexpected error reading inbound note: {e:?}"),
     }
 
-    // Verify actor label marks the intended recipient on the inbound copy.
     let inbound_note = local_notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
@@ -4511,20 +4147,12 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
     );
 }
 
-// T9 — actor-addressed reply (ADR-057) with ADR-007 Rev 2 all-local model.
-//
-// ADR-007: all writes go to "local". ADR-057: actor labels distinguish routing.
-// example actor (registry_shared) sends to khive (both copies in "local"). Then replies to
-// the inbound copy, verifying reply inherits the canonical thread_id.
 #[tokio::test]
 async fn t9_reply_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
-    // Both actors use a registry with default_namespace="lambda:shared", but ADR-007
-    // ensures all storage routes to "local".
     let (registry_shared, rt_shared) =
         build_crossns_registry(Arc::clone(&backend), "lambda:shared", vec![]);
 
-    // "example actor" (operating as lambda:shared) sends to "khive".
     let send_result = registry_shared
         .dispatch(
             "comm.send",
@@ -4538,7 +4166,6 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
         .map(|s| s.to_string())
         .expect("T9: send must return full_id");
 
-    // ADR-007 Rev 2: all notes are in "local", not "lambda:shared".
     let local_tok = rt_shared
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -4559,7 +4186,6 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
         .map(|n| n.id.as_hyphenated().to_string())
         .expect("T9: must find inbound note in local ns (ADR-007 all-local)");
 
-    // Reply to the inbound message using the same registry.
     let reply_result = registry_shared
         .dispatch(
             "comm.reply",
@@ -4572,7 +4198,6 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
     );
     let reply_val = reply_result.unwrap();
 
-    // Reply carries the same thread_id as the original send.
     let reply_thread_id = reply_val
         .get("thread_id")
         .and_then(|v| v.as_str())
@@ -4583,7 +4208,6 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
         "T9: reply thread_id must match original outbound UUID"
     );
 
-    // Four notes in local ns: outbound1 + inbound1 + outbound2 (reply) + inbound2.
     let notes_after = rt_shared
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
@@ -4598,10 +4222,6 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
     );
 }
 
-// T10 — ADR-057: reply to a non-existent message ID fails with NotFound.
-// Under actor-addressed delivery, the inbound note is in the SENDER's namespace
-// (lambda:leo), not the recipient's (lambda:khive). A reply attempt by khive
-// using a random ID fails because the note is not visible in khive's namespace.
 #[tokio::test]
 async fn t10_reply_cross_ns_denied_when_empty() {
     let backend = shared_backend();
@@ -4610,7 +4230,6 @@ async fn t10_reply_cross_ns_denied_when_empty() {
     let (registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    // leo sends to khive — both copies land in leo ns, khive ns gets nothing.
     registry_leo
         .dispatch(
             "comm.send",
@@ -4619,8 +4238,6 @@ async fn t10_reply_cross_ns_denied_when_empty() {
         .await
         .expect("T10: initial send must succeed");
 
-    // khive attempts to reply using a well-formed but non-existent UUID.
-    // The inbound note is in lambda:leo ns, invisible to lambda:khive registry.
     let nonexistent_id = "00000000-0000-0000-0000-000000000000";
     let reply_result = registry_khive
         .dispatch(
@@ -4641,15 +4258,11 @@ async fn t10_reply_cross_ns_denied_when_empty() {
     );
 }
 
-// T11 — ADR-057: actor-addressed send always succeeds (allowlist no longer gates comm.send).
-// ADR-007 Rev 2: both notes land in "local" (all-local model).
-// The rollback path (dual_write_message) is tested by T13/T14 via FTS/vector injection.
 #[tokio::test]
 async fn t11_inbound_write_failure_rolls_back_outbound() {
     let backend = shared_backend();
     let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
 
-    // ADR-057: send is actor-addressed and always succeeds regardless of allowlist.
     let result = registry_leo
         .dispatch(
             "comm.send",
@@ -4661,7 +4274,6 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
         "T11: actor-addressed send must succeed; got {result:?}"
     );
 
-    // ADR-007 Rev 2: both outbound + inbound copies land in "local" (not sender ns).
     let local_tok = rt_leo
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -4679,10 +4291,6 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
     );
 }
 
-// T12 — ADR-057: both directions succeed (actor-addressed, allowlist no longer gates comm.send).
-// ADR-007 Rev 2: each send produces 2 notes in "local" (all-local model).
-// After 2 sends (leo→khive and khive→leo), "local" has 4 notes total.
-// Actor labels distinguish the sender/recipient for each pair.
 #[tokio::test]
 async fn t12_allowlist_is_one_directional() {
     let backend = shared_backend();
@@ -4690,7 +4298,6 @@ async fn t12_allowlist_is_one_directional() {
     let (registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    // leo → khive: succeeds.
     let result_leo = registry_leo
         .dispatch(
             "comm.send",
@@ -4702,7 +4309,6 @@ async fn t12_allowlist_is_one_directional() {
         "T12: leo→khive send must succeed under ADR-057; got {result_leo:?}"
     );
 
-    // ADR-007 Rev 2: notes from leo's send are in "local" (rt_leo's backend).
     let local_tok_leo = rt_leo
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -4719,7 +4325,6 @@ async fn t12_allowlist_is_one_directional() {
         "T12: 2 notes (outbound+inbound) in local ns after leo→khive send"
     );
 
-    // khive → leo: also succeeds.
     let result_khive = registry_khive
         .dispatch(
             "comm.send",
@@ -4731,7 +4336,6 @@ async fn t12_allowlist_is_one_directional() {
         "T12: khive→leo send must succeed under ADR-057; got {result_khive:?}"
     );
 
-    // ADR-007 Rev 2: notes from khive's send are also in "local" (shared backend).
     let local_tok_khive = rt_khive
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
@@ -4739,7 +4343,6 @@ async fn t12_allowlist_is_one_directional() {
         .list_notes(&local_tok_khive, Some("message"), 100, 0)
         .await
         .unwrap();
-    // Both registries share the same backend, so local has 4 notes total (2 per send).
     assert_eq!(
         khive_local_notes
             .iter()
@@ -4750,27 +4353,14 @@ async fn t12_allowlist_is_one_directional() {
     );
 }
 
-// T13 — FTS failure on note write leaves no stranded row.
-//
-// Under ADR-007 Rev 2 dispatch pins the storage token to Namespace::local().
-// arm_fts_fail("local") would race against every other concurrent test that
-// writes a note to "local". To preserve namespace-targeting isolation, this
-// test uses a unique UUID namespace via rt.create_note() directly (bypassing
-// dispatch). This validates the same create_note_inner rollback behavior —
-// commit row → FTS error → compensate (delete row) → return Err — without
-// the cross-test injection race that "local" would introduce.
 #[tokio::test]
 async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
     use khive_runtime::arm_fts_fail_scoped;
 
-    // Unique namespace keeps the process-global FTS_FAIL_NS one-shot isolated
-    // from other concurrent tests (each test uses a different UUID).
     let unique_ns = format!("t13-{}", uuid::Uuid::new_v4().simple());
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let tok = rt.authorize(Namespace::parse(&unique_ns).unwrap()).unwrap();
 
-    // Arm FTS injection on the unique namespace — fires on the next create_note
-    // call in this namespace, then clears (one-shot).
     let _fts_arm = arm_fts_fail_scoped(&unique_ns);
 
     // Attempt to create a note; the FTS step must fail and roll back the row.
@@ -4790,7 +4380,6 @@ async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
         "T13: create_note must fail when FTS injection is armed; got: {result:?}"
     );
 
-    // No live note must remain — the row was compensated by create_note_inner.
     let notes = rt.list_notes(&tok, Some("message"), 100, 0).await.unwrap();
     let alive = notes.iter().filter(|n| n.deleted_at.is_none()).count();
     assert_eq!(
@@ -4799,15 +4388,6 @@ async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
     );
 }
 
-// T14 — vector insertion failure on note write leaves no stranded row.
-//
-// Under ADR-007 Rev 2 dispatch pins the storage token to Namespace::local().
-// arm_vector_fail("local") would race against every other concurrent test that
-// writes a note with an embedder registered. To preserve namespace-targeting
-// isolation, this test uses a unique UUID namespace via rt.create_note()
-// directly (bypassing dispatch). This validates the same create_note_inner
-// rollback behavior — commit row → FTS ok → vector error → compensate (delete
-// row + FTS) → return Err — without the cross-test injection race.
 #[tokio::test]
 async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
     use async_trait::async_trait;
@@ -4849,15 +4429,11 @@ async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
         }
     }
 
-    // Unique namespace keeps the process-global VECTOR_FAIL_NS one-shot isolated
-    // from other concurrent tests (each test uses a different UUID).
     let unique_ns = format!("t14-{}", uuid::Uuid::new_v4().simple());
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     rt.register_embedder(T14VecProvider);
     let tok = rt.authorize(Namespace::parse(&unique_ns).unwrap()).unwrap();
 
-    // Arm vector injection on the unique namespace — fires on the next create_note
-    // call in this namespace after row + FTS commit, then clears (one-shot).
     let _vector_arm = arm_vector_fail_scoped(&unique_ns);
 
     // Attempt to create a note; the vector step must fail and roll back row + FTS.
@@ -4877,7 +4453,6 @@ async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
         "T14: create_note must fail when vector injection is armed; got: {result:?}"
     );
 
-    // No live note must remain — the row was compensated by create_note_inner.
     let notes = rt.list_notes(&tok, Some("message"), 100, 0).await.unwrap();
     let alive = notes.iter().filter(|n| n.deleted_at.is_none()).count();
     assert_eq!(
@@ -4886,16 +4461,7 @@ async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
     );
 }
 
-// ── Issue #75 regression: actor-identity filter (ADR-057) ────────────────────
-//
-// Root cause: handle_inbox read caller_actor from token.namespace() (always
-// "local") instead of token.actor().id. The to_actor guard was permanently
-// dormant. After the fix, when RuntimeConfig.actor_id is set, authorize() mints
-// a token carrying that actor label, activating the filter.
-
-/// Build a comm registry backed by a shared in-memory StorageBackend with a
-/// configured actor identity. The minted token's actor.id will equal `actor_id`,
-/// activating the to_actor filter in handle_inbox.
+/// Build a comm registry backed by a shared in-memory StorageBackend with a configured actor identity.
 fn build_actor_registry(
     backend: Arc<khive_db::StorageBackend>,
     actor_id: &str,
@@ -4923,7 +4489,7 @@ fn build_actor_registry(
     (registry, rt)
 }
 
-/// Actor A sends to actor B. B's inbox should see the message; A's inbox should not.
+/// Actor A sends to actor B.
 #[tokio::test]
 async fn t_actor_inbox_filters_to_actor() {
     let backend = shared_backend();
@@ -4931,7 +4497,6 @@ async fn t_actor_inbox_filters_to_actor() {
     let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
     let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
 
-    // A sends to B.
     let send_result = registry_a
         .dispatch(
             "comm.send",
@@ -4944,8 +4509,6 @@ async fn t_actor_inbox_filters_to_actor() {
         "send must return id: {send_result}"
     );
 
-    // B's inbox (status=all) should contain exactly one message addressed to lambda:b.
-    // Note: comm.inbox already filters for direction=inbound; all returned messages are inbound.
     let b_inbox = registry_b
         .dispatch(
             "comm.inbox",
@@ -4960,7 +4523,6 @@ async fn t_actor_inbox_filters_to_actor() {
         1,
         "B must see exactly 1 message (addressed to lambda:b); count={b_count}, messages: {b_messages:?}"
     );
-    // Verify the message is addressed to lambda:b (via the properties.to_actor field).
     let b_to_actor = b_messages[0]["properties"]["to_actor"].as_str();
     assert_eq!(
         b_to_actor,
@@ -4968,7 +4530,6 @@ async fn t_actor_inbox_filters_to_actor() {
         "message must be addressed to lambda:b; got {b_to_actor:?}"
     );
 
-    // A's inbox should NOT contain the message (it was addressed to lambda:b, not lambda:a).
     let a_inbox = registry_a
         .dispatch(
             "comm.inbox",
@@ -4983,18 +4544,11 @@ async fn t_actor_inbox_filters_to_actor() {
     );
 }
 
-/// After fix #199, an anonymous caller's inbox is filtered to messages with to_actor="local"
-/// or absent. Messages sent to specific actor labels (e.g. "lambda:x", "lambda:y") are
-/// NOT visible to anonymous callers — this closes the cross-actor inbox read leak.
-///
-/// Prior behavior (pre-fix): all messages were visible to anonymous callers ("party-line
-/// fallback"). That behavior was the bug.
+/// After fix #199, an anonymous caller's inbox is filtered to messages with to_actor="local" or absent.
 #[tokio::test]
 async fn t_anonymous_actor_inbox_filters_addressed_messages() {
     let (registry, _rt) = build_registry();
 
-    // Send two messages from the same anonymous session to specific actor labels.
-    // These sends emit a tracing::warn! (#200) but proceed.
     registry
         .dispatch(
             "comm.send",
@@ -5064,9 +4618,6 @@ allowed_outbound_namespaces = ["lambda:other"]
     );
 }
 
-// TOML wiring test — KhiveConfig parsed from TOML with
-// `actor.allowed_outbound_namespaces = [...]` must land those values in
-// RuntimeConfig.allowed_outbound_namespaces.
 #[test]
 fn toml_allowed_outbound_namespaces_wires_into_runtime_config() {
     use khive_runtime::{runtime_config_from_khive_config, RuntimeConfig};
@@ -5109,31 +4660,7 @@ allowed_outbound_namespaces = ["lambda:khive", "lambda:atlas"]
     );
 }
 
-// ---------------------------------------------------------------------------
-// Cluster-2 isolation tests (branch fix/comm-tenant-isolation-strict)
-// ---------------------------------------------------------------------------
-//
-// These tests were added as part of the pre-cloud-hardening audit (2026-06-23).
-// They cover the decision-independent (no ADR required) half of the isolation
-// story:
-//   - #199 (comm.inbox actor-filter bypass): the to_actor filter must isolate
-//     tenants when actor_id IS configured.
-//   - #224 (gate actor identity gap): the GateRequest.actor must carry the
-//     configured actor identity, not ActorRef::anonymous(), so a cloud TenantGate
-//     can act on it. Fixed in PR #271, which removed the #[ignore] attribute.
-//     The test now passes unconditionally.
-
-/// When two registries share the same storage backend but carry distinct
-/// configured actor identities, `comm.inbox` must isolate each actor's view:
-///
-/// - Actor A sends to B → B's inbox (status=all) shows the message; A's does not.
-/// - Actor B sends to A → A's inbox (status=all) shows the message; B's does not.
-///
-/// This is the end-to-end isolation assertion for #199. It PASSES today when
-/// `actor_id` is properly configured per-registry. The test documents that the
-/// to_actor filter is active and working — the misconfiguration footgun (missing
-/// actor_id → party-line) is addressed separately by the strict-mode startup gate
-/// (`KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`).
+/// When two registries share the same storage backend but carry distinct configured actor identities, `comm.inbox` must isolate each actor's view: - Actor A sends to B → B's inbox (status=all) shows the message; A's does not. - Actor B sends to A → A's inbox (status=all) shows the message; B's does not.
 #[tokio::test]
 async fn t_c2_inbox_isolation_cross_actor() {
     let backend = shared_backend();
@@ -5141,7 +4668,6 @@ async fn t_c2_inbox_isolation_cross_actor() {
     let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:tenant-a");
     let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:tenant-b");
 
-    // A sends to B.
     let send_ab = registry_a
         .dispatch(
             "comm.send",
@@ -5154,7 +4680,6 @@ async fn t_c2_inbox_isolation_cross_actor() {
         "send must return id: {send_ab}"
     );
 
-    // B sends to A.
     let send_ba = registry_b
         .dispatch(
             "comm.send",
@@ -5167,7 +4692,6 @@ async fn t_c2_inbox_isolation_cross_actor() {
         "send must return id: {send_ba}"
     );
 
-    // B's inbox must contain exactly one message (the one addressed to tenant-b).
     let b_inbox = registry_b
         .dispatch(
             "comm.inbox",
@@ -5187,7 +4711,6 @@ async fn t_c2_inbox_isolation_cross_actor() {
         "B's inbox message must be the one A sent to B; got {b_content:?}"
     );
 
-    // A's inbox must contain exactly one message (the one addressed to tenant-a).
     let a_inbox = registry_a
         .dispatch(
             "comm.inbox",
@@ -5209,19 +4732,11 @@ async fn t_c2_inbox_isolation_cross_actor() {
 }
 
 /// Verifies that the configured actor identity reaches the gate (issue #224 fix).
-///
-/// When `actor_id = "lambda:tenant-x"` is set on the `VerbRegistryBuilder`, the
-/// `GateRequest.actor.id` must equal `"lambda:tenant-x"` so that a cloud
-/// `TenantGate` can enforce per-actor policies. Fixed in PR #234 by threading the
-/// configured actor into `VerbRegistry::dispatch` before the gate consult.
-///
-/// See: https://github.com/ohdearquant/khive/issues/224
 #[tokio::test]
 async fn t_c2_gate_receives_configured_actor_not_anonymous() {
     use khive_runtime::{Gate, GateDecision, GateError, GateRef, GateRequest};
     use std::sync::Mutex;
 
-    // A recording gate that captures every actor ID it sees.
     #[derive(Debug)]
     struct RecordingGate {
         seen_actor_ids: Mutex<Vec<String>>,
@@ -5264,7 +4779,6 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
     builder.with_gate(gate.clone() as GateRef);
     let registry = builder.build().expect("registry with recording gate");
 
-    // Dispatch any verb — the gate is consulted before pack dispatch.
     let _ = registry
         .dispatch(
             "comm.inbox",
@@ -5273,9 +4787,6 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
         .await
         .expect("inbox dispatch must not error");
 
-    // The gate must have recorded the configured "lambda:tenant-x" actor, not
-    // "local" (anonymous). #234 threads the configured actor into dispatch so
-    // the gate sees it before the consult; a regression would record "local".
     let seen = gate.seen_actor_ids.lock().unwrap();
     assert!(
         seen.iter().any(|id| id == "lambda:tenant-x"),
@@ -5286,30 +4797,9 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
     );
 }
 
-// ── Issue #199 / #200 regression: actor attribution and inbox isolation ────────
-//
-// These tests reproduce the two bugs fixed in this PR:
-//
-// #200: from_actor stamped as 'local' when sender has no actor.id configured but
-//       sends to a specific actor label.  Addressed sends from anonymous callers
-//       must be rejected; party-line self-sends (to="local") still work.
-//
-// #199: inbox actor-filter skipped when caller resolves to anonymous/'local'.
-//       An unconfigured caller must NOT see messages addressed to other actors;
-//       they must only see messages whose to_actor is "local" (or absent/NULL).
-
 /// #200 regression: anonymous sender sending to a specific actor label stamps from_actor="local".
-///
-/// The send is NOT rejected (to preserve backward compatibility with sessions that set
-/// default_namespace but not actor_id), but attribution is mis-stamped. A tracing::warn!
-/// is emitted. This is a known limitation pending issue #75 (actor identity per request).
-///
-/// The important invariant: even with the corrupted from_actor, the message is stored and
-/// the #199 inbox fix prevents OTHER anonymous callers from reading messages with
-/// to_actor set to a specific label.
 #[tokio::test]
 async fn i199_200_anonymous_send_to_specific_actor_is_warned() {
-    // build_registry() has no actor_id → token.actor().id = "local".
     let (registry, _rt) = build_registry();
 
     let result = registry
@@ -5319,7 +4809,6 @@ async fn i199_200_anonymous_send_to_specific_actor_is_warned() {
         )
         .await;
 
-    // The send proceeds (warn-only), not rejected.
     assert!(
         result.is_ok(),
         "#200: anonymous send to a specific actor must proceed (warn-only); got err: {result:?}"
@@ -5332,11 +4821,8 @@ async fn i199_200_anonymous_send_to_specific_actor_is_warned() {
 }
 
 /// #200 / single-tenant: anonymous sender sending to "local" (party-line) still works.
-///
-/// The fix must not break OSS single-tenant deployments where everyone is 'local'.
 #[tokio::test]
 async fn i199_200_anonymous_send_to_local_still_works() {
-    // build_registry() has no actor_id → anonymous caller.
     let (registry, _rt) = build_registry();
 
     let result = registry
@@ -5357,18 +4843,10 @@ async fn i199_200_anonymous_send_to_local_still_works() {
 }
 
 /// #199 regression: anonymous caller must NOT read messages addressed to other actors.
-///
-/// Before the fix, `comm.inbox` with an unconfigured caller (actor="local") returned
-/// ALL inbound messages regardless of `to_actor`, leaking cross-actor inbox content.
-/// After the fix, the anonymous caller only sees messages with to_actor="local" or
-/// to_actor absent/NULL.
 #[tokio::test]
 async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
     let backend = shared_backend();
 
-    // Actor B (configured) sends a message addressed to itself.  We inject the
-    // inbound note directly to give it to_actor="lambda:b" without going through
-    // the send gate that would now reject an anonymous send.
     let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
     registry_b
         .dispatch(
@@ -5382,7 +4860,6 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
         .await
         .expect("B sends to itself");
 
-    // Confirm B can read its own inbox (1 message).
     let b_inbox = registry_b
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
@@ -5412,7 +4889,6 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
     let mut builder_anon = VerbRegistryBuilder::new();
     builder_anon.register(khive_pack_kg::KgPack::new(rt_anon.clone()));
     builder_anon.register(CommPack::new(rt_anon.clone()));
-    // No with_actor_id → anonymous.
     let registry_anon = builder_anon.build().expect("anon registry");
 
     let anon_inbox = registry_anon
@@ -5431,15 +4907,10 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
 }
 
 /// #199 / single-tenant: anonymous caller still sees messages addressed to "local".
-///
-/// Party-line messages (to_actor="local" or to_actor absent) must remain visible
-/// to anonymous callers — this is the OSS single-tenant case.
 #[tokio::test]
 async fn i199_anonymous_inbox_sees_local_messages() {
-    // build_registry() has no actor_id → anonymous.
     let (registry, _rt) = build_registry();
 
-    // Send to "local" — this is the single-tenant party-line path.
     registry
         .dispatch(
             "comm.send",
@@ -5459,8 +4930,6 @@ async fn i199_anonymous_inbox_sees_local_messages() {
          got count={count}"
     );
 }
-
-// --- ingest routing tests (actor routing via default_inbound_actor + correlation) ---
 
 /// Helper: ingest a message note and return the stored props.
 async fn ingest_and_get_props(
@@ -5545,9 +5014,7 @@ async fn ingest_dedup_returns_existing_canonical_thread_id() {
     );
 }
 
-/// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must
-/// echo the literal stored value — not fabricate the duplicate's note UUID
-/// (which would route a caller into a DIFFERENT thread on a later send).
+/// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must echo the literal stored value — not fabricate the duplicate's note UUID (which would route a caller into a DIFFERENT thread on a later send).
 #[tokio::test]
 async fn ingest_dedup_echoes_stored_non_uuid_thread_label() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -5604,8 +5071,7 @@ async fn ingest_dedup_echoes_stored_non_uuid_thread_label() {
     );
 }
 
-/// Dedup ack for a legacy row with NO stored thread_id falls back to the
-/// duplicate's note UUID as thread root (#479b) and flags the derivation.
+/// Dedup ack for a legacy row with NO stored thread_id falls back to the duplicate's note UUID as thread root (#479b) and flags the derivation.
 #[tokio::test]
 async fn ingest_dedup_without_stored_thread_id_falls_back_with_warning() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -5659,12 +5125,7 @@ async fn ingest_dedup_without_stored_thread_id_falls_back_with_warning() {
     );
 }
 
-// ── list(kind=message) thread filter: legacy all-hex labels vs. UUID prefixes ──
-
-/// Regression (PR #1623 round 2): an all-hex >=8-char stored thread label
-/// that is NOT a UUID (e.g. "deadbeef") must still be matched exactly — the
-/// UUID-prefix arm in the resolver must not swallow it and error "no message
-/// thread matches prefix". A genuine UUID prefix must still resolve.
+/// Regression (PR #1623): an all-hex >=8-char stored thread label that is NOT a UUID (e.g. "deadbeef") must still be matched exactly — the UUID-prefix arm in the resolver must not swallow it and error "no message thread matches prefix".
 #[tokio::test]
 async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -5672,7 +5133,6 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
         .authorize(khive_runtime::Namespace::local())
         .expect("authorize local");
 
-    // Legacy row: an all-hex, 8-char, non-UUID thread label stored verbatim.
     rt.create_note(
         &token,
         "message",
@@ -5685,8 +5145,6 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
     .await
     .expect("create legacy hex-labeled message");
 
-    // Arm 1: the legacy all-hex label must resolve exactly, not error as an
-    // unmatched UUID prefix.
     let legacy = registry
         .dispatch(
             "list",
@@ -5694,7 +5152,7 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
         )
         .await
         .expect("legacy all-hex label must match exactly, not error");
-    let legacy = legacy.as_array().expect("list result array");
+    let legacy = list_items(&legacy);
     assert_eq!(
         legacy.len(),
         1,
@@ -5702,7 +5160,6 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
     );
     assert_eq!(legacy[0]["properties"]["thread_id"], "deadbeef");
 
-    // Arm 2: a genuine UUID prefix must still resolve to its thread.
     let thread = "bbbbcccc-1111-2222-3333-444455556666";
     rt.create_note(
         &token,
@@ -5723,7 +5180,7 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
         )
         .await
         .expect("genuine UUID prefix must still resolve");
-    let prefixed = prefixed.as_array().expect("list result array");
+    let prefixed = list_items(&prefixed);
     assert_eq!(
         prefixed.len(),
         1,
@@ -5732,11 +5189,7 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
     assert_eq!(prefixed[0]["properties"]["thread_id"], thread);
 }
 
-/// Regression (PR #1623 round 3): the thread-prefix resolver must scan ONLY
-/// `message` notes. A non-message note carrying a `thread_id` property that
-/// shares the queried prefix must not inject a second candidate (which would
-/// surface as a false "ambiguous thread_id prefix" error) when the caller
-/// lists with the substrate-level kind that leaves the note kind unbound.
+/// Regression (PR #1623): the thread-prefix resolver must scan ONLY `message` notes.
 #[tokio::test]
 async fn list_thread_prefix_resolution_ignores_non_message_notes() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -5757,8 +5210,6 @@ async fn list_thread_prefix_resolution_ignores_non_message_notes() {
     .await
     .expect("create uuid-threaded message");
 
-    // Decoy: a non-message note carrying a thread_id whose first 8 hex chars
-    // collide with the message thread's prefix.
     rt.create_note(
         &token,
         "observation",
@@ -5771,8 +5222,6 @@ async fn list_thread_prefix_resolution_ignores_non_message_notes() {
     .await
     .expect("create decoy observation");
 
-    // list(kind="note") leaves the note-kind filter unbound, so pre-fix the
-    // DISTINCT scan saw both UUIDs and errored "ambiguous thread_id prefix".
     let result = registry
         .dispatch(
             "list",
@@ -5780,7 +5229,7 @@ async fn list_thread_prefix_resolution_ignores_non_message_notes() {
         )
         .await
         .expect("prefix resolution must ignore non-message notes");
-    let notes = result.as_array().expect("list result array");
+    let notes = list_items(&result);
     assert_eq!(
         notes.len(),
         1,
@@ -5790,11 +5239,7 @@ async fn list_thread_prefix_resolution_ignores_non_message_notes() {
     assert_eq!(notes[0]["properties"]["thread_id"], message_thread);
 }
 
-/// Regression (PR #1623 round 4): thread-prefix resolution must use the SAME
-/// visibility scope as the list read (`['local'] ∪ visible_namespaces`). A
-/// thread stored only in a configured visible namespace is returned by the
-/// list path, so its prefix must resolve rather than error "no message
-/// thread matches".
+/// Regression (PR #1623): thread-prefix resolution must use the SAME visibility scope as the list read (`['local'] ∪ visible_namespaces`).
 #[tokio::test]
 async fn list_thread_prefix_resolves_across_configured_visible_namespaces() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -5828,7 +5273,7 @@ async fn list_thread_prefix_resolves_across_configured_visible_namespaces() {
         )
         .await
         .expect("a prefix of a thread in a visible namespace must resolve");
-    let messages = result.as_array().expect("list result array");
+    let messages = list_items(&result);
     assert_eq!(
         messages.len(),
         1,
@@ -5837,10 +5282,7 @@ async fn list_thread_prefix_resolves_across_configured_visible_namespaces() {
     assert_eq!(messages[0]["properties"]["thread_id"], thread);
 }
 
-/// Regression (PR #1623 round 4): when the same prefix matches two DIFFERENT
-/// thread UUIDs — one in the primary namespace, one in a configured visible
-/// namespace — the resolver must report the ambiguity instead of silently
-/// resolving to the primary row and omitting the visible one.
+/// Regression (PR #1623): when the same prefix matches two DIFFERENT thread UUIDs — one in the primary namespace, one in a configured visible namespace — the resolver must report the ambiguity instead of silently resolving to the primary row and omitting the visible one.
 #[tokio::test]
 async fn list_thread_prefix_collision_across_visible_namespaces_is_ambiguous() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -5899,16 +5341,11 @@ async fn list_thread_prefix_collision_across_visible_namespaces_is_ambiguous() {
     );
 }
 
-/// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive
-/// → ingested note to_actor=lambda:khive.
+/// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive → ingested note to_actor=lambda:khive.
 #[tokio::test]
 async fn ingest_routing_reply_routes_to_original_sender() {
     let (registry, rt) = build_registry_for_ns("local");
 
-    // Plant an outbound message that looks like one lambda:khive sent.
-    // We use comm.send to write the note, then read its external_id back.
-    // We need a note with properties.external_id set so correlation resolution can find it.
-    // Directly insert via the runtime store to control all fields.
     let outbound_external_id = "<sent-msg-001@khive.ai>";
     {
         use khive_storage::note::Note;
@@ -5945,7 +5382,6 @@ async fn ingest_routing_reply_routes_to_original_sender() {
         store.upsert_note(note).await.expect("upsert outbound note");
     }
 
-    // Ingest a reply whose correlation_external_id matches the outbound note's external_id.
     let props = ingest_and_get_props(
         &registry,
         &rt,
@@ -5967,18 +5403,12 @@ async fn ingest_routing_reply_routes_to_original_sender() {
     );
 }
 
-/// (a2) Regression: outbound stores its Message-ID in wire form `<id@domain>`, but an
-/// inbound `In-Reply-To` is delivered bracket-free (`id@domain`) because `mail_parser`
-/// strips the angle brackets. Pass-1 must still correlate the reply back to the original
-/// sender. Before the bracket-toggle fix this fell through to `default_inbound_actor`
-/// (lambda:leo) with a fresh thread — the exact failure seen on the live round-trip.
+/// (a2) Regression: outbound stores its Message-ID in wire form `<id@domain>`, but an inbound `In-Reply-To` is delivered bracket-free (`id@domain`) because `mail_parser` strips the angle brackets.
 #[tokio::test]
 async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
     let (registry, rt) = build_registry_for_ns("local");
 
-    // Outbound note stores the Message-ID WITH angle brackets (wire form).
     let outbound_external_id = "<sent-msg-002@khive.ai>";
-    // Inbound In-Reply-To arrives WITHOUT brackets (mail_parser strips them).
     let inbound_correlation = "sent-msg-002@khive.ai";
     let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
     {
@@ -6095,26 +5525,13 @@ async fn ingest_routing_no_default_falls_back_to_to_field() {
     );
 }
 
-// ── X-Khive-Thread-ID header correlation (thread-UUID fallback) ───
-//
-// When our own outbound email carries X-Khive-Thread-ID = <thread_uuid>, a reply
-// that preserves that header arrives with correlation_external_id = <thread_uuid>.
-// The existing pass-1 (external_id match) finds nothing because thread_uuid ≠
-// the note's external_id (which is a Message-ID).  The new pass-2 matches
-// $.thread_id on an outbound note to recover from_actor and route the reply
-// back to the original sender's actor.
-
-/// (d) Reply correlating via thread-UUID (X-Khive-Thread-ID fallback) routes to
-/// the original sender's actor even when no external_id match exists.
+/// (d) Reply correlating via thread-UUID (X-Khive-Thread-ID fallback) routes to the original sender's actor even when no external_id match exists.
 #[tokio::test]
 async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
     use khive_storage::note::Note;
 
     let (registry, rt) = build_registry_for_ns("local");
 
-    // Plant an outbound message note directly (simulates one we already sent).
-    // Properties: external_id is a standard Message-ID; thread_id is the internal UUID.
-    // from_actor is the actor we expect the reply to route back to.
     let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
     {
         let token = rt
@@ -6138,7 +5555,6 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
                 "to": "email:user@example.com",
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
-                // external_id is a real Message-ID — NOT the thread_uuid.
                 "external_id": "<original-message-id@khive.ai>",
                 "thread_id": thread_uuid,
                 "sent_at": chrono::Utc::now().to_rfc3339(),
@@ -6150,9 +5566,6 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
         store.upsert_note(note).await.expect("upsert outbound note");
     }
 
-    // Ingest a reply whose X-Khive-Thread-ID uses an accepted braced UUID
-    // spelling. Pass 2 must query with the canonical spelling stored above,
-    // recover from_actor=lambda:khive, and keep the selected root canonical.
     let braced_thread_uuid = format!("{{{thread_uuid}}}");
     let props = ingest_and_get_props(
         &registry,
@@ -6182,10 +5595,7 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
     );
 }
 
-/// Pass-2 correlation must also probe the URN and upper-hex spellings a
-/// pre-v1 handler could have stored, not just canonical/compact/braced. A
-/// canonical incoming correlation must still find a legacy outbound row
-/// whose `thread_id` was persisted in one of those forms.
+/// Pass-2 correlation must also probe the URN and upper-hex spellings a pre-v1 handler could have stored, not just canonical/compact/braced.
 #[tokio::test]
 async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -6228,7 +5638,6 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
         store.upsert_note(note).await.expect("upsert outbound note");
     }
 
-    // Legacy row #1: thread_id stored in lower URN form.
     let urn_thread_uuid = uuid::Uuid::new_v4();
     plant_outbound_with_thread_id(
         &rt,
@@ -6238,7 +5647,6 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
     )
     .await;
 
-    // Legacy row #2: thread_id stored in upper-hex hyphenated form.
     let upper_thread_uuid = uuid::Uuid::new_v4();
     plant_outbound_with_thread_id(
         &rt,
@@ -6248,8 +5656,6 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
     )
     .await;
 
-    // Reply correlates with the canonical spelling — pass 2 must still find
-    // the legacy URN-stored row and recover its from_actor/root.
     let urn_props = ingest_and_get_props(
         &registry,
         &rt,
@@ -6277,7 +5683,6 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
          hyphenated spelling; got props={urn_props}"
     );
 
-    // Same check against the upper-hex-stored row.
     let upper_props = ingest_and_get_props(
         &registry,
         &rt,
@@ -6305,12 +5710,6 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
          hyphenated spelling; got props={upper_props}"
     );
 }
-
-// --- issue #403: In-Reply-To/References on outbound replies (native MUA threading) ---
-//
-// khive's own thread continuity uses X-Khive-Thread-ID / external_id correlation
-// (tested above); native mail clients (iPhone Mail, Gmail) instead group
-// conversations by RFC 5322 Message-ID ancestry, which these tests cover.
 
 /// Helper: plant a message note directly with the given properties, returning its UUID.
 async fn plant_message_note(
@@ -6375,10 +5774,7 @@ async fn reply_and_get_outbound_props(
     note.properties.expect("note has properties")
 }
 
-/// (a) Reply to an inbound-originated parent: the parent's Message-ID lives in
-/// `wire_message_id` (bracket-free, as `mail_parser` delivers it), never in
-/// `external_id`, which for an inbound note is the unrelated IMAP dedup key.
-/// The reply must read `wire_message_id` and wrap it for the wire.
+/// (a) Reply to an inbound-originated parent: the parent's Message-ID lives in `wire_message_id` (bracket-free, as `mail_parser` delivers it), never in `external_id`, which for an inbound note is the unrelated IMAP dedup key.
 #[tokio::test]
 async fn reply_sets_in_reply_to_for_inbound_originated_parent() {
     let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
@@ -6394,7 +5790,6 @@ async fn reply_sets_in_reply_to_for_inbound_originated_parent() {
             "to_actor": "lambda:khive",
             // IMAP dedup key -- must NOT be mistaken for a Message-ID.
             "external_id": "imap:host:1:42",
-            // The email's own Message-ID, bracket-free as mail_parser delivers it.
             "wire_message_id": "inbound-msg-001@example.com",
             "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
             "sent_at": chrono::Utc::now().to_rfc3339(),
@@ -6412,9 +5807,7 @@ async fn reply_sets_in_reply_to_for_inbound_originated_parent() {
     );
 }
 
-/// (b) Reply to an outbound-minted parent: the parent's own Message-ID was
-/// self-minted into `external_id` (bracketed) by the outbox delivery loop. The
-/// reply must reuse it verbatim.
+/// (b) Reply to an outbound-minted parent: the parent's own Message-ID was self-minted into `external_id` (bracketed) by the outbox delivery loop.
 #[tokio::test]
 async fn reply_sets_in_reply_to_for_outbound_minted_parent() {
     let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
@@ -6445,9 +5838,7 @@ async fn reply_sets_in_reply_to_for_outbound_minted_parent() {
     );
 }
 
-/// (c) Reply to a parent with no known wire Message-ID (e.g. a khive-internal
-/// message never routed through email): no In-Reply-To/References must be
-/// fabricated, and the reply still succeeds exactly as before this feature.
+/// (c) Reply to a parent with no known wire Message-ID (e.g. a khive-internal message never routed through email): no In-Reply-To/References must be fabricated, and the reply still succeeds exactly as before this feature.
 #[tokio::test]
 async fn reply_omits_in_reply_to_when_parent_has_no_wire_message_id() {
     let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
@@ -6476,8 +5867,7 @@ async fn reply_omits_in_reply_to_when_parent_has_no_wire_message_id() {
     );
 }
 
-/// `comm.ingest` with `wire_message_id` persists it on the resulting note, kept
-/// distinct from `external_id` (the IMAP dedup key).
+/// `comm.ingest` with `wire_message_id` persists it on the resulting note, kept distinct from `external_id` (the IMAP dedup key).
 #[tokio::test]
 async fn ingest_persists_wire_message_id_distinct_from_external_id() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -6533,8 +5923,7 @@ async fn ingest_omits_wire_message_id_when_absent() {
     );
 }
 
-/// `comm.ingest` with `wire_references` persists it on the resulting note, kept
-/// distinct from `external_id` (the IMAP dedup key) and from `wire_message_id`.
+/// `comm.ingest` with `wire_references` persists it on the resulting note, kept distinct from `external_id` (the IMAP dedup key) and from `wire_message_id`.
 #[tokio::test]
 async fn ingest_persists_wire_references_distinct_from_external_id() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -6591,16 +5980,7 @@ async fn ingest_omits_wire_references_when_absent() {
     );
 }
 
-// --- issue #403: References must carry the full ancestor chain ---
-//
-// The prior implementation set References from the single
-// `in_reply_to` value, dropping any ancestors before the immediate parent.
-// These tests assert the exact serialized References/In-Reply-To values
-// (not just presence) for each required case.
-
-/// (a) Reply whose parent has an existing References chain of 2+ ids: the
-/// reply's References must be that chain followed by the parent's own
-/// Message-ID, and In-Reply-To must remain exactly the parent Message-ID.
+/// (a) Reply whose parent has an existing References chain of 2+ ids: the reply's References must be that chain followed by the parent's own Message-ID, and In-Reply-To must remain exactly the parent Message-ID.
 #[tokio::test]
 async fn reply_extends_existing_references_chain_of_two_or_more() {
     let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
@@ -6638,9 +6018,7 @@ async fn reply_extends_existing_references_chain_of_two_or_more() {
     );
 }
 
-/// (b) Reply whose parent has no References chain of its own (e.g. it was a
-/// thread root): References must degrade gracefully to the parent Message-ID
-/// alone, identical to pre-chain-preservation behavior.
+/// (b) Reply whose parent has no References chain of its own (e.g. it was a thread root): References must degrade gracefully to the parent Message-ID alone, identical to pre-chain-preservation behavior.
 #[tokio::test]
 async fn reply_references_falls_back_to_parent_message_id_when_no_chain() {
     let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
@@ -6676,10 +6054,7 @@ async fn reply_references_falls_back_to_parent_message_id_when_no_chain() {
     );
 }
 
-/// (c) Reply-to-outbound direction: the parent was one of our own prior sends,
-/// so its chain lives in `references_chain` (not `wire_references`). A reply
-/// must extend THAT chain, proving the direction-aware read is wired through
-/// `comm.reply` end-to-end, not just unit-tested on `parent_references_chain`.
+/// (c) Reply-to-outbound direction: the parent was one of our own prior sends, so its chain lives in `references_chain` (not `wire_references`).
 #[tokio::test]
 async fn reply_extends_references_chain_for_outbound_parent() {
     let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
@@ -6723,8 +6098,7 @@ async fn reply_extends_references_chain_for_outbound_parent() {
     );
 }
 
-/// (d) A malformed token embedded in the parent's stored chain must be skipped
-/// rather than propagated into the reply's References header.
+/// (d) A malformed token embedded in the parent's stored chain must be skipped rather than propagated into the reply's References header.
 #[tokio::test]
 async fn reply_skips_malformed_token_in_parent_references_chain() {
     let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
@@ -6757,13 +6131,7 @@ async fn reply_skips_malformed_token_in_parent_references_chain() {
     );
 }
 
-/// (e) A stored `references_chain` that is itself tainted -- already containing
-/// an equivalent of the parent's own Message-ID (e.g. legacy/corrupted data;
-/// this exact shape is never produced by `comm.reply` itself, see test (c)
-/// above, which now uses the realistic ancestors-only shape) -- must not be
-/// propagated as a literal duplicate. The duplicate is dropped and first-seen
-/// order is preserved: the parent's id keeps its original position in the
-/// chain rather than being appended again at the end.
+/// (e) A stored `references_chain` that is itself tainted -- already containing an equivalent of the parent's own Message-ID (e.g. legacy/corrupted data; this exact shape is never produced by `comm.reply` itself, see test (c) above, which now uses the realistic ancestors-only shape) -- must not be propagated as a literal duplicate.
 #[tokio::test]
 async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
     let (registry, rt) = build_actor_registry(shared_backend(), "lambda:khive");
@@ -6800,13 +6168,7 @@ async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
     );
 }
 
-// --- issue #448: quarantine metadata must survive comm.ingest persistence ---
-
-/// A quarantined envelope (as `EmailChannel::quarantine_envelope` builds it, ADR-056
-/// Amendment 2026-07-02) must persist its `quarantined`/`quarantine_reason`/
-/// `quarantine_claimed_from` markers through `comm.ingest`, and `from`/`from_actor`
-/// must stay the fixed `email:quarantine` marker -- `quarantine_claimed_from` is
-/// carried for maintainer review only, never as an attribution source.
+/// A quarantined envelope (as `EmailChannel::quarantine_envelope` builds it, ADR-056 Amendment 2026-07-02) must persist its `quarantined`/`quarantine_reason`/ `quarantine_claimed_from` markers through `comm.ingest`, and `from`/`from_actor` must stay the fixed `email:quarantine` marker -- `quarantine_claimed_from` is carried for maintainer review only, never as an attribution source.
 #[tokio::test]
 async fn ingest_persists_quarantine_metadata_and_never_attributes_claimed_sender() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -6860,8 +6222,7 @@ async fn ingest_persists_quarantine_metadata_and_never_attributes_claimed_sender
     );
 }
 
-/// Absent `metadata` must leave persisted properties exactly as before this fix
-/// (no `quarantined`/`quarantine_reason`/`quarantine_claimed_from` keys at all).
+/// Absent `metadata` must leave persisted properties exactly as before this fix (no `quarantined`/`quarantine_reason`/`quarantine_claimed_from` keys at all).
 #[tokio::test]
 async fn ingest_without_metadata_persists_no_quarantine_keys() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -6893,9 +6254,7 @@ async fn ingest_without_metadata_persists_no_quarantine_keys() {
     );
 }
 
-/// Metadata must merge additively: it must never be able to override a stable
-/// field the handler stamped or fabricate an optional stable field that is not
-/// meaningful for direct ingest (`outbound_ref`, `sent_by_process`).
+/// Metadata must merge additively: it must never be able to override a stable field the handler stamped or fabricate an optional stable field that is not meaningful for direct ingest (`outbound_ref`, `sent_by_process`).
 #[tokio::test]
 async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -6951,12 +6310,7 @@ async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
     );
 }
 
-// ── Issue #479a: comm.ingest must reject malformed thread_id ─────────────────
-
-/// `comm.ingest` with a malformed `thread_id` must return `InvalidInput` and
-/// must not write any note (issue #479a). Before the fix, an invalid thread_id
-/// was silently filtered out and replaced with a fresh UUID, splitting the
-/// message into the wrong conversation while still reporting success.
+/// `comm.ingest` with a malformed `thread_id` must return `InvalidInput` and must not write any note (issue #479a).
 #[tokio::test]
 async fn ingest_rejects_malformed_thread_id_without_writing_note() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -6999,8 +6353,7 @@ async fn ingest_rejects_malformed_thread_id_without_writing_note() {
     );
 }
 
-/// `comm.ingest` accepts a compact UUID but reports and persists the canonical
-/// full-hyphenated v1 spelling.
+/// `comm.ingest` accepts a compact UUID but reports and persists the canonical full-hyphenated v1 spelling.
 #[tokio::test]
 async fn ingest_canonicalizes_valid_uuid_thread_id() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -7050,8 +6403,7 @@ async fn ingest_canonicalizes_valid_uuid_thread_id() {
     );
 }
 
-/// A transport timestamp is an instant, not opaque adapter text: accepted
-/// RFC 3339 offsets are normalized to UTC before the v1 marker is written.
+/// A transport timestamp is an instant, not opaque adapter text: accepted RFC 3339 offsets are normalized to UTC before the v1 marker is written.
 #[tokio::test]
 async fn ingest_canonicalizes_rfc3339_sent_at() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -7101,8 +6453,7 @@ async fn ingest_canonicalizes_rfc3339_sent_at() {
     );
 }
 
-/// A supplied timestamp that names no instant must fail before any v1 message
-/// is persisted; silently accepting it would make `comm_schema_version=1` lie.
+/// A supplied timestamp that names no instant must fail before any v1 message is persisted; silently accepting it would make `comm_schema_version=1` lie.
 #[tokio::test]
 async fn ingest_rejects_malformed_sent_at_without_writing_note() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -7142,13 +6493,7 @@ async fn ingest_rejects_malformed_sent_at_without_writing_note() {
     );
 }
 
-// ── Issue #479b: missing thread roots fall back to the matched message's own UUID ──
-
-/// A reply correlated to an outbound message that has no `thread_id` property
-/// (e.g. a legacy/imported row) must reuse the outbound note's own UUID as the
-/// canonical root and route to the original `from_actor`, instead of being
-/// treated as unmatched and split into a fresh thread routed to the default
-/// inbound actor.
+/// A reply correlated to an outbound message that has no `thread_id` property (e.g. a legacy/imported row) must reuse the outbound note's own UUID as the canonical root and route to the original `from_actor`, instead of being treated as unmatched and split into a fresh thread routed to the default inbound actor.
 #[tokio::test]
 async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -7179,8 +6524,6 @@ async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() 
                 "from_actor": "lambda:khive",
                 "to_actor": "email:user@example.com",
                 "external_id": outbound_external_id,
-                // No `thread_id` -- simulates a legacy/imported root row written
-                // before the canonical thread_id field existed.
                 "sent_at": chrono::Utc::now().to_rfc3339(),
             })),
             created_at: now,
@@ -7237,9 +6580,7 @@ async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() 
     );
 }
 
-/// Correlation against a legacy outbound row may recover a UUID stored in a
-/// compact spelling. The new inbound row must canonicalize that root, and a
-/// thread lookup through a pre-v1 child id must still include every spelling.
+/// Correlation against a legacy outbound row may recover a UUID stored in a compact spelling.
 #[tokio::test]
 async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -7357,10 +6698,7 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
     }
 }
 
-/// A mixed thread can contain children written before v1 preserved UUID input
-/// verbatim and children written after v1 with a canonical root. Starting from
-/// either the canonical root or a new v1 child must recover every legacy
-/// formatter spelling, not only the spelling carried by the selected row.
+/// A mixed thread can contain children written before v1 preserved UUID input verbatim and children written after v1 with a canonical root.
 #[tokio::test]
 async fn thread_from_canonical_rows_includes_all_legacy_uuid_spellings_once() {
     use khive_storage::note::Note;
@@ -7472,9 +6810,7 @@ async fn thread_from_canonical_rows_includes_all_legacy_uuid_spellings_once() {
     }
 }
 
-/// `comm.thread` must include a root message that has no `thread_id` property
-/// at all (issue #479b) -- the SQL query only matches `properties.thread_id ==
-/// root`, which a thread-id-less root can never satisfy on its own.
+/// `comm.thread` must include a root message that has no `thread_id` property at all (issue #479b) -- the SQL query only matches `properties.thread_id == root`, which a thread-id-less root can never satisfy on its own.
 #[tokio::test]
 async fn thread_includes_root_message_without_thread_id_property() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -7563,11 +6899,7 @@ async fn thread_includes_root_message_without_thread_id_property() {
     );
 }
 
-// --- comm.heartbeat / comm.health (khive #606) ---
-
-/// design review amendment 1 (blocking): a fresh install with no persisted daemon
-/// heartbeat state must report `role: "client"` with an empty channel list —
-/// never fabricate channel entries the comm pack has no evidence for.
+/// design review amendment 1 (blocking): a fresh install with no persisted daemon heartbeat state must report `role: "client"` with an empty channel list — never fabricate channel entries the comm pack has no evidence for.
 #[tokio::test]
 async fn health_reports_client_role_when_no_heartbeat_state_exists() {
     let (registry, _rt) = build_registry();
@@ -7589,10 +6921,7 @@ async fn health_reports_client_role_when_no_heartbeat_state_exists() {
     );
 }
 
-/// ADR-103 Stage 1 / issue #723 ask 2: `comm.health()` must self-report this
-/// process's own resource usage — `cpu_us`/`rss_bytes` via `getrusage`, plus
-/// the (possibly empty) set of named background phases currently in flight.
-/// No computed `healthy` field, matching the rest of this verb's contract.
+/// ADR-103 Stage 1 / issue #723 ask 2: `comm.health()` must self-report this process's own resource usage — `cpu_us`/`rss_bytes` via `getrusage`, plus the (possibly empty) set of named background phases currently in flight.
 #[tokio::test]
 async fn health_includes_resource_self_report() {
     let (registry, _rt) = build_registry();
@@ -7611,9 +6940,6 @@ async fn health_includes_resource_self_report() {
         resource.get("healthy").is_none(),
         "resource must never carry a computed healthy bool"
     );
-    // `getrusage` should succeed on every CI runner this crate builds on
-    // (unix); the field must at least be present (null only on a platform
-    // with no implementation) and non-negative when populated.
     assert!(
         resource.get("cpu_us").is_some(),
         "cpu_us key must be present"
@@ -7634,8 +6960,7 @@ async fn health_includes_resource_self_report() {
     );
 }
 
-/// comm.health() takes no arguments — any caller-supplied args must be rejected
-/// rather than silently ignored (spec: "read-only, NO args").
+/// comm.health() takes no arguments — any caller-supplied args must be rejected rather than silently ignored (spec: "read-only, NO args").
 #[tokio::test]
 async fn health_rejects_stray_args() {
     let (registry, _rt) = build_registry();
@@ -7650,11 +6975,7 @@ async fn health_rejects_stray_args() {
     );
 }
 
-/// Core cross-process-read contract (design review amendment 1): once the daemon
-/// persists a successful heartbeat, `comm.health()` returns it annotated
-/// `role: "daemon"`, `source: "daemon-heartbeat"` — this is true even though
-/// the *reading* call is a plain in-process dispatch here, mirroring a
-/// client-role stdio caller reading state it did not write itself.
+/// Core cross-process-read contract (design review amendment 1): once the daemon persists a successful heartbeat, `comm.health()` returns it annotated `role: "daemon"`, `source: "daemon-heartbeat"` — this is true even though the *reading* call is a plain in-process dispatch here, mirroring a client-role stdio caller reading state it did not write itself.
 #[tokio::test]
 async fn heartbeat_success_is_visible_via_health() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -7694,8 +7015,7 @@ async fn heartbeat_success_is_visible_via_health() {
     assert_eq!(ch["consecutive_failures"].as_u64(), Some(0));
 }
 
-/// #1472: a silently stopped poller must be distinguishable from a healthy,
-/// idle channel even when its persisted failure count is zero.
+/// #1472: a silently stopped poller must be distinguishable from a healthy, idle channel even when its persisted failure count is zero.
 #[tokio::test]
 async fn health_flags_stopped_poller_after_three_nominal_intervals() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -7726,8 +7046,7 @@ async fn health_flags_stopped_poller_after_three_nominal_intervals() {
     assert_eq!(channel["stalled"].as_bool(), Some(true));
 }
 
-/// Mixed-version rows lack cadence metadata. Their staleness is unknown, not
-/// false: `false` would misreport an old frozen row as current.
+/// Mixed-version rows lack cadence metadata.
 #[tokio::test]
 async fn health_reports_null_stalled_for_legacy_heartbeat() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -7755,8 +7074,7 @@ async fn health_reports_null_stalled_for_legacy_heartbeat() {
     assert!(channel["stalled"].is_null());
 }
 
-/// A future attempt timestamp cannot support an elapsed-time judgment (for
-/// example under clock skew), so it must not be reported as current.
+/// A future attempt timestamp cannot support an elapsed-time judgment (for example under clock skew), so it must not be reported as current.
 #[tokio::test]
 async fn health_reports_null_stalled_for_future_attempt() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -7784,8 +7102,7 @@ async fn health_reports_null_stalled_for_future_attempt() {
     assert!(health["channels"][0]["stalled"].is_null());
 }
 
-/// Malformed persisted failure counters cannot safely distinguish a healthy
-/// idle channel from one in failure/backoff, so their staleness is unknown.
+/// Malformed persisted failure counters cannot safely distinguish a healthy idle channel from one in failure/backoff, so their staleness is unknown.
 #[tokio::test]
 async fn health_reports_null_stalled_for_malformed_or_missing_failure_count() {
     use khive_storage::note::Note;
@@ -7844,9 +7161,7 @@ async fn health_reports_null_stalled_for_malformed_or_missing_failure_count() {
     );
 }
 
-/// design review amendment 3: `last_error` is RETAINED after a subsequent success
-/// (callers compare `last_error.at` vs `last_success_at`), and
-/// `consecutive_failures` resets to 0 on success.
+/// design review amendment 3: `last_error` is RETAINED after a subsequent success (callers compare `last_error.at` vs `last_success_at`), and `consecutive_failures` resets to 0 on success.
 #[tokio::test]
 async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failures() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -7930,8 +7245,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
     assert_eq!(ch["stalled"].as_bool(), Some(false));
 }
 
-/// design review amendment 2: rows are keyed by channel slug + kind, never kind
-/// alone — two accounts of the same kind must not collapse into one row.
+/// design review amendment 2: rows are keyed by channel slug + kind, never kind alone — two accounts of the same kind must not collapse into one row.
 #[tokio::test]
 async fn heartbeat_keys_by_slug_not_kind_alone() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -7981,8 +7295,7 @@ async fn heartbeat_keys_by_slug_not_kind_alone() {
     assert!(slugs.contains("ops@khive.ai"));
 }
 
-/// Repeated heartbeats for the same (kind, slug) update the same row (via
-/// `upsert_note`'s deterministic id) rather than accumulating duplicates.
+/// Repeated heartbeats for the same (kind, slug) update the same row (via `upsert_note`'s deterministic id) rather than accumulating duplicates.
 #[tokio::test]
 async fn heartbeat_repeated_calls_update_same_row() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8080,8 +7393,7 @@ async fn heartbeat_rejects_invalid_outcome() {
     );
 }
 
-/// Spec: "report TIMESTAMPS only ... never a computed `healthy: bool`" —
-/// the channel entry shape must not carry any boolean health verdict.
+/// Spec: "report TIMESTAMPS only ... never a computed `healthy: bool`" — the channel entry shape must not carry any boolean health verdict.
 #[tokio::test]
 async fn health_channel_entry_never_carries_a_healthy_bool() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8114,20 +7426,7 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
     );
 }
 
-/// khive #877: `comm.health` must read `channel_health` rows from the
-/// caller's injected namespace (`token.namespace()`), not the fixed
-/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant. Plants one row
-/// directly under `"local"` and one directly under a non-local `"tenant-a"`
-/// namespace, planting directly rather than via `comm.heartbeat` to isolate
-/// the `comm.health` read path under test — the heartbeat write-path namespace
-/// is covered by the #917 writer tests below. An unscoped call
-/// defaults to `"local"` and must see only the local row; a call with an
-/// explicit `namespace="tenant-a"` must see only tenant-a's row, never
-/// local's. Also asserts the response's `namespace` field (khive #877)
-/// names the namespace actually read for both the unscoped and the
-/// explicitly-scoped call, so a caller can tell "no daemon anywhere" apart
-/// from "no rows under my scope yet" instead of the two cases being
-/// indistinguishable client-role/empty-channels responses.
+/// khive #877: `comm.health` must read `channel_health` rows from the caller's injected namespace (`token.namespace()`), not the fixed `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant.
 #[tokio::test]
 async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
     use khive_storage::note::Note;
@@ -8218,18 +7517,7 @@ async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
     );
 }
 
-/// khive #917: an authorized per-tenant writer — an embedding host that
-/// authenticates a tenant principal out-of-band and dispatches via
-/// `VerbRegistry::dispatch_as` with a `VerifiedActor`, passing the tenant's
-/// own namespace as the explicit `namespace` dispatch param (ADR-007 Rev 6
-/// Rule 3's explicit escape, the same mechanism the local poll loop already
-/// uses to pin its own writes to `"local"`) — persists its `comm.heartbeat`
-/// row under that tenant's own namespace rather than the fixed
-/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant. A tenant-scoped
-/// `comm.health` read now sees that row (closing the "reads an empty set by
-/// construction" gap #917 reports), while the default (local-scoped)
-/// `comm.health` read is unaffected — heartbeat rows for different
-/// namespaces do not bleed into each other.
+/// khive #917: an authorized per-tenant writer — an embedding host that authenticates a tenant principal out-of-band and dispatches via `VerbRegistry::dispatch_as` with a `VerifiedActor`, passing the tenant's own namespace as the explicit `namespace` dispatch param (ADR-007 Rev 6 Rule 3's explicit escape, the same mechanism the local poll loop already uses to pin its own writes to `"local"`) — persists its `comm.heartbeat` row under that tenant's own namespace rather than the fixed `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant.
 #[tokio::test]
 async fn authorized_writer_persists_heartbeat_under_its_own_tenant_namespace() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8279,18 +7567,7 @@ async fn authorized_writer_persists_heartbeat_under_its_own_tenant_namespace() {
     );
 }
 
-/// khive #917 regression guard: the write namespace is a component of the
-/// deterministic heartbeat row id (`heartbeat_note_id`), so two authorized
-/// per-tenant writers dispatching `comm.heartbeat` for the SAME
-/// `(channel_kind, channel_slug)` under DIFFERENT namespaces must produce two
-/// distinct rows — one visible under each tenant's scoped `comm.health`, never
-/// colliding onto a single id. Were the namespace dropped from the id hash,
-/// both writes would resolve to one UUID and the second would replace the first
-/// (`upsert_note`'s `INSERT OR REPLACE` keys on the row id), so
-/// `comm.health(namespace="tenant-a")` would return an empty set instead of
-/// tenant-a's own heartbeat — and every existing #917 test would still pass.
-/// Drives the real handler via `dispatch_as` (not direct note planting) so it
-/// pins the write-path id derivation the plant-based read-path test cannot.
+/// khive #917 regression guard: the write namespace is a component of the deterministic heartbeat row id (`heartbeat_note_id`), so two authorized per-tenant writers dispatching `comm.heartbeat` for the SAME `(channel_kind, channel_slug)` under DIFFERENT namespaces must produce two distinct rows — one visible under each tenant's scoped `comm.health`, never colliding onto a single id.
 #[tokio::test]
 async fn two_tenants_same_channel_get_distinct_heartbeat_rows() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8323,9 +7600,6 @@ async fn two_tenants_same_channel_get_distinct_heartbeat_rows() {
         .await
         .expect("tenant-b heartbeat succeeds");
 
-    // Each tenant's scoped read must see exactly its OWN row for the shared
-    // channel. If the namespace were dropped from the id hash the two writes
-    // would collide onto one row and one of these reads would be empty.
     for ns in ["tenant-a", "tenant-b"] {
         let health = registry
             .dispatch("comm.health", serde_json::json!({ "namespace": ns }))
@@ -8350,10 +7624,7 @@ async fn two_tenants_same_channel_get_distinct_heartbeat_rows() {
     }
 }
 
-// ── #493: comm.inbox from_actor / from_prefix sender filter ─────────────────
-
-/// A single actor namespace receives messages from two distinct senders;
-/// `from_actor` (exact match) selects only the messages from the named sender.
+/// A single actor namespace receives messages from two distinct senders; `from_actor` (exact match) selects only the messages from the named sender.
 #[tokio::test]
 async fn t493_inbox_from_actor_filters_to_exact_sender() {
     let backend = shared_backend();
@@ -8395,8 +7666,7 @@ async fn t493_inbox_from_actor_filters_to_exact_sender() {
     );
 }
 
-/// `from_prefix` selects all senders whose actor label starts with the given prefix,
-/// e.g. `"agent:khive:"` selects every spawned agent under that namespace.
+/// `from_prefix` selects all senders whose actor label starts with the given prefix, e.g. `"agent:khive:"` selects every spawned agent under that namespace.
 #[tokio::test]
 async fn t493_inbox_from_prefix_filters_to_matching_senders() {
     let backend = shared_backend();
@@ -8475,8 +7745,7 @@ async fn t493_inbox_from_actor_and_from_prefix_mutually_exclusive() {
     );
 }
 
-/// Absent from_actor/from_prefix preserves today's behavior exactly: no sender filter
-/// is applied and both senders' messages are returned.
+/// Absent from_actor/from_prefix preserves today's behavior exactly: no sender filter is applied and both senders' messages are returned.
 #[tokio::test]
 async fn t493_inbox_without_sender_filter_returns_all_senders() {
     let backend = shared_backend();
@@ -8514,20 +7783,7 @@ async fn t493_inbox_without_sender_filter_returns_all_senders() {
     );
 }
 
-// ── #494: comm.thread tail pagination (order + after cursor) ────────────────
-//
-// NOTE: `comm.send`/`comm.reply` targeting the caller's own namespace ("local")
-// write BOTH an outbound and an inbound copy of every logical message into that
-// same namespace (dual_write_message, ADR-057) — so each `content` string below
-// appears TWICE in an unfiltered thread(), consecutively (outbound then inbound),
-// since the inbound copy is always written a moment after the outbound copy in
-// the same call. Tests account for this pairing explicitly rather than assuming
-// one physical note per logical send (matches the existing #485/H3 tests' use of
-// tolerant `>=` counts for the same reason).
-
-/// Default order ("asc") truncates from the tail — this is the pre-existing
-/// (buggy, per #494) behavior that must stay byte-identical: a thread longer
-/// than `limit` returns the HEAD (oldest messages), not the newest.
+/// Default order ("asc") truncates from the tail — this is the pre-existing (buggy, per #494) behavior that must stay byte-identical: a thread longer than `limit` returns the HEAD (oldest messages), not the newest.
 #[tokio::test]
 async fn t494_thread_default_order_truncates_head_unchanged() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8551,11 +7807,6 @@ async fn t494_thread_default_order_truncates_head_unchanged() {
             .unwrap_or_else(|e| panic!("reply-{i} succeeds: {e:?}"));
     }
 
-    // 5 logical messages (root + 4 replies), each an ADR-057 dual-write pair
-    // (outbound+inbound) collapsed by #94's dedup fix into ONE thread entry
-    // per logical message. limit=2 with no order= must return the OLDEST 2
-    // logical messages: root, reply-1 — no duplicate "root" entry anymore
-    // (pre-#94-fix behavior returned both physical copies of "root").
     let result = registry
         .dispatch(
             "comm.thread",
@@ -8577,8 +7828,7 @@ async fn t494_thread_default_order_truncates_head_unchanged() {
     );
 }
 
-/// `order="desc"` returns the newest `limit` messages instead of the oldest — the
-/// #494 fix: long threads can now reach their tail.
+/// `order="desc"` returns the newest `limit` messages instead of the oldest — the #494 fix: long threads can now reach their tail.
 #[tokio::test]
 async fn t494_thread_order_desc_returns_newest_messages() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8655,12 +7905,7 @@ async fn t494_thread_invalid_order_rejected() {
     );
 }
 
-/// `after` accepts a message id cursor and returns only messages strictly after it
-/// (enables incremental polling without re-fetching history). The cursor resolves
-/// to the OUTBOUND copy's `full_id` (what `comm.reply` returns), which post-#94 is
-/// also the canonical id of the "reply-1" logical message itself — so it is
-/// excluded by the strict `>` comparison, and there is nothing after it (reply-1
-/// was the last message sent).
+/// `after` accepts a message id cursor and returns only messages strictly after it (enables incremental polling without re-fetching history).
 #[tokio::test]
 async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8706,10 +7951,7 @@ async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
     );
 }
 
-/// Insert a `message` note directly into the store with an explicit `created_at`,
-/// bypassing `comm.send`/`comm.reply`. Cursor/tie-break/ordering tests need exact
-/// control over timestamps (including two rows sharing the same microsecond) that
-/// racing the wall clock through the normal dispatch path cannot guarantee.
+/// Insert a `message` note directly into the store with an explicit `created_at`, bypassing `comm.send`/`comm.reply`.
 async fn insert_thread_message(
     rt: &KhiveRuntime,
     ns: &str,
@@ -8748,11 +7990,7 @@ async fn insert_thread_message(
         .expect("insert message");
 }
 
-/// #494: two physical messages that share the exact same
-/// microsecond `created_at` (e.g. what an ADR-057 dual-write self-send can
-/// produce) must not be skipped or duplicated around an id cursor — the cursor
-/// filter and sort must compare the full `(created_at, full_id)` tuple, not
-/// timestamp alone.
+/// #494: two physical messages that share the exact same microsecond `created_at` (e.g. what an ADR-057 dual-write self-send can produce) must not be skipped or duplicated around an id cursor — the cursor filter and sort must compare the full `(created_at, full_id)` tuple, not timestamp alone.
 #[tokio::test]
 async fn t494_thread_after_id_cursor_ties_on_equal_created_at_no_skip_no_dup() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -8813,10 +8051,7 @@ async fn t494_thread_after_id_cursor_ties_on_equal_created_at_no_skip_no_dup() {
     );
 }
 
-/// #494: an `after` timestamp cursor must be parsed to
-/// microseconds (not compared as a raw string) so non-canonical but valid RFC
-/// 3339 forms — whole-second `Z`, or an explicit `+00:00` offset — compare
-/// correctly against khive's canonical microsecond timestamps.
+/// #494: an `after` timestamp cursor must be parsed to microseconds (not compared as a raw string) so non-canonical but valid RFC 3339 forms — whole-second `Z`, or an explicit `+00:00` offset — compare correctly against khive's canonical microsecond timestamps.
 #[tokio::test]
 async fn t494_thread_after_timestamp_cursor_accepts_noncanonical_rfc3339() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -8865,9 +8100,7 @@ async fn t494_thread_after_timestamp_cursor_accepts_noncanonical_rfc3339() {
     }
 }
 
-/// #494: an `after` value that is neither a resolvable
-/// message id nor a parseable RFC 3339 timestamp must fail loudly, never be
-/// silently coerced into "no cursor" (which would return the whole thread).
+/// #494: an `after` value that is neither a resolvable message id nor a parseable RFC 3339 timestamp must fail loudly, never be silently coerced into "no cursor" (which would return the whole thread).
 #[tokio::test]
 async fn t494_thread_after_invalid_string_is_hard_error() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8899,9 +8132,7 @@ async fn t494_thread_after_invalid_string_is_hard_error() {
     );
 }
 
-/// #494: `order="desc"` combined with an id `after` cursor
-/// must filter against the DESC sequence, not always `created_at >`. "After" in
-/// desc order means further along the desc traversal, i.e. strictly older.
+/// #494: `order="desc"` combined with an id `after` cursor must filter against the DESC sequence, not always `created_at >`.
 #[tokio::test]
 async fn t494_thread_order_desc_with_after_id_cursor_returns_strictly_older_in_desc_sequence() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -8955,9 +8186,7 @@ async fn t494_thread_order_desc_with_after_id_cursor_returns_strictly_older_in_d
     );
 }
 
-/// Absent `order`/`after` preserves the #494 ordering/truncation behavior; the message
-/// count itself changed under #94's dedup fix (one entry per logical message, not one
-/// per ADR-057 dual-write physical copy) — see the updated assertions below.
+/// Absent `order`/`after` preserves the #494 ordering/truncation behavior; the message count itself changed under #94's dedup fix (one entry per logical message, not one per ADR-057 dual-write physical copy) — see the updated assertions below.
 #[tokio::test]
 async fn t494_thread_without_new_params_unchanged() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -8997,19 +8226,13 @@ async fn t494_thread_without_new_params_unchanged() {
     assert_eq!(contents, vec!["root", "reply-1"]);
 }
 
-// ── #94: dual-write dedup + actor-scoped thread visibility ───────────────────
-
-/// Full round trip: A sends to B, B replies, A replies again. `comm.thread`
-/// must return exactly 3 logical messages (not 6 ADR-057 dual-write physical
-/// copies), in chronological order, each attributed to the actor that
-/// actually sent it, with no duplicate entries (issue #94 symptom 3).
+/// Full round trip: A sends to B, B replies, A replies again.
 #[tokio::test]
 async fn t94_thread_round_trip_returns_deduped_logical_messages() {
     let backend = shared_backend();
     let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
     let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
 
-    // 1. A -> B.
     let sent = registry_a
         .dispatch(
             "comm.send",
@@ -9019,7 +8242,6 @@ async fn t94_thread_round_trip_returns_deduped_logical_messages() {
         .expect("A sends to B");
     let root_id = sent["full_id"].as_str().expect("full_id").to_string();
 
-    // 2. B finds it in inbox and replies.
     let b_inbox = registry_b
         .dispatch(
             "comm.inbox",
@@ -9038,7 +8260,6 @@ async fn t94_thread_round_trip_returns_deduped_logical_messages() {
         .await
         .expect("B replies");
 
-    // 3. A finds B's reply in inbox and replies again.
     let a_inbox = registry_a
         .dispatch(
             "comm.inbox",
@@ -9057,8 +8278,6 @@ async fn t94_thread_round_trip_returns_deduped_logical_messages() {
         .await
         .expect("A replies again");
 
-    // 4. thread() must show exactly 3 logical messages, in order, correctly
-    // attributed, with no duplicates — from either party's point of view.
     let thread = registry_a
         .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
         .await
@@ -9088,7 +8307,6 @@ async fn t94_thread_round_trip_returns_deduped_logical_messages() {
         "each entry attributed to the actor that actually sent it; got {from_actors:?}"
     );
 
-    // B's view must match exactly — the same 3 deduped, correctly attributed entries.
     let thread_from_b = registry_b
         .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
         .await
@@ -9096,10 +8314,7 @@ async fn t94_thread_round_trip_returns_deduped_logical_messages() {
     assert_eq!(thread_from_b["count"].as_u64().unwrap_or(0), 3);
 }
 
-/// A message addressed to one actor pair must not be visible to an unrelated
-/// third actor who merely knows (or can resolve) the thread's root id — the
-/// caller-boundary gap between `thread` (previously unfiltered by actor) and
-/// `inbox` (already actor-scoped) from issue #94 symptom 1/2.
+/// A message addressed to one actor pair must not be visible to an unrelated third actor who merely knows (or can resolve) the thread's root id — the caller-boundary gap between `thread` (previously unfiltered by actor) and `inbox` (already actor-scoped) from issue #94 symptom 1/2.
 #[tokio::test]
 async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
     let backend = shared_backend();
@@ -9115,8 +8330,6 @@ async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
         .expect("A sends to B");
     let root_id = sent["full_id"].as_str().expect("full_id").to_string();
 
-    // C is neither the sender nor the addressee of any row in this thread, even
-    // though C shares the same namespace and can resolve the root id.
     let thread_from_c = registry_c
         .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
         .await
@@ -9129,7 +8342,6 @@ async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
          got {thread_from_c}"
     );
 
-    // A, the actual sender, still sees it.
     let thread_from_a = registry_a
         .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
         .await
@@ -9137,10 +8349,7 @@ async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
     assert_eq!(thread_from_a["count"].as_u64().unwrap_or(0), 1);
 }
 
-/// A legacy message note lacking `to_actor` (pre-ADR-057 data, or directly
-/// store-inserted content) must remain visible via `comm.thread`'s actor
-/// scoping — the same EqOrMissing rule `comm.inbox` already applies for
-/// exactly this shape (ADR-057 Q3).
+/// A legacy message note lacking `to_actor` (pre-ADR-057 data, or directly store-inserted content) must remain visible via `comm.thread`'s actor scoping — the same EqOrMissing rule `comm.inbox` already applies for exactly this shape (ADR-057 Q3).
 #[tokio::test]
 async fn t94_thread_legacy_message_without_to_actor_stays_visible() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -9155,8 +8364,6 @@ async fn t94_thread_legacy_message_without_to_actor_stays_visible() {
     let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
     let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
 
-    // insert_thread_message stores only `from`/`to` (no from_actor/to_actor) —
-    // exactly the legacy shape this test guards.
     let legacy_id = uuid::Uuid::new_v4();
     insert_thread_message(
         &rt,
@@ -9184,10 +8391,7 @@ async fn t94_thread_legacy_message_without_to_actor_stays_visible() {
     );
 }
 
-// ── #495: comm.send / comm.reply metadata (tags) passthrough ────────────────
-
-/// `comm.send(tags=[...])` persists the tags into `properties["tags"]` on the
-/// inbound copy, round-tripped via `comm.inbox`.
+/// `comm.send(tags=[...])` persists the tags into `properties["tags"]` on the inbound copy, round-tripped via `comm.inbox`.
 #[tokio::test]
 async fn t495_send_tags_roundtrip_via_inbox() {
     let backend = shared_backend();
@@ -9222,8 +8426,7 @@ async fn t495_send_tags_roundtrip_via_inbox() {
     assert_eq!(tag_strs, vec!["run:abc123", "traffic:agent"]);
 }
 
-/// `comm.send(tags=[...])` also persists on the outbound copy, round-tripped
-/// via `comm.read` after resolving the sender's own outbound note.
+/// `comm.send(tags=[...])` also persists on the outbound copy, round-tripped via `comm.read` after resolving the sender's own outbound note.
 #[tokio::test]
 async fn t495_send_tags_present_on_outbound_copy() {
     let backend = shared_backend();
@@ -9347,8 +8550,7 @@ async fn t495_send_without_tags_omits_tags_property() {
     );
 }
 
-/// `comm.send` with an unknown top-level field (typo) is still rejected —
-/// `tags` addition must not have loosened `deny_unknown_fields`.
+/// `comm.send` with an unknown top-level field (typo) is still rejected — `tags` addition must not have loosened `deny_unknown_fields`.
 #[tokio::test]
 async fn t495_send_rejects_unknown_field_alongside_tags() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -9369,8 +8571,6 @@ async fn t495_send_rejects_unknown_field_alongside_tags() {
         "unknown field alongside tags must still be rejected; got {result:?}"
     );
 }
-
-// --- channel poll checkpoint persistence tests (khive #449) ---
 
 #[tokio::test]
 async fn cursor_get_returns_none_for_new_mailbox() {
@@ -9506,8 +8706,6 @@ async fn cursor_uidvalidity_reset_can_replace_high_water_with_null() {
         .await
         .expect("initial commit succeeds");
 
-    // A UIDVALIDITY change resets the epoch; the new generation carries no
-    // high_water yet because nothing has been fetched in the new epoch.
     registry
         .dispatch(
             "comm.cursor_commit",
@@ -9642,19 +8840,7 @@ async fn cursor_schema_lazy_bootstraps_fresh_memory_runtime() {
     assert_eq!(committed["generation"], 1);
 }
 
-// ── Issue #820: sub-agent self-address must be loud, not silent ─────────────
-//
-// A sub-agent session spawned in the same project scope resolves its actor
-// identity from the same worktree-scoped `.khive/config.toml` as its parent
-// orchestrator (ADR-096 Fork 2: `[actor] id` is a per-project, not per-session,
-// injection tier). When the sub-agent addresses that shared label thinking it
-// reaches a distinct parent principal, `from_actor` and `to_actor` collapse
-// onto the identical string with no error and no distinct inbox.
-
-/// Child and parent configured with genuinely distinct actor identities: a
-/// send from the child to the parent's label must succeed and land in the
-/// parent's inbox only, exactly as ordinary actor-addressed delivery already
-/// works (ADR-057). This is the "no bug" baseline the fix must not regress.
+/// Child and parent configured with genuinely distinct actor identities: a send from the child to the parent's label must succeed and land in the parent's inbox only, exactly as ordinary actor-addressed delivery already works (ADR-057).
 #[tokio::test]
 async fn i820_child_to_parent_delivery_with_distinct_identities_succeeds() {
     let backend = shared_backend();
@@ -9696,9 +8882,7 @@ async fn i820_child_to_parent_delivery_with_distinct_identities_succeeds() {
     );
 }
 
-/// A caller whose named target genuinely IS its own resolved actor identity
-/// (a deliberate note-to-self) must still be allowed to send when it says so
-/// explicitly via `self_send=true`.
+/// A caller whose named target genuinely IS its own resolved actor identity (a deliberate note-to-self) must still be allowed to send when it says so explicitly via `self_send=true`.
 #[tokio::test]
 async fn i820_explicit_self_send_allowed_when_flagged() {
     let (registry, _rt) = build_actor_registry(shared_backend(), "lambda:leo");
@@ -9730,12 +8914,7 @@ async fn i820_explicit_self_send_allowed_when_flagged() {
     );
 }
 
-/// The silent-collapse case: a session addresses a label that happens to equal
-/// its own resolved actor identity (e.g. a sub-agent naming what it believes is
-/// its parent's distinct label, but which resolves to the same `[actor] id` as
-/// its own token per ADR-096 Fork 2) WITHOUT declaring `self_send=true`. This
-/// must now be a loud error, never a silent delivery into the sender's own
-/// inbox.
+/// The silent-collapse case: a session addresses a label that happens to equal its own resolved actor identity (e.g. a sub-agent naming what it believes is its parent's distinct label, but which resolves to the same `[actor] id` as its own token per ADR-096 Fork 2) WITHOUT declaring `self_send=true`.
 #[tokio::test]
 async fn i820_unflagged_self_address_is_a_loud_error() {
     let (registry, _rt) = build_actor_registry(shared_backend(), "lambda:leo");
@@ -9770,11 +8949,7 @@ async fn i820_unflagged_self_address_is_a_loud_error() {
     );
 }
 
-/// The anonymous single-tenant party-line default (`to="local"` from an
-/// unattributed caller) must remain unaffected: `to_actor == "local"` is
-/// exempted from the self-address rejection since it is the pervasive
-/// unconfigured single-actor pattern, not a collapsed distinct-principal
-/// address.
+/// The anonymous single-tenant party-line default (`to="local"` from an unattributed caller) must remain unaffected: `to_actor == "local"` is exempted from the self-address rejection since it is the pervasive unconfigured single-actor pattern, not a collapsed distinct-principal address.
 #[tokio::test]
 async fn i820_anonymous_local_party_line_send_still_succeeds() {
     let (registry, _rt) = build_registry();
@@ -9792,10 +8967,7 @@ async fn i820_anonymous_local_party_line_send_still_succeeds() {
     );
 }
 
-// ── #113: reply is restricted to a thread participant ─────────────────────────
-
-/// A third party holding a message id (neither the sender nor the addressee)
-/// must not be able to reply to it.
+/// A third party holding a message id (neither the sender nor the addressee) must not be able to reply to it.
 #[tokio::test]
 async fn i113_non_participant_reply_rejected() {
     let backend = shared_backend();
@@ -9828,8 +9000,7 @@ async fn i113_non_participant_reply_rejected() {
     );
 }
 
-/// An unattributed caller is still a distinct `local` actor and must not bypass
-/// participant checks for messages carrying explicit actor fields.
+/// An unattributed caller is still a distinct `local` actor and must not bypass participant checks for messages carrying explicit actor fields.
 #[tokio::test]
 async fn i113_anonymous_non_participant_reply_rejected() {
     let backend = shared_backend();
@@ -9891,9 +9062,7 @@ async fn i113_addressee_reply_succeeds() {
     assert_eq!(reply["from"], "lambda:b");
 }
 
-/// The original sender may also reply to their own outbound message (e.g. a
-/// follow-up before the recipient has responded) — either party is a
-/// participant, not addressee-only.
+/// The original sender may also reply to their own outbound message (e.g. a follow-up before the recipient has responded) — either party is a participant, not addressee-only.
 #[tokio::test]
 async fn i113_sender_reply_to_own_message_succeeds() {
     let backend = shared_backend();
@@ -9921,8 +9090,7 @@ async fn i113_sender_reply_to_own_message_succeeds() {
     assert_eq!(reply["from"], "lambda:a");
 }
 
-/// A legacy message with neither `to_actor` nor `from_actor` fails open
-/// (no attributed party to restrict against), matching the #87/#94 precedent.
+/// A legacy message with neither `to_actor` nor `from_actor` fails open (no attributed party to restrict against), matching the #87/#94 precedent.
 #[tokio::test]
 async fn i113_legacy_message_without_actors_fails_open() {
     use khive_storage::note::Note;
@@ -9953,8 +9121,6 @@ async fn i113_legacy_message_without_actors_fails_open() {
     );
 }
 
-// ── #66: comm.unread — count-only unread view ──────────────────────────────────
-
 #[tokio::test]
 async fn i66_unread_counts_only_matching_inbound_unread() {
     let backend = shared_backend();
@@ -9983,8 +9149,6 @@ async fn i66_unread_counts_only_matching_inbound_unread() {
     assert_eq!(unread_before["count"], 2);
     assert_eq!(unread_before["actor"], "lambda:b");
 
-    // Mark B's own inbound copy of msg 2 read (the id `comm.inbox` returns for
-    // B, not the outbound `send` response's id); unread count must drop to 1.
     let inbox = registry_b
         .dispatch(
             "comm.inbox",
@@ -10035,7 +9199,6 @@ async fn i66_unread_rejects_assignee_override() {
         "removed assignee override must be rejected as an unknown param; got {err}"
     );
 
-    // Without the override, the orchestrator's own unread count is 0.
     let own_unread = registry_orch
         .dispatch("comm.unread", serde_json::json!({}))
         .await
@@ -10072,8 +9235,7 @@ async fn i66_inbox_response_carries_unread_count() {
     );
 }
 
-/// `limit=0` is the count-only inbox path: it returns no message payloads but
-/// still reports the caller's real unread total.
+/// `limit=0` is the count-only inbox path: it returns no message payloads but still reports the caller's real unread total.
 #[tokio::test]
 async fn i66_inbox_limit_zero_carries_real_unread_count() {
     let backend = shared_backend();
@@ -10100,19 +9262,7 @@ async fn i66_inbox_limit_zero_carries_real_unread_count() {
     );
 }
 
-// ── send-single-txn: atomic dual-write coverage ────────────────────────────
-//
-// `dual_write_message` now commits both message copies (row + FTS + one
-// vector row per registered embedding model) through
-// `khive_runtime::create_notes_atomic` — ONE writer transaction for the
-// pair instead of one writer acquisition per row/FTS/vector write. This
-// test covers the multi-model vector fan-out count landing inside the
-// single atomic unit.
-
-/// A send must land the outbound + inbound note, an FTS document for each,
-/// and one vector row PER registered embedding model for EACH note, all
-/// inside the single atomic unit. Two stub models are registered: the
-/// vector-row count for each model must be exactly 2 (outbound + inbound).
+/// A send must land the outbound + inbound note, an FTS document for each, and one vector row PER registered embedding model for EACH note, all inside the single atomic unit.
 #[tokio::test]
 async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
     use async_trait::async_trait;
@@ -10178,7 +9328,6 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
         .await
         .expect("send succeeds");
 
-    // Actor-addressed sends land both copies in "local".
     let local_tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&local_tok, Some("message"), 100, 0)
@@ -10208,8 +9357,6 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
         );
     }
 }
-
-// ── #1422: inbox pagination, richer filters, and bulk read ────────────────────
 
 async fn insert_i1422_message(
     runtime: &KhiveRuntime,
@@ -10910,12 +10057,7 @@ async fn i1422_rejects_invalid_filter_and_bulk_shapes() {
         .is_err());
 }
 
-// ---- ADR-124 note-write identity guard: update-path refusal on pack-owned kinds ----
-
-/// Build a registry the same way as [`build_registry`] but also install the
-/// pack-owned note kind set, mirroring `khive-mcp`'s boot path
-/// (`KhiveMcpServer::with_packs`). Without this the runtime never learns
-/// `message` is pack-owned and the guard stays inert.
+/// Build a registry the same way as [`build_registry`] but also install the pack-owned note kind set, mirroring `khive-mcp`'s boot path (`KhiveMcpServer::with_packs`).
 fn build_registry_with_owned_kinds() -> (VerbRegistry, KhiveRuntime) {
     let (registry, rt) = build_registry();
     rt.install_pack_owned_note_kinds(
@@ -10928,33 +10070,14 @@ fn build_registry_with_owned_kinds() -> (VerbRegistry, KhiveRuntime) {
     (registry, rt)
 }
 
-/// Build a registry the same way as [`build_registry_with_owned_kinds`] but
-/// also install the pack-owned note-write validator, mirroring both
-/// `khive-mcp` boot paths. A test exercising the CREATE- or MERGE-path guard
-/// against a registry that skips this call proves nothing: the derive/preserve
-/// step is inert on an unwired runtime exactly like the update-path refusal
-/// was inert before `install_pack_owned_note_kinds` existed.
+/// Build a registry the same way as [`build_registry_with_owned_kinds`] but also install the pack-owned note-write validator, mirroring both `khive-mcp` boot paths.
 fn build_registry_with_owned_kinds_and_validator() -> (VerbRegistry, KhiveRuntime) {
     let (registry, rt) = build_registry_with_owned_kinds();
     registry.call_register_note_write_validators(&rt);
     (registry, rt)
 }
 
-/// The confirmed hole, reproduced as a test: a generic `update(properties=
-/// {from_actor: ...})` must no longer be able to forge the handler-stamped
-/// `from_actor` on a `message` note. This is the central regression test —
-/// send a message, forge via update, assert the forgery is refused and the
-/// stored value is unchanged.
-///
-/// Table-driven over every key in `OWNER_ESTABLISHED_PROPERTIES`
-/// (khive-runtime's `curation.rs`, kept in sync by hand here since the
-/// const is crate-private and this is a different crate). Nothing here
-/// detects that drift: a key added to the const without an arm added below
-/// leaves this test green and that key uncovered, so a change that protects
-/// a new key adds its arm here in the same change. For each key, a complete snapshot of
-/// the note's stored `properties` is compared before and after the refused
-/// attempt — not just a handful of named fields — so a forgery that lands
-/// on any untested field is still caught.
+/// The confirmed hole, reproduced as a test: a generic `update(properties= {from_actor: ...})` must no longer be able to forge the handler-stamped `from_actor` on a `message` note.
 #[tokio::test]
 async fn update_refuses_to_forge_owner_established_properties_on_message_note() {
     let (registry, _rt) = build_registry_with_owned_kinds();
@@ -11023,9 +10146,7 @@ async fn update_refuses_to_forge_owner_established_properties_on_message_note() 
     }
 }
 
-/// Positive arm: a non-owned property update on the same `message` note must
-/// still succeed and round-trip — the guard admits everything it does not
-/// specifically name.
+/// Positive arm: a non-owned property update on the same `message` note must still succeed and round-trip — the guard admits everything it does not specifically name.
 #[tokio::test]
 async fn update_admits_non_owned_properties_on_message_note() {
     let (registry, _rt) = build_registry_with_owned_kinds();
@@ -11065,8 +10186,7 @@ async fn update_admits_non_owned_properties_on_message_note() {
     );
 }
 
-/// The guard fires only on pack-owned kinds: naming `from_actor` on a base
-/// kg note kind (e.g. `observation`) must succeed.
+/// The guard fires only on pack-owned kinds: naming `from_actor` on a base kg note kind (e.g. `observation`) must succeed.
 #[tokio::test]
 async fn update_permits_from_actor_key_on_generic_note_kind() {
     let (registry, _rt) = build_registry_with_owned_kinds();
@@ -11099,9 +10219,7 @@ async fn update_permits_from_actor_key_on_generic_note_kind() {
     assert_eq!(after["properties"]["from_actor"], "anyone");
 }
 
-/// A non-object `properties` patch on a `message` note is refused: it would
-/// replace the whole property object (erasing every owned key) rather than
-/// merging into it.
+/// A non-object `properties` patch on a `message` note is refused: it would replace the whole property object (erasing every owned key) rather than merging into it.
 #[tokio::test]
 async fn update_refuses_non_object_properties_patch_on_message_note() {
     let (registry, _rt) = build_registry_with_owned_kinds();
@@ -11133,13 +10251,7 @@ async fn update_refuses_non_object_properties_patch_on_message_note() {
     );
 }
 
-// ---- ADR-124 note-write identity guard: CREATE-path derivation ----
-
-/// FORGE arm: a generic `create(kind="message", properties={from_actor:
-/// "forged"})` call under an authenticated token for actor X must store
-/// `from_actor == X` — the true caller — not the forged value. This is not a
-/// refusal: the create succeeds and the identity property is silently
-/// corrected to the value the authorization token actually names.
+/// FORGE arm: a generic `create(kind="message", properties={from_actor: "forged"})` call under an authenticated token for actor X must store `from_actor == X` — the true caller — not the forged value.
 #[tokio::test]
 async fn create_derives_from_actor_overwriting_a_forged_value() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11168,9 +10280,7 @@ async fn create_derives_from_actor_overwriting_a_forged_value() {
     );
 }
 
-/// LEGITIMATE-NO-KEY arm: a `create(kind="message", content=...)` with no
-/// `from_actor` in properties at all must still come out stamped with the
-/// authenticated caller.
+/// LEGITIMATE-NO-KEY arm: a `create(kind="message", content=...)` with no `from_actor` in properties at all must still come out stamped with the authenticated caller.
 #[tokio::test]
 async fn create_stamps_from_actor_when_caller_supplies_no_identity_key() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11198,22 +10308,7 @@ async fn create_stamps_from_actor_when_caller_supplies_no_identity_key() {
     );
 }
 
-/// DAEMON-STAMP arm: the real `comm.send` writer path must still stamp
-/// `from_actor` correctly and succeed once the validator is installed. A
-/// guard that broke the writer that is supposed to set `from_actor` would
-/// fail closed into an outage — prove it does not.
-///
-/// MECHANISM SENSITIVITY: this arm stays green even with the atomic
-/// multi-note writer's own derivation call removed entirely, because
-/// `comm.send`'s handler (`crates/khive-pack-comm/src/handlers.rs`) derives
-/// and stamps `from_actor` onto the message spec BEFORE it ever reaches
-/// `khive-runtime`'s `create_notes_atomic_with_report`. A failure here means
-/// the send handler itself, or the ordinary (non-atomic) write path, broke —
-/// it says nothing about the atomic writer's own guard. That coverage lives
-/// in `khive-runtime`'s
-/// `atomic_message::tests::create_notes_atomic_derives_from_actor_overwriting_a_forged_value`,
-/// which calls the atomic writer directly with a forged property and would
-/// fail if this arm alone were relied on.
+/// DAEMON-STAMP arm: the real `comm.send` writer path must still stamp `from_actor` correctly and succeed once the validator is installed.
 #[tokio::test]
 async fn comm_send_still_stamps_from_actor_with_validator_installed() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11247,18 +10342,7 @@ async fn comm_send_still_stamps_from_actor_with_validator_installed() {
     );
 }
 
-/// GENERIC-KIND arm: the validator is single-occupancy across all packs, so
-/// a `create` on a kind comm does not own (`observation`, owned by kg) must
-/// pass its properties through untouched.
-///
-/// MECHANISM SENSITIVITY: the foreign-kind passthrough assertion alone would
-/// stay green even if the validator were never installed at all — with no
-/// validator, every kind's properties pass through untouched, so that
-/// assertion by itself cannot tell "validator installed and correctly scoped
-/// to `message`" apart from "no validator at all". The paired `message`
-/// assertion below closes that gap: it only passes if a validator is
-/// installed AND correctly scoped, so this arm fails if the validator is
-/// missing, not just if it is mis-scoped.
+/// GENERIC-KIND arm: the validator is single-occupancy across all packs, so a `create` on a kind comm does not own (`observation`, owned by kg) must pass its properties through untouched.
 #[tokio::test]
 async fn create_leaves_generic_kind_properties_untouched() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11310,8 +10394,6 @@ async fn create_leaves_generic_kind_properties_untouched() {
     );
 }
 
-// ---- ADR-124 note-write identity guard: MERGE-path preservation ----
-
 async fn send_message_as(registry: &VerbRegistry, actor: &str, content: &str) -> String {
     let sent = registry
         .dispatch_with_identity(
@@ -11331,9 +10413,7 @@ async fn send_message_as(registry: &VerbRegistry, actor: &str, content: &str) ->
         .to_string()
 }
 
-/// FORGERY-BLOCKED arm: merging a `message` note authored by Y into one
-/// authored by X with `strategy="prefer_from"` — the attack this guard
-/// exists for — must leave the surviving note's `from_actor` as X, not Y.
+/// FORGERY-BLOCKED arm: merging a `message` note authored by Y into one authored by X with `strategy="prefer_from"` — the attack this guard exists for — must leave the surviving note's `from_actor` as X, not Y.
 #[tokio::test]
 async fn merge_preserves_into_note_from_actor_under_prefer_from() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11364,21 +10444,7 @@ async fn merge_preserves_into_note_from_actor_under_prefer_from() {
     );
 }
 
-/// CONTROL arm: the same merge under `strategy="prefer_into"` must also
-/// leave `from_actor` as X.
-///
-/// Honesty note (khive-oss PR #1690 round 3): this arm is NOT sensitive to
-/// the preservation step being removed. `PreferInto`'s fold
-/// (`merge_json` in `khive-runtime`'s `curation.rs`) only ever inserts a
-/// `from`-note key that is absent on `into` — `from_actor` is already
-/// present on X's into-note before the merge runs, so the fold itself never
-/// touches it. This arm stays green with `preserve_owner_established_properties`
-/// deleted entirely; it is a legitimate control (it proves the merge doesn't
-/// silently overwrite under this strategy) but it is NOT evidence the guard
-/// works. `merge_preserves_into_note_from_actor_under_prefer_from` above is
-/// the arm carrying the security-relevant assertion: `PreferFrom`'s fold
-/// does overwrite `from_actor` with Y's value, so that arm only passes
-/// because the preserve step reverts it.
+/// CONTROL arm: the same merge under `strategy="prefer_into"` must also leave `from_actor` as X.
 #[tokio::test]
 async fn merge_preserves_into_note_from_actor_under_prefer_into() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11406,10 +10472,7 @@ async fn merge_preserves_into_note_from_actor_under_prefer_into() {
     assert_eq!(after["properties"]["from_actor"], "lambda:x");
 }
 
-/// NON-IDENTITY-KEY arm: a non-owned property that differs between the two
-/// notes still folds by strategy — `prefer_from` takes the from-note's
-/// value — proving the preserve step pins only the owner-established keys,
-/// not the whole property object.
+/// NON-IDENTITY-KEY arm: a non-owned property that differs between the two notes still folds by strategy — `prefer_from` takes the from-note's value — proving the preserve step pins only the owner-established keys, not the whole property object.
 #[tokio::test]
 async fn merge_still_folds_non_owned_properties_by_strategy() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11459,9 +10522,7 @@ async fn merge_still_folds_non_owned_properties_by_strategy() {
     );
 }
 
-/// GENERIC-KIND arm: merging two `observation` notes (a kind comm does not
-/// own) under `prefer_from` must let a `from_actor`-named property overwrite
-/// normally — the preservation guard fires only on pack-owned kinds.
+/// GENERIC-KIND arm: merging two `observation` notes (a kind comm does not own) under `prefer_from` must let a `from_actor`-named property overwrite normally — the preservation guard fires only on pack-owned kinds.
 #[tokio::test]
 async fn merge_overwrites_from_actor_on_generic_kind_under_prefer_from() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11521,13 +10582,7 @@ async fn merge_overwrites_from_actor_on_generic_kind_under_prefer_from() {
     );
 }
 
-/// PROPERTIES-MERGED-ACCURACY arm: restoring an owner-established key that
-/// was already present on the into-note (here `to_actor`) must not be
-/// double-counted against `properties_merged` — the fold never counted that
-/// key as "added" in the first place, because `to_actor` already existed on
-/// the into-note before the merge. Only the genuinely new non-owned key
-/// (`added`) contributed to the fold, so `properties_merged` must report 1,
-/// not 0, and the non-owned key must actually survive on the merged note.
+/// PROPERTIES-MERGED-ACCURACY arm: restoring an owner-established key that was already present on the into-note (here `to_actor`) must not be double-counted against `properties_merged` — the fold never counted that key as "added" in the first place, because `to_actor` already existed on the into-note before the merge.
 #[tokio::test]
 async fn merge_reports_properties_merged_for_key_that_actually_survives() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11601,15 +10656,7 @@ async fn merge_reports_properties_merged_for_key_that_actually_survives() {
     );
 }
 
-/// NESTED-UNION arm: an owner-established key that holds an OBJECT
-/// (`thread_id`) merged under `strategy="union"` must not be double-counted
-/// either. The round-2 fix above corrected the flat case
-/// (`merge_reports_properties_merged_for_key_that_actually_survives`); this
-/// is the nested case that fix left uncorrected. Under `union` the fold
-/// recurses into `thread_id` and counts the absorbed note's nested key as a
-/// merged contribution, but restoration then reverts `thread_id` wholesale
-/// back to the into-note's pre-merge value — so nothing the fold counted
-/// actually survived, and `properties_merged` must report 0.
+/// NESTED-UNION arm: an owner-established key that holds an OBJECT (`thread_id`) merged under `strategy="union"` must not be double-counted either.
 #[tokio::test]
 async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -11684,26 +10731,7 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
     );
 }
 
-/// ROUTE-LEVEL RESTORATION arm: the whole scenario driven through the pack's
-/// actual `comm.send`/`create` + `merge` verbs (not `count_new_property_keys`
-/// called directly — that unit-level coverage already lives in
-/// `khive-runtime`'s `curation.rs` tests), on a pack-owned `message` note.
-///
-/// `external_id` is an `OWNER_ESTABLISHED_PROPERTIES` key `comm.send` never
-/// sets, so the into-note's property map genuinely lacks the key entirely
-/// (unlike `subject`, which `comm.send` always writes, even as `null` — a
-/// present-but-null key would already be "in" the into-note's map and
-/// wouldn't exercise the "absent from into" removal path). The from-note is
-/// built with `create` so `properties` can name `external_id` directly.
-///
-/// Under `prefer_from` the fold treats `external_id` as a genuinely new key
-/// — the into-note's property map does not have it — and counts it as one
-/// contribution. Restoration then reverts it: `external_id` is absent on the
-/// into-note, so it is removed from the merged result rather than kept.
-/// Nothing the fold counted actually survives, so `properties_merged` must
-/// report 0, and the into-note's owner-established properties (here
-/// `from_actor`) must still read as the into-note's own, not the absorbed
-/// note's.
+/// ROUTE-LEVEL RESTORATION arm: the whole scenario driven through the pack's actual `comm.send`/`create` + `merge` verbs (not `count_new_property_keys` called directly — that unit-level coverage already lives in `khive-runtime`'s `curation.rs` tests), on a pack-owned `message` note.
 #[tokio::test]
 async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_new_key_through_the_route(
 ) {
@@ -11780,8 +10808,6 @@ async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_
          restoration, so nothing genuinely survived; got {merged}"
     );
 }
-
-// ── #1468 / #1471: projected inbox/thread reads and sent history ─────────────
 
 #[tokio::test]
 async fn i1471_sent_box_is_sender_scoped_and_filters_recipient_and_since() {
@@ -11962,12 +10988,7 @@ async fn i1468_fields_projects_inbox_and_thread_with_one_strict_vocabulary() {
     assert!(empty.to_string().contains("at least one field"));
 }
 
-// ── #1471 follow-up: anonymous-local scoping, cross-box rejections, sent fallback ──
-
-/// The anonymous `"local"` caller is scoped by `to_actor = "local" OR to_actor IS NULL`
-/// like every other caller (ADR-057 amendment): it shares messages addressed to
-/// `"local"`, keeps legacy rows without `to_actor` visible, and must not see
-/// messages explicitly addressed to another actor.
+/// The anonymous `"local"` caller is scoped by `to_actor = "local" OR to_actor IS NULL` like every other caller (ADR-057 amendment): it shares messages addressed to `"local"`, keeps legacy rows without `to_actor` visible, and must not see messages explicitly addressed to another actor.
 #[tokio::test]
 async fn i1471_anonymous_local_inbox_scoping_and_legacy_visibility() {
     let backend = shared_backend();
@@ -12040,9 +11061,7 @@ async fn i1471_anonymous_local_inbox_scoping_and_legacy_visibility() {
     );
 }
 
-/// Cross-box filters must fail loudly rather than silently return the wrong
-/// box: sender filters and read `status` are inbox-only, while `to_actor` is
-/// sent-only (ADR-057 amendment).
+/// Cross-box filters must fail loudly rather than silently return the wrong box: sender filters and read `status` are inbox-only, while `to_actor` is sent-only (ADR-057 amendment).
 #[tokio::test]
 async fn i1471_cross_box_filters_are_rejected() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -12078,9 +11097,7 @@ async fn i1471_cross_box_filters_are_rejected() {
     }
 }
 
-/// The anonymous `"local"` sent box keeps legacy outbound rows without
-/// `from_actor` visible (EqOrMissing fallback), while rows attributed to
-/// another actor never leak into it.
+/// The anonymous `"local"` sent box keeps legacy outbound rows without `from_actor` visible (EqOrMissing fallback), while rows attributed to another actor never leak into it.
 #[tokio::test]
 async fn i1471_local_sent_box_includes_legacy_rows_only() {
     let backend = shared_backend();
@@ -12169,10 +11186,7 @@ async fn i1471_local_sent_box_includes_legacy_rows_only() {
     );
 }
 
-/// An ATTRIBUTED caller's sent box requires an exact `from_actor` match:
-/// legacy outbound rows without `from_actor` are never inherited (fail
-/// closed), even when they live in the namespace the caller's query scans.
-/// Only the anonymous `"local"` actor gets the EqOrMissing fallback.
+/// An ATTRIBUTED caller's sent box requires an exact `from_actor` match: legacy outbound rows without `from_actor` are never inherited (fail closed), even when they live in the namespace the caller's query scans.
 #[tokio::test]
 async fn i1471_attributed_sent_box_excludes_legacy_rows() {
     let backend = shared_backend();
@@ -12203,10 +11217,6 @@ async fn i1471_attributed_sent_box_excludes_legacy_rows() {
     )
     .await
     .expect("legacy from_actor-less outbound fixture");
-    // In-scope control: an identically created note that DOES carry the
-    // caller's `from_actor` must be visible, proving the exclusion above is
-    // the actor predicate and not namespace scoping making the legacy row
-    // unreachable.
     rt_a.create_note(
         &tok,
         "message",
@@ -12250,11 +11260,7 @@ async fn i1471_attributed_sent_box_excludes_legacy_rows() {
     );
 }
 
-// ── #1471 follow-up: sent-box combination pins ──────────────────────────────
-
-/// Projection applies to sent rows through the same strict vocabulary as the
-/// inbox box, and the sent box always reports `unread_count = 0` (outbound
-/// rows carry no recipient read state).
+/// Projection applies to sent rows through the same strict vocabulary as the inbox box, and the sent box always reports `unread_count = 0` (outbound rows carry no recipient read state).
 #[tokio::test]
 async fn sent_box_fields_projection_applies_and_unread_count_is_zero() {
     let backend = shared_backend();
@@ -12298,9 +11304,7 @@ async fn sent_box_fields_projection_applies_and_unread_count_is_zero() {
     assert_eq!(message["direction"], "outbound");
 }
 
-/// Sent-box paging walks the newest-first filtered sequence with stable page
-/// boundaries: `next_offset` chains pages without overlap or gaps, and the
-/// terminal page reports `has_more = false` with a null `next_offset`.
+/// Sent-box paging walks the newest-first filtered sequence with stable page boundaries: `next_offset` chains pages without overlap or gaps, and the terminal page reports `has_more = false` with a null `next_offset`.
 #[tokio::test]
 async fn sent_box_paginates_newest_first_with_stable_boundaries() {
     let backend = shared_backend();
@@ -12364,8 +11368,7 @@ async fn sent_box_paginates_newest_first_with_stable_boundaries() {
     );
 }
 
-/// A `box` value outside the accepted set is rejected, and the error names
-/// the valid values.
+/// A `box` value outside the accepted set is rejected, and the error names the valid values.
 #[tokio::test]
 async fn inbox_rejects_box_value_outside_the_accepted_set() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -12385,10 +11388,7 @@ async fn inbox_rejects_box_value_outside_the_accepted_set() {
     );
 }
 
-/// An empty-string `to_actor` filter is caller error: stored actor labels are
-/// never empty (`send` validates), so the filter could only silently match
-/// nothing. It is rejected with the same shape as the empty substring-filter
-/// validations.
+/// An empty-string `to_actor` filter is caller error: stored actor labels are never empty (`send` validates), so the filter could only silently match nothing.
 #[tokio::test]
 async fn sent_box_rejects_empty_to_actor_filter() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -12407,12 +11407,7 @@ async fn sent_box_rejects_empty_to_actor_filter() {
     );
 }
 
-/// A stored outbound row missing `to_actor`/`from_actor` degrades per the
-/// handler's definitions instead of panicking: for the anonymous `"local"`
-/// caller the `from_actor` predicate falls back to EqOrMissing so the row
-/// stays listed, the projected `to_actor` alias has no property or top-level
-/// `to` to fall back to and renders as null, and an exact `to_actor` filter
-/// simply does not match the property-less row.
+/// A stored outbound row missing `to_actor`/`from_actor` degrades per the handler's definitions instead of panicking: for the anonymous `"local"` caller the `from_actor` predicate falls back to EqOrMissing so the row stays listed, the projected `to_actor` alias has no property or top-level `to` to fall back to and renders as null, and an exact `to_actor` filter simply does not match the property-less row.
 #[tokio::test]
 async fn sent_box_null_property_fallback_does_not_panic() {
     let backend = shared_backend();
@@ -12470,9 +11465,7 @@ async fn sent_box_null_property_fallback_does_not_panic() {
     );
 }
 
-/// A long-poll on the sent box wakes when the caller sends a new message: the
-/// inbox generation counter is direction-agnostic, so an outbound commit
-/// publishes the same signal an inbound one does.
+/// A long-poll on the sent box wakes when the caller sends a new message: the inbox generation counter is direction-agnostic, so an outbound commit publishes the same signal an inbound one does.
 #[tokio::test]
 async fn sent_box_long_poll_wakes_after_concurrent_send() {
     let (registry, _rt) = build_registry_for_ns("local");

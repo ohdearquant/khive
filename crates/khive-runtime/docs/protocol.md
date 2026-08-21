@@ -23,13 +23,26 @@ MCP request(ops=...) → khive_request::parse_request → Vec<ParsedOp>
   for each ParsedOp:
     VerbRegistry::dispatch(verb, params)
       → help=true? → describe_verb() [short-circuit, no gate]
-      → Gate::check(GateRequest) → Allow|Deny
+      → Gate::check(GateRequest) → Allow|Deny|Err
           Deny → RuntimeError::PermissionDenied [pack not invoked]
+          Err → RuntimeError::GateUnavailable [pack not invoked]
           Allow → first matching pack.dispatch(verb, params)
                   → RuntimeResult<Value>
       → EventStore::append(audit_event) [if configured]
       → DispatchHook::on_dispatch(event) [if configured]
 ```
+
+When the configured main backend is read-only, the registry intentionally
+holds no `EventStore`: a known-failing append is not attempted. Successful
+non-help operation entries instead carry an `advisories` array beside their
+canonical `result`, with code `audit_persistence_skipped_read_only`. Failed and
+aborted entries receive no such advisory because they do not claim a successful
+operation whose audit persistence was skipped.
+
+Read-only versus writable main-backend mode is engine-coherence state, not
+request identity. It is folded into the warm-daemon `config_id`, so a snapshot
+inspection request cannot be served by a daemon that retained a write-capable
+handle to the same database path.
 
 ## Verb Visibility Contract
 
@@ -81,7 +94,8 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
 ## Invariants
 
 - One pack per verb at boot: duplicate verb names across packs produce `RuntimeError::VerbCollision`.
-- Gate is consulted before every dispatch. Gate infrastructure errors are fail-open (ADR-018).
+- Gate is consulted before every dispatch. Gate infrastructure errors are audited and fail closed
+  with `RuntimeError::GateUnavailable` (ADR-018, ADR-129).
 - Namespace is attribution and gate-policy input (ADR-007 Rev 6, ADR-050): it is minted into
   the dispatch `NamespaceToken`'s read/write scope, not re-checked per record. By-ID
   operations (get, delete, update) resolve globally unique UUIDs without a namespace
@@ -93,12 +107,14 @@ For subhandlers, the envelope additionally carries `"visibility": "internal"` an
 
 ## Failure Modes
 
-| Condition                        | Error                                              |
-| --------------------------------- | --------------------------------------------------- |
-| Unknown verb                      | `RuntimeError::UnknownVerb("unknown verb ...")`    |
-| Gate deny                         | `RuntimeError::PermissionDenied { verb, reason }`  |
-| Pack not loaded                   | `RuntimeError::UnknownVerb` (unknown verb path)    |
-| Malformed explicit namespace      | `RuntimeError::InvalidInput` (non-string `namespace`, rejected before gate) |
+| Condition                                             | Error                                                                       |
+| ----------------------------------------------------- | --------------------------------------------------------------------------- |
+| Unknown verb                                          | `RuntimeError::UnknownVerb("unknown verb ...")`                             |
+| Gate deny                                             | `RuntimeError::PermissionDenied { verb, reason }`                           |
+| Gate infrastructure error                             | `RuntimeError::GateUnavailable { verb, reason }`                            |
+| Pack not loaded                                       | `RuntimeError::UnknownVerb` (unknown verb path)                             |
+| Malformed explicit namespace                          | `RuntimeError::InvalidInput` (non-string `namespace`, rejected before gate) |
+| Read-only audit backend after a successful inspection | Success plus `audit_persistence_skipped_read_only` advisory                 |
 
 `RuntimeError::NamespaceMismatch` is a historical/rejected variant from a pre-Rev-6
 design where by-ID lookups compared `record.namespace == caller_namespace`; it is not

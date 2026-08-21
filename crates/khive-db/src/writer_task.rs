@@ -33,14 +33,24 @@
 //! | Recovery (`walpin` beacon/sidecar bookkeeping) | None — file-level bookkeeping (PID beacons, heartbeats) alongside the database, not a SQL connection against it | No | N/A — never acquires a database writer connection |
 //! | Top-level maintenance (`VACUUM` via `execute_script_top_level`/`WriterTaskHandle::send_top_level`) | `WriterTaskHandle`, skipping the per-request `BEGIN IMMEDIATE`/`COMMIT` wrap only | Yes | Routed through the SAME single writer owner as every other queued request — only the transaction wrap is skipped, never the queue |
 //!
+//! Store constructors may run outside Tokio and temporarily cache no handle;
+//! every store request-path write refreshes through
+//! `ConnectionPool::writer_task_for_write` at execution time. Strict routing
+//! refuses a missing handle, while the explicit compatibility fallback emits
+//! its store-specific violation at the actual direct-writer seam. The strict
+//! default itself remains gated by ADR-135 F2 / ADR-136 D2 evidence.
+//!
 //! A `direct_route_violation` sink row (`timeout_sink::emit_direct_route_violation`,
 //! ADR-136 D1 gate 6c) is emitted ONLY for the first row's degrade path — a
 //! `SqlAccess`-reachable write that bypassed an enabled queue. The other four
 //! rows are exempt by design and never emit that row.
 
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use khive_storage::error::{StorageError, WriterTaskRequestState};
@@ -58,6 +68,117 @@ use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
 /// nested-transaction rule and return `SQLITE_ERROR: cannot start a
 /// transaction within a transaction` (ADR-067 lines 271-276).
 type WriteOp<R> = Box<dyn FnOnce(&Connection) -> Result<R, StorageError> + Send>;
+
+/// Latest completed writer-task span for one database, decomposed at the
+/// boundaries an operator can act on (#1849). A zero value means that phase
+/// did not run (top-level/early-failure request) or completed below the
+/// microsecond clock resolution; `total_micros` retains the full span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterStageObservation {
+    pub queue_wait_micros: u64,
+    pub transaction_acquire_micros: u64,
+    pub body_micros: u64,
+    pub commit_micros: u64,
+    pub total_micros: u64,
+    pub queue_depth_at_entry: u64,
+    pub observed_at_unix_ms: u64,
+}
+
+static WRITER_STAGE_OBSERVATIONS: OnceLock<
+    Mutex<HashMap<Option<PathBuf>, WriterStageObservation>>,
+> = OnceLock::new();
+
+fn writer_stage_observations() -> &'static Mutex<HashMap<Option<PathBuf>, WriterStageObservation>> {
+    WRITER_STAGE_OBSERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn writer_db_key_from_path(path: Option<&Path>) -> Option<PathBuf> {
+    path.map(Path::to_path_buf)
+}
+
+fn writer_db_key(pool: &ConnectionPool) -> Option<PathBuf> {
+    writer_db_key_from_path(pool.canonical_path())
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn observed_at_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Pure in-memory read of the most recently completed writer-task span for
+/// this exact backend. It acquires no SQLite connection and performs no I/O.
+pub fn last_writer_stage_observation(pool: &ConnectionPool) -> Option<WriterStageObservation> {
+    writer_stage_observations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&writer_db_key(pool))
+        .cloned()
+}
+
+struct WriteTelemetry {
+    backend_key: Option<PathBuf>,
+    db: String,
+    submitted_at: Instant,
+    queue_depth_at_entry: usize,
+    slow_write_threshold: Option<Duration>,
+}
+
+impl WriteTelemetry {
+    fn new(
+        backend_key: Option<PathBuf>,
+        db: String,
+        queue_depth_at_entry: usize,
+        slow_write_threshold: Option<Duration>,
+    ) -> Self {
+        Self {
+            backend_key,
+            db,
+            submitted_at: Instant::now(),
+            queue_depth_at_entry,
+            slow_write_threshold,
+        }
+    }
+
+    fn queue_wait(&self) -> Duration {
+        self.submitted_at.elapsed()
+    }
+
+    fn finish(
+        self,
+        queue_wait: Duration,
+        transaction_acquire: Duration,
+        body: Duration,
+        commit: Duration,
+    ) {
+        let total = self.submitted_at.elapsed();
+        let observation = WriterStageObservation {
+            queue_wait_micros: duration_micros(queue_wait),
+            transaction_acquire_micros: duration_micros(transaction_acquire),
+            body_micros: duration_micros(body),
+            commit_micros: duration_micros(commit),
+            total_micros: duration_micros(total),
+            queue_depth_at_entry: self.queue_depth_at_entry as u64,
+            observed_at_unix_ms: observed_at_unix_ms(),
+        };
+        writer_stage_observations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.backend_key, observation.clone());
+
+        if self
+            .slow_write_threshold
+            .is_some_and(|threshold| total >= threshold)
+        {
+            crate::timeout_sink::emit_slow_write(&self.db, &observation);
+        }
+    }
+}
 
 /// One write request awaiting execution by the writer task.
 ///
@@ -77,6 +198,7 @@ pub struct WriteRequest<R: Send + 'static> {
     op: WriteOp<R>,
     reply: oneshot::Sender<Result<R, StorageError>>,
     top_level: bool,
+    telemetry: WriteTelemetry,
 }
 
 mod sealed {
@@ -88,12 +210,23 @@ mod sealed {
         fn execute_and_reply_reporting_terminal(
             self: Box<Self>,
             conn: &rusqlite::Connection,
+            tx_span: Option<khive_storage::tx_registry::TxHandle>,
+            queue_wait: std::time::Duration,
+            transaction_acquire: std::time::Duration,
         ) -> Option<khive_storage::error::WriterTaskRequestState>;
 
         fn execute_and_reply_top_level_reporting_terminal(
             self: Box<Self>,
             conn: &rusqlite::Connection,
+            queue_wait: std::time::Duration,
         ) -> Option<khive_storage::error::WriterTaskRequestState>;
+
+        fn reply_error_after_begin(
+            self: Box<Self>,
+            err: khive_storage::error::StorageError,
+            queue_wait: std::time::Duration,
+            transaction_acquire: std::time::Duration,
+        );
     }
 }
 
@@ -145,6 +278,10 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
     /// [`Self::execute_and_reply_top_level`] (no transaction wrap) instead
     /// of [`Self::execute_and_reply`] (wrapped in `BEGIN IMMEDIATE`).
     fn is_top_level(&self) -> bool;
+
+    /// Time from the caller constructing this request (before bounded-channel
+    /// admission) until the writer task dequeued it.
+    fn queue_wait(&self) -> Duration;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,46 +325,92 @@ pub(crate) fn execute_wrapped_transaction<R, F>(
 where
     F: FnOnce(&Connection) -> Result<R, StorageError>,
 {
-    match catch_unwind(AssertUnwindSafe(|| operation(conn))) {
-        Ok(Ok(value)) => match conn.execute_batch("COMMIT") {
-            Ok(()) if conn.is_autocommit() => (Ok(value), None),
-            Ok(()) => {
-                tracing::error!(
+    let profiled = execute_wrapped_transaction_profiled(conn, commit_operation, operation);
+    (profiled.result, profiled.terminal_state)
+}
+
+struct ProfiledWrappedTransaction<R> {
+    result: Result<R, StorageError>,
+    terminal_state: Option<WriterTaskRequestState>,
+    body: Duration,
+    commit: Duration,
+}
+
+fn execute_wrapped_transaction_profiled<R, F>(
+    conn: &Connection,
+    commit_operation: &'static str,
+    operation: F,
+) -> ProfiledWrappedTransaction<R>
+where
+    F: FnOnce(&Connection) -> Result<R, StorageError>,
+{
+    let body_started = Instant::now();
+    let operation_outcome = catch_unwind(AssertUnwindSafe(|| operation(conn)));
+    let body = body_started.elapsed();
+
+    match operation_outcome {
+        Ok(Ok(value)) => {
+            let commit_started = Instant::now();
+            let commit_outcome = conn.execute_batch("COMMIT");
+            let commit = commit_started.elapsed();
+            match commit_outcome {
+                Ok(()) if conn.is_autocommit() => ProfiledWrappedTransaction {
+                    result: Ok(value),
+                    terminal_state: None,
+                    body,
+                    commit,
+                },
+                Ok(()) => {
+                    tracing::error!(
                     "writer transaction: COMMIT returned success but the connection is still in \
                      a transaction; request side effects are unknown"
                 );
-                let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                (
-                    Err(writer_task_terminated(request_state)),
-                    Some(request_state),
-                )
-            }
-            Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
-                RollbackDisposition::RolledBack => (
-                    Err(StorageError::Pool {
-                        operation: commit_operation.into(),
-                        message: commit_error.to_string(),
-                    }),
-                    None,
-                ),
-                RollbackDisposition::SideEffectsUnknown => {
                     let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                    (
-                        Err(writer_task_terminated(request_state)),
-                        Some(request_state),
-                    )
+                    ProfiledWrappedTransaction {
+                        result: Err(writer_task_terminated(request_state)),
+                        terminal_state: Some(request_state),
+                        body,
+                        commit,
+                    }
                 }
-            },
-        },
+                Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
+                    RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
+                        result: Err(StorageError::Pool {
+                            operation: commit_operation.into(),
+                            message: commit_error.to_string(),
+                        }),
+                        terminal_state: None,
+                        body,
+                        commit,
+                    },
+                    RollbackDisposition::SideEffectsUnknown => {
+                        let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                        ProfiledWrappedTransaction {
+                            result: Err(writer_task_terminated(request_state)),
+                            terminal_state: Some(request_state),
+                            body,
+                            commit,
+                        }
+                    }
+                },
+            }
+        }
         Ok(Err(operation_error)) => {
             match rollback_after_failure(conn, "request operation failure") {
-                RollbackDisposition::RolledBack => (Err(operation_error), None),
+                RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
+                    result: Err(operation_error),
+                    terminal_state: None,
+                    body,
+                    commit: Duration::ZERO,
+                },
                 RollbackDisposition::SideEffectsUnknown => {
                     let request_state = WriterTaskRequestState::SideEffectsUnknown;
-                    (
-                        Err(writer_task_terminated(request_state)),
-                        Some(request_state),
-                    )
+                    ProfiledWrappedTransaction {
+                        result: Err(writer_task_terminated(request_state)),
+                        terminal_state: Some(request_state),
+                        body,
+                        commit: Duration::ZERO,
+                    }
                 }
             }
         }
@@ -238,10 +421,12 @@ where
                     WriterTaskRequestState::SideEffectsUnknown
                 }
             };
-            (
-                Err(writer_task_terminated(request_state)),
-                Some(request_state),
-            )
+            ProfiledWrappedTransaction {
+                result: Err(writer_task_terminated(request_state)),
+                terminal_state: Some(request_state),
+                body,
+                commit: Duration::ZERO,
+            }
         }
     }
 }
@@ -250,24 +435,53 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
     fn execute_and_reply_reporting_terminal(
         self: Box<Self>,
         conn: &Connection,
+        tx_span: Option<khive_storage::tx_registry::TxHandle>,
+        queue_wait: Duration,
+        transaction_acquire: Duration,
     ) -> Option<WriterTaskRequestState> {
         // Keep the typed reply sender outside the unwind boundary. Calling
         // `(self.op)(conn)` directly would drop `self.reply` while unwinding,
         // leaving the active caller with only an untyped RecvError.
-        let WriteRequest { op, reply, .. } = *self;
-        let (result, terminal_state) = execute_wrapped_transaction(conn, "writer_task_commit", op);
+        let WriteRequest {
+            op,
+            reply,
+            telemetry,
+            ..
+        } = *self;
+        let profiled = execute_wrapped_transaction_profiled(conn, "writer_task_commit", op);
+        // The reply wake can make the caller immediately observe the
+        // committed/error result. Deregister the transaction span first so
+        // tx_registry continues to mean "currently open SQL transaction",
+        // never "a transaction whose caller has already resumed" (#1790).
+        drop(tx_span);
+        telemetry.finish(
+            queue_wait,
+            transaction_acquire,
+            profiled.body,
+            profiled.commit,
+        );
         // The receiver may already be gone (caller dropped its future) —
         // that is not this task's problem to report.
-        let _ = reply.send(result);
-        terminal_state
+        let _ = reply.send(profiled.result);
+        profiled.terminal_state
     }
 
     fn execute_and_reply_top_level_reporting_terminal(
         self: Box<Self>,
         conn: &Connection,
+        queue_wait: Duration,
     ) -> Option<WriterTaskRequestState> {
-        let WriteRequest { op, reply, .. } = *self;
-        match catch_unwind(AssertUnwindSafe(|| op(conn))) {
+        let WriteRequest {
+            op,
+            reply,
+            telemetry,
+            ..
+        } = *self;
+        let body_started = Instant::now();
+        let outcome = catch_unwind(AssertUnwindSafe(|| op(conn)));
+        let body = body_started.elapsed();
+        telemetry.finish(queue_wait, Duration::ZERO, body, Duration::ZERO);
+        match outcome {
             Ok(outcome) if conn.is_autocommit() => {
                 // No COMMIT/ROLLBACK here: this request explicitly did not
                 // open a transaction, so there is nothing to close.
@@ -293,30 +507,73 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             }
         }
     }
+
+    fn reply_error_after_begin(
+        self: Box<Self>,
+        err: StorageError,
+        queue_wait: Duration,
+        transaction_acquire: Duration,
+    ) {
+        let WriteRequest {
+            reply, telemetry, ..
+        } = *self;
+        telemetry.finish(
+            queue_wait,
+            transaction_acquire,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let _ = reply.send(Err(err));
+    }
 }
 
 impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
     fn execute_and_reply(self: Box<Self>, conn: &Connection) {
-        let _ = sealed::Sealed::execute_and_reply_reporting_terminal(self, conn);
+        let queue_wait = self.queue_wait();
+        let _ = sealed::Sealed::execute_and_reply_reporting_terminal(
+            self,
+            conn,
+            None,
+            queue_wait,
+            Duration::ZERO,
+        );
     }
 
     fn execute_and_reply_top_level(self: Box<Self>, conn: &Connection) {
-        let _ = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(self, conn);
+        let queue_wait = self.queue_wait();
+        let _ =
+            sealed::Sealed::execute_and_reply_top_level_reporting_terminal(self, conn, queue_wait);
     }
 
     fn reply_error(self: Box<Self>, err: StorageError) {
-        // Same "receiver may already be gone" reasoning as above — send and
-        // move on regardless of outcome.
-        let _ = self.reply.send(Err(err));
+        let queue_wait = self.queue_wait();
+        sealed::Sealed::reply_error_after_begin(self, err, queue_wait, Duration::ZERO);
     }
 
     fn is_top_level(&self) -> bool {
         self.top_level
     }
+
+    fn queue_wait(&self) -> Duration {
+        self.telemetry.queue_wait()
+    }
 }
 
 fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError {
     StorageError::WriterTaskTerminated { request_state }
+}
+
+fn writer_task_begin_error(error: rusqlite::Error, busy_timeout: Duration) -> StorageError {
+    if crate::timeout_sink::is_busy_or_locked(&error) {
+        StorageError::WriterTaskBusy {
+            timeout_ms: u64::try_from(busy_timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    } else {
+        StorageError::Pool {
+            operation: "writer_task_begin".into(),
+            message: error.to_string(),
+        }
+    }
 }
 
 /// Sender half of the write queue. Cheaply cloneable (wraps an
@@ -325,6 +582,9 @@ fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError
 #[derive(Clone, Debug)]
 pub struct WriterTaskHandle {
     tx: mpsc::Sender<Box<dyn AnyWriteRequest + Send>>,
+    /// Exact canonical backend identity used by the in-memory stage registry.
+    /// Kept separate from `db`, whose lossy display form is logging-only.
+    backend_key: Option<PathBuf>,
     /// This handle's pool's writer-timeout sink identity (`timeout_sink::db_label`),
     /// captured at spawn so `send_with_timeout`'s `WriteQueueFull` path can
     /// report a `queue_saturation` sink row (ADR-136 D1 gate 6a) without
@@ -397,10 +657,17 @@ impl WriterTaskHandle {
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let telemetry = WriteTelemetry::new(
+            self.backend_key.clone(),
+            self.db.clone(),
+            self.queue_depth(),
+            self.slow_write_threshold,
+        );
         let request = WriteRequest {
             op: Box::new(op),
             reply: reply_tx,
             top_level,
+            telemetry,
         };
 
         self.tx
@@ -422,13 +689,10 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue(op).await?;
-        let result = reply_rx
+        reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
-        self.finish_latency_observation(observation);
-        result
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Like [`Self::send`], but bounds the wait for the bounded channel to
@@ -454,7 +718,6 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let observation = self.begin_latency_observation();
         let reply_rx = match tokio::time::timeout(timeout, self.enqueue(op)).await {
             Ok(Ok(reply_rx)) => reply_rx,
             Ok(Err(e)) => return Err(e),
@@ -465,11 +728,9 @@ impl WriterTaskHandle {
             }
         };
 
-        let result = reply_rx
+        reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
-        self.finish_latency_observation(observation);
-        result
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Like [`Self::send`], but bounds the enqueue-capacity wait with this
@@ -506,13 +767,10 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue_inner(op, true).await?;
-        let result = reply_rx
+        reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
-        self.finish_latency_observation(observation);
-        result
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Like [`Self::send_top_level`], but bounds the enqueue-capacity wait
@@ -524,7 +782,6 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let observation = self.begin_latency_observation();
         let reply_rx =
             match tokio::time::timeout(self.enqueue_timeout, self.enqueue_inner(op, true)).await {
                 Ok(Ok(reply_rx)) => reply_rx,
@@ -536,42 +793,9 @@ impl WriterTaskHandle {
                 }
             };
 
-        let result = reply_rx
+        reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
-        self.finish_latency_observation(observation);
-        result
-    }
-
-    /// Snapshot the start instant and the queue backlog for one send, if
-    /// slow-write observation is enabled for this handle. The depth is
-    /// captured at send START — after completion the drain loop has already
-    /// consumed this request, so a completion-time read would systematically
-    /// understate the backlog the caller actually waited behind.
-    fn begin_latency_observation(&self) -> Option<(std::time::Instant, usize)> {
-        self.slow_write_threshold
-            .map(|_| (std::time::Instant::now(), self.queue_depth()))
-    }
-
-    /// Emit a `slow_write` sink row if this send's whole span met the
-    /// threshold. Called on the reply path — success or typed error alike,
-    /// since the caller experienced the latency either way. Never called
-    /// when the reply channel itself is severed (writer-task terminated),
-    /// which is reported through its own retirement row.
-    fn finish_latency_observation(&self, observation: Option<(std::time::Instant, usize)>) {
-        let (Some(threshold), Some((start, depth_at_entry))) =
-            (self.slow_write_threshold, observation)
-        else {
-            return;
-        };
-        let elapsed = start.elapsed();
-        if elapsed >= threshold {
-            crate::timeout_sink::emit_slow_write(
-                &self.db,
-                elapsed.as_millis() as u64,
-                depth_at_entry,
-            );
-        }
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Current write-queue backlog depth: requests enqueued but not yet
@@ -620,7 +844,9 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     // ownership boundary instead.
     let conn = pool.open_standalone_writer_untracked()?;
     let acquisition_counters = pool.writer_acquisition_counters();
+    let busy_timeout = pool.config().busy_timeout;
     let origin = pool.origin();
+    let backend_key = writer_db_key(pool);
     let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
     let join = tokio::spawn(run_writer_task(
@@ -629,6 +855,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
         origin,
         db.clone(),
         acquisition_counters,
+        busy_timeout,
     ));
     // Stored on the pool (not returned) so the handle's clone-and-share
     // contract stays untouched; see ConnectionPool::take_writer_task_join
@@ -636,6 +863,7 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     pool.set_writer_task_join(join);
     Ok(WriterTaskHandle {
         tx,
+        backend_key,
         db,
         slow_write_threshold: crate::timeout_sink::slow_write_threshold(),
         enqueue_timeout: std::time::Duration::from_millis(
@@ -677,8 +905,13 @@ async fn run_writer_task(
     origin: khive_storage::tx_registry::TxOrigin,
     db: String,
     acquisition_counters: Arc<WriterAcquisitionCounters>,
+    busy_timeout: Duration,
 ) {
     while let Some(request) = rx.recv().await {
+        // The bounded-channel wait ends at this exact dequeue boundary.
+        // Sampling inside the blocking closure would misattribute a saturated
+        // Tokio blocking pool to writer-queue contention (#1849).
+        let queue_wait = request.queue_wait();
         let origin = origin.clone();
         let acquisition_counters = Arc::clone(&acquisition_counters);
         let outcome = tokio::task::spawn_blocking(move || {
@@ -705,16 +938,27 @@ async fn run_writer_task(
                 // this same drain loop, so the single-writer guarantee
                 // holds; only the transaction wrap is skipped.
                 acquisition_counters.record_writer_task_acquisition();
-                sealed::Sealed::execute_and_reply_top_level_reporting_terminal(request, &conn)
+                sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
+                    request, &conn, queue_wait,
+                )
             } else {
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                let tx_span = khive_storage::tx_registry::register_scoped(
                     Some("writer_task_tx".to_string()),
                     origin,
                 );
-                match conn.execute_batch("BEGIN IMMEDIATE") {
+                let transaction_acquire_started = Instant::now();
+                let begin_outcome = conn.execute_batch("BEGIN IMMEDIATE");
+                let transaction_acquire = transaction_acquire_started.elapsed();
+                match begin_outcome {
                     Ok(()) => {
                         acquisition_counters.record_writer_task_acquisition();
-                        sealed::Sealed::execute_and_reply_reporting_terminal(request, &conn)
+                        sealed::Sealed::execute_and_reply_reporting_terminal(
+                            request,
+                            &conn,
+                            Some(tx_span),
+                            queue_wait,
+                            transaction_acquire,
+                        )
                     }
                     Err(e) => {
                         // Do NOT run the request's operation: `conn` never
@@ -727,10 +971,30 @@ async fn run_writer_task(
                             "writer task: BEGIN IMMEDIATE failed; replying an \
                              error without running the request's operation"
                         );
-                        request.reply_error(StorageError::Pool {
-                            operation: "writer_task_begin".into(),
-                            message: e.to_string(),
-                        });
+                        // Although BEGIN never opened a SQL transaction, the
+                        // scoped attempt is observable in tx_registry. Drop
+                        // it before waking the caller for the same reply-side
+                        // lifecycle guarantee as successful requests (#1790).
+                        drop(tx_span);
+                        // Count the refusal the caller is about to be told
+                        // about. Classify by matching the value the shared
+                        // classifier returned, never by re-testing `e`: a
+                        // second copy of the busy rule here could drift from
+                        // the error actually replied, and the counter would
+                        // then disagree with the caller's own experience.
+                        let begin_error = writer_task_begin_error(e, busy_timeout);
+                        match &begin_error {
+                            StorageError::WriterTaskBusy { .. } => {
+                                acquisition_counters.record_writer_task_begin_busy()
+                            }
+                            _ => acquisition_counters.record_writer_task_begin_error(),
+                        }
+                        sealed::Sealed::reply_error_after_begin(
+                            request,
+                            begin_error,
+                            queue_wait,
+                            transaction_acquire,
+                        );
                         None
                     }
                 }
@@ -777,9 +1041,35 @@ mod tests {
     use crate::pool::PoolConfig;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
     use serial_test::serial;
+
+    #[test]
+    fn begin_error_classification_is_code_based_and_narrow() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("rendered text is irrelevant".to_string()),
+            );
+            assert!(matches!(
+                writer_task_begin_error(error, Duration::from_millis(175)),
+                StorageError::WriterTaskBusy { timeout_ms: 175 }
+            ));
+        }
+
+        let structural = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("database is locked".to_string()),
+        );
+        assert!(matches!(
+            writer_task_begin_error(structural, Duration::from_millis(175)),
+            StorageError::Pool { ref operation, .. } if operation == "writer_task_begin"
+        ));
+    }
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc as std_mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::Duration;
 
     fn file_pool(path: &std::path::Path) -> ConnectionPool {
@@ -829,6 +1119,173 @@ mod tests {
             }
             other => panic!("expected WriterTaskTerminated({expected:?}), got {other:?}"),
         }
+    }
+
+    struct ParkedWake {
+        entered: std_mpsc::SyncSender<()>,
+        release: Mutex<std_mpsc::Receiver<()>>,
+    }
+
+    impl Wake for ParkedWake {
+        fn wake(self: Arc<Self>) {
+            self.entered
+                .send(())
+                .expect("reply sender must rendezvous with the test");
+            self.release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .expect("test must release the parked reply sender");
+        }
+    }
+
+    fn arm_parked_wake<F: Future>(
+        mut future: Pin<&mut F>,
+    ) -> (std_mpsc::Receiver<()>, std_mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std_mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let waker = Waker::from(Arc::new(ParkedWake {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        let mut context = Context::from_waker(&waker);
+        assert!(
+            matches!(future.as_mut().poll(&mut context), Poll::Pending),
+            "writer send must remain pending until its operation replies"
+        );
+        (entered_rx, release_tx)
+    }
+
+    fn poll_ready<F: Future>(mut future: Pin<&mut F>) -> F::Output {
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("reply wake must make the writer send ready"),
+        }
+    }
+
+    fn database_tx_view(pool: &ConnectionPool) -> khive_storage::tx_registry::TxOriginFilter {
+        match pool.origin() {
+            khive_storage::tx_registry::TxOrigin::Database(identity) => {
+                khive_storage::tx_registry::TxOriginFilter::Secondary(identity)
+            }
+            other => panic!("expected a file-backed database origin, got {other:?}"),
+        }
+    }
+
+    async fn wait_for_writer_span_to_close(view: &khive_storage::tx_registry::TxOriginFilter) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while khive_storage::tx_registry::any_open_labeled(view, "writer_task_tx") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer task transaction span must eventually close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tx_registry)]
+    async fn successful_send_reply_waits_for_writer_tx_deregistration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_success_reply_lifecycle.db");
+        let pool = file_pool(&path);
+        let view = database_tx_view(&pool);
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+        let (op_started_tx, op_started_rx) = std_mpsc::sync_channel(0);
+        let (op_release_tx, op_release_rx) = std_mpsc::channel();
+
+        let send = handle.send(move |_conn| {
+            op_started_tx
+                .send(())
+                .expect("operation must rendezvous with the test");
+            op_release_rx
+                .recv()
+                .expect("test must release the operation");
+            Ok::<_, StorageError>(())
+        });
+        tokio::pin!(send);
+        let (reply_entered_rx, reply_release_tx) = arm_parked_wake(send.as_mut());
+
+        op_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer operation must start");
+        op_release_tx.send(()).expect("release writer operation");
+        reply_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reply sender must wake the waiting caller");
+
+        let reply = poll_ready(send.as_mut());
+        let span_was_open_at_reply =
+            khive_storage::tx_registry::any_open_labeled(&view, "writer_task_tx");
+
+        reply_release_tx
+            .send(())
+            .expect("release parked reply sender");
+        wait_for_writer_span_to_close(&view).await;
+
+        reply.expect("committed operation reply");
+        assert!(
+            !span_was_open_at_reply,
+            "a successful caller reply must not become observable while its committed writer_task_tx span remains registered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tx_registry)]
+    async fn begin_failure_reply_waits_for_writer_tx_deregistration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_reply_lifecycle.db");
+        let cfg = PoolConfig {
+            path: Some(path),
+            busy_timeout: Duration::from_millis(150),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        let view = database_tx_view(&pool);
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+        let lock_holder = pool.try_writer().expect("pool writer");
+        lock_holder
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold database write lock");
+        let op_ran = Arc::new(AtomicBool::new(false));
+        let op_ran_in_request = Arc::clone(&op_ran);
+
+        let send = handle.send(move |_conn| {
+            op_ran_in_request.store(true, Ordering::SeqCst);
+            Ok::<_, StorageError>(())
+        });
+        tokio::pin!(send);
+        let (reply_entered_rx, reply_release_tx) = arm_parked_wake(send.as_mut());
+        reply_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("BEGIN failure must wake the waiting caller");
+
+        let reply = poll_ready(send.as_mut());
+        let span_was_open_at_reply =
+            khive_storage::tx_registry::any_open_labeled(&view, "writer_task_tx");
+
+        reply_release_tx
+            .send(())
+            .expect("release parked reply sender");
+        wait_for_writer_span_to_close(&view).await;
+        lock_holder
+            .conn()
+            .execute_batch("ROLLBACK")
+            .expect("release database write lock");
+
+        assert!(
+            matches!(
+                &reply,
+                Err(StorageError::WriterTaskBusy { timeout_ms }) if *timeout_ms == 150
+            ),
+            "expected typed retryable writer-task contention, got {reply:?}"
+        );
+        assert!(!op_ran.load(Ordering::SeqCst));
+        assert!(
+            !span_was_open_at_reply,
+            "a BEGIN-failure caller reply must not become observable while its writer_task_tx span remains registered"
+        );
     }
 
     // `#[serial(tx_registry)]`: `run_writer_task` registers a `writer_task_tx`
@@ -882,10 +1339,9 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(StorageError::Pool { operation, .. }) if operation == "writer_task_begin"
+                Err(StorageError::WriterTaskBusy { timeout_ms }) if *timeout_ms == 150
             ),
-            "expected a writer_task_begin Pool error on BEGIN IMMEDIATE \
-             failure, got {result:?}"
+            "expected a typed retryable error on contended BEGIN IMMEDIATE, got {result:?}"
         );
         assert!(
             !op_ran.load(Ordering::SeqCst),
@@ -899,14 +1355,120 @@ mod tests {
         lock_holder.conn().execute_batch("ROLLBACK").unwrap();
         drop(lock_holder);
 
+        handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id, v) VALUES (100, 'next-request')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert_after_busy".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("transient contention must not retire the writer task");
+
         let reader = pool.reader().expect("reader");
         let count: i64 = reader
             .conn()
-            .query_row("SELECT COUNT(*) FROM t WHERE id = 99", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM t WHERE id IN (99, 100)", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(
-            count, 0,
-            "no row must have landed from the request whose BEGIN IMMEDIATE failed"
+            count, 1,
+            "the failed request must not land, while the next request commits on the same task"
+        );
+    }
+
+    // `#[serial(tx_registry)]`: same rationale as
+    // `begin_immediate_failure_replies_error_without_running_op`.
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn contended_begin_increments_its_own_failure_counter() {
+        // Real contention, same construction as the test above: a refused
+        // write must be COUNTED, not merely reported to its caller. Before
+        // this counter, `db_diagnostics` showed a clean writer while requests
+        // were being refused after a full busy timeout, so an operator could
+        // not distinguish this daemon from one that had never refused a write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_busy_counter.db");
+        let cfg = PoolConfig {
+            path: Some(path.clone()),
+            busy_timeout: Duration::from_millis(150),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+
+        let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+
+        let before = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            before.writer_task_begin_busy, 0,
+            "baseline: nothing has been refused yet"
+        );
+
+        let lock_holder = pool.try_writer().unwrap();
+        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let result = handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await;
+        assert!(
+            matches!(&result, Err(StorageError::WriterTaskBusy { .. })),
+            "precondition: the request must actually be refused busy, got {result:?}"
+        );
+
+        let after = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            after.writer_task_begin_busy, 1,
+            "the refusal the caller was told about must appear in the counters"
+        );
+        assert_eq!(
+            after.writer_task_begin_errors, 0,
+            "a busy refusal must not be counted as a non-busy BEGIN error"
+        );
+        assert_eq!(
+            after.timeouts, before.timeouts,
+            "a writer-task BEGIN refusal must not be mislabeled as a pool-mutex \
+             checkout timeout — separate ADR-135 F6 stages, separate counters"
+        );
+
+        // Discriminating arm: a SUCCEEDING request must not move the failure
+        // counter. Without this the assertion above would also pass against a
+        // counter that simply counted every request.
+        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+        drop(lock_holder);
+        handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id) VALUES (2)", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert_after_busy".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("the writer task survives transient contention");
+
+        let settled = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            settled.writer_task_begin_busy, 1,
+            "a successful request must leave the refusal counter untouched"
+        );
+        assert!(
+            settled.writer_task_acquisitions > after.writer_task_acquisitions,
+            "and it must still register as a success"
         );
     }
 
@@ -959,6 +1521,53 @@ mod tests {
         assert_eq!(counters.timeouts, 0);
     }
 
+    #[tokio::test]
+    async fn writer_task_connection_follows_checkpoint_ownership_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_autocheckpoint.db");
+        let pool = file_pool(&path);
+        // The pool-registered handle (not a directly spawned side task):
+        // `propagate_checkpoint_claim_to_writer_task` reaches exactly this
+        // task's connection.
+        let handle = pool
+            .writer_task_handle()
+            .expect("writer task should spawn")
+            .expect("file-backed pool resolves the write queue on");
+
+        let read_pages = |handle: &WriterTaskHandle| {
+            let handle = handle.clone();
+            async move {
+                handle
+                    .send_top_level(|conn| {
+                        conn.pragma_query_value(None, "wal_autocheckpoint", |row| {
+                            row.get::<_, u32>(0)
+                        })
+                        .map_err(|e| StorageError::Pool {
+                            operation: "test_wal_autocheckpoint".into(),
+                            message: e.to_string(),
+                        })
+                    })
+                    .await
+                    .expect("query writer-task connection pragma")
+            }
+        };
+
+        // Spawned before any claim: the task's long-lived connection keeps
+        // the bounded fallback.
+        assert_eq!(
+            read_pages(&handle).await,
+            crate::pool::FALLBACK_WAL_AUTOCHECKPOINT_PAGES
+        );
+
+        // After the claim propagates, the same connection is flipped to the
+        // dedicated-owner setting without reopening.
+        pool.claim_checkpoint_ownership().expect("claim ownership");
+        pool.propagate_checkpoint_claim_to_writer_task()
+            .await
+            .expect("propagate claim to the running writer task");
+        assert_eq!(read_pages(&handle).await, 0);
+    }
+
     #[test]
     fn spawn_fails_on_in_memory_pool() {
         // In-memory pools have no standalone-connection support
@@ -987,6 +1596,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -1026,6 +1636,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -1351,11 +1962,13 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: true,
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
         let terminal_state = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
             Box::new(request),
             &conn,
+            Duration::ZERO,
         );
         assert_eq!(
             terminal_state,
@@ -1394,10 +2007,16 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
-        let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+        let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
+            Box::new(request),
+            &conn,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
@@ -1526,10 +2145,16 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
-        let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+        let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
+            Box::new(request),
+            &conn,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
@@ -1565,10 +2190,16 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
-        let terminal_state =
-            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+        let terminal_state = sealed::Sealed::execute_and_reply_reporting_terminal(
+            Box::new(request),
+            &conn,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         assert_eq!(
             terminal_state,
             Some(WriterTaskRequestState::SideEffectsUnknown)
@@ -1830,6 +2461,7 @@ mod tests {
 
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -1856,6 +2488,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
         let handle = WriterTaskHandle {
             tx,
+            backend_key: None,
             db: "test".to_string(),
             slow_write_threshold: None,
             enqueue_timeout: Duration::from_secs(5),
@@ -1880,5 +2513,134 @@ mod tests {
 
         assert_writer_task_terminal_state(result, WriterTaskRequestState::SideEffectsUnknown);
         assert!(!request_ran.load(Ordering::SeqCst));
+    }
+
+    /// #1849: writer telemetry uses the same canonical OS-path identity as
+    /// the pool. A lossy display string would merge these distinct backends.
+    #[cfg(unix)]
+    #[test]
+    fn writer_stage_backend_key_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_a =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/khive-writer-\x80.db".to_vec()));
+        let path_b =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/khive-writer-\x81.db".to_vec()));
+        assert_eq!(
+            path_a.display().to_string(),
+            path_b.display().to_string(),
+            "fixture must reproduce the lossy display-label collision"
+        );
+        assert_ne!(
+            writer_db_key_from_path(Some(&path_a)),
+            writer_db_key_from_path(Some(&path_b)),
+            "backend keys must retain the canonical path's exact OS bytes"
+        );
+    }
+
+    /// #1849: a deliberately slow transaction body with no queue backlog or
+    /// lock contention must be attributed to `body`, not flattened into one
+    /// opaque send-to-reply duration.
+    #[tokio::test]
+    async fn writer_stage_sample_attributes_a_slow_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_stage_sample.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).unwrap();
+
+        handle
+            .send(|conn| {
+                std::thread::sleep(Duration::from_millis(60));
+                conn.execute("INSERT INTO t VALUES (1)", [])
+                    .map_err(|error| StorageError::Pool {
+                        operation: "writer_stage_sample".into(),
+                        message: error.to_string(),
+                    })
+            })
+            .await
+            .unwrap();
+
+        let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
+        assert!(
+            sample.body_micros >= 50_000,
+            "the synthetic delay must land in the body stage: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.queue_wait_micros,
+            "fast queueing must not receive the body's delay: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.transaction_acquire_micros,
+            "an uncontended BEGIN must not receive the body's delay: {sample:?}"
+        );
+        assert!(
+            sample.body_micros > sample.commit_micros,
+            "a fast COMMIT must not receive the body's delay: {sample:?}"
+        );
+        assert!(sample.observed_at_unix_ms > 0);
+    }
+
+    /// #1849: bounded-channel queue wait ends when the drain loop receives
+    /// the request. Saturation in Tokio's blocking pool happens after that
+    /// boundary and must remain in `total - named_stages`, never be relabeled
+    /// as writer-queue contention.
+    #[test]
+    fn writer_queue_wait_excludes_blocking_pool_scheduling_delay() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("writer_dequeue_boundary.db");
+            let pool = file_pool(&path);
+            let handle = spawn(&pool, 8).unwrap();
+
+            let (blocker_started_tx, blocker_started_rx) = std_mpsc::sync_channel(0);
+            let (release_blocker_tx, release_blocker_rx) = std_mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).unwrap();
+                release_blocker_rx.recv().unwrap();
+            });
+            blocker_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("sole blocking worker must be occupied");
+
+            let reply = handle
+                .enqueue(|_conn| Ok::<(), StorageError>(()))
+                .await
+                .expect("request must enter the bounded writer channel");
+            let dequeue_deadline = Instant::now() + Duration::from_secs(1);
+            while handle.queue_depth() != 0 {
+                assert!(
+                    Instant::now() < dequeue_deadline,
+                    "writer drain never dequeued the accepted request"
+                );
+                tokio::task::yield_now().await;
+            }
+
+            let scheduling_delay = Duration::from_millis(150);
+            tokio::time::sleep(scheduling_delay).await;
+            release_blocker_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            reply.await.unwrap().unwrap();
+
+            let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
+            assert!(
+                sample.total_micros.saturating_sub(sample.queue_wait_micros) >= 100_000,
+                "the post-dequeue blocking-pool delay must not inflate queue_wait: {sample:?}"
+            );
+        });
     }
 }

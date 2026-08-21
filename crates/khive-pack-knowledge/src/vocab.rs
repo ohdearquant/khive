@@ -232,7 +232,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.search",
-        description: "TF-IDF ranked search over the atom teaching corpus ONLY — knowledge graph entities and notes are a disjoint corpus and are never returned here; use the kg pack's `search` verb for those. Embedding rerank applies by default when an embedder is configured. Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Score bands: score>=0.46 reliably on-target, 0.42<=score<0.46 mixed quality, score<0.42 mostly off-target.",
+        description: "TF-IDF ranked search over the atom teaching corpus ONLY — knowledge graph entities and notes are a disjoint corpus and are never returned here; use the kg pack's `search` verb for those. Embedding rerank applies by default when an embedder is configured. Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Scores are squash-normalized to [0,1); absolute score is not a presence signal — use result rank for presence/coverage checks.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -282,7 +282,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum score threshold (default 0.0). Score bands: score>=0.46 reliable, 0.42<=score<0.46 mixed, score<0.42 mostly off-target.",
+                description: "Minimum score threshold (default 0.0). Scores are squash-normalized to [0,1); absolute score is not a presence signal — use result rank for presence/coverage checks.",
             },
             ParamDef {
                 name: "weights",
@@ -429,7 +429,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.import",
-        description: "Ingest atlas markdown file(s) as atoms with parsed sections",
+        description: "Validate and ingest atlas markdown file(s) with stable path identity",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -437,7 +437,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "path",
                 param_type: "string",
                 required: true,
-                description: "Filesystem path to a markdown file or directory",
+                description: "Filesystem path to a .md file or bounded directory tree",
             },
             ParamDef {
                 name: "format",
@@ -449,7 +449,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "chunk_strategy",
                 param_type: "string",
                 required: false,
-                description: "\"section\" (one section per atom, default) or \"atom\" (entire file as one atom)",
+                description: "\"section\" (atom plus parsed section rows, default) or \"atom\" (whole markdown in one atom, no section rows)",
             },
         ],
     },
