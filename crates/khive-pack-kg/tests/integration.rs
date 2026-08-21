@@ -312,6 +312,40 @@ async fn create_entity_type_case_only_difference_is_not_flagged_as_normalized() 
     );
 }
 
+// Repeated, leading, and trailing separators (space/hyphen/underscore) are
+// cosmetic — same word as the canonical registry entry once collapsed and
+// stripped — and must not be flagged as an alias substitution either. This
+// pins the fix for `normalize_for_comparison` diverging from the registry's
+// own `to_snake_case`: a naive space/hyphen-only substitution turns
+// "--Algorithm__" into "__algorithm__" (never collapsing or stripping), which
+// then compares unequal to the stored "algorithm" and misreports a purely
+// cosmetic normalization as a genuine alias substitution.
+#[tokio::test]
+async fn create_entity_type_repeated_leading_trailing_separators_are_not_flagged_as_normalized() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Some Other Algorithm",
+                "entity_kind": "concept",
+                "entity_type": "--Algorithm__",
+            }),
+        )
+        .await
+        .expect("entity_type '--Algorithm__' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("algorithm")
+    );
+    assert!(
+        result.get("entity_type_normalized").is_none(),
+        "repeated/leading/trailing separator folding must not be reported as an alias \
+         substitution; got: {result}"
+    );
+}
+
 // Bulk create must surface the same alias visibility even when `verbose` is
 // left at its default `false` — the atomic-path summary response is the
 // only place a non-verbose bulk caller ever sees the applied entity_type.

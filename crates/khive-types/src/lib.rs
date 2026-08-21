@@ -33,7 +33,9 @@ pub mod vector;
 pub use agent::{AgentRecord, AgentState, TerminalReason};
 pub use edge::{EdgeCategory, EdgeRelation};
 pub use entity::{Entity, EntityKind, Link, PropertyValue};
-pub use entity_type::{EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType};
+pub use entity_type::{
+    to_snake_case, EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType,
+};
 pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
