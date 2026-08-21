@@ -8,6 +8,7 @@ use khive_runtime::{
     RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlRow, SqlValue};
+use khive_storage::Note;
 use khive_types::Pack;
 
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
@@ -5204,6 +5205,180 @@ async fn try_create_note_rejects_forged_transport_owned_message_properties() {
         health["channels"].as_array().map(Vec::len),
         Some(0),
         "no channel_health backlog entry should exist either: {health:?}"
+    );
+}
+
+/// PR #1839 round 3, blocker: `try_create_note` refuses the three
+/// transport-owned properties, but round 2 left the raw `NoteStore` accessor
+/// (`runtime.notes(&token)`) able to write them directly — an in-process
+/// caller holding a namespace token could call `upsert_note` or
+/// `try_insert_note` with a forged `kind = "message"` note and `comm.health`
+/// would count it as real quarantine backlog. `KhiveRuntime::notes()` is now
+/// wrapped in a policy-enforcing decorator that refuses these writes at the
+/// storage-accessor boundary itself, not just at the `try_create_note`
+/// fast-path funnel. Assert both `upsert_note` and `try_insert_note` are
+/// refused, individually per key, and that no row survives for `comm.health`
+/// to count.
+#[tokio::test]
+async fn raw_note_store_accessor_rejects_forged_transport_owned_message_properties() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+
+    for (key, value) in [
+        ("quarantined", serde_json::json!(true)),
+        ("channel_kind", serde_json::json!("email")),
+        ("channel_slug", serde_json::json!("forged-channel")),
+    ] {
+        let note = Note::new("local", "message", "forged via raw upsert_note")
+            .with_properties(serde_json::json!({ key: value }));
+        let err = store.upsert_note(note).await.expect_err(&format!(
+            "upsert_note must reject a direct write setting `{key}`"
+        ));
+        assert!(
+            err.to_string().contains(key),
+            "rejection must name the offending property `{key}`: {err}"
+        );
+
+        let note = Note::new("local", "message", "forged via raw try_insert_note")
+            .with_properties(serde_json::json!({ key: value }));
+        let err = store.try_insert_note(note).await.expect_err(&format!(
+            "try_insert_note must reject a direct write setting `{key}`"
+        ));
+        assert!(
+            err.to_string().contains(key),
+            "rejection must name the offending property `{key}`: {err}"
+        );
+    }
+
+    // All three at once, through both write paths.
+    let all_three = serde_json::json!({
+        "quarantined": true,
+        "channel_kind": "email",
+        "channel_slug": "forged-channel",
+    });
+    let err = store
+        .upsert_note(
+            Note::new("local", "message", "forged via raw upsert_note (all three)")
+                .with_properties(all_three.clone()),
+        )
+        .await
+        .expect_err("upsert_note must reject all three transport-owned properties at once");
+    assert!(!err.to_string().is_empty());
+    let err = store
+        .try_insert_note(
+            Note::new(
+                "local",
+                "message",
+                "forged via raw try_insert_note (all three)",
+            )
+            .with_properties(all_three),
+        )
+        .await
+        .expect_err("try_insert_note must reject all three transport-owned properties at once");
+    assert!(!err.to_string().is_empty());
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["quarantined_count"].as_u64(),
+        Some(0),
+        "no raw-storage write must leave a row for comm.health to count: {health:?}"
+    );
+    assert_eq!(
+        health["channels"].as_array().map(Vec::len),
+        Some(0),
+        "no channel_health backlog entry should exist either: {health:?}"
+    );
+}
+
+/// PR #1839 round 3, high: the channel-ingest capability used to live in a
+/// process-global `OnceLock` on the factory, granted only inside
+/// `PackRegistry::register_packs`. Direct composition (`CommPack::new`
+/// without going through the registry, as `khive-mcp/src/serve.rs` does for
+/// one test fixture) could never receive it, and — because the global was
+/// process-wide rather than instance-bound — a grant to one registry's comm
+/// pack leaked into every other `CommPack` instance in the same test binary.
+/// This regression proves both fixed: an ungranted direct instance fails
+/// closed with a configuration error (not a leaked grant, not an
+/// `InvalidInput`), and the explicit constructor variant lets a direct
+/// composition succeed.
+#[tokio::test]
+async fn comm_ingest_capability_is_instance_bound_not_process_global() {
+    // A comm pack registered the normal way (through the registry) holds
+    // its own grant, proving grants still flow through the intended path.
+    let (registered_registry, _registered_rt) = build_registry_for_ns("local");
+    let registered_result = registered_registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "granted via the registry path",
+            }),
+        )
+        .await;
+    assert!(
+        registered_result.is_ok(),
+        "a registry-registered comm pack must retain its grant: {registered_result:?}"
+    );
+
+    // A direct `CommPack::new` composition — built in the SAME process,
+    // after the registry-based grant above — must NOT observe that grant.
+    // Under the old process-global design this succeeded; under the
+    // instance-bound design it must fail closed.
+    let ungranted_runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut ungranted_builder = VerbRegistryBuilder::new();
+    ungranted_builder.register(khive_pack_kg::KgPack::new(ungranted_runtime.clone()));
+    ungranted_builder.register(CommPack::new(ungranted_runtime.clone()));
+    let ungranted_registry = ungranted_builder.build().expect("registry builds");
+
+    let ungranted_result = ungranted_registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "must not observe another instance's grant",
+            }),
+        )
+        .await;
+    let err = ungranted_result.expect_err(
+        "a direct CommPack::new composition must not observe a grant made to a different \
+         registered instance",
+    );
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::Unconfigured(_)),
+        "a missing grant must classify as a configuration/startup failure, not InvalidInput: {err}"
+    );
+
+    // The explicit constructor variant lets a direct composition succeed.
+    let granted_runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut granted_builder = VerbRegistryBuilder::new();
+    granted_builder.register(khive_pack_kg::KgPack::new(granted_runtime.clone()));
+    granted_builder.register(CommPack::new_with_channel_ingest_capability(
+        granted_runtime.clone(),
+        khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+    ));
+    let granted_registry = granted_builder.build().expect("registry builds");
+
+    let granted_result = granted_registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "granted via the explicit direct-composition constructor",
+            }),
+        )
+        .await;
+    assert!(
+        granted_result.is_ok(),
+        "an explicitly-granted direct composition must succeed: {granted_result:?}"
     );
 }
 
