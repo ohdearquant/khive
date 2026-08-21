@@ -464,6 +464,14 @@ impl KhiveRuntime {
     }
 
     /// Return a reference to the underlying storage backend.
+    ///
+    /// This is an embedder/infrastructure surface (connection pools, schema
+    /// plans, diagnostics). Stores obtained from it are NOT wrapped by the
+    /// message-evidence policy that [`Self::notes`] enforces: an embedder
+    /// holding the backend already holds root-equivalent access to the
+    /// database file, so the policy boundary sits at the typed accessors
+    /// pack code uses, not here. Pack code must not take note stores from
+    /// this surface.
     pub fn backend(&self) -> &StorageBackend {
         &self.backend
     }

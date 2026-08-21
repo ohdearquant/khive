@@ -13,6 +13,14 @@
 //! that seam by refusing the same three properties on a `kind = "message"`
 //! note at every full-note write.
 //!
+//! The boundary this decorator enforces is the runtime's TYPED accessor
+//! surface — the seams pack code actually reaches. `KhiveRuntime::backend()`
+//! and `KhiveRuntime::sql()` are embedder capabilities (pools, schema plans,
+//! diagnostics, raw SQL): an embedder holding them already holds
+//! root-equivalent access to the database file itself, so no store-layer
+//! check can bind it, and no pack code calls either for note writes (the
+//! integration suite pins where the boundary sits).
+//!
 //! `try_create_note_impl` (the runtime-internal implementation backing both
 //! `try_create_note` and `try_create_note_as_trusted_ingest`) bypasses this
 //! decorator entirely by reaching the backend directly
@@ -73,13 +81,39 @@ fn reject_if_forged_message_note(note: &Note, operation: &'static str) -> Storag
 /// and a kind-scoped check would need a lookup whose result the refusal
 /// would then depend on. A future release-from-quarantine flow belongs on
 /// the capability path, not here.
+///
+/// The guard accepts only targets whose top-level segment it can fully
+/// parse: an optional `$` root, an optional `.` separator, then a bare
+/// identifier. SQLite's JSON path grammar admits other spellings of the
+/// same top-level key — quoted labels (`$."quarantined"`), bracket and
+/// escaped forms, and the bare `$` root that replaces the whole properties
+/// object — which a substring split cannot canonicalize, so every such
+/// spelling is refused outright rather than compared against the reserved
+/// list: a target this guard cannot prove innocent does not pass it. The
+/// same rule covers `set_note_property` keys, which the store interpolates
+/// into a quoted JSON path. Production callers patch only bare-identifier
+/// targets (`read`, `$.read`, `external_id`), so the strictness costs no
+/// legitimate caller anything.
 fn reject_reserved_patch_target(target: &str, operation: &'static str) -> StorageResult<()> {
-    let first_segment = target
-        .strip_prefix("$.")
-        .unwrap_or(target)
-        .split(['.', '['])
-        .next()
-        .unwrap_or(target);
+    let body = target.strip_prefix('$').unwrap_or(target);
+    let body = body.strip_prefix('.').unwrap_or(body);
+    let first_segment = &body[..body.find(['.', '[']).unwrap_or(body.len())];
+    let is_bare_identifier = !first_segment.is_empty()
+        && !first_segment.starts_with(|c: char| c.is_ascii_digit())
+        && first_segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !is_bare_identifier {
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: operation.into(),
+            message: format!(
+                "property target `{target}` is not a bare top-level identifier; the public \
+                 NoteStore accessor refuses target spellings it cannot prove distinct from \
+                 the transport-owned message properties"
+            ),
+        });
+    }
     if !TRANSPORT_OWNED_MESSAGE_PROPERTIES.contains(&first_segment) {
         return Ok(());
     }

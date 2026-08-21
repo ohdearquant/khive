@@ -5395,6 +5395,131 @@ async fn raw_note_store_accessor_rejects_patching_reserved_keys_onto_existing_me
     );
 }
 
+/// SQLite's JSON path grammar admits spellings of the same top-level key
+/// that a substring comparison cannot canonicalize: the quoted dot label
+/// (`$."quarantined"`), the bracket form, and the bare `$` root, which
+/// `json_set` would use to replace the whole properties object at once.
+/// The guard refuses every target it cannot parse as a bare top-level
+/// identifier, so all of these fail closed rather than sliding past a
+/// string equality check — and a bare-identifier spelling of a
+/// NON-reserved key still passes, so the strictness is scoped to the
+/// grammar, not the seam.
+#[tokio::test]
+async fn patch_guard_refuses_target_spellings_it_cannot_prove_innocent() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+
+    let innocent = Note::new("local", "message", "innocent message for spelling probes")
+        .with_properties(serde_json::json!({ "direction": "inbound", "read": false }));
+    let id = innocent.id;
+    let updated_at = innocent.updated_at;
+    store.upsert_note(innocent).await.expect("innocent insert");
+
+    let filter = khive_storage::NoteFilter::default();
+    for path in [
+        "$.\"quarantined\"",
+        "$[\"quarantined\"]",
+        "$['quarantined']",
+        "$",
+        "$.",
+        "$.\"read\"",
+    ] {
+        let err = store
+            .try_patch_note_property(
+                id,
+                "local",
+                &filter,
+                path,
+                serde_json::json!(true),
+                updated_at,
+            )
+            .await
+            .expect_err(&format!("try_patch_note_property must refuse `{path}`"));
+        assert!(
+            err.to_string().contains("bare top-level identifier"),
+            "`{path}` must be refused as unparseable, got: {err}"
+        );
+        store
+            .patch_note_property_atomic(
+                vec![id],
+                "local",
+                &filter,
+                path,
+                serde_json::json!(true),
+                updated_at,
+            )
+            .await
+            .expect_err(&format!("patch_note_property_atomic must refuse `{path}`"));
+    }
+
+    for key in ["\"quarantined\"", "qu\"arantined", ""] {
+        store
+            .set_note_property(id, key, serde_json::json!(true), updated_at)
+            .await
+            .expect_err(&format!(
+                "set_note_property must refuse non-bare key `{key}`"
+            ));
+    }
+
+    store
+        .try_patch_note_property(
+            id,
+            "local",
+            &filter,
+            "$.read",
+            serde_json::json!(true),
+            updated_at,
+        )
+        .await
+        .expect("a bare-identifier non-reserved path must still pass the guard");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["quarantined_count"].as_u64(),
+        Some(0),
+        "no spelling probe may leave a countable row: {health:?}"
+    );
+}
+
+/// Pins WHERE the message-evidence policy boundary sits. The decorated
+/// typed accessor (`KhiveRuntime::notes`) refuses reserved transport
+/// properties; `KhiveRuntime::backend()` is the embedder/infrastructure
+/// surface, and stores taken from it are deliberately NOT policy-wrapped —
+/// an embedder holding the backend already holds root-equivalent access to
+/// the database file, so a store-layer check there binds nobody. No pack
+/// code takes note stores from the backend surface. If this test starts
+/// failing because the raw path now refuses, the boundary was moved:
+/// update the module contract in `note_store_guard.rs` and this pin
+/// together, deliberately.
+#[tokio::test]
+async fn storage_backend_note_stores_are_an_embedder_surface_outside_the_policy_boundary() {
+    let (_registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    let decorated = rt.notes(&token).expect("typed accessor");
+    let forged = Note::new("local", "message", "decorated accessor must refuse this")
+        .with_properties(serde_json::json!({ "quarantined": true }));
+    decorated
+        .upsert_note(forged)
+        .await
+        .expect_err("the typed accessor is the policy boundary and must refuse");
+
+    let raw = rt.backend().notes().expect("embedder store");
+    let embedder_row = Note::new("local", "message", "embedder surface is not policy-bound")
+        .with_properties(serde_json::json!({ "quarantined": true }));
+    raw.upsert_note(embedder_row)
+        .await
+        .expect("the embedder surface sits outside the policy boundary by contract");
+}
+
 /// PR #1839 round 3, high: the channel-ingest capability used to live in a
 /// process-global `OnceLock` on the factory, granted only inside
 /// `PackRegistry::register_packs`. Direct composition (`CommPack::new`
