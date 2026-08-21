@@ -51,19 +51,108 @@ const FULL_UUID_IDENTIFIER_HELP: &str = "A complete UUID spelling accepted by th
     search. Strict identifier responses use canonical lowercase dashed UUIDs.";
 const SHORT_PREFIX_IDENTIFIER_HELP: &str = "A short UUID prefix is at least 8 hexadecimal \
     characters without dashes that do not parse as a complete UUID. It is a resolution, not a \
-    direct identifier; a 32-character compact UUID is complete input instead. Its lookup scope belongs to the consuming parameter: \
-    operations governed by ADR-007's by-ID contract resolve without a namespace filter, while \
-    other resolvers may search only the caller's primary namespace. A prefix can be missing or \
-    ambiguous.";
+    direct identifier; a 32-character compact UUID is complete input instead. Its lookup scope \
+    belongs to the consuming parameter — see `identifier_resolution.resolution_modes` for the \
+    exhaustive per-mode rule, and each `uuid`/`array of uuid` parameter's own description for \
+    which mode it uses. A prefix can be missing or ambiguous.";
 const IDENTIFIER_PARAMETER_HELP: &str = "A parameter that requires a full UUID rejects prefixes \
     and explains the resolution consequence. Its corresponding response field remains a \
     canonical full UUID so the value can be submitted again.";
 
+/// Single-source, per-[`IdResolutionMode`] contract text.
+///
+/// Every `uuid`/`array of uuid` [`ParamDef`] declares which of these modes its
+/// handler actually implements (see [`IdResolutionMode`]'s own doc comment).
+/// [`VerbRegistry::describe_verb`] renders the SAME text in two places: once
+/// per matching parameter's description, and once in the top-level
+/// `identifier_resolution.resolution_modes` map — so the wording can never
+/// drift between the two call sites, and a caller reading only the top-level
+/// envelope still sees every mode that exists on the wire, not just the ones
+/// this particular verb happens to use.
+///
+/// `None` for [`IdResolutionMode::NotApplicable`]: nothing is appended to a
+/// non-identifier parameter's description, and it is never listed in
+/// `resolution_modes`.
+fn resolution_mode_contract(mode: IdResolutionMode) -> Option<&'static str> {
+    match mode {
+        IdResolutionMode::NotApplicable => None,
+        IdResolutionMode::UnscopedById => Some(
+            "ID contract (unscoped by-ID, ADR-007 Rev 6): a full UUID and a short hex prefix \
+             (8+ hex chars) both resolve with no namespace filter — the caller already knows \
+             the specific record, and authorization is the Gate's seam, not resolution's. A \
+             prefix matching nothing or matching more than one record is rejected. Used by \
+             get/update/delete/merge/link (link's source_id/target_id resolve through the same \
+             unfiltered path as the four record-level by-ID verbs), GTD's lifecycle id \
+             parameters, and brain's feedback target_id.",
+        ),
+        IdResolutionMode::PrefixScopedToPrimary => Some(
+            "ID contract (prefix scoped to primary namespace): a full UUID resolves as given, \
+             with no namespace check performed by this resolver. A short hex prefix (8+ hex \
+             chars) is resolved by searching only the caller's primary namespace, and is \
+             rejected if it matches nothing or matches more than one record there.",
+        ),
+        IdResolutionMode::FullAndPrefixScopedToPrimary => Some(
+            "ID contract (full UUID and prefix both scoped to primary namespace): both a full \
+             UUID and a short hex prefix (8+ hex chars) are validated against the caller's \
+             primary namespace — a record that exists but belongs to a different namespace \
+             resolves as not found. A prefix matching more than one record in that namespace \
+             is rejected as ambiguous.",
+        ),
+        IdResolutionMode::FullUuidOnlyScopedToPrimary => Some(
+            "ID contract (full UUID only, scoped to primary namespace): only a complete UUID \
+             is accepted — a short hex prefix is rejected outright because this field stores \
+             an explicit stable reference — and the UUID is validated against the caller's own \
+             (primary) namespace; a record that exists in a different namespace resolves as \
+             not found.",
+        ),
+        IdResolutionMode::UnscopedFullUuidOnly => Some(
+            "ID contract (full UUID only, unscoped): only a complete UUID is accepted — a \
+             short hex prefix is rejected outright — and no namespace check is performed on \
+             this parameter itself; any namespace scoping comes from the enclosing operation, \
+             not from this identifier.",
+        ),
+    }
+}
+
+/// Stable wire key for an [`IdResolutionMode`], used as the key under
+/// `identifier_resolution.resolution_modes`.
+fn resolution_mode_key(mode: IdResolutionMode) -> &'static str {
+    match mode {
+        IdResolutionMode::NotApplicable => "not_applicable",
+        IdResolutionMode::UnscopedById => "unscoped_by_id",
+        IdResolutionMode::PrefixScopedToPrimary => "prefix_scoped_to_primary",
+        IdResolutionMode::FullAndPrefixScopedToPrimary => "full_and_prefix_scoped_to_primary",
+        IdResolutionMode::FullUuidOnlyScopedToPrimary => "full_uuid_only_scoped_to_primary",
+        IdResolutionMode::UnscopedFullUuidOnly => "unscoped_full_uuid_only",
+    }
+}
+
 fn identifier_resolution_help() -> Value {
+    let modes: serde_json::Map<String, Value> = [
+        IdResolutionMode::UnscopedById,
+        IdResolutionMode::PrefixScopedToPrimary,
+        IdResolutionMode::FullAndPrefixScopedToPrimary,
+        IdResolutionMode::FullUuidOnlyScopedToPrimary,
+        IdResolutionMode::UnscopedFullUuidOnly,
+    ]
+    .into_iter()
+    .map(|mode| {
+        (
+            resolution_mode_key(mode).to_string(),
+            Value::String(
+                resolution_mode_contract(mode)
+                    .expect("every non-NotApplicable mode has contract text")
+                    .to_string(),
+            ),
+        )
+    })
+    .collect();
+
     serde_json::json!({
         "full_uuid": FULL_UUID_IDENTIFIER_HELP,
         "short_prefix": SHORT_PREFIX_IDENTIFIER_HELP,
         "parameter_rule": IDENTIFIER_PARAMETER_HELP,
+        "resolution_modes": modes,
     })
 }
 
@@ -1208,32 +1297,6 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
     rows
 }
 
-/// Shared explanation of the id contract, appended by [`VerbRegistry::describe_verb`]
-/// to every parameter declared `param_type: "uuid"` across every pack's
-/// `HandlerDef`, rather than pasted into each individual `ParamDef.description`.
-///
-/// A full UUID demonstrates the caller already knows the specific record, so
-/// it resolves the same way everywhere regardless of namespace. A short hex
-/// prefix is a *resolution* — a search — which can match nothing, match
-/// exactly one record, or match ambiguously. Ambiguity is an error in every
-/// case: UUIDs are globally unique, so two distinct rows sharing a prefix
-/// always require caller disambiguation.
-///
-/// Resolution scope follows the verb, and the by-ID verbs do **not** scope to
-/// the caller's namespace. `get`, `update`, `delete`, `merge`, and `link`
-/// (whose `source_id`/`target_id` endpoints resolve the same way) resolve a
-/// prefix through `resolve_prefix_unfiltered`, which applies no namespace
-/// predicate at all, so their prefix path matches their already-unfiltered
-/// full-UUID path (ADR-007 Rev 6: by-ID access is namespace-agnostic, and the
-/// Gate — not storage-layer filtering — is the authorization seam). Verbs that
-/// resolve through the scoped path instead search the caller's primary
-/// namespace only.
-const ID_PARAM_CONTRACT: &str = "ID contract: a full UUID is namespace-agnostic (the caller \
-    already knows the specific record). A short hex prefix is a resolution — a search — which \
-    may match nothing, or match ambiguously. On the by-ID verbs (get/update/delete/merge/link) \
-    prefix resolution applies no namespace filter, matching their already-unfiltered full-UUID \
-    path; authorization is the Gate's seam, not resolution's.";
-
 impl VerbRegistry {
     /// This registry's construction-baked default namespace.
     ///
@@ -1296,10 +1359,14 @@ impl VerbRegistry {
     /// `link`'s envelope additionally carries `endpoint_rules` — the composed
     /// per-relation source/target allowlist (issue #964) — so batch callers can
     /// defer to the kernel's own table instead of re-implementing it locally.
-    /// Every `param_type == "uuid"` parameter description has
-    /// `ID_PARAM_CONTRACT` appended — a single shared explanation of the
-    /// full-UUID-vs-short-prefix contract instead of restating it per param
-    /// across every `HandlerDef` in every pack.
+    /// Every `uuid`/`array of uuid` parameter description has its
+    /// declared [`IdResolutionMode`]'s contract text appended — the same
+    /// text rendered under `identifier_resolution.resolution_modes` — so the
+    /// full-UUID-vs-short-prefix rule is stated once per mode (in
+    /// [`resolution_mode_contract`]) and inherited by every matching param,
+    /// instead of restating it per param across every `HandlerDef` in every
+    /// pack. Parameters whose mode is [`IdResolutionMode::NotApplicable`]
+    /// (every non-identifier parameter) are left unchanged.
     /// Unknown verbs return `RuntimeError::InvalidInput`. Full shape documented
     /// in `docs/protocol.md` §Request Schema.
     pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
@@ -1311,10 +1378,9 @@ impl VerbRegistry {
                         .params
                         .iter()
                         .map(|p| {
-                            let description = if p.param_type == "uuid" {
-                                format!("{} {}", p.description, ID_PARAM_CONTRACT)
-                            } else {
-                                p.description.to_string()
+                            let description = match resolution_mode_contract(p.resolution_mode) {
+                                Some(contract) => format!("{} {}", p.description, contract),
+                                None => p.description.to_string(),
                             };
                             serde_json::json!({
                                 "name": p.name,
@@ -8407,34 +8473,36 @@ mod help_tests {
     // Used to test that help=true on a Subhandler returns callable_via_mcp: false.
     static EMBED_PARAMS: [ParamDef; 0] = [];
 
-    // A uuid-typed param, used to verify `describe_verb` appends
-    // ID_PARAM_CONTRACT to every `param_type: "uuid"` description instead of
-    // requiring each `HandlerDef` to paste the contract in by hand.
+    // A uuid-typed param declaring IdResolutionMode::UnscopedById, used to
+    // verify `describe_verb` appends `resolution_mode_contract`'s rendering
+    // to every uuid-typed description instead of requiring each `HandlerDef`
+    // to paste the contract in by hand.
     static GET_PARAMS: [ParamDef; 1] = [ParamDef {
         name: "id",
         param_type: "uuid",
         required: true,
         description: "UUID of the record to fetch.",
-        resolution_mode: IdResolutionMode::NotApplicable,
+        resolution_mode: IdResolutionMode::UnscopedById,
     }];
 
     // Mirrors link's real source_id/target_id params (both `param_type:
-    // "uuid"`) — used to verify the shared id contract is appended to link's
-    // endpoint params too, matching the enumeration in `ID_PARAM_CONTRACT`.
+    // "uuid"`, `IdResolutionMode::UnscopedById`) — used to verify the shared
+    // id contract is appended to link's endpoint params too, matching the
+    // enumeration in `resolution_mode_contract`'s `UnscopedById` text.
     static LINK_PARAMS: [ParamDef; 2] = [
         ParamDef {
             name: "source_id",
             param_type: "uuid",
             required: true,
             description: "Source node UUID.",
-            resolution_mode: IdResolutionMode::NotApplicable,
+            resolution_mode: IdResolutionMode::UnscopedById,
         },
         ParamDef {
             name: "target_id",
             param_type: "uuid",
             required: true,
             description: "Target node UUID.",
-            resolution_mode: IdResolutionMode::NotApplicable,
+            resolution_mode: IdResolutionMode::UnscopedById,
         },
     ];
 
@@ -8599,13 +8667,24 @@ mod help_tests {
             .is_some_and(|text| text.contains("submitted again")));
     }
 
-    /// `describe_verb` appends the shared id contract to every `param_type:
-    /// "uuid"` parameter's description, so the full-UUID-vs-short-prefix
-    /// rule is stated once (here) and inherited by every verb, rather than
-    /// requiring each `HandlerDef` to paste its own explanation. The
-    /// contract must explain what a prefix *is* (a resolution whose scope
-    /// follows the verb, unfiltered on the by-ID verbs), not just which verbs
-    /// happen to accept one.
+    /// `describe_verb` appends `resolution_mode_contract(p.resolution_mode)`
+    /// to every uuid-typed parameter's description, so the full-UUID-vs-
+    /// short-prefix rule is stated once per mode (in
+    /// `resolution_mode_contract`) and inherited by every verb declaring
+    /// that mode, rather than requiring each `HandlerDef` to paste its own
+    /// explanation — or, worse, one blanket explanation getting appended to
+    /// parameters whose actual resolver behaves differently (see
+    /// `IdResolutionMode`'s doc comment: this is exactly the bug the mode
+    /// field replaced — a single shared string asserted namespace-agnostic
+    /// full-UUID acceptance on every uuid param, which was false for
+    /// primary-scoped and namespace-filtered resolvers).
+    /// This test covers `IdResolutionMode::UnscopedById`; the full mode
+    /// enumeration is exercised against real pack definitions by
+    /// `kkernel::pack_introspect::tests::
+    /// every_uuid_param_across_every_registered_pack_declares_a_resolution_mode`
+    /// and its `describe_verb_renders_mode_specific_contract_for_real_handlers`
+    /// companion (khive-runtime cannot depend on the pack crates itself
+    /// without a circular dependency).
     ///
     /// The namespace assertion below is deliberately specific. It first
     /// asserted only `description.contains("namespace")`, which passes
