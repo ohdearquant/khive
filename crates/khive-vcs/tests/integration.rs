@@ -126,6 +126,9 @@ fn snapshot_id_changes_when_edge_added() {
         target: e2.id,
         relation: EdgeRelation::Extends,
         weight: 1.0,
+        properties: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
     });
 
     let h_after = snapshot_id_for_archive(&archive).unwrap();

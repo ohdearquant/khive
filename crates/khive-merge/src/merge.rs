@@ -110,7 +110,7 @@ fn deterministic_timestamp(ours: &KgArchive, theirs: &KgArchive) -> chrono::Date
 /// # Errors
 ///
 /// Returns [`MergeError`] for namespace mismatch, non-finite edge weights,
-/// duplicate entity IDs, duplicate edge IDs or keys, or relation reconstruction.
+/// duplicate entity IDs, or duplicate edge IDs or keys.
 /// See `crates/khive-merge/docs/api/three-way-merge.md` for the full pipeline.
 pub fn three_way_merge(
     base: &KgArchive,

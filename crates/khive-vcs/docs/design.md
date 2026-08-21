@@ -31,6 +31,8 @@ and `api/snapshot-hash.md` (content-addressed `SnapshotId` hashing).
   on every invocation."
 - `entity_type` is included in the canonical hash representation so that two snapshots
   differing only in `entity_type` produce different `SnapshotId` values.
+- Edge `properties` round-trip to storage `metadata`; both edge timestamps are preserved
+  independently, and recursively canonicalized edge properties participate in snapshot identity.
 - Custom merge engine variants (`MergeNotImplemented`) were removed; the merge engine is
   superseded for v1.
 - Custom push/pull error variants (`RemoteUnreachable`, `AuthFailed`, `NonFastForward`,
@@ -69,7 +71,7 @@ and `api/snapshot-hash.md` (content-addressed `SnapshotId` hashing).
   §canonical NDJSON record shape and snapshot hash):
   1. Entities sorted by UUID string (case-insensitive ascending).
   2. Edges sorted by (source, target, relation) ascending.
-  3. Property keys sorted alphabetically within each entity.
+  3. Property keys sorted recursively within each entity and edge.
   4. Tags sorted lexicographically within each entity.
 - Root object key order: `{"edges": [...], "entities": [...]}` (alphabetical).
 - `exported_at`, `namespace`, `format`, `version` are excluded from the hash;
@@ -92,8 +94,8 @@ and `api/snapshot-hash.md` (content-addressed `SnapshotId` hashing).
   different `SnapshotId` values, enforcing the canonical entity record shape.
 - `VCS-AUD-004`: tests in `src/types.rs` verify that the custom `Deserialize` impl
   rejects non-canonical inputs (missing prefix, uppercase hex, whitespace, wrong length).
-- The `build_kg_archive` function in `src/sync.rs` validates edge relations before
-  computing the hash, ensuring that invalid relations are caught before any cache or
-  database write (fail-closed behaviour consistent with ADR-037).
+- Local and remote sync call the same complete `validate_ndjson_records` gate before
+  creating a temporary database or publishing a cache. `build_kg_archive` then preserves
+  edge metadata and both timestamps for canonical hashing.
 - Non-finite edge weights (`NaN`, `Infinity`) are rejected by `edge_to_canonical_value`
   with `VcsError::Internal` — this is a correctness gate, not just a serialization concern.

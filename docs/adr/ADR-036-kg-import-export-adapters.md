@@ -118,8 +118,10 @@ adapter reads the file twice, filtering rows by the presence of required columns
 
 Expects a JSON array of objects at the top level. Without a mapping file, the adapter maps
 keys directly to entity fields (case-insensitive): `id`, `name`, `kind`, `description`. All
-other keys collect into `properties`. Edge objects are detected by the presence of `source` and
-`target` fields. Mixed arrays (entities and edges in the same file) are supported.
+other keys collect into `properties`. Edge objects are detected only by the complete canonical
+`source` and `target` signature. `from` and `to` are ordinary entity metadata. A record with both
+complete `kind`+`name` and `source`+`target` signatures is rejected as ambiguous. Mixed arrays
+(entities and edges in the same file) are supported.
 
 With a mapping file, the `entities` section applies (same shape as CSV mapping, with JSON key
 paths instead of column names).
@@ -217,8 +219,9 @@ Mapping files are deferred. The shipped CLI rejects `--mapping` with a clear
 
 - CSV/TSV: auto-detect entity rows vs edge rows from header names; `--default-kind`
   supplies a kind when entity rows omit one.
-- JSON: parse a top-level array of objects; objects with `source` and `target` become
-  edges, other objects become entities; unrecognized keys fold into `properties`.
+- JSON: parse a top-level array of objects; objects with canonical `source` and `target` become
+  edges, other objects become entities; ambiguous complete dual signatures are rejected and
+  unrecognized entity keys fold into `properties`.
 
 Interactive mapping generation and `.khive/kg/import-mapping.yaml` are not shipped.
 
@@ -502,6 +505,30 @@ taxonomy values are rejected through validation.
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Shipped  | Deno CSV/TSV/JSON import; Rust `FormatAdapter`/record/error types; Rust `JsonFormatAdapter`; `kkernel kg import` archive/json/ndjson                    |
 | Deferred | mapping files, schema modes, Rust CSV/TSV modules, BibTeX/RDF/JSON-LD/GraphML/GEXF/Markdown, non-NDJSON export formats other than archive compatibility |
+
+## Amendment 1 (2026-08-09): fail-closed generic JSON identity and timestamps
+
+The shipped generic JSON/NDJSON and canonical NDJSON import boundaries validate deterministic
+record invariants before the first target write:
+
+1. Entity `name` and other required strings are non-blank after trimming. The original non-blank
+   bytes are preserved; validation does not normalize the stored label.
+2. A present `created_at` or `updated_at` is a string that parses as RFC 3339. Missing timestamps
+   may use the documented import-time fallback. A present malformed value is never treated as
+   missing and never replaced by the current time.
+3. JSON record classification uses only the complete canonical `source`+`target` edge signature.
+   `from`/`to` alone are entity properties. A complete entity signature (`kind`+`name`) combined
+   with a complete edge signature is rejected as ambiguous rather than silently choosing one.
+4. `khive-vcs` runs non-blank-name validation with its existing kind/timestamp/sort/referential
+   validate-first gate before creating a temporary database. `khive-runtime::import_kg` likewise
+   completes deterministic entity-kind/name and edge-weight validation before opening the target
+   entity store; mutable endpoint existence and namespace checks remain at write time.
+5. Edge `properties`, `created_at`, and `updated_at` remain reserved portable fields through adapter,
+   archive, runtime, and VCS conversion. Properties persist as storage edge metadata and contribute
+   to the canonical snapshot hash; the two timestamps persist independently.
+
+These rules supersede any earlier implementation text that allowed alias-based edge detection or
+warning/default behavior for a present malformed timestamp, or discarded edge metadata/provenance.
 
 ## Format-v2 migration UX (deferred to ADR-048)
 
