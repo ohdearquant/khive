@@ -632,6 +632,15 @@ pub struct WriterAcquisitionSnapshot {
     /// Writer-task `BEGIN IMMEDIATE` attempts that failed for a reason other
     /// than busy or locked, and so surface as `StorageError::Pool`.
     pub writer_task_begin_errors: u64,
+    /// Dequeued writer-task requests that reached the writer seam (executed
+    /// or attempted to execute their operation) and terminated in error,
+    /// counted once per request regardless of the specific terminal state.
+    pub writer_task_request_failures: u64,
+    /// Subset of `writer_task_request_failures` whose terminal state was
+    /// `WriterTaskRequestState::SideEffectsUnknown` — the commit or rollback
+    /// outcome could not be established, so the request's side effects on
+    /// the database are unknown.
+    pub writer_task_side_effects_unknown: u64,
 }
 
 /// Atomics backing [`WriterAcquisitionSnapshot`]. The writer task retains an
@@ -645,6 +654,8 @@ pub(crate) struct WriterAcquisitionCounters {
     pooled_timeouts: AtomicU64,
     writer_task_begin_busy: AtomicU64,
     writer_task_begin_errors: AtomicU64,
+    writer_task_request_failures: AtomicU64,
+    writer_task_side_effects_unknown: AtomicU64,
 }
 
 impl WriterAcquisitionCounters {
@@ -671,6 +682,23 @@ impl WriterAcquisitionCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one dequeued writer-task request that reached the writer seam
+    /// and terminated in error. Called exactly once per such request,
+    /// regardless of which terminal state it produced.
+    pub(crate) fn record_writer_task_request_failure(&self) {
+        self.writer_task_request_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the subset of [`Self::record_writer_task_request_failure`]
+    /// whose terminal state was `SideEffectsUnknown`. Callers pair this call
+    /// with a `record_writer_task_request_failure()` call for the same
+    /// request rather than in place of it.
+    pub(crate) fn record_writer_task_side_effects_unknown(&self) {
+        self.writer_task_side_effects_unknown
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> WriterAcquisitionSnapshot {
         let pooled_acquisitions = self.pooled_acquisitions.load(Ordering::Relaxed);
         let standalone_acquisitions = self.standalone_acquisitions.load(Ordering::Relaxed);
@@ -685,6 +713,10 @@ impl WriterAcquisitionCounters {
             timeouts: self.pooled_timeouts.load(Ordering::Relaxed),
             writer_task_begin_busy: self.writer_task_begin_busy.load(Ordering::Relaxed),
             writer_task_begin_errors: self.writer_task_begin_errors.load(Ordering::Relaxed),
+            writer_task_request_failures: self.writer_task_request_failures.load(Ordering::Relaxed),
+            writer_task_side_effects_unknown: self
+                .writer_task_side_effects_unknown
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -3323,6 +3355,8 @@ mod tests {
                 timeouts: 0,
                 writer_task_begin_busy: 0,
                 writer_task_begin_errors: 0,
+                writer_task_request_failures: 0,
+                writer_task_side_effects_unknown: 0,
             },
             "the public standalone boundary must contribute to the aggregate exactly once"
         );
@@ -3394,6 +3428,8 @@ mod tests {
                 // counters. This is the mislabeling guard in assertion form.
                 writer_task_begin_busy: 0,
                 writer_task_begin_errors: 0,
+                writer_task_request_failures: 0,
+                writer_task_side_effects_unknown: 0,
             }
         );
 
@@ -3409,6 +3445,8 @@ mod tests {
                 timeouts: 1,
                 writer_task_begin_busy: 0,
                 writer_task_begin_errors: 0,
+                writer_task_request_failures: 0,
+                writer_task_side_effects_unknown: 0,
             }
         );
     }

@@ -467,15 +467,72 @@ pub struct WriterContentionDiagnostics {
     /// Writer-task `BEGIN IMMEDIATE` attempts that failed for a reason other
     /// than busy or locked.
     pub writer_task_begin_errors: u64,
-    /// Process-wide audit appends whose errors were logged and swallowed.
+    /// Dequeued writer-task requests that reached the writer seam and
+    /// returned error, counted once per request. Sourced directly from the
+    /// pool's own acquisition-site counters, so — unlike the runtime-supplied
+    /// fields below — it is populated identically for every caller.
+    pub writer_task_request_failures: u64,
+    /// Subset of `writer_task_request_failures` whose terminal state was
+    /// `WriterTaskRequestState::SideEffectsUnknown`.
+    pub writer_task_side_effects_unknown: u64,
+    /// Process-wide audit appends whose errors were logged and swallowed —
+    /// pure-observability rows only (config-lock rows, best-effort recall
+    /// telemetry). An obligation-bearing row's commit failure (a gate
+    /// denial's own audit row, a dispatch outcome, an unknown-verb row, or a
+    /// `git.digest` receipt) is never counted here: those either fail the
+    /// dispatch that produced them directly (visible to the caller as an
+    /// error, not as this counter moving) or, for a denial whose dispatch
+    /// already fails independent of the row, are tracked by the runtime's
+    /// own separate obligation-failure counter instead. Summing this field
+    /// with `audit_batch_flush_failures` therefore does not double-count an
+    /// obligation-bearing generation failure against this one.
     pub audit_append_failures: Option<u64>,
     /// Why `audit_append_failures` is unavailable to this caller.
     pub audit_append_failures_unavailable_reason: Option<String>,
+    /// Accepted audit-batch generations that reached a terminal non-commit
+    /// outcome after retry, including driver death; excludes preflight and
+    /// admission rejection. `None` for a direct `khive-db` caller, or when no
+    /// runtime audit-batch control has been wired into diagnostics.
+    pub audit_batch_flush_failures: Option<u64>,
+    /// Why `audit_batch_flush_failures` is unavailable to this caller.
+    pub audit_batch_flush_failures_unavailable_reason: Option<String>,
+    /// Pure-observability audit rows released without a commit. `None` under
+    /// the same conditions as `audit_batch_flush_failures`.
+    pub audit_degraded_rows: Option<u64>,
+    /// Why `audit_degraded_rows` is unavailable to this caller.
+    pub audit_degraded_rows_unavailable_reason: Option<String>,
+    /// Monotonic process-lifetime flag set once any row has been released
+    /// degraded. `None` under the same conditions as
+    /// `audit_batch_flush_failures`.
+    pub audit_degraded: Option<bool>,
+    /// Why `audit_degraded` is unavailable to this caller.
+    pub audit_degraded_unavailable_reason: Option<String>,
+}
+
+/// Process-wide audit-batch health counters, supplied by the runtime layer
+/// that owns the audit-batch control. `khive-db` never produces these itself
+/// — a direct `khive-db` caller always sees the corresponding
+/// `WriterContentionDiagnostics` fields as `None` plus an explicit reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeAuditBatchMetrics {
+    /// Accepted generations reaching terminal non-commit after retry,
+    /// including driver death; excludes preflight/admission rejection.
+    pub flush_failures: u64,
+    /// Pure-observability rows released without commit.
+    pub degraded_rows: u64,
+    /// Monotonic process-lifetime degradation flag.
+    pub degraded: bool,
 }
 
 impl WriterContentionDiagnostics {
-    fn snapshot(pool: &ConnectionPool, audit_append_failures: Option<u64>) -> Self {
+    fn snapshot(
+        pool: &ConnectionPool,
+        audit_append_failures: Option<u64>,
+        runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
+    ) -> Self {
         let writer = pool.writer_acquisition_snapshot();
+        let unavailable_reason =
+            || Some("no audit-batch control is registered with this runtime instance".to_string());
         Self {
             writer_acquisitions: writer.acquisitions,
             pooled_writer_acquisitions: writer.pooled_acquisitions,
@@ -484,10 +541,27 @@ impl WriterContentionDiagnostics {
             writer_acquisition_timeouts: writer.timeouts,
             writer_task_begin_busy: writer.writer_task_begin_busy,
             writer_task_begin_errors: writer.writer_task_begin_errors,
+            writer_task_request_failures: writer.writer_task_request_failures,
+            writer_task_side_effects_unknown: writer.writer_task_side_effects_unknown,
             audit_append_failures,
             audit_append_failures_unavailable_reason: audit_append_failures.is_none().then(|| {
                 "runtime audit instrumentation was not supplied to khive-db diagnostics".to_string()
             }),
+            audit_batch_flush_failures: runtime_audit_batch_metrics.map(|m| m.flush_failures),
+            audit_batch_flush_failures_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
+            audit_degraded_rows: runtime_audit_batch_metrics.map(|m| m.degraded_rows),
+            audit_degraded_rows_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
+            audit_degraded: runtime_audit_batch_metrics.map(|m| m.degraded),
+            audit_degraded_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
         }
     }
 }
@@ -565,7 +639,7 @@ pub fn collect(
     build: BuildIdentity,
     sweep_interval: Duration,
 ) -> DbDiagnostics {
-    collect_inner(pool, build, sweep_interval, None)
+    collect_inner(pool, build, sweep_interval, None, None)
 }
 
 /// Assemble the report with the runtime's process-wide count of swallowed
@@ -576,7 +650,13 @@ pub fn collect_with_audit_append_failures(
     sweep_interval: Duration,
     audit_append_failures: u64,
 ) -> DbDiagnostics {
-    collect_inner(pool, build, sweep_interval, Some(audit_append_failures))
+    collect_inner(
+        pool,
+        build,
+        sweep_interval,
+        Some(audit_append_failures),
+        None,
+    )
 }
 
 /// Assemble diagnostics without allowing request abandonment to leave the
@@ -594,10 +674,36 @@ pub async fn collect_with_audit_append_failures_interruptibly(
     sweep_interval: Duration,
     audit_append_failures: u64,
 ) -> StorageResult<DbDiagnostics> {
+    collect_with_runtime_audit_metrics_interruptibly(
+        pool,
+        build,
+        sweep_interval,
+        audit_append_failures,
+        None,
+    )
+    .await
+}
+
+/// Like [`collect_with_audit_append_failures_interruptibly`], additionally
+/// threading through the runtime's audit-batch health counters. `None` when
+/// no audit-batch control is registered with the calling runtime instance —
+/// the corresponding `writer_contention` fields then report unavailable with
+/// a reason, exactly like `audit_append_failures` does for a direct
+/// `khive-db` caller.
+pub async fn collect_with_runtime_audit_metrics_interruptibly(
+    pool: Arc<ConnectionPool>,
+    build: BuildIdentity,
+    sweep_interval: Duration,
+    audit_append_failures: u64,
+    runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
+) -> StorageResult<DbDiagnostics> {
     crate::ensure_request_read_active("db_diagnostics")?;
     let counters = checkpoint_counters();
-    let writer_contention =
-        WriterContentionDiagnostics::snapshot(&pool, Some(audit_append_failures));
+    let writer_contention = WriterContentionDiagnostics::snapshot(
+        &pool,
+        Some(audit_append_failures),
+        runtime_audit_batch_metrics,
+    );
 
     let Some(path) = pool.config().path.clone() else {
         crate::ensure_request_read_active("db_diagnostics")?;
@@ -652,9 +758,14 @@ fn collect_inner(
     build: BuildIdentity,
     sweep_interval: Duration,
     audit_append_failures: Option<u64>,
+    runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
 ) -> DbDiagnostics {
     let counters = checkpoint_counters();
-    let writer_contention = WriterContentionDiagnostics::snapshot(pool, audit_append_failures);
+    let writer_contention = WriterContentionDiagnostics::snapshot(
+        pool,
+        audit_append_failures,
+        runtime_audit_batch_metrics,
+    );
 
     let Some(path) = pool.config().path.clone() else {
         return DbDiagnostics {
@@ -927,6 +1038,87 @@ mod tests {
             stopped.load(Ordering::SeqCst),
             "dropping diagnostics while its census worker is live must stop the PID/fd walk"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_audit_batch_fields_are_additive_and_unavailable_without_a_control() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, _path) = seeded_pool(&dir);
+        let pool = Arc::new(pool);
+
+        let without_control = collect_with_audit_append_failures_interruptibly(
+            Arc::clone(&pool),
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+            0,
+        )
+        .await
+        .expect("diagnostics succeed");
+        assert!(without_control
+            .writer_contention
+            .audit_batch_flush_failures
+            .is_none());
+        assert!(
+            without_control
+                .writer_contention
+                .audit_batch_flush_failures_unavailable_reason
+                .is_some(),
+            "no audit-batch control was supplied, so the field must carry a reason, not a \
+             fabricated zero"
+        );
+        assert!(without_control
+            .writer_contention
+            .audit_degraded_rows
+            .is_none());
+        assert!(without_control.writer_contention.audit_degraded.is_none());
+
+        let with_control = collect_with_runtime_audit_metrics_interruptibly(
+            Arc::clone(&pool),
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+            0,
+            Some(RuntimeAuditBatchMetrics {
+                flush_failures: 3,
+                degraded_rows: 7,
+                degraded: true,
+            }),
+        )
+        .await
+        .expect("diagnostics succeed");
+        assert_eq!(
+            with_control.writer_contention.audit_batch_flush_failures,
+            Some(3)
+        );
+        assert!(with_control
+            .writer_contention
+            .audit_batch_flush_failures_unavailable_reason
+            .is_none());
+        assert_eq!(with_control.writer_contention.audit_degraded_rows, Some(7));
+        assert_eq!(with_control.writer_contention.audit_degraded, Some(true));
+
+        // Existing fields must be unaffected by the new ones — additive, not
+        // a reshuffle.
+        assert_eq!(
+            with_control.writer_contention.writer_acquisitions,
+            without_control.writer_contention.writer_acquisitions
+        );
+    }
+
+    #[test]
+    fn writer_task_pool_sourced_counters_are_always_populated_directly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, _path) = seeded_pool(&dir);
+
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("9.9.9", None),
+            Duration::from_secs(30),
+        );
+
+        // Unlike the runtime-supplied audit-batch fields, these two come
+        // straight from the pool's own counters and are never `Option`.
+        assert_eq!(report.writer_contention.writer_task_request_failures, 0);
+        assert_eq!(report.writer_contention.writer_task_side_effects_unknown, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

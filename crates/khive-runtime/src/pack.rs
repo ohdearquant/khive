@@ -474,6 +474,10 @@ pub struct VerbRegistryBuilder {
     /// with a synthetic `EventView` describing the outcome and carrying no
     /// observations. Opt-in: when None, no overhead is incurred.
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
+    /// ADR-133 audit-batch config override, applied when `build()` lazily
+    /// constructs the batch seam from `event_store`. `None` uses
+    /// `AuditBatchConfig::default()`.
+    audit_batch_config: Option<crate::audit_batch::AuditBatchConfig>,
 }
 
 impl VerbRegistryBuilder {
@@ -489,6 +493,7 @@ impl VerbRegistryBuilder {
             event_store: None,
             audit_store_read_only: false,
             dispatch_hook: None,
+            audit_batch_config: None,
         }
     }
 
@@ -717,6 +722,38 @@ impl VerbRegistryBuilder {
             .map(|h| h.name)
             .collect();
 
+        // ADR-133: incidental audit writes route through one batch seam per
+        // configured `EventStore` instead of taking a writer-task
+        // acquisition per dispatch. No store configured (tracing-only or
+        // read-only-audit registries) means no seam to construct.
+        //
+        // A configured store that does not implement the seam's
+        // `preflight_event`/`append_events_idempotent` pair would otherwise
+        // build silently: every submitted row is rejected at preflight, the
+        // dispatch that produced it still reports success, and nothing here
+        // distinguishes that from a healthy registry. Reject it now, with an
+        // actionable message, instead of at the first audited dispatch.
+        if let Some(store) = &self.event_store {
+            if !store.supports_idempotent_audit_batch() {
+                return Err(RuntimeError::IncompatibleEventStore(
+                    "the configured EventStore does not implement ADR-133's \
+                     preflight_event/append_events_idempotent pair \
+                     (supports_idempotent_audit_batch() returned false); every \
+                     audited dispatch would silently lose its audit row while \
+                     still reporting success. Implement both methods and \
+                     override supports_idempotent_audit_batch() to opt in, or \
+                     do not call with_event_store() for this backend."
+                        .to_string(),
+                ));
+            }
+        }
+        let audit_batch = self.event_store.clone().map(|store| {
+            crate::audit_batch::AuditBatch::new(
+                store,
+                self.audit_batch_config.clone().unwrap_or_default(),
+            )
+        });
+
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
             resolvers: Arc::new(self.resolvers),
@@ -729,6 +766,7 @@ impl VerbRegistryBuilder {
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
+            audit_batch,
         })
     }
 }
@@ -920,6 +958,11 @@ pub struct VerbRegistry {
     /// across every clone of this registry via the `Arc`, so admissions made
     /// by one dispatch are visible to the next on the same warm daemon.
     reference_ring: Arc<crate::reference_ring::ReferenceRing>,
+    /// ADR-133 audit-batch seam. `None` exactly when `event_store` is
+    /// `None` — no store configured means no seam to construct, and every
+    /// audit call site falls back to its pre-ADR-133 tracing-only/no-op
+    /// path.
+    audit_batch: Option<Arc<crate::audit_batch::AuditBatch>>,
 }
 
 /// Result of an operation handled outside normal pack dispatch, paired with
@@ -1245,6 +1288,41 @@ impl VerbRegistry {
         self.event_store.clone()
     }
 
+    /// Process-lifetime audit-batch health counters for this registry's
+    /// ADR-133 seam, if one is configured. `None` exactly when
+    /// [`Self::event_store`] is `None` — the same condition under which no
+    /// batch exists to report on. The `db_diagnostics` verb feeds this into
+    /// `KhiveRuntime::db_diagnostics_with_audit_metrics` so an operator can
+    /// see flush failures and pure-observability degradation instead of the
+    /// permanently-unavailable placeholder a bare `KhiveRuntime` reports.
+    pub fn audit_batch_metrics(&self) -> Option<khive_db::diagnostics::RuntimeAuditBatchMetrics> {
+        self.audit_batch.as_ref().map(|batch| {
+            let m = batch.health_metrics();
+            khive_db::diagnostics::RuntimeAuditBatchMetrics {
+                flush_failures: m.flush_failures,
+                degraded_rows: m.degraded_rows,
+                degraded: m.degraded,
+            }
+        })
+    }
+
+    /// Stop admitting new audit rows and wait for every already-accepted row
+    /// to reach a terminal state (ADR-133).
+    ///
+    /// A no-op returning `Ok(())` when no `EventStore` — and therefore no
+    /// audit-batch seam — is configured. Callers that own this registry's
+    /// shutdown sequence should call this before tearing down the writer or
+    /// database so no accepted audit row is silently dropped mid-flight.
+    pub async fn shutdown_audit_batch(
+        &self,
+    ) -> Result<(), crate::audit_batch::AuditTerminalReason> {
+        use crate::audit_batch::AuditBatchControl;
+        match &self.audit_batch {
+            Some(audit_batch) => audit_batch.close_and_drain().await,
+            None => Ok(()),
+        }
+    }
+
     /// Advisory for a dispatch whose configured audit sink is read-only.
     ///
     /// The MCP transport places this beside successful per-operation results;
@@ -1436,7 +1514,20 @@ impl VerbRegistry {
                             EventOutcome::Denied,
                             Some(crate::cost_unit::base_resource_payload(request_id)),
                         );
-                        append_audit_event_best_effort(store, event, verb).await;
+                        // The dispatch already returns `PermissionDenied`
+                        // below regardless of whether this row commits — a
+                        // deny never reports success — so a persistent
+                        // commit failure here has no caller-visible outcome
+                        // to fold into; it is still logged and counted by
+                        // the helper.
+                        let _ = append_audit_event_best_effort(
+                            self.audit_batch.as_ref(),
+                            store,
+                            event,
+                            verb,
+                            crate::audit_batch::AuditProducer::GateDenied,
+                        )
+                        .await;
                     }
                     return Err(RuntimeError::PermissionDenied {
                         verb: verb.to_string(),
@@ -1475,6 +1566,7 @@ impl VerbRegistry {
             };
             let outcome = persist_git_digest_receipt(
                 self.event_store.as_ref(),
+                self.audit_batch.as_ref(),
                 &gate_req,
                 deferred_audit.as_ref(),
                 &mut receipt_result,
@@ -1498,15 +1590,17 @@ impl VerbRegistry {
             || receipt_outcome == Some(GitDigestReceiptOutcome::BuildRejected)
         {
             if let Some(audit) = deferred_audit.take() {
-                self.persist_intercepted_audit(
-                    verb,
-                    &gate_req,
-                    audit,
-                    result.as_ref().map(|outcome| &outcome.result),
-                    duration_us,
-                    request_id,
-                )
-                .await;
+                let audit_outcome = self
+                    .persist_intercepted_audit(
+                        verb,
+                        &gate_req,
+                        audit,
+                        result.as_ref().map(|outcome| &outcome.result),
+                        duration_us,
+                        request_id,
+                    )
+                    .await;
+                result = fold_audit_obligation(result, audit_outcome);
             }
         }
         result
@@ -1520,9 +1614,9 @@ impl VerbRegistry {
         result: Result<&Value, &RuntimeError>,
         duration_us: i64,
         request_id: Option<u64>,
-    ) {
+    ) -> Result<(), RuntimeError> {
         let Some(store) = &self.event_store else {
-            return;
+            return Ok(());
         };
         let event = match result {
             Ok(value) if verb == "link" && gate_req.args.get("links").is_none() => {
@@ -1581,7 +1675,13 @@ impl VerbRegistry {
             )
             .with_duration_us(duration_us),
         };
-        append_audit_event_best_effort(store, event, verb).await;
+        let producer = if result.is_ok() {
+            crate::audit_batch::AuditProducer::DispatchSucceeded
+        } else {
+            crate::audit_batch::AuditProducer::DispatchFailed
+        };
+        append_audit_event_best_effort(self.audit_batch.as_ref(), store, event, verb, producer)
+            .await
     }
 
     fn gate_request_with_identity(
@@ -1625,7 +1725,14 @@ impl VerbRegistry {
                 EventOutcome::Error,
                 Some(crate::cost_unit::base_resource_payload(request_id)),
             );
-            append_audit_event_best_effort(store, event, gate_req.verb.as_str()).await;
+            let _ = append_audit_event_best_effort(
+                self.audit_batch.as_ref(),
+                store,
+                event,
+                gate_req.verb.as_str(),
+                crate::audit_batch::AuditProducer::GateUnavailable,
+            )
+            .await;
         }
         RuntimeError::GateUnavailable {
             verb: gate_req.verb.clone(),
@@ -1740,8 +1847,17 @@ impl VerbRegistry {
                                 format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                             )
                             .with_payload(payload);
-                            append_audit_event_best_effort(store, storage_event, "config.lock")
-                                .await;
+                            // ConfigLocked is pure observability: the helper
+                            // never returns `Err` for it, so there is
+                            // nothing to fold.
+                            let _ = append_audit_event_best_effort(
+                                self.audit_batch.as_ref(),
+                                store,
+                                storage_event,
+                                "config.lock",
+                                crate::audit_batch::AuditProducer::ConfigLocked,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1778,7 +1894,17 @@ impl VerbRegistry {
                             EventOutcome::Denied,
                             Some(crate::cost_unit::base_resource_payload(request_id)),
                         );
-                        append_audit_event_best_effort(store, storage_event, verb).await;
+                        // As above (line ~1513): this path always returns
+                        // `PermissionDenied` below regardless, so there is no
+                        // success outcome to fold a commit failure into.
+                        let _ = append_audit_event_best_effort(
+                            self.audit_batch.as_ref(),
+                            store,
+                            storage_event,
+                            verb,
+                            crate::audit_batch::AuditProducer::GateDenied,
+                        )
+                        .await;
                     }
                 }
 
@@ -1913,6 +2039,7 @@ impl VerbRegistry {
                     Some(
                         persist_git_digest_receipt(
                             self.event_store.as_ref(),
+                            self.audit_batch.as_ref(),
                             &gate_req,
                             deferred_audit.as_ref(),
                             &mut result,
@@ -1939,7 +2066,11 @@ impl VerbRegistry {
                     if let Some(store) = &self.event_store {
                         let is_link_singleton =
                             verb == "link" && gate_req.args.get("links").is_none();
-                        match &result {
+                        // Read-only pass over `result` first: every arm below
+                        // only needs `audit_outcome` afterward, and folding a
+                        // failure into `result` requires a mutable borrow
+                        // that cannot coexist with the `&result` match below.
+                        let audit_outcome: Result<(), RuntimeError> = match &result {
                             Ok(ok_val) if is_link_singleton => {
                                 // ADR-103 Amendment 1: `link` (singleton or
                                 // bulk) has no embedding-bearing path — edges
@@ -1975,8 +2106,14 @@ impl VerbRegistry {
                                         .with_payload(payload)
                                         .with_payload_schema_version(2)
                                         .with_duration_us(dispatch_us);
-                                        append_audit_event_best_effort(store, storage_event, verb)
-                                            .await;
+                                        append_audit_event_best_effort(
+                                            self.audit_batch.as_ref(),
+                                            store,
+                                            storage_event,
+                                            verb,
+                                            crate::audit_batch::AuditProducer::DispatchSucceeded,
+                                        )
+                                        .await
                                     }
                                     None => {
                                         tracing::warn!(
@@ -1991,8 +2128,14 @@ impl VerbRegistry {
                                             Some(resource),
                                         )
                                         .with_duration_us(dispatch_us);
-                                        append_audit_event_best_effort(store, storage_event, verb)
-                                            .await;
+                                        append_audit_event_best_effort(
+                                            self.audit_batch.as_ref(),
+                                            store,
+                                            storage_event,
+                                            verb,
+                                            crate::audit_batch::AuditProducer::DispatchSucceeded,
+                                        )
+                                        .await
                                     }
                                 }
                             }
@@ -2032,12 +2175,30 @@ impl VerbRegistry {
                                         Some(crate::cost_unit::base_resource_payload(request_id)),
                                     ),
                                 };
+                                let producer = if result.is_ok() {
+                                    crate::audit_batch::AuditProducer::DispatchSucceeded
+                                } else {
+                                    crate::audit_batch::AuditProducer::DispatchFailed
+                                };
                                 let storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
-                                append_audit_event_best_effort(store, storage_event, verb).await;
+                                append_audit_event_best_effort(
+                                    self.audit_batch.as_ref(),
+                                    store,
+                                    storage_event,
+                                    verb,
+                                    producer,
+                                )
+                                .await
                             }
-                        }
+                        };
+                        // Only a would-be-success dispatch can be flipped by
+                        // an obligation failure (ADR-133 D2/D3/D4): an
+                        // already-erroring dispatch (DispatchFailed producer)
+                        // keeps its original error, matching
+                        // `fold_audit_obligation`'s contract.
+                        result = fold_audit_obligation(result, audit_outcome);
                     }
                 }
 
@@ -2157,7 +2318,17 @@ impl VerbRegistry {
                     EventOutcome::Error,
                     Some(crate::cost_unit::base_resource_payload(request_id)),
                 );
-                append_audit_event_best_effort(store, storage_event, verb).await;
+                // Dispatch already returns `UnknownVerb` below regardless, so
+                // — as with the deny paths above — there is no success
+                // outcome to fold a commit failure into.
+                let _ = append_audit_event_best_effort(
+                    self.audit_batch.as_ref(),
+                    store,
+                    storage_event,
+                    verb,
+                    crate::audit_batch::AuditProducer::UnknownVerb,
+                )
+                .await;
             }
         }
 
@@ -3026,10 +3197,40 @@ fn build_audit_storage_event(
     storage_event
 }
 
+/// Process-wide pure-observability audit appends whose errors were logged
+/// and swallowed — never an obligation-bearing row, which fails its dispatch
+/// instead and is counted separately by
+/// [`AUDIT_OBLIGATION_APPEND_FAILURES`]/[`audit_obligation_append_failure_count`].
+/// Keeping this counter obligation-free preserves its documented contract
+/// (`docs/guide/api-reference.md`, `khive-db`'s `WriterContentionDiagnostics::audit_append_failures`
+/// doc comment): every unit counted here was swallowed, none was propagated.
 static AUDIT_APPEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn audit_append_failure_count() -> u64 {
     AUDIT_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide commit failures for obligation-bearing audit rows (ADR-133
+/// D2/D3/D4): gate denials, dispatch outcomes, unknown-verb rows, and
+/// `git.digest` success receipts. Most call sites fold this failure into the
+/// dispatch's own error (a would-be success becomes an error, per
+/// [`fold_audit_obligation`]); a denial's own audit row is the one
+/// exception — its dispatch already returns `PermissionDenied` independent
+/// of whether this row commits, so the failure is logged and counted here
+/// but not separately propagated. Disjoint from [`AUDIT_APPEND_FAILURES`] —
+/// each failing row is classified by [`crate::audit_batch::classify`] into
+/// exactly one of the two classes and increments exactly one of these two
+/// counters, never both.
+static AUDIT_OBLIGATION_APPEND_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only reader: no production caller needs this counter today (unlike
+/// [`audit_append_failure_count`], which `KhiveRuntime::db_diagnostics`
+/// surfaces), but the mechanism tests need to observe it directly to prove
+/// obligation and swallowed failures land on disjoint counters.
+#[cfg(test)]
+pub(crate) fn audit_obligation_append_failure_count() -> u64 {
+    AUDIT_OBLIGATION_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 const GIT_DIGEST_RECEIPT_FAILURE: &str =
@@ -3064,6 +3265,7 @@ enum GitDigestReceiptOutcome {
 /// explicitly warns that ingest writes may already have committed.
 async fn persist_git_digest_receipt(
     store: Option<&Arc<dyn EventStore>>,
+    audit_batch: Option<&Arc<crate::audit_batch::AuditBatch>>,
     gate_req: &GateRequest,
     audit: Option<&AuditEvent>,
     result: &mut Result<Value, RuntimeError>,
@@ -3152,8 +3354,31 @@ async fn persist_git_digest_receipt(
     payload_object.insert("result".to_string(), report.clone());
     event.payload = payload;
 
-    if let Err(store_err) = store.append_event(event).await {
-        AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Strict path (ADR-133): a git.digest success receipt must still commit
+    // exactly once before the caller can see success, so this row waits on
+    // its generation's commit through the batch seam rather than
+    // best-effort — the batching only changes whether it shares a writer
+    // acquisition with concurrent rows, never whether it is durable before
+    // the caller observes success.
+    let submit_result = if let Some(audit_batch) = audit_batch {
+        use crate::audit_batch::AuditBatchControl;
+        audit_batch
+            .submit(crate::audit_batch::PreparedAuditRow {
+                event,
+                producer: crate::audit_batch::AuditProducer::GitDigestReceipt,
+            })
+            .await
+            .map(|_outcome| ())
+            .map_err(|reason| format!("{reason:?}"))
+    } else {
+        store.append_event(event).await.map_err(|e| e.to_string())
+    };
+    if let Err(store_err) = submit_result {
+        // `GitDigestReceipt` is always `DispatchObligation` (see
+        // `crate::audit_batch::classify`) and this failure always
+        // propagates below, so it belongs on the obligation counter, not
+        // the swallowed-failures one.
+        AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
             verb = "git.digest",
             error = %store_err,
@@ -3166,20 +3391,106 @@ async fn persist_git_digest_receipt(
     GitDigestReceiptOutcome::Persisted
 }
 
-/// Append an audit event, logging and swallowing store failures.
+/// Append an audit event, propagating a persistent failure for
+/// obligation-bearing producers and swallowing it for pure-observability
+/// producers.
 ///
-/// Ordinary audit persistence is best-effort: a store write failure must not
-/// fail the verb call it is auditing. `git.digest` success receipts use the
-/// strict helper above instead. Every swallowed failure increments the
+/// ADR-133 D2/D3/D4: a dispatch must not report success when the row that
+/// accounts for, authorizes, or audits it did not commit. Producers
+/// classified [`crate::audit_batch::AuditProductionClass::DispatchObligation`]
+/// (gate denials, dispatch outcomes, unknown-verb, git.digest receipts)
+/// therefore return `Err` here on a persistent commit failure; the caller is
+/// responsible for folding that into the dispatch result on the
+/// success path — see [`fold_audit_obligation`]. Producers classified
+/// [`crate::audit_batch::AuditProductionClass::PureObservability`]
+/// (config-lock rows, `memory.recall` execution) degrade gracefully: the
+/// failure is logged and counted but never returned, matching the pre-ADR-133
+/// best-effort contract.
+///
+/// Every failure — obligation or observability — increments the
 /// process-wide diagnostics counter above.
-async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Event, verb: &str) {
+///
+/// When the registry has an audit-batch seam configured (it is whenever
+/// `store` is), the row routes through
+/// [`crate::audit_batch::AuditBatchControl::submit`] instead of taking its
+/// own writer-task acquisition — concurrent producers collapse onto one
+/// commit per generation. `audit_batch: None` (a `VerbRegistry` predating
+/// the seam, or constructed without going through the builder) falls back to
+/// the pre-ADR-133 direct append, classified the same way.
+async fn append_audit_event_best_effort(
+    audit_batch: Option<&Arc<crate::audit_batch::AuditBatch>>,
+    store: &Arc<dyn EventStore>,
+    event: Event,
+    verb: &str,
+    producer: crate::audit_batch::AuditProducer,
+) -> Result<(), RuntimeError> {
+    use crate::audit_batch::{classify, AuditBatchControl, AuditProductionClass};
+
+    let is_obligation = classify(producer) == AuditProductionClass::DispatchObligation;
+
+    if let Some(audit_batch) = audit_batch {
+        if let Err(reason) = audit_batch
+            .submit(crate::audit_batch::PreparedAuditRow { event, producer })
+            .await
+        {
+            if is_obligation {
+                AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    verb,
+                    reason = ?reason,
+                    "audit obligation batch submission failed; failing dispatch"
+                );
+                return Err(RuntimeError::Internal(format!(
+                    "audit obligation commit failed for verb {verb:?}: {reason:?}"
+                )));
+            }
+            AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                verb,
+                reason = ?reason,
+                "audit event batch submission failed (non-fatal)"
+            );
+        }
+        return Ok(());
+    }
+
     if let Err(store_err) = store.append_event(event).await {
+        if is_obligation {
+            AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                verb,
+                error = %store_err,
+                "audit obligation store write failed; failing dispatch"
+            );
+            return Err(RuntimeError::Internal(format!(
+                "audit obligation commit failed for verb {verb:?}: {store_err}"
+            )));
+        }
         AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             verb,
             error = %store_err,
             "audit event store write failed (non-fatal)"
         );
+    }
+    Ok(())
+}
+
+/// Fold an audit-obligation outcome into a dispatch result.
+///
+/// A dispatch that would otherwise report success cannot claim it once the
+/// row accounting for it fails to commit (ADR-133 D2/D3/D4), so `Ok` becomes
+/// the audit's `Err`. A dispatch that already reports failure keeps its
+/// original error — the obligation is on never reporting a false success,
+/// not on replacing one error with another.
+fn fold_audit_obligation<T>(
+    result: Result<T, RuntimeError>,
+    audit_outcome: Result<(), RuntimeError>,
+) -> Result<T, RuntimeError> {
+    match (result, audit_outcome) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(audit_err)) => Err(audit_err),
+        (Err(err), _) => Err(err),
     }
 }
 
@@ -5196,12 +5507,18 @@ pub(crate) mod tests {
     struct MemoryEventStore {
         events: std::sync::Mutex<Vec<Event>>,
         fail_appends: bool,
+        /// Fail only a generation whose batch contains an event of this
+        /// kind, leaving every other generation (e.g. the deferred
+        /// obligation row committed after dispatch resolves) to commit
+        /// normally. Lets a test fail a pure-observability row without
+        /// also failing the obligation row that shares the same store.
+        fail_kind: Option<EventKind>,
     }
 
     #[async_trait]
     impl EventStore for MemoryEventStore {
         async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
-            if self.fail_appends {
+            if self.fail_appends || self.fail_kind == Some(event.kind) {
                 return Err(khive_storage::StorageError::Internal(
                     "injected audit append failure".to_string(),
                 ));
@@ -5246,6 +5563,47 @@ pub(crate) mod tests {
         }
         async fn count_events(&self, _filter: EventFilter) -> khive_storage::StorageResult<u64> {
             Ok(self.events.lock().unwrap().len() as u64)
+        }
+
+        fn preflight_event(&self, _event: &Event) -> khive_storage::StorageResult<()> {
+            Ok(())
+        }
+
+        async fn append_events_idempotent(
+            &self,
+            events: Vec<Event>,
+        ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
+        {
+            if self.fail_appends
+                || self
+                    .fail_kind
+                    .is_some_and(|kind| events.iter().any(|e| e.kind == kind))
+            {
+                return Err(khive_storage::StorageError::Internal(
+                    "injected audit append failure".to_string(),
+                ));
+            }
+            let mut store = self.events.lock().unwrap();
+            let mut rows = Vec::with_capacity(events.len());
+            for event in events {
+                if let Some(existing) = store.iter().find(|e| e.id == event.id) {
+                    if *existing == event {
+                        rows.push(
+                            khive_storage::event::EventAppendDisposition::AlreadyPresentIdentical,
+                        );
+                    } else {
+                        rows.push(khive_storage::event::EventAppendDisposition::IdentityConflict);
+                    }
+                } else {
+                    store.push(event);
+                    rows.push(khive_storage::event::EventAppendDisposition::Inserted);
+                }
+            }
+            Ok(khive_storage::event::IdempotentEventBatchResult { rows })
+        }
+
+        fn supports_idempotent_audit_batch(&self) -> bool {
+            true
         }
     }
 
@@ -5344,8 +5702,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
     async fn git_digest_receipt_append_failure_never_returns_unqualified_success() {
         let before = audit_append_failure_count();
+        let before_obligation = audit_obligation_append_failure_count();
         let store = Arc::new(MemoryEventStore {
             fail_appends: true,
             ..MemoryEventStore::default()
@@ -5367,7 +5727,15 @@ pub(crate) mod tests {
                     && message.contains("writes may have committed")),
             "error is stable, safe, and retry-aware: {err}"
         );
-        assert_eq!(audit_append_failure_count(), before + 1);
+        // The git.digest receipt is obligation-bearing (`GitDigestReceipt`
+        // classifies as `DispatchObligation`) and this failure propagated
+        // into the dispatch's own error above, so it counts on the
+        // obligation counter, not the swallowed-failures one.
+        assert_eq!(audit_append_failure_count(), before);
+        assert_eq!(
+            audit_obligation_append_failure_count(),
+            before_obligation + 1
+        );
     }
 
     #[tokio::test]
@@ -5885,8 +6253,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial(audit_append_failures)]
-    async fn swallowed_audit_append_failure_is_counted_without_failing_dispatch() {
+    #[serial(audit_obligation_append_failures)]
+    async fn audit_append_failure_fails_an_obligation_bearing_dispatch() {
         let before = audit_append_failure_count();
+        let before_obligation = audit_obligation_append_failure_count();
 
         let successful_store = Arc::new(MemoryEventStore::default());
         let mut successful_builder = VerbRegistryBuilder::new();
@@ -5900,9 +6270,19 @@ pub(crate) mod tests {
         assert_eq!(
             audit_append_failure_count(),
             before,
-            "successful audit appends must not increment the failure counter"
+            "successful audit appends must not increment the swallowed-failure counter"
+        );
+        assert_eq!(
+            audit_obligation_append_failure_count(),
+            before_obligation,
+            "successful audit appends must not increment the obligation-failure counter"
         );
 
+        // ADR-133 D2/D3/D4: `list`'s deferred audit row is a
+        // `DispatchSucceeded` obligation. A dispatch must not report success
+        // when the row that accounts for it did not commit, so a persistent
+        // commit failure here must fail the dispatch that would otherwise
+        // have reported success.
         let failing_store = Arc::new(MemoryEventStore {
             fail_appends: true,
             ..MemoryEventStore::default()
@@ -5911,16 +6291,271 @@ pub(crate) mod tests {
         failing_builder.register(AlphaPack);
         failing_builder.with_event_store(failing_store);
         let failing_registry = failing_builder.build().expect("registry builds");
-        failing_registry
+        let err = failing_registry
             .dispatch("list", Value::Null)
             .await
-            .expect("best-effort audit failure must preserve dispatch success");
+            .expect_err(
+                "a persistent obligation-bearing audit commit failure must fail the dispatch",
+            );
+        assert!(
+            matches!(&err, RuntimeError::Internal(message)
+                if message.contains("audit obligation commit failed")),
+            "error names the obligation failure so it is distinguishable from a handler error: {err}"
+        );
 
+        // `list`'s deferred audit row is `DispatchSucceeded`, an obligation
+        // producer, so this propagated failure belongs on the obligation
+        // counter — the swallowed-failure counter must not move for it.
         assert_eq!(
             audit_append_failure_count(),
-            before + 1,
-            "the swallowed append failure must remain visible to diagnostics"
+            before,
+            "an obligation failure must never inflate the swallowed-failure counter"
         );
+        assert_eq!(
+            audit_obligation_append_failure_count(),
+            before_obligation + 1,
+            "the failed obligation append must remain visible to diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
+    async fn config_locked_row_degrades_without_failing_the_dispatch_that_observed_it() {
+        // Deny-gate a dispatch so the only append this call makes is the
+        // immediate `ConfigLocked` drain in the gate-check block: the
+        // `GateDenied` row and the eventual `PermissionDenied` return are
+        // unaffected by the store either way (see the two `let _ =` sites
+        // above), so any failure this test observes is isolated to the
+        // pure-observability `ConfigLocked` row. The `fail_appends: true`
+        // store also fails the fire-and-forget `GateDenied` append, which
+        // now counts on the obligation counter (`#[serial(...)]` above
+        // keeps that from racing this file's exact-delta assertions on it).
+        #[derive(Debug)]
+        struct DenyGate;
+        impl Gate for DenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, khive_gate::GateError> {
+                Ok(GateDecision::Deny {
+                    reason: "denied for test".to_string(),
+                })
+            }
+        }
+
+        crate::config_ledger::record_config_locked("adr133_test_key", "adr133_test_value");
+
+        let store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(DenyGate));
+        builder.with_event_store(store);
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect_err("the gate denies every request");
+        assert!(
+            matches!(err, RuntimeError::PermissionDenied { .. }),
+            "a pure-observability row's failure must never surface as the dispatch error: {err}"
+        );
+
+        let metrics = registry
+            .audit_batch_metrics()
+            .expect("with_event_store configures the ADR-133 seam");
+        assert!(
+            metrics.degraded,
+            "the config-locked row's commit failure must be visible as degradation"
+        );
+        assert!(metrics.degraded_rows >= 1);
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    #[serial(audit_append_failures)]
+    async fn config_locked_row_failure_never_fails_a_dispatch_that_would_otherwise_succeed() {
+        // ADR-133 criterion 4's success half: a pure-observability row's
+        // commit failure must degrade gracefully without touching the
+        // caller-visible outcome of a dispatch that has nothing to do with
+        // it. Only the `ConfigLocked` generation fails here — the gate
+        // allows the call, so `list`'s own `DispatchSucceeded` obligation
+        // row commits in a later, unaffected generation.
+        crate::config_ledger::record_config_locked(
+            "adr133_success_path_key",
+            "adr133_success_path_value",
+        );
+
+        let store = Arc::new(MemoryEventStore {
+            fail_kind: Some(EventKind::ConfigLocked),
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store);
+        let registry = builder.build().expect("registry builds");
+
+        let result = registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect("a config-locked row's commit failure must never fail an unrelated dispatch");
+        assert_eq!(
+            result,
+            serde_json::json!({ "pack": "alpha", "verb": "list" })
+        );
+
+        let metrics = registry
+            .audit_batch_metrics()
+            .expect("with_event_store configures the ADR-133 seam");
+        assert!(
+            metrics.degraded_rows >= 1,
+            "the config-locked row's failure must remain visible as degradation"
+        );
+    }
+
+    /// An `EventStore` that only implements the base trait — the
+    /// unmodified pre-ADR-133 shape. `preflight_event`/
+    /// `append_events_idempotent`/`supports_idempotent_audit_batch` are all
+    /// inherited defaults.
+    #[derive(Default)]
+    struct LegacyEventStore {
+        events: std::sync::Mutex<Vec<Event>>,
+    }
+
+    #[async_trait]
+    impl EventStore for LegacyEventStore {
+        async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+        async fn append_events(
+            &self,
+            events: Vec<Event>,
+        ) -> khive_storage::StorageResult<BatchWriteSummary> {
+            let attempted = events.len() as u64;
+            self.events.lock().unwrap().extend(events);
+            Ok(BatchWriteSummary {
+                attempted,
+                affected: attempted,
+                failed: 0,
+                first_error: String::new(),
+            })
+        }
+        async fn get_event(&self, id: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {
+            Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.id == id)
+                .cloned())
+        }
+        async fn query_events(
+            &self,
+            _filter: EventFilter,
+            _page: PageRequest,
+        ) -> khive_storage::StorageResult<Page<Event>> {
+            let items = self.events.lock().unwrap().clone();
+            let total = items.len() as u64;
+            Ok(Page {
+                items,
+                total: Some(total),
+            })
+        }
+        async fn count_events(&self, _filter: EventFilter) -> khive_storage::StorageResult<u64> {
+            Ok(self.events.lock().unwrap().len() as u64)
+        }
+    }
+
+    #[test]
+    fn build_rejects_a_configured_event_store_incompatible_with_the_audit_batch_seam() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(Arc::new(LegacyEventStore::default()));
+        let err = match builder.build() {
+            Ok(_) => {
+                panic!("a store that cannot implement the seam must not build a healthy registry")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, RuntimeError::IncompatibleEventStore(message)
+                if message.contains("supports_idempotent_audit_batch")),
+            "error names the missing capability so an operator can act on it: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
+    async fn db_diagnostics_with_audit_metrics_reports_batch_failure_and_degradation() {
+        // One dispatch call exercises both halves of the classifier through
+        // the registry it actually owns the seam on: the queued
+        // `ConfigLocked` (pure-observability) row drains during the gate
+        // check regardless of allow/deny, and `list`'s deferred
+        // `DispatchSucceeded` (obligation) row is appended once dispatch
+        // resolves — both against the same persistently failing store.
+        crate::config_ledger::record_config_locked(
+            "adr133_diag_test_key",
+            "adr133_diag_test_value",
+        );
+        let store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store);
+        let registry = builder.build().expect("registry builds");
+        let _ = registry.dispatch("list", Value::Null).await;
+
+        let metrics = registry
+            .audit_batch_metrics()
+            .expect("with_event_store configures the ADR-133 seam");
+        assert!(metrics.degraded, "the config-locked row must have degraded");
+        assert!(metrics.degraded_rows >= 1);
+        assert!(
+            metrics.flush_failures >= 1,
+            "the list dispatch's obligation row must count as a flush failure"
+        );
+
+        let rt = KhiveRuntime::memory().expect("memory runtime should create");
+        let report = rt
+            .db_diagnostics_with_audit_metrics(Some(metrics))
+            .await
+            .expect("diagnostics succeed");
+        assert_eq!(report.writer_contention.audit_degraded, Some(true));
+        assert!(report.writer_contention.audit_degraded_rows.unwrap_or(0) >= 1);
+        assert!(
+            report
+                .writer_contention
+                .audit_batch_flush_failures
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(report
+            .writer_contention
+            .audit_batch_flush_failures_unavailable_reason
+            .is_none());
+        assert!(report
+            .writer_contention
+            .audit_degraded_unavailable_reason
+            .is_none());
+
+        // The no-metrics path (a bare `KhiveRuntime::db_diagnostics`, or the
+        // `db_diagnostics_with_audit_metrics(None)` it delegates to) must
+        // still report the batch-health fields as explicitly unavailable
+        // rather than silently zero, so an operator cannot mistake "no
+        // registry wired in" for "no failures occurred".
+        let bare_report = rt.db_diagnostics().await.expect("diagnostics succeed");
+        assert!(bare_report.writer_contention.audit_degraded.is_none());
+        assert!(bare_report
+            .writer_contention
+            .audit_degraded_unavailable_reason
+            .is_some());
     }
 
     #[tokio::test]

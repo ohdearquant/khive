@@ -9795,6 +9795,43 @@ backend = "kg-backend"
             ) -> khive_storage::StorageResult<u64> {
                 Ok(self.events.lock().unwrap().len() as u64)
             }
+
+            fn preflight_event(
+                &self,
+                _event: &khive_storage::Event,
+            ) -> khive_storage::StorageResult<()> {
+                Ok(())
+            }
+
+            async fn append_events_idempotent(
+                &self,
+                events: Vec<khive_storage::Event>,
+            ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
+            {
+                let mut store = self.events.lock().unwrap();
+                let mut rows = Vec::with_capacity(events.len());
+                for event in events {
+                    if let Some(existing) = store.iter().find(|e| e.id == event.id) {
+                        if *existing == event {
+                            rows.push(
+                                khive_storage::event::EventAppendDisposition::AlreadyPresentIdentical,
+                            );
+                        } else {
+                            rows.push(
+                                khive_storage::event::EventAppendDisposition::IdentityConflict,
+                            );
+                        }
+                    } else {
+                        store.push(event);
+                        rows.push(khive_storage::event::EventAppendDisposition::Inserted);
+                    }
+                }
+                Ok(khive_storage::event::IdempotentEventBatchResult { rows })
+            }
+
+            fn supports_idempotent_audit_batch(&self) -> bool {
+                true
+            }
         }
 
         /// The ADR-094 lifecycle-event subsequence the sequencing test

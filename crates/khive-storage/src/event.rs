@@ -7,11 +7,13 @@ use uuid::Uuid;
 
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
+use crate::capability::StorageCapability;
+use crate::error::StorageError;
 use crate::types::{BatchWriteSummary, Page, PageRequest, StorageResult};
 
 /// Storage-level event record. Every verb execution produces one.
 /// Immutable once appended; projection rows are written beside it at append time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: Uuid,
     pub namespace: String,
@@ -183,6 +185,30 @@ pub struct EventFilter {
     pub payload_proposal_id: Option<Uuid>,
 }
 
+/// Per-row outcome of an [`EventStore::append_events_idempotent`] call, in
+/// input order. Distinguishes a fresh insert from a retry that reproduced an
+/// identical row from a retry whose identity now disagrees with what is
+/// already stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventAppendDisposition {
+    /// No prior row with this id existed; it was inserted.
+    Inserted,
+    /// A prior row with this id existed and every persisted column plus the
+    /// ordered observation projection matched exactly. Not re-inserted.
+    AlreadyPresentIdentical,
+    /// A prior row with this id existed but disagreed with the submitted
+    /// row. Not inserted; unrelated rows in the same batch are unaffected.
+    IdentityConflict,
+}
+
+/// Result of [`EventStore::append_events_idempotent`]. `rows` preserves the
+/// input order and length of the submitted batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdempotentEventBatchResult {
+    pub rows: Vec<EventAppendDisposition>,
+}
+
 /// Append-only operation log for verb executions.
 #[async_trait]
 pub trait EventStore: Send + Sync + 'static {
@@ -200,4 +226,57 @@ pub trait EventStore: Send + Sync + 'static {
     ) -> StorageResult<Page<Event>>;
     /// Count events matching a filter.
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64>;
+
+    /// Validate `event` against the exact insert/observation shape the
+    /// backend would build at append time, performing no I/O. Rejects a
+    /// malformed row before it is ever enqueued for a write, so one bad
+    /// producer input cannot poison a batch shared with other callers.
+    ///
+    /// Backends that do not implement pre-enqueue validation return
+    /// [`StorageError::Unsupported`].
+    fn preflight_event(&self, event: &Event) -> StorageResult<()> {
+        let _ = event;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "preflight_event".into(),
+            message: "this EventStore backend does not implement preflight_event".into(),
+        })
+    }
+
+    /// Append a batch of events with idempotent retry semantics: a row
+    /// carrying an id that already exists is compared against every
+    /// persisted column and its ordered observation projection rather than
+    /// treated as a write conflict. Exact equality reports
+    /// [`EventAppendDisposition::AlreadyPresentIdentical`] instead of
+    /// re-inserting; any mismatch reports
+    /// [`EventAppendDisposition::IdentityConflict`] for that row alone,
+    /// while unrelated rows in the same batch still commit.
+    ///
+    /// Backends that do not implement idempotent batching return
+    /// [`StorageError::Unsupported`].
+    async fn append_events_idempotent(
+        &self,
+        events: Vec<Event>,
+    ) -> StorageResult<IdempotentEventBatchResult> {
+        let _ = events;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "append_events_idempotent".into(),
+            message: "this EventStore backend does not implement append_events_idempotent".into(),
+        })
+    }
+
+    /// Whether this backend implements `preflight_event` and
+    /// `append_events_idempotent` for real, rather than inheriting their
+    /// `Unsupported`-returning defaults above.
+    ///
+    /// A caller that builds an ADR-133 audit-batch seam over a backend that
+    /// answers `false` here would have every audited row rejected at
+    /// preflight while the dispatch it audits still reports success — the
+    /// exact silent-loss failure mode the batch exists to prevent. Defaults
+    /// to `false` so an unmodified legacy backend is caught at registry
+    /// build time instead of appearing healthy.
+    fn supports_idempotent_audit_batch(&self) -> bool {
+        false
+    }
 }

@@ -502,6 +502,25 @@ impl KhiveRuntime {
     /// which backend this runtime handle is bound to, so a report never
     /// describes a database this handle is not the canonical owner of.
     pub async fn db_diagnostics(&self) -> RuntimeResult<khive_db::diagnostics::DbDiagnostics> {
+        // No `VerbRegistry` handle is reachable from a bare `KhiveRuntime`
+        // (the audit-batch seam is owned by whichever registry was built
+        // over this runtime's `EventStore`, not by the runtime itself), so
+        // the batch-health fields report unavailable with a reason here.
+        // Callers that hold the registry — e.g. the `db_diagnostics` verb
+        // handler — use `Self::db_diagnostics_with_audit_metrics` with
+        // `VerbRegistry::audit_batch_metrics()` instead.
+        self.db_diagnostics_with_audit_metrics(None).await
+    }
+
+    /// As [`Self::db_diagnostics`], but with the caller supplying the
+    /// ADR-133 audit-batch health counters from whichever `VerbRegistry`
+    /// owns the seam over this runtime's `EventStore` (typically
+    /// `VerbRegistry::audit_batch_metrics()`). `None` behaves identically to
+    /// [`Self::db_diagnostics`].
+    pub async fn db_diagnostics_with_audit_metrics(
+        &self,
+        runtime_audit_batch_metrics: Option<khive_db::diagnostics::RuntimeAuditBatchMetrics>,
+    ) -> RuntimeResult<khive_db::diagnostics::DbDiagnostics> {
         let pool = self.core().backend.pool_arc();
         let interval = khive_db::CheckpointConfig::from_env().interval;
         let build_hash = crate::build_info::BUILD_INFO
@@ -510,11 +529,12 @@ impl KhiveRuntime {
         let build =
             khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
 
-        khive_db::diagnostics::collect_with_audit_append_failures_interruptibly(
+        khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
             pool,
             build,
             interval,
             crate::pack::audit_append_failure_count(),
+            runtime_audit_batch_metrics,
         )
         .await
         .map_err(RuntimeError::from)
