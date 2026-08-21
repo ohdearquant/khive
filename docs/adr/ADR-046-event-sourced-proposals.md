@@ -7,7 +7,7 @@
 
 - ADR-014 (Curation Operations — apply step rides on existing curation primitives)
 - ADR-017 (Pack Standard — KG pack handler surface; async event-consumer worker registration is deferred)
-- ADR-018 (Authorization Gate — gates the apply step)
+- ADR-018 (Authorization Gate — gates the apply step; Gate-error posture is amended by ADR-129)
 - ADR-022 (Events Query Surface — proposals live as events)
 - ADR-032 (Brain Profile Orchestration — future proposal-event Fold design; no v1 consumer)
 - ADR-041 (Event Provenance Projection — open-proposal projection lives here)
@@ -1012,12 +1012,12 @@ amendment adds, for governance-bearing changesets only:
    dispatch with a typed error
    (`ReviewerNotAuthorized { proposal_id, actor_id }`) — parallel to
    `SelfApprovalForbidden`, before the handler runs and before any event
-   lands. **Admission errors fail closed for this class**: a resolver
-   failure, an authority-provider error, or an unavailable provider
-   refuses the dispatch exactly as a denial does; the base dispatch path's
-   fail-open treatment of Gate errors is explicitly overridden for
-   governance-bearing review dispatch, while ungoverned verbs keep their
-   existing behavior. On allow, stage 2 issues the endpoint-scoped
+   lands. **Admission errors fail closed for this class**: ADR-129 already
+   requires a stage-1 Gate infrastructure error to refuse dispatch, and a
+   resolver failure, authority-provider error, or unavailable provider in
+   stage 2 independently refuses exactly as a denial does. Neither failure
+   path invokes the handler; ungoverned verbs inherit ADR-129's base Gate
+   error posture. On allow, stage 2 issues the endpoint-scoped
    `AuthorityReceipt` and the dispatch site hands it to the handler
    in-process (item 2); the handler performs no authorization of its own.
 2. The receipt is runtime-internal and non-serializable (ADR-159 §2), and

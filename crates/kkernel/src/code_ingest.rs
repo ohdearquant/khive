@@ -492,6 +492,8 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
         if let Some(properties) = &entity.properties {
             secret_gate::check_json(properties).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
+        secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         secret_gate::check_tags(&entity.tags).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     for note in &batch.notes {
@@ -502,6 +504,8 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
         if let Some(properties) = &note.properties {
             secret_gate::check_json(properties).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
+        secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     Ok(())
 }
@@ -1342,6 +1346,56 @@ mod tests {
         assert!(
             !db.exists(),
             "rejecting a secret-bearing document must leave the db path untouched"
+        );
+    }
+
+    #[test]
+    fn preflight_secret_gate_rejects_reserved_key_on_entity_properties() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let mut batch = mapped_batch(&findings);
+        let mut props = batch.entities[0]
+            .properties
+            .clone()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        props.insert(
+            "khive:secret_gate".to_string(),
+            serde_json::json!("exempted:content-sha256-manifest-v1"),
+        );
+        batch.entities[0].properties = Some(serde_json::Value::Object(props));
+
+        let err = preflight_secret_gate(&batch)
+            .expect_err("a caller-supplied reserved key on an entity must be rejected");
+        assert!(
+            err.to_string().contains("khive:secret_gate")
+                && err.to_string().contains("runtime-owned"),
+            "error must name the reservation rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_secret_gate_rejects_reserved_key_on_note_properties() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let mut batch = mapped_batch(&findings);
+        let mut props = batch.notes[0]
+            .properties
+            .clone()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        props.insert(
+            "khive:secret_gate".to_string(),
+            serde_json::json!("exempted:content-sha256-manifest-v1"),
+        );
+        batch.notes[0].properties = Some(serde_json::Value::Object(props));
+
+        let err = preflight_secret_gate(&batch)
+            .expect_err("a caller-supplied reserved key on a note must be rejected");
+        assert!(
+            err.to_string().contains("khive:secret_gate")
+                && err.to_string().contains("runtime-owned"),
+            "error must name the reservation rejection: {err}"
         );
     }
 

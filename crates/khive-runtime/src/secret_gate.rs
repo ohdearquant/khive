@@ -130,6 +130,45 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
     Ok(())
 }
 
+// ─── Reserved property key (ADR-115 Amendment 1) ────────────────────────────
+
+/// Top-level JSON property key reserved for runtime-owned exemption state.
+///
+/// No caller may create, replace, merge, or remove this key through any
+/// properties-bearing write path — ADR-115 Amendment 1 §3. Reservation binds
+/// unconditionally: the runtime does not yet stamp any record with this key
+/// (the finalizer that would do so is a separate, later increment), so no
+/// caller-supplied occurrence of it can ever be a legitimate echo of
+/// persisted state. Only the exact top-level key is reserved; the same
+/// spelling nested inside an object *value* is ordinary content and remains
+/// subject to [`check_json`], never a posture mutation.
+pub const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
+
+/// Reject a caller-supplied top-level `khive:secret_gate` property key.
+///
+/// Call this before any diff, merge, or storage preparation touches
+/// caller-supplied `properties` on any properties-bearing write path —
+/// create, patch update, or full replace. Returns `Ok(())` when `properties`
+/// is absent, is not a JSON object, or does not name the reserved key at the
+/// top level.
+///
+/// This is the one shared validator for the reservation rule (ADR-115
+/// Amendment 1 §3); every properties-bearing write path across every crate
+/// must call this instead of re-implementing the check.
+pub fn reject_reserved_secret_gate_property(
+    properties: Option<&serde_json::Value>,
+) -> RuntimeResult<()> {
+    if let Some(serde_json::Value::Object(map)) = properties {
+        if map.contains_key(RESERVED_SECRET_GATE_KEY) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "property key `{RESERVED_SECRET_GATE_KEY}` is runtime-owned and cannot be \
+                 created, replaced, merged, or removed by callers"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn scan_json_value(value: &serde_json::Value) -> RuntimeResult<()> {
     match value {
         serde_json::Value::String(s) => check(s),
@@ -278,6 +317,157 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
         cursor = end.max(cursor);
     }
     out.push_str(&text[cursor..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Maximum characters of raw error text admitted to the masking pass.
+///
+/// This is NOT a tight bound like [`MAX_LOG_TEXT_OUTPUT_CHARS`] below — it exists only to
+/// stop a truly pathological input (gigabytes of attacker-controlled text funneled into one
+/// error/log line) from making the masking scan unbounded. It is a pure compute bound, not a
+/// safety bound: [`find_url_userinfo`] has no length limit on the password it recognizes, so
+/// no finite value of this constant can guarantee a credential never straddles it — a
+/// password longer than whatever this is set to always has a crossing case. The actual
+/// safety invariant lives in [`redact_crossing_boundary_url_userinfo`], the fallback
+/// [`bounded_masked_log_text`] runs after [`mask_secrets`]: it redacts any `scheme://user:`
+/// opening whose password run reaches this cut point without a terminating `@`, regardless
+/// of how long that password is. 1 MiB just keeps the scan itself cheap.
+const MAX_LOG_TEXT_MASK_INPUT_CHARS: usize = 1_048_576;
+/// Maximum characters of masked error text emitted to a log record.
+const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
+
+/// Bound and mask arbitrary error text for log emission.
+///
+/// Log records are a disclosure surface the same way wire errors are: they are
+/// shipped, aggregated, and read by consumers outside the process. Backend
+/// error text (gate backends included) can embed connection strings or
+/// credentials, so the FULL text (up to `MAX_LOG_TEXT_MASK_INPUT_CHARS`, a
+/// pure compute bound — see its doc comment) is masked with the canonical
+/// detector set before any truncation happens. Masking after truncation would
+/// let a secret whose tail sits past the bound lose the context (e.g. a URL's
+/// terminating `@`) a detector needs to recognize it, leaving its head
+/// unmasked in the log — truncate-then-mask must never replace
+/// mask-then-truncate here. Because `MAX_LOG_TEXT_MASK_INPUT_CHARS` is
+/// finite and `find_url_userinfo` has no bound on password length, a
+/// password long enough still crosses the cut before its terminating `@`
+/// ever appears; `redact_crossing_boundary_url_userinfo` closes that gap
+/// by redacting the unterminated opening directly, so no credential prefix
+/// survives regardless of secret length. Control (`Cc`) and format
+/// (`Cf`) Unicode codepoints in the masked text are then escaped: a log line
+/// is plain text read by tooling outside this process, and an embedded CR/LF
+/// or bidi/format override could forge or visually disguise part of the
+/// record. The result is bounded again for the emitted record. A truncation
+/// in either the masking pass or the output pass appends `…` so the record
+/// declares its own incompleteness.
+pub fn bounded_masked_log_text(text: &str) -> String {
+    let mask_input_truncated = text.chars().nth(MAX_LOG_TEXT_MASK_INPUT_CHARS).is_some();
+    let bounded_input: std::borrow::Cow<'_, str> = if mask_input_truncated {
+        std::borrow::Cow::Owned(text.chars().take(MAX_LOG_TEXT_MASK_INPUT_CHARS).collect())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+    let masked = mask_secrets(&bounded_input);
+    let masked = if mask_input_truncated {
+        redact_crossing_boundary_url_userinfo(&masked)
+    } else {
+        masked
+    };
+    let neutralized = neutralize_log_unsafe_chars(&masked);
+
+    let mut chars = neutralized.chars();
+    let mut bounded: String = chars.by_ref().take(MAX_LOG_TEXT_OUTPUT_CHARS).collect();
+    if chars.next().is_some() || mask_input_truncated {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Fallback for a `scheme://user:<password>` credential whose password run
+/// collided with [`bounded_masked_log_text`]'s truncation of the mask-scan
+/// input at [`MAX_LOG_TEXT_MASK_INPUT_CHARS`]. [`find_url_userinfo`] only
+/// recognizes a credential once it sees the terminating `@`; when that `@`
+/// sits past the truncation point, [`mask_secrets`] never sees the shape at
+/// all and the raw `scheme://user:<password prefix>` reaches the log. No
+/// finite value of [`MAX_LOG_TEXT_MASK_INPUT_CHARS`] can rule this out — the
+/// detector is unbounded, so any cap has a crossing case — so the invariant
+/// has to come from this fallback, not from the cap's size.
+///
+/// Only called when `bounded_masked_log_text` actually truncated the input.
+/// It scans `://` occurrences left to right and redacts at the EARLIEST
+/// unterminated `user:<password-run>` opening: a colon splits the tail into
+/// two non-empty pieces and no `@`, space, or newline appears anywhere from
+/// that occurrence to the end of the truncated text. An occurrence whose
+/// tail does contain one of those terminators is a complete URL or ordinary
+/// prose that ends inside the text (e.g. two URLs logged side by side) and
+/// is skipped, not redacted. The anchor must be the earliest such opening,
+/// never the last: a later `://` can sit INSIDE the crossing password
+/// itself (passwords may contain `://`), and anchoring there would leave
+/// the real `user:<password prefix>` before it in the emitted log. From the
+/// earliest unterminated opening's colon onward everything is redacted —
+/// zero password characters survive, no matter how long the password
+/// actually is.
+fn redact_crossing_boundary_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find("://") {
+        let scheme_pos = search_from + rel;
+        let rest = &text[scheme_pos + 3..];
+        let terminated =
+            rest.contains('@') || rest.contains(' ') || rest.contains('\n') || rest.contains('\r');
+        if !terminated {
+            if let Some(colon) = rest.find(':') {
+                let user = &rest[..colon];
+                let pass = &rest[colon + 1..];
+                if !user.is_empty() && !pass.is_empty() {
+                    let redact_from = scheme_pos + 3 + colon;
+                    let mut out = String::with_capacity(redact_from + REDACTION_MARKER.len());
+                    out.push_str(&text[..redact_from]);
+                    out.push_str(REDACTION_MARKER);
+                    return std::borrow::Cow::Owned(out);
+                }
+            }
+        }
+        search_from = scheme_pos + 3;
+    }
+    std::borrow::Cow::Borrowed(text)
+}
+
+/// `true` for a Unicode control (`Cc`) or format (`Cf`) codepoint, tab excepted.
+///
+/// Classification is by Unicode general category rather than an ASCII byte range so that
+/// multi-byte control/format characters (bidi overrides, zero-width joiners, line/paragraph
+/// separators encoded as UTF-8) are caught the same way as single-byte C0 controls like
+/// CR/LF — a byte-range check would only ever see the latter. Tab is excepted: it is
+/// visually inert in a log line and common in legitimately reformatted prose.
+fn is_log_unsafe_char(c: char) -> bool {
+    if c == '\t' {
+        return false;
+    }
+    matches!(
+        unicode_general_category::get_general_category(c),
+        unicode_general_category::GeneralCategory::Control
+            | unicode_general_category::GeneralCategory::Format
+    )
+}
+
+/// Escape every [`is_log_unsafe_char`] codepoint in `text` as `\u{XXXX}`.
+///
+/// Returns `Cow::Borrowed` when nothing needs escaping (the common case), avoiding an
+/// allocation. This runs on already-masked text: it must never be skipped for text that
+/// bypassed [`mask_secrets`], since a control character can sit inside a would-be secret
+/// span and is a distinct disclosure vector from the credential detectors (log injection /
+/// forgery, not credential leakage).
+fn neutralize_log_unsafe_chars(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_log_unsafe_char) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if is_log_unsafe_char(c) {
+            out.push_str(&format!("\\u{{{:04x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
     std::borrow::Cow::Owned(out)
 }
 
@@ -2432,6 +2622,75 @@ mod tests {
         );
     }
 
+    // ── Reserved secret-gate property key (ADR-115 Amendment 1) ─────────────
+
+    #[test]
+    fn reject_reserved_key_passes_absent_properties() {
+        assert!(reject_reserved_secret_gate_property(None).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_passes_unrelated_properties() {
+        let props = serde_json::json!({"name": "value", "tags": ["a", "b"]});
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_passes_non_object_properties() {
+        // Non-object properties cannot name a top-level key at all.
+        let props = serde_json::json!("just a string");
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+        let arr = serde_json::json!(["a", "b"]);
+        assert!(reject_reserved_secret_gate_property(Some(&arr)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_top_level_key_creation() {
+        let props = serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"});
+        let err = reject_reserved_secret_gate_property(Some(&props)).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_regardless_of_value_shape() {
+        // Presence alone is rejected — arbitrary value, null (explicit removal
+        // shape), and a value that happens to match the real stamp format are
+        // all rejected identically; a caller can never legitimately write this
+        // key by any value.
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!({"nested": "object"}),
+            serde_json::json!("exempted:content-sha256-manifest-v1"),
+        ] {
+            let props = serde_json::json!({"khive:secret_gate": value});
+            assert!(
+                reject_reserved_secret_gate_property(Some(&props)).is_err(),
+                "must reject value shape: {props:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_reserved_key_allows_nested_non_top_level_occurrence() {
+        // The same spelling nested inside a value is ordinary content, not a
+        // posture mutation — only the exact top-level key is reserved.
+        let props = serde_json::json!({"notes": {"khive:secret_gate": "not-a-stamp"}});
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_key_blocks_alongside_other_legitimate_keys() {
+        let props = serde_json::json!({
+            "name": "value",
+            "khive:secret_gate": "exempted:content-sha256-manifest-v1",
+        });
+        assert!(reject_reserved_secret_gate_property(Some(&props)).is_err());
+    }
+
     #[test]
     fn check_json_passes_safe_properties() {
         let props = serde_json::json!({
@@ -3593,6 +3852,250 @@ mod tests {
     }
 
     // ── mask_secrets: in-place redaction reusing the canonical detector ───────
+
+    #[test]
+    fn bounded_masked_log_text_masks_connection_string_credentials() {
+        let raw =
+            "gate backend probe failed: postgres://svc:not-a-real-secret@internal-host refused"; // gitleaks:allow
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains("not-a-real-secret"),
+            "credential must be masked: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "masked marker must record that detail was redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("gate backend probe failed"),
+            "non-secret diagnostic prose must survive: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_bounds_pathological_input() {
+        let raw = "x".repeat(MAX_LOG_TEXT_OUTPUT_CHARS + 500);
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            rendered.chars().count() <= MAX_LOG_TEXT_OUTPUT_CHARS + 1,
+            "output must be bounded: {} chars",
+            rendered.chars().count()
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated output must declare its own truncation"
+        );
+
+        let short = "gate policy file unreadable";
+        assert_eq!(
+            bounded_masked_log_text(short),
+            short,
+            "short clean text passes through unchanged"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_masks_low_entropy_password_past_old_truncation_bound() {
+        // Regression: masking used to run AFTER truncating the raw input to a
+        // few KB, so a connection string whose password ran past that bound
+        // lost its terminating `@` before the url-userinfo detector (a
+        // shape match, not an entropy one) ever saw it — a low-entropy
+        // password can't trip the entropy heuristic either, so it leaked
+        // verbatim into the log. Masking now runs on the full input first,
+        // so a password far longer than the old 4096-char bound is still
+        // caught.
+        let long_low_entropy_password = "a".repeat(5_000);
+        let raw = format!(
+            "gate backend probe failed: postgres://svc:{long_low_entropy_password}@internal-host refused"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "long low-entropy password must not survive in the log: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "masked marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression for the crossing-boundary leak: a password longer than
+    /// [`MAX_LOG_TEXT_MASK_INPUT_CHARS`] never gets a chance to show its
+    /// terminating `@` to `find_url_userinfo` inside the truncated scan
+    /// input, so the shape detector alone can never catch it — and it's
+    /// deliberately low-entropy so the entropy heuristic can't catch it
+    /// either. Only `redact_crossing_boundary_url_userinfo` can close this.
+    #[test]
+    fn bounded_masked_log_text_redacts_password_crossing_mask_input_cap() {
+        let huge_low_entropy_password = "a".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw =
+            format!("gate backend probe failed: postgres://svc:{huge_low_entropy_password}@internal-host refused");
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "no password fragment may survive when the password crosses the mask-input cap: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated record must declare its own incompleteness: {rendered:?}"
+        );
+    }
+
+    /// Regression: a crossing password that itself contains `://` must not
+    /// let the fallback anchor at that nested delimiter. Anchoring at the
+    /// last `://` would redact only from the nested span onward, leaving
+    /// the real `user:<password prefix>` before it in the emitted log. The
+    /// fallback must anchor at the earliest unterminated credential
+    /// opening, so zero password characters survive.
+    #[test]
+    fn bounded_masked_log_text_redacts_crossing_password_containing_nested_scheme() {
+        let mut password = "a".repeat(1000);
+        password.push_str("://h:");
+        password.push_str(&"b".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000));
+        let raw =
+            format!("gate backend probe failed: postgres://svc:{password}@internal-host refused");
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "password prefix before the nested delimiter must not survive: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&"b".repeat(50)),
+            "password tail after the nested delimiter must not survive: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression: a complete URL earlier in the text must not stop the
+    /// fallback from catching a later credential run that crosses the cap.
+    /// The earlier URL's span terminates inside the text (whitespace after
+    /// it), so it is skipped; the later unterminated `user:<password-run>`
+    /// is the one redacted.
+    #[test]
+    fn bounded_masked_log_text_redacts_crossing_credential_after_complete_url() {
+        let huge_low_entropy_password = "c".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw = format!(
+            "probe of https://ok-host/health failed; retry hit postgres://svc:{huge_low_entropy_password}@internal-host refused"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            rendered.contains("ok-host"),
+            "the earlier complete URL must survive untouched: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&"c".repeat(50)),
+            "no password fragment may survive: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression: the crossing-boundary fallback must not fire when the
+    /// password's terminating `@` sits safely inside the (untruncated)
+    /// bounded input — the existing `find_url_userinfo` arm alone must
+    /// still catch and mask it, with exactly one mask marker.
+    #[test]
+    fn bounded_masked_log_text_masks_password_just_under_cap_with_terminating_at() {
+        let password_under_cap = "a".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS - 1000);
+        let raw = format!(
+            "gate backend probe failed: postgres://svc:{password_under_cap}@internal-host refused"
+        );
+        assert!(
+            raw.chars().count() < MAX_LOG_TEXT_MASK_INPUT_CHARS,
+            "test precondition: whole input must stay under the mask-input cap so no truncation occurs"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"a".repeat(50)),
+            "terminated credential must still be masked normally: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches("***MASKED***").count(),
+            1,
+            "exactly one mask marker — the crossing fallback must not fire early: {rendered:?}"
+        );
+    }
+
+    /// Regression: giant truncated text with no `://user:` shape at all must
+    /// pass through unmodified by the crossing-boundary fallback — it must
+    /// not manufacture a false redaction out of ordinary non-credential
+    /// prose that happens to be long enough to hit the mask-input cap.
+    #[test]
+    fn bounded_masked_log_text_giant_non_credential_text_unaffected_by_crossing_fallback() {
+        let raw = "x".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains("***MASKED***"),
+            "non-credential text must never be redacted: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "truncated record must still declare its own incompleteness: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("xxxx"),
+            "non-credential content must survive verbatim up to the output bound: {rendered:?}"
+        );
+    }
+
+    /// Regression: an ordinary short connection string (well under both
+    /// caps) must keep being masked exactly as before — the crossing
+    /// fallback is gated on truncation and must never touch this path.
+    #[test]
+    fn bounded_masked_log_text_masks_ordinary_short_connection_string() {
+        let raw = "gate backend probe failed: postgres://svc:hunter2pw@internal-host refused"; // gitleaks:allow
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains("hunter2pw"),
+            "credential must be masked: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches("***MASKED***").count(),
+            1,
+            "exactly one mask marker for the one credential: {rendered:?}"
+        );
+        assert!(
+            !rendered.ends_with('…'),
+            "short untruncated text must not declare truncation: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_neutralizes_control_and_format_chars() {
+        let raw = "line one\r\ninjected: \u{1b}[31mFAKE ALERT\u{1b}[0m line two";
+        let rendered = bounded_masked_log_text(raw);
+        assert!(
+            !rendered.contains('\r') && !rendered.contains('\n'),
+            "CR/LF must be neutralized so a single log line cannot be split/forged: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC control character must be neutralized: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("line one") && rendered.contains("line two"),
+            "surrounding prose must survive neutralization: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_masked_log_text_keeps_accented_and_cjk_text_unchanged() {
+        let raw = "café résumé 日本語のテキスト 数据库连接管理";
+        assert_eq!(
+            bounded_masked_log_text(raw),
+            raw,
+            "accented and CJK prose must pass through unmodified"
+        );
+    }
 
     #[test]
     fn mask_secrets_borrows_clean_text() {

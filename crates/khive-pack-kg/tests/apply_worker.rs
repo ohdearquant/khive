@@ -12,6 +12,7 @@ use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EventFilter;
 use khive_types::EventKind;
 use khive_types::{Id128, NoteDraft, ProposalChangeset, ProposalCreatedPayload};
+use serde_json::json;
 use uuid::Uuid;
 
 fn setup() -> (KhiveRuntime, NamespaceToken) {
@@ -523,5 +524,96 @@ async fn apply_worker_rejects_invalid_note_kind() {
             .iter()
             .any(|n| n.name.as_deref() == Some("BadNote")),
         "C3: note with invalid kind must not be created in the KG"
+    );
+}
+
+/// ADR-115 Amendment 1 §3: proposal apply is reservation-only — a
+/// caller-supplied top-level `khive:secret_gate` property on an `AddEntity`
+/// changeset must be rejected before materialization, the same way ordinary
+/// `create` rejects it.
+#[tokio::test]
+async fn apply_worker_rejects_reserved_secret_gate_property_on_add_entity() {
+    use khive_types::EntityDraft;
+
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::AddEntity {
+        entity: EntityDraft {
+            kind: "concept".to_string(),
+            name: "ReservedKeyEntity".to_string(),
+            description: Some("should fail".to_string()),
+            properties: Some(json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"})),
+            tags: vec![],
+        },
+    };
+
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("maybe_apply itself must succeed (errors emitted as ProposalApplied{Failed})");
+
+    let entities = rt
+        .list_entities(&tok, None, None, 100, 0)
+        .await
+        .expect("list_entities");
+    assert!(
+        !entities.iter().any(|e| e.name == "ReservedKeyEntity"),
+        "entity carrying the reserved property key must not be created in the KG"
+    );
+}
+
+/// Note-substrate counterpart of
+/// `apply_worker_rejects_reserved_secret_gate_property_on_add_entity`.
+#[tokio::test]
+async fn apply_worker_rejects_reserved_secret_gate_property_on_add_note() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::AddNote {
+        note: NoteDraft {
+            kind: "observation".to_string(),
+            name: Some("ReservedKeyNote".to_string()),
+            content: "should fail".to_string(),
+            properties: Some(json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"})),
+        },
+    };
+
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("maybe_apply itself must succeed (errors emitted as ProposalApplied{Failed})");
+
+    let notes = rt
+        .notes(&tok)
+        .expect("notes store")
+        .query_notes(
+            tok.namespace().as_str(),
+            None,
+            PageRequest {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("query_notes");
+    assert!(
+        !notes
+            .items
+            .iter()
+            .any(|n| n.name.as_deref() == Some("ReservedKeyNote")),
+        "note carrying the reserved property key must not be created in the KG"
     );
 }

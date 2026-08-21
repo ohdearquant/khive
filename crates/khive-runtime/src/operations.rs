@@ -1303,6 +1303,7 @@ impl KhiveRuntime {
         content_ref: Option<&ContentRef>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_entity_kind(kind)?;
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         // Secret gate: scan name, description, structured properties, and tags.
         crate::secret_gate::check(name)?;
         if let Some(d) = description {
@@ -3169,6 +3170,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         crate::secret_gate::check(content)?;
         if let Some(n) = name {
             crate::secret_gate::check(n)?;
@@ -3281,6 +3283,7 @@ impl KhiveRuntime {
         // same derived values. Runs before the secret gate so the gate scans
         // exactly what will be written.
         let properties = self.derive_note_write_properties(kind, token, properties)?;
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check(content)?;
         if let Some(n) = name {
@@ -5329,6 +5332,7 @@ impl KhiveRuntime {
             changed_fields.push("weight");
         }
         if let Some(props) = patch.properties {
+            crate::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;
             edge.metadata = Some(props);
         }
 
@@ -5767,6 +5771,7 @@ impl KhiveRuntime {
             if spec.name.trim().is_empty() {
                 return Err(RuntimeError::InvalidInput("name must not be empty".into()));
             }
+            crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
             crate::secret_gate::check(&spec.name)?;
             if let Some(d) = &spec.description {
                 crate::secret_gate::check(d)?;
@@ -16145,6 +16150,106 @@ mod tests {
             "BASE_ENTITY_ENDPOINT_RULES has drifted from ADR-002's base endpoint contract.\n\
              In the ADR but not enforced by the runtime: {missing_from_runtime:#?}\n\
              Enforced by the runtime but not in the ADR: {extra_in_runtime:#?}"
+        );
+    }
+
+    // ── Universal reserved-key reservation (ADR-115 Amendment 1, first rung) ──
+
+    fn reserved_key_props() -> serde_json::Value {
+        serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"})
+    }
+
+    #[tokio::test]
+    async fn create_entity_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let err = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "reserved-key-entity",
+                None,
+                Some(reserved_key_props()),
+                vec![],
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+        // No partial mutation: the record must not exist under any name/search.
+        let found = rt
+            .list_entities(&tok, Some("concept"), None, 10, 0)
+            .await
+            .expect("list must succeed");
+        assert!(
+            found.iter().all(|e| e.name != "reserved-key-entity"),
+            "rejected create must leave no row behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let err = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "reserved-key note content",
+                None,
+                Some(reserved_key_props()),
+                vec![],
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_many_rejects_reserved_secret_gate_key_atomically() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let specs = vec![
+            EntityCreateSpec {
+                kind: "concept".to_string(),
+                entity_type: None,
+                name: "clean-entity".to_string(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            },
+            EntityCreateSpec {
+                kind: "concept".to_string(),
+                entity_type: None,
+                name: "reserved-key-entity".to_string(),
+                description: None,
+                properties: Some(reserved_key_props()),
+                tags: vec![],
+            },
+        ];
+        let err = rt
+            .create_many(&tok, specs)
+            .await
+            .expect_err("a reserved key anywhere in the batch must reject the whole batch");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+        // No partial mutation: the leading clean spec must not have been written either.
+        let found = rt
+            .list_entities(&tok, Some("concept"), None, 10, 0)
+            .await
+            .expect("list must succeed");
+        assert!(
+            found.is_empty(),
+            "batch rejection must leave zero rows behind, found: {found:?}"
         );
     }
 }

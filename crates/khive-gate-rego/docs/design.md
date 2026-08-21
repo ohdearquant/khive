@@ -8,11 +8,11 @@ This crate is the reference Rego backend for the khive authorization gate define
 
 Key design decisions and constraints:
 
-- **Fail-open on dispatch errors.** When `Gate::check` returns `Err(GateError)`, the runtime
-  treats it as an infrastructure failure, logs a warning, and proceeds. This is the ADR-018
-  "fail-open on gate Err" behavior. To prevent unintended access, always declare a
-  `default decision := {"decision": "deny", ...}` so unmatched requests deny explicitly
-  rather than relying on the fail-open path.
+- **Fail-closed on dispatch errors.** When `Gate::check` returns `Err(GateError)`, the runtime
+  audits the infrastructure outage and returns `RuntimeError::GateUnavailable` without invoking
+  the operation. Policies should still declare a
+  `default decision := {"decision": "deny", ...}` so unmatched requests produce an explicit
+  policy denial instead of an infrastructure-outage response.
 
 - **Fail-closed on load errors.** Policy syntax/parse errors and empty policy directories are
   detected at construction time (`from_policy_str` / `from_dir` return `Err`), not at dispatch.
@@ -24,7 +24,7 @@ Key design decisions and constraints:
 
 - **Entrypoint validation at construction.** `try_with_entrypoint` rejects empty,
   whitespace-only, or non-`data.`-prefixed entrypoints before the gate is installed.
-  This prevents a misconfigured entrypoint from causing fail-open dispatch errors at runtime.
+  This prevents a misconfigured entrypoint from causing gate-unavailable dispatch errors at runtime.
   `with_entrypoint` is the infallible variant for programmatic use with already-validated paths.
 
 - **Deterministic policy load order.** `from_dir` sorts `.rego` files by name before loading,
@@ -35,6 +35,5 @@ Key design decisions and constraints:
 - The `README.md` and `docs/api/policy-contract.md` retain ADR-018 cross-references for external readers
   navigating from documentation to the authoritative design record. Only the `.rs` source files
   have had ADR citations removed.
-- The fail-open behavior described here matches the production runtime behavior in
-  `khive-runtime`. Any change to the gate error handling policy must be coordinated with
-  the runtime gate dispatch path.
+- The fail-closed behavior described here matches the production runtime behavior in
+  `khive-runtime`; gate-outage handling remains coordinated with the runtime dispatch path.

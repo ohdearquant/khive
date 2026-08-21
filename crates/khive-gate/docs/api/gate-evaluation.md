@@ -24,5 +24,7 @@ the sibling `khive-gate-rego` crate and downstream capability or wrapper impleme
 ## Error boundary
 
 `GateError::Policy` reports policy parsing or evaluation failures and `GateError::Internal` reports
-backend infrastructure faults. The dispatcher decides how errors affect availability; a gate that
-must fail closed should convert evaluation uncertainty into an explicit denial.
+backend infrastructure faults. The dispatcher audits every `GateError` as gate unavailability,
+returns `RuntimeError::GateUnavailable`, and never invokes the operation. An implementation should
+convert evaluation uncertainty into `Ok(GateDecision::Deny)` only when it intends to report an
+explicit policy refusal rather than an infrastructure outage.

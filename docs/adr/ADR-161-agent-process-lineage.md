@@ -2,6 +2,19 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-16
+- **Revised:** 2026-08-19 (Rev 2 — design review R2: enumeration snapshot semantics and cursor
+  binding, depth truncation split from page continuation, pre-lineage records classed unknown,
+  dispatcher missing-identity fail-closed, cascade serialization rule); 2026-08-20 (design
+  review R3: mutable-filter scope semantics for `agent.list(state=...)`, root authorization
+  for `agent.descendants` with unauthorized/nonexistent indistinguishability, cross-operation
+  disclosure composition assigned to the gate; R4: direction claim scoped to
+  `state="non_terminal"`, gate-side bound generalized to rate or finite disclosure quota —
+  only the quota form makes the cumulative budget finite; R5: enforcement dependency stated
+  honestly — ADR-018 v1 does not enforce rate obligations, so hidden-population deployments
+  are out of contract until its promised rate-limiter successor ships carrying the shared
+  finite quota, requirements on that successor enumerated; the quota is a
+  non-resetting caller-lifetime cap, persisted across restarts — resetting quotas are rate
+  bounds and lift nothing)
 - **Extends:** ADR-142
 
 ## Context
@@ -72,12 +85,21 @@ to an arbitrary member of that set, silently and with no error to observe.
 This ADR therefore requires that the agent-loop dispatcher's context carry the `agent_id` of
 the record on whose behalf it is dispatching, and `parent_agent_id` binds from that field. It
 is runtime-resolved on exactly the terms `owner_actor` already is: set by the dispatcher from
-its own execution state, never read from the request, never influenced by the process. A
-dispatch that cannot produce a record-identifying `agent_id` is not an agent-issued spawn, and
-the resulting record is a root with `parent_agent_id` null — the runtime never falls back to
-guessing a parent from actor or class. Attaching a child to a _possible_ parent is worse than
-recording no parent at all, because a null is legible as absent while a wrong parent reads as
-fact. A record's parentage therefore cannot be forged, transferred, or repointed.
+its own execution state, never read from the request, never influenced by the process.
+
+**An agent-loop dispatch that cannot produce that `agent_id` is a validation error, not a
+root.** The dispatcher knows, from its own execution state, that it is dispatching on a
+record's behalf; a dispatch from that path with no record identity is a dispatcher defect, and
+admitting the child as a root would write a falsehood — "submitted directly by a caller that
+is not an agent process" — into an immutable field, precisely where the machinery producing
+the field is known to be broken. The error names the defect; nothing is admitted. Only a spawn
+that does not pass through the agent-loop dispatcher is a direct spawn, and only a direct
+spawn is a root. The runtime never falls back to guessing a parent from actor or class.
+Attaching a child to a _possible_ parent is worse than recording no parent at all, because a
+null is legible as absent while a wrong parent reads as fact — and for the same reason, a
+false null admitted on a defective dispatch path would read as fact too, which is why that
+arm fails closed rather than admitting a mislabelled root. A record's parentage therefore
+cannot be forged, transferred, or repointed.
 
 Because a parent must be an existing record at the moment its child is admitted, and every
 child is a new record, the lineage relation is acyclic by construction: the table is a
@@ -134,6 +156,30 @@ about content would leave a new direct spawn with no admissible form at all, whi
 rule. Existing digests keep their `1` and no migration of them is required or permitted; a
 record with no stored version predates this ADR and reads as `1`.
 
+**A version-1 record's lineage is unknown, not root.** Every record admitted before this ADR
+was spawned without lineage tracking, so its null `parent_agent_id` records only that nothing
+was captured — it is not evidence that the spawn came from a direct caller, and reading it as
+a proven root would attribute a positive origin claim to rows whose origin was never observed.
+Lineage is therefore a three-valued classification, derived rather than stored: a record is a
+**root** when its fingerprint version is 2 or later and `parent_agent_id` is null, a **child**
+when `parent_agent_id` is set, and **unknown** when its fingerprint version is 1. Every
+surface that returns process records — `agent.observe`, `agent.list`, `agent.descendants` —
+carries the derived `lineage` field with exactly those three values, so no consumer has to
+reconstruct the distinction from a null, and no consumer can miss it. `lineage_depth` on an
+unknown record is 0 by the column rule above and carries the same caveat: it is a default,
+not a measured depth. Migration writes nothing: the classification is derived at read time
+from fields that already exist.
+
+The replay arm follows. A repeat that resolves a parent — an agent-issued spawn — arriving
+against a stored version-1 record is a validation error naming the version mismatch: the
+version-1 comparison form omits parent context entirely, so it cannot distinguish a repeat
+whose parent matches from one whose parent differs, and silently accepting the match would
+hand the caller a record whose lineage is unknown as though it were the lineage the repeat
+resolved. A direct repeat — no parent resolved — against a version-1 record compares under the
+four-field form as already stated. This closes the same two-site arm for pre-existing records
+that the fingerprint amendment closes for new ones, by refusal where comparison is impossible
+rather than by comparison.
+
 This is an amendment to two ADR-142 contracts and is labelled as one rather than described as
 purely additive. The first is `spawn_fingerprint`'s compared content and its versioning. The
 second is the agent table's column list [ADR-142 §1], which gains `spawn_fingerprint_version`
@@ -189,10 +235,10 @@ across the restart boundary, for the same reason authority is not.
 The agent pack registers two additional read-only verbs, under the same registry, discovery,
 and gate rules as the existing five [ADR-142 §1; ADR-023]:
 
-| Verb                | Required parameters | Optional parameters                              | Success value                                                                             |
-| ------------------- | ------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| `agent.list`        | —                   | `parent_id`, `state`, `owner`, `limit`, `cursor` | `{ agents: [record...], count, complete, next_cursor? }`                                  |
-| `agent.descendants` | `id`                | `max_depth`, `limit`, `cursor`                   | `{ root: agent_id, agents: [record + relative_depth...], count, complete, next_cursor? }` |
+| Verb                | Required parameters | Optional parameters                              | Success value                                                                                                     |
+| ------------------- | ------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `agent.list`        | —                   | `parent_id`, `state`, `owner`, `limit`, `cursor` | `{ agents: [record...], count, complete, as_of, next_cursor? }`                                                   |
+| `agent.descendants` | `id`                | `max_depth`, `limit`, `cursor`                   | `{ root: agent_id, agents: [record + relative_depth...], count, complete, depth_truncated, as_of, next_cursor? }` |
 
 - `agent.list` enumerates process records matching every supplied filter. `parent_id`
   selects direct children only; `parent_id` omitted with no other filter enumerates the
@@ -203,34 +249,109 @@ and gate rules as the existing five [ADR-142 §1; ADR-023]:
 - Both verbs read the agent table only. **Enumeration never wakes a process**: no provider
   is invoked, no state changes, no activity timestamp updates — the same read-only contract
   as `agent.observe`, over a set instead of one record.
-- Both results carry an explicit `complete` boolean: false whenever `limit` truncated the
-  result or `max_depth` cut the walk before exhaustion, so a caller can never mistake a
-  truncated enumeration for the whole population. An enumeration that cannot read the table is
-  a per-operation error, never an empty success.
-- **Continuation is a cursor, and the ordering it rides on is part of the contract.** A
-  numeric offset is not enough here: the agent table is written concurrently with the reads,
-  so an offset into a set that gains and loses rows between calls silently skips records and
-  repeats others, and a caller paging to exhaustion has no way to notice either. Both verbs
-  therefore enumerate in a total, stable order — ascending `(spawned_at, agent_id)`, with
-  `agent_id` breaking ties so the order is total even for records admitted in the same
-  instant — and `agent.descendants` applies that order within each depth level, preserving
-  breadth-first traversal across pages. `spawned_at` is named deliberately: it is the agent
-  table's own admission timestamp [ADR-142 §1, agent-table column list], and the table carries
-  no `created_at`. A cursor contract naming a column the table does not have is unimplementable,
-  so the sort key is stated here as a column reference rather than as a generic convention.
-  A truncated result carries `next_cursor`, an opaque
-  token encoding the position in that order; passing it back as `cursor` resumes immediately
-  after the last returned record. `next_cursor` is present exactly when `complete` is false,
-  and absent exactly when it is true, so the two fields cannot disagree.
-- Records admitted after a page was served sort after that page's cursor position and are
-  returned by a later page; records that reach `terminal` mid-enumeration are still returned,
-  since state is a field rather than a filter on existence. Neither case can shift a record
-  the caller has already seen into a position it would be served from again. The cursor is
-  opaque deliberately — a caller that constructs or arithmetically manipulates one is relying
-  on an encoding this ADR does not fix.
+- Both results carry an explicit `complete` boolean, and it answers exactly one question:
+  has every record in this enumeration's scope been returned across this cursor chain? The
+  scope is defined below — the caller's filters, the walk's `max_depth`, the enumeration's
+  admission horizon, and the caller's visibility — and `complete` is always relative to it.
+  A caller can therefore never mistake a page-truncated enumeration for the whole scope. An
+  enumeration that cannot read the table is a per-operation error, never an empty success.
+- Depth truncation is a property of the scope, not of pagination, and the two are reported
+  separately. `agent.descendants` carries `depth_truncated`: true exactly when at least one
+  record at relative depth equal to `max_depth` has, within the enumeration's admission
+  horizon, at least one child — that is, when the **structural** forest actually continues
+  past the requested depth, not merely when the bound was supplied. Structural is deliberate,
+  on the same reasoning as `subtree_terminal`: the walk crosses records the caller may not
+  see, so a visible-only probe could report false while deeper visible records exist behind
+  a hidden intermediate — a flag that lies about the caller's own view. The structural probe
+  is instead one of the bounded structural-aggregate disclosures enumerated in §3's
+  authorization paragraph: its value can depend on a child the caller may not observe, and
+  that is admitted rather than accidental. The existence probe that answers it examines at
+  most one child per frontier record and is not a visit for `lineage_visit_limit` purposes. A walk whose pages are exhausted but whose depth was cut
+  reports `complete: true, depth_truncated: true` and no cursor: there are no further pages
+  in this scope, and a deeper scope is a new enumeration with a larger `max_depth`, not a
+  continuation of this one. Conflating the two — one flag for both page truncation and depth
+  truncation — would force a cursor into existence for an enumeration that has nothing left
+  to return, and a caller resuming it would page forever through empty results.
+- **Continuation is a cursor over a fixed population, and both halves of that are the
+  contract.** A numeric offset is not enough here: the agent table is written concurrently
+  with the reads, so an offset into a set that gains and loses rows between calls silently
+  skips records and repeats others, and a caller paging to exhaustion has no way to notice
+  either. A stable sort order alone is not enough either, and the failure is worst exactly
+  where this ADR's own ordering is: `agent.descendants` pages depth-major, so a record
+  admitted at a shallow depth after a deeper page was served sorts _before_ the cursor and
+  would be silently and permanently omitted from every later page — one such record already
+  falsifies `complete`, and a single new shallow subtree omits its entire prefix. Enumeration
+  therefore fixes its population when the cursor is minted: the first page captures an
+  **admission horizon** — the position, in admission order, of the most recently admitted
+  record **visible to the caller** at that moment — and every page of the enumeration
+  returns only records admitted at or before it. Scoping the horizon to the visible
+  population changes no result and is required by the disclosure budget: it changes no
+  result because a parent is always admitted before its child, so every record servable to
+  the caller — and every structural ancestor a walk crosses to reach it — sits at or before
+  the newest visible record's position, making a table-wide horizon and a visible one select
+  the same pages; and it is required because a table-wide horizon would make the cursor, and
+  `as_of` below, a function of hidden records' admission times, a disclosure §3's
+  authorization paragraph does not budget. Records admitted later are outside this enumeration's scope by definition
+  rather than missed by accident; a caller that wants them starts a new enumeration and gets
+  a new horizon. Within that fixed population both verbs enumerate in a total, stable order —
+  ascending `(spawned_at, agent_id)`, with `agent_id` breaking ties so the order is total
+  even for records admitted in the same instant — and `agent.descendants` applies that order
+  within each depth level, preserving breadth-first traversal across pages. The population is
+  genuinely fixed because every field it is computed from is immutable: `spawned_at` and
+  `agent_id` never change, `parent_agent_id` never changes, and records are durable [ADR-142
+  §1] with no deletion or retention policy defined (Non-goals below), so the reachable set at
+  a horizon is the same set on every page — and any future retention policy must either
+  preserve this property for live cursors or invalidate them, never silently shrink a paged
+  population.
+  `spawned_at` is named deliberately: it is the agent table's own admission timestamp
+  [ADR-142 §1, agent-table column list], and the table carries no `created_at`. A cursor
+  contract naming a column the table does not have is unimplementable, so the sort key is
+  stated here as a column reference rather than as a generic convention. A page-truncated
+  result carries `next_cursor`, an opaque token encoding the horizon and the position in that
+  order; passing it back as `cursor` resumes immediately after the last returned record,
+  under the same horizon. `next_cursor` is present exactly when `complete` is false, and
+  absent exactly when it is true, so the two fields cannot disagree. Every page's result
+  carries `as_of`: the admission timestamp of the horizon — the `spawned_at` of the most
+  recently admitted record visible to the caller at cursor mint, or null when none was — so
+  the age of the view is inspectable rather than inferred, and carries no information about
+  records the caller may not see. `as_of` is an informational projection of the horizon,
+  not the horizon itself: the authoritative horizon, including its tiebreak, travels only
+  inside the cursor, and `as_of` is never accepted back as an input.
+- **A cursor is bound to the enumeration that minted it, and presenting it anywhere else is a
+  validation error.** The token binds the verb, the complete parameter set (the filters, the
+  root `id` and `max_depth` for `agent.descendants`), the caller's resolved authorization
+  context as ADR-142 already snapshots it, the admission horizon, and an expiry. A cursor
+  presented with any differing element fails validation naming the mismatch — resuming
+  another query's cursor, or another caller's, would splice two enumerations and let one
+  principal page under another's visibility; resuming after the caller's authorization
+  context has changed would enumerate under an authority that is neither the old one nor
+  auditable as the new one. Expiry bounds how stale a horizon a caller can keep paging: an
+  expired cursor is a validation error naming the expiry, and the caller re-enumerates. The
+  expiry is an operator configuration parameter with a published default; as with the other
+  bounds in §4, its existence is normative here and its value is not.
+- Records that reach `terminal` mid-enumeration are still returned when the enumeration's
+  filters are immutable-only — every `agent.descendants` walk, and every `agent.list`
+  without `state` — since state is a field rather than a filter on existence, and a
+  record's admission-order position never moves: a record the caller has already seen can
+  never be served again, and a record in such a scope can never escape it. A `state` filter
+  is the one mutable element a caller can put in scope, and it changes that promise, so the
+  change is stated rather than implied: filter membership is evaluated once per record, at
+  the moment the page that would carry it is computed, and `complete` is relative to those
+  evaluations. A record that stops matching before its page is computed — for
+  `state="non_terminal"` the only possible direction, since `terminal` is absorbing — is
+  outside the enumeration's scope by that evaluation rather than missed by accident; a
+  record served and then terminalized was truthfully in scope when its page was computed;
+  and no record is ever served twice or re-admitted, because positions are immutable and the
+  drop-out is one-way. The alternative — holding a state-filtered population fixed as of the
+  horizon — is rejected deliberately: it would require the read path to answer what a
+  record's state was at cursor mint, a reconstruction the agent table does not hold and only
+  the audit plane could approximate, and a read verb taking an audit-plane dependency to
+  serve a filter would invert the planes' layering. The cursor is opaque deliberately — a
+  caller that constructs or arithmetically manipulates one is relying on an encoding this
+  ADR does not fix.
 - Returned records carry the same field set as `agent.observe`, under the same additive-only
-  versioning [ADR-142 §1, "Observation surface"]; `parent_agent_id` and `lineage_depth`
-  appear in both surfaces.
+  versioning [ADR-142 §1, "Observation surface"]; `parent_agent_id`, `lineage_depth`, and the
+  derived `lineage` classification (§1) appear in both surfaces.
 
 **Authorization is per record and identical to observation.** The ADR-142 lifecycle-record
 authorizer already defines who may observe a record: the record's `owner_actor`, or a caller
@@ -238,9 +359,60 @@ whose current mapped peer class is in the operator's delegated-lifecycle class s
 §1, "Actor provenance"]. Enumeration applies exactly that predicate per candidate record and
 returns the records that pass, silently omitting the rest: a caller's enumeration result is
 precisely the set of records it could have `agent.observe`d individually, so the two
-surfaces can never disagree about visibility, and enumeration discloses nothing about
-records outside the caller's authority — including their existence. `count` and `complete`
-describe the visible set, not the table.
+surfaces can never disagree about visibility, and enumeration discloses no record outside
+the caller's authority: not its fields, not its identity. `count` and `complete` describe
+the visible set, not the table. The walk's root is a record like any other, and naming it
+is not authority over it: `agent.descendants` applies this same predicate to the record
+named by `id` before walking anything, and a root that fails it produces the identical
+error, in shape and message, as an `id` naming no record at all — the two cases are
+indistinguishable by construction, so the verb is not an existence oracle for hidden
+records. Anchoring is disclosure: a walk from an unauthorized root would hand the caller
+that root's existence and every returned record's depth relative to it, neither of which
+the per-record predicate on the results ever budgeted.
+
+That claim is scoped to records, and the scoping is deliberate, because an absolute
+zero-disclosure claim would be false: this ADR contains exactly four places where a caller
+learns a bounded structural-aggregate fact whose value depends on records it cannot see, and
+they are enumerated here rather than left to be discovered. `subtree_terminal` is computed
+over the structural set (§4). `undisclosed_survivors: true` says unseen survivors exist
+(§4). `depth_truncated` probes structural children, so its value can depend on a child the
+caller may not observe (§3 above). And a `lineage_visit_limit` refusal (§4) is a
+caller-visible error whose occurrence depends on how many records — visible or not — the
+structural walk reached: two hidden populations straddling the bound are distinguishable by
+whether the refusal fires, which is one threshold bit about hidden population size. Each of
+the four is deliberate, bounded to an aggregate fact, and justified where it is defined;
+none discloses a record. An implementation must not widen any of them, and must not add a
+fifth without amending this paragraph — this list is the contract's complete disclosure
+budget. The budget counts bits per operation, and composition across operations is a real
+channel this ADR names rather than hides: each of the four discloses at most one threshold
+bit per call, so a caller iterating a bounded probe — binary-searching hidden structural
+depth with `max_depth` against `depth_truncated`, or bracketing hidden population size
+against the `lineage_visit_limit` refusal — accumulates bits at a rate bounded only by its
+call rate. A rate bound alone slows that reconstruction without making it finite — any
+positive rate over an unbounded lifetime accumulates unbounded bits — and no bound imposed
+by these verbs could do better, because every honest answer to a legitimate operation
+carries its bit: the only finite cumulative budget is refusal of service once a caller's
+budget is spent, and admission refusal is the gate's decision by construction. So the
+channel can only be closed at the gate — and this ADR does not pretend the gate closes it
+today. ADR-018 ("Why no obligation enforcement in v1?") is explicit that
+`Obligation::RateLimit` is returned by policies and NOT enforced by the runtime in v1,
+with per-actor counters deferred to a future rate-limiter ADR. A sentence here requiring a
+gate-side bound would therefore assign an obligation to a component whose own contract
+documents non-enforcement, and a requirement without an enforcement seam is not a
+contract. The dependency is stated instead, with its consequence: **deployments that rely
+on record hiddenness against these verbs are out of contract until the rate-limiter ADR
+that ADR-018 promises ships, extended to carry a finite per-caller disclosure quota** —
+principal identity the caller's resolved authorization context as ADR-142 snapshots it;
+one budget shared across this ADR's four disclosure sites rather than four independent
+ones; consumption atomic and completed before admission; the budget a caller-lifetime
+cap — persisted across restarts and never replenished, because a quota that resets leaks
+one bit per epoch indefinitely and is a rate bound wearing a quota's name; exhaustion a
+refusal naming the bound. A rate-only configuration of that successor — including any
+resetting or replenishing quota — slows reconstruction and bounds nothing cumulatively,
+so it does not lift this paragraph's restriction; only the non-resetting lifetime form
+does. Deployments whose delegated-lifecycle
+class sets hide no records from any caller — where all four bits refer to nothing — are
+unaffected and deployable under this ADR as written.
 
 ### 4. Reaching a subtree: kill with descendants
 
@@ -314,6 +486,29 @@ necessarily all of them. The concurrent-spawn arm — a mid-walk descendant spaw
 admission-time set does not contain — is an acceptance fixture for any implementation of
 this ADR.
 
+**Child admission serializes against kill through the child's own insert, and without this
+rule `subtree_terminal: true` is not a fact.** The illegal-transition guard above and the
+re-resolution loop each read state that the other path writes, and two reads at different
+moments prove nothing about the moment between them: a dispatch could pass its parent-liveness
+check while the parent is still live, the cascade could then kill the parent and run its final
+re-resolution before the child row lands, and the insert could commit after the emptiness read
+— a live descendant admitted behind a result that already said the subtree was dead. The rule
+that excludes that interleaving is therefore normative: **spawn admission's parent-liveness
+check and the child-record insert are one atomic action against the same store state that
+lifecycle transitions write through** — a compare-and-insert whose insert commits only if the
+dispatching record is non-terminal at commit time. That gives every child insert a defined
+order against every kill of its parent: an insert that commits before the kill is a row the
+final re-resolution reads (re-resolution runs only after the cascade's kill writes have
+committed), and an insert ordered after the kill fails admission with the illegal-transition
+error. There is no third arm, so a final re-resolution that finds no non-terminal descendant
+has found a fact, and `subtree_terminal: true` is linearizable rather than a race read twice.
+The rule is stated as a store contract — transaction, compare-and-insert, or an equivalent
+fence — not as an implementation choice; a backend that cannot make the check-and-insert
+atomic against lifecycle writes cannot implement this section. The interleaving above —
+a spawn admitted concurrently with the kill of its dispatching record, asserted to either
+appear in the re-resolution or fail admission, never neither — is an acceptance fixture for
+any implementation of this ADR, beside the concurrent-spawn arm above.
+
 **Every one of these operations is bounded in total work, output, and audit volume, and the
 bounds are refusals rather than truncations.** A lineage tree is written by the processes being
 enumerated, so its size is not under the reader's control, and an unbounded traversal is a
@@ -324,7 +519,18 @@ with a published default. Total records visited by a single enumeration or by on
 is capped independently of `limit` by `lineage_visit_limit`, because a walk can visit far more
 records than it returns once filters and authorization are applied; exceeding it is a
 per-operation error naming the bound, never a silently short answer — a truncated-looking
-success here would be indistinguishable from a small tree. (For a cascading kill that has
+success here would be indistinguishable from a small tree. The bound counts structural
+visits, not visible results, and must: the walk's cost is driven by every record it touches,
+so a bound over only what the caller may see would hand a low-visibility caller an unbounded
+walk — the exact exhaustion surface the bound exists to close. That choice has a disclosure
+consequence and this ADR admits it rather than leaving it implicit: whether the refusal
+fires depends on records the caller cannot see, so a caller can learn one threshold bit
+about hidden population size — the same footing as `undisclosed_survivors`, and one of
+the bounded structural-aggregate disclosures enumerated in §3's authorization paragraph,
+which owns their count. The two-population arm — identical visible sets over hidden populations of
+`lineage_visit_limit` and `lineage_visit_limit + 1` structural records, asserted to produce
+empty success and the bound refusal respectively, and asserted to disclose nothing beyond
+that bit — is an acceptance fixture for any implementation of this ADR. (For a cascading kill that has
 already terminated records, this rule is refined below: the error arm applies only while
 nothing has been destroyed.) Cascade passes are capped by
 `cascade_pass_limit`, as §4 already requires, and a cascade that exhausts it returns
@@ -362,11 +568,16 @@ Audit volume follows from these and needs no separate cap: one event per pass pl
 record reached, both already bounded above. What does need saying is that the bounds are
 enforced per operation and not per caller — this ADR does not define a rate limit, and a caller
 issuing many bounded enumerations in a loop remains a matter for the gate rather than for these
-verbs.
+verbs. That assignment carries more than resource cost: §3's disclosure budget composes across
+calls through exactly this loop, so the finite disclosure quota §3 requires before
+hidden-population deployments come into contract is a gate-side mechanism, never one of
+these verbs' — §3 names the ADR-018 successor that must carry it, and until it ships the
+restriction in §3 stands in place of an enforcement claim.
 
 The subtree kill is per-record, not transactional: each record's kill succeeds or fails by
 ADR-142's own rules (an already-`terminal` descendant is a no-op, exactly as in the
-single-record case), and the operation's result enumerates per-record outcomes — killed,
+single-record case) — this concerns the cascade's own writes and does not weaken the
+admission-side atomicity rule above — and the operation's result enumerates per-record outcomes — killed,
 already terminal, or error — rather than collapsing the subtree into one aggregate outcome. A caller
 therefore sees exactly which records the cascade reached, and a partially failed cascade is
 visible as itself, never as a clean kill.
@@ -458,8 +669,9 @@ not something this ADR grants.
   stop or a sweep that intends to reach a subtree has a durable path to it, and
   `descendants=true` makes the reach a single audited operation.
 - Enumeration-without-waking gives operators and coordinators a truthful population view:
-  `agent.list(state="non_terminal")` is the live process table, `complete` says whether the
-  view is whole, and no process is disturbed by being counted.
+  `agent.list(state="non_terminal")` is the process table as of the enumeration's admission
+  horizon, `complete` says whether that view is whole, `as_of` says how old it is, and no
+  process is disturbed by being counted.
 - Per-tree accounting becomes derivable from first-class state: usage accumulated per run
   (ADR-142 parity row 16) can be aggregated over `agent.descendants` without external
   bookkeeping, keeping the agent table the single source of truth for structure as well as
@@ -473,8 +685,12 @@ not something this ADR grants.
   to be discovered.
 - The agent-loop dispatcher must carry the executing record's `agent_id` in its dispatch
   context. Where it carries only `owner_actor` and `owner_peer_class` today, that is a real
-  addition and not a reinterpretation of existing fields; until it lands, agent-issued spawns
-  correctly record no parent rather than a guessed one.
+  addition and not a reinterpretation of existing fields — and it ships as part of
+  implementing this ADR, not ahead of or behind it: a runtime that implements lineage rejects
+  an agent-loop dispatch lacking the record identity (§1) rather than admitting a silently
+  mislabelled root, so there is no interim state in which agent-issued spawns record
+  plausible-looking parentage that is actually absence. Records admitted before the
+  implementation exists are version-1 records, and their lineage reads `unknown` (§1).
 
 ## Alternatives considered
 
