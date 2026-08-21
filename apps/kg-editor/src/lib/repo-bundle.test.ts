@@ -33,6 +33,39 @@ describe("khive.repo.v1 browser contract", () => {
     expect(repoBundleSchema.safeParse(value).success).toBe(false);
   });
 
+  it("rejects disagreement between view and aggregate availability", () => {
+    const value = goldenValue() as {
+      capability: { views: { hidden_coupling: { status: string; unavailable_reason?: string } } };
+    };
+    value.capability.views.hidden_coupling.status = "unavailable";
+    value.capability.views.hidden_coupling.unavailable_reason =
+      "analysis was not produced";
+
+    expect(repoBundleSchema.safeParse(value).success).toBe(false);
+  });
+
+  it("accepts repository ownership when only the module join is unavailable", () => {
+    const value = goldenValue() as {
+      capability: { views: { ownership: { status: string; unavailable_reason?: string } } };
+      aggregates: { ownership: { modules: { items: unknown[]; total_count: unknown; next_cursor?: string | null; truncated: boolean; disclosure: { status: string; reason?: string | null } } } };
+    };
+    value.capability.views.ownership.status = "unavailable";
+    value.capability.views.ownership.unavailable_reason = "module join was not complete";
+    value.aggregates.ownership.modules.items = [];
+    value.aggregates.ownership.modules.total_count = {
+      status: "unavailable",
+      reason: "module join was not complete",
+    };
+    value.aggregates.ownership.modules.next_cursor = null;
+    value.aggregates.ownership.modules.truncated = false;
+    value.aggregates.ownership.modules.disclosure = {
+      status: "unavailable",
+      reason: "module join was not complete",
+    };
+
+    expect(repoBundleSchema.safeParse(value).success).toBe(true);
+  });
+
   it("also validates the golden against the normative JSON Schema", () => {
     const ajv = new Ajv2020({ allErrors: true, strict: false });
     addFormats(ajv);

@@ -1,6 +1,6 @@
 import type { ReviewBundle } from "@/lib/review-bundle";
 
-export const atlasReviewFixture: ReviewBundle = {
+export const demoReviewFixture: ReviewBundle = {
   schema_version: "khive.review.v1",
   review_kind: "pull_request",
   generated_at: "2026-08-07T17:26:00Z",
@@ -17,11 +17,11 @@ export const atlasReviewFixture: ReviewBundle = {
     unavailable_actions: ["apply", "commit", "push", "publish", "persist_review"],
   },
   repository: {
-    owner: "ohdearquant",
-    name: "atlas-kg",
+    owner: "acme-demo",
+    name: "demo-kg",
     visibility: "private",
     default_branch: "main",
-    head_branch: "atlas/enrich/provenance-batch-184",
+    head_branch: "demo/enrich/provenance-batch-184",
     base_sha: "4c82e846d657ade7f2f2567618b9e63e80f42ea6",
     head_sha: "7ea9c6b25e23a64c9b8b602b8a61c5da41f36e1a",
   },
@@ -35,9 +35,9 @@ export const atlasReviewFixture: ReviewBundle = {
   pull_request: {
     number: 184,
     title: "Curate assertion-level provenance and retire the batch-only model",
-    body: "Atlas found that corrections are reviewed per assertion while provenance is currently attached only at batch level. This change preserves batch lineage and adds assertion-level evidence anchors.",
+    body: "Casey found that corrections are reviewed per assertion while provenance is currently attached only at batch level. This change preserves batch lineage and adds assertion-level evidence anchors.",
     state: "open",
-    author: "lambda:atlas",
+    author: "actor:casey",
     created_at: "2026-08-07T17:20:00Z",
     head_sha: "7ea9c6b25e23a64c9b8b602b8a61c5da41f36e1a",
   },
@@ -53,10 +53,10 @@ export const atlasReviewFixture: ReviewBundle = {
   change_set: {
     envelope: {
       schema_version: 1,
-      producer: "lambda:atlas",
-      producer_model_family: "family:atlas-frontier",
+      producer: "actor:casey",
+      producer_model_family: "family:demo-frontier",
       staged_at: 1786123200000000,
-      batch_id: "atlas-enrich-2026-08-07-184",
+      batch_id: "demo-enrich-2026-08-07-184",
     },
     operations: [
       {
@@ -203,12 +203,12 @@ export const atlasReviewFixture: ReviewBundle = {
   ],
   review_gate: {
     required: true,
-    producer_model_family: "family:atlas-frontier",
+    producer_model_family: "family:demo-frontier",
     reviewer_model_family: null,
     eligible: false,
     approval_ready: false,
     status: "awaiting_independent_reviewer",
-    reason: "Select a reviewer outside family:atlas-frontier before approval.",
+    reason: "Select a reviewer outside family:demo-frontier before approval.",
     persisted: false,
   },
   summary: {
@@ -255,7 +255,7 @@ export const atlasReviewFixture: ReviewBundle = {
       id: "review-family",
       label: "Independent reviewer",
       status: "pending",
-      detail: "Select a reviewer outside family:atlas-frontier before approval.",
+      detail: "Select a reviewer outside family:demo-frontier before approval.",
       duration_ms: 0,
     },
     ],
@@ -480,21 +480,21 @@ export const atlasReviewFixture: ReviewBundle = {
     {
       sha: "7ea9c6b25e23a64c9b8b602b8a61c5da41f36e1a",
       subject: "kg: stage assertion-level provenance",
-      author: "lambda:atlas",
+      author: "actor:casey",
       created_at: "2026-08-07T17:20:00Z",
       state: "head",
     },
     {
       sha: "4c82e846d657ade7f2f2567618b9e63e80f42ea6",
       subject: "kg: snapshot after source refresh",
-      author: "lambda:atlas",
+      author: "actor:casey",
       created_at: "2026-08-07T15:08:00Z",
       state: "base",
     },
     {
       sha: "d124b53e0ff383b4aa2d872f0c1e7bd1065f2001",
       subject: "kg: resume the snapshot lane",
-      author: "lambda:khive",
+      author: "khive-bot",
       created_at: "2026-07-28T02:19:00Z",
       state: "ancestor",
     },
@@ -506,9 +506,9 @@ export const atlasReviewFixture: ReviewBundle = {
     items: [
     {
       id: "activity-1",
-      actor: "lambda:atlas",
+      actor: "actor:casey",
       action: "opened this review",
-      body: "Seven staged operations from atlas-enrich-2026-08-07-184. Four route to tier 2.",
+      body: "Seven staged operations from demo-enrich-2026-08-07-184. Four route to tier 2.",
       created_at: "2026-08-07T17:20:00Z",
       tone: "neutral",
     },
@@ -522,7 +522,7 @@ export const atlasReviewFixture: ReviewBundle = {
     },
     {
       id: "activity-3",
-      actor: "lambda:reviewer",
+      actor: "actor:robin",
       action: "left a review note",
       body: "Keep the historical batch model visible; supersession should affect the current view, not erase lineage.",
       created_at: "2026-08-07T17:24:00Z",
@@ -566,7 +566,7 @@ export const atlasReviewFixture: ReviewBundle = {
         id: "436254d4",
         score: 0.853,
         memory_type: "semantic",
-        content: "Build the KG editor local-first with Atlas as the driving committer and make growth reviewable, diffable, and revertible.",
+        content: "Build the KG editor local-first with the curator persona as the driving committer and make growth reviewable, diffable, and revertible.",
       },
       {
         id: "b07f238e",

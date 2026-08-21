@@ -6,7 +6,7 @@ import { z } from "zod";
 import { buildReviewJsonSchema } from "../../scripts/review-json-schema.mjs";
 import reviewSchema from "../../../../docs/schemas/khive-review-v1.schema.json";
 import changesetGolden from "../../../../docs/schemas/examples/khive-review-v1-changeset.json";
-import { atlasReviewFixture } from "@/lib/fixtures/atlas-review";
+import { demoReviewFixture } from "@/lib/fixtures/demo-review";
 import { parseReviewInput, reviewInputSchema } from "@/lib/review-bundle";
 
 describe("normative khive.review.v1 JSON Schema", () => {
@@ -19,7 +19,7 @@ describe("normative khive.review.v1 JSON Schema", () => {
   });
 
   it("accepts the bounded pull-request fixture", () => {
-    expect(validate(atlasReviewFixture), JSON.stringify(validate.errors)).toBe(true);
+    expect(validate(demoReviewFixture), JSON.stringify(validate.errors)).toBe(true);
   });
 
   it("accepts the exact Rust-produced shared changeset golden", () => {
@@ -40,16 +40,16 @@ describe("normative khive.review.v1 JSON Schema", () => {
     expect(() => parseReviewInput(inventedNested)).toThrow();
 
     const missingLabel = {
-      ...atlasReviewFixture,
-      capability: { ...atlasReviewFixture.capability, label: undefined },
+      ...demoReviewFixture,
+      capability: { ...demoReviewFixture.capability, label: undefined },
     };
     expect(validate(missingLabel)).toBe(false);
     expect(() => parseReviewInput(missingLabel)).toThrow();
 
     const unratifiedVerifiedHash = {
-      ...atlasReviewFixture,
+      ...demoReviewFixture,
       snapshot_identity: {
-        ...atlasReviewFixture.snapshot_identity,
+        ...demoReviewFixture.snapshot_identity,
         hash_status: "verified",
       },
     };
@@ -57,9 +57,9 @@ describe("normative khive.review.v1 JSON Schema", () => {
     expect(() => parseReviewInput(unratifiedVerifiedHash)).toThrow();
 
     const unavailableWithHashes = {
-      ...atlasReviewFixture,
+      ...demoReviewFixture,
       snapshot_identity: {
-        ...atlasReviewFixture.snapshot_identity,
+        ...demoReviewFixture.snapshot_identity,
         hash_status: "unavailable",
       },
     };
@@ -69,10 +69,10 @@ describe("normative khive.review.v1 JSON Schema", () => {
 
   it("maps current-algorithm output to an unavailable identity with null hashes (ADR-145 D4)", () => {
     const unratifiedProducerIdentity = {
-      ...atlasReviewFixture,
-      capability: { ...atlasReviewFixture.capability, source: "import" },
+      ...demoReviewFixture,
+      capability: { ...demoReviewFixture.capability, source: "import" },
       snapshot_identity: {
-        ...atlasReviewFixture.snapshot_identity,
+        ...demoReviewFixture.snapshot_identity,
         hash_status: "unavailable",
         algorithm: null,
         base_hash: null,
@@ -83,9 +83,9 @@ describe("normative khive.review.v1 JSON Schema", () => {
     expect(() => parseReviewInput(unratifiedProducerIdentity)).not.toThrow();
 
     for (const carried of [
-      { algorithm: atlasReviewFixture.snapshot_identity.algorithm },
-      { base_hash: atlasReviewFixture.snapshot_identity.base_hash },
-      { head_hash: atlasReviewFixture.snapshot_identity.head_hash },
+      { algorithm: demoReviewFixture.snapshot_identity.algorithm },
+      { base_hash: demoReviewFixture.snapshot_identity.base_hash },
+      { head_hash: demoReviewFixture.snapshot_identity.head_hash },
     ]) {
       const unavailableCarryingValue = {
         ...unratifiedProducerIdentity,

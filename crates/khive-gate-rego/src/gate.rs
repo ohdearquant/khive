@@ -159,19 +159,22 @@ impl Gate for RegoGate {
             engine.eval_rule(self.entrypoint.clone())
         };
 
-        // Gate errors are dispatcher-fail-open; policy evaluation uncertainty must deny.
+        // Keep policy evaluation uncertainty distinguishable from a gate infrastructure outage,
+        // per the accepted policy contract (docs/api/policy-contract.md): both branches below
+        // fail closed via `Ok(GateDecision::Deny)`, never `Err`. The evaluator's error detail
+        // is deliberately dropped rather than folded into the deny reason or the tracing call —
+        // this crate depends only on `khive-gate` and cannot reach the runtime's log masker, so
+        // any raw evaluator text here would cross both the wire and the log unmasked. Operators
+        // who need the detail reproduce the failing policy/input locally. The two reasons stay
+        // textually distinct so the two failure modes remain distinguishable to a caller.
         let value = match result {
             Ok(v) => v,
-            Err(e) => {
+            Err(_) => {
                 tracing::warn!(
                     entrypoint = %self.entrypoint,
-                    error = %e,
                     "rego eval failed — denying (fail-closed)"
                 );
-                return Ok(GateDecision::deny(format!(
-                    "policy evaluation failed for {}: {e}",
-                    self.entrypoint
-                )));
+                return Ok(GateDecision::deny("policy evaluation failed"));
             }
         };
 
@@ -183,18 +186,18 @@ impl Gate for RegoGate {
             )));
         }
 
+        // Same rationale as the evaluator-failure branch above: no raw error text in the
+        // tracing call or the deny reason.
         let decision_json = match value.to_json_str() {
             Ok(s) => s,
-            Err(e) => {
+            Err(_) => {
                 tracing::warn!(
                     entrypoint = %self.entrypoint,
-                    error = %e,
                     "decision value failed to serialize — denying (fail-closed)"
                 );
-                return Ok(GateDecision::deny(format!(
-                    "policy rule {} produced unserializable value: {e}",
-                    self.entrypoint
-                )));
+                return Ok(GateDecision::deny(
+                    "policy produced an unserializable decision",
+                ));
             }
         };
 
@@ -314,21 +317,30 @@ mod tests {
             }),
         );
 
-        let decision = gate.check(&req).expect("check must not Err (fail-closed)");
+        // `default decision := input.args` is rejected by regorus at eval time
+        // ("invalid ref in default value"), not policy-authored deny — this is
+        // the evaluator-failure path and fails closed via `Ok(GateDecision::Deny)`
+        // carrying a static classified reason, never the evaluator's raw error
+        // text or the caller-supplied input it echoes.
+        let decision = gate
+            .check(&req)
+            .expect("evaluator failure must be Ok(Deny) (fail-closed)");
         let reason = match decision {
             GateDecision::Deny { reason } => reason,
-            GateDecision::Allow { .. } => {
-                panic!("wrong-shaped policy result must deny, not allow")
-            }
+            GateDecision::Allow { .. } => panic!("evaluator failure must deny, not allow"),
         };
 
         assert!(
             !reason.contains(fake_key),
-            "Deny reason must never echo the caller-supplied secret; got: {reason}"
+            "deny reason must never echo the caller-supplied secret; got: {reason}"
         );
         assert!(
             !reason.contains("api_key"),
-            "Deny reason must never echo caller-supplied field names either; got: {reason}"
+            "deny reason must never echo caller-supplied field names either; got: {reason}"
+        );
+        assert_eq!(
+            reason, "policy evaluation failed",
+            "evaluator failure must classify with the static evaluator-failure reason"
         );
     }
 
@@ -420,6 +432,56 @@ mod tests {
         assert!(
             !log_output.contains("api_key"),
             "tracing output must never contain caller-supplied field names either; got: {log_output}"
+        );
+    }
+
+    // ---- distinguishability: evaluator failure vs decision-serialization
+    // failure must classify into different static deny reasons ----
+
+    #[test]
+    fn evaluator_failure_and_serialization_failure_classify_differently() {
+        let evaluator_failure_policy = r#"
+            package khive.gate
+            import rego.v1
+            default decision := input.args
+        "#;
+        let evaluator_failure_gate =
+            RegoGate::from_policy_str(evaluator_failure_policy).expect("policy compiles");
+        let evaluator_decision = evaluator_failure_gate
+            .check(&request("search"))
+            .expect("evaluator failure must be Ok(Deny) (fail-closed)");
+        let evaluator_reason = match evaluator_decision {
+            GateDecision::Deny { reason } => reason,
+            GateDecision::Allow { .. } => panic!("evaluator failure must deny, not allow"),
+        };
+
+        // A float product large enough that regorus's arbitrary-precision
+        // number can no longer be reformatted into a JSON-parseable literal —
+        // forces the decision-serialization branch without needing the
+        // evaluator itself to fail.
+        let serialization_failure_policy = r#"
+            package khive.gate
+            import rego.v1
+            decision := 1.0e300 * 1.0e300
+        "#;
+        let serialization_failure_gate =
+            RegoGate::from_policy_str(serialization_failure_policy).expect("policy compiles");
+        let serialization_decision = serialization_failure_gate
+            .check(&request("search"))
+            .expect("unserializable decision value must be Ok(Deny) (fail-closed)");
+        let serialization_reason = match serialization_decision {
+            GateDecision::Deny { reason } => reason,
+            GateDecision::Allow { .. } => panic!("unserializable decision must deny, not allow"),
+        };
+
+        assert_eq!(evaluator_reason, "policy evaluation failed");
+        assert_eq!(
+            serialization_reason,
+            "policy produced an unserializable decision"
+        );
+        assert_ne!(
+            evaluator_reason, serialization_reason,
+            "evaluator failure must stay distinguishable from a decision-serialization failure"
         );
     }
 }

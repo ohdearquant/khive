@@ -93,6 +93,9 @@ impl KnowledgeHandlers {
             if let Some(ref props) = atom_in.properties {
                 khive_runtime::secret_gate::check_json(props)?;
             }
+            khive_runtime::secret_gate::reject_reserved_secret_gate_property(
+                atom_in.properties.as_ref(),
+            )?;
             if let Some(ref uri) = atom_in.source_uri {
                 khive_runtime::secret_gate::check(uri)?;
             }
@@ -283,6 +286,9 @@ impl KnowledgeHandlers {
                 Some(m) => serde_json::to_string(m).unwrap_or_else(|_| "[]".into()),
                 None => "[]".to_string(),
             };
+            // The mirror's properties are synthesized entirely from `members`
+            // (a `Vec<String>`, no arbitrary-key input); `DomainInput` carries no
+            // `properties` field, so the top-level reserved key is unreachable here.
             let properties_json = serde_json::to_string(
                 &serde_json::json!({ "members": domain_in.members.as_deref().unwrap_or(&[]) }),
             )

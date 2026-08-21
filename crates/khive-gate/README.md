@@ -40,10 +40,12 @@ are both non-zero.
 - `GateDecision::Allow { obligations }` carries zero or more `Obligation` values
   (`Audit`, `RateLimit`, `Custom`) the runtime records on dispatch. `GateDecision::Deny
   { reason }` aborts dispatch — deny is authoritative and requires a non-empty reason.
-- `AuditEvent::from_check` builds the structured audit record (`actor`, `namespace`,
-  `verb`, `decision`, `obligations`, `gate_impl`, `session_id`) emitted once per gate
-  consultation. Its JSON projection is a stable public contract — field names don't
-  change without a new ADR.
+- `AuditEvent::from_check` builds the structured audit record for an explicit Allow or
+  Deny decision. `AuditEvent::gate_unavailable` builds the corresponding record when
+  `Gate::check` returns `GateError`; the runtime refuses dispatch without invoking the
+  operation. Both carry `actor`, `namespace`, `verb`, `decision`, `obligations`,
+  `gate_impl`, and `session_id`. Their JSON projection is a stable public contract —
+  field names don't change without a new ADR.
 - All wire types (`ActorRef`, `GateRequest`, `GateDecision`, `Obligation`) validate
   their invariants both at construction (`try_new` / `try_*` constructors) and at
   deserialization (custom `Deserialize` via a private `TryFrom<Raw*>` shape), so a

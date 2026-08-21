@@ -707,13 +707,14 @@ fn spawn_daemon() -> std::io::Result<std::process::Child> {
 }
 
 fn spawn_daemon_with_exe(exe: &std::path::Path) -> std::io::Result<std::process::Child> {
-    spawn_daemon_with_exe_and_config(exe, None, None)
+    spawn_daemon_with_exe_and_config(exe, None, None, None)
 }
 
 fn spawn_daemon_with_exe_and_config(
     exe: &std::path::Path,
     config: Option<&std::path::Path>,
     db: Option<&str>,
+    packs: Option<&[String]>,
 ) -> std::io::Result<std::process::Child> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -747,6 +748,20 @@ fn spawn_daemon_with_exe_and_config(
     //   fingerprint from the normalized frame.
     if let Some(db) = db {
         cmd.arg("--db").arg(db);
+    }
+    // Forward the spawning client's already-resolved pack set explicitly
+    // rather than relying on ambient `KHIVE_PACKS` env inheritance: the
+    // client may have resolved packs from a CLI `--pack` flag or a
+    // discovered `[runtime].packs` config entry, neither of which travels
+    // through `Command::new`'s default env inheritance. Without this, a
+    // freshly spawned daemon falls back to the built-in default pack set,
+    // its `config_id` fingerprint disagrees with every caller expecting the
+    // wider set, and those callers permanently fall back to in-process
+    // dispatch instead of the warm daemon (khive-oss#1941).
+    if let Some(packs) = packs {
+        for pack in packs {
+            cmd.arg("--pack").arg(pack);
+        }
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::null());
     // The daemon's tracing (including WAL/checkpoint telemetry) goes to
@@ -2052,16 +2067,99 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
 /// --daemon` against automatic discovery and immediately disagree with the
 /// request it was spawned to serve, and `kkernel exec --db :memory:` would
 /// bind the fresh daemon to the config's declared persistent files.
+///
+/// `packs`, when given, is the caller's already-resolved pack list (whatever
+/// mix of CLI `--pack`, `KHIVE_PACKS`, or config-file `[runtime].packs`
+/// produced it) forwarded verbatim as explicit `--pack` args on the spawned
+/// daemon — see the doc comment on `spawn_daemon_with_exe_and_config`.
+pub async fn forward_or_spawn_with_config_and_packs(
+    frame: &DaemonRequestFrame,
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+    packs: Option<&[String]>,
+) -> Option<Result<String, McpError>> {
+    #[cfg(any(test, feature = "test-forward-seam"))]
+    if let Some(intercepted) = test_forward_seam::intercept(packs) {
+        return intercepted;
+    }
+    let spawn = || {
+        let exe = std::env::current_exe()?;
+        spawn_daemon_with_exe_and_config(&exe, config, db, packs)
+    };
+    forward_or_spawn_with(frame, &spawn).await
+}
+
+/// Forward a request, spawning the daemon if needed, without an explicit
+/// pack list: the spawned daemon falls back to its own pack resolution
+/// (config-file `[runtime].packs` or the built-in default set), exactly as
+/// it did before pack forwarding existed.
+///
+/// Thin compatibility wrapper over
+/// [`forward_or_spawn_with_config_and_packs`] preserving the pre-existing
+/// three-argument public signature, so external callers of the published
+/// crate keep compiling unchanged.
 pub async fn forward_or_spawn_with_config(
     frame: &DaemonRequestFrame,
     config: Option<&std::path::Path>,
     db: Option<&str>,
 ) -> Option<Result<String, McpError>> {
-    let spawn = || {
-        let exe = std::env::current_exe()?;
-        spawn_daemon_with_exe_and_config(&exe, config, db)
-    };
-    forward_or_spawn_with(frame, &spawn).await
+    forward_or_spawn_with_config_and_packs(frame, config, db, None).await
+}
+
+/// Test-only capture hook armed at the real entry of
+/// `forward_or_spawn_with_config_and_packs` — the actual adapter-boundary conversion
+/// site (`packs.as_deref()` at each production call site) production code
+/// runs through, as opposed to a `ForwardFnPtr` spy that stands in for the
+/// whole adapter and never executes its conversion. Unarmed, `intercept`
+/// costs one thread-local read and returns `None` immediately: the
+/// production path is byte-for-byte unaffected.
+///
+/// Gated by `cfg(any(test, feature = "test-forward-seam"))` so both the
+/// in-crate `khive-mcp` test suite (plain `cfg(test)`) and a cross-crate
+/// `kkernel` test (which cannot see `khive-mcp`'s `cfg(test)` items, so it
+/// enables the `test-forward-seam` feature via a `[dev-dependencies]`
+/// re-declaration instead) can reach it.
+#[cfg(any(test, feature = "test-forward-seam"))]
+pub mod test_forward_seam {
+    use super::McpError;
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static CAPTURED: std::cell::RefCell<Option<Option<Vec<String>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Arm the one-shot hook. The next call into
+    /// `forward_or_spawn_with_config_and_packs` on this thread records its `packs`
+    /// argument and returns a canned success without touching a socket or
+    /// spawning a process; the hook then disarms itself.
+    pub fn arm() {
+        CAPTURED.with(|c| *c.borrow_mut() = None);
+        ARMED.with(|a| a.set(true));
+    }
+
+    /// Take the captured `packs` argument from the most recent armed call,
+    /// if any, and disarm the hook. Disarming here means a hook armed for a
+    /// call that never reached `intercept` cannot survive to intercept a
+    /// later, unrelated call on the same thread.
+    pub fn take_captured() -> Option<Option<Vec<String>>> {
+        ARMED.with(|a| a.set(false));
+        CAPTURED.with(|c| c.borrow_mut().take())
+    }
+
+    pub(super) fn intercept(packs: Option<&[String]>) -> Option<Option<Result<String, McpError>>> {
+        let was_armed = ARMED.with(|a| a.replace(false));
+        if !was_armed {
+            return None;
+        }
+        CAPTURED.with(|c| *c.borrow_mut() = Some(packs.map(<[String]>::to_vec)));
+        Some(Some(Ok(serde_json::json!({
+            "results": [{"ok": true, "tool": "stats", "result": {}}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0},
+        })
+        .to_string())))
+    }
 }
 
 #[cfg(test)]
@@ -3187,7 +3285,7 @@ mod tests {
         path
     }
 
-    /// The config path threaded through `forward_or_spawn_with_config` must
+    /// The config path threaded through `forward_or_spawn_with_config_and_packs` must
     /// actually appear on the spawned daemon's command line; a script
     /// fixture records its argv so the assertion observes the real child
     /// invocation (`crates/kkernel/src/exec.rs`'s spy seam proves the exec
@@ -3203,7 +3301,7 @@ mod tests {
         );
 
         let config_path = dir.path().join("selected.toml");
-        let mut child = spawn_daemon_with_exe_and_config(&exe, Some(&config_path), None)
+        let mut child = spawn_daemon_with_exe_and_config(&exe, Some(&config_path), None, None)
             .expect("spawn argv-recording fixture");
         let status = child.wait().expect("wait for argv-recording fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
@@ -3213,6 +3311,62 @@ mod tests {
             recorded.trim_end(),
             format!("mcp --daemon --config {}", config_path.display()),
             "the explicit config selection must reach the daemon command line"
+        );
+    }
+
+    /// The pack list threaded through `forward_or_spawn_with_config_and_packs` must
+    /// reach the spawned daemon's command line as explicit `--pack` flags —
+    /// the fix for the auto-spawn dropping a client's resolved `KHIVE_PACKS`
+    /// (or `--pack`-flag, or config-file `[runtime].packs`) selection when it
+    /// spawns a fresh daemon (khive-oss#1941).
+    #[test]
+    fn spawn_daemon_with_exe_and_config_appends_pack_flags_to_command_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("argv.txt");
+        let exe = daemon_script_fixture(
+            &dir,
+            "record-argv.sh",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
+        );
+
+        let packs = vec!["kg".to_string(), "gtd".to_string(), "formal".to_string()];
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None, Some(&packs))
+            .expect("spawn argv-recording fixture");
+        let status = child.wait().expect("wait for argv-recording fixture");
+        assert!(status.success(), "fixture must exit 0: {status}");
+
+        let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
+        assert_eq!(
+            recorded.trim_end(),
+            "mcp --daemon --pack kg --pack gtd --pack formal",
+            "the caller's resolved pack set must reach the daemon command line as --pack flags"
+        );
+    }
+
+    /// A `None` pack list (the default, backward-compatible shape used by
+    /// bare `forward_or_spawn`/`spawn_daemon`) must append no `--pack` flags
+    /// at all — the spawned daemon falls through to its own env/config
+    /// resolution exactly as before this fix.
+    #[test]
+    fn spawn_daemon_with_exe_and_config_omits_pack_flags_when_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("argv.txt");
+        let exe = daemon_script_fixture(
+            &dir,
+            "record-argv.sh",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
+        );
+
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None, None)
+            .expect("spawn argv-recording fixture");
+        let status = child.wait().expect("wait for argv-recording fixture");
+        assert!(status.success(), "fixture must exit 0: {status}");
+
+        let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
+        assert_eq!(
+            recorded.trim_end(),
+            "mcp --daemon",
+            "no packs supplied must mean no --pack flags on the daemon command line"
         );
     }
 
@@ -3232,7 +3386,7 @@ mod tests {
 
         let config_path = dir.path().join("selected.toml");
         let mut child =
-            spawn_daemon_with_exe_and_config(&exe, Some(&config_path), Some(":memory:"))
+            spawn_daemon_with_exe_and_config(&exe, Some(&config_path), Some(":memory:"), None)
                 .expect("spawn argv-recording fixture");
         let status = child.wait().expect("wait for argv-recording fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
@@ -3269,7 +3423,7 @@ mod tests {
             &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
         );
 
-        let mut child = spawn_daemon_with_exe_and_config(&exe, None, Some("/tmp/main.db"))
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, Some("/tmp/main.db"), None)
             .expect("spawn argv-recording fixture");
         let status = child.wait().expect("wait for argv-recording fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
@@ -3299,7 +3453,7 @@ mod tests {
             drop(writer);
         });
 
-        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None)
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None, None)
             .expect("transient ETXTBSY must be retried");
         release.join().expect("fixture writer release thread");
         let status = child.wait().expect("wait for executable fixture");

@@ -79,7 +79,7 @@ const viewLabels: Record<View, string> = {
 };
 
 const reviewerFamilies = [
-  "family:atlas-frontier",
+  "family:demo-frontier",
   "family:independent-reasoner",
   "family:human-curator",
 ];

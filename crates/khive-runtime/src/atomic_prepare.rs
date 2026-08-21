@@ -472,6 +472,7 @@ pub async fn prepare_add_entity(
         crate::secret_gate::check_json(p)?;
     }
     crate::secret_gate::check_tags(&tags)?;
+    crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
     let ns = token.namespace().as_str();
     let mut entity = khive_storage::Entity::new(ns, kind, name);
@@ -535,6 +536,7 @@ pub async fn prepare_add_note(
     if let Some(ref p) = properties {
         crate::secret_gate::check_json(p)?;
     }
+    crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
     let ns = token.namespace().as_str();
     let mut note = khive_storage::note::Note::new(ns, kind, content);
@@ -937,6 +939,7 @@ async fn prepare_update_edge(
     if let Some(ref p) = properties {
         crate::secret_gate::check_json(p)?;
     }
+    crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
     let namespace = edge.namespace.clone();
     let record_tok = NamespaceToken::for_namespace(
@@ -3187,6 +3190,55 @@ mod tests {
         );
     }
 
+    /// ADR-115 Amendment 1 §3: the reserved `khive:secret_gate` property key
+    /// must be rejected on atomic edge-metadata updates the same way it is
+    /// on canonical `update_edge`.
+    #[tokio::test]
+    async fn atomic_update_edge_rejects_reserved_secret_gate_property() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "ReservedEdgeA");
+        let b = khive_storage::Entity::new("local", "concept", "ReservedEdgeB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        let edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.4, None)
+            .await
+            .expect("seed edge");
+        let edge_id = Uuid::from(edge.id);
+
+        let err = prepare_update(
+            &runtime,
+            &token,
+            &json!({
+                "id": edge_id.to_string(),
+                "properties": {"khive:secret_gate": "exempted:content-sha256-manifest-v1"},
+            }),
+            None,
+        )
+        .await
+        .expect_err("a caller-supplied reserved key on edge metadata must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
+            "expected a reservation rejection, got: {err:?}"
+        );
+
+        let unchanged = runtime
+            .get_edge(&token, edge_id)
+            .await
+            .expect("get_edge")
+            .expect("edge still present");
+        assert!(
+            unchanged.metadata.is_none(),
+            "rejected edge update must leave metadata untouched"
+        );
+    }
+
     /// The symmetric-relation conflict-absorption branch of
     /// `prepare_update_edge` — mirrors `update_edge_symmetric_dml`'s case
     /// (b): changing a non-symmetric edge's `relation` to a symmetric one
@@ -3741,6 +3793,60 @@ mod tests {
             err,
             RuntimeError::InvalidInput(message) if message.contains("name must be a string or null")
         ));
+    }
+
+    /// ADR-115 Amendment 1 §3: proposal materialization (`prepare_add_entity`)
+    /// must reject the reserved `khive:secret_gate` property key the same way
+    /// canonical `create` does — proposal apply is reservation-only, never an
+    /// exemption-consuming path.
+    #[tokio::test]
+    async fn prepare_add_entity_rejects_reserved_secret_gate_property() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_add_entity(
+            &runtime,
+            &token,
+            &json!({
+                "kind": "concept",
+                "name": "ReservedKeyEntity",
+                "properties": {"khive:secret_gate": "exempted:content-sha256-manifest-v1"},
+            }),
+        )
+        .await
+        .expect_err("a caller-supplied reserved key on a new entity must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
+            "expected a reservation rejection, got: {err:?}"
+        );
+    }
+
+    /// Note-substrate counterpart of
+    /// `prepare_add_entity_rejects_reserved_secret_gate_property`.
+    #[tokio::test]
+    async fn prepare_add_note_rejects_reserved_secret_gate_property() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_add_note(
+            &runtime,
+            &token,
+            &json!({
+                "kind": "observation",
+                "content": "a note carrying a reserved property key",
+                "properties": {"khive:secret_gate": "exempted:content-sha256-manifest-v1"},
+            }),
+        )
+        .await
+        .expect_err("a caller-supplied reserved key on a new note must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
+            "expected a reservation rejection, got: {err:?}"
+        );
     }
 
     #[tokio::test]

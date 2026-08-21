@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
@@ -20,6 +20,246 @@ function exactish(value: string): RegExp {
 }
 
 describe("repository showcase", () => {
+  it("answers repository triage questions before exposing the raw analysis views", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    const triage = screen.getByRole("region", { name: "Repository triage" });
+    expect(within(triage).getByRole("heading", { name: "What deserves attention?" })).toBeVisible();
+    expect(container.querySelector('[data-repository-metric="modules"]')).toHaveTextContent(`${bundle.graph.modules.items.length}`);
+    expect(container.querySelector('[data-repository-metric="modules"]')).toHaveTextContent(/complete/i);
+    expect(container.querySelector('[data-repository-metric="commits"]')).toHaveTextContent(`${bundle.graph.commits.items.length}`);
+    expect(within(triage).getByText("Observed", { selector: "span" })).toBeVisible();
+    expect(within(triage).getAllByText("Candidate", { selector: "span" }).length).toBeGreaterThan(0);
+    expect(container.querySelector('[data-signal-kind="hidden_coupling"]')).toHaveTextContent(/truncated/i);
+
+    const firstStart = within(triage).getAllByRole("button", { name: /inspect .*\.rs/i })[0];
+    await user.click(firstStart);
+    const inspector = within(triage).getByRole("complementary", { name: "Module evidence" });
+    expect(within(inspector).getByText("Analysis window")).toBeVisible();
+    expect(within(inspector).getByRole("heading", { name: bundle.capability.labels.metrics.commits })).toBeVisible();
+
+    await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "pool.rs");
+    const poolResult = within(triage).getByRole("button", { name: /inspect .*pool\.rs/i });
+    await user.click(poolResult);
+    expect(within(inspector).getByRole("heading", { level: 3 }).textContent).toContain("pool.rs");
+
+    await user.click(within(triage).getAllByRole("button", { name: /open full analysis/i })[0]);
+    expect(screen.getByRole("button", { name: bundle.capability.views.hotspot_quadrant.label })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("navigation", { name: bundle.capability.labels.product })).toBeVisible();
+  });
+
+  it("keeps module search bounded and gives an empty result one recovery action", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "definitely-not-a-module");
+
+    const empty = triage.querySelector<HTMLElement>('[data-state="empty"]')!;
+    expect(empty).toBeVisible();
+    expect(empty.querySelectorAll("button")).toHaveLength(1);
+    expect(within(triage).getAllByRole("button", { name: "Clear search" })).toHaveLength(1);
+    await user.click(within(empty).getByRole("button", { name: "Clear search" }));
+    expect(within(triage).getByRole("searchbox", { name: "Find a module or path" })).toHaveValue("");
+  });
+
+  it("moves focus and scroll position to the analysis selected from triage", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    await user.click(within(triage).getAllByRole("button", { name: /open full analysis/i })[0]);
+
+    const dashboard = container.querySelector<HTMLElement>("[data-repository-dashboard]")!;
+    await waitFor(() => expect(dashboard).toHaveFocus());
+    expect(scrollIntoView).toHaveBeenCalledOnce();
+  });
+
+  it("renders an unavailable top-level metric as unavailable text, not a fabricated zero", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.dependency_topology.meta.status = "unavailable";
+    bundle.aggregates.dependency_topology.meta.unavailable_reason = "topology analysis was not produced";
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const cyclesMetric = container.querySelector<HTMLElement>('[data-repository-metric="cycles"]')!;
+
+    expect(cyclesMetric).toHaveTextContent(bundle.capability.labels.unavailable);
+    expect(cyclesMetric.querySelector("strong")).not.toHaveTextContent(/^0$/);
+  });
+
+  it("marks the combined attention metric truncated (not complete) when one attention analysis is truncated", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.hotspot_quadrant.data.items = bundle.aggregates.hotspot_quadrant.data.items.slice(0, 1);
+    bundle.aggregates.hotspot_quadrant.data.total_count = { status: "available", value: 99 };
+    bundle.aggregates.hotspot_quadrant.data.truncated = true;
+    bundle.aggregates.hotspot_quadrant.data.disclosure = {
+      status: "truncated",
+      reason: "hotspot export was capped",
+    };
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    expect(within(triage).getAllByText(/hotspot export was capped/i).length).toBeGreaterThan(0);
+    expect(triage.querySelector('[data-state="unavailable"]')).not.toBeInTheDocument();
+  });
+
+  it("discloses when a bounded module search hides matches beyond its cap", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={golden()} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "e");
+
+    const state = triage.querySelector<HTMLElement>('[data-state="truncated"][data-bound="8"]');
+    expect(state).toBeVisible();
+    expect(within(triage).getByText(/8 of \d+ captured matches/)).toBeVisible();
+  });
+
+  it("distinguishes unavailable recommendation analyses from measured empty", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.api_surface.meta.status = "unavailable";
+    bundle.aggregates.api_surface.meta.unavailable_reason = "API ranking was not produced";
+    for (const analysis of [bundle.aggregates.hotspot_quadrant, bundle.aggregates.dependency_topology, bundle.aggregates.hidden_coupling, bundle.aggregates.ownership]) {
+      analysis.meta.status = "unavailable";
+      analysis.meta.unavailable_reason = "attention analysis was not produced";
+    }
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    expect(within(triage).getByText("API ranking was not produced")).toBeVisible();
+    expect(within(triage).getAllByText(/attention analysis was not produced/i).length).toBeGreaterThan(0);
+    expect(triage.querySelectorAll('[data-state="unavailable"]').length).toBeGreaterThanOrEqual(2);
+    expect(triage).not.toHaveTextContent(/No captured module has a non-zero/i);
+  });
+
+  it("navigates inspector relationships and discloses cycles and history bounds", async () => {
+    const bundle = golden();
+    const cycle = bundle.aggregates.dependency_topology.cycles.items.find((candidate) => candidate.module_ids.length > 1)!;
+    const selected = bundle.graph.modules.items.find((module) => module.id === cycle.module_ids[0])!;
+    const peer = bundle.graph.modules.items.find((module) => module.id === cycle.module_ids[1])!;
+    const history = bundle.graph.history_navigation.by_module.items.find((row) => row.module_id === selected.id)!.commits;
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+
+    await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), selected.source_path);
+    await user.click(within(triage).getByRole("button", { name: `Inspect ${selected.source_path}` }));
+
+    const inspector = within(triage).getByRole("complementary", { name: "Module evidence" });
+    await waitFor(() => expect(inspector).toHaveFocus());
+    expect(scrollIntoView).toHaveBeenCalled();
+    expect(within(inspector).getByText(cycle.id)).toBeVisible();
+    expect(within(inspector).getByText("Not classified in this snapshot")).toBeVisible();
+    const historyMetric = inspector.querySelector<HTMLElement>('[data-inspector-metric="commits"]')!;
+    expect(historyMetric).toHaveTextContent(String(history.total_count.status === "available" ? history.total_count.value : history.items.length));
+    expect(inspector).toHaveTextContent(/inspector sampled/i);
+
+    const cycleSection = within(inspector).getByText(cycle.id).closest("section")!;
+    await user.click(within(cycleSection).getByRole("button", { name: peer.source_path }));
+    expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(peer.source_path);
+  });
+
+  it("renders strongly connected components as membership, not a directed path", async () => {
+    const bundle = golden();
+    const cycle = bundle.aggregates.dependency_topology.cycles.items[0];
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(screen.getByRole("button", { name: bundle.capability.views.dependency_topology.label }));
+
+    const cycleRow = screen.getByText(cycle.id).closest(".repo-list-row")!;
+    expect(cycleRow).toHaveTextContent("SCC members:");
+    expect(cycleRow).not.toHaveTextContent("→");
+    expect(container.querySelector("[data-repository-dashboard]")).toBeVisible();
+  });
+
+  it("renders missing module history as unavailable rather than zero", () => {
+    const bundle = structuredClone(golden());
+    const target = [...bundle.aggregates.api_surface.data.items].sort((left, right) => right.dependent_count - left.dependent_count)[0];
+    bundle.graph.history_navigation.by_module.items = bundle.graph.history_navigation.by_module.items.filter((row) => row.module_id !== target.module_id);
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>("[data-module-inspector]")!;
+    const commitMetric = inspector.querySelector<HTMLElement>('[data-inspector-metric="commits"]')!;
+
+    expect(commitMetric).toHaveTextContent(bundle.capability.labels.unavailable);
+    expect(commitMetric).not.toHaveTextContent(/^0$/);
+    expect(inspector).toHaveTextContent("No module history-navigation row was captured.");
+  });
+
+  it("reports truncated (not unavailable) history when a module's row is missing from a truncated by-module page", () => {
+    const bundle = structuredClone(golden());
+    const target = [...bundle.aggregates.api_surface.data.items].sort((left, right) => right.dependent_count - left.dependent_count)[0];
+    bundle.graph.history_navigation.by_module.items = bundle.graph.history_navigation.by_module.items.filter((row) => row.module_id !== target.module_id);
+    bundle.graph.history_navigation.by_module.truncated = true;
+    bundle.graph.history_navigation.by_module.disclosure = {
+      status: "truncated",
+      reason: "by-module history export was capped",
+    };
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>("[data-module-inspector]")!;
+    const commitMetric = inspector.querySelector<HTMLElement>('[data-inspector-metric="commits"]')!;
+    const coverage = within(inspector)
+      .getByText(`${bundle.capability.labels.metrics.commits} coverage`)
+      .closest('[data-state="truncated"]') as HTMLElement;
+
+    expect(commitMetric).not.toHaveTextContent(/^0$/);
+    expect(commitMetric).not.toHaveTextContent(bundle.capability.labels.unavailable);
+    expect(commitMetric).toHaveTextContent(/0 shown/i);
+    expect(coverage).toBeVisible();
+    expect(coverage).toHaveTextContent(/by-module history export was capped/i);
+    expect(inspector).not.toHaveTextContent("No module history-navigation row was captured.");
+  });
+
+  it("renders unavailable topology metrics as unavailable rather than zero", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.dependency_topology.meta.status = "unavailable";
+    bundle.aggregates.dependency_topology.meta.unavailable_reason =
+      "topology analysis was not produced";
+    bundle.graph.structure_edges.disclosure.status = "unavailable";
+    bundle.graph.structure_edges.disclosure.reason =
+      "structure edges were not produced";
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+
+    for (const metric of ["fan-in", "fan-out"]) {
+      const row = inspector.querySelector<HTMLElement>(
+        `[data-inspector-metric="${metric}"]`,
+      )!;
+      expect(row).toHaveTextContent(bundle.capability.labels.unavailable);
+      expect(row).not.toHaveTextContent(/^0$/);
+    }
+    expect(inspector).toHaveTextContent("topology analysis was not produced");
+  });
+
+  it("shows unavailable coupling evidence instead of a measured-empty claim", () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.hidden_coupling.meta.status = "unavailable";
+    bundle.aggregates.hidden_coupling.meta.unavailable_reason = "coupling analysis was not produced";
+
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>("[data-module-inspector]")!;
+
+    expect(inspector).toHaveTextContent("coupling analysis was not produced");
+    expect(inspector).not.toHaveTextContent(/No pair for this module appears/i);
+  });
+
   it("renders all ten capability-owned view labels", () => {
     const bundle = golden();
     render(<RepoShowcase bundle={bundle} />);
@@ -151,10 +391,24 @@ describe("repository showcase", () => {
     const bundle = structuredClone(golden());
     const user = userEvent.setup();
     bundle.capability.views.hotspot_quadrant.label = "Contract-owned risk field";
+    bundle.capability.views.dependency_topology.label = "Contract-owned topology";
+    bundle.capability.views.hidden_coupling.label = "Contract-owned coupling";
+    bundle.capability.views.api_surface.label = "Contract-owned API surface";
+    bundle.capability.labels.node_types.module = "Contract-owned component";
+    bundle.capability.labels.metrics.package_count = "Contract-owned package count";
+    bundle.capability.labels.metrics.module_count = "Contract-owned module count";
+    bundle.capability.labels.metrics.commits = "Contract-owned commits";
+    bundle.capability.labels.metrics.cycle_count = "Contract-owned cycles";
     bundle.capability.labels.metrics.fan_in = "Contract-owned inbound degree";
+    bundle.capability.labels.metrics.fan_out = "Contract-owned outbound degree";
+    bundle.capability.labels.metrics.bus_factor = "Contract-owned bus factor";
+    bundle.capability.labels.metrics.dependent_count = "Contract-owned dependent count";
+    bundle.capability.labels.metrics.cochange_count = "Contract-owned co-change count";
+    bundle.capability.labels.metrics.support = "Contract-owned support";
     bundle.capability.labels.metrics.change_frequency = "Contract-owned revisions";
-    const quadrant = bundle.aggregates.hotspot_quadrant.data.items[0].quadrant;
-    bundle.capability.labels.hotspot_quadrants[quadrant] = "Contract-owned quadrant";
+    for (const quadrant of Object.keys(bundle.capability.labels.hotspot_quadrants) as Array<keyof typeof bundle.capability.labels.hotspot_quadrants>) {
+      bundle.capability.labels.hotspot_quadrants[quadrant] = "Contract-owned quadrant";
+    }
     bundle.capability.labels.metrics.p50 = "Contract-owned median";
     bundle.aggregates.cadence_timeline.pull_request_lead_time_hours = {
       status: "available",
@@ -162,6 +416,24 @@ describe("repository showcase", () => {
     };
 
     const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>("[data-repository-triage]")!;
+    for (const label of [
+      "Contract-owned package count",
+      "Contract-owned module count",
+      "Contract-owned commits",
+      "Contract-owned cycles",
+      "Contract-owned inbound degree",
+      "Contract-owned outbound degree",
+      "Contract-owned bus factor",
+      "Contract-owned topology",
+      "Contract-owned coupling",
+      "Contract-owned component evidence",
+    ]) {
+      expect(within(triage).getAllByText(label).length).toBeGreaterThan(0);
+    }
+    expect(triage).toHaveTextContent("Contract-owned API surface");
+    expect(triage).toHaveTextContent("Contract-owned dependent count");
+    expect(triage).toHaveTextContent("Contract-owned quadrant");
     await user.click(screen.getByRole("button", { name: "Contract-owned risk field" }));
 
     expect(screen.getByRole("heading", { name: "Contract-owned risk field" })).toBeVisible();
@@ -181,12 +453,7 @@ describe("repository showcase", () => {
 
     const { container } = render(<RepoShowcase bundle={bundle} />);
 
-    // Multiple `[data-state="truncated"]` disclosures can coexist: the browser-side
-    // local display slice (bound = shown, always ambient once a list exceeds the UI
-    // row cap) is a separate concern from the bundle's own page-bound disclosure.
-    // Target the modules page's own disclosure by its distinguishing reason text.
-    const state = Array.from(container.querySelectorAll<HTMLElement>('[data-state="truncated"]'))
-      .find((node) => node.textContent?.includes("fixture node budget"));
+    const state = container.querySelector<HTMLElement>(`.repo-view-panel [data-state="truncated"][data-bound="${bundle.graph.modules.bound.max_items}"]`);
     expect(state).toBeVisible();
     expect(state).toHaveAttribute("data-bound", String(bundle.graph.modules.bound.max_items));
     if (bundle.graph.modules.total_count.status === "available") {
@@ -278,6 +545,23 @@ describe("repository showcase", () => {
     }
   });
 
+  it("reports a cursor-bearing cadence series as truncated even when its disclosure says complete", async () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.cadence_timeline.commits.next_cursor = "cursor-after-first-page";
+    bundle.aggregates.cadence_timeline.commits.disclosure = {
+      status: "complete",
+      reason: null,
+    };
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+
+    expect(container.querySelector('[data-cadence-series="commits"]')).toHaveAttribute(
+      "data-series-status",
+      "truncated",
+    );
+  });
+
   it("caps large browser tables and discloses the local slice", async () => {
     const bundle = golden();
     const user = userEvent.setup();
@@ -285,7 +569,9 @@ describe("repository showcase", () => {
     await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
 
     expect(container.querySelectorAll(".repo-view-panel tbody tr")).toHaveLength(200);
-    expect(Array.from(container.querySelectorAll(".repo-view-panel .repo-bounded.truncated")).some((node) => node.textContent?.toLocaleLowerCase().includes(bundle.capability.labels.truncated.toLocaleLowerCase()))).toBe(true);
+    const localSlice = container.querySelector<HTMLElement>(`.repo-view-panel [data-state="truncated"][data-shown="200"][data-known-total="${bundle.aggregates.hotspot_quadrant.data.items.length}"]`);
+    expect(localSlice).toBeVisible();
+    expect(localSlice).toHaveTextContent(/truncated/i);
   });
 
   it("settles the structure graph without collapsing nodes onto a handful of shared coordinates", () => {

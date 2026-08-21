@@ -713,6 +713,37 @@ async fn upsert_atoms_rejects_empty_slug() {
     assert!(err.to_string().contains("slug"), "got: {err}");
 }
 
+#[tokio::test]
+async fn upsert_atoms_rejects_reserved_secret_gate_property_key() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{
+                "slug": "reserved-key-atom",
+                "name": "Reserved key atom",
+                "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+                "properties": { "khive:secret_gate": "exempted:content-sha256-manifest-v1" }
+            }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("khive:secret_gate") && err.to_string().contains("runtime-owned"),
+        "got: {err}"
+    );
+
+    let list = f
+        .dispatch("knowledge.list", json!({}))
+        .await
+        .expect("list ok");
+    assert_eq!(
+        list["atoms"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "rejected atom must not be persisted"
+    );
+}
+
 // ── upsert_domains ────────────────────────────────────────────────────────────
 
 #[tokio::test]

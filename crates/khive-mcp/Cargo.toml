@@ -64,6 +64,12 @@ channel-email = ["khive-channel", "khive-channel-email"]
 # Requires KHIVE_TELEGRAM_* environment variables at runtime; does nothing when unset.
 # Coexists with channel-email (ChannelRegistry keys by (kind, slug), #606).
 channel-telegram = ["khive-channel", "khive-channel-telegram"]
+# test-forward-seam: expose `daemon::test_forward_seam`, a one-shot capture
+# hook at the entry of `forward_or_spawn_with_config`, to crates outside this
+# one. Test-instrumentation only — unarmed, it has no runtime effect. Enabled
+# only from downstream `[dev-dependencies]` re-declarations of this crate,
+# never from a release dependency.
+test-forward-seam = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
