@@ -541,7 +541,10 @@ impl KhiveRuntime {
     /// Wrapped in [`crate::note_store_guard::PolicyEnforcingNoteStore`], which
     /// refuses any insert/upsert of a `kind = "message"` note carrying
     /// `quarantined` / `channel_kind` / `channel_slug` — the transport-owned
-    /// evidence `comm.health` trusts at face value. The trusted channel-ingest
+    /// evidence `comm.health` trusts at face value — and refuses patching
+    /// those keys through the property-mutation seams on any note kind, so
+    /// the guard cannot be sidestepped by inserting a clean message note and
+    /// patching the evidence onto it afterward. The trusted channel-ingest
     /// path does not go through this accessor; see
     /// [`Self::raw_notes`] and [`Self::try_create_note_as_trusted_ingest`].
     pub fn notes(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn NoteStore>> {
@@ -1118,9 +1121,11 @@ impl KhiveRuntime {
     /// [`crate::note_store_guard::PolicyEnforcingNoteStore`], which refuses
     /// `upsert_note` / `upsert_notes` / `try_insert_note` /
     /// `replace_note_if_unchanged` calls that would write a `kind = "message"`
-    /// note carrying `quarantined` / `channel_kind` / `channel_slug` —
-    /// unconditionally, since that public accessor has no way to see a trust
-    /// decision. `try_create_note_impl` itself reaches storage through
+    /// note carrying `quarantined` / `channel_kind` / `channel_slug`, and
+    /// refuses `set_note_property` / `try_patch_note_property` /
+    /// `patch_note_property_atomic` / `update_note_properties` calls that
+    /// would patch any of those keys onto any note — unconditionally, since
+    /// that public accessor has no way to see a trust decision. `try_create_note_impl` itself reaches storage through
     /// [`Self::raw_notes`], the unwrapped accessor, so its own inline check
     /// (which can legitimately allow those properties for trusted ingest)
     /// is not double-enforced or contradicted by the wrapper.

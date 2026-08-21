@@ -66,8 +66,61 @@ fn reject_if_forged_message_note(note: &Note, operation: &'static str) -> Storag
     })
 }
 
-/// Wraps `inner` so every full-note insert/upsert seam enforces the
-/// reserved-transport-property policy described at module level.
+/// The property-patch seams cannot see the note's kind in their signatures,
+/// so they refuse the reserved keys unconditionally: no public-store caller
+/// legitimately patches transport-owned keys on any note kind (quarantine
+/// disposition is established only at ingest, through the capability path),
+/// and a kind-scoped check would need a lookup whose result the refusal
+/// would then depend on. A future release-from-quarantine flow belongs on
+/// the capability path, not here.
+fn reject_reserved_patch_target(target: &str, operation: &'static str) -> StorageResult<()> {
+    let first_segment = target
+        .strip_prefix("$.")
+        .unwrap_or(target)
+        .split(['.', '['])
+        .next()
+        .unwrap_or(target);
+    if !TRANSPORT_OWNED_MESSAGE_PROPERTIES.contains(&first_segment) {
+        return Ok(());
+    }
+    Err(StorageError::InvalidInput {
+        capability: StorageCapability::Notes,
+        operation: operation.into(),
+        message: format!(
+            "`{first_segment}` is transport-owned and cannot be patched through the public \
+             NoteStore accessor; only the trusted channel-ingest path may establish quarantine \
+             disposition and channel provenance"
+        ),
+    })
+}
+
+fn reject_reserved_replacement_properties(
+    properties: Option<&Value>,
+    operation: &'static str,
+) -> StorageResult<()> {
+    let Some(key) = properties
+        .and_then(Value::as_object)
+        .and_then(transport_owned_message_property_named_in)
+    else {
+        return Ok(());
+    };
+    Err(StorageError::InvalidInput {
+        capability: StorageCapability::Notes,
+        operation: operation.into(),
+        message: format!(
+            "`{key}` is transport-owned and cannot be written through the public NoteStore \
+             accessor; only the trusted channel-ingest path may establish quarantine disposition \
+             and channel provenance"
+        ),
+    })
+}
+
+/// Wraps `inner` so every full-note insert/upsert seam AND every
+/// property-patch seam enforces the reserved-transport-property policy
+/// described at module level. Insert/upsert refusal is scoped to
+/// `kind = "message"` notes (the note is in hand); the patch seams refuse
+/// the reserved keys on any note, since kind is not in their signatures and
+/// no public-store caller legitimately patches those keys at all.
 pub(crate) struct PolicyEnforcingNoteStore {
     inner: Arc<dyn NoteStore>,
 }
@@ -122,6 +175,7 @@ impl NoteStore for PolicyEnforcingNoteStore {
         properties: Option<Value>,
         updated_at: i64,
     ) -> StorageResult<bool> {
+        reject_reserved_replacement_properties(properties.as_ref(), "update_note_properties")?;
         self.inner
             .update_note_properties(id, properties, updated_at)
             .await
@@ -134,6 +188,7 @@ impl NoteStore for PolicyEnforcingNoteStore {
         value: Value,
         updated_at: i64,
     ) -> StorageResult<bool> {
+        reject_reserved_patch_target(key, "set_note_property")?;
         self.inner
             .set_note_property(id, key, value, updated_at)
             .await
@@ -148,6 +203,7 @@ impl NoteStore for PolicyEnforcingNoteStore {
         value: Value,
         updated_at: i64,
     ) -> StorageResult<bool> {
+        reject_reserved_patch_target(json_path, "try_patch_note_property")?;
         self.inner
             .try_patch_note_property(id, namespace, filter, json_path, value, updated_at)
             .await
@@ -162,6 +218,7 @@ impl NoteStore for PolicyEnforcingNoteStore {
         value: Value,
         updated_at: i64,
     ) -> StorageResult<()> {
+        reject_reserved_patch_target(json_path, "patch_note_property_atomic")?;
         self.inner
             .patch_note_property_atomic(ids, namespace, filter, json_path, value, updated_at)
             .await

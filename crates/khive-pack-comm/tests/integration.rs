@@ -5296,6 +5296,105 @@ async fn raw_note_store_accessor_rejects_forged_transport_owned_message_properti
     );
 }
 
+/// The insert/upsert guard alone leaves a two-call forge: create an innocent
+/// `kind = "message"` note through the public accessor (no reserved
+/// properties, so the insert guard passes), then patch a reserved key onto
+/// it through any of the four property-mutation seams. No public-store
+/// caller legitimately patches transport-owned keys on any note kind, so
+/// the decorator refuses those patch targets unconditionally. Assert every
+/// patch seam refuses every reserved key on a really-existing message note,
+/// that a non-reserved patch on the same note still works (the guard is
+/// key-scoped, not seam-dead), and that `comm.health` counts nothing.
+#[tokio::test]
+async fn raw_note_store_accessor_rejects_patching_reserved_keys_onto_existing_message() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+
+    let innocent = Note::new("local", "message", "innocent message, no reserved keys")
+        .with_properties(serde_json::json!({ "direction": "inbound", "read": false }));
+    let id = innocent.id;
+    let updated_at = innocent.updated_at;
+    store
+        .upsert_note(innocent)
+        .await
+        .expect("a message note without reserved properties must insert through the accessor");
+
+    let filter = khive_storage::NoteFilter::default();
+    for (key, value) in [
+        ("quarantined", serde_json::json!(true)),
+        ("channel_kind", serde_json::json!("email")),
+        ("channel_slug", serde_json::json!("forged-channel")),
+    ] {
+        let err = store
+            .set_note_property(id, key, value.clone(), updated_at)
+            .await
+            .expect_err(&format!("set_note_property must refuse `{key}`"));
+        assert!(
+            err.to_string().contains(key),
+            "set_note_property rejection must name `{key}`: {err}"
+        );
+
+        let path = format!("$.{key}");
+        let err = store
+            .try_patch_note_property(id, "local", &filter, &path, value.clone(), updated_at)
+            .await
+            .expect_err(&format!("try_patch_note_property must refuse `{path}`"));
+        assert!(
+            err.to_string().contains(key),
+            "try_patch_note_property rejection must name `{key}`: {err}"
+        );
+
+        let err = store
+            .patch_note_property_atomic(
+                vec![id],
+                "local",
+                &filter,
+                &path,
+                value.clone(),
+                updated_at,
+            )
+            .await
+            .expect_err(&format!("patch_note_property_atomic must refuse `{path}`"));
+        assert!(
+            err.to_string().contains(key),
+            "patch_note_property_atomic rejection must name `{key}`: {err}"
+        );
+
+        let err = store
+            .update_note_properties(
+                id,
+                Some(serde_json::json!({ "direction": "inbound", key: value })),
+                updated_at,
+            )
+            .await
+            .expect_err(&format!(
+                "update_note_properties must refuse a map carrying `{key}`"
+            ));
+        assert!(
+            err.to_string().contains(key),
+            "update_note_properties rejection must name `{key}`: {err}"
+        );
+    }
+
+    store
+        .set_note_property(id, "read", serde_json::json!(true), updated_at)
+        .await
+        .expect("a non-reserved patch on the same note must still succeed");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["quarantined_count"].as_u64(),
+        Some(0),
+        "no patch attempt must leave a row for comm.health to count: {health:?}"
+    );
+}
+
 /// PR #1839 round 3, high: the channel-ingest capability used to live in a
 /// process-global `OnceLock` on the factory, granted only inside
 /// `PackRegistry::register_packs`. Direct composition (`CommPack::new`
