@@ -128,10 +128,11 @@ reference to the writer's state of mind or to the world at write time:
   satisfies D. Codebase identifiers (repository, package, crate, source language) are
   explicitly step 6 evidence, not instance identifiers.
 - **Technique identity (T)**, evaluated only when D holds: the record's own text names a
-  technique as its referent — its `entity_type` is a technique-designating `Concept` subtype
-  (`algorithm`, `technique`, `method`, `pattern`, `architecture`, `model`), or its name or
-  description names the referent with one of those designators. A vocabulary-presence test
-  on the record's fields, not an inference about the prose.
+  technique as its referent — its `entity_type` is one of `Concept`'s canonical subtypes, or
+  its name or description names the referent with one of ADR-001 step 8's own designators
+  (`idea`, `method`, `algorithm`, `theory`, `architecture`, `research gap`, `metric`) or
+  with a `Concept` canonical-subtype name. A vocabulary-presence test on the record's
+  fields reusing vocabulary ADR-001 already owns, not an inference about the prose.
 
 The arms partition on D, then on T, so they are mutually exclusive by construction: D absent →
 step 5 does not fire and the walk continues to step 6 (a codebase classifies `Project`, a pure

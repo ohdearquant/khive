@@ -245,12 +245,14 @@ the writer's state of mind or to the world at write time:
   evidence, not instance identifiers — a record carrying only codebase identity does not
   satisfy D and continues to step 6, where it classifies `Project`.
 - **Technique identity (T)** — evaluated only when D holds: the record's own text names a
-  technique as its referent. T holds exactly when the record's `entity_type` is a
-  technique-designating `Concept` subtype (`algorithm`, `technique`, `method`, `pattern`,
-  `architecture`, `model`), or its name or description names the referent with one of those
-  designators (the designating word is present in the record's text). T is a
-  vocabulary-presence test on the record's own fields — the same instrument as step 9's
-  question-note trigger — never an inference about what the prose "really" means.
+  technique as its referent. T holds exactly when the record's `entity_type` is one of
+  `Concept`'s canonical subtypes (the "Initial canonical subtypes" table above), or its name or
+  description names the referent with one of step 8's own designators (`idea`, `method`,
+  `algorithm`, `theory`, `architecture`, `research gap`, `metric`) or with a `Concept`
+  canonical-subtype name — the designating word present in the record's text. Both arms
+  reuse vocabulary this ADR already owns; no new designator list is minted. T is a vocabulary-presence test on the record's own
+  fields — the same instrument as step 9's question-note trigger — never an inference about
+  what the prose "really" means.
 
 The sub-procedure:
 
