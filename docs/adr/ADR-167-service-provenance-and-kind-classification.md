@@ -61,17 +61,20 @@ filter `list(kind="edge", target_id=…)` does reach them: the earlier report th
 What remains open is exhaustive ENUMERATION, which is a different question from whether the filter
 matches. Two independent gaps stand between the listing surface and the set the purge will delete.
 
-First, offset paging is unsound. Issue #2088 records that the multi-namespace visibility path
-fetches each namespace's rows ordered by `created_at`, re-sorts the union by UUID, and then slices
-`[offset, offset+limit)`: the window floats as the prefix grows, so successive pages both duplicate
-and skip rows, and a paged walk terminates having seen a fraction of the population while reporting
-nothing wrong. The defect is not confined to inbound reads: `source_id` and `target_id` are filter
-predicates on the same listing path (`build_edge_filter_sql` in
-`crates/khive-db/src/stores/graph.rs`), so a source-filtered walk pages through the same floating
-window. No direction of offset-paged enumeration is safe while the defect stands.
+First, offset paging over multiple namespaces was unsound when this ADR was drafted. Issue #2088
+recorded that the multi-namespace visibility path fetched each namespace's rows ordered by
+`created_at`, re-sorted the union by UUID, and then sliced `[offset, offset+limit)`: the window
+floats as the prefix grows, so successive pages both duplicate and skip rows while reporting
+nothing wrong, in both filter directions (`source_id` and `target_id` share the listing path).
+That defect has since been fixed: the multi-namespace branch now issues a single statement over
+the whole namespace set with a real `LIMIT`/`OFFSET` (the change that closed #2088), and the
+exact-enumeration and page-stability regressions are owned by that change's own tests. This ADR
+does not re-own them; the defect remains in this record because it is measured evidence of how
+quietly an enumeration can be incomplete, which is the failure class the contract below exists
+to exclude.
 
-Second — and this holds even for a sound cursor walk — the listing surface answers a narrower
-question than the purge asks. `list_edges_after` (`crates/khive-runtime/src/operations.rs`) walks
+Second — and this holds even now that the listing paths are sound — the listing surface answers
+a narrower question than the purge asks. `list_edges_after` (`crates/khive-runtime/src/operations.rs`) walks
 the durable insertion-sequence ledger correctly, but it is visibility-scoped to the caller's
 namespaces and, like every listing path, filters to live rows (`deleted_at IS NULL`). The purge is
 `DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1` — no namespace predicate, no
@@ -273,24 +276,20 @@ this ADR is complete when all of the following hold:
 
 **Migration procedure (Decision 3).**
 
-- Enumeration, offset-paging discriminator: the fixture is exact, so the pre-image failure is
-  decidable rather than probabilistic. Six incident edges on the migrating record, three per
-  namespace across two namespaces (`A`: a1, a2, a3; `B`: b1, b2, b3), creation timestamps
-  strictly interleaved (a1 < b1 < a2 < b2 < a3 < b3), and edge UUIDs assigned in strictly
-  descending order of creation, so every later-created edge id sorts before every
-  earlier-created one. Page size 2. The defective offset walk (per-namespace `created_at`
-  prefix of size `offset + limit`, union re-sorted by UUID, sliced) then returns page 1 =
-  {b2, a2}, page 2 = {b2, a2} again (b3 and a3, newly exposed in the page-2 prefix, sort
-  before b2 and displace the window), page 3 = {b1, a1}: b2 and a2 are duplicated and b3 and
-  a3 are never returned. The test asserts the offset walk produces exactly that duplicate-
-  and-omission pattern while the in-transaction purge-predicate enumeration returns all six
-  edge ids exactly once and reconciles with `COUNT(*)` = 6.
-- Enumeration, destructive-scope completeness: the fixture additionally holds one incident
-  edge in a namespace NOT visible to the migrating caller and one incident edge already
-  soft-deleted. A visible/live enumeration (the cursor walk) returns neither; the
-  in-transaction purge-predicate enumeration returns both, the count reconciles, and both
-  rows receive dispositions before any plan is prepared — because the purge would delete
-  both. A migration prepared from the visible/live enumeration alone must be refused.
+- Enumeration, exactness: multi-namespace listing exactness (every row exactly once across
+  pages, stable page order) is owned by the tests of the change that closed #2088 and is not
+  re-owned here; this ADR's enumeration criteria assume it and test what the listing surface
+  cannot answer.
+- Enumeration, destructive-scope completeness: the fixture holds six incident edges on the
+  migrating record spread across two namespaces, of which one is in a namespace NOT visible
+  to the migrating caller and one is already soft-deleted. A visible/live enumeration (the
+  cursor walk or the listing surface) returns four; the in-transaction purge-predicate
+  enumeration returns all six edge ids exactly once (deduplicated, so a self-loop edge
+  matching on both source and target counts once), and reconciles with `COUNT(*)` = 6 under
+  the same predicate in the same transaction. All six receive dispositions before any plan
+  is prepared — because the purge would delete all six. A migration prepared from the
+  four-row visible/live enumeration must be refused, and the refusal is the asserted
+  outcome, not a warning.
 - Edge-as-endpoint coverage: the fixture includes an `annotates` edge whose TARGET is itself an
   edge incident to the migrating record; the enumeration finds it, and after migration the
   annotation is re-anchored to the recreated edge's new id (or deleted with a recorded
