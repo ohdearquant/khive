@@ -3,7 +3,8 @@
 **Status**: Proposed\
 **Date**: 2026-06-23\
 **Authors**: khive maintainers
-**Depends on**: ADR-007 (Namespace as Attribution), ADR-018 (Authorization Gate), ADR-049
+**Depends on**: ADR-007 (Namespace as Attribution), ADR-018 (Authorization Gate, as amended by
+ADR-129), ADR-049
 (khived daemon), ADR-057 (Comm Actor-Addressed Delivery)\
 **Amends (effective now)**: ADR-007 Rule 4 (TenantGate clause); ADR-018
 §"AllowAllGate" and §"Multi-tenant deployments" context bullet — see
@@ -240,7 +241,8 @@ traffic" recommendation for multi-actor deployments is satisfied by the process 
 rather than by a TenantGate implementation. When the per-actor-process topology is in use,
 AllowAllGate is not a misconfiguration.
 
-ADR-018 §"Hard enforcement" and §"Fail-open on gate Err" are unchanged and apply verbatim.
+ADR-018 §"Hard enforcement" and its ADR-129-amended fail-closed Gate-error contract apply verbatim.
+This supersedes this proposal's original reference to the pre-ADR-129 fail-open section.
 
 ---
 

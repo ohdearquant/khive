@@ -275,6 +275,7 @@ pub async fn create_notes_atomic_with_report(
         // never reaches storage verbatim on this writer either.
         let properties =
             runtime.derive_note_write_properties(spec.kind, spec.token, spec.properties.clone())?;
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         crate::secret_gate::check(spec.content)?;
         if let Some(n) = spec.name {
             crate::secret_gate::check(n)?;
@@ -653,6 +654,48 @@ mod tests {
             ann_write_log_count(&runtime, ns, NAN_MODEL).await,
             0,
             "no ann_write_log row may be committed when an embedding is non-finite"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_notes_atomic_rejects_reserved_secret_gate_key() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = "atomic-message-reserved-key-test";
+        let token = runtime
+            .authorize(Namespace::parse(ns).unwrap())
+            .expect("authorize");
+
+        let result = create_notes_atomic(
+            &runtime,
+            vec![AtomicNoteSpec {
+                token: &token,
+                id: None,
+                kind: "observation",
+                name: None,
+                content: "atomic message reservation target",
+                properties: Some(
+                    serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"}),
+                ),
+            }],
+        )
+        .await;
+
+        let err = result.expect_err("caller-supplied reserved key must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+
+        let alive = runtime
+            .list_notes(&token, Some("observation"), 100, 0)
+            .await
+            .expect("list_notes")
+            .into_iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count();
+        assert_eq!(
+            alive, 0,
+            "no note row may be committed on reservation rejection"
         );
     }
 

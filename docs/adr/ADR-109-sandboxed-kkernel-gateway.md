@@ -3,8 +3,8 @@
 **Status**: Proposed\
 **Date**: 2026-07-11\
 **Authors**: khive maintainers\
-**Depends on**: ADR-018 (Authorization Gate), ADR-016 (Request DSL), ADR-017 (Pack
-Standard), ADR-007 Rev 7 (Namespace as Attribution-Only)\
+**Depends on**: ADR-018 (Authorization Gate, as amended by ADR-129), ADR-016 (Request DSL),
+ADR-017 (Pack Standard), ADR-007 Rev 7 (Namespace as Attribution-Only)\
 **Related**: ADR-108 (Git Write Surface - composition point, Fork (d) below), ADR-085 (Code
 Pack - precedent for an admin-CLI-only surface distinct from the agent-facing MCP surface),
 khive-cloud API-key scope model (design input for Fork (b))
@@ -47,9 +47,9 @@ declared set of things and nothing else. Both need a surface with:
 - No filesystem-path-bearing arguments accepted (a sandboxed caller must not be able to
   direct khive to read or write an arbitrary host path).
 - Fail-closed behavior on anything outside the declared contract - an unrecognized verb, an
-  out-of-allowlist argument shape, or a Gate infrastructure error must deny, not fall
-  through to a permissive default the way ADR-018's base Gate fails open on infrastructure
-  errors.
+  out-of-allowlist argument shape, or a Gate infrastructure error must refuse. ADR-129 now
+  requires the base Gate to refuse infrastructure errors too; the gateway rule remains necessary
+  for its additional allowlist, argument-shape, namespace, and budget boundaries.
 
 This ADR specs a gateway **mode** for this third trust tier. How that mode is packaged
 (Fork (a)) and how the sandboxed caller authenticates (Fork (b)) were presented to design
@@ -109,9 +109,9 @@ resolved in place, with the full set of rulings summarized in the Resolutions se
 6. **Fail-closed on anything outside the contract.** Any of: an unrecognized verb, an
    argument shape that does not match the declared contract, a caller-supplied namespace
    override attempt, a Gate infrastructure error (`Err(GateError)`), or a rate/budget cap
-   exceeded - all result in denial. This explicitly reverses ADR-018's fail-open-on-`Err`
-   posture (see Rationale below) for the gateway path only; the base Gate's fail-open
-   behavior is unchanged for the operator and trusted-agent tiers.
+   exceeded - all result in denial or typed refusal. For Gate infrastructure errors this now
+   matches ADR-129's base fail-closed posture; the gateway-specific validation failures remain
+   additional refusals rather than a gateway-only reversal of the base Gate.
 
 ### Fork (a): Process boundary
 
@@ -230,7 +230,7 @@ rules 2, 4, 5, and 6 above that go beyond what `Obligation` enforcement does tod
 - Pro: reuses ADR-018's policy language and engine entirely; a capability grant and a
   general Gate policy are authored in the same language, reducing the number of
   configuration surfaces an operator must learn; Rego's `default decision := {"decision":
- "deny", ...}` pattern (already the documented fail-closed idiom in ADR-018's own example
+ "deny", ...}` pattern (the documented explicit-deny idiom in ADR-018's own example
   policy) is a natural fit for rule 6's fail-closed requirement.
 - Con: couples the gateway's capability model to Rego/regorus even for the simplest
   allowlist cases, where C1's flat format would suffice and be easier to audit at a glance;
@@ -380,8 +380,9 @@ the gateway path.
 ## References
 
 - ADR-018 - Authorization Gate; `Gate`, `GateRequest`, `GateDecision`, `Obligation`,
-  `PackGatePolicy`; this ADR's enforcement additions (rules 5 and 6) are explicit, scoped
-  deltas from ADR-018's declared-not-enforced `RateLimit` and fail-open-on-`Err` defaults
+  `PackGatePolicy`; this ADR's rate enforcement and gateway-specific validation refusals are
+  scoped additions. Gate infrastructure-error refusal is inherited from ADR-129, not a scoped
+  delta from ADR-018.
 - ADR-018 Amendment 1 - canonical verb identity; the allowlist check in rule 1 depends on
   the same canonicalization step to avoid an alias-based bypass
 - ADR-016 - Request DSL; the wire surface the gateway's pre-dispatch check intercepts

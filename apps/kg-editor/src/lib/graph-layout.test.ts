@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { settleGraphLayout } from "@/lib/graph-layout";
-import { atlasReviewFixture } from "@/lib/fixtures/atlas-review";
+import { demoReviewFixture } from "@/lib/fixtures/demo-review";
 
 describe("settleGraphLayout", () => {
   it("settles the golden review graph independently of input order", () => {
-    const nodes = atlasReviewFixture.graph.nodes.items;
-    const edges = atlasReviewFixture.graph.edges.items;
+    const nodes = demoReviewFixture.graph.nodes.items;
+    const edges = demoReviewFixture.graph.edges.items;
     const settled = settleGraphLayout(nodes, edges).map(({ id, x, y }) => ({
       id,
       x,

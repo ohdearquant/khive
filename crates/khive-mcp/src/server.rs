@@ -2616,8 +2616,58 @@ result (e.g. create then link with the new entity's id)."#)]
     }
 }
 
+/// Boxed future returned by the daemon-forwarding seam.
+#[cfg(unix)]
+type ForwardFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Option<Result<String, McpError>>> + Send + 'a>,
+>;
+
+/// Function pointer type for the daemon-forwarding seam, parameterized so
+/// tests can inject a spy in place of the real `forward_or_spawn_with_config_and_packs`
+/// call — the real call spawns/contacts an actual daemon process, which
+/// tests must not do. `packs` mirrors `forward_or_spawn_with_config_and_packs`'s own
+/// optional `packs` argument exactly: the `Some`/`None` decision is made by
+/// the shared call site in `request_with_forward`, not inside the adapter,
+/// so a spy standing in for this seam observes the same optional argument
+/// the real function would receive. `config`/`db` are always `None` at this
+/// call site.
+#[cfg(unix)]
+type ForwardFnPtr =
+    for<'a> fn(&'a khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -> ForwardFuture<'a>;
+
+/// Adapts the real `forward_or_spawn_with_config_and_packs` to the `ForwardFnPtr`
+/// signature. A pure pass-through — the `Some`/`None` decision already
+/// happened at the call site — so this boundary carries no logic a test
+/// spy could fail to observe.
+#[cfg(unix)]
+fn forward_or_spawn_boxed(
+    frame: &khive_runtime::DaemonRequestFrame,
+    packs: Option<Vec<String>>,
+) -> ForwardFuture<'_> {
+    Box::pin(async move {
+        crate::daemon::forward_or_spawn_with_config_and_packs(frame, None, None, packs.as_deref())
+            .await
+    })
+}
+
 impl KhiveMcpServer {
     async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
+        #[cfg(unix)]
+        return self.request_with_forward(p, forward_or_spawn_boxed).await;
+        #[cfg(not(unix))]
+        return self.request_with_forward(p).await;
+    }
+
+    /// Inner implementation of `request_with_cancellation`, parameterized
+    /// over the daemon-forwarding seam so tests can drive the real dispatch
+    /// path (registry resolution included) while asserting on what would
+    /// have reached `forward_or_spawn_with_config_and_packs`, without spawning or
+    /// contacting a real daemon.
+    async fn request_with_forward(
+        &self,
+        p: RequestParams,
+        #[cfg(unix)] forward_fn: ForwardFnPtr,
+    ) -> Result<String, McpError> {
         // Parse before the daemon decision. The daemon protocol's historical
         // error channel is string-only, so forwarding malformed DSL would turn
         // `invalid_params` plus its structured `parse-error` reason into an
@@ -2645,7 +2695,19 @@ impl KhiveMcpServer {
         #[cfg(unix)]
         if p.save_to.is_none() {
             let frame = self.wire_daemon_frame(&p);
-            let forwarded = crate::daemon::forward_or_spawn(&frame);
+            // Forward this server's own resolved pack list so a daemon this
+            // call spawns serves the SAME packs this process registered —
+            // `pack_names()` reflects the actual loaded registry regardless
+            // of whether that selection came from `--pack`, `KHIVE_PACKS`,
+            // or a discovered `[runtime].packs` config entry, none of which
+            // otherwise reach a freshly spawned child (khive-oss#1941).
+            let resolved_packs: Vec<String> = self
+                .registry
+                .pack_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            let forwarded = forward_fn(&frame, Some(resolved_packs));
             tokio::pin!(forwarded);
             let forwarded = tokio::select! {
                 result = &mut forwarded => result,
@@ -3816,6 +3878,137 @@ mod tests {
         assert_eq!(
             error.data.as_ref().and_then(|data| data["reason"].as_str()),
             Some("parse-error")
+        );
+    }
+
+    /// khive-oss#1941 regression seam: `request_with_forward` must pass
+    /// THIS server's own resolved registry pack list to the daemon-forwarding
+    /// seam as `Some(...)`, not `None` and not some other list. The spy's
+    /// signature is `Option<Vec<String>>` — the exact shape
+    /// `forward_or_spawn_with_config_and_packs` itself receives — because the
+    /// `Some`/`None` decision is made at the shared call site in
+    /// `request_with_forward` before `forward_fn` is invoked, not inside the
+    /// production adapter (`forward_or_spawn_boxed`) that this spy replaces.
+    /// That adapter is now a pure pass-through with no logic of its own, so
+    /// this spy observes precisely what the real
+    /// `forward_or_spawn_with_config_and_packs` call would receive. Two independent
+    /// mutations must both redden this test:
+    /// - swapping the production `forward_fn(&frame, Some(resolved_packs))`
+    ///   call for `forward_fn(&frame, Some(Vec::new()))` — the restricted
+    ///   two-pack registry built here (`kg`, `gtd`) no longer matches what
+    ///   the spy records;
+    /// - swapping that same call for `forward_fn(&frame, None)` — the spy
+    ///   records `None` instead of `Some(vec!["kg", "gtd"])`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_registry_pack_list_reaches_forward_seam() {
+        thread_local! {
+            static SPY_CAPTURED_PACKS: std::cell::RefCell<Option<Option<Vec<String>>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn spy_forward(
+            _frame: &khive_runtime::DaemonRequestFrame,
+            packs: Option<Vec<String>>,
+        ) -> ForwardFuture<'_> {
+            SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
+            Box::pin(async {
+                Some(Ok(json!({
+                    "results": [{"ok": true, "tool": "stats", "result": {}}],
+                    "summary": {"total": 1, "succeeded": 1, "failed": 0},
+                })
+                .to_string()))
+            })
+        }
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "gtd".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime restricted to kg + gtd");
+        let server =
+            KhiveMcpServer::new(runtime).expect("server builds with restricted kg+gtd registry");
+        SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
+
+        let params = RequestParams {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        };
+
+        let result = server.request_with_forward(params, spy_forward).await;
+
+        assert!(
+            result.is_ok(),
+            "the spy-forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_PACKS.with(|captured| captured.borrow_mut().take()),
+            Some(Some(vec!["kg".to_string(), "gtd".to_string()])),
+            "the server's own resolved registry pack set must reach the daemon-forwarding \
+             seam as Some(...) so a daemon this call spawns serves the same packs this \
+             process registered"
+        );
+    }
+
+    /// Adapter-boundary regression: `restricted_registry_pack_list_reaches_forward_seam`
+    /// above proves the derivation site (`Some(resolved_packs)` in
+    /// `request_with_forward`) folds the right pack list, but its `spy_forward`
+    /// stands in for `forward_or_spawn_boxed` itself, so it never executes the
+    /// adapter's own `packs.as_deref()` conversion at
+    /// `crate::daemon::forward_or_spawn_with_config_and_packs`'s call site. This test
+    /// instead drives `request_with_cancellation` — the real production entry
+    /// point, which always calls the real `forward_or_spawn_boxed` — and
+    /// observes the argument via a one-shot capture hook armed at the entry of
+    /// `forward_or_spawn_with_config_and_packs` itself (`crate::daemon::test_forward_seam`),
+    /// past both the derivation site AND the adapter conversion. Changing the
+    /// adapter's `packs.as_deref()` argument to `None` reddens this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_registry_pack_list_reaches_real_adapter_boundary() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "gtd".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime restricted to kg + gtd");
+        let server =
+            KhiveMcpServer::new(runtime).expect("server builds with restricted kg+gtd registry");
+
+        crate::daemon::test_forward_seam::arm();
+
+        let params = RequestParams {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        };
+
+        let result = server.request_with_cancellation(params).await;
+
+        assert!(
+            result.is_ok(),
+            "the intercepted dispatch through the real production entry point must \
+             succeed: {result:?}"
+        );
+        assert_eq!(
+            crate::daemon::test_forward_seam::take_captured(),
+            Some(Some(vec!["kg".to_string(), "gtd".to_string()])),
+            "the real forward_or_spawn_boxed adapter must convert the server's resolved \
+             registry pack set into Some(&packs) at the forward_or_spawn_with_config_and_packs \
+             call boundary"
         );
     }
 

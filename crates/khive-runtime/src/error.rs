@@ -345,6 +345,14 @@ pub enum RuntimeError {
     #[error("permission denied for verb {verb:?}: {reason}")]
     PermissionDenied { verb: String, reason: String },
 
+    /// The configured gate could not produce an authorization decision.
+    ///
+    /// This is distinct from [`Self::PermissionDenied`]: the pack or
+    /// intercepted operation is never invoked, but the gate did not answer
+    /// with an explicit denial.
+    #[error("gate unavailable for verb {verb:?}: {reason}")]
+    GateUnavailable { verb: String, reason: String },
+
     /// A structured [`khive_types::KhiveError`] converted into the runtime
     /// layer. The full structured error is preserved so callers can inspect
     /// `kind`, `code`, `details`, and `retry_hint` without information loss.
@@ -493,6 +501,7 @@ impl RuntimeError {
             Self::VerbCollision { .. } => "VerbCollision",
             Self::ReservedEnvelopeParam { .. } => "ReservedEnvelopeParam",
             Self::PermissionDenied { .. } => "PermissionDenied",
+            Self::GateUnavailable { .. } => "GateUnavailable",
             Self::Khive(_) => "Khive",
             Self::NamespaceMismatch { .. } => "NamespaceMismatch",
             Self::AmbiguousPrefix { .. } => "AmbiguousPrefix",

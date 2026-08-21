@@ -829,6 +829,7 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, bool, Vec<&'static str>)> {
+        crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref name) = patch.name {
             crate::secret_gate::check(name)?;
         }
@@ -1390,6 +1391,7 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
+        crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
             crate::secret_gate::check(content)?;
         }
@@ -9220,5 +9222,95 @@ mod tests {
             row.budget_rows as usize, summary.tx_budget.rows_charged,
             "the log must carry the same observed row count the summary reports"
         );
+    }
+
+    // ── Universal reserved-key reservation (ADR-115 Amendment 1, first rung) ──
+
+    fn reserved_key_props() -> serde_json::Value {
+        serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"})
+    }
+
+    #[tokio::test]
+    async fn update_entity_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "reservation-target-entity",
+                None,
+                Some(serde_json::json!({"k": "v"})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    properties: Some(reserved_key_props()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected on patch update");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+
+        // No partial mutation: the original properties must be unchanged.
+        let unchanged = rt
+            .entities(&tok)
+            .unwrap()
+            .get_entity(entity.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.properties, Some(serde_json::json!({"k": "v"})));
+    }
+
+    #[tokio::test]
+    async fn update_note_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "reservation target note",
+                None,
+                Some(serde_json::json!({"k": "v"})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = rt
+            .update_note(
+                &tok,
+                note.id,
+                NotePatch::new(None, None, None, None, Some(reserved_key_props())),
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected on patch update");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+
+        let unchanged = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.properties, Some(serde_json::json!({"k": "v"})));
     }
 }
