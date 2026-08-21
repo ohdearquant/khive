@@ -6935,8 +6935,8 @@ mod tests {
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
     }
 
-    /// #2088 regression at the runtime seam, rebuilt deterministic per the
-    /// #2089 round-1 review (finding 3): the previous fixture created edges
+    /// #2088 regression at the runtime seam, rebuilt deterministic under
+    /// #2089: the previous fixture created edges
     /// through the normal `link()` path (random UUIDs, wall-clock
     /// timestamps), so whether it exposed the pre-image bug — sorting the
     /// per-namespace merge by UUID alone, a key unrelated to the
@@ -7072,7 +7072,7 @@ mod tests {
         );
     }
 
-    /// #2089 round-1 MEDIUM finding 2: `list_edges`'s trait-default fallback
+    /// #2089: `list_edges`'s trait-default fallback
     /// (taken when a `GraphStore` backend returns `Unsupported` from
     /// `query_edges_in_namespaces` — i.e. it does not override the batched
     /// namespace query, per [`khive_storage::GraphStore`]'s default) merges
