@@ -27,6 +27,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { DataState } from "@/components/data-state";
+import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
 import { RepositoryTriage } from "@/components/showcase/repository-triage";
 import type { ShowcaseBundleSource } from "@/lib/adapters/preferred-showcase-source";
 import {
@@ -301,47 +302,68 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
   const [subtreeId, setSubtreeId] = useState(graph.repository.id);
   const [zoom, setZoom] = useState(1);
   const [selectedId, setSelectedId] = useState(graph.repository.id);
-  const subtreePackages = subtreeId === graph.repository.id
-    ? graph.packages.items
-    : graph.packages.items.filter((item) => item.id === subtreeId);
-  // Sort by id before truncating so the displayed slice — and therefore the
-  // shared seeded layout fed by it — is independent of input array order
-  // (ADR-153 D4).
-  const displayedPackages = [...subtreePackages].sort((left, right) => left.id.localeCompare(right.id)).slice(0, 8);
-  const selectablePackages = graph.packages.items.slice(0, UI_ROW_LIMIT);
-  const displayedPackageIds = new Set(displayedPackages.map((item) => item.id));
-  const subtreeModules = graph.modules.items.filter((item) => subtreeId === graph.repository.id || item.package_id === subtreeId);
-  const displayedModules = subtreeModules.filter((item) => displayedPackageIds.has(item.package_id))
-    .sort((left, right) => left.id.localeCompare(right.id))
-    .slice(0, 42);
-  const visibleIds = new Set([
-    graph.repository.id,
-    ...displayedPackages.map((item) => item.id),
-    ...displayedModules.map((item) => item.id),
-  ]);
-  const visibleEdges = graph.structure_edges.items.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
-  const displayedEdges = visibleEdges.slice(0, UI_GRAPH_EDGE_LIMIT);
-  const layoutNodes = [
-    { id: graph.repository.id },
-    ...displayedPackages.map((item) => ({ id: item.id })),
-    ...displayedModules.map((item) => ({ id: item.id })),
-  ];
-  const layoutEdges = [
-    ...displayedPackages.map((item) => ({
-      id: `contains-${graph.repository.id}-${item.id}`,
-      source: graph.repository.id,
-      target: item.id,
-    })),
-    ...displayedModules.map((item) => ({
-      id: `contains-${item.package_id}-${item.id}`,
-      source: item.package_id,
-      target: item.id,
-    })),
-    ...displayedEdges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target })),
-  ];
-  const positions = new Map(
-    settleGraphLayout(layoutNodes, layoutEdges).map((node) => [node.id, { x: node.x, y: node.y }]),
-  );
+  const {
+    subtreePackageCount,
+    displayedPackages,
+    selectablePackages,
+    subtreeModuleCount,
+    displayedModules,
+    displayedEdges,
+    visibleIds,
+    positions,
+  } = useMemo(() => {
+    const subtreePackages = subtreeId === graph.repository.id
+      ? graph.packages.items
+      : graph.packages.items.filter((item) => item.id === subtreeId);
+    // Sort by id before truncating so the displayed slice — and therefore the
+    // shared seeded layout fed by it — is independent of input array order
+    // (ADR-153 D4).
+    const displayedPackages = [...subtreePackages].sort((left, right) => left.id.localeCompare(right.id)).slice(0, 8);
+    const selectablePackages = graph.packages.items.slice(0, UI_ROW_LIMIT);
+    const displayedPackageIds = new Set(displayedPackages.map((item) => item.id));
+    const subtreeModules = graph.modules.items.filter((item) => subtreeId === graph.repository.id || item.package_id === subtreeId);
+    const displayedModules = subtreeModules.filter((item) => displayedPackageIds.has(item.package_id))
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .slice(0, 42);
+    const visibleIds = new Set([
+      graph.repository.id,
+      ...displayedPackages.map((item) => item.id),
+      ...displayedModules.map((item) => item.id),
+    ]);
+    const visibleEdges = graph.structure_edges.items.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
+    const displayedEdges = visibleEdges.slice(0, UI_GRAPH_EDGE_LIMIT);
+    const layoutNodes = [
+      { id: graph.repository.id },
+      ...displayedPackages.map((item) => ({ id: item.id })),
+      ...displayedModules.map((item) => ({ id: item.id })),
+    ];
+    const layoutEdges = [
+      ...displayedPackages.map((item) => ({
+        id: `contains-${graph.repository.id}-${item.id}`,
+        source: graph.repository.id,
+        target: item.id,
+      })),
+      ...displayedModules.map((item) => ({
+        id: `contains-${item.package_id}-${item.id}`,
+        source: item.package_id,
+        target: item.id,
+      })),
+      ...displayedEdges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target })),
+    ];
+    const positions = new Map(
+      settleGraphLayout(layoutNodes, layoutEdges).map((node) => [node.id, { x: node.x, y: node.y }]),
+    );
+    return {
+      subtreePackageCount: subtreePackages.length,
+      displayedPackages,
+      selectablePackages,
+      subtreeModuleCount: subtreeModules.length,
+      displayedModules,
+      displayedEdges,
+      visibleIds,
+      positions,
+    };
+  }, [graph, subtreeId]);
   const degrees = new Map<string, number>();
   const fanIn = new Map<string, number>();
   const fanOut = new Map<string, number>();
@@ -510,8 +532,8 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
           ))}
         </ul>
         <LocalSliceDisclosure shown={displayedEdges.length} total={graph.structure_edges.items.length} label={capability.views.structure_graph.label} labels={labels} />
-        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackages.length} label={labels.node_types.package} labels={labels} />
-        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModules.length} label={labels.node_types.module} labels={labels} />
+        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackageCount} label={labels.node_types.package} labels={labels} />
+        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModuleCount} label={labels.node_types.module} labels={labels} />
       </div>
       <BoundDisclosure page={graph.packages} labels={labels} />
       <BoundDisclosure page={graph.modules} labels={labels} />
@@ -1039,6 +1061,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
   }> | null>(null);
   const [navigationStatus, setNavigationStatus] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
+  const overviewRef = useRef<HTMLElement>(null);
   const dashboardRef = useRef<HTMLDivElement>(null);
   const copyLinkRef = useRef<HTMLButtonElement>(null);
 
@@ -1262,11 +1285,27 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       block: "start",
     });
   }
+
+  function openModuleFromPalette(moduleId: string) {
+    selectModule(moduleId);
+    const inspector = overviewRef.current?.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    );
+    if (!inspector) return;
+    inspector.focus({ preventScroll: true });
+    const reduceMotion = window.matchMedia?.(
+      "(prefers-reduced-motion: reduce)",
+    ).matches ?? false;
+    inspector.scrollIntoView?.({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  }
   return (
-    <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
+    <article ref={overviewRef} className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
       <header className="repo-overview-heading">
         <div className="repo-identity"><span className="repo-avatar"><Package aria-hidden="true" /></span><div><span>{repository.host} · {availabilityText(repository.default_branch, capability.labels)}</span><strong>{repository.owner}/{repository.name}</strong></div></div>
-        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span><button ref={copyLinkRef} type="button" className="repo-copy-link" onClick={copyInvestigationLink}><Copy aria-hidden="true" /> Copy investigation link</button>{copyStatus && <span role="status" className="repo-copy-status">{copyStatus}</span>}</div>
+        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span><RepositoryCommandPalette bundle={bundle} activeView={activeView} selectedModuleId={selectedModuleId} onSelectModule={openModuleFromPalette} onSelectView={openAnalysis} onCopyLink={copyInvestigationLink} /><button ref={copyLinkRef} type="button" className="repo-copy-link" onClick={copyInvestigationLink}><Copy aria-hidden="true" /> Copy investigation link</button>{copyStatus && <span role="status" className="repo-copy-status">{copyStatus}</span>}</div>
       </header>
       <section className="repo-capability-strip" aria-label={capability.labels.product}>
         <div><ShieldCheck aria-hidden="true" /><div><strong>{capability.labels.product}</strong><span>{capability.mode}</span></div></div>
