@@ -3270,7 +3270,13 @@ impl KhiveRuntime {
             note = note.with_properties(p);
         }
 
-        let inserted = self.notes(token)?.try_insert_note(note.clone()).await?;
+        // Bypasses the `notes()` accessor's PolicyEnforcingNoteStore wrapper —
+        // the reserved-transport-property check above already enforces the
+        // identical policy, conditionally allowing the trusted-ingest path,
+        // so this reaches storage directly rather than duplicate the check
+        // through a wrapper that cannot see the trust decision this function
+        // just made.
+        let inserted = self.raw_notes(token)?.try_insert_note(note.clone()).await?;
         if !inserted {
             return Ok(None);
         }

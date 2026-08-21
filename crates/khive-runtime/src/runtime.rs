@@ -537,7 +537,29 @@ impl KhiveRuntime {
     }
 
     /// Get a NoteStore scoped to the token's namespace.
+    ///
+    /// Wrapped in [`crate::note_store_guard::PolicyEnforcingNoteStore`], which
+    /// refuses any insert/upsert of a `kind = "message"` note carrying
+    /// `quarantined` / `channel_kind` / `channel_slug` — the transport-owned
+    /// evidence `comm.health` trusts at face value. The trusted channel-ingest
+    /// path does not go through this accessor; see
+    /// [`Self::raw_notes`] and [`Self::try_create_note_as_trusted_ingest`].
     pub fn notes(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn NoteStore>> {
+        Ok(crate::note_store_guard::PolicyEnforcingNoteStore::wrap(
+            self.raw_notes(token)?,
+        ))
+    }
+
+    /// Get the unwrapped, policy-free NoteStore scoped to the token's namespace.
+    ///
+    /// Bypasses [`crate::note_store_guard::PolicyEnforcingNoteStore`]. Callers
+    /// within this crate that have already enforced the reserved-transport-
+    /// property policy themselves (namely `try_create_note_impl`, which
+    /// applies it conditionally based on whether the caller presented a
+    /// [`crate::pack::ChannelIngestCapability`]) use this to reach storage
+    /// directly rather than run a redundant, less-informed check. Not exposed
+    /// outside this crate — every other caller must use [`Self::notes`].
+    pub(crate) fn raw_notes(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn NoteStore>> {
         Ok(self
             .backend
             .notes_for_namespace(token.namespace().as_str())?)
@@ -1077,19 +1099,31 @@ impl KhiveRuntime {
     /// and `atomic_message::create_notes_atomic_with_report` (the atomic
     /// multi-note writer).
     ///
-    /// NOT covered: `try_create_note` (`operations.rs`), and the raw
-    /// `try_insert_note` / `upsert_note` methods on the [`NoteStore`] returned
-    /// by [`notes`](Self::notes). `try_create_note` is deliberately excluded —
-    /// its only caller path is `comm.ingest`, where `properties.from_actor` is
-    /// the external transport sender named by the `from` parameter, not the
-    /// authenticated caller, and where transport-owned quarantine/channel
-    /// properties are legitimately established. Running the generic validator
-    /// there would stamp every inbound message as the ingesting daemon and
-    /// reject the evidence the trusted ingest handler just derived. The
-    /// `NoteStore` accessors are a lower-level storage
-    /// escape hatch with no properties-derivation contract of their own; a
-    /// caller reaching storage directly is expected to have already decided
-    /// what `properties` to write.
+    /// NOT covered by this validator: `try_create_note` (`operations.rs`).
+    /// `try_create_note` is deliberately excluded — its only caller path is
+    /// `comm.ingest`, where `properties.from_actor` is the external transport
+    /// sender named by the `from` parameter, not the authenticated caller,
+    /// and where transport-owned quarantine/channel properties are
+    /// legitimately established. Running the generic validator there would
+    /// stamp every inbound message as the ingesting daemon and reject the
+    /// evidence the trusted ingest handler just derived. `try_create_note`
+    /// instead runs its own narrower reserved-transport-property check
+    /// inline (`operations.rs`'s `try_create_note_impl`), which allows the
+    /// three `message`-kind transport properties only when called through
+    /// [`Self::try_create_note_as_trusted_ingest`] with a
+    /// [`crate::pack::ChannelIngestCapability`].
+    ///
+    /// The `NoteStore` returned by [`notes`](Self::notes) is covered by a
+    /// different, narrower mechanism: it is wrapped in
+    /// [`crate::note_store_guard::PolicyEnforcingNoteStore`], which refuses
+    /// `upsert_note` / `upsert_notes` / `try_insert_note` /
+    /// `replace_note_if_unchanged` calls that would write a `kind = "message"`
+    /// note carrying `quarantined` / `channel_kind` / `channel_slug` —
+    /// unconditionally, since that public accessor has no way to see a trust
+    /// decision. `try_create_note_impl` itself reaches storage through
+    /// [`Self::raw_notes`], the unwrapped accessor, so its own inline check
+    /// (which can legitimately allow those properties for trusted ingest)
+    /// is not double-enforced or contradicted by the wrapper.
     /// Register a pack-defined custom fusion strategy under `name` (ADR-012).
     ///
     /// Unlike `install_entity_type_validator`/`install_note_mutation_hook`,

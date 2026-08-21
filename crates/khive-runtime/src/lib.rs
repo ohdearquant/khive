@@ -21,6 +21,7 @@ pub mod engine_config;
 pub mod error;
 pub mod fusion;
 pub mod graph_traversal;
+mod note_store_guard;
 pub mod objectives;
 pub mod operations;
 pub mod pack;
