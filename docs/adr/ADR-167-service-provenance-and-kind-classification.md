@@ -216,13 +216,16 @@ matrix, so an org-contained service cannot simply be recreated as a concept. Eve
 therefore be classified against ADR-002's matrix BEFORE anything is deleted, into exactly four
 dispositions, each of which must be written down per edge:
 
-- **PRESERVE** — the triple is legal under the new kind, and an id-preserving endpoint move
-  (ADR-113's `move_edge_endpoint`) is available in the running system and collision-free for this
-  edge. The edge moves onto the new record with its id intact, so every annotation targeting it —
-  however deep in the closure — stays valid with no re-anchoring. Preferred over RECREATE wherever
-  it qualifies. It exempts nothing: the edge still appears in the closure enumeration, its
-  disposition is still written down, and the move still executes inside the same atomic plan as
-  the rest of the correction.
+- **PRESERVE** — the resulting triple is legal, and an id-preserving endpoint move (ADR-113's
+  `move_edge_endpoint`) is available in the running system and collision-free for this edge. The
+  edge keeps its id while exactly one endpoint moves: for an incident edge, the migrating-record
+  endpoint moves onto the new record; for a closure member, the target moves to its annotated
+  subject's mapped replacement — a closure member is never moved onto the new record. A closure
+  member whose subject is itself preserved needs no move at all: its target id is still valid.
+  Because the id survives, every annotation targeting a PRESERVEd edge stays valid with no
+  re-anchoring. Preferred over RECREATE wherever it qualifies. It exempts nothing: the edge still
+  appears in the closure enumeration, its disposition is still written down, and any move still
+  executes inside the same atomic plan as the rest of the correction.
 - **RECREATE** — the triple is legal under the new kind. Recreate and read back.
 - **RE-EXPRESS** — the triple is illegal but the fact survives under a different relation or a
   different endpoint. Name the replacement triple and why it carries the same claim.
@@ -268,8 +271,8 @@ With those settled, a kind correction:
    recreated or re-expressed edge maps to its planned replacement within the plan, a deleted edge
    maps to a named deletion. Every `annotates` edge's re-anchor target is then read off that map,
    never assumed: an annotation of the record itself re-anchors to the new record; an annotation
-   of a closure edge re-anchors to that edge's mapped replacement — the recreated edge, never the
-   new record; an annotation whose subject maps to a deletion is itself deleted or re-anchored to
+   of a closure edge re-anchors to that edge's mapped replacement — the edge itself when
+   preserved, its recreation when recreated, never the new record; an annotation whose subject maps to a deletion is itself deleted or re-anchored to
    a named carrier. A note left pointing at a deleted subject is not an acceptable outcome. **Any
    REFUSE stops here.**
 4. Prepares deletion and all recreations as ONE atomic plan, commits it, and reads back every recreated
@@ -375,8 +378,11 @@ this ADR is complete when all of the following hold:
 - Edge-as-endpoint coverage: the fixture includes an `annotates` edge whose TARGET is itself an
   edge incident to the migrating record, and a second-level chain — a note whose `annotates`
   edge targets that first `annotates` edge. The closure enumeration finds both levels, and
-  after migration each annotation is re-anchored to the recreated edge's new id (or deleted
-  with a recorded disposition) — never left pointing at a purged edge id. A migration
+  after migration every annotation's target is asserted by the replacement map's outcome for
+  its subject: a PRESERVEd subject keeps its original id and the annotation still points at
+  it; a recreated or re-expressed subject's annotation points at the mapped replacement id;
+  a deleted subject's annotation follows its recorded deletion-or-carrier disposition. No
+  annotation points at a purged edge id under any disposition mix. A migration
   prepared from a one-level enumeration must be refused, for the same reason the four-row
   visible/live enumeration above is refused.
 - Disposition gate: a fixture edge with no legal expression under the new kind (for example
