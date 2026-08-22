@@ -237,14 +237,14 @@ kinds as constructible, queryable, or enumerable is a misreading of this ADR. Th
 `ADR-163` rows additionally require `docs/adr/ADR-163-restart-boundary-event-legibility.md`
 itself to move from Proposed to Accepted.
 
-| #  | EventKind                                                                       | Site / verb discriminator                                       | Retention class           | Correlation key | Referent / terminal condition                                                                                                                 |
-| -- | ------------------------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| 47 | `RestartScanOpened` (ADR-163; not yet in `EventKind::ALL`)                      | Boot scan, emitted before any per-record event.                 | `age_archivable`          | `boot_id`       | Runtime-system-actor telemetry once complete; see §1's completeness rule: this unit is ineligible until row 49 exists for the same `boot_id`. |
-| 48 | `RecordTerminatedAtRestart` (ADR-163; not yet in `EventKind::ALL`)              | Boot scan, one per terminated record.                           | `age_archivable`          | `boot_id`       | Same unit as rows 47/49.                                                                                                                      |
-| 49 | `RestartScanClosed` (ADR-163; not yet in `EventKind::ALL`)                      | Boot scan, emitted after per-record events.                     | `age_archivable`          | `boot_id`       | Same unit; this event's presence is what makes the unit complete.                                                                             |
-| 50 | `ArchiveSegmentSealed` (this ADR, §5; not yet in `EventKind::ALL`)              | Archival worker, one per sealed segment.                        | `pinned_while_referenced` | none            | Referent: the segment. Terminal: destruction of the segment (§6).                                                                             |
-| 51 | `ArchiveRowsPruned` (this ADR, §5; not yet in `EventKind::ALL`)                 | Archival worker, one per prune.                                 | `pinned_while_referenced` | none            | Same shape as row 50.                                                                                                                         |
-| 52 | `ArchiveSegmentAccessAttempted` (this ADR, §5, §6; not yet in `EventKind::ALL`) | Operator unseal/restore/replace/delete action, one per attempt. | `pinned_while_referenced` | none            | Same shape as row 50.                                                                                                                         |
+| #  | EventKind                                                                       | Site / verb discriminator                                                                                                                      | Retention class           | Correlation key | Referent / terminal condition                                                                                                                 |
+| -- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| 47 | `RestartScanOpened` (ADR-163; not yet in `EventKind::ALL`)                      | Boot scan, emitted before any per-record event.                                                                                                | `age_archivable`          | `boot_id`       | Runtime-system-actor telemetry once complete; see §1's completeness rule: this unit is ineligible until row 49 exists for the same `boot_id`. |
+| 48 | `RecordTerminatedAtRestart` (ADR-163; not yet in `EventKind::ALL`)              | Boot scan, one per terminated record.                                                                                                          | `age_archivable`          | `boot_id`       | Same unit as rows 47/49.                                                                                                                      |
+| 49 | `RestartScanClosed` (ADR-163; not yet in `EventKind::ALL`)                      | Boot scan, emitted after per-record events.                                                                                                    | `age_archivable`          | `boot_id`       | Same unit; this event's presence is what makes the unit complete.                                                                             |
+| 50 | `ArchiveSegmentSealed` (this ADR, §5; not yet in `EventKind::ALL`)              | Archival worker, one per sealed segment.                                                                                                       | `pinned_while_referenced` | none            | Referent: the segment. Terminal: destruction of the segment (§6).                                                                             |
+| 51 | `ArchiveRowsPruned` (this ADR, §5; not yet in `EventKind::ALL`)                 | Archival worker, one per prune.                                                                                                                | `pinned_while_referenced` | none            | Same shape as row 50.                                                                                                                         |
+| 52 | `ArchiveSegmentAccessAttempted` (this ADR, §5, §6; not yet in `EventKind::ALL`) | Operator unseal/restore/replace/delete action: one attempt row per attempt, plus one completion row when an allowed action's effect runs (§5). | `pinned_while_referenced` | none            | Same shape as row 50.                                                                                                                         |
 
 ### 3. Archival is copy-then-seal-then-verify; the plane as a whole stays append-only
 
@@ -326,22 +326,23 @@ for a given kind, it remains a Table B row (§2) and is not part of the closed p
   appended before the delete executes. Retention class: `pinned_while_referenced`,
   referent the segment; terminal condition: destruction of the segment.
 - **`ArchiveSegmentAccessAttempted`**: appended for every unseal, restore, replace, or
-  delete attempt against a sealed segment (§6), success or failure. A denied attempt and
-  an allowed `unseal`/`restore` each produce exactly one row (`stage: "attempt"`). An
-  allowed `replace_segment` or `delete_segment` produces exactly two rows sharing one
-  `attempt_id`: an attempt row appended before the effect and a completion row appended
-  after the effect concludes — the event plane is append-only (§1), so the effect's final
-  outcome is carried by its own row, never by mutating the attempt row. Typed payload:
+  delete attempt against a sealed segment (§6), success or failure. A denied attempt
+  produces exactly one row (`stage: "attempt"`), as does an allowed `unseal`/`restore`
+  whose digest verification fails (no effect runs). Every allowed attempt whose effect
+  runs produces exactly two rows sharing one `attempt_id`: an attempt row appended before
+  the effect and a completion row appended after the effect concludes — the event plane is
+  append-only (§1), so the effect's final outcome is carried by its own row, never by
+  mutating the attempt row. Typed payload:
 
   | Field                         | Type                                                             | Nullable | Semantics                                                                                                                                                                                                                                                                                                                                                                                                                       |
   | ----------------------------- | ---------------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
   | `segment_id`                  | `Uuid`                                                           | no       | The segment the attempt targets.                                                                                                                                                                                                                                                                                                                                                                                                |
   | `attempt_id`                  | `Uuid`                                                           | no       | Unique per attempt; identical on an attempt row and its completion row, which is how a reader joins the pair (§6).                                                                                                                                                                                                                                                                                                              |
-  | `stage`                       | `"attempt" \| "completion"`                                      | no       | `attempt` rows are appended before the action's effect (the precondition posture below). `completion` rows exist only for an allowed `replace_segment` or `delete_segment` and are appended after the effect concludes, carrying its outcome evidence (§6).                                                                                                                                                                     |
+  | `stage`                       | `"attempt" \| "completion"`                                      | no       | `attempt` rows are appended before the action's effect (the precondition posture below). `completion` rows exist for every allowed action whose effect ran, are appended after the effect concludes, and carry its outcome evidence (§6).                                                                                                                                                                                       |
   | `action`                      | `"unseal" \| "restore" \| "replace_segment" \| "delete_segment"` | no       | The canonical action attempted; `replace_segment` and `delete_segment` are distinguishable by this value alone (§6).                                                                                                                                                                                                                                                                                                            |
   | `gate_decision`               | `"allow" \| "deny"`                                              | no       | The Gate's decision for this attempt (ADR-018).                                                                                                                                                                                                                                                                                                                                                                                 |
   | `digest_verified`             | `"true" \| "false" \| "unknown"`                                 | no       | Tri-state, present for every action. See below for the required value per action and outcome.                                                                                                                                                                                                                                                                                                                                   |
-  | `replacement_segment_id`      | `Uuid`                                                           | yes      | Identity of the replacement segment (§6). Required on both rows of an allowed `replace_segment` (it is known before the effect: the replacement is sealed per §3 before this action runs); null for `unseal`, `restore`, and `delete_segment`.                                                                                                                                                                                  |
+  | `replacement_segment_id`      | `Uuid`                                                           | yes      | Identity of the replacement segment (§6). Required on both rows of an allowed `replace_segment` (it is known before the effect: the replacement is sealed per §3 before this action runs); null for `unseal`, `restore`, and `delete_segment`, and null on a denied `replace_segment` attempt — a denied request's replacement-only fields are all null, whatever the request supplied.                                         |
   | `pre_replace_digest`          | `String`                                                         | yes      | Content digest of the segment being replaced, read from its manifest, not recomputed (§6). Same nullability as `replacement_segment_id`.                                                                                                                                                                                                                                                                                        |
   | `post_replace_digest`         | `String`                                                         | yes      | Content digest of the replacement segment, from its own `ArchiveSegmentSealed` manifest (§6). Same nullability as `replacement_segment_id`.                                                                                                                                                                                                                                                                                     |
   | `manifest_version`            | `i64`                                                            | yes      | Version of the manifest that publishes the supersession pointer from the original `segment_id` to `replacement_segment_id` (§6). Completion rows only: set when and only when the version pointer was written; null on attempt rows and on a completion row whose failure preceded the pointer write.                                                                                                                           |
@@ -365,6 +366,9 @@ for a given kind, it remains a Table B row (§2) and is not part of the closed p
     comparison to report for these two actions, allowed or denied. `replace_segment`'s own
     verification result is carried by `replace_verification_status`, above — a distinct
     field, not an overload of `digest_verified`.
+  - **`unknown`** is the value on **every completion row**, for all four actions: a digest
+    comparison happens at most once per attempt, before the effect, and its outcome lives
+    on the attempt row that made it; a completion row reports the effect, not a comparison.
 
   Attribution: the operator principal the Gate resolved for the request (ADR-162 §2's
   dispatched-actor form: this is an explicit operator action, not background daemon work,
@@ -456,9 +460,11 @@ Amendment 3 exactly as it refuses any other dispatch.
 
 Every attempt at any of the four actions, whether the Gate allows or denies it and,
 for open/restore, whether the digest comparison passes, emits `ArchiveSegmentAccessAttempted`
-(§5) before the action's effect, if any, is allowed to proceed. This is what makes the
-audit mandatory rather than advisory: an implementation that performs the action first and
-records the attempt afterward, or only on success, does not implement this section.
+(§5) before the action's effect, if any, is allowed to proceed — with one carve-out,
+stated below: an attempt whose audit append itself fails emits nothing and performs
+nothing. This is what makes the audit mandatory rather than advisory: an implementation
+that performs the action first and records the attempt afterward, or only on success,
+does not implement this section.
 
 **Lifecycle order, stated exactly, for both outcomes:**
 
@@ -472,9 +478,12 @@ records the attempt afterward, or only on success, does not implement this secti
   `digest_verified` is set to the comparison's actual result (`"true"` or `"false"`); if it
   cannot complete (for example, a read error against the segment media),
   `digest_verified: "unknown"` → the effect (serve the resolved segment for `unseal`; copy
-  rows to the restore destination for `restore`) runs only if `digest_verified: "true"`.
-  These two actions produce no completion row: every fact their audit reports is
-  determined before the effect, so the single attempt row is complete evidence.
+  rows to the restore destination for `restore`) runs only if `digest_verified: "true"` →
+  when the effect runs, a completion row is appended (`stage: "completion"`, same
+  `attempt_id`, `gate_decision: "allow"`, `digest_verified: "unknown"`) whose outcome is
+  `EventOutcome::Success` when the serve or copy completed and `EventOutcome::Error` when
+  it failed after release. A verification failure produces no completion row: the effect
+  never ran, and the attempt row already carries that failure durably.
 - **Allow path, replace/delete:** Gate decision (`allow`) → attempt row appended
   (`stage: "attempt"`, `gate_decision: "allow"`, `digest_verified: "unknown"`, outcome
   `EventOutcome::Success` — on an attempt row, `Success` asserts exactly that the attempt
@@ -495,17 +504,26 @@ structured tracing plus `EventStore` persistence), and the call returns an error
 caller rather than serving the segment's rows from an unverified read. Nothing in this path
 substitutes a partial or unverified read for a verified one. An open or restore whose
 verification passes records outcome `EventOutcome::Success` with
-`digest_verified: "true"`; on this row, `Success` asserts exactly that the segment was
-verified and released for the action, which is everything determined at append time. The
-serve or copy that follows reports its own failure to the caller through the operation
-result — it reads the sealed segment without mutating it, so a post-release failure leaves
-the segment's audit trail complete and (for restore) the destination reconcilable by
-re-running the restore.
+`digest_verified: "true"` on its attempt row; on this row, `Success` asserts exactly that
+the segment was verified and released for the action, which is everything determined at
+append time. The serve or copy that follows carries its own outcome on the completion row
+— `Success` when it completed, `Error` when it failed after release — and reports any
+failure to the caller through the operation result as well. The effect reads the sealed
+segment without mutating it, so a post-release failure leaves the segment intact and (for
+restore) the destination reconcilable by re-running the restore.
 
-For replace and delete, the **completion row** carries the effect's outcome; the attempt
-row never does. A replace whose full sequence succeeds — replacement sealing and its own
-`ArchiveSegmentSealed` verification, this action's pre-publish re-verification, and the
-version-pointer write — appends a completion row with `EventOutcome::Success`,
+For every action, the **completion row** carries the effect's outcome; the attempt row
+never does. For replace and delete in particular: replacement sealing is not a step of
+the replace sequence: the
+replacement is copied, sealed, and verified per §3 **before** this action runs (§6's
+replace definition), its failures are reported by the sealing path itself, and a
+replacement that was never successfully sealed cannot be named by a replace attempt at
+all — there is no `replacement_segment_id` to record, so no attempt row for such a
+request exists and the request is refused outright. The replace sequence this event
+audits therefore begins after admission, with a sealed replacement in hand:
+`post_replace_digest` is always readable from the replacement's own manifest on both
+rows. A replace whose sequence succeeds — this action's pre-publish re-verification and
+the version-pointer write — appends a completion row with `EventOutcome::Success`,
 `replace_verification_status: "verified"`, and `manifest_version` set; a `Success`
 completion row with any other verification status is unrepresentable under these
 definitions, since the sequence cannot succeed without the re-verification passing. A
@@ -513,10 +531,10 @@ delete that destroys the segment's media appends a completion row with
 `EventOutcome::Success` and `terminal_disposition: "destroyed"`. A failure at any step of
 the replace sequence appends a completion row with `EventOutcome::Error`, with
 `replace_verification_status` stating strictly how far the re-verification itself got —
-`not_attempted` when the failure preceded it (for example, replacement sealing),
-`failed` when it ran and mismatched, `verified` when it passed and a later step (the
-version-pointer write) failed — and `manifest_version` set only if the pointer write
-happened. A failed delete (media destruction does not complete) appends a completion row
+`not_attempted` when the failure preceded it (for example, reading the replacement's
+manifest back at re-verification setup), `failed` when it ran and mismatched, `verified`
+when it passed and a later step (the version-pointer write) failed — and
+`manifest_version` set only if the pointer write happened. A failed delete (media destruction does not complete) appends a completion row
 with `EventOutcome::Error` and `terminal_disposition` left null. `digest_verified` stays
 `"unknown"` on both rows of replace and delete, allowed or denied, per §5 — neither action
 reads current segment content, so no comparison outcome ever applies to it.
@@ -526,14 +544,29 @@ stated above: if the durable append of the **attempt row** fails, none of the fo
 effects may proceed — `unseal`/`restore` serve nothing, and `replace_segment`/
 `delete_segment` perform no mutation — the same fail-closed rule §5 already states for
 `ArchiveSegmentSealed`/`ArchiveRowsPruned` ("if the append fails, the prune does not run").
+An attempt whose audit append fails leaves **no event row**: within the event plane it is
+indistinguishable from no attempt having been made. That is an intentional availability
+limitation, stated rather than papered over — the audit store is a gating dependency, so
+its unavailability blocks the action instead of letting it run unaudited, and the
+operation reports the append failure to its caller as the action's error, and MUST also
+log it at error level through the host tracing sink (the same two-sink discipline the
+digest-failure path uses); the caller-visible failure plus that tracing record is the
+case's signature. The "every attempt emits" rule above
+therefore reads: no attempt proceeds unrecorded, and every attempt the audit store could
+record is recorded.
 The completion append cannot gate an effect that has already run: if it fails, or the
 process dies mid-effect, the operation reports an error to its caller, and the durable
-signature is an attempt row with no completion row under its `attempt_id`. An auditor
-reads that signature as "admitted, final outcome not recorded" — never as success — and
-resolves what actually happened from the manifest chain and segment media state (§6's
-replace and delete steps each leave that state unambiguous at every failure point).
-Re-appending a completion row for the same `attempt_id` after recovery is permitted;
-mutating either existing row is not.
+signature is an attempt row **that expected a completion** with no completion row under
+its `attempt_id`. Which attempt rows expect one is decidable from the attempt row alone:
+a denied attempt and a failed-verification `unseal`/`restore` attempt (outcome `Denied`
+or `Error`) expect none; an attempt row whose outcome admitted the effect expects exactly
+one. An auditor reads the missing-completion signature as "admitted, final outcome not
+recorded" — never as success — and resolves what actually happened from the state the
+action touches: the manifest chain and segment media for replace and delete (§6's steps
+leave that state unambiguous at every failure point), the restore destination for
+restore, and nothing for unseal, whose effect mutates no durable state. Re-appending a
+completion row for the same `attempt_id` after recovery is permitted; mutating either
+existing row is not.
 
 ### 7. The query surface states what retention did — two additive behaviours on ADR-022
 
