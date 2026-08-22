@@ -353,6 +353,75 @@ describe("repository triage model", () => {
     });
   });
 
+  it("reports truncated attention coverage when an input analysis is capped", () => {
+    const brief = buildRepositoryBrief(bundle);
+
+    expect(bundle.aggregates.hidden_coupling.data.truncated).toBe(true);
+    expect(brief.attentionState.status).toBe("truncated");
+    expect(brief.attentionState.reason).toContain(
+      "section limited to 1000 items",
+    );
+  });
+
+  it("treats a page carrying a pagination cursor as incomplete even when its disclosure reports complete", () => {
+    const cursorPage = structuredClone(bundle);
+    cursorPage.aggregates.hidden_coupling.data.truncated = false;
+    cursorPage.aggregates.hidden_coupling.data.disclosure = {
+      status: "complete",
+      reason: null,
+    };
+    cursorPage.aggregates.hidden_coupling.data.next_cursor = "offset:1000";
+
+    const brief = buildRepositoryBrief(cursorPage);
+    const coupling = brief.attentionSignals.find(
+      (signal) => signal.kind === "hidden_coupling",
+    );
+    const coverage = coupling?.evidence.find((item) =>
+      item.label === "Coverage"
+    );
+
+    expect(coverage?.value).toContain("Truncated");
+    expect(coverage?.value).toContain(
+      "Additional items are available beyond this page.",
+    );
+
+    // The metric path must carry the same cursor-aware default reason as the
+    // evidence path, and the attention rollup must surface it rather than
+    // falling back to the generic aggregate text.
+    expect(brief.attentionState.status).toBe("truncated");
+    expect(brief.attentionState.reason).toContain(
+      "Additional items are available beyond this page.",
+    );
+    const target = buildRepositoryBrief(bundle).startHere[0];
+    const insight = buildModuleInsight(cursorPage, target.moduleId);
+    expect(insight?.couplingState).toMatchObject({
+      status: "truncated",
+      reason: "Additional items are available beyond this page.",
+    });
+  });
+
+  it("keeps the unknown-total reason on a cursor-bearing page instead of the generic continuation text", () => {
+    const cursorUnknownTotal = structuredClone(bundle);
+    cursorUnknownTotal.aggregates.hidden_coupling.data.truncated = false;
+    cursorUnknownTotal.aggregates.hidden_coupling.data.disclosure = {
+      status: "complete",
+      reason: null,
+    };
+    cursorUnknownTotal.aggregates.hidden_coupling.data.next_cursor =
+      "offset:1000";
+    cursorUnknownTotal.aggregates.hidden_coupling.data.total_count = {
+      status: "unavailable",
+      reason: "total not computed for this export",
+    };
+
+    const target = buildRepositoryBrief(bundle).startHere[0];
+    const insight = buildModuleInsight(cursorUnknownTotal, target.moduleId);
+    expect(insight?.couplingState).toMatchObject({
+      status: "truncated",
+      reason: "total not computed for this export",
+    });
+  });
+
   it("finds a module by the path a user already knows", () => {
     const matches = findRepositoryModules(bundle, "pool.rs", 8);
     expect(matches.items.length).toBeGreaterThan(0);

@@ -132,6 +132,8 @@ export interface ModuleInsight {
 
 const RECENT_COMMIT_LIMIT = 12;
 const OWNERSHIP_MINIMUM_COMMITS = 5;
+const PAGE_CONTINUATION_REASON =
+  "Additional items are available beyond this page.";
 
 function compareText(left: string, right: string): number {
   if (left < right) return -1;
@@ -183,8 +185,8 @@ function pageEvidence(
       | { status: "available"; value: number }
       | { status: "unavailable"; reason: string };
     bound: { kind: "all" | "top_n"; max_items: number; order: string };
-    truncated: boolean;
     next_cursor?: string | null;
+    truncated: boolean;
     disclosure: {
       status: "complete" | "truncated" | "unavailable";
       reason?: string | null;
@@ -195,14 +197,16 @@ function pageEvidence(
   const total = page.total_count.status === "available"
     ? `${page.total_count.value} declared`
     : `total ${labels.unavailable}`;
-  const reasonSuffix = page.disclosure.reason
-    ? `: ${page.disclosure.reason}`
-    : "";
-  const status = page.disclosure.status === "unavailable"
-    ? `${labels.unavailable}${reasonSuffix}`
-    : page.disclosure.status === "truncated" || page.next_cursor != null
-    ? `${labels.truncated}${reasonSuffix}`
-    : "complete";
+  const hasUnseenPage = page.next_cursor != null &&
+    page.disclosure.status === "complete";
+  const disclosureStatus = hasUnseenPage ? "truncated" : page.disclosure.status;
+  const reason = page.disclosure.reason ??
+    (hasUnseenPage ? PAGE_CONTINUATION_REASON : null);
+  const status = disclosureStatus === "complete"
+    ? "complete"
+    : `${
+      disclosureStatus === "truncated" ? labels.truncated : labels.unavailable
+    }${reason ? `: ${reason}` : ""}`;
   return {
     label,
     value: `${page.items.length} present, ${total}; ${status}`,
@@ -252,6 +256,8 @@ function pageMetric(
   const reason = page.disclosure.reason ??
     (status !== "complete" && page.total_count.status === "unavailable"
       ? page.total_count.reason
+      : status === "truncated" && page.next_cursor != null
+      ? PAGE_CONTINUATION_REASON
       : null);
   const reasonSuffix = reason ? `; ${reason}` : "";
   const summary = status === "complete"
