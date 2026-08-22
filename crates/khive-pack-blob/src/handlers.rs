@@ -7,10 +7,9 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use khive_runtime::daemon::MAX_FRAME_BYTES;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::blob::ContentRef;
 use khive_storage::BlobStore;
-use tokio::sync::Semaphore;
 
 /// Ceiling on the size of any object this verb surface will hydrate into
 /// memory, on either the write path (`blob.put`'s decoded size) or the read
@@ -22,23 +21,13 @@ use tokio::sync::Semaphore;
 /// smaller limit than `blob.put` would strand an object callers put through
 /// this very server.
 ///
-/// Set to ADR-111's 64 MiB v1 object ceiling (`docs/adr/ADR-111-blob-store.md`
-/// Amendment 2, "the existing whole-buffer trait is accepted for S3 v1 up to
-/// 64 MiB per object"), matching `khive_db::stores::blob_s3::MAX_OBJECT_BYTES`
-/// exactly. `FsBlobStore` enforces no ceiling of its own, so this verb-level
+/// Set to ADR-111's 64 MiB v1 object ceiling (`docs/adr/ADR-111-blob-store.md`),
+/// matching `khive_db::stores::blob_s3::MAX_OBJECT_BYTES`
+/// exactly. `FsBlobStore::put` enforces no ceiling of its own, so this verb-level
 /// bound is what makes put/get behavior backend-independent: an object this
 /// surface accepts against an `FsBlobStore` install must also fit through an
 /// `S3BlobStore` install without a surprise rejection on `put`.
 const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Bounds concurrent `blob.get` hydration. A single parallel batch can issue
-/// up to 100 ops (ADR-016's batch cap); without a bound, each concurrent
-/// `blob.get` could hydrate a full `MAX_OBJECT_BYTES` object and hold its
-/// base64 encoding in memory at once. Four permits caps worst-case transient
-/// memory for concurrent get hydration at roughly
-/// `4 * MAX_OBJECT_BYTES` raw plus base64 blowup, independent of how many
-/// `blob.get` ops land in one batch.
-static GET_HYDRATION_PERMITS: Semaphore = Semaphore::const_new(4);
 
 /// Reserve for the JSON envelope around `bytes` in a `blob.get` response
 /// (`content_ref`, `size`, `range`, field names, and braces/quoting) —
@@ -58,6 +47,16 @@ fn max_returnable_raw_bytes() -> u64 {
 
 fn blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, RuntimeError> {
     runtime.blob_store().ok_or_else(|| {
+        RuntimeError::Unconfigured(
+            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or \
+             KHIVE_BLOB_ROOT)"
+                .to_string(),
+        )
+    })
+}
+
+fn blob_hydrator(runtime: &KhiveRuntime) -> Result<Arc<BlobHydrator>, RuntimeError> {
+    runtime.blob_hydrator().ok_or_else(|| {
         RuntimeError::Unconfigured(
             "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or \
              KHIVE_BLOB_ROOT)"
@@ -120,17 +119,6 @@ fn parse_range(params: &Value, verb: &str) -> Result<Option<(u64, Option<u64>)>,
     Ok(Some((offset, length)))
 }
 
-/// Digest-verify `bytes` against the ref they were stored/retrieved under.
-///
-/// The CAS backend never re-validates on read (`khive-db/src/stores/blob.rs`
-/// trusts the filesystem), so this is the one place a bit-rotted or
-/// hand-tampered object gets caught instead of silently round-tripping under
-/// a mismatched digest.
-fn verify_digest(bytes: &[u8], expected: &ContentRef) -> bool {
-    let actual = ContentRef::from_digest_bytes(blake3::hash(bytes).as_bytes());
-    &actual == expected
-}
-
 /// `blob.put` — store `bytes` (base64), returning the resulting `ContentRef`.
 /// The `bytes` field is required; a missing or non-string value is `InvalidInput`.
 ///
@@ -188,15 +176,15 @@ pub(crate) async fn handle_put(
 /// Two bounds apply before any bytes are hydrated: the requested slice
 /// (computed from `size()` when no range is given, or the range length
 /// otherwise) must fit under the daemon's `MAX_FRAME_BYTES` IPC cap once
-/// base64-encoded (`max_returnable_raw_bytes`), and hydration itself runs
-/// under `GET_HYDRATION_PERMITS` to bound worst-case concurrent memory
-/// across a batch of `blob.get` ops.
+/// base64-encoded (`max_returnable_raw_bytes`), and complete-object hydration
+/// enters the runtime's shared weighted raw-byte admission.
 pub(crate) async fn handle_get(
     runtime: &KhiveRuntime,
     _token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let store = blob_store(runtime)?;
+    let hydrator = blob_hydrator(runtime)?;
     let content_ref = parse_content_ref(&params, "blob.get")?;
     let range = parse_range(&params, "blob.get")?;
 
@@ -234,20 +222,13 @@ pub(crate) async fn handle_get(
         )));
     }
 
-    let _permit = GET_HYDRATION_PERMITS
-        .acquire()
-        .await
-        .expect("GET_HYDRATION_PERMITS is never closed");
-    let bytes = store.get(&content_ref).await?;
-    if !verify_digest(&bytes, &content_ref) {
-        return Err(RuntimeError::Internal(format!(
-            "blob.get: object stored under {content_ref} is corrupt (digest mismatch on read)"
-        )));
-    }
-
+    let verified = hydrator
+        .hydrate_verified(&content_ref, MAX_OBJECT_BYTES)
+        .await?;
+    let bytes = verified.bytes();
     let total_len = bytes.len();
     let (slice, range_out) = match range {
-        None => (bytes.as_slice(), None),
+        None => (bytes, None),
         Some((offset, length)) => {
             let offset = offset as usize;
             if offset > total_len {
@@ -265,6 +246,15 @@ pub(crate) async fn handle_get(
             )
         }
     };
+
+    if slice.len() as u64 > max_returnable {
+        return Err(RuntimeError::InvalidInput(format!(
+            "blob.get: requested slice of {} bytes would base64-encode to a response exceeding \
+             the {MAX_FRAME_BYTES}-byte daemon frame cap ({max_returnable} raw bytes max); pass \
+             a smaller range",
+            slice.len()
+        )));
+    }
 
     let mut out = json!({
         "content_ref": content_ref.to_string(),

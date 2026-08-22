@@ -2244,10 +2244,12 @@ Store bytes (base64) in the content-addressed blob store; returns the BLAKE3
 ### `blob.get` — Assertive
 
 Read an object back by `content_ref`, base64-encoded in the response, with an optional
-byte range. The object is rejected before any bytes are hydrated if it exceeds the
-64 MiB ceiling this verb will fetch, or if the requested slice would base64-encode to a
-response exceeding the daemon's IPC frame cap. Concurrent `blob.get` hydration is bounded
-by a small pack-level semaphore.
+byte range. Metadata preflight rejects an object reported above the 64 MiB ceiling before
+hydration; the backend's streaming actual-byte bound remains authoritative when metadata is
+stale or false-small. A requested slice that would base64-encode past the daemon's IPC frame
+cap is also rejected. Concurrent `blob.get` hydration is bounded by the runtime's shared
+weighted raw-byte admission; range responses still hydrate and verify the complete object
+before slicing.
 
 | Param         | Type   | Required | Notes                                                                                                                             |
 | ------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
