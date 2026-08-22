@@ -896,18 +896,24 @@ const BLOB_GC_FENCE_TRIGGER_MESSAGE: &str = "content_ref is reserved by an activ
 /// right NAMES exist in `sqlite_master`. Same-named no-op triggers (or a
 /// rewritten trigger body) would pass the name census while letting a
 /// claimed `content_ref` become live in the released-writer window, so the
-/// gate exercises the fence: inside one writer transaction it claims a
-/// sentinel digest, attempts the attachment INSERT and attachment UPDATE that
-/// the triggers must reject, requires both to fail with the triggers' own
-/// RAISE message, and deletes every probe row before the unit commits. Any
-/// other outcome — either write accepted, or rejected for a different
-/// reason — refuses the sweep with [`StorageError::Unsupported`].
+/// gate exercises the fence: inside one writer transaction it claims the
+/// all-zero sentinel AND a second random digest, and attempts the attachment
+/// INSERT and attachment UPDATE the triggers must reject for EACH claimed
+/// digest — with the second digest's arms using a different attachment shape
+/// (substrate `note`, role `evidence`), so a trigger rewrite restricted to
+/// one digest, substrate, or role fails an arm instead of passing a
+/// fixed-sentinel census. Every arm must fail with the triggers' own RAISE
+/// message, and every probe row is deleted before the unit commits. Any
+/// other outcome — a write accepted, or rejected for a different reason —
+/// refuses the sweep with [`StorageError::Unsupported`].
 async fn blob_gc_fence_probe(sql: &dyn SqlAccess) -> StorageResult<()> {
     let run = Uuid::new_v4().simple().to_string();
     blob_gc_fence_probe_with_ids(
         sql,
         format!("__blob-gc-fence-probe-insert-{run}__"),
         format!("__blob-gc-fence-probe-update-{run}__"),
+        format!("__blob-gc-fence-probe-insert2-{run}__"),
+        format!("__blob-gc-fence-probe-update2-{run}__"),
         format!("__fence_probe-{run}__"),
     )
     .await
@@ -921,6 +927,8 @@ async fn blob_gc_fence_probe_with_ids(
     sql: &dyn SqlAccess,
     insert_id: String,
     update_id: String,
+    insert2_id: String,
+    update2_id: String,
     claim_key: String,
 ) -> StorageResult<()> {
     fn fence_rejection(result: Result<u64, StorageError>) -> Result<bool, String> {
@@ -937,6 +945,19 @@ async fn blob_gc_fence_probe_with_ids(
         }
     }
 
+    fn required_seed(value: Option<SqlValue>) -> StorageResult<String> {
+        match value {
+            Some(SqlValue::Text(seed)) => Ok(seed),
+            _ => Err(StorageError::Unsupported {
+                capability: StorageCapability::Blob,
+                operation: "transactional_orphan_sweep".into(),
+                message: "the blob GC fence probe could not select an unclaimed \
+                          canonical seed; refusing deletion so a later sweep can retry"
+                    .into(),
+            }),
+        }
+    }
+
     let op: AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
             // Ownership guard: the cleanup below deletes these ids
@@ -945,12 +966,14 @@ async fn blob_gc_fence_probe_with_ids(
             let preexisting = writer
                 .query_row(SqlStatement {
                     sql: "SELECT (SELECT COUNT(*) FROM attachments \
-                                   WHERE record_uuid IN (?1, ?2)) \
-                              + (SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = ?3)"
+                                   WHERE record_uuid IN (?1, ?2, ?3, ?4)) \
+                              + (SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = ?5)"
                         .to_string(),
                     params: vec![
                         SqlValue::Text(insert_id.clone()),
                         SqlValue::Text(update_id.clone()),
+                        SqlValue::Text(insert2_id.clone()),
+                        SqlValue::Text(update2_id.clone()),
                         SqlValue::Text(claim_key.clone()),
                     ],
                     label: Some("blob_gc_fence_probe_ownership_guard".to_string()),
@@ -1002,27 +1025,73 @@ async fn blob_gc_fence_probe_with_ids(
                 })
                 .await?
                 .and_then(|row| row.columns.first().map(|column| column.value.clone()));
-            let seed_ref = match seed_ref {
-                Some(SqlValue::Text(seed_ref)) => seed_ref,
-                _ => {
-                    return Err(StorageError::Unsupported {
-                        capability: StorageCapability::Blob,
-                        operation: "transactional_orphan_sweep".into(),
-                        message: "the blob GC fence probe could not select an unclaimed \
-                                  canonical seed; refusing deletion so a later sweep can retry"
-                            .into(),
-                    });
-                }
-            };
+            let seed_ref = required_seed(seed_ref)?;
+
+            let seed2_ref = writer
+                .query_row(SqlStatement {
+                    sql: "WITH RECURSIVE candidates(attempt, content_ref) AS ( \
+                              SELECT 1, lower(hex(randomblob(32))) \
+                              UNION ALL \
+                              SELECT attempt + 1, lower(hex(randomblob(32))) \
+                              FROM candidates WHERE attempt < 8 \
+                          ) \
+                          SELECT candidate.content_ref FROM candidates AS candidate \
+                          WHERE candidate.content_ref NOT IN (?1, ?2) \
+                            AND NOT EXISTS ( \
+                                SELECT 1 FROM blob_gc_claims \
+                                WHERE content_ref = candidate.content_ref \
+                            ) \
+                          LIMIT 1"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string()),
+                        SqlValue::Text(seed_ref.clone()),
+                    ],
+                    label: Some("blob_gc_fence_probe_select_seed2".to_string()),
+                })
+                .await?
+                .and_then(|row| row.columns.first().map(|column| column.value.clone()));
+            let seed2_ref = required_seed(seed2_ref)?;
+
+            // The second CLAIMED digest. A trigger rewrite conditioned on the
+            // fixed all-zero sentinel passes that sentinel's arms; this digest
+            // is random per run, so such a rewrite fails the arms below.
+            let probe2_ref = writer
+                .query_row(SqlStatement {
+                    sql: "WITH RECURSIVE candidates(attempt, content_ref) AS ( \
+                              SELECT 1, lower(hex(randomblob(32))) \
+                              UNION ALL \
+                              SELECT attempt + 1, lower(hex(randomblob(32))) \
+                              FROM candidates WHERE attempt < 8 \
+                          ) \
+                          SELECT candidate.content_ref FROM candidates AS candidate \
+                          WHERE candidate.content_ref NOT IN (?1, ?2, ?3) \
+                            AND NOT EXISTS ( \
+                                SELECT 1 FROM blob_gc_claims \
+                                WHERE content_ref = candidate.content_ref \
+                            ) \
+                          LIMIT 1"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string()),
+                        SqlValue::Text(seed_ref.clone()),
+                        SqlValue::Text(seed2_ref.clone()),
+                    ],
+                    label: Some("blob_gc_fence_probe_select_probe2".to_string()),
+                })
+                .await?
+                .and_then(|row| row.columns.first().map(|column| column.value.clone()));
+            let probe2_ref = required_seed(probe2_ref)?;
 
             writer
                 .execute(SqlStatement {
                     sql: "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
-                          VALUES (?1, ?2, 0)"
+                          VALUES (?1, ?2, 0), (?1, ?3, 0)"
                         .to_string(),
                     params: vec![
                         SqlValue::Text(claim_key.clone()),
                         SqlValue::Text(BLOB_GC_FENCE_PROBE_REF.to_string()),
+                        SqlValue::Text(probe2_ref.clone()),
                     ],
                     label: Some("blob_gc_fence_probe_claim".to_string()),
                 })
@@ -1067,14 +1136,59 @@ async fn blob_gc_fence_probe_with_ids(
                 .await;
             let update_fenced = fence_rejection(update_attempt);
 
+            let insert2_attempt = writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO attachments \
+                          (record_uuid, substrate, role, content_ref, created_at) \
+                          VALUES (?1, 'note', 'evidence', ?2, 0)"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(insert2_id.clone()),
+                        SqlValue::Text(probe2_ref.clone()),
+                    ],
+                    label: Some("blob_gc_fence_probe_insert2_arm".to_string()),
+                })
+                .await;
+            let insert2_fenced = fence_rejection(insert2_attempt);
+
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO attachments \
+                          (record_uuid, substrate, role, content_ref, created_at) \
+                          VALUES (?1, 'note', 'evidence', ?2, 0)"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(update2_id.clone()),
+                        SqlValue::Text(seed2_ref),
+                    ],
+                    label: Some("blob_gc_fence_probe_update2_arm_seed".to_string()),
+                })
+                .await?;
+            let update2_attempt = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE attachments SET content_ref = ?1 \
+                          WHERE record_uuid = ?2 AND role = 'evidence'"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(probe2_ref),
+                        SqlValue::Text(update2_id.clone()),
+                    ],
+                    label: Some("blob_gc_fence_probe_update2_arm".to_string()),
+                })
+                .await;
+            let update2_fenced = fence_rejection(update2_attempt);
+
             // Remove every probe row before this unit commits, including an
             // attachment row a dead fence let through.
             writer
                 .execute(SqlStatement {
-                    sql: "DELETE FROM attachments WHERE record_uuid IN (?1, ?2)".to_string(),
+                    sql: "DELETE FROM attachments WHERE record_uuid IN (?1, ?2, ?3, ?4)"
+                        .to_string(),
                     params: vec![
                         SqlValue::Text(insert_id.clone()),
                         SqlValue::Text(update_id.clone()),
+                        SqlValue::Text(insert2_id.clone()),
+                        SqlValue::Text(update2_id.clone()),
                     ],
                     label: Some("blob_gc_fence_probe_cleanup_attachments".to_string()),
                 })
@@ -1087,12 +1201,20 @@ async fn blob_gc_fence_probe_with_ids(
                 })
                 .await?;
 
-            Ok(Box::new((insert_fenced, update_fenced)) as Box<dyn std::any::Any + Send>)
+            Ok(
+                Box::new((insert_fenced, update_fenced, insert2_fenced, update2_fenced))
+                    as Box<dyn std::any::Any + Send>,
+            )
         })
     });
     let outcome = sql.atomic_unit(op).await?;
-    let (insert_fenced, update_fenced) = *outcome
-        .downcast::<(Result<bool, String>, Result<bool, String>)>()
+    let (insert_fenced, update_fenced, insert2_fenced, update2_fenced) = *outcome
+        .downcast::<(
+            Result<bool, String>,
+            Result<bool, String>,
+            Result<bool, String>,
+            Result<bool, String>,
+        )>()
         .map_err(|_| {
             StorageError::Internal("blob GC fence probe returned an unexpected outcome type".into())
         })?;
@@ -1118,7 +1240,9 @@ async fn blob_gc_fence_probe_with_ids(
         }
     };
     arm_verdict("INSERT", insert_fenced)?;
-    arm_verdict("UPDATE", update_fenced)
+    arm_verdict("UPDATE", update_fenced)?;
+    arm_verdict("second-digest INSERT", insert2_fenced)?;
+    arm_verdict("second-digest UPDATE", update2_fenced)
 }
 
 async fn validate_blob_gc_evidence(sql: &dyn SqlAccess) -> StorageResult<()> {
@@ -1127,11 +1251,17 @@ async fn validate_blob_gc_evidence(sql: &dyn SqlAccess) -> StorageResult<()> {
     // database sweep owner excludes another claim producer, and each bounded
     // claim unit anti-joins the then-current live rows under its writer lock.
     let mut reader = sql.reader().await?;
+    // length() and GLOB both stop at an embedded NUL, so a value of 64 hex
+    // characters followed by a NUL and arbitrary bytes passes them while
+    // failing the exact-equality liveness anti-join. The byte-length arm
+    // closes that class: chars = 64 AND bytes = 64 forces a NUL-free,
+    // all-single-byte value.
     let invalid_claim = reader
         .query_row(SqlStatement {
             sql: "SELECT content_ref FROM blob_gc_claims \
                   WHERE typeof(content_ref) <> 'text' \
                      OR length(content_ref) <> 64 \
+                     OR length(CAST(content_ref AS BLOB)) <> 64 \
                      OR content_ref GLOB '*[^0-9a-f]*' \
                   LIMIT 1"
                 .to_string(),
@@ -1150,6 +1280,7 @@ async fn validate_blob_gc_evidence(sql: &dyn SqlAccess) -> StorageResult<()> {
             sql: "SELECT content_ref FROM attachments \
                   WHERE typeof(content_ref) <> 'text' \
                       OR length(content_ref) <> 64 \
+                      OR length(CAST(content_ref AS BLOB)) <> 64 \
                       OR content_ref GLOB '*[^0-9a-f]*' \
                   LIMIT 1"
                 .to_string(),
@@ -3809,6 +3940,8 @@ mod tests {
             sql.as_ref(),
             "victim-id".to_string(),
             "victim-update-id".to_string(),
+            "victim-insert2-id".to_string(),
+            "victim-update2-id".to_string(),
             "victim-claim-key".to_string(),
         )
         .await
@@ -3872,6 +4005,8 @@ mod tests {
             sql.as_ref(),
             "retained-id".to_string(),
             "retained-update-id".to_string(),
+            "retained-insert2-id".to_string(),
+            "retained-update2-id".to_string(),
             "retained-claim-key".to_string(),
         )
         .await
@@ -3889,6 +4024,191 @@ mod tests {
         assert_eq!(
             survivors, 1,
             "the retained entity ledger row must survive the attachment probe"
+        );
+    }
+
+    fn nul_embedded_canonical_ref() -> String {
+        let mut polluted = "a".repeat(64);
+        polluted.push('\0');
+        polluted.push_str("zz");
+        polluted
+    }
+
+    /// SQLite's `length()` counts characters before the first NUL and GLOB
+    /// stops scanning there, so a 64-hex-then-NUL value passes both while the
+    /// exact-equality liveness anti-join cannot match it. The byte-length arm
+    /// must refuse the sweep on such a claim row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_gc_evidence_rejects_a_nul_embedded_claim_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                     VALUES ('nul-claim-key', ?1, 0)",
+                    rusqlite::params![nul_embedded_canonical_ref()],
+                )
+                .unwrap();
+        }
+
+        let sql = backend.sql();
+        let error = super::validate_blob_gc_evidence(sql.as_ref())
+            .await
+            .expect_err("a NUL-embedded claim ref must refuse the sweep");
+        assert!(
+            error.to_string().contains("blob_gc_claims"),
+            "expected the claims-table refusal, got {error:?}"
+        );
+    }
+
+    /// The attachments schema CHECK uses the same NUL-blind `length()`/GLOB
+    /// pair, so the polluted row INSERTS successfully — this test proves that
+    /// on purpose — and the evidence validator must then be the backstop that
+    /// refuses the sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_gc_evidence_rejects_a_nul_embedded_attachment_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO attachments \
+                     (record_uuid, substrate, role, content_ref, created_at) \
+                     VALUES ('nul-attachment-id', 'entity', 'content', ?1, 0)",
+                    rusqlite::params![nul_embedded_canonical_ref()],
+                )
+                .expect("the schema CHECK is NUL-blind, so this row must insert");
+        }
+
+        let sql = backend.sql();
+        let error = super::validate_blob_gc_evidence(sql.as_ref())
+            .await
+            .expect_err("a NUL-embedded attachment ref must refuse the sweep");
+        assert!(
+            error.to_string().contains("attachments"),
+            "expected the attachments-table refusal, got {error:?}"
+        );
+    }
+
+    /// A trigger rewrite that fences only the probe's fixed all-zero sentinel
+    /// passes the sentinel arms; the second-digest arms must catch it. The
+    /// healthy fixture is probed first as the positive control.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fence_probe_refuses_a_digest_restricted_trigger_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+
+        let sql = backend.sql();
+        super::blob_gc_fence_probe(sql.as_ref())
+            .await
+            .expect("the healthy fence must pass all four probe arms");
+
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            writer
+                .conn_mut()
+                .execute_batch(
+                    "DROP TRIGGER attachments_reject_claimed_blob_insert; \
+                     DROP TRIGGER attachments_reject_claimed_blob_update; \
+                     CREATE TRIGGER attachments_reject_claimed_blob_insert \
+                     BEFORE INSERT ON attachments \
+                     WHEN NEW.content_ref = \
+                         '0000000000000000000000000000000000000000000000000000000000000000' \
+                       AND EXISTS (SELECT 1 FROM blob_gc_claims \
+                                   WHERE content_ref = NEW.content_ref) \
+                     BEGIN \
+                         SELECT RAISE(ABORT, \
+                             'content_ref is reserved by an active blob sweep'); \
+                     END; \
+                     CREATE TRIGGER attachments_reject_claimed_blob_update \
+                     BEFORE UPDATE OF content_ref ON attachments \
+                     WHEN NEW.content_ref = \
+                         '0000000000000000000000000000000000000000000000000000000000000000' \
+                       AND EXISTS (SELECT 1 FROM blob_gc_claims \
+                                   WHERE content_ref = NEW.content_ref) \
+                     BEGIN \
+                         SELECT RAISE(ABORT, \
+                             'content_ref is reserved by an active blob sweep'); \
+                     END;",
+                )
+                .unwrap();
+        }
+
+        let error = super::blob_gc_fence_probe(sql.as_ref())
+            .await
+            .expect_err("a sentinel-only fence must fail the second-digest arms");
+        assert!(
+            matches!(error, StorageError::Unsupported { .. }),
+            "expected StorageError::Unsupported, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("second-digest"),
+            "the refusal must name a second-digest arm, got {error}"
+        );
+    }
+
+    /// A trigger rewrite restricted to the entity/content shape passes the
+    /// sentinel arms; the note-shaped second-digest arms must catch it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fence_probe_refuses_a_shape_restricted_trigger_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer
+                .conn_mut()
+                .execute_batch(
+                    "DROP TRIGGER attachments_reject_claimed_blob_insert; \
+                     DROP TRIGGER attachments_reject_claimed_blob_update; \
+                     CREATE TRIGGER attachments_reject_claimed_blob_insert \
+                     BEFORE INSERT ON attachments \
+                     WHEN NEW.substrate = 'entity' \
+                       AND EXISTS (SELECT 1 FROM blob_gc_claims \
+                                   WHERE content_ref = NEW.content_ref) \
+                     BEGIN \
+                         SELECT RAISE(ABORT, \
+                             'content_ref is reserved by an active blob sweep'); \
+                     END; \
+                     CREATE TRIGGER attachments_reject_claimed_blob_update \
+                     BEFORE UPDATE OF content_ref ON attachments \
+                     WHEN NEW.substrate = 'entity' \
+                       AND EXISTS (SELECT 1 FROM blob_gc_claims \
+                                   WHERE content_ref = NEW.content_ref) \
+                     BEGIN \
+                         SELECT RAISE(ABORT, \
+                             'content_ref is reserved by an active blob sweep'); \
+                     END;",
+                )
+                .unwrap();
+        }
+
+        let sql = backend.sql();
+        let error = super::blob_gc_fence_probe(sql.as_ref())
+            .await
+            .expect_err("an entity-shape-only fence must fail the note-shaped arms");
+        assert!(
+            matches!(error, StorageError::Unsupported { .. }),
+            "expected StorageError::Unsupported, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("second-digest"),
+            "the refusal must name a second-digest arm, got {error}"
         );
     }
 
