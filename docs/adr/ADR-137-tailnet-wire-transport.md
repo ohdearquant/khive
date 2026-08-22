@@ -196,13 +196,22 @@ does today and the crate must move to match.
    outside the receiver's supported range is rejected rather than negotiated downward.
 
    **The rejection layer is stated normatively because two layers could plausibly own it.** A
-   version field carrying any non-negative integer, `0` included, is syntactically well-formed and
-   MUST decode: the decoder's job is grammar, and a receiver that rejected `0` as
-   `malformed_frame` would close the connection on a frame it could have answered. Admission is
-   where the range is enforced: a handshake naming a version outside the receiver's supported
-   range, `0` and `99` alike, is rejected at handshake admission with `unsupported_version`.
-   Version `0` is therefore not special-cased on the receive path; it is out of range like any
-   other unsupported value, and the floor of `1` is what makes it out of range.
+   version field carrying any non-negative integer **representable as an unsigned 32-bit value**,
+   `0` included, is syntactically well-formed and MUST decode: the decoder's job is grammar, and a
+   receiver that rejected `0` as `malformed_frame` would close the connection on a frame it could
+   have answered. Admission is where the range is enforced: a handshake naming a version outside
+   the receiver's supported range, `0` and `99` alike, is rejected at handshake admission with
+   `unsupported_version`. Version `0` is therefore not special-cased on the receive path; it is out
+   of range like any other unsupported value, and the floor of `1` is what makes it out of range.
+
+   **The wire type is a 32-bit unsigned integer, and that bound is normative rather than
+   incidental.** A JSON integer too large for it, `4294967296` being the boundary case, is a
+   grammar violation and is rejected at decode as `malformed_frame`; it never reaches handshake
+   admission and never produces `unsupported_version`. Saying so is load-bearing: without the
+   bound, "any non-negative integer MUST decode" reads as arbitrary precision, and an
+   implementation built on a bignum type would admit `4294967296` and reject it at admission while
+   this one rejects it at decode. That is a disagreement at exactly the layer this decision
+   settles, so the overflow boundary is a required conformance vector rather than an edge case.
 
    Locally constructing a version-`0` frame is a separate matter from receiving one. An encoder
    MUST NOT emit a handshake or handshake acknowledgment naming version `0`; that is a local
@@ -290,16 +299,26 @@ does today and the crate must move to match.
    does not exist and cannot be tested. Decode-then-encode is the only operation the crate has, and
    it is the one a forwarding consumer composes.
 
-   Scope of the preserved span, stated because each of these is otherwise implementation-defined:
+   **The span is the complete raw byte range of the value, and every byte in it is preserved.** It
+   begins at the first byte of the value's first token and ends at the last byte of its last token.
+   Interior whitespace is inside the span and is preserved with everything else; no normalization
+   is permitted anywhere within it. An earlier draft of this decision allowed an implementation to
+   normalize interior whitespace, which contradicted the byte-exactness it was defining: two
+   implementations could then produce different output from one input and both claim conformance,
+   which is the disagreement the decision exists to remove. Preservation is also the cheaper rule
+   to implement, since an implementation satisfying this decision already holds the raw bytes and
+   normalizing would be extra work.
 
-   - **Preserved:** member order, the original lexical form of numbers, string escape sequences as
-     written, and any duplicate members nested _inside_ the opaque subvalue. Duplicate rejection
-     under decision 4 governs the typed envelope only, and must not be applied recursively into an
-     opaque subvalue.
-   - **Not preserved and not required to be:** whitespace between the subvalue's own tokens, which
-     an implementation MAY normalize; envelope formatting outside the subvalue span; and any value
-     the holder constructed locally rather than receiving, which has no source bytes to preserve
-     and is encoded by the ordinary serializer.
+   Consequences of that span, each stated because it is otherwise implementation-defined:
+
+   - **Preserved,** as part of the raw span: member order, the original lexical form of numbers,
+     string escape sequences as written, interior whitespace, and any duplicate members nested
+     _inside_ the opaque subvalue. Duplicate rejection under decision 4 governs the typed envelope
+     only, and must not be applied recursively into an opaque subvalue.
+   - **Outside the span, and therefore not governed here:** whitespace before the value's first
+     token or after its last, which belongs to the enclosing envelope; envelope formatting
+     generally; and any value the holder constructed locally rather than receiving, which has no
+     source bytes to preserve and is encoded by the ordinary serializer.
 
    **This requires a representation the current typed structs cannot provide.** `serde_json::Value`
    discards member order and number lexemes at parse time, so satisfying this decision means
@@ -316,12 +335,21 @@ does today and the crate must move to match.
 10. **`event.payload` must be a JSON object — CHANGED.** The parent ADR specifies `payload` as "a
     topic-specific JSON object whose exact field-by-field shape this ADR delegates, by name, to
     the implementation-phase topic catalog below". The crate types the field as an arbitrary JSON
-    value,
-    so a scalar, array, or `null` payload is accepted on the wire while an implementation written
-    from the ADR would reject it. The object requirement is retained and the crate must enforce
-    it at decode: "field-by-field" presupposes fields, and an object is the only shape a topic
-    catalog can extend compatibly, whereas a scalar payload cannot gain a field without a
-    breaking change.
+    value, so a scalar, array, or `null` payload is accepted on the wire while an implementation
+    written from the ADR would reject it. The object requirement is retained: "field-by-field"
+    presupposes fields, and an object is the only shape a topic catalog can extend compatibly,
+    whereas a scalar payload cannot gain a field without a breaking change.
+
+    **The requirement binds both directions, and saying only "at decode" would leave the contract
+    open on the side that matters more.** A decoder MUST reject a non-object `event.payload`. An
+    encoder MUST also reject one, as a local construction error in the manner of decision 1's
+    version-`0` clause, so a conforming implementation cannot put a frame on the wire that a
+    conforming peer must refuse. The crate currently enforces neither: the encode-side validator
+    matches `Frame::Event` and performs no shape check, so `encode_frame` will emit a scalar,
+    array, or `null` payload today. A decode-only rule would leave exactly that behaviour legal,
+    and the resulting split — one implementation sending what another must reject — is the
+    interoperability failure this amendment exists to prevent. Both directions therefore need
+    conformance vectors.
 
     This item was found while confirming the others and is recorded here rather than deferred,
     because an amendment that claims to close the wire contract while leaving a known frame-shape
@@ -351,21 +379,51 @@ section. An amendment that asserted its own verification in the present tense wo
 an unlocatable artifact and make every normative claim above unreproducible.
 
 **This amendment MUST NOT be ratified until the matrix is checked in.** The artifact is a set of
-vectors under `crates/khive-wire-protocol/tests/`, each pairing input bytes with the expected
-classification, plus a runner that executes them against an implementation. Required coverage,
-positive and negative, is every rule above: boundary frame lengths on both sides of the limit,
-version zero and out-of-range versions, empty operation ids, unknown and duplicate and
-explicitly-null envelope members, both id-bearing and id-less unknown error codes, each of the
-three handshake sequence violations, arbitrary topic and timestamp strings, opaque subvalues that
-round-trip byte-exactly, and non-object event payloads.
+vectors under `crates/khive-wire-protocol/tests/`, plus a runner that executes them against an
+implementation.
+
+**A vector is not a byte string paired with a verdict, because several rules above are stateful.**
+Whether a `handshake` frame is legal depends on whether the handshake has already completed, and
+whether a `response` frame is legal depends on which end received it — the same bytes classify
+differently in each case. A vector schema without that context cannot express decision 6 at all.
+Each vector therefore carries:
+
+- **Endpoint direction** — which side is decoding, since several frame kinds are legal inbound on
+  exactly one end.
+- **An ordered sequence of preceding frames**, or an explicit statement of the gate state the
+  vector begins from. A one-frame vector states "fresh connection, handshake not yet completed".
+- **The input bytes** of the frame under test.
+- **The expected classification**: accepted, or rejected with a named wire error code.
+- **The expected terminal scope** of a rejection: request-terminal or connection-terminal.
+
+Required coverage, positive and negative, is every rule above: boundary frame lengths on both
+sides of the limit, version zero and out-of-range versions **and the `4294967296` overflow
+boundary from decision 1**, empty operation ids, unknown and duplicate and explicitly-null
+envelope members, both id-bearing and id-less unknown error codes, each of the three handshake
+sequence violations, arbitrary topic and timestamp strings, opaque subvalues that round-trip
+byte-exactly, and non-object event payloads **on both the decode and the encode side, per
+decision 10**.
+
+**Consumed frame length is an agreement criterion for accepted frames only.** A decode error in
+this crate deliberately carries no consumed count: once a frame fails to decode the stream
+position is unrecoverable, the error is connection-terminal, and a transport is required to close
+rather than resynchronize. Asking two implementations to agree on where a rejected frame ended
+would demand a value one of them is designed not to produce, which would make the gate
+unexecutable rather than strict. For rejected frames the agreement criteria are the
+classification and the terminal scope; the length criterion does not apply.
 
 Vectors MUST be run through the Rust crate and through at least one independent JSON
-implementation, which must agree on four things: accept or reject classification, whether a
-rejection is request-terminal or connection-terminal, consumed frame length, and byte-exact
-opaque-subvalue round trip under the decode-then-encode operation defined in decision 9. The
-independent implementation is what makes the matrix a conformance artifact rather than a second
-copy of this crate's own assumptions, and it is why decision 9 had to name a concrete operation:
-a second implementation cannot be tested against a requirement phrased as an intention.
+implementation, which must agree on:
+
+- accept or reject classification, for every vector;
+- the wire error code and terminal scope of each rejection;
+- consumed frame length, for accepted frames only, per the paragraph above;
+- byte-exact opaque-subvalue round trip under the decode-then-encode operation defined in
+  decision 9.
+
+The independent implementation is what makes the matrix a conformance artifact rather than a
+second copy of this crate's own assumptions, and it is why decision 9 had to name a concrete
+operation: a second implementation cannot be tested against a requirement phrased as an intention.
 
 ## Consequences
 
