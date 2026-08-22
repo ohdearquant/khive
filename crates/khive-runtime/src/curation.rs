@@ -1437,6 +1437,29 @@ impl KhiveRuntime {
             note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
+            // ADR-056 makes these three properties transport evidence owned
+            // exclusively by `comm.ingest`. This check lives at the runtime
+            // patch seam, not only in comm's shared-CRUD hook, because direct
+            // Rust callers and atomic update preparation both arrive here
+            // without dispatching that hook. Scope it to `message`: the same
+            // JSON names remain ordinary caller metadata on every other kind.
+            if note.kind == "message" {
+                if !props.is_object() {
+                    return Err(RuntimeError::InvalidInput(
+                        "properties on a `message` note must be patched with an object: a \
+                         non-object patch would replace the transport-owned quarantine and \
+                         channel provenance established by `comm.ingest`"
+                            .into(),
+                    ));
+                }
+                if let Some(named) = message_transport_owned_property_named_in(&props) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "`{named}` is transport-owned on a `message` note and cannot be patched; \
+                         only `comm.ingest` may establish quarantine disposition and channel \
+                         provenance"
+                    )));
+                }
+            }
             // On a pack-owned note kind, the properties in
             // `OWNER_ESTABLISHED_PROPERTIES` are established by the owning pack
             // and read back by it to decide something structural — who wrote
@@ -2763,6 +2786,20 @@ fn merge_note_sql(
         )));
     }
 
+    // A quarantined message participates in no merges, in either role. Folding
+    // its content into an ordinary message would retain the body while the
+    // marker restoration below drops the `quarantined` disposition — laundering
+    // quarantined transport content into an unmarked record. Release is the
+    // channel-ingest path's decision, never a side effect of curation.
+    if into_note.kind == "message"
+        && (message_is_quarantined(&into_note) || message_is_quarantined(&from_note))
+    {
+        return Err(SqliteError::InvalidData(
+            "cannot merge a quarantined message: quarantine disposition is              transport-owned and must be released by the channel-ingest path              before the content can be folded into another record"
+                .to_string(),
+        ));
+    }
+
     let now = chrono::Utc::now().timestamp_micros();
     let into_str = into_id.to_string();
     let from_str = from_id.to_string();
@@ -2865,6 +2902,9 @@ fn merge_note_sql(
     // the surviving row still says who wrote it.
     if preserve_owner_established {
         preserve_owner_established_properties(&into_note.properties, &mut merged_props);
+    }
+    if into_note.kind == "message" {
+        preserve_message_transport_properties(&into_note.properties, &mut merged_props);
     }
 
     // Recomputed from the final retained properties rather than carried
@@ -3242,6 +3282,45 @@ pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
     "external_id",
 ];
 
+/// Transport evidence that only `comm.ingest` may establish on a `message`.
+///
+/// This list is deliberately separate from [`OWNER_ESTABLISHED_PROPERTIES`].
+/// The latter applies to every pack-owned note kind; quarantine disposition
+/// and channel attribution are message-only, and protecting these names on a
+/// task, memory, or another pack-owned note would reserve ordinary metadata
+/// outside ADR-056's scope.
+pub(crate) const MESSAGE_TRANSPORT_OWNED_PROPERTIES: &[&str] =
+    &["quarantined", "channel_kind", "channel_slug"];
+
+/// Whether a stored message note carries a live quarantine disposition.
+///
+/// The marker is written by transports as JSON `true` and by some channel
+/// adapters as the string `"true"`; both spellings are live in stored data
+/// (`comm.health` counts both). Any present value other than an explicit
+/// boolean `false` or string `"false"` reads as quarantined, so an unexpected
+/// encoding fails closed.
+fn message_is_quarantined(note: &khive_storage::note::Note) -> bool {
+    let Some(Value::Object(map)) = note.properties.as_ref() else {
+        return false;
+    };
+    match map.get("quarantined") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => value != "false",
+        Some(_) => true,
+    }
+}
+
+fn message_transport_owned_property_named_in(patch: &Value) -> Option<&'static str> {
+    let Value::Object(map) = patch else {
+        return None;
+    };
+    MESSAGE_TRANSPORT_OWNED_PROPERTIES
+        .iter()
+        .copied()
+        .find(|key| map.contains_key(*key))
+}
+
 /// The first [`OWNER_ESTABLISHED_PROPERTIES`] key a caller-supplied
 /// `properties` patch names, if any.
 ///
@@ -3287,13 +3366,19 @@ pub(crate) fn preserve_owner_established_properties(
     into: &Option<Value>,
     merged: &mut Option<Value>,
 ) {
+    preserve_property_keys(OWNER_ESTABLISHED_PROPERTIES, into, merged);
+}
+
+fn preserve_message_transport_properties(into: &Option<Value>, merged: &mut Option<Value>) {
+    preserve_property_keys(MESSAGE_TRANSPORT_OWNED_PROPERTIES, into, merged);
+}
+
+fn preserve_property_keys(keys: &[&str], into: &Option<Value>, merged: &mut Option<Value>) {
     if !matches!(merged, Some(Value::Object(_))) {
         let Some(Value::Object(into_map)) = into else {
             return;
         };
-        let owned_on_into = OWNER_ESTABLISHED_PROPERTIES
-            .iter()
-            .any(|key| into_map.contains_key(*key));
+        let owned_on_into = keys.iter().any(|key| into_map.contains_key(*key));
         if owned_on_into {
             *merged = into.clone();
         }
@@ -3306,7 +3391,7 @@ pub(crate) fn preserve_owner_established_properties(
         Some(Value::Object(m)) => Some(m),
         _ => None,
     };
-    for key in OWNER_ESTABLISHED_PROPERTIES {
+    for key in keys {
         match into_map.and_then(|m| m.get(*key)) {
             Some(value) => {
                 // Already present on `into` — restore it verbatim.
@@ -6165,6 +6250,134 @@ mod tests {
                 .expect("rejected generic mutation leaves the schedule intact");
             assert_eq!(note.properties.as_ref().unwrap()["trigger_at"], trigger_at);
         }
+    }
+
+    #[tokio::test]
+    async fn merge_note_refuses_quarantined_message_in_either_role() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let capability = crate::pack::ChannelIngestCapability { _sealed: () };
+        let ordinary = rt
+            .create_note(
+                &tok,
+                "message",
+                None,
+                "ordinary message",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let quarantined = rt
+            .try_create_note_as_trusted_ingest(
+                &capability,
+                &tok,
+                "message",
+                None,
+                "quarantined transport content",
+                Some(serde_json::json!({"quarantined": true})),
+            )
+            .await
+            .unwrap()
+            .expect("quarantined insert");
+
+        for (into_id, from_id) in [(ordinary.id, quarantined.id), (quarantined.id, ordinary.id)] {
+            let error = rt
+                .merge_note(
+                    &tok,
+                    into_id,
+                    from_id,
+                    EntityDedupMergePolicy::PreferFrom,
+                    ContentMergeStrategy::Append,
+                    false,
+                )
+                .await
+                .expect_err("a quarantined message must not merge in either role");
+            assert!(error.to_string().contains("quarantined"), "{error}");
+        }
+
+        // Neither operand was mutated by the refused merges.
+        let store = rt.notes(&tok).unwrap();
+        let kept = store
+            .get_note(quarantined.id)
+            .await
+            .unwrap()
+            .expect("quarantined note intact");
+        assert_eq!(
+            kept.properties.as_ref().unwrap()["quarantined"],
+            serde_json::json!(true)
+        );
+        assert_eq!(kept.content, "quarantined transport content");
+    }
+
+    #[tokio::test]
+    async fn merge_note_refuses_string_encoded_quarantine_marker() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let capability = crate::pack::ChannelIngestCapability { _sealed: () };
+        let ordinary = rt
+            .create_note(
+                &tok,
+                "message",
+                None,
+                "ordinary message",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        // Some channel adapters record the marker as the string "true".
+        let quarantined = rt
+            .try_create_note_as_trusted_ingest(
+                &capability,
+                &tok,
+                "message",
+                None,
+                "string-marked quarantined content",
+                Some(serde_json::json!({"quarantined": "true"})),
+            )
+            .await
+            .unwrap()
+            .expect("quarantined insert");
+
+        let error = rt
+            .merge_note(
+                &tok,
+                ordinary.id,
+                quarantined.id,
+                EntityDedupMergePolicy::PreferFrom,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .expect_err("string-encoded quarantine marker must also refuse the merge");
+        assert!(error.to_string().contains("quarantined"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn merge_note_still_merges_unquarantined_messages() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "message", None, "into message", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "message", None, "from message", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_note(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .expect("ordinary message merge must still work");
     }
 
     #[tokio::test]

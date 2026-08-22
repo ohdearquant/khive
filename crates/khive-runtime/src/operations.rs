@@ -349,6 +349,25 @@ fn note_snippet(note: &Note) -> Option<String> {
     text_preview(&note.content, 200)
 }
 
+/// Message properties established only by the trusted channel-ingest path.
+///
+/// Mirrors `khive-pack-comm`'s `TRANSPORT_OWNED_MESSAGE_PROPERTIES`. Duplicated
+/// here rather than imported because `khive-runtime` sits below `khive-pack-comm`
+/// in the dependency chain (`runtime → packs`); this list is the one place in
+/// the runtime layer that needs to know the shape of comm's trust boundary,
+/// guarding [`KhiveRuntime::try_create_note`]'s fast path.
+const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] =
+    &["quarantined", "channel_kind", "channel_slug"];
+
+fn transport_owned_message_property_named_in(
+    properties: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'static str> {
+    TRANSPORT_OWNED_MESSAGE_PROPERTIES
+        .iter()
+        .copied()
+        .find(|key| properties.contains_key(*key))
+}
+
 /// Result of resolving a UUID to its substrate kind.
 #[derive(Clone, Debug)]
 pub enum Resolved {
@@ -3161,6 +3180,14 @@ impl KhiveRuntime {
     /// This method is intentionally narrower than `create_note`: it skips
     /// salience/decay, annotates edges, and embedding-model selection, which
     /// are not needed for channel-ingest paths.
+    ///
+    /// Rejects `quarantined` / `channel_kind` / `channel_slug` on a `message`
+    /// note: those three properties are transport-owned evidence that
+    /// `comm.health` trusts at face value, and this fast path (unlike the
+    /// generic `create` verb funnel) is not covered by the
+    /// pack-installed note-write validator. Only the trusted channel-ingest
+    /// path may establish them — see
+    /// [`Self::try_create_note_as_trusted_ingest`].
     pub async fn try_create_note(
         &self,
         token: &NamespaceToken,
@@ -3168,6 +3195,48 @@ impl KhiveRuntime {
         name: Option<&str>,
         content: &str,
         properties: Option<serde_json::Value>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_impl(token, kind, name, content, properties, false)
+            .await
+    }
+
+    /// Like [`Self::try_create_note`] but permits the caller to establish the
+    /// transport-owned `message` properties (`quarantined`, `channel_kind`,
+    /// `channel_slug`).
+    ///
+    /// This is a deliberately named, separate entry point rather than a flag
+    /// on `try_create_note` so the trust decision is visible at every call
+    /// site: `comm.ingest` (`khive-pack-comm/src/handlers.rs`) is the sole
+    /// legitimate caller, because it is the only code that has just derived
+    /// quarantine disposition and channel provenance from the inbound
+    /// transport itself. The caller set is bounded by possession, not
+    /// documentation: the required [`crate::ChannelIngestCapability`] is
+    /// constructible only inside this crate and granted at pack registration
+    /// exclusively to channel-transport packs. Every other write path uses
+    /// `try_create_note`, which rejects those three properties
+    /// unconditionally.
+    pub async fn try_create_note_as_trusted_ingest(
+        &self,
+        _capability: &crate::pack::ChannelIngestCapability,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_impl(token, kind, name, content, properties, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_create_note_impl(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+        allow_transport_owned_message_properties: bool,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -3177,6 +3246,19 @@ impl KhiveRuntime {
         }
         if let Some(ref p) = properties {
             crate::secret_gate::check_json(p)?;
+        }
+        if !allow_transport_owned_message_properties && kind == "message" {
+            if let Some(key) = properties
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .and_then(transport_owned_message_property_named_in)
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "`{key}` is transport-owned on a `message` note and cannot be supplied \
+                     through `try_create_note`; only the trusted channel-ingest path may \
+                     establish quarantine disposition and channel provenance"
+                )));
+            }
         }
 
         let ns = token.namespace().as_str();
@@ -3188,7 +3270,13 @@ impl KhiveRuntime {
             note = note.with_properties(p);
         }
 
-        let inserted = self.notes(token)?.try_insert_note(note.clone()).await?;
+        // Bypasses the `notes()` accessor's PolicyEnforcingNoteStore wrapper —
+        // the reserved-transport-property check above already enforces the
+        // identical policy, conditionally allowing the trusted-ingest path,
+        // so this reaches storage directly rather than duplicate the check
+        // through a wrapper that cannot see the trust decision this function
+        // just made.
+        let inserted = self.raw_notes(token)?.try_insert_note(note.clone()).await?;
         if !inserted {
             return Ok(None);
         }

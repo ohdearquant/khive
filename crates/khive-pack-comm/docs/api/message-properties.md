@@ -62,7 +62,15 @@ used by routing and authorization.
 ## Extension fields
 
 V1 messages may carry additional properties such as `tags`, `external_id`, `wire_message_id`,
-`wire_references`, `channel_kind`, `in_reply_to_message_id`, `references_chain`, and
+`wire_references`, `channel_kind`, `channel_slug`, `in_reply_to_message_id`, `references_chain`, and
 adapter-supplied metadata. These do not weaken the stable-field invariants. Stable field names are
 reserved during ingest even when an optional field is absent, so adapter metadata cannot override
 or fabricate one.
+
+Every channel poller is required to pass both its `Channel::kind()` as `channel_kind` and its exact
+`Channel::slug()` as `channel_slug` to `comm.ingest`. Together they identify the transport account
+whose health row owns the message; `channel_kind` alone is insufficient when two credentials use
+the same adapter. The handler-owned values override free-form adapter metadata. `channel_kind`,
+`channel_slug`, and `quarantined` are transport-owned on `message` notes: only `comm.ingest` may
+establish them, and generic create, update, atomic-update preparation, and merge cannot forge,
+change, erase, or transfer them.

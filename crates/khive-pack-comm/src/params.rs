@@ -152,6 +152,11 @@ pub(crate) struct IngestParams {
     pub thread_id: Option<String>,
     #[serde(default)]
     pub channel_kind: Option<String>,
+    /// Stable credential/account identity returned by `Channel::slug`. Kept
+    /// separate from transport metadata so an adapter cannot spoof which
+    /// `comm.health` channel entry owns a quarantined message.
+    #[serde(default)]
+    pub channel_slug: Option<String>,
     /// Stable transport dedup key. For email: `imap:{host}:{uidvalidity}:{uid}`. Duplicate messages are silently ignored.
     #[serde(default)]
     pub external_id: Option<String>,

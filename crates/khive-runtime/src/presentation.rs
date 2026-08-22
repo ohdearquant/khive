@@ -355,11 +355,12 @@ pub enum PresentationMode {
     Human,
 }
 
-/// Structural `null` fields that are PRESERVED in Agent mode even when null.
+/// Lifecycle/operational `null` fields that are PRESERVED in Agent mode.
 ///
-/// These fields carry lifecycle or pagination meaning (absent ≠ null) and
-/// must not be dropped.
-const PRESERVED_NULL_FIELDS: &[&str] = &[
+/// These fields carry state meaning (absent ≠ known-unknown) and must not be
+/// dropped. The channel-health fields distinguish a quarantine-only identity
+/// from a heartbeat row whose liveness facts were actually observed.
+const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
     "completed_at",
     "deleted_at",
     "due_at",
@@ -372,6 +373,13 @@ const PRESERVED_NULL_FIELDS: &[&str] = &[
     "parent_id",
     "superseded_by",
     "replaced_by",
+    "poll_interval_secs",
+    "stalled",
+    "last_success_at",
+    "last_poll_attempt_at",
+    "last_failure_at",
+    "last_error",
+    "consecutive_failures",
 ];
 
 /// Empty collection fields that define a stable response envelope and must
@@ -466,7 +474,7 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
     match mode {
         PresentationMode::Verbose | PresentationMode::Human => value,
         PresentationMode::Agent => {
-            let preserved_nulls: HashSet<&str> = PRESERVED_NULL_FIELDS.iter().copied().collect();
+            let preserved_nulls: HashSet<&str> = LIFECYCLE_NULL_PRESERVE.iter().copied().collect();
             let score_fields: HashSet<&str> = SCORE_FIELDS.iter().copied().collect();
             let payload_timestamps: HashSet<&str> =
                 PAYLOAD_TIMESTAMP_FIELDS.iter().copied().collect();
@@ -889,6 +897,39 @@ mod tests {
         let out = agent(v);
         assert_eq!(out["parent_id"], json!(null));
         assert_eq!(out["superseded_by"], json!(null));
+    }
+
+    #[test]
+    fn agent_preserves_unknown_channel_heartbeat_nulls() {
+        let v = json!({
+            "channels": [{
+                "poll_interval_secs": null,
+                "stalled": null,
+                "last_success_at": null,
+                "last_poll_attempt_at": null,
+                "last_failure_at": null,
+                "last_error": null,
+                "consecutive_failures": null,
+                "quarantined_count": 1,
+            }]
+        });
+        let out = agent(v);
+        let channel = out["channels"][0].as_object().expect("channel object");
+        for field in [
+            "poll_interval_secs",
+            "stalled",
+            "last_success_at",
+            "last_poll_attempt_at",
+            "last_failure_at",
+            "last_error",
+            "consecutive_failures",
+        ] {
+            assert_eq!(
+                channel.get(field),
+                Some(&Value::Null),
+                "Agent presentation must preserve unknown heartbeat fact `{field}`"
+            );
+        }
     }
 
     #[test]

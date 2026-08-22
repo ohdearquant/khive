@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity,
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, NotePatch, RequestIdentity,
     RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlRow, SqlValue};
+use khive_storage::Note;
 use khive_types::Pack;
 
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
@@ -19,8 +20,12 @@ fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-    builder.register(CommPack::new(runtime.clone()));
+    khive_runtime::PackRegistry::register_packs(
+        &["kg".to_string(), "comm".to_string()],
+        runtime.clone(),
+        &mut builder,
+    )
+    .expect("register kg+comm through the factory path");
     let registry = builder.build().expect("registry builds");
     (registry, runtime)
 }
@@ -29,8 +34,12 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
 fn build_registry_for_ns(ns: &str) -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-    builder.register(CommPack::new(runtime.clone()));
+    khive_runtime::PackRegistry::register_packs(
+        &["kg".to_string(), "comm".to_string()],
+        runtime.clone(),
+        &mut builder,
+    )
+    .expect("register kg+comm through the factory path");
     builder.with_default_namespace(ns);
     let registry = builder.build().expect("registry builds");
     (registry, runtime)
@@ -5129,7 +5138,526 @@ async fn ingest_dedup_without_stored_thread_id_falls_back_with_warning() {
     );
 }
 
-/// Regression (PR #1623): an all-hex >=8-char stored thread label that is NOT a UUID (e.g. "deadbeef") must still be matched exactly — the UUID-prefix arm in the resolver must not swallow it and error "no message thread matches prefix".
+// ── transport-owned message property write boundary (PR #1839 round 2) ──
+
+/// `try_create_note` is a public `khive-runtime` method reachable by any
+/// in-process caller holding a `NamespaceToken` — it is not routed through
+/// the generic `create` verb funnel's pack-installed note-write validator.
+/// `comm.ingest` is documented as the sole legitimate writer of
+/// `quarantined` / `channel_kind` / `channel_slug` (transport-owned
+/// evidence `comm.health` trusts at face value). A direct `try_create_note`
+/// call attempting to forge any of those three properties must be rejected,
+/// individually and in combination — and no row must be left behind for
+/// `comm.health` to count as real quarantine backlog.
+#[tokio::test]
+async fn try_create_note_rejects_forged_transport_owned_message_properties() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    for (key, value) in [
+        ("quarantined", serde_json::json!(true)),
+        ("channel_kind", serde_json::json!("email")),
+        ("channel_slug", serde_json::json!("forged-channel")),
+    ] {
+        let err = rt
+            .try_create_note(
+                &token,
+                "message",
+                None,
+                "forged quarantine row via direct runtime write",
+                Some(serde_json::json!({ key: value })),
+            )
+            .await
+            .expect_err(&format!(
+                "try_create_note must reject a direct write setting `{key}`"
+            ));
+        assert!(
+            err.to_string().contains(key),
+            "rejection must name the offending property `{key}`: {err}"
+        );
+    }
+
+    // All three at once must also be rejected as a single write.
+    let err = rt
+        .try_create_note(
+            &token,
+            "message",
+            None,
+            "forged quarantine row via direct runtime write (all three)",
+            Some(serde_json::json!({
+                "quarantined": true,
+                "channel_kind": "email",
+                "channel_slug": "forged-channel",
+            })),
+        )
+        .await
+        .expect_err("try_create_note must reject all three transport-owned properties at once");
+    assert!(!err.to_string().is_empty());
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["quarantined_count"].as_u64(),
+        Some(0),
+        "a rejected direct write must leave no row for comm.health to count: {health:?}"
+    );
+    assert_eq!(
+        health["channels"].as_array().map(Vec::len),
+        Some(0),
+        "no channel_health backlog entry should exist either: {health:?}"
+    );
+}
+
+/// PR #1839 round 3, blocker: `try_create_note` refuses the three
+/// transport-owned properties, but round 2 left the raw `NoteStore` accessor
+/// (`runtime.notes(&token)`) able to write them directly — an in-process
+/// caller holding a namespace token could call `upsert_note` or
+/// `try_insert_note` with a forged `kind = "message"` note and `comm.health`
+/// would count it as real quarantine backlog. `KhiveRuntime::notes()` is now
+/// wrapped in a policy-enforcing decorator that refuses these writes at the
+/// storage-accessor boundary itself, not just at the `try_create_note`
+/// fast-path funnel. Assert both `upsert_note` and `try_insert_note` are
+/// refused, individually per key, and that no row survives for `comm.health`
+/// to count.
+#[tokio::test]
+async fn raw_note_store_accessor_rejects_forged_transport_owned_message_properties() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+
+    for (key, value) in [
+        ("quarantined", serde_json::json!(true)),
+        ("channel_kind", serde_json::json!("email")),
+        ("channel_slug", serde_json::json!("forged-channel")),
+    ] {
+        let note = Note::new("local", "message", "forged via raw upsert_note")
+            .with_properties(serde_json::json!({ key: value }));
+        let err = store.upsert_note(note).await.expect_err(&format!(
+            "upsert_note must reject a direct write setting `{key}`"
+        ));
+        assert!(
+            err.to_string().contains(key),
+            "rejection must name the offending property `{key}`: {err}"
+        );
+
+        let note = Note::new("local", "message", "forged via raw try_insert_note")
+            .with_properties(serde_json::json!({ key: value }));
+        let err = store.try_insert_note(note).await.expect_err(&format!(
+            "try_insert_note must reject a direct write setting `{key}`"
+        ));
+        assert!(
+            err.to_string().contains(key),
+            "rejection must name the offending property `{key}`: {err}"
+        );
+    }
+
+    // All three at once, through both write paths.
+    let all_three = serde_json::json!({
+        "quarantined": true,
+        "channel_kind": "email",
+        "channel_slug": "forged-channel",
+    });
+    let err = store
+        .upsert_note(
+            Note::new("local", "message", "forged via raw upsert_note (all three)")
+                .with_properties(all_three.clone()),
+        )
+        .await
+        .expect_err("upsert_note must reject all three transport-owned properties at once");
+    assert!(!err.to_string().is_empty());
+    let err = store
+        .try_insert_note(
+            Note::new(
+                "local",
+                "message",
+                "forged via raw try_insert_note (all three)",
+            )
+            .with_properties(all_three),
+        )
+        .await
+        .expect_err("try_insert_note must reject all three transport-owned properties at once");
+    assert!(!err.to_string().is_empty());
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["quarantined_count"].as_u64(),
+        Some(0),
+        "no raw-storage write must leave a row for comm.health to count: {health:?}"
+    );
+    assert_eq!(
+        health["channels"].as_array().map(Vec::len),
+        Some(0),
+        "no channel_health backlog entry should exist either: {health:?}"
+    );
+}
+
+/// The insert/upsert guard alone leaves a two-call forge: create an innocent
+/// `kind = "message"` note through the public accessor (no reserved
+/// properties, so the insert guard passes), then patch a reserved key onto
+/// it through any of the four property-mutation seams. No public-store
+/// caller legitimately patches transport-owned keys on any note kind, so
+/// the decorator refuses those patch targets unconditionally. Assert every
+/// patch seam refuses every reserved key on a really-existing message note,
+/// that a non-reserved patch on the same note still works (the guard is
+/// key-scoped, not seam-dead), and that `comm.health` counts nothing.
+#[tokio::test]
+async fn raw_note_store_accessor_rejects_patching_reserved_keys_onto_existing_message() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+
+    let innocent = Note::new("local", "message", "innocent message, no reserved keys")
+        .with_properties(serde_json::json!({ "direction": "inbound", "read": false }));
+    let id = innocent.id;
+    let updated_at = innocent.updated_at;
+    store
+        .upsert_note(innocent)
+        .await
+        .expect("a message note without reserved properties must insert through the accessor");
+
+    let filter = khive_storage::NoteFilter::default();
+    for (key, value) in [
+        ("quarantined", serde_json::json!(true)),
+        ("channel_kind", serde_json::json!("email")),
+        ("channel_slug", serde_json::json!("forged-channel")),
+    ] {
+        let err = store
+            .set_note_property(id, key, value.clone(), updated_at)
+            .await
+            .expect_err(&format!("set_note_property must refuse `{key}`"));
+        assert!(
+            err.to_string().contains(key),
+            "set_note_property rejection must name `{key}`: {err}"
+        );
+
+        let path = format!("$.{key}");
+        let err = store
+            .try_patch_note_property(id, "local", &filter, &path, value.clone(), updated_at)
+            .await
+            .expect_err(&format!("try_patch_note_property must refuse `{path}`"));
+        assert!(
+            err.to_string().contains(key),
+            "try_patch_note_property rejection must name `{key}`: {err}"
+        );
+
+        let err = store
+            .patch_note_property_atomic(
+                vec![id],
+                "local",
+                &filter,
+                &path,
+                value.clone(),
+                updated_at,
+            )
+            .await
+            .expect_err(&format!("patch_note_property_atomic must refuse `{path}`"));
+        assert!(
+            err.to_string().contains(key),
+            "patch_note_property_atomic rejection must name `{key}`: {err}"
+        );
+
+        let err = store
+            .update_note_properties(
+                id,
+                Some(serde_json::json!({ "direction": "inbound", key: value })),
+                updated_at,
+            )
+            .await
+            .expect_err(&format!(
+                "update_note_properties must refuse a map carrying `{key}`"
+            ));
+        assert!(
+            err.to_string().contains(key),
+            "update_note_properties rejection must name `{key}`: {err}"
+        );
+    }
+
+    store
+        .set_note_property(id, "read", serde_json::json!(true), updated_at)
+        .await
+        .expect("a non-reserved patch on the same note must still succeed");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["quarantined_count"].as_u64(),
+        Some(0),
+        "no patch attempt must leave a row for comm.health to count: {health:?}"
+    );
+}
+
+/// SQLite's JSON path grammar admits spellings of the same top-level key
+/// that a substring comparison cannot canonicalize: the quoted dot label
+/// (`$."quarantined"`), the bracket form, and the bare `$` root, which
+/// `json_set` would use to replace the whole properties object at once.
+/// The guard refuses every target it cannot parse as a bare top-level
+/// identifier, so all of these fail closed rather than sliding past a
+/// string equality check — and a bare-identifier spelling of a
+/// NON-reserved key still passes, so the strictness is scoped to the
+/// grammar, not the seam.
+#[tokio::test]
+async fn patch_guard_refuses_target_spellings_it_cannot_prove_innocent() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+
+    let innocent = Note::new("local", "message", "innocent message for spelling probes")
+        .with_properties(serde_json::json!({ "direction": "inbound", "read": false }));
+    let id = innocent.id;
+    let updated_at = innocent.updated_at;
+    store.upsert_note(innocent).await.expect("innocent insert");
+
+    let filter = khive_storage::NoteFilter::default();
+    for path in [
+        "$.\"quarantined\"",
+        "$[\"quarantined\"]",
+        "$['quarantined']",
+        "$",
+        "$.",
+        "$.\"read\"",
+    ] {
+        let err = store
+            .try_patch_note_property(
+                id,
+                "local",
+                &filter,
+                path,
+                serde_json::json!(true),
+                updated_at,
+            )
+            .await
+            .expect_err(&format!("try_patch_note_property must refuse `{path}`"));
+        assert!(
+            err.to_string().contains("bare top-level identifier"),
+            "`{path}` must be refused as unparseable, got: {err}"
+        );
+        store
+            .patch_note_property_atomic(
+                vec![id],
+                "local",
+                &filter,
+                path,
+                serde_json::json!(true),
+                updated_at,
+            )
+            .await
+            .expect_err(&format!("patch_note_property_atomic must refuse `{path}`"));
+    }
+
+    for key in ["\"quarantined\"", "qu\"arantined", ""] {
+        store
+            .set_note_property(id, key, serde_json::json!(true), updated_at)
+            .await
+            .expect_err(&format!(
+                "set_note_property must refuse non-bare key `{key}`"
+            ));
+    }
+
+    store
+        .try_patch_note_property(
+            id,
+            "local",
+            &filter,
+            "$.read",
+            serde_json::json!(true),
+            updated_at,
+        )
+        .await
+        .expect("a bare-identifier non-reserved path must still pass the guard");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["quarantined_count"].as_u64(),
+        Some(0),
+        "no spelling probe may leave a countable row: {health:?}"
+    );
+}
+
+/// Pins WHERE the message-evidence policy boundary sits. The decorated
+/// typed accessor (`KhiveRuntime::notes`) refuses reserved transport
+/// properties; `KhiveRuntime::backend()` is the embedder/infrastructure
+/// surface, and stores taken from it are deliberately NOT policy-wrapped —
+/// an embedder holding the backend already holds root-equivalent access to
+/// the database file, so a store-layer check there binds nobody. No pack
+/// code takes note stores from the backend surface (gtd and schedule issue
+/// kind-constrained note DML through `sql()`; the module doc in
+/// `note_store_guard.rs` enumerates both writers and their constraints).
+/// If this test starts failing because the raw path now refuses, the
+/// boundary was moved: update the module contract in `note_store_guard.rs`
+/// and this pin together, deliberately.
+#[tokio::test]
+async fn storage_backend_note_stores_are_an_embedder_surface_outside_the_policy_boundary() {
+    let (_registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    let decorated = rt.notes(&token).expect("typed accessor");
+    let forged = Note::new("local", "message", "decorated accessor must refuse this")
+        .with_properties(serde_json::json!({ "quarantined": true }));
+    decorated
+        .upsert_note(forged)
+        .await
+        .expect_err("the typed accessor is the policy boundary and must refuse");
+
+    let raw = rt.backend().notes().expect("embedder store");
+    let embedder_row = Note::new("local", "message", "embedder surface is not policy-bound")
+        .with_properties(serde_json::json!({ "quarantined": true }));
+    raw.upsert_note(embedder_row)
+        .await
+        .expect("the embedder surface sits outside the policy boundary by contract");
+}
+
+/// PR #1839 round 3, high: the channel-ingest capability used to live in a
+/// process-global `OnceLock` on the factory, granted only inside
+/// `PackRegistry::register_packs`. Direct composition (`CommPack::new`
+/// without going through the registry, as `khive-mcp/src/serve.rs` does for
+/// one test fixture) could never receive it, and — because the global was
+/// process-wide rather than instance-bound — a grant to one registry's comm
+/// pack leaked into every other `CommPack` instance in the same test binary.
+/// This regression proves both fixed: an ungranted direct instance fails
+/// closed with a configuration error (not a leaked grant, not an
+/// `InvalidInput`), and the explicit constructor variant lets a direct
+/// composition succeed.
+#[tokio::test]
+async fn comm_ingest_capability_is_instance_bound_not_process_global() {
+    // A comm pack registered the normal way (through the registry) holds
+    // its own grant, proving grants still flow through the intended path.
+    let (registered_registry, _registered_rt) = build_registry_for_ns("local");
+    let registered_result = registered_registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "granted via the registry path",
+            }),
+        )
+        .await;
+    assert!(
+        registered_result.is_ok(),
+        "a registry-registered comm pack must retain its grant: {registered_result:?}"
+    );
+
+    // A direct `CommPack::new` composition — built in the SAME process,
+    // after the registry-based grant above — must NOT observe that grant.
+    // Under the old process-global design this succeeded; under the
+    // instance-bound design it must fail closed.
+    let ungranted_runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut ungranted_builder = VerbRegistryBuilder::new();
+    ungranted_builder.register(khive_pack_kg::KgPack::new(ungranted_runtime.clone()));
+    ungranted_builder.register(CommPack::new(ungranted_runtime.clone()));
+    let ungranted_registry = ungranted_builder.build().expect("registry builds");
+
+    let ungranted_result = ungranted_registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "must not observe another instance's grant",
+            }),
+        )
+        .await;
+    let err = ungranted_result.expect_err(
+        "a direct CommPack::new composition must not observe a grant made to a different \
+         registered instance",
+    );
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::Unconfigured(_)),
+        "a missing grant must classify as a configuration/startup failure, not InvalidInput: {err}"
+    );
+
+    // The explicit constructor variant lets a direct composition succeed.
+    let granted_runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut granted_builder = VerbRegistryBuilder::new();
+    granted_builder.register(khive_pack_kg::KgPack::new(granted_runtime.clone()));
+    granted_builder.register(CommPack::new_with_channel_ingest_capability(
+        granted_runtime.clone(),
+        khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+    ));
+    let granted_registry = granted_builder.build().expect("registry builds");
+
+    let granted_result = granted_registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "granted via the explicit direct-composition constructor",
+            }),
+        )
+        .await;
+    assert!(
+        granted_result.is_ok(),
+        "an explicitly-granted direct composition must succeed: {granted_result:?}"
+    );
+}
+
+/// The trusted-ingest path must still permit `comm.ingest` (its sole caller,
+/// holding the registration-granted channel-ingest capability) to establish
+/// the same three properties `try_create_note` refuses, and `comm.health`
+/// must count the resulting row. Exercised through the verb so the test
+/// proves the granted capability path end to end; the runtime method itself
+/// is uncallable from outside `khive-runtime` without a grant, which is the
+/// restriction under test.
+#[tokio::test]
+async fn comm_ingest_establishes_quarantine_via_granted_capability() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "external:sender",
+            "to": "local",
+            "content": "legitimate quarantine row via the trusted ingest path",
+            "channel_kind": "email",
+            "channel_slug": "trusted-channel",
+            "metadata": {"quarantined": true},
+        }),
+    )
+    .await;
+    assert_eq!(
+        props
+            .get("quarantined")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(props["channel_kind"], "email");
+    assert_eq!(props["channel_slug"], "trusted-channel");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(health["quarantined_count"].as_u64(), Some(1));
+}
+
+// ── list(kind=message) thread filter: legacy all-hex labels vs. UUID prefixes ──
+
+/// Regression (PR #1623 round 2): an all-hex >=8-char stored thread label
+/// that is NOT a UUID (e.g. "deadbeef") must still be matched exactly — the
+/// UUID-prefix arm in the resolver must not swallow it and error "no message
+/// thread matches prefix". A genuine UUID prefix must still resolve.
 #[tokio::test]
 async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
     let (registry, rt) = build_registry_for_ns("local");
@@ -6270,6 +6798,8 @@ async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
             "from": "email:quarantine",
             "to": "email:maintainer@example.com",
             "content": "spoofed body",
+            "channel_kind": "email",
+            "channel_slug": "account-1",
             "external_id": "imap:mail:3:1",
             "namespace": "local",
             "metadata": {
@@ -6280,6 +6810,8 @@ async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
                 "subject": ["not", "a", "string"],
                 "outbound_ref": "fabricated-twin",
                 "sent_by_process": "fabricated-process",
+                "channel_kind": "telegram",
+                "channel_slug": "spoofed-account",
             },
         }),
     )
@@ -6312,6 +6844,42 @@ async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
         props.get("sent_by_process").is_none(),
         "adapter metadata must not fabricate originating-process provenance; got props={props}"
     );
+    assert_eq!(props["channel_kind"].as_str(), Some("email"));
+    assert_eq!(props["channel_slug"].as_str(), Some("account-1"));
+}
+
+#[tokio::test]
+async fn ingest_rejects_ambiguous_channel_identity() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    for (extra, field) in [
+        (serde_json::json!({"channel_kind": "  "}), "channel_kind"),
+        (
+            serde_json::json!({"channel_kind": "email", "channel_slug": "  "}),
+            "channel_slug",
+        ),
+        (
+            serde_json::json!({"channel_slug": "account-1"}),
+            "channel_kind",
+        ),
+    ] {
+        let mut args = serde_json::json!({
+            "namespace": "local",
+            "from": "email:quarantine",
+            "to": "local",
+            "content": "invalid provenance",
+        });
+        args.as_object_mut()
+            .expect("args object")
+            .extend(extra.as_object().expect("extra object").clone());
+        let err = registry
+            .dispatch("comm.ingest", args)
+            .await
+            .expect_err("ambiguous channel identity must fail closed");
+        assert!(
+            err.to_string().contains(field),
+            "error must name {field}: {err}"
+        );
+    }
 }
 
 /// `comm.ingest` with a malformed `thread_id` must return `InvalidInput` and must not write any note (issue #479a).
@@ -6916,6 +7484,8 @@ async fn health_reports_client_role_when_no_heartbeat_state_exists() {
     assert_eq!(result["role"].as_str(), Some("client"));
     assert!(result["source"].is_null());
     assert!(result["as_of"].as_str().is_some());
+    assert_eq!(result["quarantined_count"].as_u64(), Some(0));
+    assert_eq!(result["unattributed_quarantined_count"].as_u64(), Some(0));
     assert_eq!(
         result["channels"]
             .as_array()
@@ -7019,7 +7589,360 @@ async fn heartbeat_success_is_visible_via_health() {
     assert_eq!(ch["consecutive_failures"].as_u64(), Some(0));
 }
 
-/// #1472: a silently stopped poller must be distinguishable from a healthy, idle channel even when its persisted failure count is zero.
+/// khive #1383: quarantine is a terminal disposition for one message, not a
+/// channel failure. Healthy heartbeat facts therefore stay healthy while the
+/// read surface reports every live parked row, grouped by the exact transport
+/// identity that produced it. Legacy rows without a channel slug remain
+/// visible in an honest unattributed total instead of disappearing or being
+/// guessed onto an account.
+#[tokio::test]
+async fn health_counts_live_quarantines_by_channel_without_marking_polling_failed() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    for slug in ["acct-1", "acct-2"] {
+        registry
+            .dispatch(
+                "comm.heartbeat",
+                serde_json::json!({
+                    "namespace": "local",
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "poll_interval_secs": 5,
+                    "outcome": "success",
+                }),
+            )
+            .await
+            .expect("healthy channel heartbeat");
+    }
+
+    async fn ingest_quarantine(
+        registry: &khive_runtime::VerbRegistry,
+        external_id: &str,
+        channel_slug: Option<&str>,
+        quarantined: serde_json::Value,
+    ) -> String {
+        let mut args = serde_json::json!({
+            "namespace": "local",
+            "from": "email:quarantine",
+            "to": "local",
+            "content": format!("parked {external_id}"),
+            "channel_kind": "email",
+            "external_id": external_id,
+            "metadata": {
+                "quarantined": quarantined,
+                "quarantine_reason": "test",
+            },
+        });
+        if let Some(slug) = channel_slug {
+            args["channel_slug"] = serde_json::json!(slug);
+            args["metadata"]["channel_slug"] = serde_json::json!("spoofed-by-metadata");
+        }
+        registry
+            .dispatch("comm.ingest", args)
+            .await
+            .expect("quarantine ingest")["full_id"]
+            .as_str()
+            .expect("full_id")
+            .to_string()
+    }
+
+    // Both wire spellings produced by generic channel metadata are accepted.
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-acct-1-string",
+        Some("acct-1"),
+        serde_json::json!("true"),
+    )
+    .await;
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-acct-1-bool",
+        Some("acct-1"),
+        serde_json::json!(true),
+    )
+    .await;
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-acct-2",
+        Some("acct-2"),
+        serde_json::json!("true"),
+    )
+    .await;
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-legacy",
+        None,
+        serde_json::json!("true"),
+    )
+    .await;
+
+    // Purged/soft-deleted rows are no longer parked and must not contribute.
+    let deleted_id = ingest_quarantine(
+        &registry,
+        "quarantine-health-deleted",
+        Some("acct-2"),
+        serde_json::json!("true"),
+    )
+    .await;
+    registry
+        .dispatch(
+            "delete",
+            serde_json::json!({"id": deleted_id, "kind": "note"}),
+        )
+        .await
+        .expect("soft-delete quarantined message");
+
+    // A false marker is ordinary mail, not a parked item.
+    ingest_quarantine(
+        &registry,
+        "quarantine-health-false",
+        Some("acct-1"),
+        serde_json::json!("false"),
+    )
+    .await;
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(health["quarantined_count"].as_u64(), Some(4));
+    assert_eq!(health["unattributed_quarantined_count"].as_u64(), Some(1));
+
+    let channels = health["channels"].as_array().expect("channels array");
+    assert_eq!(channels.len(), 2);
+    for (slug, expected) in [("acct-1", 2), ("acct-2", 1)] {
+        let channel = channels
+            .iter()
+            .find(|channel| channel["channel_slug"].as_str() == Some(slug))
+            .expect("channel health row");
+        assert_eq!(channel["consecutive_failures"].as_u64(), Some(0));
+        assert_eq!(channel["stalled"].as_bool(), Some(false));
+        assert_eq!(channel["quarantined_count"].as_u64(), Some(expected));
+    }
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({"status": "all", "limit": 50}),
+        )
+        .await
+        .expect("full inbox is the supported quarantine inspection path");
+    let visible_parked = inbox["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|message| {
+            let marker = &message["properties"]["quarantined"];
+            marker.as_bool() == Some(true) || marker.as_str() == Some("true")
+        })
+        .count();
+    assert_eq!(
+        visible_parked, 4,
+        "the same live rows counted by health must be inspectable with their full properties"
+    );
+}
+
+/// A deployment may intentionally keep operational heartbeats in `local`
+/// while routing message data into another authorized namespace. The scoped
+/// health read for that message namespace must still synthesize the parked
+/// channel entry from persisted quarantine provenance; it must not mislabel
+/// that evidence as a daemon heartbeat.
+#[tokio::test]
+async fn health_surfaces_quarantine_channel_without_a_heartbeat_in_that_namespace() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "tenant-a",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": "tenant parked message",
+                "channel_kind": "email",
+                "channel_slug": "tenant-mailbox",
+                "external_id": "quarantine-health-tenant-a",
+                "metadata": {
+                    "quarantined": "true",
+                    "quarantine_reason": "test",
+                },
+            }),
+        )
+        .await
+        .expect("tenant quarantine ingest");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({"namespace": "tenant-a"}))
+        .await
+        .expect("tenant health succeeds");
+    assert_eq!(health["namespace"].as_str(), Some("tenant-a"));
+    assert_eq!(health["role"].as_str(), Some("client"));
+    assert!(health["source"].is_null());
+    assert_eq!(health["quarantined_count"].as_u64(), Some(1));
+    assert_eq!(health["unattributed_quarantined_count"].as_u64(), Some(0));
+    let channels = health["channels"].as_array().expect("channels array");
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
+    assert_eq!(channels[0]["channel_slug"].as_str(), Some("tenant-mailbox"));
+    assert_eq!(channels[0]["quarantined_count"].as_u64(), Some(1));
+    for field in [
+        "poll_interval_secs",
+        "stalled",
+        "last_success_at",
+        "last_poll_attempt_at",
+        "last_failure_at",
+        "last_error",
+        "consecutive_failures",
+    ] {
+        assert!(
+            channels[0][field].is_null(),
+            "without a heartbeat, `{field}` is unknown rather than fabricated: {}",
+            channels[0]
+        );
+    }
+}
+
+async fn plant_healthy_channel_rows(rt: &KhiveRuntime, count: usize) {
+    use khive_storage::note::Note;
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+    let base = chrono::Utc::now().timestamp_micros();
+    let notes = (0..count)
+        .map(|index| {
+            let slug = format!("heartbeat-{index:03}");
+            Note {
+                id: uuid::Uuid::new_v4(),
+                namespace: "local".to_string(),
+                kind: "channel_health".to_string(),
+                status: "active".to_string(),
+                name: Some(format!("email:{slug}")),
+                content: format!("channel heartbeat: email:{slug}"),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(serde_json::json!({
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "poll_interval_secs": 5,
+                    "last_success_at": chrono::Utc::now().to_rfc3339(),
+                    "last_poll_attempt_at": chrono::Utc::now().to_rfc3339(),
+                    "last_failure_at": null,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                })),
+                created_at: base + index as i64,
+                updated_at: base + index as i64,
+                deleted_at: None,
+            }
+        })
+        .collect();
+    let summary = store
+        .upsert_notes(notes)
+        .await
+        .expect("batch healthy channel rows");
+    assert_eq!(summary.attempted, count as u64);
+    assert_eq!(summary.affected, count as u64);
+    assert_eq!(summary.failed, 0, "heartbeat seed failures: {summary:?}");
+}
+
+async fn ingest_attributed_quarantine(
+    registry: &VerbRegistry,
+    external_id: &str,
+    channel_slug: &str,
+) {
+    registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": format!("parked {external_id}"),
+                "channel_kind": "email",
+                "channel_slug": channel_slug,
+                "external_id": external_id,
+                "metadata": {"quarantined": true, "quarantine_reason": "test"},
+            }),
+        )
+        .await
+        .expect("quarantine ingest");
+}
+
+/// Heartbeats are authoritative liveness evidence and consume the bounded
+/// channel budget first. A quarantine identity that sorts before them must not
+/// displace a heartbeat or be emitted as a heartbeat-free synthetic row.
+#[tokio::test]
+async fn health_channel_limit_never_displaces_a_real_heartbeat() {
+    let (registry, rt) = build_registry_for_ns("local");
+    plant_healthy_channel_rows(&rt, 200).await;
+    ingest_attributed_quarantine(
+        &registry,
+        "quarantine-health-over-limit",
+        "000-quarantine-only",
+    )
+    .await;
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channels = health["channels"].as_array().expect("channels array");
+    assert_eq!(channels.len(), 200, "the union has one hard response bound");
+    assert_eq!(health["quarantined_count"].as_u64(), Some(1));
+    assert!(
+        channels
+            .iter()
+            .all(|channel| channel["poll_interval_secs"].as_u64() == Some(5)),
+        "all 200 returned entries must be real heartbeat rows: {channels:?}"
+    );
+    assert!(
+        channels
+            .iter()
+            .all(|channel| channel["channel_slug"] != "000-quarantine-only"),
+        "quarantine-only evidence must not displace or masquerade as a heartbeat"
+    );
+}
+
+/// Once all heartbeat rows fit, quarantine-only identities fill only the
+/// remaining capacity in stable `(channel_kind, channel_slug)` order.
+#[tokio::test]
+async fn health_channel_limit_orders_quarantine_only_fill_deterministically() {
+    let (registry, rt) = build_registry_for_ns("local");
+    plant_healthy_channel_rows(&rt, 199).await;
+    ingest_attributed_quarantine(&registry, "quarantine-health-late", "zz-last").await;
+    ingest_attributed_quarantine(&registry, "quarantine-health-first", "aa-first").await;
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channels = health["channels"].as_array().expect("channels array");
+    assert_eq!(channels.len(), 200, "the union has one hard response bound");
+    assert_eq!(health["quarantined_count"].as_u64(), Some(2));
+    assert_eq!(
+        channels[0]["channel_slug"], "heartbeat-198",
+        "heartbeat rows retain the store's newest-first order"
+    );
+    assert_eq!(
+        channels[198]["channel_slug"], "heartbeat-000",
+        "the complete heartbeat page remains ahead of synthetic entries"
+    );
+    assert_eq!(
+        channels[199]["channel_slug"], "aa-first",
+        "the lexicographically first quarantine-only identity fills the final slot"
+    );
+    assert!(
+        channels
+            .iter()
+            .all(|channel| channel["channel_slug"] != "zz-last"),
+        "later quarantine-only identities are truncated deterministically"
+    );
+}
+
+/// #1472: a silently stopped poller must be distinguishable from a healthy,
+/// idle channel even when its persisted failure count is zero.
 #[tokio::test]
 async fn health_flags_stopped_poller_after_three_nominal_intervals() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -10190,7 +11113,220 @@ async fn update_admits_non_owned_properties_on_message_note() {
     );
 }
 
-/// The guard fires only on pack-owned kinds: naming `from_actor` on a base kg note kind (e.g. `observation`) must succeed.
+/// Quarantine disposition and channel attribution are transport-owned facts.
+/// Generic update must not hide a parked message or move it between channels;
+/// the supported recovery mutation is delete/purge.
+#[tokio::test]
+async fn update_refuses_to_forge_transport_owned_quarantine_properties() {
+    let (registry, _rt) = build_registry();
+    let ingested = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": "transport-owned update guard",
+                "channel_kind": "email",
+                "channel_slug": "real-account",
+                "external_id": "transport-owned-update-guard",
+                "metadata": {"quarantined": true, "quarantine_reason": "test"},
+            }),
+        )
+        .await
+        .expect("the legitimate comm.ingest path must remain accepted");
+    let full_id = ingested["full_id"].as_str().expect("full_id").to_string();
+
+    for (key, forged_value) in [
+        ("quarantined", serde_json::json!(false)),
+        ("channel_kind", serde_json::json!("telegram")),
+        ("channel_slug", serde_json::json!("forged-account")),
+    ] {
+        let before = registry
+            .dispatch("get", serde_json::json!({"id": full_id}))
+            .await
+            .expect("get before refused update");
+        let err = registry
+            .dispatch(
+                "update",
+                serde_json::json!({"id": full_id, "properties": {key: forged_value}}),
+            )
+            .await
+            .expect_err("generic update must refuse transport-owned properties");
+        assert!(
+            err.to_string().contains(key),
+            "error must name {key}: {err}"
+        );
+        let after = registry
+            .dispatch("get", serde_json::json!({"id": full_id}))
+            .await
+            .expect("get after refused update");
+        assert_eq!(
+            after["properties"], before["properties"],
+            "refused `{key}` update must leave all message properties unchanged"
+        );
+    }
+}
+
+/// The pack hook exercised above belongs to `VerbRegistry::dispatch("update", ...)`.
+/// A Rust embedder can call the public runtime API directly, so the canonical
+/// runtime update seam must independently enforce the same transport ownership.
+#[tokio::test]
+async fn direct_runtime_update_refuses_transport_owned_message_properties() {
+    let (registry, runtime) = build_registry_with_owned_kinds_and_validator();
+    let ingested = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": "direct runtime transport guard",
+                "channel_kind": "email",
+                "channel_slug": "real-account",
+                "external_id": "direct-runtime-transport-guard",
+                "metadata": {"quarantined": true, "quarantine_reason": "test"},
+            }),
+        )
+        .await
+        .expect("the trusted ingest path must seed transport evidence");
+    let id = uuid::Uuid::parse_str(ingested["full_id"].as_str().expect("full_id"))
+        .expect("full_id must be canonical");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let before = runtime
+        .get_note_including_deleted(&token, id)
+        .await
+        .expect("read seeded note")
+        .expect("seeded note");
+
+    for (key, forged_value) in [
+        ("quarantined", serde_json::json!(false)),
+        ("channel_kind", serde_json::json!("telegram")),
+        ("channel_slug", serde_json::json!("forged-account")),
+    ] {
+        let error = runtime
+            .update_note(
+                &token,
+                id,
+                NotePatch::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(serde_json::json!({key: forged_value})),
+                ),
+            )
+            .await
+            .expect_err("direct runtime update must refuse transport-owned message properties");
+        assert!(
+            error.to_string().contains(key),
+            "direct-runtime refusal must name {key}: {error}"
+        );
+        assert_eq!(
+            runtime
+                .get_note_including_deleted(&token, id)
+                .await
+                .expect("read note after refusal")
+                .expect("note after refusal"),
+            before,
+            "refused direct update naming `{key}` must leave the whole note unchanged"
+        );
+    }
+}
+
+/// Atomic execution prepares note replacement DML without dispatching the KG
+/// pack hook. Preparation must reject the same forged transport evidence
+/// before it can enter an atomic write plan.
+#[tokio::test]
+async fn atomic_prepare_refuses_transport_owned_message_properties() {
+    let (registry, runtime) = build_registry_with_owned_kinds_and_validator();
+    let ingested = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:quarantine",
+                "to": "local",
+                "content": "atomic prepare transport guard",
+                "channel_kind": "email",
+                "channel_slug": "real-account",
+                "external_id": "atomic-prepare-transport-guard",
+                "metadata": {"quarantined": true, "quarantine_reason": "test"},
+            }),
+        )
+        .await
+        .expect("the trusted ingest path must seed transport evidence");
+    let full_id = ingested["full_id"].as_str().expect("full_id");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+
+    for (key, forged_value) in [
+        ("quarantined", serde_json::json!(false)),
+        ("channel_kind", serde_json::json!("telegram")),
+        ("channel_slug", serde_json::json!("forged-account")),
+    ] {
+        let error = khive_runtime::atomic_prepare::prepare_update(
+            &runtime,
+            &token,
+            &serde_json::json!({
+                "id": full_id,
+                "properties": {key: forged_value},
+            }),
+            Some(khive_runtime::atomic_prepare::AtomicUpdateKind::Note {
+                specific: Some("message".to_string()),
+            }),
+        )
+        .await
+        .expect_err("atomic preparation must refuse transport-owned message properties");
+        assert!(
+            error.to_string().contains(key),
+            "atomic-prepare refusal must name {key}: {error}"
+        );
+    }
+}
+
+/// The transport-property rule belongs specifically to comm's `message`
+/// kind. The same JSON keys remain ordinary metadata on a generic note when
+/// a Rust embedder calls the runtime directly.
+#[tokio::test]
+async fn direct_runtime_update_allows_transport_named_properties_on_other_kinds() {
+    let (registry, runtime) = build_registry_with_owned_kinds_and_validator();
+    let created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "foreign-kind transport-name control",
+            }),
+        )
+        .await
+        .expect("create observation");
+    let id =
+        uuid::Uuid::parse_str(created["id"].as_str().expect("id")).expect("id must be canonical");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+
+    let updated = runtime
+        .update_note(
+            &token,
+            id,
+            NotePatch::new(
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "quarantined": true,
+                    "channel_kind": "user-label",
+                    "channel_slug": "user-value",
+                })),
+            ),
+        )
+        .await
+        .expect("transport-named keys are not reserved on an observation");
+    assert_eq!(updated.properties.unwrap()["quarantined"], true);
+}
+
+/// The guard fires only on pack-owned kinds: naming `from_actor` on a base
+/// kg note kind (e.g. `observation`) must succeed.
 #[tokio::test]
 async fn update_permits_from_actor_key_on_generic_note_kind() {
     let (registry, _rt) = build_registry_with_owned_kinds();
@@ -10255,7 +11391,52 @@ async fn update_refuses_non_object_properties_patch_on_message_note() {
     );
 }
 
-/// FORGE arm: a generic `create(kind="message", properties={from_actor: "forged"})` call under an authenticated token for actor X must store `from_actor == X` — the true caller — not the forged value.
+// ---- ADR-124 note-write identity guard: CREATE-path derivation ----
+
+/// Public generic message creation cannot manufacture transport evidence that
+/// only `comm.ingest` is authorized to establish.
+#[tokio::test]
+async fn create_refuses_transport_owned_quarantine_properties() {
+    let (registry, _rt) = build_registry();
+
+    for (key, forged_value) in [
+        ("quarantined", serde_json::json!(true)),
+        ("channel_kind", serde_json::json!("email")),
+        ("channel_slug", serde_json::json!("victim-account")),
+    ] {
+        let err = registry
+            .dispatch(
+                "create",
+                serde_json::json!({
+                    "kind": "message",
+                    "content": format!("generic create forgery: {key}"),
+                    "properties": {key: forged_value},
+                }),
+            )
+            .await
+            .expect_err("generic create must refuse transport-owned properties");
+        assert!(
+            err.to_string().contains(key),
+            "error must name {key}: {err}"
+        );
+    }
+
+    let messages = registry
+        .dispatch("list", serde_json::json!({"kind": "message", "limit": 10}))
+        .await
+        .expect("list after refused creates");
+    assert_eq!(
+        messages["items"].as_array().map(Vec::len),
+        Some(0),
+        "a refused generic create must not leave a partial message row"
+    );
+}
+
+/// FORGE arm: a generic `create(kind="message", properties={from_actor:
+/// "forged"})` call under an authenticated token for actor X must store
+/// `from_actor == X` — the true caller — not the forged value. This is not a
+/// refusal: the create succeeds and the identity property is silently
+/// corrected to the value the authorization token actually names.
 #[tokio::test]
 async fn create_derives_from_actor_overwriting_a_forged_value() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -10476,7 +11657,225 @@ async fn merge_preserves_into_note_from_actor_under_prefer_into() {
     assert_eq!(after["properties"]["from_actor"], "lambda:x");
 }
 
-/// NON-IDENTITY-KEY arm: a non-owned property that differs between the two notes still folds by strategy — `prefer_from` takes the from-note's value — proving the preserve step pins only the owner-established keys, not the whole property object.
+/// Transport provenance belongs to one transport item, so merging another
+/// message into the survivor must never import channel identity or quarantine
+/// disposition that the survivor did not already have. An absent key is part
+/// of the survivor's immutable state just as much as a present value. The
+/// table covers every public property merge policy; each policy would import
+/// the absorbed note's absent-on-into keys without the restoration guard.
+#[tokio::test]
+async fn merge_never_transfers_transport_properties_under_any_strategy() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    for strategy in ["prefer_into", "prefer_from", "union"] {
+        let into = registry
+            .dispatch(
+                "comm.ingest",
+                serde_json::json!({
+                    "namespace": "local",
+                    "from": "legacy:unattributed",
+                    "to": "local",
+                    "content": format!("transport-free survivor for {strategy}"),
+                    "external_id": format!("transport-free-survivor-{strategy}"),
+                }),
+            )
+            .await
+            .expect("trusted ingest may preserve a legacy unattributed row");
+        let into_id = into["full_id"].as_str().expect("full_id").to_string();
+
+        let from = registry
+            .dispatch(
+                "comm.ingest",
+                serde_json::json!({
+                    "namespace": "local",
+                    "from": "email:quarantine",
+                    "to": "local",
+                    "content": format!("attributed transport source for {strategy}"),
+                    "channel_kind": "email",
+                    "channel_slug": format!("source-{strategy}"),
+                    "external_id": format!("attributed-transport-source-{strategy}"),
+                }),
+            )
+            .await
+            .expect("trusted ingest must establish transport evidence");
+        let from_id = from["full_id"].as_str().expect("full_id").to_string();
+        let from_before = registry
+            .dispatch("get", serde_json::json!({"id": from_id}))
+            .await
+            .expect("read transport source before merge");
+        assert_eq!(from_before["properties"]["channel_kind"], "email");
+        assert_eq!(
+            from_before["properties"]["channel_slug"],
+            format!("source-{strategy}")
+        );
+
+        registry
+            .dispatch(
+                "merge",
+                serde_json::json!({
+                    "kind": "message",
+                    "into_id": into_id,
+                    "from_id": from_id,
+                    "strategy": strategy,
+                }),
+            )
+            .await
+            .expect("generic message merge must succeed");
+
+        let after = registry
+            .dispatch("get", serde_json::json!({"id": into_id}))
+            .await
+            .expect("read survivor after merge");
+        for key in ["channel_kind", "channel_slug"] {
+            assert!(
+                after["properties"].get(key).is_none(),
+                "{strategy} must not transfer transport-owned `{key}` from the absorbed \
+                 message into a survivor that lacked it; got {after}"
+            );
+        }
+    }
+}
+
+/// A quarantined message participates in no merges at all: folding its content
+/// into an ordinary message while the marker restoration drops `quarantined`
+/// would launder quarantined transport content into an unmarked record.
+/// Release is the channel-ingest path's decision, never a curation side
+/// effect, so the merge is refused in every strategy and either operand role.
+#[tokio::test]
+async fn merge_refuses_quarantined_message_under_every_strategy() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    for strategy in ["prefer_into", "prefer_from", "union"] {
+        let ordinary = registry
+            .dispatch(
+                "comm.ingest",
+                serde_json::json!({
+                    "namespace": "local",
+                    "from": "legacy:unattributed",
+                    "to": "local",
+                    "content": format!("ordinary operand for {strategy}"),
+                    "external_id": format!("quarantine-merge-ordinary-{strategy}"),
+                }),
+            )
+            .await
+            .expect("ordinary ingest");
+        let quarantined = registry
+            .dispatch(
+                "comm.ingest",
+                serde_json::json!({
+                    "namespace": "local",
+                    "from": "email:quarantine",
+                    "to": "local",
+                    "content": format!("quarantined operand for {strategy}"),
+                    "channel_kind": "email",
+                    "channel_slug": format!("quarantine-merge-{strategy}"),
+                    "external_id": format!("quarantine-merge-parked-{strategy}"),
+                    "metadata": {"quarantined": true, "quarantine_reason": "test"},
+                }),
+            )
+            .await
+            .expect("quarantined ingest");
+        let ordinary_id = ordinary["full_id"].as_str().expect("full_id").to_string();
+        let quarantined_id = quarantined["full_id"]
+            .as_str()
+            .expect("full_id")
+            .to_string();
+
+        for (into_id, from_id) in [
+            (&ordinary_id, &quarantined_id),
+            (&quarantined_id, &ordinary_id),
+        ] {
+            let error = registry
+                .dispatch(
+                    "merge",
+                    serde_json::json!({
+                        "kind": "message",
+                        "into_id": into_id,
+                        "from_id": from_id,
+                        "strategy": strategy,
+                    }),
+                )
+                .await
+                .expect_err("a quarantined message must not merge in either role");
+            assert!(
+                error.to_string().contains("quarantined"),
+                "{strategy}: {error}"
+            );
+        }
+
+        let parked = registry
+            .dispatch("get", serde_json::json!({"id": quarantined_id}))
+            .await
+            .expect("quarantined note intact after refused merges");
+        assert_eq!(parked["properties"]["quarantined"], true);
+        assert!(
+            parked["content"]
+                .as_str()
+                .expect("content")
+                .contains("quarantined operand"),
+            "refused merge must not mutate the quarantined operand"
+        );
+    }
+}
+
+/// Scope control for merge: transport-shaped names on `observation` are
+/// caller metadata, so the normal `prefer_from` fold must remain intact.
+#[tokio::test]
+async fn merge_transfers_transport_named_properties_on_non_message_notes() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let into = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "transport-name merge control survivor",
+            }),
+        )
+        .await
+        .expect("create into observation");
+    let from = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "transport-name merge control source",
+                "properties": {
+                    "quarantined": true,
+                    "channel_kind": "user-label",
+                    "channel_slug": "user-value",
+                },
+            }),
+        )
+        .await
+        .expect("create from observation");
+    let into_id = into["id"].as_str().expect("id");
+    let from_id = from["id"].as_str().expect("id");
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "observation",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("transport-shaped names do not restrict observation merge");
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("read merged observation");
+    assert_eq!(after["properties"]["quarantined"], true);
+    assert_eq!(after["properties"]["channel_kind"], "user-label");
+    assert_eq!(after["properties"]["channel_slug"], "user-value");
+}
+
+/// NON-IDENTITY-KEY arm: a non-owned property that differs between the two
+/// notes still folds by strategy — `prefer_from` takes the from-note's
+/// value — proving the preserve step pins only the owner-established keys,
+/// not the whole property object.
 #[tokio::test]
 async fn merge_still_folds_non_owned_properties_by_strategy() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
