@@ -3,14 +3,14 @@
 **Status**: accepted
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
-accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch proposed
+accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch added
 2026-08-16 by ADR-160)
 **Authors**: khive maintainers
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which requires
+**Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), which requires
 backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and implements
 ADR-121's attachment-only liveness and claim fences through a Phase-4a GC compatibility release,
 mandatory fleet convergence/drain plus application-service quiescence, and boot-gated Phase-4b V21
-cutover on acceptance.
+cutover.
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (trait-only capability
@@ -327,7 +327,7 @@ Once admitted, the filesystem implementation:
 6. removes that bounded claim batch in a second short SQL-only atomic unit before advancing, then
    releases all locks after the final batch.
 
-**Two-release rollout (proposed ADR-160 Phase 4a → Phase 4b).** The epoch gate above ships first as
+**Two-release rollout (ADR-160 Phase 4a → Phase 4b).** The epoch gate above ships first as
 Phase 4a and makes no schema or data change: it does not create attachments, register or execute
 V21, backfill, dual-read, dual-write, or drop the legacy column. Callers must not fall back to
 caller-snapshot `orphan_sweep` or unconditional `delete` while the gate refuses.

@@ -3,7 +3,7 @@
 **Status**: accepted\
 **Date**: 2026-07-23\
 **Authors**: khive maintainers\
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), whose moodboard migration
+**Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), whose moodboard migration
 consumes this accepted role-keyed desired state, makes the canonical main backend the sole
 attachment/GC-liveness authority, and specifies a two-release GC-compatibility/deployment gate plus
 a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`.\

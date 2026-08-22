@@ -195,7 +195,8 @@ above remains the historical pre-consolidation record.
 > finish it atomically only for a zero-legacy-reference database. A legacy V20
 > database stops at V20; the async host coordinator holds the canonical blob-GC
 > owner across stage, verified application backfill, and finalization. The
-> durable marker is `Pending`/`Incomplete`/`Complete`, and the V21 ledger row is
+> durable marker row admits only `incomplete`/`complete`; the `Pending` status
+> is derived from the marker row's absence, never stored. The V21 ledger row is
 > inserted only in the final transaction that swaps claim fences and drops
 > `entities.content_ref`.
 

@@ -3,10 +3,10 @@
 **Status**: accepted\
 **Date**: 2026-05-22\
 **Authors**: khive maintainers\
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds the required
+**Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), which adds the required
 backend-enforced bounded-and-verified BlobStore read while leaving admission and lifecycle policy
 in runtime, binds vector operations to a complete embedding-space identity, and implements
-ADR-121's attachment capability/current ten-capability surface on acceptance.
+ADR-121's attachment capability, completing the current ten-capability surface.
 
 ## Context
 
