@@ -266,10 +266,17 @@ fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cach
             return Err(CacheError::UnsafeToReplace(repo_dir));
         }
         // Slots created before `clone` gained `--no-checkout` still carry a
-        // worktree; nothing else on this path would ever remove it. Runs
-        // before `dir_size` below so the cap is checked against the size the
-        // slot actually ends the pass at.
-        strip_legacy_worktree(&repo_dir)?;
+        // worktree, and nothing else on this path would ever remove it. Such a
+        // slot is replaced whole rather than stripped in place: the removal
+        // below re-derives ownership from a descriptor it opens itself, and
+        // after it `.git` is gone, so the fresh no-checkout installer in the
+        // `else` arm is what reinstates the slot.
+        if slot_carries_worktree(&repo_dir)? {
+            remove_owned_entry(root, &repo_dir)?;
+        }
+    }
+
+    if repo_dir.join(".git").exists() {
         fetch(&repo_dir)?;
         advance_to_fetched_tip(&repo_dir)?;
         // `repo_dir` was just fetched into and its ownership already
@@ -320,14 +327,23 @@ fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cac
         return Err(CacheError::UnsafeToReplace(repo_dir));
     }
 
+    let cap = clone_max_bytes();
+
     // Same legacy-slot migration as the `ensure_clone_locked` path: a repair
     // pass reaches slots that predate `--no-checkout` too, and the invariant is
-    // that no slot carries a worktree, not that no slot acquires one.
-    strip_legacy_worktree(&repo_dir)?;
+    // that no slot carries a worktree, not that no slot acquires one. A fresh
+    // install is already the repaired state this path was trying to reach, so
+    // there is nothing left to refetch afterwards.
+    if slot_carries_worktree(&repo_dir)? {
+        remove_owned_entry(root, &repo_dir)?;
+        install_fresh_clone(canonical_url, root, &repo_dir, cap)?;
+        evict_lru(root, &repo_dir)?;
+        return Ok(repo_dir);
+    }
+
     fetch_refetch(&repo_dir)?;
     advance_to_fetched_tip(&repo_dir)?;
 
-    let cap = clone_max_bytes();
     let size = dir_size(&repo_dir)?;
     if size > cap {
         // Ownership-guarded removal, not a raw `remove_dir_all` — see
@@ -810,8 +826,8 @@ fn advance_to_fetched_tip(repo: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Remove a worktree left behind by a slot created before [`clone`] gained
-/// `--no-checkout`.
+/// Does this slot still carry a worktree left behind by a clone that predates
+/// `--no-checkout`?
 ///
 /// `--no-checkout` and the ref-only [`advance_to_fetched_tip`] together stop a
 /// slot from *becoming* materialized, and neither one un-materializes a slot
@@ -822,24 +838,42 @@ fn advance_to_fetched_tip(repo: &Path) -> Result<(), CacheError> {
 /// arrives only when a slot happens to be evicted or recloned, which is to say
 /// on no schedule at all.
 ///
-/// This runs before the cap check on purpose. `dir_size` counts the worktree,
-/// so a legacy slot can exceed the cap on exactly the bytes this function is
-/// about to reclaim, and the caller would evict a slot for a size it no longer
-/// has.
+/// This is checked before the cap check on purpose. `dir_size` counts the
+/// worktree, so a legacy slot can exceed the cap on exactly the bytes the
+/// migration is about to reclaim, and the caller would otherwise evict a slot
+/// for a size it is no longer going to have.
 ///
-/// The index is removed alongside the files. Leaving a populated index behind
-/// would make every removed path read as a staged deletion to anything that
-/// later ran a status-like command, and dropping it leaves a migrated slot
-/// byte-for-byte in the shape a fresh `--no-checkout` clone produces.
+/// Replacing the slot rather than stripping it also disposes of the index for
+/// free. A populated index left beside a removed worktree would make every
+/// removed path read as a staged deletion to anything that later ran a
+/// status-like command; a reinstalled slot is byte-for-byte what a fresh
+/// `--no-checkout` clone produces, because it is one.
 ///
-/// Ownership is the caller's precondition: every call site has already
-/// established `is_owned_entry`, and this function deletes without re-checking,
-/// so it must not be called on a path that has not passed that gate.
-fn strip_legacy_worktree(repo: &Path) -> Result<(), CacheError> {
-    let mut removed_any = false;
+/// This is a read, and the migration it gates is a whole-slot replacement
+/// through [`remove_owned_entry`] followed by [`install_fresh_clone`] — the
+/// same pair [`reclone_locked`] uses.
+///
+/// Detecting and then deleting in place would be the obvious shape and is the
+/// wrong one. Recursively removing children through the shared cache-key
+/// pathname reintroduces exactly the race `remove_owned_entry` exists to close:
+/// the slot lock is same-process only, so between an ownership check and a
+/// pathname traversal an external writer can replace `<root>/<key>`, and the
+/// traversal then deletes the replacement's children. `remove_owned_entry`
+/// instead opens the slot with `O_DIRECTORY | O_NOFOLLOW`, re-checks ownership
+/// against that descriptor, renames by descriptor into the private staging
+/// namespace, and verifies the moved inode before removing anything. Routing
+/// the migration through it means this change adds no new destructive traversal
+/// at all.
+///
+/// Both error directions of this detector are safe, which is why it is allowed
+/// to be a plain pathname read: a false positive costs one unnecessary
+/// reinstall of a slot that is about to be fetched anyway, and a false negative
+/// leaves the slot exactly as it was before this change. It never decides what
+/// gets deleted; the removal re-derives that from a descriptor it opens itself.
+fn slot_carries_worktree(repo: &Path) -> Result<bool, CacheError> {
     let entries = std::fs::read_dir(repo).map_err(|e| {
         CacheError::Git(format!(
-            "reading {} to strip a worktree: {e}",
+            "reading {} to detect a legacy worktree: {e}",
             repo.display()
         ))
     })?;
@@ -850,38 +884,9 @@ fn strip_legacy_worktree(repo: &Path) -> Result<(), CacheError> {
         if name == ".git" || name == MARKER_FILE {
             continue;
         }
-        let path = entry.path();
-        // `symlink_metadata` rather than `metadata`: a symlink in the worktree
-        // must be removed as a link, never followed out of the slot.
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| CacheError::Git(format!("stat of {}: {e}", path.display())))?;
-        let outcome = if meta.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        outcome.map_err(|e| {
-            CacheError::Git(format!(
-                "removing legacy worktree entry {}: {e}",
-                path.display()
-            ))
-        })?;
-        removed_any = true;
+        return Ok(true);
     }
-
-    if removed_any {
-        match std::fs::remove_file(repo.join(".git").join("index")) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(CacheError::Git(format!(
-                    "removing the index of migrated slot {}: {e}",
-                    repo.display()
-                )))
-            }
-        }
-    }
-    Ok(())
+    Ok(false)
 }
 
 fn fetch(repo: &Path) -> Result<(), CacheError> {
@@ -1812,6 +1817,67 @@ mod tests {
             !slot2.join(".git").join("index").exists(),
             "the index must go with the files, or every removed path reads as \
              a staged deletion"
+        );
+        assert_eq!(
+            test_head_sha(&slot2),
+            test_head_sha(&upstream),
+            "migration must not damage the slot: HEAD still resolves"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// The repair path reaches legacy slots too, and it is a separate call
+    /// site from the one above.
+    ///
+    /// Without this test the production call in `refetch_clone_locked` can be
+    /// deleted or reordered while the ensure-path test stays green, which
+    /// leaves repair-triggered legacy slots materialized — the exact defect
+    /// the ensure-path test was written to catch, surviving in the path that
+    /// test does not execute. Coverage of a migration belongs at every call
+    /// site that can present the state, not once per migration.
+    #[test]
+    fn a_legacy_slot_reached_by_the_repair_path_is_migrated_too() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
+
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        test_git(&upstream, &["init", "-q"]);
+        test_git(&upstream, &["config", "user.email", "t@example.com"]);
+        test_git(&upstream, &["config", "user.name", "T"]);
+        std::fs::write(upstream.join("tracked.md"), "content\n").unwrap();
+        test_git(&upstream, &["add", "tracked.md"]);
+        test_git(&upstream, &["commit", "-q", "-m", "commit A"]);
+
+        let url = upstream.to_str().expect("utf8 path");
+        let slot = ensure_clone(url).expect("initial clone");
+
+        // Same seeding operation as the ensure-path test: the thing that
+        // actually produced these slots before `--no-checkout`.
+        test_git(&slot, &["reset", "--hard"]);
+        assert!(
+            worktree_entries(&slot).contains(&"tracked.md".to_string()),
+            "fixture control: the seeded slot must actually carry a worktree, \
+             otherwise the assertion below passes vacuously"
+        );
+        assert!(
+            slot.join(".git").join("index").exists(),
+            "fixture control: the seeded slot must carry a populated index"
+        );
+
+        let slot2 = refetch_clone(url).expect("refetch the legacy slot");
+        assert_eq!(slot2, slot, "same cache slot");
+        assert_eq!(
+            worktree_entries(&slot2),
+            Vec::<String>::new(),
+            "the repair path must migrate a legacy slot as well; it reaches \
+             the same pre-`--no-checkout` slots the ensure path does"
+        );
+        assert!(
+            !slot2.join(".git").join("index").exists(),
+            "the index must not survive the migration on this path either"
         );
         assert_eq!(
             test_head_sha(&slot2),
