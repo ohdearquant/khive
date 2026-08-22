@@ -401,6 +401,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 param_type: "string",
                 required: false,
                 description: "Stable channel credential/account identity returned by `Channel::slug`. Channel pollers supply it with `channel_kind` so quarantine health can be grouped without trusting free-form metadata (khive #1383).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "external_id",
