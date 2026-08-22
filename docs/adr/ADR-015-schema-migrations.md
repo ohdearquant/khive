@@ -148,6 +148,7 @@ above remains the historical pre-consolidation record.
 |     V18 | #1479              | ann_consumer_pending               | shipped |
 |     V19 | #1649              | list_cursor_backfill_repair        | shipped |
 |     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
+|     V21 | ADR-121 / ADR-160  | attachments_first_class            | shipped |
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
@@ -189,6 +190,59 @@ above remains the historical pre-consolidation record.
 > durable entity-write fence used by bounded transactional filesystem-blob GC.
 > The migration version is independent of ADR-091's amendment number.
 
+> **V21 record (2026-08-16, ADR-121 / ADR-160 Phase 4b)**:
+> `attachments_first_class` is boot-gated and resumable. `run_migrations` may
+> finish it atomically only for a zero-legacy-reference database. A legacy V20
+> database stops at V20; the async host coordinator holds the canonical blob-GC
+> owner across stage, verified application backfill, and finalization. The
+> durable marker row admits only `incomplete`/`complete`; the `Pending` status
+> is derived from the marker row's absence, never stored. The V21 ledger row is
+> inserted only in the final transaction that swaps claim fences and drops
+> `entities.content_ref`.
+
+> **Phase 4a compatibility record (2026-08-16, ADR-111 / ADR-160)**: the
+> separately deployed GC compatibility epoch gate does not add attachments,
+> backfill data, dual-read or dual-write, or record V21. It leaves every V20
+> database unchanged. Transactional filesystem-blob GC accepts only an exact,
+> completed V21 epoch; it refuses V20, pending, incomplete, and malformed epochs
+> in dry-run and destructive modes before filesystem or claim mutation. Every
+> pre-Phase-4a process must be drained after fleet convergence and before a
+> Phase-4b binary may start the destructive V21 cutover. Every Phase-4a
+> application-serving/read-write process must also be quiesced or proven unable
+> to access the database during cutover; only a GC-only worker has narrow
+> compatibility with exact completed V21. The Phase-4b serving fleet starts only
+> after exact-current topology validation.
+
+### 2026-08-16 implementation amendment — coordinated host boot
+
+This amendment supersedes the older boot-entrypoint and per-backend migration
+topology language later in this ADR, including the boot portion of Amendment A1.
+The current implementation has these boundaries:
+
+- Production MCP and kkernel serving paths are async host-boot coordinators.
+  They apply the ordinary migration prefix but expose no runtime, pack, request,
+  or blob-GC surface until V21 is complete.
+- `run_migrations` may finish V21 atomically only when no legacy content
+  references require application evidence. Otherwise it returns successfully at
+  V20; the host retains canonical database GC ownership across attachment stage,
+  bounded artifact verification, and exclusive finalization.
+- Multi-backend boot prepares and inventories every distinct secondary first.
+  Any legacy or current attachment authority there is an actionable error. Only
+  after those checks may canonical `main` complete V21, because its attachment
+  table is the sole SQL liveness source visible to process-shared blob GC.
+- `kkernel db migrate` and `kkernel db check` load the same discovered or
+  explicit khive config as host boot. With declared `[[backends]]`, omission of
+  `--backend` targets the configured topology; `--backend <name>` selects a
+  declared backend. Advancing canonical `main` or selecting one of its physical
+  aliases still requires every distinct secondary to be prepared and
+  inventoried first. With no declared topology, the implicit target is `main`
+  at `--db` or the default path.
+- The admin path is core-only: it does not register packs, instantiate embedding
+  models, or apply pack-auxiliary DDL. Migration still resolves bounded blob
+  hydration when legacy V20 application evidence requires it. `db check`
+  remains read-only and reports the targeted ledger state without constructing
+  a runtime or completing V21.
+
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
 > **Process**: When a new ADR introduces a schema migration, it MUST request the next ledger version here (claim by editing this table in the same PR). ADRs MUST NOT use placeholder text like "version: <next>" once merged.
@@ -200,10 +254,10 @@ above remains the historical pre-consolidation record.
 khive has two distinct schema-application mechanisms with non-overlapping
 responsibilities:
 
-| Mechanism                    | Owner      | Purpose                                         | Versioning                                  | Trigger                              |
-| ---------------------------- | ---------- | ----------------------------------------------- | ------------------------------------------- | ------------------------------------ |
-| **Versioned migrations**     | `khive-db` | Forward-only evolution of core substrate tables | Yes (`_schema_migrations`)                  | `kkernel db migrate`                 |
-| **Pack schema declarations** | Pack crate | Idempotent declaration of pack-auxiliary tables | No (boot-time `CREATE TABLE IF NOT EXISTS`) | Pack registration at runtime startup |
+| Mechanism                    | Owner      | Purpose                                         | Versioning                                  | Trigger                                 |
+| ---------------------------- | ---------- | ----------------------------------------------- | ------------------------------------------- | --------------------------------------- |
+| **Versioned migrations**     | `khive-db` | Forward-only evolution of core substrate tables | Yes (`_schema_migrations`)                  | Async host boot or `kkernel db migrate` |
+| **Pack schema declarations** | Pack crate | Idempotent declaration of pack-auxiliary tables | No (boot-time `CREATE TABLE IF NOT EXISTS`) | Pack registration at runtime startup    |
 
 Versioned migrations evolve the core schema — tables that ADR-004 substrates
 need. Pack schema declarations add pack-specific tables that depend on a backend
@@ -342,42 +396,58 @@ the DB stays at V4.
 ### Per-backend independence (multi-file federation)
 
 In a multi-backend deployment (ADR-009), each SQLite file has its own
-`_schema_migrations` table and its own current version. `kkernel db migrate`
-iterates over all configured backends and runs migrations independently on each:
+`_schema_migrations` table and its own current version. The async config-aware
+host opens and deduplicates those databases, then applies one ordered protocol:
 
 ```text
-for backend in config.backends:
-    run_migrations(backend.connection)
+for each distinct secondary:
+    prepare ordinary schema prefix
+    require zero legacy/current attachment authority
+    complete its empty V21 state
+prepare canonical main
+coordinate main attachment stage, verified backfill, and V21 finalization
 ```
 
-Backends advance independently. A freshly added backend starts at version 0 and
-catches up to the latest version on first migrate. An existing backend at V4
-advances to V7 when the codebase ships V5–V7. The migration array is the same
-for every backend; the application state may differ per backend until all are
-brought current.
+The migration array remains the same for every backend, and each file retains
+its own ledger. V21 nevertheless cannot be enabled independently in arbitrary
+order: secondary inventory must finish before `main` becomes the sole
+attachment/GC-liveness authority.
 
-### `kkernel db migrate` is the operator entry point
+### Host boot and `kkernel db migrate` entry points
 
-Migration execution is an operator-context operation (ADR-003), not an
-agent-context operation. `kkernel db migrate` is the canonical command:
+Migration execution remains host/operator context (ADR-003), never an agent
+verb. Production MCP/kkernel boot applies the required schema work before
+serving. The config-aware admin commands are:
 
 ```bash
-kkernel db migrate              # migrate all configured backends
-kkernel db migrate --backend main   # migrate one specific backend
-kkernel db migrate --dry-run        # show what would be applied
+kkernel db migrate                  # discovered topology, or implicit default main
+kkernel db migrate --config <path>  # explicit configured topology
+kkernel db migrate --backend <name> # named target (main/alias retains prerequisites)
+kkernel db migrate --db <path>      # implicit main, or a compatible main override
+kkernel db migrate --dry-run        # read-only report from the migration target plan
 kkernel db migrate --check          # exit 0 if current; nonzero otherwise
+kkernel db check --config <path> --strict
 ```
 
-The MCP binary (`khive-mcp`) does NOT apply migrations at startup. It assumes
-the operator has already run `kkernel db migrate`. If a backend's schema is
-behind the codebase's expectation, `khive-mcp` startup fails fast with a
-diagnostic pointing at `kkernel db migrate`. This prevents silent partial
-operation on a stale schema.
-
-**Exception**: in-memory `khive-db` backends (used for tests and ephemeral
-deployments) apply migrations automatically on creation. There's no operator
-to invoke `kkernel db migrate` for an ephemeral DB, and the migration cost is
-negligible against an empty store.
+`db migrate` uses the same async storage-topology coordinator as MCP boot, so a
+legacy V20 database cannot bypass secondary inventory, artifact authentication,
+or the incomplete-cutover fence. The coordinator deduplicates physical aliases,
+advances distinct secondaries before canonical `main`, and runs without pack
+registration, embedders, or pack DDL. Selecting a non-main secondary advances
+only that empty-authority target; selecting `main` (or its physical alias)
+retains the secondary prerequisites. `--dry-run` and `--check` delegate to the
+read-only topology inspection path. A concrete `--db`/`KHIVE_DB` override must
+agree with a declared main backend (or be the supported all-memory override),
+rather than silently replacing a configured topology.
+Read-only `db check` reuses the same pure target plan: selecting `main` or a
+SQLite alias includes every secondary prerequisite; an independent secondary
+remains a single target. Before either command opens anything, that planner
+validates `read_only` agreement across every physical SQLite alias, including
+aliases outside a named target. `--db :memory:` instead makes every configured
+name a distinct ephemeral backend, so only literal `main` retains the full
+prerequisite plan. Migration output derives `prerequisite` from physical backend
+identity: main's aliases are targets, while distinct secondary objects are
+prerequisites.
 
 ### Bootstrap path for pre-versioning databases
 
@@ -488,23 +558,27 @@ lock for the duration of its transaction; concurrent writers wait or fail with
 `SQLITE_BUSY`. Long-running queries during a migration are handled by SQLite's
 own concurrency model.
 
-Pool-level coordination (`ConnectionPool` in `khive-db`) ensures that migrations
-run before any other writer claims the lock. The `kkernel db migrate` command
-runs to completion before any service connections accept writes.
+Pool-level coordination (`ConnectionPool` in `khive-db`) ensures that each
+migration transaction owns the writer. The async host coordinator completes
+schema/V21 work before it exposes service connections; the explicit
+`kkernel db migrate` command likewise runs its planned target set to completion
+before returning.
 
 ### Schema diagnostics
 
-`kkernel db check` reports per-backend schema state without applying changes:
+`kkernel db check` reports every targeted backend's schema ledger and validates
+an exact current V21 state without applying changes:
 
 ```text
 $ kkernel db check
-main:    V7 (current)
-lore:    V5 (behind: V6, V7 pending)
-archive: V7 (current)
+main:    V21 (current)
+lore:    V20 (behind: V21 pending)
+archive: V21 (current)
 ```
 
-`kkernel db check --strict` exits nonzero if any backend is behind. CI uses
-this to verify migrations are current before deployment.
+`kkernel db check --strict` exits nonzero if any planned target is behind,
+ahead, or structurally invalid at the current version. CI uses this to verify
+migrations are exact-current before deployment.
 
 ## Rationale
 
@@ -558,23 +632,25 @@ are allowed only as documented, nullable, backward-compatible exceptions for
 already-shipped pack tables; the current v1 example is GTD audit namespace
 backfill. Structural/core schema changes still belong in versioned migrations.
 
-### Why migration application is operator-context, not agent-context?
+### Why migration application is host/operator-context, not agent-context?
 
-Migrations are operationally significant. A pack that auto-migrates on startup
-can corrupt data if the migration has a bug — and the bug isn't noticed until
-the agent makes a call that exercises the corrupted state. An operator running
-`kkernel db migrate` deliberately has the option to dry-run, check, and stage
-the change.
+Migrations are operationally significant and never run because an agent invoked
+a pack verb. The trusted host owns them before it exposes dispatch. V21 further
+requires an explicit coordinator that retains GC ownership, authenticates
+application evidence, and fails startup rather than serving a partial state.
 
-The operator can run migrations in a CI/CD pipeline, in a maintenance window,
-or after taking a backup. Auto-apply at startup forfeits all of these options.
+Operators who need preflight control can still run config-aware
+`kkernel db check --strict` and `kkernel db migrate` in CI/CD, a maintenance
+window, or after taking a backup. Startup application is therefore coordinated
+host work, not an ungoverned pack-side effect.
 
 ### Why per-backend independent state?
 
 Multi-backend deployments (ADR-009) have backends with different lifecycles. A
 backup-restored `archive.db` might be at V4 when the rest of the deployment is
-at V7. Running `kkernel db migrate` brings the restored backend current. If all
-backends shared one version, restoring `archive.db` would force a global
+at V7. Running `kkernel db migrate --config <path> --backend archive` brings
+that independent secondary current. If all backends shared one version,
+restoring `archive.db` would force a global
 rollback or break the system.
 
 Per-backend state isolates these cases. Each backend advances independently;
@@ -582,16 +658,16 @@ the codebase's migration set is global, but applied state is per-file.
 
 ## Alternatives Considered
 
-| Alternative                                      | Why rejected                                                                               |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| `PRAGMA user_version` only                       | No audit trail, no names, no migration history.                                            |
-| `CREATE TABLE IF NOT EXISTS` only                | Cannot evolve schema (no ALTER), no ordering, no audit.                                    |
-| External migration tool (sqlx-migrate, refinery) | Heavy dependency; sqlx doesn't fit the trait-only model; we already wrote this.            |
-| Down migrations + reversal                       | Doubles maintenance; snapshots cover the use case.                                         |
-| Auto-apply migrations at startup                 | Operationally dangerous; no dry-run, no staging.                                           |
-| Single global version across all backends        | Breaks under multi-file federation with independent backend lifecycles.                    |
-| Pack-owned versioned migrations in v1            | Adds machinery for an unproven case; pack tables work via idempotent CREATE IF NOT EXISTS. |
-| All migrations in one transaction                | A single failure rolls back all prior migrations; wasted work and recovery confusion.      |
+| Alternative                                      | Why rejected                                                                                             |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `PRAGMA user_version` only                       | No audit trail, no names, no migration history.                                                          |
+| `CREATE TABLE IF NOT EXISTS` only                | Cannot evolve schema (no ALTER), no ordering, no audit.                                                  |
+| External migration tool (sqlx-migrate, refinery) | Heavy dependency; sqlx doesn't fit the trait-only model; we already wrote this.                          |
+| Down migrations + reversal                       | Doubles maintenance; snapshots cover the use case.                                                       |
+| Uncoordinated eager migration at startup         | Operationally dangerous; current host boot uses an explicit ordered coordinator and durable V21 staging. |
+| Single global version across all backends        | Breaks under multi-file federation with independent backend lifecycles.                                  |
+| Pack-owned versioned migrations in v1            | Adds machinery for an unproven case; pack tables work via idempotent CREATE IF NOT EXISTS.               |
+| All migrations in one transaction                | A single failure rolls back all prior migrations; wasted work and recovery confusion.                    |
 
 ## Consequences
 
@@ -599,7 +675,8 @@ the codebase's migration set is global, but applied state is per-file.
 
 - Migration history is queryable: `SELECT * FROM _schema_migrations`.
 - Per-migration transactions: failure leaves the DB at the prior version.
-- Operator-context execution: deliberate, scriptable, dry-runnable.
+- Host/operator-context execution: coordinated before serving, with an explicit
+  config-aware topology admin path that remains scriptable and dry-runnable.
 - Multi-backend support: each SQLite file advances independently.
 - Pack tables stay separate from core schema: packs don't need to coordinate
   with `khive-db` releases for their own tables.
@@ -610,9 +687,9 @@ the codebase's migration set is global, but applied state is per-file.
 
 - No down migrations. Rollback requires snapshot restore.
   Mitigated: ADR-010 versioning is the rollback story; the dev path is drop+remigrate.
-- Operator must run `kkernel db migrate` before serving traffic.
-  Mitigated: `kkernel db check --strict` integrates with CI; documented in
-  deployment guide.
+- Starting a newer production host may perform schema writes before serving.
+  Mitigated: the async coordinator fails closed, V21 staging is durable and
+  resumable, and `kkernel db check --strict` remains available for CI preflight.
 - Pack tables can't evolve through `ALTER` in v1.
   Mitigated: deferred until a concrete pack use case justifies the machinery.
 - A buggy migration can lock progress until fixed and shipped as a new version.
@@ -626,8 +703,8 @@ the codebase's migration set is global, but applied state is per-file.
   databases bootstrapped via in-process schema before migrations existed.
 - `_schema_migrations` table is created lazily on first `run_migrations` call;
   it is not part of V1.
-- In-memory databases auto-migrate on creation (no operator to invoke
-  `kkernel db migrate`).
+- Writable file-backed and in-memory host boot both apply the ordinary prefix;
+  an empty database can take V21's atomic zero-reference fast path.
 
 ## Implementation
 
@@ -637,18 +714,24 @@ the codebase's migration set is global, but applied state is per-file.
 - `crates/khive-db/src/migrations.rs`:
   - `VersionedMigration` struct; `up` sourced from a `.sql` file via `include_str!`.
   - `MIGRATIONS: &[VersionedMigration]` — contiguous, append-only.
-  - `run_migrations(conn)` — applies all unapplied migrations in order.
+  - `run_migrations(conn)` — applies the ordinary prefix in order and completes
+    V21 only for the zero-reference fast path; legacy V20 returns at V20 for
+    host-assisted continuation.
   - `MIGRATION_TRACKING_TABLE` DDL for `_schema_migrations`.
 - `scripts/lint-sql.sh`:
   - Executes every `crates/**/*.sql` against an in-memory SQLite database and
     checks hygiene. Wired into `scripts/ci.sh` and `.pre-commit-config.yaml`.
-- `crates/kkernel/src/db.rs` (or similar subcommand module):
-  - `kkernel db migrate [--backend <name>] [--dry-run] [--check]`.
-  - `kkernel db check [--strict]`.
+- `crates/kkernel/src/cli.rs`:
+  - `kkernel db migrate [--config <path>] [--db <path>] [--backend <name>]
+    [--dry-run] [--check]`; config-aware and secondary-first before main.
+  - `kkernel db check [--config <path>] [--db <path>] [--backend <name>]
+    [--strict]`; read-only topology inspection.
 - `crates/khive-runtime/src/runtime.rs`:
   - In-memory `KhiveRuntime::memory()` calls `run_migrations` on creation.
-  - File-backed `KhiveRuntime::new(config)` verifies migration state at
-    startup; fails fast if behind.
+  - File-backed `KhiveRuntime::new(config)` accepts fresh/current state and
+    refuses legacy application-assisted V21. MCP/kkernel async host builders
+    coordinate it and construct through `from_prepared_backend` only after
+    durable completion.
 - `khive-storage::Pack` trait (ADR-017, Pack Standard): adds `fn schema_plan(&self) ->
   SchemaPlan` for pack-auxiliary tables. Applied during pack registration.
 
@@ -665,34 +748,38 @@ the codebase's migration set is global, but applied state is per-file.
   changes (rows in existing `notes` table).
 - ADR-017: Pack Standard — `SchemaPlan` trait for pack-auxiliary tables.
 - ADR-017: Pack Standard (§EDGE_RULES) — endpoint rules don't require migrations.
-- ADR-071: Backend-Pluggable Runtime — `BackendMigrator` trait (see Amendment A1 below).
+- ADR-071: Backend-Pluggable Runtime — historical `BackendMigrator` proposal
+  (see Amendment A1 and its implementation-status note below).
 
 ## Amendment A1: `BackendMigrator` trait (ADR-071, 2026-06-25)
 
-ADR-071 introduces a `BackendMigrator` trait in `khive-storage` that the runtime boot path
-calls instead of the current direct `run_migrations(conn: &mut rusqlite::Connection)` call.
+> **Implementation status (superseded boot shape, 2026-08-16):** the exact
+> `BackendMigrator`/`BackendHandle::boot()` shape described below is retained as
+> historical design context but is not the current production boot surface.
+> `StorageBackend::prepare_core_schema` supplies the ordinary prefix, and the
+> async khive-mcp/kkernel builders own secondary inventory and application-assisted
+> V21 coordination as specified in the implementation amendment above.
 
-The amendment to ADR-015 is narrow: the direct `run_migrations(conn)` call documented in
-§Implementation (`crates/khive-runtime/src/runtime.rs`) is replaced by the `BackendMigrator`
-trait, defined in `khive-storage`. The startup contract is unchanged from §Decision — the
-MCP binary does not apply migrations at startup. Per ADR-071 §2, boot dispatches by backend
-kind: a **file-backed** runtime calls `BackendMigrator::current_version()` and fails fast
-with a diagnostic pointing at `kkernel db migrate` when the persisted version is behind the
-codebase expectation; it does not call `migrate()`. `BackendMigrator::migrate()` is reserved
-for the `kkernel db migrate` operator command and for **in-memory/ephemeral** backends, whose
-`boot()` applies all migrations automatically (there is no operator to invoke `kkernel db
-migrate` for an ephemeral database).
+ADR-071 proposed a `BackendMigrator` trait in `khive-storage` that the runtime boot path
+would call instead of a direct `run_migrations(conn: &mut rusqlite::Connection)` call.
 
-`khive-db` provides `SqliteMigrator`, which implements `BackendMigrator` by wrapping the
-existing `run_migrations` function. The `VersionedMigration` struct, the migration array,
-the `_schema_migrations` table, the `.sql` file convention, and all other ADR-015 mechanics
-are unchanged. Only the call site in the runtime moves from a direct `rusqlite::Connection`
-call to the trait method.
+The planned amendment was narrow: replace the direct `run_migrations(conn)` call documented in
+§Implementation (`crates/khive-runtime/src/runtime.rs`) with the `BackendMigrator` trait while
+retaining the original operator-only startup contract. In that historical shape, a
+**file-backed** runtime would call `BackendMigrator::current_version()` and fail fast when behind;
+`BackendMigrator::migrate()` would be reserved for `kkernel db migrate` and
+**in-memory/ephemeral** boot. The 2026-08-16 implementation amendment above supersedes that
+startup policy and the proposed trait did not become the current host surface.
 
-This change removes `rusqlite` from `khive-runtime`'s production dependency tree, restoring
-the boundary specified in ADR-005 and ADR-009.
+The proposed `khive-db::SqliteMigrator` would have wrapped the existing `run_migrations`
+function. The implemented code instead keeps the `VersionedMigration` array,
+`_schema_migrations`, and `.sql` convention in `khive-db`, exposes
+`StorageBackend::prepare_core_schema`, and places application-assisted coordination in the async
+host.
 
-The `BackendMigrator` trait:
+The dependency-boundary goal remains: runtime and packs do not issue `rusqlite` calls directly.
+
+The historical proposed `BackendMigrator` trait was:
 
 ```rust
 // crates/khive-storage/src/migrations.rs
@@ -706,6 +793,5 @@ pub trait BackendMigrator: Send + Sync {
 }
 ```
 
-`SqliteMigrator` in `khive-db` implements this trait over a `ConnectionPool`. Alternate
-backends implement it over their own connection types. The runtime holds
-`Arc<dyn BackendMigrator>` in its `BackendHandle` (ADR-071 §1).
+This exact `SqliteMigrator` / `Arc<dyn BackendMigrator>` wiring is not part of the current
+implementation; the async host-builder contract above is authoritative.

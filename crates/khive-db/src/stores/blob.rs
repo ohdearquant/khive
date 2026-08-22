@@ -1494,22 +1494,184 @@ async fn release_blob_gc_batch(sql: &dyn SqlAccess, root_key: String) -> Storage
 /// so a root-only lock is insufficient: two differently configured roots for
 /// one database must not recover each other's live claims. File-backed pools
 /// additionally take [`acquire_database_gc_lock`] for cross-process exclusion.
-type SweepLockMap = HashMap<Option<PathBuf>, Arc<tokio::sync::Mutex<()>>>;
+type SweepLockMap = HashMap<Option<PathBuf>, Arc<DatabaseGcProcessLock>>;
+
+#[derive(Debug, Default)]
+struct DatabaseGcProcessLock {
+    held: StdMutex<bool>,
+    released: std::sync::Condvar,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
+}
+
+impl DatabaseGcProcessLock {
+    fn acquire(self: &Arc<Self>) -> DatabaseGcProcessGuard {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *held {
+            #[cfg(test)]
+            self.waiters
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held = self
+                .released
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            self.waiters
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        *held = true;
+        DatabaseGcProcessGuard {
+            lock: Arc::clone(self),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<DatabaseGcProcessGuard> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *held {
+            return None;
+        }
+        *held = true;
+        Some(DatabaseGcProcessGuard {
+            lock: Arc::clone(self),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct DatabaseGcProcessGuard {
+    lock: Arc<DatabaseGcProcessLock>,
+}
+
+impl Drop for DatabaseGcProcessGuard {
+    fn drop(&mut self) {
+        let mut held = self
+            .lock
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(*held, "database GC process owner released twice");
+        *held = false;
+        self.lock.released.notify_one();
+    }
+}
 
 fn database_sweep_locks() -> &'static StdMutex<SweepLockMap> {
     static REGISTRY: OnceLock<StdMutex<SweepLockMap>> = OnceLock::new();
     REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn sweep_lock_for_database(database_path: Option<&Path>) -> Arc<tokio::sync::Mutex<()>> {
+fn sweep_lock_for_database(database_path: Option<&Path>) -> Arc<DatabaseGcProcessLock> {
     let key = database_path.map(Path::to_path_buf);
     let mut locks = database_sweep_locks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     locks
         .entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .or_insert_with(|| Arc::new(DatabaseGcProcessLock::default()))
         .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn database_gc_waiter_count(database_path: Option<&Path>) -> usize {
+    sweep_lock_for_database(database_path)
+        .waiters
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Exclusive canonical-database ownership shared by transactional blob GC and
+/// the boot-gated V21 attachment cutover.
+///
+/// The process-local mutex is acquired first and retained while the advisory
+/// file lock is acquired on a blocking thread. Moving the owned mutex guard
+/// into that closure makes cancellation safe: dropping the outer future cannot
+/// release process ownership while a blocking advisory acquisition continues.
+pub struct DatabaseGcOwnerGuard {
+    _process_guard: DatabaseGcProcessGuard,
+    _advisory_guard: Option<fs::File>,
+    database_path: Option<PathBuf>,
+}
+
+pub(crate) fn acquire_database_gc_owner_for_path_blocking(
+    database_path: Option<PathBuf>,
+) -> StorageResult<DatabaseGcOwnerGuard> {
+    let process_guard = sweep_lock_for_database(database_path.as_deref()).acquire();
+    let advisory_guard = acquire_database_gc_lock(database_path.as_deref())?;
+    Ok(DatabaseGcOwnerGuard {
+        _process_guard: process_guard,
+        _advisory_guard: advisory_guard,
+        database_path,
+    })
+}
+
+/// Try to acquire canonical database-GC ownership without waiting.
+///
+/// This is the fail-closed bridge for the legacy raw-connection migration API:
+/// a caller may already hold an opaque pooled writer guard, so waiting here
+/// could invert the canonical owner-before-writer order used by sweeps. The
+/// production backend boot path uses the blocking helper before writer
+/// checkout instead.
+pub(crate) fn try_acquire_database_gc_owner_for_path(
+    database_path: PathBuf,
+) -> StorageResult<DatabaseGcOwnerGuard> {
+    let process_guard = sweep_lock_for_database(Some(&database_path))
+        .try_acquire()
+        .ok_or_else(|| {
+            StorageError::Internal(format!(
+                "database GC owner for {} is already held; retry schema migration through the \
+                 coordinated backend boot path",
+                database_path.display()
+            ))
+        })?;
+    let lock_path = database_gc_lock_path(&database_path);
+    let advisory_guard = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| map_io_err(error, "database_gc_lock_open"))?;
+    fs4::FileExt::try_lock(&advisory_guard)
+        .map_err(|error| map_io_err(error.into(), "database_gc_lock_try_acquire"))?;
+    Ok(DatabaseGcOwnerGuard {
+        _process_guard: process_guard,
+        _advisory_guard: Some(advisory_guard),
+        database_path: Some(database_path),
+    })
+}
+
+impl std::fmt::Debug for DatabaseGcOwnerGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DatabaseGcOwnerGuard")
+            .field("database_path", &self.database_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DatabaseGcOwnerGuard {
+    /// Canonical database path that keys this owner, or `None` for an
+    /// in-memory database whose process-local mutex is the complete fence.
+    pub fn database_path(&self) -> Option<&Path> {
+        self.database_path.as_deref()
+    }
+}
+
+/// Acquire the canonical database owner used by both V21 boot cutover and
+/// transactional blob sweep. Callers must retain the returned guard across
+/// every stage that must exclude the other protocol.
+pub async fn acquire_database_gc_owner(sql: &dyn SqlAccess) -> StorageResult<DatabaseGcOwnerGuard> {
+    let database_path = sql.database_path();
+    tokio::task::spawn_blocking(move || acquire_database_gc_owner_for_path_blocking(database_path))
+        .await
+        .map_err(|error| {
+            StorageError::driver(StorageCapability::Blob, "acquire_database_gc_owner", error)
+        })?
 }
 
 /// Process-wide registry of per-canonical-root write locks.
@@ -1853,8 +2015,8 @@ impl BlobStore for FsBlobStore {
     // walk/metadata happen before SQL. Bounded SQL-only units recover abandoned
     // rows and commit at most 128 fresh claims whose attachment triggers fence new
     // live references; physical deletion happens after each COMMIT; a second
-    // bounded SQL-only unit releases that batch. Owner/root locks span all
-    // phases, but SQLite's single writer never spans external I/O.
+    // bounded SQL-only unit releases that batch. Database/root owners span the
+    // destructive phases, but SQLite's single writer never spans external I/O.
     async fn transactional_orphan_sweep(
         &self,
         sql: &dyn SqlAccess,
@@ -1876,20 +2038,18 @@ impl BlobStore for FsBlobStore {
         // abandoned, including rows copied by backup or left before a root
         // relocation.
         let database_path = sql.database_path();
-        let database_guard = sweep_lock_for_database(database_path.as_deref())
-            .lock_owned()
-            .await;
         let lock_database_path = database_path.clone();
         #[cfg(test)]
         let hook_database_path = database_path.clone();
-        let database_file_guard = tokio::task::spawn_blocking(move || {
-            let guard = acquire_database_gc_lock(lock_database_path.as_deref())?;
+        let (database_guard, database_file_guard) = tokio::task::spawn_blocking(move || {
+            let process_guard = sweep_lock_for_database(lock_database_path.as_deref()).acquire();
+            let file_guard = acquire_database_gc_lock(lock_database_path.as_deref())?;
             #[cfg(test)]
             if let Some(hook) = db_ownership_sync_hook::take(hook_database_path.as_deref()) {
                 let _ = hook.reached.send(());
                 let _ = hook.release.recv();
             }
-            Ok::<_, StorageError>(guard)
+            Ok::<_, StorageError>((process_guard, file_guard))
         })
         .await
         .map_err(|e| {
@@ -2243,71 +2403,38 @@ mod tests {
         (dir, store)
     }
 
-    /// Test-only representation of the schema a later attachment-cutover
-    /// release publishes atomically.  This compatibility branch deliberately
-    /// does not register or execute V21; the fixture lets its GC reader prove
-    /// that it is safe both before the rollout (V20 must refuse) and after a
-    /// newer binary has completed the cutover (attachment liveness may sweep).
+    /// Build the exact historical V20 prefix without invoking the V21
+    /// zero-reference fast path in [`crate::run_migrations`].
+    fn prepare_v20_gc_fixture(conn: &mut rusqlite::Connection) {
+        conn.execute_batch(include_str!("../../sql/schema-migrations-table.sql"))
+            .expect("create migration ledger");
+        for migration in crate::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 20)
+        {
+            let tx = conn.transaction().expect("begin historical migration");
+            tx.execute_batch(migration.up)
+                .expect("apply historical migration body");
+            tx.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                 VALUES (?1, ?2, 0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .expect("record historical migration");
+            tx.commit().expect("commit historical migration");
+        }
+    }
+
+    /// Build the canonical completed V21 schema used by transactional-GC
+    /// tests. Phase 4b owns the real cutover now, so tests exercise its schema
+    /// instead of retaining Phase 4a's synthetic future-schema fixture.
     fn prepare_completed_v21_gc_fixture(conn: &mut rusqlite::Connection) {
-        crate::run_migrations(conn).expect("prepare canonical V20 prefix");
-        conn.execute_batch(
-            "BEGIN IMMEDIATE; \
-             CREATE TABLE attachments ( \
-                 record_uuid TEXT NOT NULL, \
-                 substrate   TEXT NOT NULL CHECK (substrate IN ('entity', 'note')), \
-                 role        TEXT NOT NULL CHECK (length(role) > 0), \
-                 content_ref TEXT NOT NULL \
-                     CHECK (length(content_ref) = 64 \
-                            AND content_ref NOT GLOB '*[^0-9a-f]*'), \
-                 media_type  TEXT, \
-                 size_bytes  INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0), \
-                 created_at  INTEGER NOT NULL, \
-                 PRIMARY KEY (record_uuid, role) \
-             ) STRICT; \
-             CREATE INDEX idx_attachments_content_ref ON attachments(content_ref); \
-             CREATE TABLE attachment_cutover_state ( \
-                 singleton    INTEGER PRIMARY KEY CHECK (singleton = 1), \
-                 state        TEXT NOT NULL CHECK (state IN ('incomplete', 'complete')), \
-                 started_at   INTEGER NOT NULL, \
-                 completed_at INTEGER, \
-                 CHECK ((state = 'incomplete' AND completed_at IS NULL) \
-                        OR (state = 'complete' AND completed_at IS NOT NULL)) \
-             ) STRICT; \
-             INSERT INTO attachments \
-                 (record_uuid, substrate, role, content_ref, created_at) \
-             SELECT id, 'entity', 'content', content_ref, updated_at \
-             FROM entities WHERE content_ref IS NOT NULL; \
-             INSERT INTO attachment_cutover_state \
-                 (singleton, state, started_at, completed_at) \
-             VALUES (1, 'complete', 21, 21); \
-             CREATE TRIGGER attachments_reject_claimed_blob_insert \
-             BEFORE INSERT ON attachments \
-             WHEN EXISTS (SELECT 1 FROM blob_gc_claims \
-                          WHERE content_ref = NEW.content_ref) \
-             BEGIN \
-                 SELECT RAISE(ABORT, 'content_ref is reserved by an active blob sweep'); \
-             END; \
-             CREATE TRIGGER attachments_reject_claimed_blob_update \
-             BEFORE UPDATE OF content_ref ON attachments \
-             WHEN EXISTS (SELECT 1 FROM blob_gc_claims \
-                          WHERE content_ref = NEW.content_ref) \
-             BEGIN \
-                 SELECT RAISE(ABORT, 'content_ref is reserved by an active blob sweep'); \
-             END; \
-             DROP TRIGGER entities_reject_claimed_blob_insert; \
-             DROP TRIGGER entities_reject_claimed_blob_update; \
-             DROP INDEX idx_entities_content_ref; \
-             ALTER TABLE entities DROP COLUMN content_ref; \
-             INSERT INTO _schema_migrations (version, name, applied_at) \
-             VALUES (21, 'attachments_first_class', 21); \
-             COMMIT;",
-        )
-        .expect("materialize completed V21 attachment-GC fixture");
+        let version = crate::run_migrations(conn).expect("prepare canonical completed V21");
+        assert_eq!(version, 21, "empty fixture must take the V21 fast path");
     }
 
     #[tokio::test]
-    async fn completed_v21_gc_gate_requires_the_attachments_content_ref_index_and_absent_legacy_column(
-    ) {
+    async fn completed_v21_gc_gate_requires_new_indexes_and_absent_legacy_column() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
@@ -2590,6 +2717,42 @@ mod tests {
             database_gc_lock_path(&database),
             PathBuf::from(expected_lock_path)
         );
+    }
+
+    #[tokio::test]
+    async fn database_gc_owner_holds_process_and_advisory_fences_until_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("owner.db");
+        let backend = crate::StorageBackend::sqlite(&database).unwrap();
+        let owner = acquire_database_gc_owner(backend.sql().as_ref())
+            .await
+            .unwrap();
+        let canonical_database = owner
+            .database_path()
+            .expect("file-backed owner path")
+            .to_path_buf();
+
+        assert!(
+            sweep_lock_for_database(Some(&canonical_database))
+                .try_acquire()
+                .is_none(),
+            "boot and sweep must share one process-local database owner"
+        );
+        let external = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(database_gc_lock_path(&canonical_database))
+            .unwrap();
+        assert!(
+            matches!(
+                fs4::FileExt::try_lock(&external),
+                Err(fs4::TryLockError::WouldBlock)
+            ),
+            "the reusable owner must also retain the cross-process advisory fence"
+        );
+
+        drop(owner);
+        fs4::FileExt::try_lock(&external).expect("owner drop releases advisory fence");
     }
 
     #[cfg(unix)]
@@ -3331,7 +3494,7 @@ mod tests {
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
         {
             let mut writer = backend.pool().writer().unwrap();
-            crate::run_migrations(writer.conn_mut()).unwrap();
+            prepare_v20_gc_fixture(writer.conn_mut());
         }
 
         let root = dir.path().join("blobs");
@@ -3506,7 +3669,7 @@ mod tests {
                         )
                         .unwrap();
                 } else {
-                    crate::run_migrations(writer.conn_mut()).unwrap();
+                    prepare_v20_gc_fixture(writer.conn_mut());
                 }
             }
 
@@ -3797,6 +3960,42 @@ mod tests {
         assert!(
             store.exists(&orphan).await.unwrap(),
             "a refused sweep must not have deleted anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_orphan_sweep_refuses_an_incomplete_cutover_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer
+                .conn_mut()
+                .execute_batch(
+                    "UPDATE attachment_cutover_state \
+                     SET state = 'incomplete', completed_at = NULL WHERE singleton = 1; \
+                     DELETE FROM _schema_migrations WHERE version = 21;",
+                )
+                .unwrap();
+        }
+
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::ZERO);
+        let orphan = store
+            .put(b"incomplete-cutover orphan".to_vec())
+            .await
+            .unwrap();
+        let error = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .expect_err("sweep must refuse every durable incomplete marker");
+        assert!(matches!(error, StorageError::Unsupported { .. }));
+        assert!(
+            store.exists(&orphan).await.unwrap(),
+            "refused incomplete-state sweep must preserve every blob"
         );
     }
 
@@ -4097,6 +4296,14 @@ mod tests {
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
+            // The table CHECK now rejects a NUL-embedded ref at admission
+            // time; bypass it to simulate a row that reached this state some
+            // other way (e.g. a pre-fix legacy row) and prove the validator
+            // is still defense-in-depth against it.
+            writer
+                .conn_mut()
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
             writer
                 .conn_mut()
                 .execute(
@@ -4105,7 +4312,11 @@ mod tests {
                      VALUES ('nul-attachment-id', 'entity', 'content', ?1, 0)",
                     rusqlite::params![nul_embedded_canonical_ref()],
                 )
-                .expect("the schema CHECK is NUL-blind, so this row must insert");
+                .expect("ignore_check_constraints must allow the corrupt row to insert");
+            writer
+                .conn_mut()
+                .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .unwrap();
         }
 
         let sql = backend.sql();

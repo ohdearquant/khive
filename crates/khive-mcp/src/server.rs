@@ -968,6 +968,12 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
 
 impl KhiveMcpServer {
     /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
+    ///
+    /// This constructor assumes the supplied runtime's database is already at a
+    /// complete V21 attachment cutover. It intentionally performs no migration
+    /// or blob-evidence verification. Production hosts opening a database should
+    /// use the async builders in [`crate::serve`] and reserve this constructor for
+    /// already-prepared runtimes and tests.
     // The error variant intentionally carries the runtime so callers can recover.
     #[allow(clippy::result_large_err)]
     pub fn new(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
@@ -978,6 +984,8 @@ impl KhiveMcpServer {
     }
 
     /// Build a server with an explicit pack list (strict — fails on unknown names).
+    ///
+    /// The same already-prepared-runtime precondition as [`Self::new`] applies.
     // The error variant intentionally carries the runtime by value so callers
     // can recover and retry. Boxing would force every recovery path through a
     // deref for no real benefit.
@@ -2208,6 +2216,7 @@ fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
         StorageCapability::Sparse => "sparse",
         StorageCapability::Text => "text",
         StorageCapability::Blob => "blob",
+        StorageCapability::Attachments => "attachments",
     }
 }
 

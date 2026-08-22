@@ -14,7 +14,7 @@ use khive_storage::blob::ContentRef;
 use khive_storage::types::{
     SqlStatement, SqlValue, VectorIndexKind, VectorSearchHit, VectorSearchRequest,
 };
-use khive_storage::{BlobStore, Entity, VectorStore};
+use khive_storage::{BlobStore, Entity, NewAttachment, VectorStore};
 use khive_types::SubstrateKind;
 
 use crate::model::{validate_embedding, DescriptorIdentity, LoadedVisionModel, VisionModelState};
@@ -400,9 +400,12 @@ async fn find_visual_asset(
     let mut reader = runtime.sql().reader().await?;
     let row = reader
         .query_row(SqlStatement {
-            sql: "SELECT id FROM entities WHERE namespace = ?1 AND kind = 'artifact' \
-                  AND entity_type = 'visual_asset' AND content_ref = ?2 \
-                  AND deleted_at IS NULL ORDER BY created_at, id LIMIT 1"
+            sql: "SELECT e.id FROM entities e \
+                  JOIN attachments a ON a.record_uuid = e.id \
+                    AND a.substrate = 'entity' AND a.role = 'content' \
+                  WHERE e.namespace = ?1 AND e.kind = 'artifact' \
+                  AND e.entity_type = 'visual_asset' AND a.content_ref = ?2 \
+                  AND e.deleted_at IS NULL ORDER BY e.created_at, e.id LIMIT 1"
                 .to_string(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
@@ -448,8 +451,11 @@ async fn find_or_create_visual_asset(
     }
 
     let default_name = format!("asset-{}", &content_ref.as_str()[..12]);
+    let size_bytes = u64::try_from(original_len).map_err(|_| {
+        RuntimeError::Internal("moodboard visual asset size exceeds u64".to_string())
+    })?;
     let asset = runtime
-        .create_entity_with_content_ref(
+        .create_entity_with_attachments(
             token,
             "artifact",
             Some("visual_asset"),
@@ -457,7 +463,12 @@ async fn find_or_create_visual_asset(
             caption,
             Some(asset_properties(prepared, original_len)),
             vec!["moodboard".to_string(), "visual_asset".to_string()],
-            content_ref,
+            vec![NewAttachment {
+                role: "content".to_string(),
+                content_ref: content_ref.clone(),
+                media_type: Some(prepared.media_type.to_string()),
+                size_bytes: Some(size_bytes),
+            }],
         )
         .await?;
     Ok((asset, true))
@@ -616,6 +627,7 @@ mod tests {
     use async_trait::async_trait;
     use khive_db::stores::blob::FsBlobStore;
     use khive_runtime::{BackendId, RuntimeConfig};
+    use khive_storage::{Attachment, AttachmentSubstrate};
     use khive_types::Namespace;
 
     #[derive(Debug)]
@@ -976,24 +988,52 @@ mod tests {
         let extra_ref = blob_store.put(b"extra".to_vec()).await.unwrap();
         let mut primary_entity =
             Entity::new(narrow.namespace().as_str(), "artifact", "primary candidate")
-                .with_entity_type(Some("visual_asset"))
-                .with_content_ref(primary_ref.to_string());
+                .with_entity_type(Some("visual_asset"));
         primary_entity.id = primary_id;
+        let primary_created_at = primary_entity.created_at;
         runtime
             .entities(&narrow)
             .unwrap()
             .upsert_entity(primary_entity)
             .await
             .unwrap();
+        runtime
+            .attachments()
+            .unwrap()
+            .upsert_attachment(Attachment {
+                record_uuid: primary_id,
+                substrate: AttachmentSubstrate::Entity,
+                role: "content".to_string(),
+                content_ref: primary_ref,
+                media_type: None,
+                size_bytes: Some(7),
+                created_at: primary_created_at,
+            })
+            .await
+            .unwrap();
         let mut extra_entity =
             Entity::new(extra.namespace().as_str(), "artifact", "extra candidate")
-                .with_entity_type(Some("visual_asset"))
-                .with_content_ref(extra_ref.to_string());
+                .with_entity_type(Some("visual_asset"));
         extra_entity.id = extra_id;
+        let extra_created_at = extra_entity.created_at;
         runtime
             .entities(&extra)
             .unwrap()
             .upsert_entity(extra_entity)
+            .await
+            .unwrap();
+        runtime
+            .attachments()
+            .unwrap()
+            .upsert_attachment(Attachment {
+                record_uuid: extra_id,
+                substrate: AttachmentSubstrate::Entity,
+                role: "content".to_string(),
+                content_ref: extra_ref,
+                media_type: None,
+                size_bytes: Some(5),
+                created_at: extra_created_at,
+            })
             .await
             .unwrap();
 
@@ -1151,11 +1191,9 @@ mod tests {
         let live_ref = blob_store.put(b"live original".to_vec()).await.unwrap();
         let stale = Uuid::new_v4();
         let live = Entity::new(token.namespace().as_str(), "artifact", "live candidate")
-            .with_entity_type(Some("visual_asset"))
-            .with_content_ref(live_ref.to_string());
+            .with_entity_type(Some("visual_asset"));
         let missing = Entity::new(token.namespace().as_str(), "artifact", "missing blob")
-            .with_entity_type(Some("visual_asset"))
-            .with_content_ref("b".repeat(64));
+            .with_entity_type(Some("visual_asset"));
         runtime
             .entities(&token)
             .unwrap()
@@ -1166,6 +1204,34 @@ mod tests {
             .entities(&token)
             .unwrap()
             .upsert_entity(missing.clone())
+            .await
+            .unwrap();
+        runtime
+            .attachments()
+            .unwrap()
+            .upsert_attachment(Attachment {
+                record_uuid: live.id,
+                substrate: AttachmentSubstrate::Entity,
+                role: "content".to_string(),
+                content_ref: live_ref,
+                media_type: None,
+                size_bytes: Some(13),
+                created_at: live.created_at,
+            })
+            .await
+            .unwrap();
+        runtime
+            .attachments()
+            .unwrap()
+            .upsert_attachment(Attachment {
+                record_uuid: missing.id,
+                substrate: AttachmentSubstrate::Entity,
+                role: "content".to_string(),
+                content_ref: ContentRef::from_hex("b".repeat(64)).unwrap(),
+                media_type: None,
+                size_bytes: None,
+                created_at: missing.created_at,
+            })
             .await
             .unwrap();
         index_embedding(&runtime, &token, &descriptor, stale, &[1.0, 0.0, 0.0, 0.0])

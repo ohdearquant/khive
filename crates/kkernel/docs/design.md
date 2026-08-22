@@ -15,10 +15,13 @@
 
 ### Multi-backend configuration (ADR-009, ADR-028)
 
-- `BackendRegistry` holds registered backends. Constructed at boot from `khive.toml`.
-- `kkernel backend list` and `kkernel backend info` expose the registry to operators.
-- Current v1 implementation exposes a single default backend. Full `khive.toml`-driven
-  multi-backend enumeration is deferred to a follow-up milestone.
+- MCP/exec host boot constructs `BackendRegistry` from `khive.toml`, deduplicates
+  physical databases, and routes each pack to its assigned runtime. Canonical
+  `main` remains the sole attachment and blob-GC liveness authority after every
+  secondary passes boot inventory.
+- `kkernel backend list` and `kkernel backend info` are a narrower legacy admin
+  surface: they currently expose only the synthetic default `main` backend, not
+  the full config-driven boot registry.
 
 ### VCS and sync (ADR-010, ADR-020)
 
@@ -29,10 +32,22 @@
 
 ### ADR-015: Schema migrations
 
-- `KhiveRuntime::new()` runs `run_migrations()` internally — constructing the runtime
-  is sufficient to apply all pending migrations.
-- `kkernel db migrate` wraps this; `kkernel db check` uses a read-only runtime to
-  report schema state without writing.
+- Ordinary schema preparation applies the canonical prefix automatically.
+  V21 is application-assisted when legacy blob references exist: the async
+  MCP/kkernel host installs bounded hydration, authenticates pack-owned
+  artifacts, and finalizes attachment-only GC before constructing a runtime.
+- `kkernel db migrate` loads the configured storage topology and reuses the
+  core-only host coordinator: physical aliases are deduplicated, distinct
+  secondaries are prepared before canonical `main`, and no pack runtime,
+  embedder, or pack-auxiliary DDL is constructed. `--backend` is an active
+  configured-backend selector; advancing `main` retains its secondary
+  prerequisites. `kkernel db check` loads the same target set and inspects each
+  migration ledger read-only without writing.
+- The V21 rollout requires Phase-4a fleet convergence and old-binary drain,
+  followed by quiescence of every Phase-4a application reader/writer during
+  cutover. A GC-only Phase-4a worker's completed-V21 compatibility is narrower
+  than serving compatibility. Phase-4b serving starts only after the same
+  planned topology validates exact-current.
 
 ### Pack standard (vocabulary + handlers) (ADR-017)
 
@@ -391,7 +406,8 @@ exactly the bug ADR-107 §4 was written to close.
 ## Consistency Notes
 
 - `kkernel db migrate --dry-run` delegates to `cmd_db_check` rather than implementing
-  a separate dry-run path. The `--check` flag makes the check exit nonzero if behind.
+  a separate dry-run path. Both reuse the migration target planner; the `--check`
+  flag exits nonzero for any behind, ahead, or invalid target.
 - The `cmd_vector_capabilities` function hard-codes baseline sqlite-vec values
   rather than instantiating a runtime — this is intentional for the v1 implementation
   but means the output does not reflect operator-configured backends.

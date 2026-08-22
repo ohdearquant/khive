@@ -48,8 +48,9 @@ pub use khive_storage::{
     DEFAULT_REQUEST_READ_TIMEOUT_SECS,
 };
 pub use migrations::{
-    inspect_schema_version, query_embedding_models, read_schema_version, run_migrations,
-    EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
+    inspect_schema_is_current, inspect_schema_version, query_embedding_models, read_schema_version,
+    run_migrations, EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration,
+    MIGRATIONS,
 };
 pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, WriterGuard};
 #[cfg(test)]

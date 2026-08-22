@@ -411,7 +411,7 @@ pub async fn run_pending_events_with_config(
     // emitting the documented JSON refusal envelope. Every other build
     // failure keeps the generic "pending-events: build server" provenance.
     let (server, schedule_rt) =
-        match crate::serve::build_server_with_explicit_namespace(&args, ns, true, false) {
+        match crate::serve::build_server_with_explicit_namespace(&args, ns, true, false).await {
             Ok(built) => built,
             Err(error) => {
                 if error
@@ -6720,14 +6720,22 @@ mod tests {
         );
     }
 
-    /// The wrapper seam (`build_server_with_explicit_namespace`, called with
-    /// `namespace_explicit: true, actor_explicit: false`) must let a
-    /// `"local"`-resolved default namespace fall through to the
-    /// project-configured actor — never clear it the way a genuine
-    /// `--actor`/`--namespace` CLI override would.
-    #[test]
+    /// The wrapper seam (`build_server_with_explicit_namespace`, called by
+    /// `run_pending_events` with `namespace_explicit: true, actor_explicit:
+    /// false`) must let a `"local"`-resolved default namespace fall through
+    /// to the project-configured actor — never clear it the way a genuine
+    /// `--actor`/`--namespace` CLI override would (`build_server`'s own,
+    /// correctly-narrower semantic). Regression for PR #782:
+    /// before this fix, `run_pending_events` called
+    /// `build_server` directly with a synthesized `namespace: Some("local")`,
+    /// which `resolve_cli_namespace` reported as `explicit = true` and
+    /// `build_server` then fed into BOTH `namespace_explicit` AND
+    /// `actor_explicit`, tripping the "genuinely explicit actor tier
+    /// requesting anonymous" branch in `resolve_runtime_config` and silently
+    /// discarding the configured `[actor] id`.
+    #[tokio::test]
     #[serial_test::serial]
-    fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
+    async fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -6757,6 +6765,7 @@ mod tests {
         // (`actor_explicit: false`).
         let (_server, schedule_rt) =
             crate::serve::build_server_with_explicit_namespace(&args, ns, true, false)
+                .await
                 .expect("build_server_with_explicit_namespace must succeed");
         let rt = schedule_rt.expect("\"schedule\" pack is in the default pack set");
         assert_eq!(
@@ -6768,14 +6777,15 @@ mod tests {
         );
     }
 
-    /// Positive control: routing the same inputs through `build_server` (the
-    /// genuine CLI-flag seam) DOES clear the actor, because there a present
-    /// namespace value really does mean "the operator typed --namespace" —
-    /// why `run_pending_events` must not reuse that entry point for a
-    /// synthesized, non-CLI-parsed namespace default.
-    #[test]
+    /// Positive control for the failure mode the fix above closes: routing
+    /// the same inputs through `build_server` (the genuine CLI-flag seam,
+    /// unchanged by this fix) DOES clear the actor, because there a
+    /// present namespace value really does mean "the operator typed
+    /// --namespace". This documents why `run_pending_events` must not reuse
+    /// that entry point for a synthesized, non-CLI-parsed namespace default.
+    #[tokio::test]
     #[serial_test::serial]
-    fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
+    async fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -6799,8 +6809,9 @@ mod tests {
             resumed_generation: None,
         };
 
-        let (_server, schedule_rt) =
-            crate::serve::build_server(&args).expect("build_server must succeed");
+        let (_server, schedule_rt) = crate::serve::build_server(&args)
+            .await
+            .expect("build_server must succeed");
         let rt = schedule_rt.expect("\"schedule\" pack is in the default pack set");
         assert_eq!(
             rt.config().actor_id,

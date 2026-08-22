@@ -120,8 +120,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// rationale.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BlobOrphanSweepConfig {
-    /// Content refs currently referenced by at least one live row somewhere
-    /// in the system, as of when the caller assembled this set. Anything
+    /// Content refs currently referenced by at least one committed record
+    /// attachment, as of when the caller assembled this set. Anything
     /// this backend stores that is NOT in this set is treated as orphaned
     /// and deleted (or reported, in `dry_run` mode) — including a
     /// `content_ref` that becomes live after this snapshot was taken.
@@ -143,8 +143,8 @@ pub struct BlobOrphanSweepResult {
     pub would_delete: u64,
     /// Objects with zero live references that were left alone because they
     /// are still inside their publish grace period — recently written and
-    /// not yet orphaned, just not yet committed to the SQL liveness authority. Reported in
-    /// both modes; never counted in `would_delete` or `deleted`.
+    /// not yet orphaned, just not yet referenced by a record attachment.
+    /// Reported in both modes; never counted in `would_delete` or `deleted`.
     pub grace_period_skipped: u64,
 }
 
@@ -218,8 +218,8 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
     /// `config.live_refs` is a **snapshot**; a `content_ref` that becomes
-    /// newly live between the snapshot and the sweep would be deleted
-    /// anyway. **Callers MUST quiesce reference writes** for the duration of
+    /// newly live between the snapshot and the sweep is deleted anyway.
+    /// **Callers MUST quiesce attachment writes** for the duration of
     /// snapshot-plus-sweep. See `crates/khive-storage/docs/api/blob-store.md`
     /// for the hazard. This API also has no [`SqlAccess`] capability with
     /// which to prove a completed V21 attachment epoch, so — unlike
@@ -240,19 +240,19 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
         })
     }
 
-    /// Select canonical SQL liveness references and sweep orphaned blobs behind a
+    /// Select live attachment references and sweep orphaned blobs behind a
     /// database-coordinated, bounded claim protocol.
     ///
     /// Unlike [`Self::orphan_sweep`], this operation obtains liveness itself
     /// from `sql`; callers do not assemble a stale snapshot. `sql` must be the
-    /// canonical main database capability used for the writes that own these
+    /// canonical main database capability used for the attachment writes that own
     /// references. Implementations must also ensure an object published after
     /// the sweep's candidate set is captured cannot be mistaken for an orphan,
     /// including when it is published between selecting live references and
     /// physical deletion. Implementations must not perform filesystem or
     /// other external I/O while holding the database writer transaction;
     /// durable claims/triggers or an equivalently fail-closed fence must keep
-    /// liveness writes safe after each short transaction commits. Claim/result
+    /// attachment writes safe after each short transaction commits. Claim/result
     /// materialization and cleanup must have an explicit per-transaction
     /// cardinality bound rather than scale one writer hold with the complete
     /// object population. A file-backed `sql` implementation must expose its
@@ -275,8 +275,15 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// evidence or a nonfunctional named fence fails closed with its validation,
     /// storage, or typed `Unsupported` error before claim cleanup or deletion.
     /// Once admitted, every attachment role is live; soft deletion alone does
-    /// not make its blob collectible. This GC compatibility does not imply that
-    /// a Phase4a application reader or writer can serve a V21 database.
+    /// not make its blob collectible.
+    ///
+    /// This is the Phase-4a GC compatibility gate. Phase 4a changes no schema or
+    /// data. Every older process sharing the database/blob root must be drained
+    /// before Phase 4b performs the attachment backfill and legacy-column drop.
+    /// Phase-4a application readers/writers must also be quiesced during cutover;
+    /// only a GC-only worker has narrow compatibility with exact completed V21.
+    /// Callers must not fall back to [`Self::orphan_sweep`] or [`Self::delete`]
+    /// when this gate refuses.
     ///
     /// Publishing a blob and committing the attachment write that references it
     /// are two separate client steps; nothing serializes them against this

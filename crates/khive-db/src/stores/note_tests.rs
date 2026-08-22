@@ -81,10 +81,26 @@ fn setup_pool() -> Arc<ConnectionPool> {
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(NOTES_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{NOTES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
     }
     pool
 }
+
+const TEST_ATTACHMENTS_DDL: &str = r#"
+CREATE TABLE attachments (
+    record_uuid TEXT NOT NULL,
+    substrate   TEXT NOT NULL CHECK (substrate IN ('entity', 'note')),
+    role        TEXT NOT NULL,
+    content_ref TEXT NOT NULL,
+    media_type  TEXT,
+    size_bytes  INTEGER,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (record_uuid, role)
+);
+"#;
 
 fn setup_memory_store() -> SqlNoteStore {
     SqlNoteStore::new(setup_pool(), false)
@@ -199,6 +215,51 @@ async fn test_hard_delete() {
 
     let fetched = store.get_note(id).await.unwrap();
     assert!(fetched.is_none());
+}
+
+#[tokio::test]
+async fn note_soft_delete_retains_attachments_and_hard_delete_removes_them() {
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(pool.clone(), false);
+    let note = make_note("default", "observation", "attached note");
+    let id = note.id;
+    store.upsert_note(note).await.unwrap();
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute(
+            "INSERT INTO attachments \
+             (record_uuid, substrate, role, content_ref, created_at) \
+             VALUES (?1, 'note', 'content', ?2, 123)",
+            rusqlite::params![id.to_string(), "a".repeat(64)],
+        )
+        .unwrap();
+
+    assert!(store.delete_note(id, DeleteMode::Soft).await.unwrap());
+    let retained: i64 = pool
+        .reader()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM attachments WHERE record_uuid = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1);
+
+    assert!(store.delete_note(id, DeleteMode::Hard).await.unwrap());
+    let removed: i64 = pool
+        .reader()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM attachments WHERE record_uuid = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(removed, 0);
 }
 
 /// Namespace isolation: one store, two namespaces — each query sees only its own.

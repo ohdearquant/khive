@@ -110,15 +110,19 @@ It contributes the additive `artifact` subtypes `visual_asset`, `moodboard`, and
 `moodboard_model`. Its ADR-148 visual path publishes original raster bytes to BlobStore, derives
 an identity-bound Lattice descriptor, and performs exact descriptor-space retrieval through
 `moodboard.model`, `moodboard.ingest`, and `moodboard.search`.
+The original raster is anchored under attachment role `content`; existing `content_ref` response
+fields project that role and do not correspond to an entity database column.
 
 ADR-149 adds explicit interaction learning through `moodboard.serve`, `moodboard.judge`,
 `moodboard.train_preference`, and `moodboard.preference`. These four verbs require a canonically
 attributed non-`local` actor. Training uses immutable randomized pairwise judgments, deterministic
 unordered-pair train/calibration/test splits, a frozen ten-feature contract, and minimum support
 gates. It fits deterministic logistic binary cross-entropy in the pack, then persists and serves
-the exact zero-intercept `10 -> 1` head through `lattice-fann` 0.7.1. FANN bytes, the calibrated
+the exact zero-intercept `10 -> 1` head through `lattice-fann` 0.9.0. FANN bytes, the calibrated
 model bundle, and their provenance live in BlobStore, an `artifact/moodboard_model`, and immutable
-events.
+events. The bundle is attachment role `content`; the separately stored FANN object is role
+`fann-network`, and load fails before network hydration if that role disagrees with the
+authenticated bundle/event evidence.
 
 The learned result is a conditional pairwise-preference probability. It is deliberately returned
 separately from conformal evidence, retrieval similarity, and any later board-level coherence

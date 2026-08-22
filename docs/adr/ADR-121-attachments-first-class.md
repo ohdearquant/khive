@@ -3,10 +3,10 @@
 **Status**: accepted\
 **Date**: 2026-07-23\
 **Authors**: khive maintainers\
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), whose moodboard migration
+**Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), whose moodboard migration
 consumes this accepted role-keyed desired state, makes the canonical main backend the sole
-attachment/GC-liveness authority, and specifies a boot-gated two-stage cutover rather than
-extending legacy `entities.content_ref`.\
+attachment/GC-liveness authority, and specifies a two-release GC-compatibility/deployment gate plus
+a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`.\
 **Depends on**:
 
 - [ADR-111](ADR-111-blob-store.md) — BlobStore (the content-addressed storage capability,
@@ -92,7 +92,10 @@ CREATE INDEX idx_attachments_content_ref ON attachments(content_ref);
 
 The migration backfills every non-null `entities.content_ref` into `attachments` with role
 `"content"` and drops the `entities.content_ref` column. After the migration there is exactly
-one reference source for blob garbage collection.
+one reference source for blob garbage collection. ADR-160 Phase 4 implements this as a
+boot-gated, resumable V21 state machine: the stage transaction retains the legacy column and
+claim fences while pack-owned roles are authenticated; one final transaction swaps the GC
+anti-join and claim triggers, drops the legacy column, and records completion before serving.
 
 ### 2. The rendition rule: what is an attachment, what is not
 
@@ -145,6 +148,11 @@ agent path for record content.
 
 ### 4. Atomic publication
 
+The generic `attach` and `create(..., attach=...)` wire behavior below belongs to rollout step 2
+and remains deferred after ADR-160 Phase 4. The shipped internal
+`create_entity_with_attachments` seam already enforces the same database atomicity for current
+consumers.
+
 `attach` (and `create` with `attach=`) performs blob write and reference commit as one
 operation behind the verb boundary: the blob is written to the store, then the attachment row
 is committed in the same database transaction as the record write. A failure on either side
@@ -187,7 +195,7 @@ exactly what it was; the record of what happened is not rewritten to serve the n
 
 ## Consumers
 
-The first live consumer, named at landing: **the channel message components**. Inbound media
+The first consumer named by this decision was **the channel message components**. Inbound media
 messages — a voice message, a shared photo — land as message notes whose text field carries
 the searchable rendition (transcript, caption) and whose raw payload attaches under a media
 role. This is the note-attachment case of §2 verbatim, and it is the consumer that makes the
@@ -197,6 +205,11 @@ with both renditions, and is retrievable through the record surface.
 Follow-on consumers, in expected order: document ingestion (paper entities holding PDF/HTML
 renditions) and multimodal retrieval (embedding fan-out over stored media renditions), each
 under its own design record.
+
+ADR-160 Phase 4 changes implementation order: moodboard visual assets and preference-model
+artifacts are the first live consumers of the internal attachment substrate. Channel ingestion and
+the agent-facing attachment verbs remain follow-on work; this ordering change does not alter the
+utterance-versus-thing rule above.
 
 ---
 
@@ -264,3 +277,21 @@ under its own design record.
    strings); atomicity, GC single-source, delete-cascade reclamation (hard delete removes
    attachment rows in-transaction and the freed blobs become sweep-eligible; soft delete
    retains them), promotion-by-ref, and hydration behavior are tested contracts.
+
+### Implementation state after ADR-160 Phase 4
+
+Rollout step 1 uses two releases. Phase 4a changes no schema or data and ships only the exact-V21
+transactional-GC epoch gate. After fleet convergence, old-binary drain, and quiescence of every
+Phase-4a application reader/writer, Phase 4b implements one coordinated schema/consumer cutover:
+typed storage and SQLite attachment stores, legacy `"content"` backfill, current entity/moodboard
+reader and writer migration, transactional hard-delete cleanup, attachment-only blob liveness and
+claim fences, authenticated `"fann-network"` reconstruction, and removal of
+`entities.content_ref`. A Phase-4a GC-only worker is narrowly safe on exact completed V21, but is
+not a schema-compatible entity server; the Phase-4b fleet starts only after exact-current topology
+validation. The canonical main/core database is the only attachment and GC-liveness authority;
+secondary runtime handles must route through `KhiveRuntime::core()` and direct attachment access on
+a secondary is rejected.
+
+The agent-facing `kg` verbs in rollout step 2 (`attach`, `detach`, `export`, create-with-attach,
+and selective hydration) remain deferred. Phase 4 adds internal runtime/storage publication seams
+for existing consumers; it does not claim the complete ADR-121 public verb rollout.

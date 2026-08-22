@@ -3,18 +3,20 @@
 **Status**: accepted
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
-accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch proposed
+accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch added
 2026-08-16 by ADR-160)
 **Authors**: khive maintainers
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which requires
-backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and introduces
-the two-release attachment-GC compatibility gate on acceptance.
+**Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), which requires
+backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and implements
+ADR-121's attachment-only liveness and claim fences through a Phase-4a GC compatibility release,
+mandatory fleet convergence/drain plus application-service quiescence, and boot-gated Phase-4b V21
+cutover.
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (trait-only capability
   surface this ADR extends with a ninth capability)
 - [ADR-015](ADR-015-schema-migrations.md) — Schema Migrations (the versioned migration this ADR uses
-  to add `entities.content_ref`)
+  to add the historical V10 `entities.content_ref`, later superseded by V21 attachments)
 - [ADR-044](ADR-044-vector-store-extensions.md) — Vector Store Extensions (the `orphan_sweep`
   CLI-only precedent this ADR mirrors for `BlobStore`)
   **Related**: [ADR-086](ADR-086-doc-file-pack.md) — proposed Doc/File Pack that deferred
@@ -31,7 +33,7 @@ large blobs that a downstream consumer (the planned doc/file pack, ADR-086) want
 reference from the graph, without inflating `khive.db` itself or forcing every KG query to page
 through blob bytes it never asked for.
 
-ADR-005 defines eight storage capability traits (`Sql`, `Notes`, `Entities`, `Graph`, `Events`,
+At the time this ADR was accepted, ADR-005 defined eight storage capability traits (`Sql`, `Notes`, `Entities`, `Graph`, `Events`,
 `Vectors`, `Sparse`, `Text`) under a "zero implementation, trait-only" constraint for
 `khive-storage`. ADR-086 explicitly deferred adding a blob capability until a real consumer needed
 it, and named `StorageCapability::Blob` as the natural v2 amendment. This ADR is that amendment
@@ -212,6 +214,13 @@ beside, and `resolve_blob_root` returns an error rather than picking an arbitrar
 
 ### 7. `entities.content_ref` — the reference column
 
+**Superseded storage shape (ADR-121 / ADR-160 Phase 4b).** This section records the V10 design that
+preceded first-class attachments. After the separate Phase-4a GC compatibility release has
+converged and every older process is drained, V21 backfills the value under attachment role
+`"content"`, keeps `Entity.content_ref` only as a compatibility read projection, and drops the
+physical entity column, its index, and its claim triggers. `attachments.content_ref` is then the sole
+SQL liveness source.
+
 A new nullable, indexed column on `entities` (migration V10,
 `crates/khive-db/sql/010-entities-content-ref.sql`):
 
@@ -242,8 +251,8 @@ column: content_ref".
 `BlobStore::orphan_sweep` is the ninth capability's mirror of `VectorStore::orphan_sweep`
 (ADR-044): an admin-side operation, not an MCP verb (adding one would be a wire-surface change
 requiring its own ADR amendment, per ADR-023). The caller (an admin CLI, not a live consumer path)
-assembles the set of live `content_ref`s — e.g. `SELECT DISTINCT content_ref FROM entities WHERE
-content_ref IS NOT NULL AND deleted_at IS NULL` — and passes it in `BlobOrphanSweepConfig`;
+assembles the set of live `content_ref`s — e.g. `SELECT DISTINCT content_ref FROM attachments` —
+and passes it in `BlobOrphanSweepConfig`;
 `FsBlobStore` walks its shard tree and reports (`dry_run: true`) or deletes (`dry_run: false`)
 everything not in that set.
 
@@ -257,16 +266,16 @@ ever add references and let GC reconcile.
 paragraph above, as originally written, claimed this design "is never removed out from under a
 concurrent reader". That remains false for `delete` and the caller-snapshot
 `orphan_sweep(config)` API. Both are **offline-maintenance-only**, not safe to run against a live
-reference writer:
+attachment writer:
 
 - `orphan_sweep`'s `live_refs` set is a **snapshot** the caller assembles before the call. Nothing
-  in `BlobStore` detects a `content_ref` that becomes newly live — a reference write lands
+  in `BlobStore` detects a `content_ref` that becomes newly live — an attachment write lands
   referencing it — between when that snapshot was taken and when the sweep runs; such a blob would
   be deleted anyway. As of the amendment below, the filesystem backend closes this specific
   destructive path in this compatibility release by refusing every call outright, rather than
   narrowing the hazard.
 - `delete` is an unconditional physical removal with the same class of hazard: any caller can
-  delete a `content_ref` a reference write races into existence a moment later, with no coordination
+  delete a `content_ref` an attachment write races into existence a moment later, with no coordination
   from this trait.
 
 Run `delete` only when writes that could create a new `content_ref` reference are quiesced.
@@ -318,6 +327,21 @@ Once admitted, the filesystem implementation:
 6. removes that bounded claim batch in a second short SQL-only atomic unit before advancing, then
    releases all locks after the final batch.
 
+**Two-release rollout (ADR-160 Phase 4a → Phase 4b).** The epoch gate above ships first as
+Phase 4a and makes no schema or data change: it does not create attachments, register or execute
+V21, backfill, dual-read, dual-write, or drop the legacy column. Callers must not fall back to
+caller-snapshot `orphan_sweep` or unconditional `delete` while the gate refuses.
+
+Every process and scheduled job that can share the database/blob root must converge on the
+Phase-4a-or-newer gate, and every pre-Phase-4a process must be drained and restart-fenced, before a
+Phase-4b binary may migrate V21. Every Phase-4a application-serving/read-write process must also be
+quiesced for the cutover, or independently proven unable to touch the database: Phase 4a does not
+make its V20 entity readers and writers compatible with the V21 column drop. A Phase-4a GC-only
+worker is safe on exact completed V21, but that narrow property is not general serving
+compatibility. Start the Phase-4b service fleet only after exact-current topology validation. This
+intentionally pauses transactional GC on V20 during the compatibility epoch; operators must budget
+capacity rather than weaken the fence.
+
 This yields two concurrency guarantees pinned by tests. A blob published after candidate capture
 is not in the sweep set and survives. A committed attachment reference cannot appear between the
 liveness query and physical deletion: SQLite's writer lock covers the anti-join plus claim commit,
@@ -336,12 +360,6 @@ deduplicated `put`. A client whose put-to-reference gap exceeds the configured g
 exposed to deletion. Tests cover a fresh unreferenced publish, deduplicated republication,
 zero-grace behavior, and deletion after grace expiry; the warning is not weakened beyond that
 evidence.
-
-Phase4a is only the compatibility fence. It does not create `attachments`, register or execute
-V21, backfill records, drop the legacy column, or make application serving V21-compatible. Before
-a later Phase4b cutover, operators first drain and restart-fence every pre-Phase4a binary, deploy
-Phase4a everywhere, and then quiesce every Phase4a application reader/writer. Only the GC method is
-mixed-V21 compatible; the Phase4b migration and serving changes are a separate follow-up.
 
 `S3BlobStore` does not override `transactional_orphan_sweep` and returns `Unsupported`; its
 caller-snapshot `orphan_sweep` has no publish-grace accounting and remains offline-maintenance-
@@ -381,33 +399,38 @@ misses.
 
 ## Consequences
 
+The following bullets record the original V10 acceptance consequences. ADR-121 / ADR-160 Phase 4b
+supersedes their entity-column details with the V21 outcome described immediately afterward.
+
 - `khive-storage` grows one new module (`blob.rs`) and one new `StorageCapability` variant; no
   existing trait or type changes shape.
 - `khive-db` grows one new store module (`stores/blob.rs`, `FsBlobStore`), one new
   `StorageBackend::blob_store` factory method, and one new migration (V10). No existing migration
   is edited.
-- `Entity` (the `khive-storage` flat/SQL-facing struct, not `khive_types::entity::Entity`) grows a
-  `content_ref: Option<String>` field. Every call site constructing an `Entity` literal
-  (`khive-db`, `khive-runtime`, `khive-vcs`) needed updating; all currently set `content_ref: None`
-  except the SQL-backed CRUD paths in `khive-db::stores::entity`, which thread the real value
-  through.
+- `Entity` (the `khive-storage` flat/SQL-facing struct, not `khive_types::entity::Entity`) grew a
+  `content_ref: Option<String>` field. At V10 acceptance, SQL-backed entity CRUD threaded the
+  physical column through that field.
 - The pre-existing entity-merge SQL path in `khive-runtime::curation::merge_entity_sql`'s `INSERT
   OR REPLACE` already omits `entity_type` from its column list (a pre-existing gap, not introduced
   by this ADR) — merging an entity through that path resets `entity_type` to `NULL` in the stored
-  row today. `content_ref` was deliberately left out of that same `INSERT OR REPLACE` for
+  row at the time. `content_ref` was deliberately left out of that same `INSERT OR REPLACE` for
   consistency with the existing (undocumented) behavior rather than silently fixing one field and
   not the other; the in-memory `MergeResult`'s returned `Entity` does still carry the "into"
   entity's `content_ref` forward, matching how it already carries `entity_type` forward in memory
-  despite the DB row losing it. This existing gap should be fixed in its own change, not folded
-  into this ADR's scope.
+  despite the DB row losing it.
 - No MCP wire-surface change: `blob_store` is reached only through `StorageBackend`, not through
   any pack verb. A future doc/file pack ADR will define what (if anything) becomes MCP-visible.
+- **Current V21 outcome (ADR-121 / ADR-160 Phase 4b):** after the Phase-4a fleet gate, the physical
+  entity column and its index and
+  claim triggers are removed. `Entity.content_ref` remains only as a compatibility response
+  projection of attachment role `"content"`; entity writes and merges no longer read or write a
+  physical `entities.content_ref`. The role-keyed attachment row is authoritative for liveness.
 - **Amendments (2026-07-13, PR #922):** `ContentRef` no longer derives
   `Deserialize` — it is hand-implemented to route every input through `from_hex`, so a malformed
   serialized value is rejected at deserialization instead of later panicking in `shard_path`.
   `FsBlobStore::put`'s floor check now accounts for the pending write's own size. `delete` and
   `orphan_sweep` are now explicitly documented (trait doc comments, §8 above) as
-  offline-maintenance-only, requiring quiesced entity writes — a real concurrency hazard the
+  offline-maintenance-only, requiring quiesced attachment writes — a real concurrency hazard the
   original §8 text incorrectly described as absent. PR #1313 later added the distinct filesystem
   `transactional_orphan_sweep` path described in §8; it did not make these legacy methods safe.
 - **Further amendment (same date):** the first fix for serializing `put` scoped
@@ -528,10 +551,10 @@ Content-addressed keys plus conditional create replace the filesystem publish cr
 concurrent `put` calls.
 
 No object-store mutex replaces the §8 safety requirement because an in-process lock would not solve
-it. The hazardous race is between a database snapshot of live `content_ref`s and a later entity
+it. The hazardous race is between a database snapshot of live `content_ref`s and a later attachment
 write, potentially across processes and storage systems. `delete` and the caller-snapshot
 `orphan_sweep` therefore remain offline-maintenance-only for S3 and require deployment-wide
-quiescence of every writer that can create a new entity reference for the full snapshot-plus-sweep
+quiescence of every writer that can create a new attachment reference for the full snapshot-plus-sweep
 interval. PR #1313 implemented `transactional_orphan_sweep` only for `FsBlobStore`;
 `S3BlobStore` retains the trait default (`Unsupported`) and does not inherit the filesystem grace-
 period guarantee.
@@ -777,7 +800,9 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
   `BlobOrphanSweepResult`, `BlobStore`.
 - `crates/khive-storage/src/capability.rs` — `StorageCapability::Blob`.
 - `crates/khive-storage/src/error.rs` — `StorageError::CapacityFloor`.
-- `crates/khive-storage/src/entity.rs` — `Entity::content_ref`, `Entity::with_content_ref`.
+- `crates/khive-storage/src/entity.rs` — `Entity::content_ref` compatibility response projection;
+  the former writable helper is removed.
+- `crates/khive-storage/src/attachment.rs` — ADR-121 role-keyed attachment contract.
 - `crates/khive-db/src/stores/blob.rs` — `FsBlobStore`, `resolve_blob_root`,
   `write_lock_for_root`/`root_write_locks` (the canonical-root-keyed shared-lock registry),
   `crosses_floor` (the pure write-size-aware floor comparison).
@@ -787,12 +812,15 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
   `crates/khive-mcp/src/serve.rs` — config-aware blob-store selection and boot wiring from PR #1054;
   no provider type enters `khive-storage`.
 - `crates/khive-storage/src/blob.rs` and `crates/khive-db/src/stores/blob.rs` — provider-neutral
-  transactional sweep contract and filesystem implementation from PR #1313.
-- `crates/khive-db/sql/010-entities-content-ref.sql` — migration V10.
-- `crates/khive-db/sql/entities-ddl.sql` — mirrored `content_ref` column + index.
-- `crates/khive-db/src/stores/entity.rs` — `content_ref` threaded through
-  `entity_upsert_statement`, `batch_upsert_entities`, `read_entity`, and all three `SELECT` column
-  lists.
+  transactional sweep contract and filesystem implementation; the Phase-4a epoch gate refuses V20
+  and every incomplete/malformed V21 combination in both modes, while exact completed V21
+  anti-joins `attachments` and validates attachment/claim refs.
+- `crates/khive-db/sql/010-entities-content-ref.sql` — historical V10 column introduced by this
+  ADR; V21 removes it after backfill.
+- `crates/khive-db/sql/021-attachments-a-stage.sql` and
+  `021-attachments-b-claim-fences.sql` — resumable stage schema and final attachment fences.
+- `crates/khive-db/src/stores/entity.rs` — role `"content"` read projection, atomic
+  entity-plus-attachment publication, and transactional hard-delete cleanup.
 
 ## References
 

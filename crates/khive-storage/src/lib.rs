@@ -1,6 +1,9 @@
-//! Storage capability traits: `SqlAccess`, `VectorStore`, `TextSearch`, `GraphStore`, `NoteStore`, `EventStore`, `BlobStore`.
+//! Storage capability traits: `SqlAccess`, `VectorStore`, `TextSearch`,
+//! `GraphStore`, `NoteStore`, `EntityStore`, `EventStore`, `SparseStore`,
+//! `BlobStore`, and `AttachmentStore`.
 
 pub mod agent;
+pub mod attachment;
 pub mod blob;
 pub mod capability;
 pub mod entity;
@@ -19,6 +22,7 @@ pub mod usage;
 pub mod vectors;
 
 pub use agent::AgentStore;
+pub use attachment::{Attachment, AttachmentStore, AttachmentSubstrate, NewAttachment};
 pub use blob::{
     BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES,
 };

@@ -140,15 +140,14 @@ per-tenant by construction, never shared across namespaces. ANN segments are der
 local-only state — they are git-ignored exactly as `working.db` vectors are (ADR-035 §6); they are
 never committed and never travel in NDJSON.
 
-**Backend data-dir accessor (new surface, a precondition of this section).** No filesystem-directory
-accessor exists on the storage/runtime surface today: `BackendConfig`/`Backend` take `path` as a
-_constructor input_, not a readable accessor, and `RuntimeConfig::db_path` is deprecated in favour of
-`from_backend` and is `None` for in-memory backends. Resolving `<backend_data_dir>` therefore
-requires adding a `backend_data_dir() -> Option<PathBuf>` accessor on the backend handle /
-`KhiveRuntime`, threaded to the knowledge pack. This is a real ADR-028 surface addition, not a free
-assumption. For a pathless/in-memory backend the accessor returns `None`: ANN persistence is disabled
-(segments are skipped) and every warm is a Cold rebuild (§2) — correct, since an in-memory backend
-has no durable home for derived state.
+**Backend data-dir accessor (implemented surface).** `StorageBackend::data_dir` and
+`KhiveRuntime::backend_data_dir() -> Option<PathBuf>` expose the directory of the pack-assigned
+backend, while `backend_ann_root()` exposes the database-scoped `<db-file>.ann/` root introduced by
+Amendment 1. `RuntimeConfig::db_path` remains an input to the supported async single-backend host
+builder; direct `from_backend` assembly neither replaces that input nor performs host coordination.
+For a pathless/in-memory backend the accessors return `None`: ANN persistence is disabled (segments
+are skipped) and every warm is a Cold rebuild (§2) — correct, since an in-memory backend has no
+durable home for derived state.
 
 **Relationship to `retrieval_snapshots` (no drop, no wholesale deprecation).** `retrieval_snapshots`
 is a **shared** table with consumers beyond the knowledge pack: the memory pack's own Vamana
@@ -306,9 +305,9 @@ path as production.
 
 ## Migration path
 
-0. **Backend data-dir accessor.** Add `backend_data_dir() -> Option<PathBuf>` to the backend handle /
-   `KhiveRuntime` (ADR-028 surface addition) and thread it to the knowledge pack; `None` ⇒ ANN
-   persistence disabled (Cold every warm). This is the precondition for steps 1–4.
+0. **Backend data-dir accessor (implemented).** `backend_data_dir() -> Option<PathBuf>` and the
+   database-scoped `backend_ann_root()` are exposed on `KhiveRuntime`; `None` ⇒ ANN persistence
+   disabled (Cold every warm). This is the precondition for steps 1–4.
 1. **Bridge persistence swap.** `AnnBridge` gains `save_atomic`/`load`/`load_or_build` delegations to
    its `VamanaIndex`; warm restores via the §2 raw-`load`-plus-content-hash decision against the
    per-(ns, model) segment dir. Keep the JSON path readable for one release for fallback; stop

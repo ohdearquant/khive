@@ -209,16 +209,19 @@ pub fn process_ref_from_env() -> Option<String> {
 
 /// Runtime configuration.
 ///
-/// The `db_path` and `embedding_model` fields are deprecated in favour of
-/// constructing the backend externally and calling [`crate::KhiveRuntime::from_backend`].
-/// They remain for backward compatibility with tests and single-binary deployments.
+/// The `db_path` field remains for backward compatibility and as input to the
+/// supported async khive-mcp/kkernel host builders. Direct backend assembly is
+/// reserved for an already-coordinated database; use
+/// [`crate::KhiveRuntime::from_prepared_backend`] when that precondition has
+/// been established. `embedding_model` remains as the primary-model config
+/// shorthand beside the provider registry.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
-    /// Deprecated: use [`crate::KhiveRuntime::from_backend`] instead. The boot path
-    /// constructs backends from `khive.toml` (`AppConfig`) and passes them to
-    /// `from_backend`. Direct `db_path` usage persists only in tests.
+    /// Production boot passes this value to the async khive-mcp/kkernel host
+    /// builders, which coordinate V21 before constructing runtimes. Tests and
+    /// already-current single-backend callers may still use it directly.
     pub db_path: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,

@@ -276,21 +276,30 @@ guarantee. The current critical section may remain pack-local until a durable un
 is separately justified. Content-hash stripe maps, model locks, judgment locks, and unrelated pack
 locks are not extracted by this program.
 
-Attachment migration is ADR-121's coordinated cutover, but its safe rollout is split across two
-releases. Phase4a is a compatibility fence only: it leaves V20 schema and data untouched and adds
-no attachment table, migration, backfill, pack writer, runtime reader, or column drop. Its
-filesystem transactional GC refuses both report-only and destructive sweeps in V20, pending,
-incomplete, missing-required-object, retained-legacy, or ahead-of-V21 epochs before root locking,
-walking, or claim cleanup. Malformed schema/evidence and nonfunctional named fences also fail
-closed before claim cleanup or deletion, though their validation/probe can occur after ownership
-and the filesystem walk. It sweeps only an exact completed V21 epoch, using every attachment role
-as liveness and the attachment INSERT/UPDATE claim fences.
+Attachment migration is ADR-121's coordinated cutover, but its destructive Phase 4b is preceded by
+one separately released compatibility epoch. **Phase 4a is only the GC compatibility epoch gate.**
+It leaves V20 schema and data byte-for-byte in their existing shape: it adds no attachment table,
+migration, backfill, pack writer, runtime reader, dual-read/write path, V21 ledger row, or column
+drop. Its filesystem transactional GC admits report-only and destructive sweeps only for an exact
+completed V21 epoch, using every attachment role as liveness and exercising the attachment
+INSERT/UPDATE claim fences. V20, pending, incomplete, missing-required-object, retained-legacy, and
+ahead-of-V21 epochs return typed `Unsupported` before root locking, filesystem walking, or
+abandoned-claim cleanup. Malformed schema/evidence and nonfunctional named fences also fail closed
+before claim cleanup or deletion, though their validation/probe may occur after ownership and the
+filesystem walk. There is no fallback to caller-snapshot sweep or unconditional delete.
 
-Phase4b is the separate follow-up that will add and backfill attachments, migrate every legacy
-reader/writer plus hard delete and GC reference query (including moodboard's `"content"` and
-`"fann-network"` roles), and then drop `entities.content_ref`. Phase4a does not ship that
-implementation. Phase4b has no serving interval over a dual source, recreates no
-`create_entity_with_content_ref`, and adds no second legacy column.
+Phase 4a must converge on every process that can share the database/blob root, and every
+pre-Phase-4a process must then be drained and prevented from restarting, before any Phase-4b binary
+is allowed to migrate the database. The cutover additionally requires service quiescence: every
+Phase-4a application-serving or read/write process must be drained, or independently proven unable
+to touch the database during migration. A Phase-4a **GC-only** worker is safe against an exact
+completed V21 because of the epoch gate, but that narrow mixed-fleet property is not general entity
+reader/writer or serving compatibility. Phase 4b itself adds and backfills attachments, migrates
+every legacy reader/writer plus hard delete and GC reference queries (including moodboard's
+`"content"` and `"fann-network"` roles), and then drops `entities.content_ref` in one reviewable
+change. The Phase-4b serving fleet starts only after exact-current topology validation. There is no
+released dual-source epoch, no recreated `create_entity_with_content_ref`, and no second legacy
+column.
 
 The canonical main/core backend is the sole database that owns attachment rows and the sole SQL
 liveness authority passed to ADR-111's transactional sweep. Record-plus-attachment APIs route
@@ -301,25 +310,27 @@ with an actionable inventory if it finds a live legacy `entities.content_ref`; t
 relocated to the main graph or explicitly curated. This program does not pretend that one
 single-database sweep can fence references spread across several databases.
 
-Before attachment-only GC or column drop is enabled, every existing `moodboard_model` with a legacy
+During Phase 4b, before attachment-only GC or column drop is enabled, every existing
+`moodboard_model` with a legacy
 bundle reference is backfilled under `"fann-network"` from a fully verified bundle plus its matching
 immutable `moodboard.model_record` event. The mutable display property is never migration authority.
 The backfill verifies bundle/network references and both governed digests; missing, mismatched, or
 corrupt evidence aborts the cutover for operator curation rather than guessing or silently
 invalidating a recoverable model.
 
-Because schema preparation currently precedes BlobStore installation, the Phase4b follow-up is a
-boot-gated, resumable two-stage migration. It may begin only after this release sequence:
+Because schema preparation currently precedes BlobStore installation, Phase 4b is a boot-gated,
+resumable two-stage migration in the second implementation release. It may begin only after this
+release sequence:
 
-1. Drain every pre-Phase4a process and install a restart fence so no older binary that can still run
-   V20 GC can return. Deploy Phase4a to the complete fleet while the database remains V20.
-2. Confirm Phase4a transactional GC returns typed `Unsupported` in both modes on V20. This is the
+1. Deploy Phase 4a everywhere that can share the database/blob root while the database remains V20;
+   prove convergence, drain every remaining pre-Phase-4a process, and install a restart fence.
+2. Confirm Phase-4a transactional GC returns typed `Unsupported` in both modes on V20. This is the
    intended compatibility state, not a reason to bypass the gate with caller-snapshot GC.
-3. Before Phase4b changes the database, quiesce every Phase4a application reader and writer. Only
-   its GC implementation understands an exact completed V21 epoch; Phase4a serving code remains a
-   V20 consumer and is not permitted to coexist with the V21 column drop.
+3. Before Phase 4b changes the database, quiesce every Phase-4a application reader and writer, or
+   prove it cannot access the database. Only the GC implementation understands an exact completed
+   V21 epoch; Phase-4a serving code remains a V20 consumer and cannot coexist with the column drop.
 
-Phase4b, which is not implemented by the Phase4a change, then performs the coordinated boot work:
+Phase 4b then performs the coordinated boot work:
 
 1. Before recording any incomplete state, boot acquires ADR-111's same canonical-database GC
    ownership (in-process plus advisory lock), waiting for any incumbent transactional sweep, and
@@ -335,9 +346,9 @@ Phase4b, which is not implemented by the Phase4a change, then performs the coord
    INSERT/UPDATE claim-fence triggers, removes the legacy entity claim triggers and
    `idx_entities_content_ref`, drops `entities.content_ref`, and marks the migration complete.
 
-The Phase4b cutover migration will be registered in the versioned schema ledger but invoked by the
-boot coordinator after GC ownership is acquired; it is not executed eagerly by the unconditional
-backend constructor. Blob-independent schema work may still run at ordinary backend open.
+The Phase-4b cutover migration is registered in the versioned schema ledger but invoked by the boot
+coordinator after GC ownership is acquired; it is not executed eagerly by the unconditional backend
+constructor. Blob-independent schema work may still run at ordinary backend open.
 
 A Phase4b crash in either stage must resume from durable state and never open a serving or sweep
 window over the intermediate dual representation. Phase4a GC already refuses an incomplete marker;
@@ -873,16 +884,28 @@ The implementation sequence is normative:
    bundle/network reads; leave candidate checks metadata-only; delete unbounded `get`, the blob GET
    semaphore, and pack-local size/read/digest helpers without removing moodboard's decoded/raster
    preprocessing gate.
-4. **Attachment convergence.** Phase4a changes no V20 schema/data: transactional filesystem GC
-   refuses every non-complete-V21 epoch in both modes and uses attachment liveness/fences only after
-   exact completion. Drain and restart-fence every older binary before fleet-wide deployment.
-   Phase4b is a separate follow-up: with Phase4a application traffic quiesced, execute ADR-121's
-   boot-gated coordinated cutover on the canonical main backend; add/backfill the substrate while
-   serving stays closed; after shared hydration is installed, migrate every legacy reader, writer,
-   hard-delete, GC query and claim fence plus moodboard roles `"content"` and `"fann-network"`;
-   reconstruct existing network roles only from verified bundle/event evidence; cross-check the
-   authenticated network reference; then finalize and drop `entities.content_ref`. Reject
-   secondary-backend anchors. Phase4b is not part of the Phase4a PR.
+4. **Attachment convergence (two releases plus a deployment gate).**
+
+   - **Phase 4a — GC compatibility epoch.** In an independently deployable release, make
+     transactional filesystem-blob GC select liveness only after it proves the exact completed V21
+     epoch. Known non-admitted epochs refuse both modes before root locking, filesystem walking, or
+     abandoned-claim cleanup; malformed evidence and nonfunctional fences fail before cleanup or
+     deletion. Phase 4a performs no attachment DDL, backfill, dual-read/write, or V21 ledger write.
+   - **Fleet convergence, drain, and service quiescence.** Deploy Phase 4a everywhere that can share
+     the database or blob root; record binary-fleet convergence, drain every pre-Phase-4a process
+     and scheduled job, and prevent old binaries from restarting. Before cutover, also drain every
+     Phase-4a application-serving/read-write process or prove that it cannot touch the database.
+     Only a GC-only Phase-4a worker has narrow post-cutover compatibility; Phase-4a entity serving
+     does not. Phase 4b must not merge into a deployable release or migrate against the fleet until
+     this operational gate is satisfied.
+   - **Phase 4b — attachment convergence.** Execute ADR-121's boot-gated coordinated cutover on the
+     canonical main backend: add/backfill the substrate while serving stays closed; after shared
+     hydration is installed, migrate every legacy reader, writer, hard-delete, GC query and claim
+     fence plus moodboard roles `"content"` and `"fann-network"`; reconstruct existing network roles
+     only from verified bundle/event evidence; cross-check the authenticated network reference;
+     then finalize and drop `entities.content_ref` in the same Phase-4b change. Reject
+     secondary-backend anchors. Require exact-current validation across the planned topology before
+     starting the Phase-4b serving fleet.
 5. **Pure retrieval.** Reuse `union_fusion`, add the ranked-prefix controller, and migrate moodboard
    with exact one-shot overfetch/underfill parity.
 6. **Identity fence.** Introduce `EmbeddingSpaceIdentity`, preserve moodboard descriptor goldens,
@@ -896,9 +919,9 @@ The implementation sequence is normative:
 10. **Query expansion.** Land the optional adapter and knowledge pilot last, default off, after
     benchmark evidence fixes its first recommended operating envelope.
 
-Each phase lands in a reviewable PR with its own rollback boundary. No later phase is required to
-make an earlier merged phase safe. Removal of the old path occurs in the same phase that closes its
-last consumer.
+Each phase, including each named Phase-4 subphase, lands in a reviewable PR/release with its own
+rollback boundary. No later phase is required to make an earlier merged phase safe. Removal of the
+old path occurs in the same subphase that closes its last consumer.
 
 ## Required verification
 
@@ -930,7 +953,7 @@ last consumer.
 
 ### Attachments and ranked materialization
 
-#### Phase4a GC compatibility
+#### Phase 4a GC compatibility
 
 - On an exact V20 database, both report-only and destructive transactional sweeps return typed
   `Unsupported` before waiting for the root lock; every blob and abandoned claim remains unchanged.
@@ -945,8 +968,14 @@ last consumer.
   fleet-wide. Before Phase4b, every Phase4a application reader/writer is quiesced; the completed-V21
   GC test is not evidence that Phase4a serving is mixed-schema compatible.
 
-#### Phase4b attachment cutover (follow-up, not in the Phase4a PR)
+#### Phase 4b attachment cutover
 
+- Release evidence proves every process and scheduled job sharing the database/blob root runs the
+  Phase-4a-or-newer gate, all pre-Phase-4a processes are drained and restart-fenced, and every
+  Phase-4a application-serving/read-write process is quiesced (or cannot access the database)
+  throughout cutover. A mixed-fleet rehearsal proves elapsed time or partial rollout is
+  insufficient; any surviving Phase-4a process is GC-only, not a schema-compatible entity server.
+- Exact-current validation covers the planned topology before the Phase-4b serving fleet starts.
 - Original bytes publish and resolve through role `"content"`; existing wire content refs are
   unchanged.
 - Preference bundle and FANN network attachments both remain live under GC, and a disagreement
