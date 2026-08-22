@@ -187,7 +187,7 @@ export function RepositoryCommandPalette({
     }
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  });
+  }, [open]);
 
   useEffect(() => {
     if (open) inputRef.current?.focus();

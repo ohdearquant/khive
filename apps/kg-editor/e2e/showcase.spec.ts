@@ -269,6 +269,87 @@ test("drills from analysis results into the shared inspector and browser history
   await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(apiPath!);
 });
 
+test("uses the structure lens to verify a hidden khive-db boundary", async ({ page }) => {
+  const graphImplementation = "crates/khive-db/src/stores/graph.rs";
+  await page.goto("/");
+
+  const toolbar = page.locator(".repo-graph-toolbar");
+  await toolbar.getByRole("combobox", { name: /Package · Structure graph/ })
+    .selectOption({ label: "khive-db" });
+  await toolbar.getByRole("radio", { name: "Hidden coupling" }).check();
+
+  const lens = page.getByRole("region", { name: "Hidden coupling lens" });
+  await expect(lens).toContainText("20 of 70 captured visible pairs shown");
+  await expect(lens).toContainText("365-day analysis window");
+  await expect(lens).toContainText("1,000 captured of 104,263 declared");
+  await expect(page.locator("[data-coupling-overlay]")).toHaveCount(20);
+
+  const graphPair = lens.getByRole("button", {
+    name:
+      "Focus coupling candidate between crates/khive-db/src/stores/graph_tests.rs and crates/khive-db/src/stores/graph.rs",
+  });
+  await graphPair.press("Enter");
+  await expect(lens).toContainText("No captured direct dependency edge");
+  await expect(page.locator("[data-coupling-overlay].selected")).toHaveCount(1);
+  expect(await page.locator(".repo-graph-node.context-dimmed").count())
+    .toBeGreaterThan(0);
+
+  await graphPair.locator("..").getByRole("button", {
+    name: `Inspect ${graphImplementation}`,
+  })
+    .press("Enter");
+  await expect(page.locator("[data-module-inspector]")).toBeFocused();
+  await expect(page.locator("[data-module-inspector]").getByRole("heading", {
+    level: 3,
+  })).toHaveText(graphImplementation);
+  await expect(page).toHaveURL(/view=structure_graph/);
+  await expect(page).toHaveURL(
+    new RegExp(`module=${encodeURIComponent(graphImplementation)}`),
+  );
+});
+
+test("keeps the structure inspector legible across desktop and mobile", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByRole("combobox", { name: /Package · Structure graph/ })
+    .selectOption({ label: "khive-db" });
+  await page.getByRole("button", {
+    name: "Concept Module stores::graph",
+    exact: true,
+  }).click();
+
+  const heading = page.locator(".repo-inspector-heading");
+  await expect(heading.getByText("stores::graph", { exact: true })).toBeVisible();
+  await expect(heading.getByText("crates/khive-db/src/stores/graph.rs", { exact: true }))
+    .toBeVisible();
+
+  const measure = () => heading.evaluate((element) => {
+    const moduleName = element.querySelector("strong");
+    const sourcePath = element.querySelector("code");
+    if (!moduleName || !sourcePath) throw new Error("graph inspector heading is incomplete");
+    return {
+      moduleNameFits: moduleName.scrollWidth <= moduleName.clientWidth,
+      sourcePathFits: sourcePath.scrollWidth <= sourcePath.clientWidth,
+      sourcePathOverflowWrap: getComputedStyle(sourcePath).overflowWrap,
+      documentFits: document.documentElement.scrollWidth === document.documentElement.clientWidth,
+    };
+  });
+
+  expect(await measure()).toMatchObject({
+    moduleNameFits: true,
+    sourcePathFits: true,
+    documentFits: true,
+  });
+
+  await page.setViewportSize({ width: 375, height: 812 });
+  expect(await measure()).toEqual({
+    moduleNameFits: true,
+    sourcePathFits: true,
+    sourcePathOverflowWrap: "anywhere",
+    documentFits: true,
+  });
+});
+
 test("a valid repository miss stays local and renders an honest state", async ({ page }) => {
   const requestedAfterSubmit: string[] = [];
   let observing = false;
