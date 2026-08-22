@@ -564,11 +564,20 @@ readers or writers, or drop `entities.content_ref`. Its filesystem
 destructive calls on V20, pending/incomplete V21, missing required objects, retained legacy
 objects, or a schema newer than the exact V21 contract. Malformed schema/evidence or nonfunctional
 named fences also fail closed, using the applicable validation, storage, or typed `Unsupported`
-error before claim cleanup or deletion. Do not bypass a refusal with caller-snapshot
-`orphan_sweep`; that API requires deployment-wide reference-write quiescence and cannot account
-for the moodboard FANN object missing from V20 SQL liveness.
+error before claim cleanup or deletion. There is no bypass through caller-snapshot `orphan_sweep`:
+that API is disabled outright in this release (typed `Unsupported` for every call, both `dry_run`
+modes) because it has no way to prove a completed V21 epoch and cannot account for the moodboard
+FANN object missing from V20 SQL liveness.
 
-Use this two-release rollout order:
+**What you can do today, right now, in this release:** back up, drain old binaries, and deploy
+Phase4a (steps 1-3 below). If a database's `attachment_cutover_state` marker is anything other than
+the exact completed V21 epoch — including "incomplete", missing, or partially applied — GC simply
+stays refused on both APIs, in both modes; the database and blob root are otherwise untouched.
+There is no restore, rollback, or marker-repair command shipped in this release, and none is
+required for the compatibility fence itself: an incomplete marker is not an error state to recover
+from, it is V20's normal, permanently-supported epoch as far as Phase4a GC is concerned.
+
+Use this rollout order for what Phase4a actually ships:
 
 1. Back up the canonical main database and inventory every process that can open it or the shared
    blob root, including daemons, one-shot admin jobs, and independently supervised replicas.
@@ -577,6 +586,12 @@ Use this two-release rollout order:
 3. Deploy Phase4a everywhere while the database remains V20. A typed V20 GC refusal in either mode
    is the expected safe state. Phase4a `db migrate` still knows only the V20 prefix and does not
    perform the attachment cutover.
+
+The following is **future design, not a runnable procedure in this release.** No Phase4b
+migration/serving tooling, boot gate, or durable-marker completion path exists in the committed
+migration registry today (it ends at V20) — do not treat the steps below as operator instructions;
+they describe what a later Phase4b release must do, once it ships:
+
 4. Before introducing Phase4b, quiesce every Phase4a application reader and writer. Only the
    Phase4a GC implementation can interpret an exact completed V21 attachment epoch; its serving,
    pack, runtime, and ordinary migration paths remain V20 consumers. Do not perform a rolling

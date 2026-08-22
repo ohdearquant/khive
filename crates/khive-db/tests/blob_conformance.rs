@@ -232,15 +232,23 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
     ));
 
     // orphan_sweep dry-run against an empty live set reports would_delete
-    // for the object we just wrote, without touching it.
-    let sweep = store
+    // for the object we just wrote, without touching it -- unless this
+    // backend disables the caller-snapshot API outright in favor of a
+    // database-coordinated sweep (`FsBlobStore` in this compatibility
+    // release: ADR-111 §8, it has no epoch capability of its own), in which
+    // case a typed `Unsupported` refusal is the conforming outcome instead.
+    // Either way nothing is touched.
+    match store
         .orphan_sweep(&BlobOrphanSweepConfig {
             live_refs: Default::default(),
             dry_run: true,
         })
         .await
-        .expect("orphan_sweep dry-run");
-    assert!(sweep.would_delete >= 1);
+    {
+        Ok(sweep) => assert!(sweep.would_delete >= 1),
+        Err(StorageError::Unsupported { .. }) => {}
+        Err(other) => panic!("unexpected orphan_sweep error: {other:?}"),
+    }
     assert!(store
         .exists(&ref_a)
         .await

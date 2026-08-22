@@ -62,7 +62,7 @@ reference — that nothing live references `content_ref` for the duration of the
 call. A caller that races a reference write against a `delete` can dangle a
 live reference; this trait does not detect or prevent that.
 
-## `BlobStore::orphan_sweep` — concurrency hazard
+## `BlobStore::orphan_sweep` — concurrency hazard, disabled in this compatibility release
 
 The operator-side GC path (khive#292 deliverable 5) — an admin-side
 operation, not an MCP verb, mirroring `VectorStore::orphan_sweep`'s CLI-only
@@ -75,13 +75,17 @@ and passes it in.
 `live_refs` is a **snapshot** the caller assembled before the call.
 `orphan_sweep` has no way to detect a `content_ref` that becomes newly live
 between when that snapshot was taken and when the sweep runs; such a
-reference is deleted anyway (see `khive-db`'s
-`orphan_sweep_race_demonstrates_the_documented_quiescence_requirement` test,
-which reproduces exactly this). This trait provides no transactional
-coordination with a reference writer. **Callers MUST quiesce reference writes**
-(nothing may create a new `content_ref` reference) for the duration of
-snapshot-plus-sweep — a maintenance window, a single-writer admin CLI
-invocation with no live traffic, or equivalent.
+reference would be deleted anyway. This trait provides no transactional
+coordination with a reference writer, and — unlike
+`transactional_orphan_sweep` — it has no `SqlAccess` capability with which to
+prove a completed V21 attachment epoch either. **The filesystem
+implementation therefore returns typed `StorageError::Unsupported` for every
+call in this compatibility release, in both `dry_run` modes, regardless of
+`live_refs`.** A caller-assembled snapshot could otherwise delete an object a
+V20 SQL query cannot see as live (e.g. a moodboard FANN network), silently
+bypassing the epoch gate `transactional_orphan_sweep` enforces. Use
+`transactional_orphan_sweep` for all sweeps against a live database; there is
+currently no supported destructive path through `orphan_sweep`.
 
 A DB-coordinated sweep is available separately as
 `BlobStore::transactional_orphan_sweep`. The Phase4a filesystem implementation
@@ -95,9 +99,13 @@ retained-legacy, and ahead-of-V21 epochs return typed
 `StorageError::Unsupported` before waiting for the blob-root lock, walking
 files, or recovering abandoned claims.
 
-After that gate, the filesystem implementation acquires database/root ownership,
-captures the complete candidate set, and classifies file age outside SQLite's
-writer transaction. It revalidates the epoch under ownership, validates every
+After that gate, the filesystem implementation acquires database ownership (the
+process-local guard plus the cross-process advisory lock) and revalidates the
+epoch immediately, before ever waiting on the root guard/lock or walking the
+filesystem — closing the gap if external maintenance changed the schema
+between the read-only preflight and ownership. Only once that recheck passes
+does it acquire root ownership, capture the complete candidate set, and
+classify file age outside SQLite's writer transaction, then validate every
 attachment and claim reference before the functional fence probe. Malformed
 stored evidence returns its validation error, and a malformed schema or
 nonfunctional named fence returns its storage or typed `Unsupported` error;
@@ -120,10 +128,11 @@ GC implementation can interpret an exact completed V21 attachment epoch. The
 Phase4b cutover still requires every Phase4a application reader and writer to be
 quiesced first.
 
-The original `orphan_sweep` remains an offline-maintenance API for callers that
-already have a trusted `live_refs` snapshot. It intentionally retains its
-quiescence requirement for compatibility; concurrent callers must use
-`transactional_orphan_sweep`.
+The original caller-snapshot `orphan_sweep` is disabled on the filesystem
+backend in this compatibility release (see above); it is not an alternative
+path for callers who want to avoid the epoch gate. All sweeps against a live
+database must go through `transactional_orphan_sweep`.
 
 Default `orphan_sweep` implementation returns `StorageError::Unsupported`; the
-filesystem backend overrides it with a real directory walk. No silent no-op.
+filesystem backend currently returns the same typed refusal rather than
+performing a real directory walk. No silent no-op.

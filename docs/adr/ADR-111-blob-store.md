@@ -261,17 +261,29 @@ reference writer:
 
 - `orphan_sweep`'s `live_refs` set is a **snapshot** the caller assembles before the call. Nothing
   in `BlobStore` detects a `content_ref` that becomes newly live — a reference write lands
-  referencing it — between when that snapshot was taken and when the sweep runs; such a blob is
-  deleted anyway. `khive-db`'s
-  `orphan_sweep_race_demonstrates_the_documented_quiescence_requirement` test reproduces this
-  exactly, so the hazard is pinned in code, not just prose.
+  referencing it — between when that snapshot was taken and when the sweep runs; such a blob would
+  be deleted anyway. As of the amendment below, the filesystem backend closes this specific
+  destructive path in this compatibility release by refusing every call outright, rather than
+  narrowing the hazard.
 - `delete` is an unconditional physical removal with the same class of hazard: any caller can
   delete a `content_ref` a reference write races into existence a moment later, with no coordination
   from this trait.
 
-Run those two methods only when writes that could create a new `content_ref` reference are
-quiesced. `BlobStore::transactional_orphan_sweep(sql, dry_run)`, added by PR #1313, is the live-
-traffic alternative for backends that can coordinate both stores.
+Run `delete` only when writes that could create a new `content_ref` reference are quiesced.
+`BlobStore::transactional_orphan_sweep(sql, dry_run)`, added by PR #1313, is the live-traffic
+alternative for backends that can coordinate both stores.
+
+**Caller-snapshot `orphan_sweep` disabled on the filesystem backend (amended 2026-08-21).** This
+API has no `SqlAccess` capability of its own, so — unlike `transactional_orphan_sweep` — it cannot
+prove a completed V21 attachment epoch before deleting anything. A caller-assembled `live_refs`
+snapshot could delete an object a V20 SQL query cannot see as live (e.g. a moodboard FANN network),
+bypassing the epoch gate below entirely. `FsBlobStore::orphan_sweep` therefore returns typed
+`StorageError::Unsupported` for every call in this release, in both `dry_run` modes, matching the
+trait default; there is no destructive path through this method until a snapshot API can carry its
+own epoch proof. This does not affect `S3BlobStore`, whose `orphan_sweep` remains the
+offline-maintenance-only quiescence-required path described near the end of this section — the
+disablement is filesystem-specific because only the filesystem backend has a competing,
+epoch-gated `transactional_orphan_sweep` implementation to defer to.
 
 **Attachment-cutover compatibility epoch (amended 2026-08-16, Phase4a).** The filesystem
 implementation no longer sweeps against V20 entity liveness. Both report-only and destructive
@@ -286,10 +298,15 @@ named fence returns typed `Unsupported`; all fail closed before claim cleanup or
 
 Once admitted, the filesystem implementation:
 
-1. acquires database/root ownership, captures the complete blob candidate set while publishers are
-   excluded, and evaluates file age outside SQLite's writer transaction;
-2. rechecks the completed epoch under ownership, validates every attachment and claim reference,
-   and then proves the attachment INSERT/UPDATE fences function before any abandoned-claim cleanup;
+1. acquires database ownership (the process-local guard plus the cross-process advisory lock) and
+   immediately rechecks the completed epoch, before ever waiting on the root guard/lock or walking
+   the filesystem — this closes the gap if external maintenance changed the schema between the
+   read-only preflight above and ownership, and keeps the pre-lock refusal contract true for every
+   listed epoch, not only the one the preflight observed;
+2. only once that recheck passes, acquires root ownership, captures the complete blob candidate set
+   while publishers are excluded, evaluates file age outside SQLite's writer transaction, validates
+   every attachment and claim reference, and then proves the attachment INSERT/UPDATE fences
+   function before any abandoned-claim cleanup;
 3. removes validated claims abandoned by the previous database owner in SQL-only transactions of
    at most 128 rows; ownership, not the mutable path-derived `root_key`, makes root relocation and
    restored-backup recovery safe;

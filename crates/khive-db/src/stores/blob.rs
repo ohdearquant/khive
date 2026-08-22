@@ -739,34 +739,6 @@ fn within_publish_grace(path: &Path, now: SystemTime, grace_period: Duration) ->
     }
 }
 
-fn sweep_blob_candidates(
-    root: &Path,
-    files: Vec<(ContentRef, PathBuf)>,
-    live_refs: &std::collections::HashSet<ContentRef>,
-    dry_run: bool,
-    grace_period: Duration,
-) -> StorageResult<BlobOrphanSweepResult> {
-    let mut result = BlobOrphanSweepResult::default();
-    let now = SystemTime::now();
-    for (content_ref, path) in files {
-        result.scanned += 1;
-        if live_refs.contains(&content_ref) {
-            continue;
-        }
-        if within_publish_grace(&path, now, grace_period) {
-            result.grace_period_skipped += 1;
-            continue;
-        }
-        result.would_delete += 1;
-        if !dry_run {
-            unlink_blob_shard_file_no_follow(root, &content_ref)
-                .map_err(|e| map_io_err(e, "orphan_sweep_delete"))?;
-            result.deleted += 1;
-        }
-    }
-    Ok(result)
-}
-
 #[derive(Debug)]
 struct PreparedTransactionalSweep {
     result: BlobOrphanSweepResult,
@@ -1366,16 +1338,6 @@ async fn release_blob_gc_batch(sql: &dyn SqlAccess, root_key: String) -> Storage
     Ok(())
 }
 
-fn sweep_blob_files(
-    root: &Path,
-    live_refs: &std::collections::HashSet<ContentRef>,
-    dry_run: bool,
-    grace_period: Duration,
-) -> StorageResult<BlobOrphanSweepResult> {
-    let files = walk_blob_files(root).map_err(|e| map_io_err(e, "orphan_sweep_walk"))?;
-    sweep_blob_candidates(root, files, live_refs, dry_run, grace_period)
-}
-
 /// Process-wide database owner fence for transactional blob sweeps.
 ///
 /// Claims live in the database and their attachment triggers are database-global,
@@ -1698,24 +1660,28 @@ impl BlobStore for FsBlobStore {
         .map_err(|e| StorageError::driver(StorageCapability::Blob, "delete", e))?
     }
 
-    // Offline-maintenance-only — see `BlobStore::orphan_sweep`'s doc comment
-    // for the concurrency hazard (`config.live_refs` is a snapshot; a
-    // `content_ref` that becomes live after the snapshot is deleted anyway).
-    // This method performs no DB coordination; it only compares against
-    // whatever set the caller handed it.
+    // Disabled for this compatibility release (Phase4a, ADR-111 §8 amended
+    // 2026-08-21): this API has no `SqlAccess` capability of its own, so it
+    // cannot prove the completed-V21 epoch `transactional_orphan_sweep`
+    // requires before any destructive path runs. A caller-assembled
+    // `live_refs` snapshot could otherwise delete an object a V20 SQL query
+    // cannot see as live (e.g. a moodboard FANN network), bypassing the
+    // epoch gate entirely. Report-only and destructive calls both refuse,
+    // matching the trait default, until a snapshot API can carry its own
+    // epoch proof.
     async fn orphan_sweep(
         &self,
         config: &BlobOrphanSweepConfig,
     ) -> StorageResult<BlobOrphanSweepResult> {
-        let root = self.root.clone();
-        let live_refs = config.live_refs.clone();
-        let dry_run = config.dry_run;
-        let grace_period = self.orphan_sweep_grace;
-        tokio::task::spawn_blocking(move || {
-            sweep_blob_files(&root, &live_refs, dry_run, grace_period)
+        let _ = config;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Blob,
+            operation: "orphan_sweep".into(),
+            message: "caller-snapshot orphan_sweep is disabled in this compatibility release; \
+                      it cannot prove a completed V21 attachment epoch, use \
+                      transactional_orphan_sweep instead"
+                .into(),
         })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Blob, "orphan_sweep", e))?
     }
 
     // `put` and the attachment write that later commits a `content_ref` to its
@@ -1763,13 +1729,41 @@ impl BlobStore for FsBlobStore {
         let database_guard = sweep_lock_for_database(database_path.as_deref())
             .lock_owned()
             .await;
+        let lock_database_path = database_path.clone();
+        #[cfg(test)]
+        let hook_database_path = database_path.clone();
+        let database_file_guard = tokio::task::spawn_blocking(move || {
+            let guard = acquire_database_gc_lock(lock_database_path.as_deref())?;
+            #[cfg(test)]
+            if let Some(hook) = db_ownership_sync_hook::take(hook_database_path.as_deref()) {
+                let _ = hook.reached.send(());
+                let _ = hook.release.recv();
+            }
+            Ok::<_, StorageError>(guard)
+        })
+        .await
+        .map_err(|e| {
+            StorageError::driver(
+                StorageCapability::Blob,
+                "transactional_orphan_sweep_lock",
+                e,
+            )
+        })??;
+
+        // Recheck immediately once database ownership -- the process-local
+        // guard plus the cross-process advisory lock -- is held, and before
+        // ever waiting on the root guard/lock or walking the filesystem, so
+        // the documented pre-lock refusal contract holds even if the epoch
+        // regressed between the read-only preflight above and ownership.
+        if !blob_gc_fencing_complete(sql).await? {
+            return Err(unsupported_blob_gc_epoch());
+        }
+
         let root_guard = self.write_lock.clone().lock_owned().await;
         let root = self.root.clone();
         let scan_root = root.clone();
-        let lock_database_path = database_path.clone();
         let grace_period = self.orphan_sweep_grace;
         let (write_guards, canonical_root, prepared) = tokio::task::spawn_blocking(move || {
-            let database_file_guard = acquire_database_gc_lock(lock_database_path.as_deref())?;
             let canonical_root = scan_root
                 .canonicalize()
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_root"))?;
@@ -1797,13 +1791,6 @@ impl BlobStore for FsBlobStore {
             )
         })??;
         let root_key = blob_root_key(&canonical_root);
-        // Recheck after acquiring the existing Phase-3 database/root owner
-        // sequence. Completed V21 is monotonic in supported writers, but this
-        // closes the safety gap if external maintenance replaced the schema
-        // between the read-only compatibility preflight and ownership.
-        if !blob_gc_fencing_complete(sql).await? {
-            return Err(unsupported_blob_gc_epoch());
-        }
         validate_blob_gc_evidence(sql).await?;
         blob_gc_fence_probe(sql).await?;
         if !dry_run {
@@ -2040,6 +2027,56 @@ mod bounded_read_sync_hook {
     }
 }
 
+/// Test-only pause on `transactional_orphan_sweep`'s database-ownership
+/// blocking task, right after the cross-process advisory lock is acquired
+/// and before the epoch recheck that immediately follows it. Lets a test
+/// mutate the database strictly between the read-only preflight and the
+/// recheck, making the recheck's ordering relative to the root guard/lock
+/// deterministic instead of racing on scheduling.
+#[cfg(test)]
+mod db_ownership_sync_hook {
+    use std::collections::{HashMap, VecDeque};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub(super) reached: Sender<()>,
+        pub(super) release: Receiver<()>,
+    }
+
+    fn registry() -> &'static StdMutex<HashMap<Option<PathBuf>, VecDeque<Hook>>> {
+        static REGISTRY: OnceLock<StdMutex<HashMap<Option<PathBuf>, VecDeque<Hook>>>> =
+            OnceLock::new();
+        REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(database_path: Option<&Path>) -> (Receiver<()>, Sender<()>) {
+        let key = database_path.map(Path::to_path_buf);
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default()
+            .push_back(Hook {
+                reached: reached_tx,
+                release: release_rx,
+            });
+        (reached_rx, release_tx)
+    }
+
+    pub(super) fn take(database_path: Option<&Path>) -> Option<Hook> {
+        let key = database_path.map(Path::to_path_buf);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2119,7 +2156,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_v21_gc_gate_requires_new_indexes_and_absent_legacy_column() {
+    async fn completed_v21_gc_gate_requires_the_attachments_content_ref_index_and_absent_legacy_column(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("khive.db");
         let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
@@ -2156,6 +2194,206 @@ mod tests {
         assert!(!blob_gc_fencing_complete(backend.sql().as_ref())
             .await
             .unwrap());
+    }
+
+    /// Table-driven acceptance matrix: starting from a fixture that passes
+    /// the gate, remove exactly one required table/index/trigger/marker/
+    /// ledger fact at a time and prove the gate rejects it, no probe or
+    /// abandoned-claim residue survives, and every candidate file and
+    /// pre-existing claim is untouched. A wrong implementation that stops
+    /// requiring any single one of these facts (e.g. the claims content_ref
+    /// index, the V21 ledger row/name/max, the marker row/`completed_at`, or
+    /// the INSERT fence alone) would still pass the narrower pre-existing
+    /// tests but fails here.
+    #[tokio::test]
+    async fn completed_v21_gate_acceptance_matrix_rejects_each_removed_fact_independently() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "blob_gc_claims_content_ref_index_dropped",
+                "DROP INDEX idx_blob_gc_claims_content_ref",
+            ),
+            (
+                "v21_ledger_row_deleted",
+                "DELETE FROM _schema_migrations WHERE version = 21",
+            ),
+            (
+                "v21_ledger_row_renamed",
+                "UPDATE _schema_migrations SET name = 'not_attachments_first_class' \
+                 WHERE version = 21",
+            ),
+            (
+                "ledger_max_version_advances_past_v21",
+                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                 VALUES (22, 'future_migration', 22)",
+            ),
+            (
+                "marker_row_deleted",
+                "DELETE FROM attachment_cutover_state WHERE singleton = 1",
+            ),
+            (
+                // The schema's own compound CHECK constraint already forbids
+                // `state = 'complete' AND completed_at IS NULL` via a plain
+                // UPDATE, so this rebuilds the table without that constraint
+                // to construct the row directly -- proving the gate's own
+                // `completed_at IS NOT NULL` predicate rejects it too,
+                // independent of the CHECK constraint's own enforcement.
+                "marker_completed_at_null_while_state_complete",
+                "DROP TABLE attachment_cutover_state; \
+                 CREATE TABLE attachment_cutover_state ( \
+                     singleton    INTEGER PRIMARY KEY CHECK (singleton = 1), \
+                     state        TEXT NOT NULL CHECK (state IN ('incomplete', 'complete')), \
+                     started_at   INTEGER NOT NULL, \
+                     completed_at INTEGER \
+                 ) STRICT; \
+                 INSERT INTO attachment_cutover_state \
+                     (singleton, state, started_at, completed_at) \
+                 VALUES (1, 'complete', 21, NULL)",
+            ),
+            (
+                "insert_fence_dropped_alone",
+                "DROP TRIGGER attachments_reject_claimed_blob_insert",
+            ),
+        ];
+
+        for (case, mutation_sql) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("khive.db");
+            let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+            {
+                let mut writer = backend.pool().writer().unwrap();
+                prepare_completed_v21_gc_fixture(writer.conn_mut());
+                writer
+                    .conn_mut()
+                    .execute_batch(mutation_sql)
+                    .unwrap_or_else(|e| panic!("case {case}: failed to apply mutation: {e}"));
+            }
+
+            assert!(
+                !blob_gc_fencing_complete(backend.sql().as_ref())
+                    .await
+                    .unwrap(),
+                "case {case}: gate must reject with this fact removed"
+            );
+
+            let store = Arc::new(
+                FsBlobStore::new(dir.path().join("blobs"), 0)
+                    .unwrap()
+                    .with_orphan_sweep_grace(Duration::ZERO),
+            );
+            let orphan = store
+                .put(format!("gate matrix orphan for {case}").into_bytes())
+                .await
+                .unwrap();
+            let abandoned_ref = "c".repeat(64);
+            {
+                let writer = backend.pool().writer().unwrap();
+                writer
+                    .conn()
+                    .execute(
+                        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                         VALUES ('gate-matrix-abandoned', ?1, 1)",
+                        [abandoned_ref.as_str()],
+                    )
+                    .unwrap();
+            }
+
+            let _root_guard = store.write_lock.clone().lock_owned().await;
+            for dry_run in [true, false] {
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    store.transactional_orphan_sweep(backend.sql().as_ref(), dry_run),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("case {case}: refusal must precede the root wait"));
+                assert!(
+                    matches!(outcome, Err(StorageError::Unsupported { .. })),
+                    "case {case} dry_run={dry_run}: expected Unsupported, got {outcome:?}"
+                );
+            }
+
+            assert!(
+                store.exists(&orphan).await.unwrap(),
+                "case {case}: a refused sweep must not delete anything"
+            );
+            let remaining: i64 = backend
+                .pool()
+                .reader()
+                .unwrap()
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = 'gate-matrix-abandoned'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 1, "case {case}: refusal must not recover claims");
+        }
+    }
+
+    /// A read failure while evaluating the completed-marker/ledger predicate
+    /// (a malformed or partially-migrated `attachment_cutover_state`) must
+    /// propagate as an error, not be silently treated as "not complete" via
+    /// some default-to-false path that could theoretically be confused with
+    /// a permissive read elsewhere. The gate's three `query_scalar` calls all
+    /// use `?`, so this pins that direction rather than leaving it assumed.
+    #[tokio::test]
+    async fn completed_v21_gate_fails_closed_when_marker_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            // `ALTER TABLE ... DROP COLUMN` refuses outright here because the
+            // table's own compound CHECK constraint still references
+            // `completed_at`; rebuild the table without the column instead
+            // to get a genuine "no such column" read failure.
+            writer
+                .conn_mut()
+                .execute_batch(
+                    "DROP TABLE attachment_cutover_state; \
+                     CREATE TABLE attachment_cutover_state ( \
+                         singleton  INTEGER PRIMARY KEY CHECK (singleton = 1), \
+                         state      TEXT NOT NULL CHECK (state IN ('incomplete', 'complete')), \
+                         started_at INTEGER NOT NULL \
+                     ) STRICT; \
+                     INSERT INTO attachment_cutover_state (singleton, state, started_at) \
+                     VALUES (1, 'complete', 21)",
+                )
+                .unwrap();
+        }
+
+        let gate_error = blob_gc_fencing_complete(backend.sql().as_ref())
+            .await
+            .expect_err("a marker read error must propagate, not silently resolve to false");
+        assert!(
+            !matches!(gate_error, StorageError::Unsupported { .. }),
+            "a read error is a distinct failure from the typed epoch refusal: {gate_error:?}"
+        );
+
+        let store = Arc::new(
+            FsBlobStore::new(dir.path().join("blobs"), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let orphan = store
+            .put(b"marker read error orphan".to_vec())
+            .await
+            .unwrap();
+        let _root_guard = store.write_lock.clone().lock_owned().await;
+        for dry_run in [true, false] {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                store.transactional_orphan_sweep(backend.sql().as_ref(), dry_run),
+            )
+            .await
+            .expect("a marker read error must fail before waiting on the root lock");
+            assert!(
+                outcome.is_err(),
+                "dry_run={dry_run}: expected the sweep to fail closed, got {outcome:?}"
+            );
+        }
+        assert!(store.exists(&orphan).await.unwrap());
     }
 
     #[test]
@@ -2254,18 +2492,11 @@ mod tests {
         );
 
         // The unrelated real shard, never touched by the attack, must still
-        // sweep normally after the fix.
-        let swept = store
-            .orphan_sweep(&BlobOrphanSweepConfig {
-                live_refs: std::collections::HashSet::new(),
-                dry_run: false,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            swept.deleted, 1,
-            "the real, unsymlinked shard must still sweep"
-        );
+        // unlink normally after the fix. `orphan_sweep` is disabled in this
+        // compatibility release (it cannot prove a completed V21 epoch), so
+        // this exercises the same underlying primitive directly rather than
+        // going through that disabled API.
+        unlink_blob_shard_file_no_follow(&root, &real).unwrap();
         assert!(!store.exists(&real).await.unwrap());
     }
 
@@ -2878,50 +3109,37 @@ mod tests {
         );
     }
 
+    /// `orphan_sweep` is disabled in this compatibility release: it has no
+    /// `SqlAccess` capability with which to prove a completed V21 epoch, so
+    /// every call refuses regardless of `live_refs` contents or `dry_run`,
+    /// and nothing on disk is ever touched. This replaces the prior
+    /// `orphan_sweep_race_demonstrates_the_documented_quiescence_requirement`
+    /// regression, which pinned the now-eliminated caller-snapshot deletion
+    /// hazard this disablement closes.
     #[tokio::test]
-    async fn orphan_sweep_race_demonstrates_the_documented_quiescence_requirement() {
-        // `orphan_sweep` and `delete` are documented
-        // (`BlobStore::orphan_sweep`'s doc comment, ADR-111 §8) as
-        // offline-maintenance-only APIs that require the caller to quiesce
-        // entity writes for the duration of snapshot-plus-sweep, because
-        // `live_refs` is a snapshot with no database coordination. This test
-        // reproduces the exact hazard in code rather than leaving it as
-        // prose: a blob that becomes newly "live" AFTER the caller's
-        // `live_refs` snapshot was taken, but BEFORE the sweep runs, is
-        // deleted anyway. That is the documented boundary, not a bug in this
-        // test — it exists so a future change that silently narrows this
-        // hazard (without updating the docs) breaks a test instead of
-        // shipping a doc/behavior mismatch.
+    async fn orphan_sweep_is_disabled_in_both_modes_regardless_of_live_refs() {
         let (_dir, store) = store(0);
         let blob = store
-            .put(b"about to become live mid-sweep".to_vec())
+            .put(b"never swept by this API".to_vec())
             .await
             .unwrap();
+        let mut live_refs = std::collections::HashSet::new();
+        live_refs.insert(blob.clone());
 
-        // The caller's live_refs snapshot was taken before an entity write
-        // referencing `blob` landed (represented here by simply never adding
-        // it to the snapshot — orphan_sweep has no other way to learn about
-        // it).
-        let live_refs_snapshot = std::collections::HashSet::new();
-
-        let result = store
-            .orphan_sweep(&BlobOrphanSweepConfig {
-                live_refs: live_refs_snapshot,
-                dry_run: false,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            result.deleted, 1,
-            "the now-live blob is deleted anyway: this is the documented hazard"
-        );
-        assert!(
-            !store.exists(&blob).await.unwrap(),
-            "orphan_sweep is unsafe against a content_ref that becomes live after the \
-             snapshot was taken — callers MUST quiesce entity writes before running it \
-             (ADR-111 §8)"
-        );
+        for dry_run in [true, false] {
+            let error = store
+                .orphan_sweep(&BlobOrphanSweepConfig {
+                    live_refs: live_refs.clone(),
+                    dry_run,
+                })
+                .await
+                .expect_err("caller-snapshot orphan_sweep must be disabled");
+            assert!(
+                matches!(error, StorageError::Unsupported { .. }),
+                "expected typed Unsupported, got {error:?}"
+            );
+        }
+        assert!(store.exists(&blob).await.unwrap());
     }
 
     /// Rollout compatibility fence: the Phase-3 binary's V20 schema cannot
@@ -3081,6 +3299,154 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 1, "refusal must not recover abandoned claims");
+        assert!(store.exists(&orphan).await.unwrap());
+    }
+
+    /// Both public sweep APIs must refuse under the same non-completed
+    /// epochs, in both `dry_run` modes, without touching files or claims.
+    /// `orphan_sweep` ignores the fixture's `SqlAccess` entirely (it has no
+    /// epoch capability of its own -- that is exactly why it is disabled),
+    /// so this proves the disablement holds even when a caller has a real,
+    /// otherwise-plausible database sitting right next to it.
+    #[tokio::test]
+    async fn both_sweep_apis_refuse_v20_and_incomplete_v21_epochs_in_both_modes() {
+        for incomplete_v21 in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("khive.db");
+            let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+            {
+                let mut writer = backend.pool().writer().unwrap();
+                if incomplete_v21 {
+                    prepare_completed_v21_gc_fixture(writer.conn_mut());
+                    writer
+                        .conn_mut()
+                        .execute(
+                            "UPDATE attachment_cutover_state \
+                             SET state = 'incomplete', completed_at = NULL \
+                             WHERE singleton = 1",
+                            [],
+                        )
+                        .unwrap();
+                } else {
+                    crate::run_migrations(writer.conn_mut()).unwrap();
+                }
+            }
+
+            let store = FsBlobStore::new(dir.path().join("blobs"), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO);
+            let orphan = store
+                .put(format!("both-apis orphan (incomplete_v21={incomplete_v21})").into_bytes())
+                .await
+                .unwrap();
+
+            for dry_run in [true, false] {
+                let snapshot_error = store
+                    .orphan_sweep(&BlobOrphanSweepConfig {
+                        live_refs: std::collections::HashSet::new(),
+                        dry_run,
+                    })
+                    .await
+                    .expect_err("orphan_sweep must refuse regardless of epoch");
+                assert!(
+                    matches!(snapshot_error, StorageError::Unsupported { .. }),
+                    "incomplete_v21={incomplete_v21} dry_run={dry_run}: expected Unsupported \
+                     from orphan_sweep, got {snapshot_error:?}"
+                );
+
+                let transactional_error = store
+                    .transactional_orphan_sweep(backend.sql().as_ref(), dry_run)
+                    .await
+                    .expect_err("transactional_orphan_sweep must refuse this epoch");
+                assert!(
+                    matches!(transactional_error, StorageError::Unsupported { .. }),
+                    "incomplete_v21={incomplete_v21} dry_run={dry_run}: expected Unsupported \
+                     from transactional_orphan_sweep, got {transactional_error:?}"
+                );
+            }
+
+            assert!(
+                store.exists(&orphan).await.unwrap(),
+                "incomplete_v21={incomplete_v21}: a refused sweep must not delete anything"
+            );
+        }
+    }
+
+    /// The epoch recheck taken under database ownership must run before the
+    /// sweep ever waits on the root guard/lock, even when the epoch was
+    /// still valid at the read-only preflight and only regressed while the
+    /// call was waiting for database ownership. Without the fix this recheck
+    /// used to run after the root guard, filesystem root lock, and directory
+    /// walk -- this pins the corrected ordering with a real cross-task race
+    /// instead of trusting the comment above it.
+    #[tokio::test]
+    async fn transactional_orphan_sweep_recheck_refuses_before_root_lock_when_epoch_regresses_after_db_ownership(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+        assert!(blob_gc_fencing_complete(backend.sql().as_ref())
+            .await
+            .unwrap());
+
+        let store = Arc::new(
+            FsBlobStore::new(dir.path().join("blobs"), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let orphan = store
+            .put(b"epoch regressed after database ownership".to_vec())
+            .await
+            .unwrap();
+
+        // Hold the root guard externally. If the recheck still ran after
+        // root acquisition (the pre-fix order), the background call below
+        // would block waiting for this guard instead of refusing, and the
+        // timeout on its join would fire.
+        let _root_guard = store.write_lock.clone().lock_owned().await;
+
+        // Key the hook by the same canonicalized path `SqlAccess::database_path`
+        // returns -- not the raw `db_path` above -- since that's what the
+        // implementation looks the hook up by.
+        let canonical_db_path = backend.sql().database_path();
+        let (reached, release) = db_ownership_sync_hook::install(canonical_db_path.as_deref());
+        let sweep_store = store.clone();
+        let sweep_backend = backend.clone();
+        let handle = tokio::spawn(async move {
+            sweep_store
+                .transactional_orphan_sweep(sweep_backend.sql().as_ref(), false)
+                .await
+        });
+
+        // The hook fires only once database ownership (process-local guard
+        // plus the cross-process advisory lock) is held, strictly after the
+        // read-only preflight already observed a valid epoch.
+        assert!(
+            recv_blocking(reached).await,
+            "the sweep must reach database ownership before this test's timeout"
+        );
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute("DELETE FROM _schema_migrations WHERE version = 21", [])
+                .unwrap();
+        }
+        release.send(()).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the recheck must refuse before ever waiting on the externally held root lock")
+            .unwrap();
+        assert!(
+            matches!(outcome, Err(StorageError::Unsupported { .. })),
+            "expected the regressed epoch to be caught immediately after database ownership: \
+             {outcome:?}"
+        );
         assert!(store.exists(&orphan).await.unwrap());
     }
 
@@ -4333,23 +4699,29 @@ mod tests {
 
     #[tokio::test]
     async fn put_dedup_mtime_refresh_has_no_observable_effect_under_zero_grace_period() {
-        // The assumption the fix relies on for every `store(0)`-flavored
-        // test in this file: `within_publish_grace` with `Duration::ZERO`
-        // never protects a candidate regardless of its mtime (`age <
-        // Duration::ZERO` is always false), so refreshing the mtime on a
-        // deduplicated republish must not change zero-grace sweep behavior.
-        // Verified directly rather than assumed.
-        let (_dir, store) = store(0);
+        // The assumption the fix relies on for every zero-grace test in this
+        // file: `within_publish_grace` with `Duration::ZERO` never protects a
+        // candidate regardless of its mtime (`age < Duration::ZERO` is always
+        // false), so refreshing the mtime on a deduplicated republish must
+        // not change zero-grace sweep behavior. Verified directly rather
+        // than assumed.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+        let store = FsBlobStore::new(dir.path().join("blobs"), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::ZERO);
         let bytes = b"zero grace dedup refresh".to_vec();
         let first = store.put(bytes.clone()).await.unwrap();
         let second = store.put(bytes.clone()).await.unwrap();
         assert_eq!(first, second);
 
         let result = store
-            .orphan_sweep(&BlobOrphanSweepConfig {
-                live_refs: std::collections::HashSet::new(),
-                dry_run: false,
-            })
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
             .await
             .unwrap();
         assert_eq!(
@@ -4403,58 +4775,6 @@ mod tests {
         );
         assert_eq!(result.grace_period_skipped, 0);
         assert!(!store.exists(&orphan).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn orphan_sweep_dry_run_reports_without_deleting() {
-        let (_dir, store) = store(0);
-        let live = store.put(b"keep me".to_vec()).await.unwrap();
-        let orphan = store.put(b"orphaned".to_vec()).await.unwrap();
-
-        let mut live_refs = std::collections::HashSet::new();
-        live_refs.insert(live.clone());
-        let result = store
-            .orphan_sweep(&BlobOrphanSweepConfig {
-                live_refs,
-                dry_run: true,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.scanned, 2);
-        assert_eq!(result.would_delete, 1);
-        assert_eq!(result.deleted, 0);
-        assert!(
-            store.exists(&orphan).await.unwrap(),
-            "dry run must not delete"
-        );
-        assert!(store.exists(&live).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn orphan_sweep_real_run_deletes_only_unreferenced_blobs() {
-        let (_dir, store) = store(0);
-        let live = store.put(b"keep me".to_vec()).await.unwrap();
-        let orphan = store.put(b"orphaned".to_vec()).await.unwrap();
-
-        let mut live_refs = std::collections::HashSet::new();
-        live_refs.insert(live.clone());
-        let result = store
-            .orphan_sweep(&BlobOrphanSweepConfig {
-                live_refs,
-                dry_run: false,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.scanned, 2);
-        assert_eq!(result.would_delete, 1);
-        assert_eq!(result.deleted, 1);
-        assert!(!store.exists(&orphan).await.unwrap());
-        assert!(
-            store.exists(&live).await.unwrap(),
-            "live blob must survive sweep"
-        );
     }
 
     #[test]

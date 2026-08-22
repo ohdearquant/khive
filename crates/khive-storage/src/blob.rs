@@ -212,16 +212,22 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// `dry_run` mode, report) those absent from `config.live_refs`.
     /// Operator-side GC path (khive#292 deliverable 5) — admin-only, not an
     /// MCP verb. Default returns `StorageError::Unsupported`; the filesystem
-    /// backend overrides it with a real directory walk.
+    /// backend currently returns the same typed refusal for every call (see
+    /// below) rather than performing a real directory walk.
     ///
     /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
     /// `config.live_refs` is a **snapshot**; a `content_ref` that becomes
-    /// newly live between the snapshot and the sweep is deleted anyway.
-    /// **Callers MUST quiesce reference writes** for the duration of
+    /// newly live between the snapshot and the sweep would be deleted
+    /// anyway. **Callers MUST quiesce reference writes** for the duration of
     /// snapshot-plus-sweep. See `crates/khive-storage/docs/api/blob-store.md`
-    /// for the race repro. Concurrent callers must use
-    /// [`Self::transactional_orphan_sweep`] instead.
+    /// for the hazard. This API also has no [`SqlAccess`] capability with
+    /// which to prove a completed V21 attachment epoch, so — unlike
+    /// [`Self::transactional_orphan_sweep`] — it cannot honor that gate. The
+    /// filesystem backend therefore disables this method entirely in this
+    /// compatibility release, in both `dry_run` modes: concurrent AND
+    /// offline callers alike must use [`Self::transactional_orphan_sweep`]
+    /// instead.
     async fn orphan_sweep(
         &self,
         config: &BlobOrphanSweepConfig,
