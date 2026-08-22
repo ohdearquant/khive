@@ -82,6 +82,11 @@
 # Keep "json" if anything parses khive's output.
 # default_output_format = "json"
 
+# Aggregate admission budget for resident, digest-verified whole-blob buffers
+# (ADR-160). Default: 268435456 (256 MiB). Values below 67108864 (64 MiB)
+# are rejected because every valid portable blob request must be reservable.
+# blob_hydration_bytes = 268435456
+
 # ── [gate] — reserved authorization surface ───────────────────────────────────────
 #
 # Do not add a live [gate] table. The accepted design uses store-held caller grants

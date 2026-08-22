@@ -434,7 +434,8 @@ impl DispatchFailure {
 /// Two servers produce the same id iff they can safely share one warm engine:
 /// same pack set (order-independent), same storage target and effective access
 /// mode, same embedders, same backend topology/routing, and same
-/// construction-baked fresh-tail, outbound, and git-write policies.
+/// construction-baked fresh-tail, blob-hydration, outbound, and git-write
+/// policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects
@@ -590,12 +591,13 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         format!("{:?}", config.backend_id)
     };
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};backend={};outbound=[{}];git_write={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={}",
         packs.join(","),
         db,
         primary,
         extra.join(","),
         ann_fresh_tail_enabled,
+        config.blob_hydration_bytes,
         backend,
         outbound.join(","),
         git_write,
@@ -4023,6 +4025,43 @@ mod tests {
             compute_config_id_with_ann_fresh_tail(&config, None, true),
             compute_config_id_with_ann_fresh_tail(&config, None, false),
             "opposite fresh-tail policies must not share one warm daemon"
+        );
+    }
+
+    #[test]
+    fn config_id_treats_absent_and_explicit_default_blob_hydration_budget_as_equivalent() {
+        use khive_runtime::engine_config::RuntimeSectionConfig;
+        use khive_runtime::{runtime_config_from_khive_config, KhiveConfig};
+
+        let base = RuntimeConfig::no_embeddings();
+        let absent = runtime_config_from_khive_config(&KhiveConfig::default(), base.clone());
+        let explicit = runtime_config_from_khive_config(
+            &KhiveConfig {
+                runtime: RuntimeSectionConfig {
+                    blob_hydration_bytes: Some(base.blob_hydration_bytes),
+                    ..RuntimeSectionConfig::default()
+                },
+                ..KhiveConfig::default()
+            },
+            base,
+        );
+
+        assert_eq!(
+            compute_config_id_with_ann_fresh_tail(&absent, None, true),
+            compute_config_id_with_ann_fresh_tail(&explicit, None, true)
+        );
+    }
+
+    #[test]
+    fn config_id_differs_when_resolved_blob_hydration_budget_differs() {
+        let config = RuntimeConfig::no_embeddings();
+        let mut changed = config.clone();
+        changed.blob_hydration_bytes /= 2;
+
+        assert_ne!(
+            compute_config_id_with_ann_fresh_tail(&config, None, true),
+            compute_config_id_with_ann_fresh_tail(&changed, None, true),
+            "different resident-blob admission budgets must not share one warm daemon"
         );
     }
 

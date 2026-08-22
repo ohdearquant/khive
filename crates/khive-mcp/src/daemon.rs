@@ -213,6 +213,7 @@ struct ConfigIdFields<'a> {
     embed: &'a str,
     extra: &'a str,
     fresh_tail: &'a str,
+    blob_hydration_bytes: &'a str,
     backend: &'a str,
     outbound: &'a str,
     git_write: &'a str,
@@ -236,6 +237,12 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
     let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
     let outbound = outbound.strip_suffix(']')?;
     let (rest, backend) = rest.rsplit_once(";backend=")?;
+    // Parse pre-ADR-160 fingerprints too so an incumbent from the preceding
+    // release reports the newly construction-baked budget as the mismatch,
+    // rather than degrading an otherwise recognizable identity to `unknown`.
+    let (rest, blob_hydration_bytes) = rest
+        .rsplit_once(";blob_hydration_bytes=")
+        .unwrap_or((rest, "<legacy-absent>"));
     let (rest, fresh_tail) = rest.rsplit_once(";fresh_tail=")?;
     let (rest, extra) = rest.rsplit_once(";extra=[")?;
     let extra = extra.strip_suffix(']')?;
@@ -247,6 +254,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         embed,
         extra,
         fresh_tail,
+        blob_hydration_bytes,
         backend,
         outbound,
         git_write,
@@ -273,6 +281,8 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "extra"
     } else if client.fresh_tail != daemon.fresh_tail {
         "fresh_tail"
+    } else if client.blob_hydration_bytes != daemon.blob_hydration_bytes {
+        "blob_hydration_bytes"
     } else if client.backend != daemon.backend {
         "backend"
     } else if client.outbound != daemon.outbound {
@@ -2733,9 +2743,9 @@ mod tests {
     #[test]
     fn first_config_mismatch_field_follows_fingerprint_order() {
         let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];fresh_tail=true;\
-                      backend=main;outbound=[];git_write=client-policy";
+                      blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=client-policy";
         let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];fresh_tail=true;\
-                      backend=main;outbound=[];git_write=daemon-policy";
+                      blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=daemon-policy";
 
         assert_eq!(first_config_mismatch_field(client, Some(daemon)), "packs");
     }
@@ -2749,6 +2759,33 @@ mod tests {
         assert_eq!(
             first_config_mismatch_field(&enabled, Some(&disabled)),
             "fresh_tail"
+        );
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_blob_hydration_budget_from_computed_ids() {
+        let config = RuntimeConfig::no_embeddings();
+        let mut changed = config.clone();
+        changed.blob_hydration_bytes /= 2;
+        let client = crate::server::compute_config_id_with_ann_fresh_tail(&config, None, true);
+        let daemon = crate::server::compute_config_id_with_ann_fresh_tail(&changed, None, true);
+
+        assert_eq!(
+            first_config_mismatch_field(&client, Some(&daemon)),
+            "blob_hydration_bytes"
+        );
+    }
+
+    #[test]
+    fn legacy_config_id_reports_the_new_blob_budget_as_its_first_mismatch() {
+        let legacy = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;\
+                      backend=main;outbound=[];git_write=policy";
+        let current = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;\
+                       blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=policy";
+
+        assert_eq!(
+            first_config_mismatch_field(current, Some(legacy)),
+            "blob_hydration_bytes"
         );
     }
 
@@ -2768,8 +2805,8 @@ mod tests {
 
     #[test]
     fn first_config_mismatch_field_names_backend_topology_without_values() {
-        let base = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;backend=main;\
-                    outbound=[];git_write=policy";
+        let base = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;\
+                    blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=policy";
         let client =
             format!("{base};backends=[main:Sqlite:/private/client.db];pack_backends=[kg=main]");
         let daemon =
@@ -2802,10 +2839,10 @@ mod tests {
         reset_fallback_counters();
         let client =
             "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];fresh_tail=true;\
-                      backend=main;outbound=[];git_write=same-policy";
+                      blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=same-policy";
         let daemon =
             "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];fresh_tail=true;\
-                      backend=main;outbound=[];git_write=same-policy";
+                      blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=same-policy";
         let response = DaemonResponseFrame {
             ok: false,
             result: None,

@@ -75,7 +75,8 @@ async fn entity_create_with_content_ref_roundtrip() {
     let blob_store = std::sync::Arc::new(
         khive_db::stores::blob::FsBlobStore::new(temp.path().to_path_buf(), 0).unwrap(),
     );
-    rt.install_blob_store(blob_store.clone());
+    rt.install_blob_store(blob_store.clone())
+        .expect("install blob store");
     let content_ref = blob_store.put(b"asset bytes".to_vec()).await.unwrap();
 
     let entity = rt
@@ -103,7 +104,8 @@ async fn entity_create_with_content_ref_rejects_unpublished_blob() {
     let temp = tempfile::tempdir().unwrap();
     rt.install_blob_store(std::sync::Arc::new(
         khive_db::stores::blob::FsBlobStore::new(temp.path().to_path_buf(), 0).unwrap(),
-    ));
+    ))
+    .expect("install blob store");
     let missing = ContentRef::from_digest_bytes(&[7; 32]);
 
     let error = rt
@@ -1928,6 +1930,7 @@ async fn file_backed_runtime_persists() {
         let config = RuntimeConfig {
             git_write: Default::default(),
             db_path: Some(path.clone()),
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
@@ -1951,6 +1954,7 @@ async fn file_backed_runtime_persists() {
         let config = RuntimeConfig {
             git_write: Default::default(),
             db_path: Some(path.clone()),
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
@@ -2572,6 +2576,7 @@ mod embedder_registry_tests {
         KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -2724,6 +2729,7 @@ mod embedder_registry_tests {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],

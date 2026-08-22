@@ -3530,6 +3530,7 @@ fn build_crossns_registry(
     let config = RuntimeConfig {
         git_write: Default::default(),
         db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::parse(dispatch_ns).unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
@@ -4469,6 +4470,7 @@ fn build_actor_registry(
     let config = RuntimeConfig {
         git_write: Default::default(),
         db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
         embedding_model: None,
         additional_embedding_models: vec![],
@@ -4760,6 +4762,7 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
     let config = RuntimeConfig {
         git_write: Default::default(),
         db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
         embedding_model: None,
         additional_embedding_models: vec![],
@@ -4874,6 +4877,7 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
     let config_anon = RuntimeConfig {
         git_write: Default::default(),
         db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
         embedding_model: None,
         additional_embedding_models: vec![],

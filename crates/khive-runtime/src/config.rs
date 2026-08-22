@@ -253,6 +253,13 @@ pub struct RuntimeConfig {
     /// Defaults to the shipped production set returned by
     /// [`RuntimeConfig::built_in_packs`].
     pub packs: Vec<String>,
+    /// Resolved aggregate admission budget for resident digest-verified blob
+    /// buffers (ADR-160 D3), in raw bytes.
+    ///
+    /// `[runtime].blob_hydration_bytes` may raise or lower the built-in 256 MiB
+    /// value, but config validation guarantees enough room for one maximum-size
+    /// whole-blob read.
+    pub blob_hydration_bytes: u64,
     /// Identifies this runtime's backend in a multi-backend deployment.
     ///
     /// Set by the boot path when constructing per-pack runtimes from `khive.toml`.
@@ -365,6 +372,7 @@ impl Default for RuntimeConfig {
             additional_embedding_models,
             gate: Arc::new(AllowAllGate),
             packs,
+            blob_hydration_bytes: crate::blob::DEFAULT_BLOB_HYDRATION_BYTES,
             backend_id: BackendId::main(),
             brain_profile,
             visible_namespaces: vec![],
@@ -703,6 +711,10 @@ pub fn runtime_config_from_khive_config(
         .or_else(|| base.actor_id.clone());
 
     let git_write = khive_cfg.git_write.clone();
+    let blob_hydration_bytes = khive_cfg
+        .runtime
+        .blob_hydration_bytes
+        .unwrap_or(base.blob_hydration_bytes);
 
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
@@ -712,6 +724,7 @@ pub fn runtime_config_from_khive_config(
             allowed_outbound_namespaces,
             actor_id,
             git_write,
+            blob_hydration_bytes,
             ..base
         };
     }
@@ -747,6 +760,7 @@ pub fn runtime_config_from_khive_config(
         allowed_outbound_namespaces,
         actor_id,
         git_write,
+        blob_hydration_bytes,
         ..base
     }
 }
@@ -957,6 +971,14 @@ mod no_embeddings_tests {
         assert!(
             configured_embedding_models(&config).is_empty(),
             "no_embeddings() must yield zero configured embedders"
+        );
+    }
+
+    #[test]
+    fn blob_hydration_default_is_four_portable_whole_objects() {
+        assert_eq!(
+            RuntimeConfig::default().blob_hydration_bytes,
+            4 * khive_storage::MAX_BLOB_WHOLE_BYTES
         );
     }
 
