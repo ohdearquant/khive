@@ -218,9 +218,11 @@ dispositions, each of which must be written down per edge:
 
 - **PRESERVE** — the resulting triple is legal, and an id-preserving endpoint move (ADR-113's
   `move_edge_endpoint`) is available in the running system and collision-free for this edge. The
-  edge keeps its id while exactly one endpoint moves: for an incident edge, the migrating-record
-  endpoint moves onto the new record; for a closure member, the target moves to its annotated
-  subject's mapped replacement — a closure member is never moved onto the new record. A closure
+  edge keeps its id while the endpoint fields referencing the moved subject are updated (the
+  primitive takes one or both fields): for an incident edge, every endpoint field referencing the
+  migrating record moves onto the new record — one field ordinarily, both for a self-loop; for a
+  closure member, the target moves to its annotated subject's mapped replacement — a closure
+  member is never moved onto the new record. A closure
   member whose subject is itself preserved needs no move at all: its target id is still valid.
   Because the id survives, every annotation targeting a PRESERVEd edge stays valid with no
   re-anchoring. Preferred over RECREATE wherever it qualifies. It exempts nothing: the edge still
@@ -374,7 +376,9 @@ this ADR is complete when all of the following hold:
   in the same transaction, the same count Decision 3 step 1 names. All six rows receive dispositions
   before any plan is prepared, because the purge would delete all six. A migration
   prepared from the four-row visible/live enumeration must be refused, and the refusal is
-  the asserted outcome, not a warning.
+  the asserted outcome, not a warning. When e3's disposition is PRESERVE, the asserted
+  outcome is that both of its endpoint fields reference the new record and its edge id is
+  unchanged — a self-loop preserved by updating one field is a defect the fixture must catch.
 - Edge-as-endpoint coverage: the fixture includes an `annotates` edge whose TARGET is itself an
   edge incident to the migrating record, and a second-level chain — a note whose `annotates`
   edge targets that first `annotates` edge. The closure enumeration finds both levels, and
