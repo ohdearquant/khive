@@ -128,10 +128,16 @@ function normalizeRepositoryUrlImpl(
   // not itself canonical). Re-normalizing the canonical value and requiring
   // an identical result is what actually proves closure, on every input,
   // not just the ones exercised by a test.
+  // This branch gets its own reason: an input reaching here has valid encoding
+  // (it survived both checks above) and is simply not stable under this
+  // normalizer, so reporting an encoding error would misdiagnose it.
   if (verifyFixedPoint) {
     const reNormalized = normalizeRepositoryUrlImpl(value, false);
     if (!reNormalized.ok || reNormalized.value !== value) {
-      return { ok: false, reason: "The repository URL contains invalid path encoding." };
+      return {
+        ok: false,
+        reason: "The repository URL cannot be normalized to a stable canonical URL.",
+      };
     }
   }
 

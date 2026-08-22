@@ -110,8 +110,15 @@ describe("showcase registry", () => {
     // ".../owner/repo.git", and normalizing that again strips again to
     // ".../owner/repo". The runtime fixed-point check catches that and
     // refuses the input outright, rather than accepting a non-canonical value.
+    // The reason is asserted, not just the refusal: this input's encoding is
+    // valid, so it must NOT report an encoding error. Without pinning the
+    // string, the message could revert to the shared encoding reason and no
+    // test would notice.
     const result = normalizeRepositoryUrl("https://forge.example/owner/repo.git.git");
-    expect(result.ok).toBe(false);
+    expect(result).toEqual({
+      ok: false,
+      reason: "The repository URL cannot be normalized to a stable canonical URL.",
+    });
   });
 
   it("is a fixed point for every value produced by the curated-alias fixtures", () => {
