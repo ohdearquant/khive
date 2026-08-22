@@ -278,16 +278,16 @@ off the record itself, so the classification stays revisitable instead of silent
 
 ### Signal table
 
-| Kind         | Strong positive signals                                               | Do NOT use when                                              |
-| ------------ | --------------------------------------------------------------------- | ------------------------------------------------------------ |
-| **Concept**  | abstract idea, method, theory, algorithm, architecture, gap, metric   | concrete document, dataset, codebase, service, or gen. state |
-| **Document** | title, authors, DOI, arXiv, publication venue, spec, report           | generated state or raw dataset                               |
-| **Dataset**  | examples, records, benchmark, corpus, train/eval/test split           | vectorized/generated index or checkpoint                     |
-| **Project**  | repo, package, crate, library, framework, source code, language       | running endpoint or deployed instance                        |
-| **Artifact** | generated, checkpointed, exported, content-addressed, version lineage | curated example collection or authored document              |
-| **Service**  | endpoint, health, latency, deployment, live process, backend          | source code project or static artifact                       |
-| **Person**   | individual human                                                      | author role without standalone entity                        |
-| **Org**      | lab, company, university, institution, consortium                     | project team used only as metadata                           |
+| Kind         | Strong positive signals                                                                 | Do NOT use when                                                        |
+| ------------ | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **Concept**  | abstract idea, method, theory, algorithm, architecture, gap, metric                     | concrete document, dataset, codebase, service, or gen. state           |
+| **Document** | title, authors, DOI, arXiv, publication venue, spec, report                             | generated state or raw dataset                                         |
+| **Dataset**  | examples, records, benchmark, corpus, train/eval/test split                             | vectorized/generated index or checkpoint                               |
+| **Project**  | repo, package, crate, library, framework, source code, language                         | running endpoint or deployed instance                                  |
+| **Artifact** | generated, checkpointed, exported, content-addressed, version lineage                   | curated example collection or authored document                        |
+| **Service**  | named endpoint/address; named host/region/cluster/operator; health/status in properties | source code project or static artifact; bare deployment/liveness words |
+| **Person**   | individual human                                                                        | author role without standalone entity                                  |
+| **Org**      | lab, company, university, institution, consortium                                       | project team used only as metadata                                     |
 
 ### Key distinctions
 

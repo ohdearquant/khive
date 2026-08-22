@@ -122,14 +122,12 @@ amendment replaces step 5's condition with a sub-procedure over two predicates, 
 from the record being written (its name, description, `entity_type`, and properties), with no
 reference to the writer's state of mind or to the world at write time:
 
-- **Instance evidence (D)**: the record names at least one instance identifier — an endpoint or
-  address, a named deployment surface, a named operator, or an operational state or state
-  history carried in the record's property fields. Bare deployment or liveness vocabulary in
-  name or description prose (`deployed`, `running`, `in production`) with no concrete referent
-  beside it is not an instance identifier and does not satisfy D. Liveness at write time is
-  not consulted, so a deployable system between deployments still satisfies D. Codebase
-  identifiers (repository, package, crate, source language) are explicitly step 6 evidence,
-  not instance identifiers.
+- **Instance evidence (D)**: defined normatively in ADR-001 §"Service/concept tie-break" — the
+  record names at least one concrete instance identifier stated in the record. ADR-001's
+  statement (including its specific host/region/cluster qualification of deployment surfaces,
+  the property-field requirement for operational state, and the exclusion of bare
+  deployment/liveness vocabulary) is the single normative text; this ADR deliberately does not
+  restate it, so the two documents cannot diverge.
 - **Technique identity (T)**, evaluated only when D holds: the record's own text names a
   technique as its referent — its `entity_type` is one of `Concept`'s canonical subtypes, or
   its name or description names the referent with one of ADR-001 step 8's own designators
