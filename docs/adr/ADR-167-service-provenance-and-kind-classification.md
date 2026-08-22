@@ -237,12 +237,22 @@ With those settled, a kind correction:
    caller-facing cursor walk (`list_edges_after`) may be used for planning reads, but the
    destructive plan is prepared only from the in-transaction enumeration. Offset paging is
    out of contract in any role, in either direction.
-2. Enumerates the second-order rows under the same completeness contract: the `annotates`
-   edges whose TARGET is one of the enumerated incident edges, and the notes those edges
-   anchor — again by direct in-transaction query over the enumerated edge IDs, with no
-   visibility or live-row filter. A recreated edge is a new edge id, so an edge-targeting
-   annotation is orphaned by recreation even when the record's own annotations were handled
-   correctly. Each gets the same re-anchor-or-delete disposition as step 3.
+2. Enumerates the annotation closure under the same completeness contract: starting from the
+   enumerated incident edges, repeatedly collects the `annotates` edges whose TARGET is any
+   edge already in the set, together with the notes those edges anchor, until a pass adds
+   nothing — a fixed-point walk over edge IDs with a visited set. The fixed point is
+   required because the runtime places no kind restriction on an edge target of `annotates`
+   (ADR-002 rule 1: the target may be an entity, a note, or any edge), so a note may
+   annotate an `annotates` edge and chains of edge-targeting annotations are constructible;
+   creation order alone would keep those chains acyclic, but an endpoint move can re-point
+   an edge after creation and nothing in the contract rules a cycle out, so termination
+   comes from the visited set, never from assumed acyclicity. One level is not enough: a note annotating an edge that itself
+   annotates an incident edge is deleted or left dangling by any plan that stops at the
+   first level. All queries are direct in-transaction reads over the enumerated edge IDs,
+   with no visibility or live-row filter. A recreated edge is a new edge id, so an
+   edge-targeting annotation is orphaned by recreation even when the record's own
+   annotations were handled correctly. Every edge and note in the closure gets the same
+   re-anchor-or-delete disposition as step 3.
 3. Classifies every enumerated edge as RECREATE, RE-EXPRESS or REFUSE against the endpoint matrix, and
    names for each `annotates` edge whether the annotating note is re-anchored to the new record or
    deleted with it. A note left pointing at a deleted subject is not an acceptable outcome. **Any
@@ -251,6 +261,14 @@ With those settled, a kind correction:
    edge. A recreated edge is a new edge id, so anything that referenced the old id does not follow and
    must be re-pointed in the same plan.
 5. Records the old record's id in the new record's properties, so the discontinuity is traceable.
+
+Relation to ADR-113: ADR-113's `move_edge_endpoint` primitive preserves an edge id when a merge
+or split moves an endpoint between records, and with it the edge's annotations. A kind migration
+cannot use it for the migrating record's own incident edges — the record id itself is re-minted,
+so those edges are deleted and recreated, and the annotation closure above is what keeps their
+annotations from dangling. Where a specific edge qualifies for an id-preserving endpoint move
+under ADR-113's own rules, that disposition is preferred for that edge, since a preserved id
+needs no re-anchoring.
 
 If kind changes later become common enough that this procedure is being run routinely, that is the
 evidence that would justify the mechanism, and the count of times it has been run is what should
@@ -336,9 +354,12 @@ this ADR is complete when all of the following hold:
   prepared from the four-row visible/live enumeration must be refused, and the refusal is
   the asserted outcome, not a warning.
 - Edge-as-endpoint coverage: the fixture includes an `annotates` edge whose TARGET is itself an
-  edge incident to the migrating record; the enumeration finds it, and after migration the
-  annotation is re-anchored to the recreated edge's new id (or deleted with a recorded
-  disposition) — never left pointing at a purged edge id.
+  edge incident to the migrating record, and a second-level chain — a note whose `annotates`
+  edge targets that first `annotates` edge. The closure enumeration finds both levels, and
+  after migration each annotation is re-anchored to the recreated edge's new id (or deleted
+  with a recorded disposition) — never left pointing at a purged edge id. A migration
+  prepared from a one-level enumeration must be refused, for the same reason the four-row
+  visible/live enumeration above is refused.
 - Disposition gate: a fixture edge with no legal expression under the new kind (for example
   `Org contains <record>` migrating to `concept`) causes the migration to stop with a REFUSE
   before any plan is prepared; no row in the store changes.
