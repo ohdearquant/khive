@@ -522,7 +522,13 @@ async fn get_nonexistent_id_returns_not_found() {
 #[tokio::test]
 async fn get_prefix_resolver_storage_failure_is_not_reported_as_not_found() {
     let pack = pack();
-    let prefix = "deadbeef";
+    // The fault arm is process-wide and fires once, while tests in this binary run
+    // concurrently — so this prefix must appear in no other test, or whichever test
+    // resolves it first consumes the arm and both tests become nondeterministic.
+    // `deadbeef` is unusable here for exactly that reason: it occurs 43 times across
+    // `crates/`, including a `get` that expects a clean miss. Keep this value unique;
+    // check with `rg <prefix> crates/` before changing it.
+    let prefix = "fa17bad0";
     let _arm = arm_prefix_resolve_fail_scoped(prefix);
 
     let err = pack
@@ -533,6 +539,44 @@ async fn get_prefix_resolver_storage_failure_is_not_reported_as_not_found() {
         matches!(err, RuntimeError::Storage(_)),
         "a storage failure during id resolution must surface as Storage, not be swallowed \
          into a false not-found; got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_ambiguous_name_reports_the_collision_not_a_false_not_found() {
+    let pack = pack();
+    // Duplicate names are permitted by the store (no unique constraint), so this makes
+    // name resolution genuinely ambiguous.
+    for _ in 0..2 {
+        pack.dispatch(
+            "create",
+            json!({"kind": "entity", "name": "GetAmbiguousFixture", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create must succeed");
+    }
+
+    let err = pack
+        .dispatch("get", json!({"id": "GetAmbiguousFixture"}))
+        .await
+        .unwrap_err();
+
+    // No fallback arm can resolve an ambiguity an earlier arm reported: `dispatch.rs`
+    // binds `graph_token = token`, so arms one and two issue the identical query, and
+    // arm three only widens the search to soft-deleted records, which can add candidates
+    // but never remove the ones causing the collision. Swallowing this as absence would
+    // tell the caller the record does not exist when in fact two of them do.
+    assert!(
+        matches!(err, RuntimeError::Ambiguous(_)),
+        "an ambiguous name must report the collision, not a false not-found; got: {err:?}"
+    );
+    let msg = match &err {
+        RuntimeError::Ambiguous(m) => m.as_str(),
+        _ => unreachable!(),
+    };
+    assert!(
+        msg.contains("GetAmbiguousFixture"),
+        "error must name the ambiguous entity: {msg}"
     );
 }
 

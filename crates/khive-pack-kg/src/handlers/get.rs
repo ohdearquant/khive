@@ -400,28 +400,26 @@ impl KgPack {
 /// `resolve_name_async` (in `common.rs`) constructs only `Storage`/`NotFound`/`Ambiguous`,
 /// and the only `InvalidInput` the prefix-resolution path can construct is a prefix-miss —
 /// so this list is exhaustive for "no id, keep trying" today. Any other variant
-/// (`Storage`, `Sqlite`, `Internal`, `AmbiguousPrefix`, …) is a failure and propagates.
+/// (`Storage`, `Sqlite`, `Internal`, `Ambiguous`, `AmbiguousPrefix`, …) is a failure and
+/// propagates.
 ///
-/// `Ambiguous` and `AmbiguousPrefix` land in opposite buckets on purpose, which is worth
-/// stating because it reads as an inconsistency otherwise. Name resolution is scoped to the
-/// caller's namespace token, so an ambiguous name really can resolve uniquely on a later arm
-/// carrying a different token — falling through is the behaviour that finds it. Prefix
-/// resolution is namespace-agnostic (`resolve_prefix_unfiltered` passes no namespace
-/// predicate), so every arm issues the identical prefix query and no later arm can do
-/// better; falling through there cannot find anything and only converts a real, reportable
-/// collision into a misleading not-found.
+/// Both ambiguity variants are failures, for the same reason: no later arm can resolve an
+/// ambiguity an earlier arm reported. `dispatch.rs` binds `graph_token = token`, so arms one
+/// and two issue the identical query, and arm three only widens the search to soft-deleted
+/// records — widening can add candidates but never remove the ones that made the name
+/// ambiguous. Falling through therefore cannot find anything; it only converts a real,
+/// reportable collision into a misleading not-found. Prefix resolution reaches the same
+/// place by a different route: `resolve_prefix_unfiltered` passes no namespace predicate at
+/// all, so it is namespace-agnostic by construction.
 fn is_resolution_absence(err: &RuntimeError) -> bool {
     matches!(
         err,
-        RuntimeError::NotFound(_) | RuntimeError::InvalidInput(_) | RuntimeError::Ambiguous(_)
+        RuntimeError::NotFound(_) | RuntimeError::InvalidInput(_)
     )
 }
 
 /// Run `get`'s three-arm id-resolution fallback chain, distinguishing "every arm reported
-/// absence" (`Ok(None)`) from "an arm could not perform its lookup" (`Err`). `Ambiguous`
-/// stays in the absence bucket deliberately: the first two arms differ only in namespace
-/// token, and a name ambiguous in the graph namespace may still resolve uniquely in the
-/// local one — treating it as a failure would regress that cross-namespace disambiguation.
+/// absence" (`Ok(None)`) from "an arm could not perform its lookup" (`Err`).
 async fn resolve_id_through_arms(
     raw_id: &str,
     runtime: &KhiveRuntime,
