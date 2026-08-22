@@ -401,6 +401,15 @@ impl KgPack {
 /// and the only `InvalidInput` the prefix-resolution path can construct is a prefix-miss —
 /// so this list is exhaustive for "no id, keep trying" today. Any other variant
 /// (`Storage`, `Sqlite`, `Internal`, `AmbiguousPrefix`, …) is a failure and propagates.
+///
+/// `Ambiguous` and `AmbiguousPrefix` land in opposite buckets on purpose, which is worth
+/// stating because it reads as an inconsistency otherwise. Name resolution is scoped to the
+/// caller's namespace token, so an ambiguous name really can resolve uniquely on a later arm
+/// carrying a different token — falling through is the behaviour that finds it. Prefix
+/// resolution is namespace-agnostic (`resolve_prefix_unfiltered` passes no namespace
+/// predicate), so every arm issues the identical prefix query and no later arm can do
+/// better; falling through there cannot find anything and only converts a real, reportable
+/// collision into a misleading not-found.
 fn is_resolution_absence(err: &RuntimeError) -> bool {
     matches!(
         err,
