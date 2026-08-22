@@ -4,10 +4,12 @@ import type { ViewId } from "@/lib/repo-bundle";
 import {
   investigationShareUrl,
   parseRepositoryLocation,
+  publicRepositoryUrlIssue,
   REPOSITORY_VIEW_IDS,
   type RepositoryLocation,
   repositoryLocationUrl,
 } from "@/lib/repository-location";
+import { normalizeRepositoryUrl } from "@/lib/showcase-registry";
 
 const repository = "https://github.com/ohdearquant/khive";
 const snapshotSha = "0123456789abcdef0123456789abcdef01234567";
@@ -77,7 +79,7 @@ describe("repository investigation location", () => {
     ["query string", `${repository}?tab=readme`],
     ["fragment", `${repository}#readme`],
   ])(
-    "accepts a curated repository URL carrying a %s",
+    "accepts a curated repository URL carrying a %s, parsed to its canonical form",
     (_name, repositoryWithExtras) => {
       const parsed = parseRepositoryLocation(
         new URL(
@@ -86,9 +88,19 @@ describe("repository investigation location", () => {
       );
 
       expect(parsed.issues).toEqual([]);
-      expect(parsed.location.repository).toBe(repositoryWithExtras);
+      expect(parsed.location.repository).toBe(repository);
     },
   );
+
+  it("accepts a deep link whose discarded query is long but whose canonical form is short", () => {
+    const longQuery = `${repository}?${"q".repeat(3000)}`;
+    const parsed = parseRepositoryLocation(
+      new URL(`https://example.test/?repo=${encodeURIComponent(longQuery)}`),
+    );
+
+    expect(parsed.issues).toEqual([]);
+    expect(parsed.location.repository).toBe(repository);
+  });
 
   it("canonicalizes to only the closed location parameters in stable order, dropping every other query parameter", () => {
     const url = repositoryLocationUrl(
@@ -343,6 +355,30 @@ describe("repository investigation location", () => {
     expect(written.searchParams.has("repo")).toBe(false);
     expect(read.location.repository).toBeNull();
     expect(read.issues.map((issue) => issue.parameter)).toContain("repo");
+  });
+
+  it("share link omits a value whose canonical form crosses the limit the input does not", () => {
+    // Canonicalization rewrites http to https, so this input is within the
+    // limit while the value every consumer would store is one character over.
+    const input = `http://example.com/a/${"r".repeat(2027)}`;
+    expect(input.length).toBe(2048);
+    expect(normalizeRepositoryUrl(input).ok).toBe(false);
+
+    const url = investigationShareUrl(new URL("https://example.test/app"), {
+      repository: input,
+      snapshotSha: null,
+      modulePath: null,
+      view: null,
+    });
+
+    expect(url.searchParams.has("repo")).toBe(false);
+  });
+
+  it("bundle validator refuses a value whose canonical form crosses the limit", () => {
+    const input = `http://example.com/a/${"r".repeat(2027)}`;
+
+    expect(publicRepositoryUrlIssue(input)).toBe("The repository URL is too long.");
+    expect(publicRepositoryUrlIssue(repository)).toBeNull();
   });
 
   it("still round-trips a valid repository URL to its canonical form", () => {

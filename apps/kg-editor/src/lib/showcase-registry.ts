@@ -28,6 +28,7 @@ export const SHOWCASE_REGISTRY: readonly ShowcaseRegistryEntry[] = [
 ] as const;
 
 export const REPOSITORY_URL_LIMIT = 2_048;
+export const REPOSITORY_URL_TOO_LONG = "The repository URL is too long.";
 
 export function normalizeRepositoryUrl(input: string):
   | Readonly<{ ok: true; value: string }>
@@ -86,7 +87,7 @@ export function normalizeRepositoryUrl(input: string):
   // apply this same limit, so the writer can no longer store a value the
   // reader would refuse.
   if (value.length > REPOSITORY_URL_LIMIT) {
-    return { ok: false, reason: "The repository URL is too long." };
+    return { ok: false, reason: REPOSITORY_URL_TOO_LONG };
   }
   return { ok: true, value };
 }
