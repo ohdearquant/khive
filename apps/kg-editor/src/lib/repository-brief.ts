@@ -132,6 +132,8 @@ export interface ModuleInsight {
 
 const RECENT_COMMIT_LIMIT = 12;
 const OWNERSHIP_MINIMUM_COMMITS = 5;
+const PAGE_CONTINUATION_REASON =
+  "Additional items are available beyond this page.";
 
 function compareText(left: string, right: string): number {
   if (left < right) return -1;
@@ -199,9 +201,7 @@ function pageEvidence(
     page.disclosure.status === "complete";
   const disclosureStatus = hasUnseenPage ? "truncated" : page.disclosure.status;
   const reason = page.disclosure.reason ??
-    (hasUnseenPage
-      ? "Additional items are available beyond this page."
-      : null);
+    (hasUnseenPage ? PAGE_CONTINUATION_REASON : null);
   const status = disclosureStatus === "complete"
     ? "complete"
     : `${
@@ -254,7 +254,9 @@ function pageMetric(
       ? "truncated"
       : "complete";
   const reason = page.disclosure.reason ??
-    (status !== "complete" && page.total_count.status === "unavailable"
+    (status === "truncated" && page.next_cursor != null
+      ? PAGE_CONTINUATION_REASON
+      : status !== "complete" && page.total_count.status === "unavailable"
       ? page.total_count.reason
       : null);
   const reasonSuffix = reason ? `; ${reason}` : "";

@@ -61,6 +61,25 @@ describe("repository showcase graph layout", () => {
     rerender(<RepoShowcase bundle={bundle} />);
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
 
+    // An unrelated bundle-field change (a capability label) with every graph
+    // layout input reference preserved must not recompute the layout. The
+    // graph container is deliberately a fresh object: a whole-`graph`
+    // dependency would recompute here, while the fine-grained inputs
+    // (repository id and the three item arrays) keep their identity.
+    const relabeledBundle = {
+      ...bundle,
+      capability: {
+        ...bundle.capability,
+        labels: {
+          ...bundle.capability.labels,
+          truncated: `${bundle.capability.labels.truncated} (relabeled)`,
+        },
+      },
+      graph: { ...bundle.graph },
+    };
+    rerender(<RepoShowcase bundle={relabeledBundle} />);
+    expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+
     const replacedModulePage = {
       ...bundle,
       graph: {

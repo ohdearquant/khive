@@ -384,6 +384,20 @@ describe("repository triage model", () => {
     expect(coverage?.value).toContain(
       "Additional items are available beyond this page.",
     );
+
+    // The metric path must carry the same cursor-aware default reason as the
+    // evidence path, and the attention rollup must surface it rather than
+    // falling back to the generic aggregate text.
+    expect(brief.attentionState.status).toBe("truncated");
+    expect(brief.attentionState.reason).toContain(
+      "Additional items are available beyond this page.",
+    );
+    const target = buildRepositoryBrief(bundle).startHere[0];
+    const insight = buildModuleInsight(cursorPage, target.moduleId);
+    expect(insight?.couplingState).toMatchObject({
+      status: "truncated",
+      reason: "Additional items are available beyond this page.",
+    });
   });
 
   it("finds a module by the path a user already knows", () => {
