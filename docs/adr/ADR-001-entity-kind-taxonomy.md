@@ -240,11 +240,22 @@ the writer's state of mind or to the world at write time:
   instance — its fields name at least one instance identifier, each a concrete referent
   stated in the record: an endpoint or address; a named deployment surface (a specific
   host, region, or cluster); a named operator; or an operational state or state history
-  carried in the record's property fields (a status property, an incident record, a dated
-  transition). Bare deployment or liveness vocabulary in name or description prose —
-  `deployed`, `running`, `live`, `in production`, `down` and the like, with no concrete
-  referent beside it — is not an instance identifier and does not satisfy D; that is
-  exactly the question-note trigger's case below. Whether the instance is up at write
+  carried in the record's property fields and tied to a named instance referent. An
+  operational-state entry qualifies only when the referent it describes is named: either
+  the entry itself names the endpoint, deployment surface, or operator whose state it
+  records (an incident record naming the affected host, a dated transition naming the
+  endpoint that changed state), or the record carries one of those referents in another
+  field. Accepted operational-state properties are those describing run state — health,
+  availability, incidents, deployment transitions (keys such as `health`, `availability`,
+  `last_incident`, `deployed_at`); the discriminator is the named referent, not the key
+  spelling. A bare lifecycle `status` value drawn from the core status vocabulary
+  (`concept`, `researched`, `prototyped`, `implemented`, `shipped`, `deprecated`), or any
+  status field with no named instance referent beside it, records the maturity of a
+  codebase or idea, is not an instance identifier, and does not satisfy D. Bare
+  deployment or liveness vocabulary in name or description prose — `deployed`, `running`,
+  `live`, `in production`, `down` and the like, with no concrete referent beside it — is
+  likewise not an instance identifier and does not satisfy D; that is exactly the
+  question-note trigger's case below. Whether the instance is up at write
   time is not consulted: a deployable system between deployments still satisfies D when
   the record names such an identifier. Fields that identify only a codebase (repository,
   package, crate, source language) are step 6 evidence, not instance identifiers — a
@@ -276,18 +287,28 @@ amendment adds only the question-note requirement stated in the tree, whose trig
 record mentions deployment vocabulary but carries no instance identifier — is likewise read
 off the record itself, so the classification stays revisitable instead of silently settled.
 
+Two boundary fixtures pin the narrowed operational-state disjunct:
+
+- A repository record carrying `status: "shipped"` alongside only codebase identity
+  (repository, crate, language) does not satisfy D — the status value names no instance
+  referent — so step 5 does not fire and the record classifies `Project` at step 6.
+- A record naming `api.example.com` as its endpoint, with `health: "down"` and
+  `last_incident: 2026-08-14` in its properties, satisfies D — operational state tied to
+  a named endpoint — and classifies `Service` even though the instance is down at write
+  time.
+
 ### Signal table
 
-| Kind         | Strong positive signals                                                                 | Do NOT use when                                                        |
-| ------------ | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| **Concept**  | abstract idea, method, theory, algorithm, architecture, gap, metric                     | concrete document, dataset, codebase, service, or gen. state           |
-| **Document** | title, authors, DOI, arXiv, publication venue, spec, report                             | generated state or raw dataset                                         |
-| **Dataset**  | examples, records, benchmark, corpus, train/eval/test split                             | vectorized/generated index or checkpoint                               |
-| **Project**  | repo, package, crate, library, framework, source code, language                         | running endpoint or deployed instance                                  |
-| **Artifact** | generated, checkpointed, exported, content-addressed, version lineage                   | curated example collection or authored document                        |
-| **Service**  | named endpoint/address; named host/region/cluster/operator; health/status in properties | source code project or static artifact; bare deployment/liveness words |
-| **Person**   | individual human                                                                        | author role without standalone entity                                  |
-| **Org**      | lab, company, university, institution, consortium                                       | project team used only as metadata                                     |
+| Kind         | Strong positive signals                                                                        | Do NOT use when                                                        |
+| ------------ | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **Concept**  | abstract idea, method, theory, algorithm, architecture, gap, metric                            | concrete document, dataset, codebase, service, or gen. state           |
+| **Document** | title, authors, DOI, arXiv, publication venue, spec, report                                    | generated state or raw dataset                                         |
+| **Dataset**  | examples, records, benchmark, corpus, train/eval/test split                                    | vectorized/generated index or checkpoint                               |
+| **Project**  | repo, package, crate, library, framework, source code, language                                | running endpoint or deployed instance                                  |
+| **Artifact** | generated, checkpointed, exported, content-addressed, version lineage                          | curated example collection or authored document                        |
+| **Service**  | named endpoint/address; named host/region/cluster/operator; run state tied to a named instance | source code project or static artifact; bare deployment/liveness words |
+| **Person**   | individual human                                                                               | author role without standalone entity                                  |
+| **Org**      | lab, company, university, institution, consortium                                              | project team used only as metadata                                     |
 
 ### Key distinctions
 
@@ -302,7 +323,8 @@ artifact is generated state — its identity is the process that produced it.
 | Model checkpoint trained on that corpus    | `Artifact` + `checkpoint`      |
 | Learned brain retrieval profile            | `Artifact` + `profile`         |
 
-**Service vs Project**: A project is source code. A service is the running thing.
+**Service vs Project**: A project is source code. A service is a deployed or deployable
+operational instance.
 
 | Thing                               | Classification                 |
 | ----------------------------------- | ------------------------------ |

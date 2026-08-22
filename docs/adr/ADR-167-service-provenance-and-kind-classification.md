@@ -177,13 +177,19 @@ has two variants and they differ in exactly the way that matters here. `Soft` ma
 leaves the row queryable under an explicit soft-delete filter. `Hard` physically removes the row **and
 cascades incident edges** — `purge_incident_edges_statement` issues
 `DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1`, unconditionally and with no soft
-counterpart. The statement order inside the atomic plan is: the record's own row delete first (under
-an exactly-one-row guard), lineage-warning statements second, and the incident-edge purge LAST
-(`crates/khive-runtime/src/operations.rs`, `crates/khive-runtime/src/atomic_prepare.rs` — both build
-this order). Nothing in a migration plan may therefore rely on the old record row still existing when
-the purge runs; it is already gone. The order is invisible to callers only because the whole plan
-commits in a single synchronous pass — which is one more reason the atomicity requirement below is
-load-bearing rather than advisory.
+counterpart. For entity and note targets, the statement order inside the atomic plan is: the record's
+own row delete first (under an exactly-one-row guard), lineage-warning statements second, and the
+incident-edge purge LAST (`crates/khive-runtime/src/operations.rs`,
+`crates/khive-runtime/src/atomic_prepare.rs` — both build this order for those targets). Nothing in a
+migration plan may therefore rely on the old record row still existing when the purge runs; it is
+already gone. The edge-as-node branch orders differently: when the deleted record is itself an edge,
+`atomic_prepare.rs` emits the lineage warnings first, purges incident edges second, and hard-deletes
+the edge row last — so a migration step deleting an edge record may still observe the edge row while
+its incident purge runs. Because this ADR treats edges as valid provenance endpoints, a migration
+plan that touches edge records must be written against the edge branch's order, not the entity/note
+order. Either way the order is invisible to callers only because the whole plan commits in a single
+synchronous pass — which is one more reason the atomicity requirement below is load-bearing rather
+than advisory.
 
 Two consequences, and the first is a correction to this ADR's own framing. **The 62-edge figure is a
 HARD-delete figure.** A soft delete destroys no edges at all; it leaves every one of them as a live row
