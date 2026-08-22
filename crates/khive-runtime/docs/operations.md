@@ -90,3 +90,11 @@ External integration test crates enable it via `khive-runtime = { ..., features 
 - `ENTITY_COMPENSATION_FAIL_NS`: entity-create compensation failure injection. The matching
   compensation skips only the entity-row delete; FTS/vector cleanup still runs so tests can
   inspect the exact residual state and combined error contract.
+- `PREFIX_RESOLVE_FAIL_NS`: storage-failure injection for `resolve_prefix_inner`, keyed by the
+  scanned prefix string rather than a namespace — `resolve_prefix_unfiltered` and
+  `resolve_prefix_unfiltered_including_deleted` pass `namespaces: None` by contract, so there is
+  no namespace to key on. Armed via `arm_prefix_resolve_fail_scoped(prefix)`; the next call
+  scanning that exact prefix returns an injected `StorageError::Timeout` instead of running the
+  table scan, then disarms. Used to prove callers that resolve an id through a prefix (e.g. the
+  `get` verb's fallback chain) distinguish a storage fault from a genuine no-match instead of
+  reporting both as not-found.
