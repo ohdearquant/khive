@@ -124,8 +124,20 @@ async function readBoundedCatalogBody(
     return new Uint8Array(buffer);
   }
 
+  if (signal.aborted) {
+    return invalidCatalog();
+  }
+
   const reader = body.getReader();
-  const onAbort = () => void reader.cancel();
+  if (signal.aborted) {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+    return invalidCatalog();
+  }
+
+  const onAbort = () => {
+    reader.cancel().catch(() => {});
+  };
   signal.addEventListener("abort", onAbort, { once: true });
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -135,7 +147,7 @@ async function readBoundedCatalogBody(
       if (done) break;
       total += value.byteLength;
       if (total > SHOWCASE_CATALOG_MAX_BYTES) {
-        await reader.cancel();
+        await reader.cancel().catch(() => {});
         return invalidCatalog();
       }
       chunks.push(value);

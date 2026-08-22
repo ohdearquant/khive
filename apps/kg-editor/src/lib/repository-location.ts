@@ -183,13 +183,36 @@ export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
 // credential such as ?access_token=..., a fragment-borne secret, a tracker
 // value — is never copied forward: the URL is rebuilt from the origin and
 // path only, and every other parameter and the hash are discarded. The same
-// guarantee extends to the repo VALUE itself: a credential nested inside it
-// (e.g. a raw, not-yet-validated `repo` param carrying its own
-// `?access_token=...`) is stripped before the value is written, so it can
-// never survive into history, a referrer header, or a copied link either.
+// guarantee extends to the repo VALUE itself: this writer strips userinfo
+// (a `user:pass@` prefix on the authority) and truncates at the first query
+// or fragment delimiter — whether literal (`?`, `#`) or percent-encoded, at
+// one or two levels of encoding (`%3F`/`%23`, `%253F`/`%2523`) — so neither
+// an embedded credential nor an encoded `?`/`#` that would decode into a
+// live delimiter on a later read can survive into history, a referrer
+// header, or a copied link. `parseRepositoryLocation` never sees this
+// truncated form — it always parses the original, unmodified value, so
+// validation results are unaffected by this history-only guarantee.
+function stripRepositoryUserinfo(value: string): string {
+  const authorityStart = value.indexOf("//");
+  if (authorityStart === -1) return value;
+  const start = authorityStart + 2;
+  const slashIndex = value.indexOf("/", start);
+  const authorityEnd = slashIndex === -1 ? value.length : slashIndex;
+  const authority = value.slice(start, authorityEnd);
+  const atIndex = authority.lastIndexOf("@");
+  if (atIndex === -1) return value;
+  return value.slice(0, start) + authority.slice(atIndex + 1) +
+    value.slice(authorityEnd);
+}
+
+const HISTORY_UNSAFE_DELIMITER = /\?|#|%3f|%23|%253f|%2523/iu;
+
 function historySafeRepositoryValue(value: string): string {
-  const delimiterIndex = value.search(/[?#]/u);
-  return delimiterIndex === -1 ? value : value.slice(0, delimiterIndex);
+  const withoutUserinfo = stripRepositoryUserinfo(value);
+  const delimiterIndex = withoutUserinfo.search(HISTORY_UNSAFE_DELIMITER);
+  return delimiterIndex === -1
+    ? withoutUserinfo
+    : withoutUserinfo.slice(0, delimiterIndex);
 }
 
 export function repositoryLocationUrl(

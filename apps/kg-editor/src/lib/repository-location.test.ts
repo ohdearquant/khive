@@ -217,6 +217,61 @@ describe("repository investigation location", () => {
     expect(url.href).not.toContain("token-fragment");
   });
 
+  it("strips userinfo credentials nested inside the repo value before writing history (kills a writer that only strips literal ? and #)", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: "https://user:SECRET@github.com/example/repo",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.get("repo")).toBe(
+      "https://github.com/example/repo",
+    );
+    expect(url.href).not.toContain("SECRET");
+    expect(url.href).not.toContain("user:SECRET@");
+  });
+
+  it("strips a double-encoded query delimiter from the repo value before writing history (kills a writer whose regex only matches literal ?/#)", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository:
+          "https://github.com/example/repo%253Faccess_token%253DSECRET",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.get("repo")).toBe(
+      "https://github.com/example/repo",
+    );
+    expect(url.href).not.toContain("SECRET");
+    expect(url.href).not.toContain("%253F");
+  });
+
+  it("strips a percent-encoded fragment delimiter from the repo value before writing history (kills a writer whose regex only matches literal ?/#)", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: "https://github.com/example/repo%23access_token=SECRET",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.get("repo")).toBe(
+      "https://github.com/example/repo",
+    );
+    expect(url.href).not.toContain("SECRET");
+    expect(url.href).not.toContain("%23");
+  });
+
   it("share form omits a module path carrying a query or fragment delimiter", () => {
     for (
       const modulePath of [

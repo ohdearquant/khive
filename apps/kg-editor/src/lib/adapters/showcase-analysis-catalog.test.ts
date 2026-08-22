@@ -5,6 +5,7 @@ import {
   loadShowcaseAnalysisCatalog,
   mergeShowcaseRegistry,
   parseShowcaseAnalysisCatalog,
+  type ShowcaseCatalogFetch,
   SHOWCASE_CATALOG_MAX_BYTES,
   SHOWCASE_CATALOG_MAX_ENTRIES,
   SHOWCASE_CATALOG_TIMEOUT_MS,
@@ -279,6 +280,120 @@ describe("showcase analysis catalog", () => {
         entries: [],
         message: expect.stringMatching(/catalog.*unavailable/i),
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never starts reading the body once the deadline has already fired, even when the fetch resolves late with a body that never completes (kills a writer that installs its abort listener only after the abort event already fired)", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveFetch: (value: unknown) => void = () => {};
+      const fetchPromise = new Promise((resolve) => {
+        resolveFetch = resolve;
+      });
+      const fetchCatalog = vi.fn(
+        () => fetchPromise,
+      ) as unknown as ShowcaseCatalogFetch;
+      const resultPromise = loadShowcaseAnalysisCatalog(fetchCatalog);
+
+      await vi.advanceTimersByTimeAsync(SHOWCASE_CATALOG_TIMEOUT_MS);
+      await expect(resultPromise).resolves.toEqual({
+        status: "degraded",
+        entries: [],
+        message: expect.stringMatching(/catalog.*unavailable/i),
+      });
+
+      const read = vi.fn(() => new Promise(() => {}));
+      const cancel = vi.fn(async () => {});
+      const getReader = vi.fn(() => ({
+        read,
+        cancel,
+        releaseLock: vi.fn(),
+      }));
+      resolveFetch({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        arrayBuffer: vi.fn(async () => {
+          throw new Error(
+            "arrayBuffer() should not be used when a body stream is available",
+          );
+        }),
+        body: { getReader } as unknown as ReadableStream<
+          Uint8Array<ArrayBuffer>
+        >,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(getReader).not.toHaveBeenCalled();
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("attaches a handler to a rejecting reader.cancel() triggered by an in-flight abort, and still settles degraded (kills a writer that discards the cancel() promise with void, leaving it unhandled)", async () => {
+    vi.useFakeTimers();
+    try {
+      const read = vi.fn(() => new Promise(() => {}));
+      let cancelResultHandled = false;
+      const cancel = vi.fn(() => ({
+        catch: (onRejected?: (reason: unknown) => unknown) => {
+          cancelResultHandled = true;
+          return Promise.resolve().then(() =>
+            onRejected?.(new Error("cancel failed"))
+          );
+        },
+        then: (
+          _onFulfilled?: (value: unknown) => unknown,
+          onRejected?: (reason: unknown) => unknown,
+        ) => {
+          cancelResultHandled = true;
+          return Promise.resolve().then(() =>
+            onRejected?.(new Error("cancel failed"))
+          );
+        },
+      }));
+      const getReader = vi.fn(() => ({
+        read,
+        cancel,
+        releaseLock: vi.fn(),
+      }));
+      const response = {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        arrayBuffer: vi.fn(async () => {
+          throw new Error(
+            "arrayBuffer() should not be used when a body stream is available",
+          );
+        }),
+        body: { getReader } as unknown as ReadableStream<
+          Uint8Array<ArrayBuffer>
+        >,
+      };
+      const fetchCatalog = vi.fn(
+        async () => response,
+      ) as unknown as ShowcaseCatalogFetch;
+
+      const resultPromise = loadShowcaseAnalysisCatalog(fetchCatalog);
+      await vi.advanceTimersByTimeAsync(SHOWCASE_CATALOG_TIMEOUT_MS);
+
+      await expect(resultPromise).resolves.toEqual({
+        status: "degraded",
+        entries: [],
+        message: expect.stringMatching(/catalog.*unavailable/i),
+      });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(cancel).toHaveBeenCalled();
+      expect(cancelResultHandled).toBe(true);
     } finally {
       vi.useRealTimers();
     }
