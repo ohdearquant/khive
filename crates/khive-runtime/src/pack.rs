@@ -5684,11 +5684,28 @@ pub(crate) mod tests {
 
     impl MemoryEventStore {
         /// Record a submission attempt. Call before any failure check.
+        ///
+        /// The projection carries the verb and whether the row's resource has a
+        /// `cost_unit` key, not just kind and outcome. That key is the observable
+        /// consequence of the row having been built FROM the handler's return
+        /// value: `cost_unit::resource_payload` derives it from `ok_val`, while
+        /// the error path's `base_resource_payload` documents that it omits it.
+        /// Recording only the outcome would leave a submission that ignores
+        /// `ok_val` while still stamping `Success` indistinguishable from one
+        /// that sources it, and those are different implementations.
         fn trace_submission(&self, events: &[Event]) {
             if let Some(trace) = &self.trace {
                 let mut trace = trace.lock().expect("trace lock");
                 for event in events {
-                    trace.push(format!("audit:{:?}:{:?}", event.kind, event.outcome));
+                    let result_derived = event
+                        .payload
+                        .get("resource")
+                        .and_then(|resource| resource.get("cost_unit"))
+                        .is_some();
+                    trace.push(format!(
+                        "audit:{:?}:{:?}:{}:cost_unit={}",
+                        event.kind, event.outcome, event.verb, result_derived
+                    ));
                 }
             }
         }
@@ -6516,8 +6533,15 @@ pub(crate) mod tests {
     /// caller-visible error and the handler's effect would leave this test green against an
     /// implementation that submits no audit row at all, or that submits one built from the
     /// error path — both of which contradict the contract while producing exactly the same
-    /// error string. Asserting the submitted row's SUCCESS outcome is what separates them,
-    /// because the error path builds its payload without a result to derive from.
+    /// error string.
+    ///
+    /// The outcome alone does not separate those. A row can carry `Success` and still have
+    /// been built without the handler's return value, which is a third implementation and
+    /// also wrong. So the trace records whether the row's resource carries `cost_unit`:
+    /// `resource_payload` derives that key from `ok_val`, and `base_resource_payload`
+    /// documents that it omits it. Asserting the key is what pins result-sourcing; the
+    /// verb is asserted alongside it so a fabricated row for some other verb cannot satisfy
+    /// the same check.
     ///
     /// Not pinned here: that the row commits on a SEPARATE writer acquisition from the
     /// handler's. The store double has no writer to observe, so that half of the mechanism
@@ -6630,10 +6654,16 @@ pub(crate) mod tests {
              string. Trace was {first_pass:?}"
         );
         assert!(
-            audit_rows.iter().any(|entry| entry.contains("Success")),
-            "the submitted row must carry the SUCCESS outcome, which is what pins that it \
-             was derived from the handler's return value: the error path builds a \
-             different payload from no result at all. Trace was {first_pass:?}"
+            audit_rows
+                .iter()
+                .any(|entry| entry.contains(":Success:create:cost_unit=true")),
+            "the submitted row must be the SUCCESS row for THIS verb, carrying a resource \
+             built from the handler's return value. The outcome alone is not enough: an \
+             implementation that stamps Success on a row built without `ok_val` would \
+             satisfy an outcome-only assertion while breaking the contract this test \
+             exists for. `cost_unit` is the discriminator because `resource_payload` \
+             derives it from the result and `base_resource_payload` omits it. Trace was \
+             {first_pass:?}"
         );
         assert_eq!(
             first_pass
