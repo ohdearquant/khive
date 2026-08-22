@@ -5667,11 +5667,37 @@ pub(crate) mod tests {
         /// normally. Lets a test fail a pure-observability row without
         /// also failing the obligation row that shares the same store.
         fail_kind: Option<EventKind>,
+        /// Append-ordered record of what was SUBMITTED to this store,
+        /// written before the injected-failure check so a submission this
+        /// store then rejects is still visible.
+        ///
+        /// `events` alone cannot show that: a rejected append returns before
+        /// the store records anything, so a test reading `events` cannot
+        /// tell a row that failed to commit from a row that was never built.
+        /// Those are different production behaviours and only one of them is
+        /// the audit contract. A test that hands the same vector to its
+        /// handler also gets the ordering between the handler's effect and
+        /// the audit submission, which is the only way to observe that the
+        /// audit row is written after the handler rather than before it.
+        trace: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    }
+
+    impl MemoryEventStore {
+        /// Record a submission attempt. Call before any failure check.
+        fn trace_submission(&self, events: &[Event]) {
+            if let Some(trace) = &self.trace {
+                let mut trace = trace.lock().expect("trace lock");
+                for event in events {
+                    trace.push(format!("audit:{:?}:{:?}", event.kind, event.outcome));
+                }
+            }
+        }
     }
 
     #[async_trait]
     impl EventStore for MemoryEventStore {
         async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            self.trace_submission(std::slice::from_ref(&event));
             if self.fail_appends || self.fail_kind == Some(event.kind) {
                 return Err(khive_storage::StorageError::Internal(
                     "injected audit append failure".to_string(),
@@ -5684,6 +5710,7 @@ pub(crate) mod tests {
             &self,
             events: Vec<Event>,
         ) -> khive_storage::StorageResult<BatchWriteSummary> {
+            self.trace_submission(&events);
             let attempted = events.len() as u64;
             let affected = attempted;
             self.events.lock().unwrap().extend(events);
@@ -5728,6 +5755,7 @@ pub(crate) mod tests {
             events: Vec<Event>,
         ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
         {
+            self.trace_submission(&events);
             if self.fail_appends
                 || self
                     .fail_kind
@@ -6472,16 +6500,28 @@ pub(crate) mod tests {
         );
     }
 
-    /// An obligation-bearing audit row is written AFTER the handler returns, from the
-    /// handler's own return value, on its own writer acquisition. So when that row fails
-    /// to commit, `fold_audit_obligation` turns a would-be success into an error for a
-    /// dispatch whose effect has ALREADY happened and cannot be rolled back by it.
+    /// An obligation-bearing audit row is written AFTER the handler returns and FROM the
+    /// handler's own return value. So when that row fails to commit,
+    /// `fold_audit_obligation` turns a would-be success into an error for a dispatch whose
+    /// effect has ALREADY happened and cannot be rolled back by it.
     ///
     /// The existing obligation test above proves the flip using `list`, a read, where the
     /// distinction does not matter. This one pins the part that decides caller behaviour:
     /// the write landed, and the caller was told it failed. A caller that treats this error
     /// as "it did not run" and retries therefore applies the effect twice, which is what the
-    /// second half asserts.
+    /// last assertion covers.
+    ///
+    /// The handler and the event store share one trace vector, so the ordering claim is
+    /// observed rather than assumed. That matters more than it looks: asserting only the
+    /// caller-visible error and the handler's effect would leave this test green against an
+    /// implementation that submits no audit row at all, or that submits one built from the
+    /// error path — both of which contradict the contract while producing exactly the same
+    /// error string. Asserting the submitted row's SUCCESS outcome is what separates them,
+    /// because the error path builds its payload without a result to derive from.
+    ///
+    /// Not pinned here: that the row commits on a SEPARATE writer acquisition from the
+    /// handler's. The store double has no writer to observe, so that half of the mechanism
+    /// needs a different fixture than this one.
     #[tokio::test]
     #[serial(audit_append_failures)]
     #[serial(audit_obligation_append_failures)]
@@ -6526,7 +6566,9 @@ pub(crate) mod tests {
                 _token: &NamespaceToken,
             ) -> Result<Value, RuntimeError> {
                 // Stands in for a committed effect: by the time this returns, the write
-                // is done and nothing downstream can undo it.
+                // is done and nothing downstream can undo it. Pushed onto the SAME
+                // vector the event store traces into, so the relative order of the
+                // effect and the audit submission is observable rather than assumed.
                 let name = params
                     .get("name")
                     .and_then(Value::as_str)
@@ -6535,7 +6577,7 @@ pub(crate) mod tests {
                 self.committed
                     .lock()
                     .expect("committed lock")
-                    .push(name.clone());
+                    .push(format!("effect:{name}"));
                 Ok(serde_json::json!({ "created": name }))
             }
         }
@@ -6543,6 +6585,7 @@ pub(crate) mod tests {
         let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let failing_store = Arc::new(MemoryEventStore {
             fail_appends: true,
+            trace: Some(Arc::clone(&committed)),
             ..MemoryEventStore::default()
         });
         let mut builder = VerbRegistryBuilder::new();
@@ -6563,11 +6606,42 @@ pub(crate) mod tests {
              caller the effect landed: {err}"
         );
 
+        // The trace carries both sides, so each of the three claims above is an
+        // assertion rather than a comment. Read as a sequence it says: the handler's
+        // effect committed, and only THEN was an audit row submitted -- a row built
+        // from the successful result, which is what makes it the obligation row and
+        // not an error row.
+        let first_pass = committed.lock().expect("committed lock").clone();
         assert_eq!(
-            committed.lock().expect("committed lock").as_slice(),
-            &["first".to_string()],
-            "the handler's effect must already be committed when the caller is told the \
-             dispatch failed -- this is the whole property under test"
+            first_pass.first().map(String::as_str),
+            Some("effect:first"),
+            "the handler's effect must land FIRST: an implementation that submitted the \
+             audit row before dispatching would satisfy every other assertion here"
+        );
+        let audit_rows: Vec<&String> = first_pass
+            .iter()
+            .filter(|entry| entry.starts_with("audit:"))
+            .collect();
+        assert!(
+            !audit_rows.is_empty(),
+            "an audit row must actually be SUBMITTED; without this assertion the test \
+             passes against an implementation that returns the same error and never \
+             builds a row at all, which is a different defect wearing the same error \
+             string. Trace was {first_pass:?}"
+        );
+        assert!(
+            audit_rows.iter().any(|entry| entry.contains("Success")),
+            "the submitted row must carry the SUCCESS outcome, which is what pins that it \
+             was derived from the handler's return value: the error path builds a \
+             different payload from no result at all. Trace was {first_pass:?}"
+        );
+        assert_eq!(
+            first_pass
+                .iter()
+                .filter(|entry| entry.as_str() == "effect:first")
+                .count(),
+            1,
+            "exactly one effect on the first pass"
         );
 
         // What a caller does on a failure it believes means "did not run".
@@ -6576,8 +6650,13 @@ pub(crate) mod tests {
             .await
             .expect_err("the retry fails the same way");
         assert_eq!(
-            committed.lock().expect("committed lock").as_slice(),
-            &["first".to_string(), "first".to_string()],
+            committed
+                .lock()
+                .expect("committed lock")
+                .iter()
+                .filter(|entry| entry.as_str() == "effect:first")
+                .count(),
+            2,
             "retrying this error double-writes; a caller must re-derive state instead of \
              resubmitting"
         );
