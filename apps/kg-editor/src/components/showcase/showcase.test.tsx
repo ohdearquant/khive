@@ -419,6 +419,42 @@ describe("materialized repository lookup", () => {
     expect([...url.searchParams.keys()]).toEqual(["repo"]);
   });
 
+  it("treats an empty repo parameter as invalid instead of falling back to the default entry", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/?repo=&access_token=secret#fragment",
+    );
+
+    render(<Showcase />);
+
+    expect(await screen.findByText("Repository lookup could not start")).toBeVisible();
+    const url = new URL(window.location.href);
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.hash).toBe("");
+    expect([...url.searchParams.keys()]).toEqual([]);
+  });
+
+  it("treats duplicate repo parameters as invalid instead of resolving the first value", async () => {
+    const repo = bundle.meta.repository.canonical_url;
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent(repo)}&repo=${
+        encodeURIComponent(repo)
+      }&access_token=secret#fragment`,
+    );
+
+    render(<Showcase />);
+
+    expect(await screen.findByText("Repository lookup could not start")).toBeVisible();
+    const url = new URL(window.location.href);
+    expect(url.searchParams.get("repo")).toBe(repo);
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.hash).toBe("");
+    expect([...url.searchParams.keys()]).toEqual(["repo"]);
+  });
+
   it("drops foreign query parameters and the fragment from history for a registry miss", async () => {
     const repo = "https://github.com/example/not-catalog-registered";
     window.history.replaceState(

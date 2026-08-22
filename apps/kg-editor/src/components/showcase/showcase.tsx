@@ -167,8 +167,9 @@ export function Showcase() {
   useEffect(() => {
     let cancelled = false;
     const sequence = ++loadSequence.current;
+    const originalLocation = new URL(window.location.href);
     replaceRepositoryQuery(
-      new URL(window.location.href).searchParams.get("repo") ?? undefined,
+      originalLocation.searchParams.get("repo") ?? undefined,
       false,
     );
     void loadShowcaseAnalysisCatalog().then((catalogResult) => {
@@ -180,7 +181,7 @@ export function Showcase() {
         message: catalogResult.message,
       });
 
-      const parsed = parseRepositoryLocation(new URL(window.location.href));
+      const parsed = parseRepositoryLocation(originalLocation);
       const repositoryIssue = parsed.issues.find((issue) =>
         issue.parameter === "repo"
       );
