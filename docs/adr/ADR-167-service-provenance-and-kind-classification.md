@@ -47,7 +47,9 @@ that path destroys edges under the only deletion mode that can actually free the
 Measured against the 19-service population: 16 carry at least one edge and 3 carry none. A
 HARD delete-and-recreate across the population would destroy **62 edges**, of which **42 are
 `annotates`** — the figure is stated for `DeleteMode::Hard` specifically, because soft deletion
-destroys none of them and instead strands all 62 on a deleted endpoint (Decision 3). Because `annotates` runs note → entity, each destroyed annotates
+destroys none of them and instead strands all 62 on a deleted endpoint (Decision 3). Because each of those 42 runs note → entity in the measured
+population (the contract itself admits edge targets for `annotates` as well — the closure
+requirement in Decision 3 exists for exactly that case), each destroyed annotates
 edge leaves a note whose subject no longer exists — the note survives, saying something about
 nothing, which is worse than either deleting it or keeping it attached.
 
@@ -211,9 +213,21 @@ window between the cascade and the last recreation is exactly where the edges ar
 **Edges whose triples become ILLEGAL under the new kind.** Recreation is not always available, and this
 is not an edge case: `Org contains Service` has no `Org contains Concept` counterpart in the endpoint
 matrix, so an org-contained service cannot simply be recreated as a concept. Every incident edge must
-therefore be classified against ADR-002's matrix BEFORE anything is deleted, into exactly three
+therefore be classified against ADR-002's matrix BEFORE anything is deleted, into exactly four
 dispositions, each of which must be written down per edge:
 
+- **PRESERVE** — the resulting triple is legal, and an id-preserving endpoint move (ADR-113's
+  `move_edge_endpoint`) is available in the running system and collision-free for this edge. The
+  edge keeps its id while the endpoint fields referencing the moved subject are updated (the
+  primitive takes one or both fields): for an incident edge, every endpoint field referencing the
+  migrating record moves onto the new record — one field ordinarily, both for a self-loop; for a
+  closure member, the target moves to its annotated subject's mapped replacement — a closure
+  member is never moved onto the new record. A closure
+  member whose subject is itself preserved needs no move at all: its target id is still valid.
+  Because the id survives, every annotation targeting a PRESERVEd edge stays valid with no
+  re-anchoring. Preferred over RECREATE wherever it qualifies. It exempts nothing: the edge still
+  appears in the closure enumeration, its disposition is still written down, and any move still
+  executes inside the same atomic plan as the rest of the correction.
 - **RECREATE** — the triple is legal under the new kind. Recreate and read back.
 - **RE-EXPRESS** — the triple is illegal but the fact survives under a different relation or a
   different endpoint. Name the replacement triple and why it carries the same claim.
@@ -237,20 +251,48 @@ With those settled, a kind correction:
    caller-facing cursor walk (`list_edges_after`) may be used for planning reads, but the
    destructive plan is prepared only from the in-transaction enumeration. Offset paging is
    out of contract in any role, in either direction.
-2. Enumerates the second-order rows under the same completeness contract: the `annotates`
-   edges whose TARGET is one of the enumerated incident edges, and the notes those edges
-   anchor — again by direct in-transaction query over the enumerated edge IDs, with no
-   visibility or live-row filter. A recreated edge is a new edge id, so an edge-targeting
-   annotation is orphaned by recreation even when the record's own annotations were handled
-   correctly. Each gets the same re-anchor-or-delete disposition as step 3.
-3. Classifies every enumerated edge as RECREATE, RE-EXPRESS or REFUSE against the endpoint matrix, and
-   names for each `annotates` edge whether the annotating note is re-anchored to the new record or
-   deleted with it. A note left pointing at a deleted subject is not an acceptable outcome. **Any
+2. Enumerates the annotation closure under the same completeness contract: starting from the
+   enumerated incident edges, repeatedly collects the `annotates` edges whose TARGET is any
+   edge already in the set, together with the notes those edges anchor, until a pass adds
+   nothing — a fixed-point walk over edge IDs with a visited set. The fixed point is
+   required because the runtime places no kind restriction on an edge target of `annotates`
+   (ADR-002 rule 1: the target may be an entity, a note, or any edge), so a note may
+   annotate an `annotates` edge and chains of edge-targeting annotations are constructible;
+   creation order alone would keep those chains acyclic, but an endpoint move can re-point
+   an edge after creation and nothing in the contract rules a cycle out, so termination
+   comes from the visited set, never from assumed acyclicity. One level is not enough: a note annotating an edge that itself
+   annotates an incident edge is deleted or left dangling by any plan that stops at the
+   first level. All queries are direct in-transaction reads over the enumerated edge IDs,
+   with no visibility or live-row filter. A recreated edge is a new edge id, so an
+   edge-targeting annotation is orphaned by recreation even when the record's own
+   annotations were handled correctly. Every edge and note in the closure gets the same
+   re-anchor-or-delete disposition as step 3.
+3. Classifies every enumerated edge — incident edges and every closure member alike — as PRESERVE,
+   RECREATE, RE-EXPRESS or REFUSE against the endpoint matrix, and builds a per-edge replacement
+   map covering the whole set before anything is deleted: a PRESERVEd edge maps to itself, a
+   recreated or re-expressed edge maps to its planned replacement within the plan, a deleted edge
+   maps to a named deletion. Every `annotates` edge's re-anchor target is then read off that map,
+   never assumed: an annotation of the record itself re-anchors to the new record; an annotation
+   of a closure edge re-anchors to that edge's mapped replacement — the edge itself when
+   preserved, its recreation when recreated, never the new record; an annotation whose subject maps to a deletion is itself deleted or re-anchored to
+   a named carrier. A note left pointing at a deleted subject is not an acceptable outcome. **Any
    REFUSE stops here.**
 4. Prepares deletion and all recreations as ONE atomic plan, commits it, and reads back every recreated
    edge. A recreated edge is a new edge id, so anything that referenced the old id does not follow and
    must be re-pointed in the same plan.
 5. Records the old record's id in the new record's properties, so the discontinuity is traceable.
+
+Relation to ADR-113: ADR-113's `move_edge_endpoint` primitive preserves an edge id when an
+endpoint moves between records, and with it every annotation targeting the edge — and its split
+recipe composes exactly the shape a kind migration needs: create the new record, then move each
+qualifying edge onto it. The PRESERVE disposition above is that composition applied here. Three
+conditions gate it per edge, all from ADR-113's own contract: the resulting triple must be legal
+under the new kind (the primitive re-validates the endpoint contract), the move must not collide
+with an existing natural key (the primitive fails loud rather than dropping the edge), and the
+primitive must exist in the running system (ADR-113 is Proposed; a system without the operation
+takes the delete-and-recreate path for every edge). An edge failing any of the three falls
+through to RECREATE, RE-EXPRESS or REFUSE, and the annotation closure above is what keeps its
+annotations from dangling.
 
 If kind changes later become common enough that this procedure is being run routinely, that is the
 evidence that would justify the mechanism, and the count of times it has been run is what should
@@ -334,11 +376,19 @@ this ADR is complete when all of the following hold:
   in the same transaction, the same count Decision 3 step 1 names. All six rows receive dispositions
   before any plan is prepared, because the purge would delete all six. A migration
   prepared from the four-row visible/live enumeration must be refused, and the refusal is
-  the asserted outcome, not a warning.
+  the asserted outcome, not a warning. When e3's disposition is PRESERVE, the asserted
+  outcome is that both of its endpoint fields reference the new record and its edge id is
+  unchanged — a self-loop preserved by updating one field is a defect the fixture must catch.
 - Edge-as-endpoint coverage: the fixture includes an `annotates` edge whose TARGET is itself an
-  edge incident to the migrating record; the enumeration finds it, and after migration the
-  annotation is re-anchored to the recreated edge's new id (or deleted with a recorded
-  disposition) — never left pointing at a purged edge id.
+  edge incident to the migrating record, and a second-level chain — a note whose `annotates`
+  edge targets that first `annotates` edge. The closure enumeration finds both levels, and
+  after migration every annotation's target is asserted by the replacement map's outcome for
+  its subject: a PRESERVEd subject keeps its original id and the annotation still points at
+  it; a recreated or re-expressed subject's annotation points at the mapped replacement id;
+  a deleted subject's annotation follows its recorded deletion-or-carrier disposition. No
+  annotation points at a purged edge id under any disposition mix. A migration
+  prepared from a one-level enumeration must be refused, for the same reason the four-row
+  visible/live enumeration above is refused.
 - Disposition gate: a fixture edge with no legal expression under the new kind (for example
   `Org contains <record>` migrating to `concept`) causes the migration to stop with a REFUSE
   before any plan is prepared; no row in the store changes.
