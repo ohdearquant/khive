@@ -1363,7 +1363,7 @@ impl VerbRegistry {
     /// declared [`IdResolutionMode`]'s contract text appended — the same
     /// text rendered under `identifier_resolution.resolution_modes` — so the
     /// full-UUID-vs-short-prefix rule is stated once per mode (in
-    /// [`resolution_mode_contract`]) and inherited by every matching param,
+    /// `resolution_mode_contract`) and inherited by every matching param,
     /// instead of restating it per param across every `HandlerDef` in every
     /// pack. Parameters whose mode is [`IdResolutionMode::NotApplicable`]
     /// (every non-identifier parameter) are left unchanged.

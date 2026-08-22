@@ -61,7 +61,7 @@ pub enum VerbCategory {
 /// identifier — full UUID and short hex-prefix acceptance, and whether
 /// either form is checked against a namespace. This is a property of the
 /// handler's own resolution code, declared explicitly per parameter so
-/// [`VerbRegistry::describe_verb`]'s rendered contract can never drift from
+/// `VerbRegistry::describe_verb`'s rendered contract can never drift from
 /// what the handler actually does (see khive-runtime's `pack.rs`
 /// `IdResolutionMode` rendering table for the exact wording per variant).
 ///
