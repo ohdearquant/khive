@@ -2315,10 +2315,8 @@ mod tests {
                 store.exists(&orphan).await.unwrap(),
                 "case {case}: a refused sweep must not delete anything"
             );
-            let remaining: i64 = backend
-                .pool()
-                .reader()
-                .unwrap()
+            let reader = backend.pool().reader().unwrap();
+            let remaining: i64 = reader
                 .conn()
                 .query_row(
                     "SELECT COUNT(*) FROM blob_gc_claims WHERE root_key = 'gate-matrix-abandoned'",
@@ -2327,6 +2325,36 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(remaining, 1, "case {case}: refusal must not recover claims");
+
+            // The gate refuses before `blob_gc_fence_probe` ever runs in
+            // every one of these cases, so no probe-shaped row (the fence
+            // probe's own claim/attachment id patterns) should exist in
+            // either table for either dry_run mode.
+            let probe_claims: i64 = reader
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM blob_gc_claims WHERE root_key GLOB '__fence_probe-*'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                probe_claims, 0,
+                "case {case}: refusal must leave no fence-probe claim residue"
+            );
+            let probe_attachments: i64 = reader
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM attachments \
+                     WHERE record_uuid GLOB '__blob-gc-fence-probe-*'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                probe_attachments, 0,
+                "case {case}: refusal must leave no fence-probe attachment residue"
+            );
         }
     }
 
@@ -3340,6 +3368,41 @@ mod tests {
                 .await
                 .unwrap();
 
+            // A known claim, seeded once per epoch case, must survive every
+            // refused arm below untouched -- refusal must never recover or
+            // otherwise mutate an existing claim.
+            let known_claim_ref = "f".repeat(64);
+            {
+                let writer = backend.pool().writer().unwrap();
+                writer
+                    .conn()
+                    .execute(
+                        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                         VALUES ('both-api-known-claim', ?1, 1)",
+                        [known_claim_ref.as_str()],
+                    )
+                    .unwrap();
+            }
+            let assert_known_claim_unchanged = |arm: &str| {
+                let remaining: i64 = backend
+                    .pool()
+                    .reader()
+                    .unwrap()
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM blob_gc_claims \
+                         WHERE root_key = 'both-api-known-claim' AND content_ref = ?1",
+                        [known_claim_ref.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    remaining, 1,
+                    "incomplete_v21={incomplete_v21} arm={arm}: refusal must not mutate \
+                     an existing claim"
+                );
+            };
+
             for dry_run in [true, false] {
                 let snapshot_error = store
                     .orphan_sweep(&BlobOrphanSweepConfig {
@@ -3353,6 +3416,7 @@ mod tests {
                     "incomplete_v21={incomplete_v21} dry_run={dry_run}: expected Unsupported \
                      from orphan_sweep, got {snapshot_error:?}"
                 );
+                assert_known_claim_unchanged(&format!("orphan_sweep dry_run={dry_run}"));
 
                 let transactional_error = store
                     .transactional_orphan_sweep(backend.sql().as_ref(), dry_run)
@@ -3363,6 +3427,9 @@ mod tests {
                     "incomplete_v21={incomplete_v21} dry_run={dry_run}: expected Unsupported \
                      from transactional_orphan_sweep, got {transactional_error:?}"
                 );
+                assert_known_claim_unchanged(&format!(
+                    "transactional_orphan_sweep dry_run={dry_run}"
+                ));
             }
 
             assert!(
@@ -3379,6 +3446,18 @@ mod tests {
     /// used to run after the root guard, filesystem root lock, and directory
     /// walk -- this pins the corrected ordering with a real cross-task race
     /// instead of trusting the comment above it.
+    ///
+    /// The externally held blocking point is the OS-level root advisory lock
+    /// (`acquire_root_write_lock`), not the process-local `write_lock`
+    /// mutex. The old (pre-fix) ordering acquired the process-local mutex
+    /// before ever reaching database ownership -- holding that mutex here
+    /// would have starved the sweep task before it ever reached the hook
+    /// below, hanging this test instead of failing it. The OS-level root
+    /// lock is only ever acquired after database ownership under both the
+    /// old and the new ordering, so both orderings reach the hook; only the
+    /// old ordering then blocks trying to acquire the lock held here,
+    /// because its (mis-placed) recheck runs after that acquisition instead
+    /// of before it.
     #[tokio::test]
     async fn transactional_orphan_sweep_recheck_refuses_before_root_lock_when_epoch_regresses_after_db_ownership(
     ) {
@@ -3393,8 +3472,9 @@ mod tests {
             .await
             .unwrap());
 
+        let blob_root = dir.path().join("blobs");
         let store = Arc::new(
-            FsBlobStore::new(dir.path().join("blobs"), 0)
+            FsBlobStore::new(blob_root.clone(), 0)
                 .unwrap()
                 .with_orphan_sweep_grace(Duration::ZERO),
         );
@@ -3403,11 +3483,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Hold the root guard externally. If the recheck still ran after
-        // root acquisition (the pre-fix order), the background call below
-        // would block waiting for this guard instead of refusing, and the
-        // timeout on its join would fire.
-        let _root_guard = store.write_lock.clone().lock_owned().await;
+        // Hold the same OS-level root lock the real sweep acquires, on the
+        // same canonicalized path it canonicalizes to.
+        let canonical_root = blob_root.canonicalize().unwrap();
+        let _root_write_guard = acquire_root_write_lock(&canonical_root).unwrap();
 
         // Key the hook by the same canonicalized path `SqlAccess::database_path`
         // returns -- not the raw `db_path` above -- since that's what the
@@ -3424,11 +3503,13 @@ mod tests {
 
         // The hook fires only once database ownership (process-local guard
         // plus the cross-process advisory lock) is held, strictly after the
-        // read-only preflight already observed a valid epoch.
-        assert!(
-            recv_blocking(reached).await,
-            "the sweep must reach database ownership before this test's timeout"
-        );
+        // read-only preflight already observed a valid epoch. Bounded so a
+        // regression that drops the hook call (or blocks ahead of it) fails
+        // this test instead of hanging it.
+        let reached_signal = tokio::time::timeout(Duration::from_secs(1), recv_blocking(reached))
+            .await
+            .expect("the sweep must reach database ownership before this test's timeout");
+        assert!(reached_signal, "hook sender was dropped before signaling");
         {
             let writer = backend.pool().writer().unwrap();
             writer
@@ -3440,7 +3521,11 @@ mod tests {
 
         let outcome = tokio::time::timeout(Duration::from_secs(1), handle)
             .await
-            .expect("the recheck must refuse before ever waiting on the externally held root lock")
+            .expect(
+                "the recheck must refuse before ever waiting on the externally held root lock -- \
+                 under the old (pre-fix) ordering this join times out instead, because the \
+                 sweep blocks acquiring the OS-level root lock held above",
+            )
             .unwrap();
         assert!(
             matches!(outcome, Err(StorageError::Unsupported { .. })),
