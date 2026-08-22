@@ -179,12 +179,14 @@ cascades incident edges** — `purge_incident_edges_statement` issues
 `DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1`, unconditionally and with no soft
 counterpart. For entity and note targets, the statement order inside the atomic plan is: the record's
 own row delete first (under an exactly-one-row guard), lineage-warning statements second, and the
-incident-edge purge LAST (`crates/khive-runtime/src/operations.rs`,
+incident-edge purge last of those three; the plan then appends FTS/vector index-purge statements and
+the deletion event after the purge (`crates/khive-runtime/src/operations.rs`,
 `crates/khive-runtime/src/atomic_prepare.rs` — both build this order for those targets). Nothing in a
 migration plan may therefore rely on the old record row still existing when the purge runs; it is
 already gone. The edge-as-node branch orders differently: when the deleted record is itself an edge,
 `atomic_prepare.rs` emits the lineage warnings first, purges incident edges second, and hard-deletes
-the edge row last — so a migration step deleting an edge record may still observe the edge row while
+the edge row last of those three (the deletion event is appended after the row delete) — so a
+migration step deleting an edge record may still observe the edge row while
 its incident purge runs. Because this ADR treats edges as valid provenance endpoints, a migration
 plan that touches edge records must be written against the edge branch's order, not the entity/note
 order. Either way the order is invisible to callers only because the whole plan commits in a single

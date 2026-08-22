@@ -69,16 +69,16 @@ pub enum EntityKind {
 }
 ```
 
-| Kind         | What it covers                                                                  |
-| ------------ | ------------------------------------------------------------------------------- |
-| **Concept**  | Algorithms, techniques, architectures, theories, models, research gaps, metrics |
-| **Document** | Papers, preprints, reports, blog posts, books, specifications, theses           |
-| **Dataset**  | Benchmarks, corpora, evaluation sets, training sets                             |
-| **Project**  | Codebases, libraries, tools, frameworks, applications, repositories             |
-| **Person**   | Researchers, engineers, authors                                                 |
-| **Org**      | Labs, companies, institutions, consortia, standards bodies                      |
-| **Artifact** | Generated/versioned state: checkpoints, snapshots, profiles, embedding indexes  |
-| **Service**  | Running operational instances: inference engines, deployed APIs, MCP servers    |
+| Kind         | What it covers                                                                     |
+| ------------ | ---------------------------------------------------------------------------------- |
+| **Concept**  | Algorithms, techniques, architectures, theories, models, research gaps, metrics    |
+| **Document** | Papers, preprints, reports, blog posts, books, specifications, theses              |
+| **Dataset**  | Benchmarks, corpora, evaluation sets, training sets                                |
+| **Project**  | Codebases, libraries, tools, frameworks, applications, repositories                |
+| **Person**   | Researchers, engineers, authors                                                    |
+| **Org**      | Labs, companies, institutions, consortia, standards bodies                         |
+| **Artifact** | Generated/versioned state: checkpoints, snapshots, profiles, embedding indexes     |
+| **Service**  | Deployed or deployable operational instances: inference engines, APIs, MCP servers |
 
 `Concept` remains the default / residual bucket.
 
@@ -468,7 +468,8 @@ They are generated, versioned, have derivation lineage, and no independent codeb
 
 Running inference engines, deployed APIs, and MCP servers fail the 5-test for `Project`:
 
-- A project is source code; a service is a running instance with health, latency, endpoints.
+- A project is source code; a service is a deployed or deployable operational instance with
+  health, latency, and endpoint semantics — running or between deployments.
 - `Project` cannot carry deployment state, endpoint URLs, or availability semantics.
 - "Show all running inference engines" requires `kind=Service`, not property filtering.
 
