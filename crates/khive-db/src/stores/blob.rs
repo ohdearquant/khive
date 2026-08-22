@@ -1254,18 +1254,37 @@ async fn validate_blob_gc_evidence(sql: &dyn SqlAccess) -> StorageResult<()> {
     // length() and GLOB both stop at an embedded NUL, so a value of 64 hex
     // characters followed by a NUL and arbitrary bytes passes them while
     // failing the exact-equality liveness anti-join. The byte-length arm
-    // closes that class: chars = 64 AND bytes = 64 forces a NUL-free,
-    // all-single-byte value.
+    // closes that class: chars = 64 AND bytes = 64 * the encoding's bytes
+    // per ASCII character forces a NUL-free canonical value. CAST(TEXT AS
+    // BLOB) yields the database text encoding's bytes (1 per hex char in
+    // UTF-8, 2 in UTF-16), so the width is derived from the same database
+    // rather than assumed, and an unrecognizable answer fails closed.
+    let canonical_bytes = match reader
+        .query_row(SqlStatement {
+            sql: "SELECT length(CAST('x' AS BLOB))".to_string(),
+            params: vec![],
+            label: Some("blob_gc_validate_encoding_width".to_string()),
+        })
+        .await?
+        .and_then(|row| row.columns.first().map(|column| column.value.clone()))
+    {
+        Some(SqlValue::Integer(width)) if (1..=4).contains(&width) => width * 64,
+        other => {
+            return Err(invalid_content_ref(format!(
+                "the text-encoding width probe returned {other:?}; refusing GC validation"
+            )));
+        }
+    };
     let invalid_claim = reader
         .query_row(SqlStatement {
             sql: "SELECT content_ref FROM blob_gc_claims \
                   WHERE typeof(content_ref) <> 'text' \
                      OR length(content_ref) <> 64 \
-                     OR length(CAST(content_ref AS BLOB)) <> 64 \
+                     OR length(CAST(content_ref AS BLOB)) <> ?1 \
                      OR content_ref GLOB '*[^0-9a-f]*' \
                   LIMIT 1"
                 .to_string(),
-            params: vec![],
+            params: vec![SqlValue::Integer(canonical_bytes)],
             label: Some("blob_gc_validate_existing_claims".to_string()),
         })
         .await?;
@@ -1280,11 +1299,11 @@ async fn validate_blob_gc_evidence(sql: &dyn SqlAccess) -> StorageResult<()> {
             sql: "SELECT content_ref FROM attachments \
                   WHERE typeof(content_ref) <> 'text' \
                       OR length(content_ref) <> 64 \
-                      OR length(CAST(content_ref AS BLOB)) <> 64 \
+                      OR length(CAST(content_ref AS BLOB)) <> ?1 \
                       OR content_ref GLOB '*[^0-9a-f]*' \
                   LIMIT 1"
                 .to_string(),
-            params: vec![],
+            params: vec![SqlValue::Integer(canonical_bytes)],
             label: Some("blob_gc_validate_live_refs".to_string()),
         })
         .await?;
@@ -4209,6 +4228,86 @@ mod tests {
         assert!(
             error.to_string().contains("second-digest"),
             "the refusal must name a second-digest arm, got {error}"
+        );
+    }
+
+    /// SQLite fixes the text encoding when the database file is first
+    /// initialized; creating (and dropping) a table under the pragma leaves
+    /// an initialized UTF-16LE database that later writers inherit.
+    fn initialize_utf16le_database(db_path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA encoding = 'UTF-16le'; \
+             CREATE TABLE __encoding_pin (x INTEGER); \
+             DROP TABLE __encoding_pin;",
+        )
+        .unwrap();
+    }
+
+    /// CAST(TEXT AS BLOB) yields the database encoding's bytes, so a fixed
+    /// bytes=64 arm would reject every valid 64-char ref in a UTF-16LE
+    /// database (128 bytes). The width-derived arm must pass them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_gc_evidence_accepts_valid_refs_in_a_utf16le_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        initialize_utf16le_database(&db_path);
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            let encoding: String = writer
+                .conn_mut()
+                .query_row("PRAGMA encoding", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                encoding, "UTF-16le",
+                "the fixture database must actually be UTF-16le"
+            );
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+
+        let sql = backend.sql();
+        super::validate_blob_gc_evidence(sql.as_ref())
+            .await
+            .expect("valid canonical refs must pass in a UTF-16LE database");
+    }
+
+    /// The NUL arm must stay red in UTF-16 as well: 64 chars + NUL + tail is
+    /// 130+ bytes against the expected 128.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_gc_evidence_rejects_a_nul_embedded_claim_ref_in_a_utf16le_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        initialize_utf16le_database(&db_path);
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            let encoding: String = writer
+                .conn_mut()
+                .query_row("PRAGMA encoding", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                encoding, "UTF-16le",
+                "the fixture database must actually be UTF-16le"
+            );
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                     VALUES ('nul-claim-key-utf16', ?1, 0)",
+                    rusqlite::params![nul_embedded_canonical_ref()],
+                )
+                .unwrap();
+        }
+
+        let sql = backend.sql();
+        let error = super::validate_blob_gc_evidence(sql.as_ref())
+            .await
+            .expect_err("a NUL-embedded claim ref must refuse the sweep in UTF-16LE too");
+        assert!(
+            error.to_string().contains("blob_gc_claims"),
+            "expected the claims-table refusal, got {error:?}"
         );
     }
 
