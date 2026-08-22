@@ -546,7 +546,7 @@ impl KhiveRuntime {
 
     /// Get a NoteStore scoped to the token's namespace.
     ///
-    /// Wrapped in [`crate::note_store_guard::PolicyEnforcingNoteStore`], which
+    /// Wrapped in `note_store_guard::PolicyEnforcingNoteStore`, which
     /// refuses any insert/upsert of a `kind = "message"` note carrying
     /// `quarantined` / `channel_kind` / `channel_slug` — the transport-owned
     /// evidence `comm.health` trusts at face value — and refuses patching
@@ -554,7 +554,7 @@ impl KhiveRuntime {
     /// the guard cannot be sidestepped by inserting a clean message note and
     /// patching the evidence onto it afterward. The trusted channel-ingest
     /// path does not go through this accessor; see
-    /// [`Self::raw_notes`] and [`Self::try_create_note_as_trusted_ingest`].
+    /// `Self::raw_notes` and [`Self::try_create_note_as_trusted_ingest`].
     pub fn notes(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn NoteStore>> {
         Ok(crate::note_store_guard::PolicyEnforcingNoteStore::wrap(
             self.raw_notes(token)?,
@@ -563,7 +563,7 @@ impl KhiveRuntime {
 
     /// Get the unwrapped, policy-free NoteStore scoped to the token's namespace.
     ///
-    /// Bypasses [`crate::note_store_guard::PolicyEnforcingNoteStore`]. Callers
+    /// Bypasses `note_store_guard::PolicyEnforcingNoteStore`. Callers
     /// within this crate that have already enforced the reserved-transport-
     /// property policy themselves (namely `try_create_note_impl`, which
     /// applies it conditionally based on whether the caller presented a
@@ -1126,7 +1126,7 @@ impl KhiveRuntime {
     ///
     /// The `NoteStore` returned by [`notes`](Self::notes) is covered by a
     /// different, narrower mechanism: it is wrapped in
-    /// [`crate::note_store_guard::PolicyEnforcingNoteStore`], which refuses
+    /// `note_store_guard::PolicyEnforcingNoteStore`, which refuses
     /// `upsert_note` / `upsert_notes` / `try_insert_note` /
     /// `replace_note_if_unchanged` calls that would write a `kind = "message"`
     /// note carrying `quarantined` / `channel_kind` / `channel_slug`, and
@@ -1134,7 +1134,7 @@ impl KhiveRuntime {
     /// `patch_note_property_atomic` / `update_note_properties` calls that
     /// would patch any of those keys onto any note — unconditionally, since
     /// that public accessor has no way to see a trust decision. `try_create_note_impl` itself reaches storage through
-    /// [`Self::raw_notes`], the unwrapped accessor, so its own inline check
+    /// `Self::raw_notes`, the unwrapped accessor, so its own inline check
     /// (which can legitimately allow those properties for trusted ingest)
     /// is not double-enforced or contradicted by the wrapper.
     /// Register a pack-defined custom fusion strategy under `name` (ADR-012).

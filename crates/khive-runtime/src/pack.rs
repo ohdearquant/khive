@@ -198,7 +198,7 @@ pub trait PackRuntime: Send + Sync {
     ///
     /// Called at most once per instance, immediately after this instance is
     /// constructed via [`PackFactory::create_install`], and only for packs
-    /// whose name appears in [`CHANNEL_INGEST_CAPABLE_PACKS`]. Storing the
+    /// whose name appears in `CHANNEL_INGEST_CAPABLE_PACKS`. Storing the
     /// grant on `self` (rather than on the `&'static dyn PackFactory`, which
     /// is a single process-wide singleton shared by every instance the
     /// factory ever creates) makes the grant instance-bound: a `CommPack`
@@ -2788,7 +2788,7 @@ pub struct PackInstall {
 ///
 /// Constructible only inside `khive-runtime` (the field is private), and
 /// granted during pack registration exclusively to factories named in
-/// [`CHANNEL_INGEST_CAPABLE_PACKS`]. Every call to
+/// `CHANNEL_INGEST_CAPABLE_PACKS`. Every call to
 /// [`crate::KhiveRuntime::try_create_note_as_trusted_ingest`] must present a
 /// reference to one, so the set of callers able to establish transport-owned
 /// message properties is bounded by possession at the composition root, not
