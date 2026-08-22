@@ -4,7 +4,7 @@ export type ShowcaseRegistryEntry = Readonly<{
   id: string;
   canonicalUrl: string;
   aliases: readonly string[];
-  assetPath: string;
+  assetPath?: string;
   analysisId?: string;
 }>;
 
@@ -94,20 +94,17 @@ export function resolveShowcaseRepository(
 }
 
 export function isAllowedShowcaseAsset(
-  assetPath: string,
+  assetPath: string | undefined,
   registry: readonly ShowcaseRegistryEntry[] = SHOWCASE_REGISTRY,
-): boolean {
-  return assetPath.startsWith(SHOWCASE_ASSET_PREFIX) &&
+): assetPath is string {
+  return typeof assetPath === "string" &&
+    assetPath.startsWith(SHOWCASE_ASSET_PREFIX) &&
     registry.some((entry) => entry.assetPath === assetPath);
 }
 
 export function isAllowedShowcaseAnalysis(
   entry: ShowcaseRegistryEntry,
-  registry: readonly ShowcaseRegistryEntry[] = SHOWCASE_REGISTRY,
 ): entry is ShowcaseRegistryEntry & Readonly<{ analysisId: string }> {
   return typeof entry.analysisId === "string" &&
-    /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(entry.analysisId) &&
-    registry.some((candidate) =>
-      candidate.id === entry.id && candidate.analysisId === entry.analysisId
-    );
+    /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(entry.analysisId);
 }
