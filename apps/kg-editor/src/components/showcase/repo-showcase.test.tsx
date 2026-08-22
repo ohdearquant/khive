@@ -65,7 +65,8 @@ describe("repository showcase", () => {
     const pushState = vi.spyOn(window.history, "pushState");
     const search = screen.getByRole("searchbox", { name: "Find a module or path" });
     await user.type(search, writer.source_path);
-    await user.click(screen.getByRole("button", { name: `Inspect ${writer.source_path}` }));
+    await user.click(within(screen.getByLabelText("Module search results"))
+      .getByRole("button", { name: `Inspect ${writer.source_path}` }));
     await waitFor(() =>
       expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(
         writer.source_path,
