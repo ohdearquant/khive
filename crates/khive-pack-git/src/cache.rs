@@ -696,6 +696,19 @@ fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
 /// the slot's `.git` tree concurrently with a `dir_size`/`evict_lru` walk
 /// (issue #842 flake family). See
 /// crates/khive-pack-git/docs/api/cache.md#clone-git-subprocess-maintenanceautofalse.
+///
+/// `--no-checkout` is what makes `--filter=blob:none` actually hold. Without
+/// it `git clone` checks out the default branch, and the checkout lazily
+/// backfills every blob reachable at `HEAD` — so the filtered clone pays for
+/// the blobs anyway and `dir_size` measures a filtered object store plus a
+/// fully materialized tree. Nothing reads this slot's worktree: every
+/// consumer command is `rev-parse`, `log`, or `remote`, all of which read
+/// refs and the object database. Measured on this repository:
+/// 61.7 MiB with the checkout, 5.6 MiB without, and all four reader commands
+/// return identical output either way.
+///
+/// The flag is only half the fix — see [`advance_to_fetched_tip`], which had
+/// to stop using `reset --hard` for the same reason.
 fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
     let status = Command::new("git")
         .arg("-c")
@@ -706,6 +719,7 @@ fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
         .arg("maintenance.auto=false")
         .arg("clone")
         .arg("--filter=blob:none")
+        .arg("--no-checkout")
         .arg(url)
         .arg(dest)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -720,39 +734,67 @@ fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Advance the cache clone's checked-out HEAD to the tip `fetch` just
-/// brought in. `git fetch` updates remote-tracking refs only; without this
-/// step the clone's HEAD stays wherever the original `git clone` (or the
-/// last reclone) left it, and every walk of `HEAD` silently covers stale
-/// history (issue #1644 — measured: a slot whose FETCH_HEAD was minutes old
-/// walked a HEAD three weeks behind and reported a clean empty pass). The
-/// clone is a disposable cache entry this crate owns outright and nothing
-/// ever writes into its worktree, so a hard reset to the fetched default
-/// branch is safe by construction. Failing to advance is a hard error, not
-/// a warning: proceeding would reintroduce the stale-walk defect silently.
+/// Advance the cache clone's `HEAD` to the tip `fetch` just brought in.
+/// `git fetch` updates remote-tracking refs only; without this step the
+/// clone's HEAD stays wherever the original `git clone` (or the last
+/// reclone) left it, and every walk of `HEAD` silently covers stale history
+/// (issue #1644 — measured: a slot whose FETCH_HEAD was minutes old walked a
+/// HEAD three weeks behind and reported a clean empty pass).
+///
+/// This moves a ref rather than resetting a working tree. `reset --hard`
+/// populates the index and the worktree, which on a `--no-checkout` slot
+/// materializes every blob reachable at the new tip and undoes the blob
+/// filter on each pass — measured on this repository: a 5.6 MiB slot became
+/// 62.5 MiB after one `reset --hard`. Nothing reads the worktree, so there
+/// is nothing for the reset to produce except the bytes the filter exists to
+/// avoid.
+///
+/// Failing to advance is a hard error, not a warning: proceeding would
+/// reintroduce the stale-walk defect silently.
 fn advance_to_fetched_tip(repo: &Path) -> Result<(), CacheError> {
     // `origin/HEAD` is created by `git clone`; repair it first in case an
     // older slot predates it or the remote's default branch moved. Best
-    // effort — the reset below is the step that must succeed.
+    // effort — the ref update below is the step that must succeed.
     let _ = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["remote", "set-head", "origin", "--auto"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .status();
-    let status = Command::new("git")
-        .arg("-c")
+
+    // A fresh slot's HEAD is a symref to the default branch, so the branch is
+    // what has to move for `rev-parse HEAD` and `log` to resolve at the tip.
+    // A slot whose HEAD is already detached has no branch to move, and there
+    // the HEAD file itself is the target. Both shapes occur: the first is
+    // what `git clone` produces, the second is reachable through repair paths
+    // and through slots older than this code.
+    let symref = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .map_err(|e| CacheError::Git(format!("spawning git symbolic-ref: {e}")))?;
+    let branch = String::from_utf8_lossy(&symref.stdout).trim().to_string();
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-C")
         .arg(repo)
-        .args(["reset", "--hard", "refs/remotes/origin/HEAD", "--"])
+        .arg("update-ref");
+    if symref.status.success() && !branch.is_empty() {
+        cmd.arg(&branch);
+    } else {
+        cmd.arg("--no-deref").arg("HEAD");
+    }
+    let status = cmd
+        .arg("refs/remotes/origin/HEAD")
         .status()
-        .map_err(|e| CacheError::Git(format!("spawning git reset: {e}")))?;
+        .map_err(|e| CacheError::Git(format!("spawning git update-ref: {e}")))?;
     if !status.success() {
         return Err(CacheError::Git(format!(
             "advancing {} to the fetched tip failed (exit {status}); a stale \
-             checkout would walk stale history, so this pass refuses to \
-             proceed",
+             HEAD would walk stale history, so this pass refuses to proceed",
             repo.display()
         )));
     }
@@ -1543,6 +1585,90 @@ mod tests {
             upstream_tip,
             "re-ensure must advance the checkout to the fetched tip \
              (issue #1644): a stale HEAD walks stale history"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Every entry in a cache slot that came from a checkout: everything
+    /// except `.git` and the cache's own `MARKER_FILE`, both of which this
+    /// crate writes itself. Named exclusions rather than a dotfile rule, so a
+    /// checked-out dotfile still counts as a materialized tree.
+    fn worktree_entries(slot: &Path) -> Vec<String> {
+        std::fs::read_dir(slot)
+            .expect("read cache slot")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != ".git" && name != MARKER_FILE)
+            .collect()
+    }
+
+    /// Issue #2104 defect 2: the slot is cloned `--filter=blob:none`, but a
+    /// checkout backfills every blob reachable at HEAD and undoes the filter.
+    /// Nothing reads this worktree — every consumer command is `rev-parse`,
+    /// `log`, or `remote` — so the materialized tree is pure cost.
+    ///
+    /// The second half of this test is the one that matters. `--no-checkout`
+    /// alone does not hold: the previous `advance_to_fetched_tip` ran
+    /// `reset --hard`, which repopulates the worktree on the very next
+    /// `ensure_clone` and gives the bytes straight back. So the assertion
+    /// after the re-ensure is what fails if the ref update ever regresses to
+    /// a reset, and the assertion on the fresh clone alone would not catch it.
+    #[test]
+    fn cache_slot_never_materializes_a_working_tree() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
+
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        test_git(&upstream, &["init", "-q"]);
+        test_git(&upstream, &["config", "user.email", "t@example.com"]);
+        test_git(&upstream, &["config", "user.name", "T"]);
+        std::fs::write(upstream.join("tracked.md"), "content\n").unwrap();
+        test_git(&upstream, &["add", "tracked.md"]);
+        test_git(&upstream, &["commit", "-q", "-m", "commit A"]);
+
+        // The upstream itself HAS a working tree, so an empty result from
+        // `worktree_entries` below is a real absence and not a helper that
+        // always returns nothing.
+        assert!(
+            worktree_entries(&upstream).contains(&"tracked.md".to_string()),
+            "control: the upstream must have a materialized tree, else the \
+             assertions below prove nothing"
+        );
+
+        let url = upstream.to_str().expect("utf8 path");
+        let slot = ensure_clone(url).expect("initial clone");
+        assert_eq!(
+            worktree_entries(&slot),
+            Vec::<String>::new(),
+            "a fresh cache slot must not check out a working tree"
+        );
+        assert_eq!(
+            test_head_sha(&slot),
+            test_head_sha(&upstream),
+            "HEAD must still resolve without a checkout"
+        );
+
+        std::fs::write(upstream.join("second.md"), "more\n").unwrap();
+        test_git(&upstream, &["add", "second.md"]);
+        test_git(&upstream, &["commit", "-q", "-m", "commit B"]);
+        let upstream_tip = test_head_sha(&upstream);
+
+        let slot2 = ensure_clone(url).expect("re-ensure existing slot");
+        assert_eq!(slot2, slot, "same cache slot");
+        assert_eq!(
+            test_head_sha(&slot2),
+            upstream_tip,
+            "advancing to the fetched tip must still work without a checkout"
+        );
+        assert_eq!(
+            worktree_entries(&slot2),
+            Vec::<String>::new(),
+            "advancing the slot must move a ref, not reset a working tree: a \
+             `reset --hard` here repopulates the tree and undoes the blob \
+             filter on every pass"
         );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
