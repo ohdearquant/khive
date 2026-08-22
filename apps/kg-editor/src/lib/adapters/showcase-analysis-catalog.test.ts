@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { SHOWCASE_ACCESS_TOKEN_STORAGE_KEY } from "@/lib/adapters/preferred-showcase-source";
 import {
   loadShowcaseAnalysisCatalog,
   mergeShowcaseRegistry,
@@ -173,6 +174,35 @@ describe("showcase analysis catalog", () => {
       status: "degraded",
       entries: [],
       message: expect.stringMatching(/catalog.*unavailable/i),
+    });
+  });
+
+  it("sends the operator bearer token on the catalog fetch when a session token is present", async () => {
+    window.sessionStorage.setItem(
+      SHOWCASE_ACCESS_TOKEN_STORAGE_KEY,
+      "  operator-secret  ",
+    );
+    try {
+      const fetchCatalog = vi.fn(async () => catalogResponse({}, 404));
+      await loadShowcaseAnalysisCatalog(fetchCatalog);
+      expect(fetchCatalog).toHaveBeenCalledWith("/api/showcase/analyses", {
+        cache: "no-store",
+        credentials: "same-origin",
+        redirect: "error",
+        headers: { authorization: "Bearer operator-secret" },
+      });
+    } finally {
+      window.sessionStorage.removeItem(SHOWCASE_ACCESS_TOKEN_STORAGE_KEY);
+    }
+  });
+
+  it("sends no Authorization header on the catalog fetch when no session token is present", async () => {
+    const fetchCatalog = vi.fn(async () => catalogResponse({}, 404));
+    await loadShowcaseAnalysisCatalog(fetchCatalog);
+    expect(fetchCatalog).toHaveBeenCalledWith("/api/showcase/analyses", {
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error",
     });
   });
 

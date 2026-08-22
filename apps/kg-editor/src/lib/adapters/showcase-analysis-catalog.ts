@@ -1,3 +1,4 @@
+import { readOperatorShowcaseAccessToken } from "@/lib/adapters/preferred-showcase-source";
 import {
   normalizeRepositoryUrl,
   SHOWCASE_REGISTRY,
@@ -102,10 +103,14 @@ export async function loadShowcaseAnalysisCatalog(
   fetchCatalog: ShowcaseCatalogFetch = fetch,
 ): Promise<ShowcaseAnalysisCatalogResult> {
   try {
+    const accessToken = readOperatorShowcaseAccessToken()?.trim();
     const response = await fetchCatalog("/api/showcase/analyses", {
       cache: "no-store",
       credentials: "same-origin",
       redirect: "error",
+      ...(accessToken
+        ? { headers: { authorization: `Bearer ${accessToken}` } }
+        : {}),
     });
     if (response.status === 404) {
       return {

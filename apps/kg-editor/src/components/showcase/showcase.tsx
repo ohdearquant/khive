@@ -29,7 +29,11 @@ import {
   resolveShowcaseRepository,
   type ShowcaseRegistryEntry,
 } from "@/lib/showcase-registry";
-import { parseRepositoryLocation } from "@/lib/repository-location";
+import {
+  parseRepositoryLocation,
+  repositoryLocationUrl,
+  type RepositoryLocation,
+} from "@/lib/repository-location";
 
 type LoadState =
   | Readonly<{ status: "loading"; entry: ShowcaseRegistryEntry }>
@@ -98,16 +102,19 @@ function replaceRepositoryQuery(
   repository?: string,
   clearInvestigation = true,
 ) {
-  const query = new URL(window.location.href);
-  if (repository) query.searchParams.set("repo", repository);
-  else query.searchParams.delete("repo");
-  if (clearInvestigation) {
-    query.searchParams.delete("at");
-    query.searchParams.delete("module");
-    query.searchParams.delete("view");
-  }
-  const search = query.searchParams.size ? `?${query.searchParams.toString()}` : "";
-  window.history.replaceState(null, "", `${query.pathname}${search}${query.hash}`);
+  const current = new URL(window.location.href);
+  const location: RepositoryLocation = {
+    repository: repository ?? null,
+    snapshotSha: clearInvestigation ? null : current.searchParams.get("at"),
+    modulePath: clearInvestigation
+      ? null
+      : current.searchParams.get("module"),
+    view: clearInvestigation
+      ? null
+      : (current.searchParams.get("view") as RepositoryLocation["view"]),
+  };
+  const url = repositoryLocationUrl(current, location);
+  window.history.replaceState(null, "", `${url.pathname}${url.search}`);
 }
 
 export function Showcase() {
@@ -160,6 +167,10 @@ export function Showcase() {
   useEffect(() => {
     let cancelled = false;
     const sequence = ++loadSequence.current;
+    replaceRepositoryQuery(
+      new URL(window.location.href).searchParams.get("repo") ?? undefined,
+      false,
+    );
     void loadShowcaseAnalysisCatalog().then((catalogResult) => {
       if (cancelled || loadSequence.current !== sequence) return;
       const registry = mergeShowcaseRegistry(catalogResult.entries);

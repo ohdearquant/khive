@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   loadPreferredShowcaseBundle,
+  readOperatorShowcaseAccessToken,
   ShowcaseAnalysisNotFoundError,
 } from "@/lib/adapters/preferred-showcase-source";
 import { loadShowcaseAnalysisCatalog } from "@/lib/adapters/showcase-analysis-catalog";
@@ -35,6 +36,7 @@ const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-rep
 const bundle = parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
 const mockedLoad = vi.mocked(loadPreferredShowcaseBundle);
 const mockedCatalog = vi.mocked(loadShowcaseAnalysisCatalog);
+const mockedAccessToken = vi.mocked(readOperatorShowcaseAccessToken);
 const defaultCatalogEntry = {
   analysis_id: "khive",
   canonical_url: "https://github.com/ohdearquant/khive",
@@ -51,6 +53,8 @@ describe("materialized repository lookup", () => {
       entries: [defaultCatalogEntry],
       message: "1 configured repository analysis discovered.",
     });
+    mockedAccessToken.mockReset();
+    mockedAccessToken.mockReturnValue(null);
   });
 
   it("resolves the repository in a direct URL before loading the default", async () => {
@@ -206,6 +210,40 @@ describe("materialized repository lookup", () => {
     );
   });
 
+  it("sends the operator bearer token on catalog discovery and still merges dynamic entries", async () => {
+    mockedAccessToken.mockReturnValue("operator-secret");
+    const actualCatalog = await vi.importActual<
+      typeof import("@/lib/adapters/showcase-analysis-catalog")
+    >("@/lib/adapters/showcase-analysis-catalog");
+    const dynamicUrl = "https://github.com/example/header-check-only";
+    const dynamicAnalysisId = "header-check-only";
+    const body = new TextEncoder().encode(JSON.stringify({
+      schema_version: "khive.showcase.catalog.v1",
+      entries: [{ analysis_id: dynamicAnalysisId, canonical_url: dynamicUrl }],
+    }));
+    const fetchCatalog = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-length": String(body.byteLength) }),
+      arrayBuffer: async () => body.buffer as ArrayBuffer,
+    }));
+    mockedCatalog.mockImplementation(() =>
+      actualCatalog.loadShowcaseAnalysisCatalog(fetchCatalog)
+    );
+
+    render(<Showcase />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: dynamicUrl })).toBeInTheDocument()
+    );
+    expect(fetchCatalog).toHaveBeenCalledWith(
+      "/api/showcase/analyses",
+      expect.objectContaining({
+        headers: { authorization: "Bearer operator-secret" },
+      }),
+    );
+  });
+
   it("waits for catalog discovery before resolving a dynamic deep link", async () => {
     const dynamicAnalysisId = "deep-link-only";
     let releaseCatalog: ((value: Awaited<ReturnType<typeof loadShowcaseAnalysisCatalog>>) => void) | undefined;
@@ -338,6 +376,67 @@ describe("materialized repository lookup", () => {
     expect(screen.getByLabelText("Analysis source")).toHaveTextContent(
       "khive DB snapshot",
     );
+  });
+
+  it("drops foreign query parameters and the fragment from history on a successful initial resolution", async () => {
+    const repo = bundle.meta.repository.canonical_url;
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent(repo)}&access_token=secret#fragment`,
+    );
+
+    const { container } = render(<Showcase />);
+
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    const url = new URL(window.location.href);
+    expect(url.searchParams.get("repo")).toBe(repo);
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.hash).toBe("");
+    expect([...url.searchParams.keys()]).toEqual(
+      expect.arrayContaining(["repo"]),
+    );
+    for (const key of url.searchParams.keys()) {
+      expect(["repo", "at", "module", "view"]).toContain(key);
+    }
+  });
+
+  it("drops foreign query parameters and the fragment from history for an invalid repository", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${
+        encodeURIComponent("ftp://example.com/owner/repo")
+      }&access_token=secret#fragment`,
+    );
+
+    render(<Showcase />);
+
+    expect(await screen.findByText("Repository lookup could not start")).toBeVisible();
+    const url = new URL(window.location.href);
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.hash).toBe("");
+    expect([...url.searchParams.keys()]).toEqual(["repo"]);
+  });
+
+  it("drops foreign query parameters and the fragment from history for a registry miss", async () => {
+    const repo = "https://github.com/example/not-catalog-registered";
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent(repo)}&access_token=secret#fragment`,
+    );
+
+    render(<Showcase />);
+
+    expect(
+      await screen.findByText("No curated showcase bundle matches this repository"),
+    ).toBeVisible();
+    const url = new URL(window.location.href);
+    expect(url.searchParams.get("repo")).toBe(repo);
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.hash).toBe("");
+    expect([...url.searchParams.keys()]).toEqual(["repo"]);
   });
 
   it("renders an honest miss when a dynamic-only analysis disappears", async () => {
