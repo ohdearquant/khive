@@ -1,4 +1,4 @@
-# ADR-167: Service Provenance, Service/Concept Classification, and Kind Migration
+# ADR-167: Service Provenance and Service/Concept Classification
 
 **Status**: proposed\
 **Date**: 2026-08-20\
@@ -46,12 +46,11 @@ procedure, not a missing procedure.
 that path destroys edges under the only deletion mode that can actually free the record.**
 Measured against the 19-service population: 16 carry at least one edge and 3 carry none. A
 HARD delete-and-recreate across the population would destroy **62 edges**, of which **42 are
-`annotates`** — the figure is stated for `DeleteMode::Hard` specifically, because soft deletion
-destroys none of them and instead strands all 62 on a deleted endpoint (Decision 3). Because each of those 42 runs note → entity in the measured
-population (the contract itself admits edge targets for `annotates` as well — the closure
-requirement in Decision 3 exists for exactly that case), each destroyed annotates
-edge leaves a note whose subject no longer exists — the note survives, saying something about
-nothing, which is worse than either deleting it or keeping it attached.
+`annotates`**. The figure is stated for `DeleteMode::Hard` specifically, because soft deletion
+destroys none of them and instead strands all 62 on a deleted endpoint. Because each of those 42
+runs note → entity in the measured population, each destroyed `annotates` edge leaves a note whose
+subject no longer exists — the note survives, saying something about nothing, which is worse than
+either deleting it or keeping it attached.
 
 Enumerating that blast radius has a complication of its own, because an edge may itself be an
 endpoint. `endpoint_exists_clause` in `crates/khive-db/src/stores/graph.rs` admits an undeleted
@@ -61,36 +60,16 @@ filter `list(kind="edge", target_id=…)` does reach them: the earlier report th
 (issue #2085) has been retracted, and an integration test covering the edge-as-target case matches.
 
 What remains open is exhaustive ENUMERATION, which is a different question from whether the filter
-matches. Two independent gaps stand between the listing surface and the set the purge will delete.
-
-First, offset paging over multiple namespaces was unsound when this ADR was drafted. Issue #2088
-recorded that the multi-namespace visibility path fetched each namespace's rows ordered by
-`created_at`, re-sorted the union by UUID, and then sliced `[offset, offset+limit)`: the window
-floats as the prefix grows, so successive pages both duplicate and skip rows while reporting
-nothing wrong, in both filter directions (`source_id` and `target_id` share the listing path).
-That defect has since been fixed: the multi-namespace branch now issues a single statement over
-the whole namespace set with a real `LIMIT`/`OFFSET` (the change that closed #2088), and the
-exact-enumeration and page-stability regressions are owned by that change's own tests. This ADR
-does not re-own them; the defect remains in this record because it is measured evidence of how
-quietly an enumeration can be incomplete, which is the failure class the contract below exists
-to exclude.
-
-Second — and this holds even now that the listing paths are sound — the listing surface answers
-a narrower question than the purge asks. `list_edges_after` (`crates/khive-runtime/src/operations.rs`) walks
-the durable insertion-sequence ledger correctly, but it is visibility-scoped to the caller's
-namespaces and, like every listing path, filters to live rows (`deleted_at IS NULL`). The purge is
+matches, and it is why this ADR does not decide the migration question. The listing surface answers
+a narrower question than the purge asks. `list_edges_after`
+(`crates/khive-runtime/src/operations.rs`) walks the durable insertion-sequence ledger correctly,
+but it is visibility-scoped to the caller's namespaces and, like every listing path, filters to
+live rows (`deleted_at IS NULL`). The purge is
 `DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1` — no namespace predicate, no
 tombstone predicate. An incident edge in a namespace the migrating caller cannot see, or one
 already soft-deleted, passes a visible/live enumeration and its matching count while the purge
 deletes it anyway. A completeness check scoped narrower than the destructive statement it guards
 is not a completeness check.
-
-The enumeration contract in Decision 3 is therefore stated against the purge's own predicate: the
-authoritative enumeration is a direct query executed inside the migration's own transaction using
-the same `source_id = ?1 OR target_id = ?1` predicate as the purge, with no visibility scoping and
-no live-row filter, so the enumerated set equals the destructive set by construction. The cursor
-walk remains the sound primitive for caller-facing pre-checks and planning reads; it is not the
-completeness instrument.
 
 ## Decision
 
@@ -118,8 +97,8 @@ endpoint table.
 ### 2. Amend ADR-001's decision tree with a deterministic service/concept tie-break
 
 ADR-001 §"Agent Classification Heuristics" stays the single classification source. This ADR does
-not introduce a parallel set of criteria; it amends ADR-001 in place — this PR carries the
-ADR-001 edit, and the operative text is ADR-001's new §"Service/concept tie-break". The
+not introduce a parallel set of criteria; it amends ADR-001 in place, and the operative text is
+ADR-001's §"Service/concept tie-break", which ADR-001 already carries. The
 amendment replaces step 5's condition with a sub-procedure over two predicates, each decidable
 from the record being written (its name, description, `entity_type`, and properties), with no
 reference to the writer's state of mind or to the world at write time:
@@ -155,306 +134,35 @@ defects: no arm can be masked by ordering, every predicate is a presence test on
 own fields and vocabulary, and codebase identity is routed to step 6 before `Service` can be
 reached.
 
-### 3. Kind migration: keep delete-and-recreate, and require a re-anchor plan
+### 3. Kind migration: deferred to a successor ADR
 
-We propose **not** adding a kind-migration mechanism, and instead requiring that any
-delete-and-recreate carries a written re-anchor plan. The reasoning is priced against the
-measured number rather than asserted.
+**This ADR specifies no kind-migration mechanism and proposes none.** The measured consequences in
+Context item 3 stand as the record of why the question is open. The closure procedure that would
+answer it is deliberately absent rather than pending.
 
-A migration mechanism would have to re-point every inbound and outbound edge, preserve edge ids
-so that anything referencing an edge stays valid, and preserve `annotates` targets across the
-substrate boundary. That is a substantial amount of runtime surface, and the population it would
-serve is small: kind changes are rare, and the store measured 19 services in total.
+The reason is a shape argument, not a scheduling one. A correct closure rule for a
+delete-and-recreate has to be a total function over the product of five independent dimensions: the
+substrate of each incident record (entity, note, event, or edge), the relation kind, the endpoint
+role the migrating record occupies in that relation, the liveness of the incident row (live or
+already tombstoned), and the namespace it lives in relative to the migrating caller's visibility.
+Context item 3 above demonstrates four of those five changing the correct answer — an edge that is
+itself an endpoint, an `annotates` edge whose destruction orphans a note, an already-tombstoned
+incident row, and a row outside the caller's visible namespaces — and the purge's own predicate
+ignores the last two entirely. A rule stated for the cases that have come up is not a specification
+of that function. It is a set of points on it, and the distance between the two is exactly where an
+edge gets destroyed without appearing in any enumeration that preceded it.
 
-Against that, the cost of the status quo is bounded and known — 62 edges across a whole-population
-hard migration, 42 of them annotations. For a single-record correction the cost is that record's own
-edge count, which is typically small.
-
-So the proposal is a **procedure**, not a mechanism. Two things have to be pinned down before the
-steps make sense, because the earlier draft of this section left both implicit and the procedure was
-unsound without them.
-
-**Deletion mode, and what each mode actually does.** `DeleteMode` (`crates/khive-storage/src/types/mod.rs`)
-has two variants and they differ in exactly the way that matters here. `Soft` marks `deleted_at` and
-leaves the row queryable under an explicit soft-delete filter. `Hard` physically removes the row **and
-cascades incident edges** — `purge_incident_edges_statement` issues
-`DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1`, unconditionally and with no soft
-counterpart. For entity and note targets, the statement order inside the atomic plan is: the record's
-own row delete first (under an exactly-one-row guard), lineage-warning statements second, and the
-incident-edge purge last of those three; the plan then appends FTS/vector index-purge statements and
-the deletion event after the purge (`crates/khive-runtime/src/operations.rs`,
-`crates/khive-runtime/src/atomic_prepare.rs` — both build this order for those targets). Nothing in a
-migration plan may therefore rely on the old record row still existing when the purge runs; it is
-already gone. The edge-as-node branch orders differently: when the deleted record is itself an edge,
-`atomic_prepare.rs` emits the lineage warnings first, purges incident edges second, and hard-deletes
-the edge row last of those three (the deletion event is appended after the row delete) — so a
-migration step deleting an edge record may still observe the edge row while
-its incident purge runs. Because this ADR treats edges as valid provenance endpoints, a migration
-plan that touches edge records must be written against the edge branch's order, not the entity/note
-order. Either way the order is invisible to callers only because the whole plan commits in a single
-synchronous pass — which is one more reason the atomicity requirement below is load-bearing rather
-than advisory.
-
-Two consequences, and the first is a correction to this ADR's own framing. **The 62-edge figure is a
-HARD-delete figure.** A soft delete destroys no edges at all; it leaves every one of them as a live row
-pointing at a record that now reads as deleted. So soft deletion is not the cheap option it appears to
-be — it converts edge destruction into a set of edges whose endpoint no longer satisfies
-`endpoint_exists_clause`, which is a worse state than either outcome, because nothing reports it. And
-hard deletion is genuinely irreversible: the cascade is a `DELETE`, there is no `deleted_at` to
-restore from, and edges are not FTS or vector indexed so no secondary copy exists.
-
-**Therefore the whole correction is one atomic unit, or it is not attempted.** The runtime already has
-the seam: `atomic_prepare` builds a plain-data `AtomicOpPlan` that `run_atomic_unit` commits in a
-single synchronous pass, with a per-statement `AffectedRowGuard`. A kind correction is prepared as one
-such plan covering deletion and every recreation, so a failure after the delete rolls the delete back
-with it. **A correction executed as a sequence of independent calls is out of contract**, because the
-window between the cascade and the last recreation is exactly where the edges are unrecoverable.
-
-**Edges whose triples become ILLEGAL under the new kind.** Recreation is not always available, and this
-is not an edge case: `Org contains Service` has no `Org contains Concept` counterpart in the endpoint
-matrix, so an org-contained service cannot simply be recreated as a concept. Every incident edge must
-therefore be classified against ADR-002's matrix BEFORE anything is deleted, into exactly four
-dispositions for a live edge — a tombstoned edge takes the tombstone-only outcomes below
-instead — each of which must be written down per edge:
-
-- **PRESERVE** — the edge is live, the resulting triple is legal, and an id-preserving endpoint
-  move (ADR-113's `move_edge_endpoint`) is available in the running system and collision-free for
-  this edge. A tombstoned edge never qualifies (see the tombstone rule below). Liveness is a
-  precondition this ADR imposes on the disposition and checks before the plan is prepared; it is
-  not inherited from the move primitive. ADR-113 specifies id preservation, canonicalization,
-  collision failure, and endpoint validation, and it does not read `deleted_at`, so a move issued
-  against a tombstoned row is not refused downstream — only this check stops it. The
-  edge keeps its id while the endpoint fields referencing the moved subject are updated (the
-  primitive takes one or both fields): for an incident edge, every endpoint field referencing the
-  migrating record moves onto the new record; for a
-  closure member, the target moves to its annotated subject's mapped replacement — a closure
-  member is never moved onto the new record. A closure
-  member whose subject is itself preserved needs no move at all: its target id is still valid.
-  **A move whose RESULT would be a self-loop never qualifies.** Endpoint validation rejects
-  `source_id == target_id` for every relation as its first check, and ADR-113 re-validates the
-  resulting endpoints, so a legacy self-loop incident on the migrating record cannot be preserved
-  by moving both of its fields onto the new record: the result is rejected, not written. Such a
-  row is a REFUSE. This is not a gap in the procedure but the endpoint contract holding: a
-  self-loop is a below-seam or legacy row, and ADR-034's `no-self-loops` audit, not a kind
-  correction, is where it is resolved.
-  Because the id survives, every annotation targeting a PRESERVEd edge stays valid with no
-  re-anchoring. Preferred over RECREATE wherever it qualifies. It exempts nothing: the edge still
-  appears in the closure enumeration, its disposition is still written down, and any move still
-  executes inside the same atomic plan as the rest of the correction.
-- **RECREATE** — the triple is legal under the new kind. Recreate and read back.
-- **RE-EXPRESS** — the triple is illegal but the fact survives under a different relation or a
-  different endpoint. Name the replacement triple and why it carries the same claim.
-- **REFUSE** — the fact has no legal expression under the new kind. This does not mean drop the edge;
-  it means **the migration does not proceed** on that record until someone decides, on the record,
-  either to accept the loss with a named carrier for the fact or to leave the kind as it is.
-
-The default is REFUSE. A procedure whose failure mode is a silently dropped edge is the thing this
-ADR exists to prevent, so an unclassifiable edge stops the migration rather than being absorbed by it.
-
-**Determinacy, stated once so it need not be restated per rule.** Every row this procedure
-enumerates — each incident edge, each closure edge, each closure note, each named carrier — must
-resolve to exactly one outcome under the rules below, decided before any plan is prepared. A row
-with no outcome, with two outcomes that disagree, or with an outcome the endpoint contract would
-reject, is a REFUSE. The rules that follow name the determinate answer wherever one exists; where
-they do not, this clause is the answer, and it fails toward stopping the migration rather than
-toward a plan whose result nobody stated.
-
-Two rules sit beside the four dispositions and are written down with the same discipline:
-
-**Annotation dispositions.** The four dispositions above classify an edge's TRIPLE against the
-endpoint matrix. Separately, every annotation in the closure — an `annotates` edge together with
-the note it anchors — carries its own recorded disposition: **re-anchor** (to the target read off
-the closure-substrate map), **delete** (the annotation is removed with its subject), or **carrier**
-(the note is re-anchored to a named carrier record that preserves the claim). A disposition names
-its outcome for both rows it governs, because they are separate substrates: re-anchor updates the
-`annotates` edge's target and retains the note unchanged; delete removes the `annotates` edge and
-states explicitly whether the note is deleted with it or retained as an orphaned free-standing
-note; carrier retains the note and re-points the `annotates` edge at the named carrier. Each
-deletion is written into the plan per row before anything executes. This is not REFUSE's forbidden
-"drop the edge": a REFUSE is an unclassifiable fact stopping the migration, while an annotation
-deletion is a decided, per-row, recorded outcome.
-
-Two recorded sources, and only these two, produce a **named deletion** entry in the
-closure-substrate map (step 3): an annotation whose recorded disposition is delete, and an edge
-carrying the NAMED-DELETION tombstone outcome below. A RE-EXPRESSed edge's original is also
-deleted, but it appears in the map as the mapping to its replacement, not as a deletion entry.
-Nothing else in the procedure deletes a row outside the record's own purge cascade.
-
-**A note's outcome aggregates every annotation that targets it.** Dispositions are recorded per
-annotation, and a note may be the subject of several, so the map's single note entry is derived
-from all of them together: the note is deleted only when EVERY annotation in the closure targeting
-it carries a delete disposition that names the note; if any one of them retains the note —
-re-anchor, carrier, or a delete that names only the annotation edge — the note is retained and
-carries an identity entry, while the deleting annotations' own edges are still deleted. Deleting a
-note that another surviving annotation still anchors would manufacture the dangling reference this
-procedure exists to prevent, so the rule resolves toward retention by construction and needs no
-refusal.
-
-**A named carrier is resolved through the map like any other reference.** A carrier disposition
-names a record that must, at plan time, either be live and outside the purge set, or appear in the
-closure-substrate map with an entry resolving to a row that is live after the plan commits. A
-carrier naming a row that maps to a named deletion, or to a tombstoned replacement, cannot preserve
-the claim it was chosen to carry and is a REFUSE. The post-plan verification checks every carrier
-target the same way it checks every annotation target.
-
-**Tombstone rule.** The purge set includes tombstoned edges, so they receive dispositions like
-every other row, but no disposition changes their deletedness. A tombstoned edge is never
-PRESERVEd — the liveness precondition on that disposition is this ADR's, checked here, not a
-property the move primitive enforces — and is never recreated live: clearing or omitting
-`deleted_at` on the replacement row would resurrect an edge someone deleted. A tombstoned edge
-therefore takes one of two recorded outcomes, or REFUSE if neither applies:
-
-- **RECREATE-TOMBSTONED** — the triple is legal under the new kind, and the replacement row is
-  created carrying forward the same `deleted_at` value the original held. The map records the
-  original's id mapping to the tombstoned replacement.
-- **NAMED-DELETION** — the fact is not carried forward. The map records a named deletion for that
-  edge id with the tombstone noted, and the plan carries the explicit `DELETE` statement for it.
-
-NAMED-DELETION is available to tombstoned edges only; a live edge with no legal expression is a
-REFUSE, which stops the migration, never a deletion. An annotation targeting a tombstoned edge
-follows the map, with one restriction the map alone does not express: **a live annotation is never
-re-anchored onto a tombstoned replacement.** Endpoint validation admits only an undeleted row as an
-edge target, so re-anchoring there would write an edge the contract rejects, and a tombstoned
-replacement is by definition deleted. An annotation whose subject takes RECREATE-TOMBSTONED
-therefore has exactly two outcomes, delete or carrier, and a recorded re-anchor disposition on such
-an annotation is a REFUSE.
-
-With those settled, a kind correction:
-
-1. Enumerates the **complete purge set** before deleting anything: a direct query inside the
-   migration's own transaction using the purge's own predicate
-   (`source_id = ?1 OR target_id = ?1`), with **no visibility scoping and no live-row filter** —
-   every namespace, tombstoned rows included, because the purge deletes across both (see the
-   enumeration note in Context). The collected edge IDs are deduplicated (an edge matching on
-   both source and target — a self-loop — is one row and is counted once) and reconciled
-   against an independently computed `COUNT(*)` under the same predicate in the same
-   transaction; a mismatch stops the migration before any destructive plan is prepared. The
-   caller-facing cursor walk (`list_edges_after`) may be used for planning reads, but the
-   destructive plan is prepared only from the in-transaction enumeration. Offset paging is
-   out of contract in any role, in either direction.
-2. Enumerates the annotation closure under the same completeness contract: starting from the
-   enumerated incident edges, repeatedly collects the `annotates` edges whose TARGET is any
-   edge **or note** already in the set, together with the notes those edges anchor, until a
-   pass adds nothing — a fixed-point walk with a visited set over the ids of everything the
-   set holds, edges and notes alike. Expanding through note targets is not optional: the
-   closure contains notes, and ADR-002 rule 1 places no kind restriction on an `annotates`
-   target (an entity, a note, or any edge), so a second note may annotate a note already in
-   the closure; a walk that expands only through edge ids never finds that annotation, and
-   deleting or re-anchoring its subject leaves it dangling. The same rule is why the fixed
-   point is required at all: chains of edge- and note-targeting annotations are
-   constructible; creation order alone would keep them acyclic, but an endpoint move can
-   re-point an edge after creation and nothing in the contract rules a cycle out, so
-   termination comes from the visited set, never from assumed acyclicity. One level is not
-   enough: a note annotating an edge that itself annotates an incident edge is deleted or
-   left dangling by any plan that stops at the first level. The walk carries a work bound,
-   `max_closure_rows`, defined as the cardinality of the visited set — every distinct edge id
-   and note id the closure holds, counted once each, incident edges included. Its default is
-   10,000, a finite value chosen to sit far above any closure a normal correction produces
-   and far below a resource hazard; a caller may raise it per call up to a hard ceiling of
-   1,000,000 rows that the caller cannot raise or disable, and a requested override above that
-   ceiling is refused as an invalid argument before the walk starts rather than silently clamped.
-   When the visited set would exceed the effective bound, the walk stops and the migration is refused
-   before any plan is prepared, reporting the bound and the count reached: annotation chains
-   are caller-constructible, so an unbounded walk is a resource hazard, and the failure mode
-   is a refused migration, never a truncated closure. All queries are
-   direct in-transaction reads over the enumerated ids, with no visibility or live-row
-   filter. A recreated edge is a new edge id, so an edge-targeting annotation is orphaned
-   by recreation even when the record's own annotations were handled correctly. Every edge
-   in the closure receives a step-3 disposition; every annotation in the closure receives
-   its own recorded re-anchor, delete, or carrier disposition (see the annotation rule
-   above).
-3. Classifies every enumerated edge — incident edges and every closure member alike — as PRESERVE,
-   RECREATE, RE-EXPRESS or REFUSE against the endpoint matrix (a tombstoned edge takes
-   RECREATE-TOMBSTONED, NAMED-DELETION or REFUSE instead), records every annotation's re-anchor,
-   delete, or carrier disposition, and builds the **closure-substrate map** covering the whole
-   set before anything is deleted. The map is keyed by id over BOTH substrates the closure holds,
-   because an `annotates` target may be either: every enumerated edge id and every enumerated
-   note id appears in it exactly once, and every entry resolves to one of three outcomes —
-   an id (the row survives under that id), a planned replacement id (created within the plan),
-   or a named deletion.
-   - **Edge entries.** A PRESERVEd edge maps to itself. A recreated or re-expressed edge maps to
-     its planned replacement. A NAMED-DELETION edge, and an edge whose recorded annotation
-     disposition is delete, map to a named deletion.
-   - **Note entries.** A note is never recreated: its id is stable across the correction, so a
-     retained note — the outcome for re-anchor and for carrier — maps to itself as an identity
-     entry. A note deleted under a delete disposition maps to a named deletion. A note retained
-     as free-standing under a delete disposition is an identity entry like any other retained
-     note. There is no fourth outcome: a note whose disposition leaves it neither retained nor
-     deleted is unclassified, which is a REFUSE.
-
-   Every `annotates` edge's re-anchor target is then read off that map, never assumed, whichever
-   substrate the target lives in: an annotation of the record itself re-anchors to the new record;
-   an annotation of a closure edge re-anchors to that edge's mapped replacement — the edge itself
-   when preserved, its recreation when recreated, never the new record; an annotation of a closure
-   NOTE re-anchors to that note's map entry, which is the same note id whenever the note is
-   retained, so the annotation needs no move; an annotation whose subject maps to a named deletion
-   is itself deleted or re-anchored to a named carrier. A note left pointing at a deleted subject
-   is not an acceptable outcome. **Any REFUSE stops here.**
-4. Prepares deletion and all recreations as ONE atomic plan and commits it, with the plan's
-   internal order fixed in five phases. Atomicity gives rollback, not ordering — a plan that
-   purged the incident edges before moving them would lose exactly the ids PRESERVE exists to
-   keep, inside a transaction that commits clean, and a plan that moved a closure member before
-   its mapped target existed would move it onto an id no row carries.
-   1. **New record created.**
-   2. **Incident PRESERVE moves.** Every PRESERVEd incident edge moves its endpoint fields
-      referencing the migrating record onto the new record.
-   3. **Deletion.** The purge cascade runs, followed by an explicit `DELETE` for every named
-      deletion whose row the cascade does not reach — a closure member is not incident to the
-      migrating record, so the purge predicate never matches it and the cascade never touches it;
-      only this statement removes it.
-   4. **Recreations.** Every RECREATE, RE-EXPRESS and RECREATE-TOMBSTONED replacement is created,
-      so that every planned replacement id in the closure-substrate map now names a live row
-      (a tombstoned replacement carries its `deleted_at` forward and is a row, not a live edge).
-   5. **Post-recreation closure re-anchors.** Every closure member whose subject maps to a
-      replacement moves its target onto that replacement. These moves run last because their
-      targets do not exist before phase 4. A closure member whose subject maps to itself — a
-      PRESERVEd edge, or any retained note — needs no move and none is planned for it.
-
-   **Every endpoint field has exactly one owning phase, and the two owners are disjoint by
-   predicate.** Phase 2 owns every field whose stored value is the MIGRATING RECORD's id; phase 5
-   owns every annotation target field whose stored value is a CLOSURE SUBJECT's id that the map
-   sends to a replacement. No field satisfies both, because the migrating record is not a closure
-   subject: it is the record being replaced, and its own annotations re-anchor to the new record
-   under phase 2, not to a replacement under phase 5. An annotation of the migrating record that is
-   itself annotated is therefore a phase-2 move as an incident edge and a phase-5 SUBJECT for the
-   annotation above it, which are different rows and different fields. Where such an annotation is
-   RECREATEd rather than preserved, its replacement is created in phase 4 already carrying the new
-   record as its target, and it is excluded from phase 5, because a row created with the right
-   target has nothing to move.
-
-   Every move statement in phases 2 and 5 carries two postconditions: an `AffectedRowGuard`
-   requiring exactly one row changed, and an endpoint read-back asserting the moved field now
-   equals the mapped target the plan named for that row. Both apply to closure members, not only
-   to incident edges. Between phases 2 and 3 the plan re-runs the purge predicate and requires
-   that no PRESERVEd incident edge id still matches it; a match stops the plan (a moved edge still
-   referencing the old record is a failed move, not a candidate for deletion). That predicate is
-   incident-scoped by construction and says nothing about closure members, so after phase 5 the
-   plan verifies the map directly: every entry that resolves to an id or a replacement id names a
-   row that exists, every `annotates` edge in the closure targets its subject's mapped outcome,
-   and no surviving row references a purged id. A recreated edge is a new edge id, so anything
-   that referenced the old id does not follow and must be re-pointed in the same plan.
-5. Records the old record's id in the new record's properties, so the discontinuity is traceable.
-
-Relation to ADR-113: ADR-113's `move_edge_endpoint` primitive preserves an edge id when an
-endpoint moves between records, and with it every annotation targeting the edge — and its split
-recipe composes exactly the shape a kind migration needs: create the new record, then move each
-qualifying edge onto it. The PRESERVE disposition above is that composition applied here. Three
-conditions gate it per edge, all from ADR-113's own contract: the resulting triple must be legal
-under the new kind (the primitive re-validates the endpoint contract), the move must not collide
-with an existing natural key (the primitive fails loud rather than dropping the edge), and the
-primitive must exist in the running system (ADR-113 is Proposed; a system without the operation
-takes the delete-and-recreate path for every edge). An edge failing any of the three falls
-through to RECREATE, RE-EXPRESS or REFUSE, and the annotation closure above is what keeps its
-annotations from dangling.
-
-If kind changes later become common enough that this procedure is being run routinely, that is the
-evidence that would justify the mechanism, and the count of times it has been run is what should
-open that decision. This ADR does not pre-commit to it.
+**A successor ADR specifying that function is REQUIRED before any implementation may depend on kind
+migration.** Until such an ADR is accepted, kind remains immutable in practice: a misclassified
+record is corrected by delete-and-recreate at the operator's own risk, with the blast radius in
+Context item 3 as the standing estimate of what that costs. Nothing accepted here creates or
+implies a supported migration path.
 
 ## Acceptance criteria
 
-Each decision above is accepted by a test that fails against the pre-image. An implementation of
-this ADR is complete when all of the following hold:
+Decisions 1 and 2 are each accepted by a test that fails against the pre-image. Decision 3
+specifies no mechanism and therefore carries no criteria. An implementation of this ADR is complete
+when all of the following hold:
 
 **Endpoint pair (Decision 1).**
 
@@ -466,9 +174,9 @@ this ADR is complete when all of the following hold:
 
 **Classification tie-break (Decision 2).**
 
-- ADR-001 itself carries the amendment in this PR's diff: its decision tree's step 5 names the
-  instance-evidence test and its §"Service/concept tie-break" states the D/T partition. A test
-  reading ADR-001 finds the operative text; ADR-167 records the decision and rationale.
+- ADR-001 itself carries the amendment: its decision tree's step 5 names the instance-evidence
+  test and its §"Service/concept tie-break" states the D/T partition. A test reading ADR-001
+  finds the operative text; ADR-167 records the decision and rationale.
 - Each arm has a worked fixture stated as exact record fields, with the tree preconditions
   explicit (every fixture is not a person, org, document, or dataset, so steps 1-4 are false
   by construction), and an expected stored outcome decidable from the written rule alone:
@@ -499,124 +207,6 @@ this ADR is complete when all of the following hold:
     `Concept` per step 9, with the open classification question recorded as a note
     annotating the record — the question-note trigger (deployment vocabulary present, no
     instance identifier) is exactly this case.
-
-**Migration procedure (Decision 3).**
-
-- Enumeration, exactness: multi-namespace listing exactness (every row exactly once across
-  pages, stable page order) is owned by the tests of the change that closed #2088 and is not
-  re-owned here; this ADR's enumeration criteria assume it and test what the listing surface
-  cannot answer.
-- Enumeration, destructive-scope completeness: the fixture is this exact matrix of six
-  incident edges on the migrating record R. The caller's visible namespaces are `ns_a` and
-  `ns_b`; `ns_hidden` is not visible to it. The invisible row (e5) and the tombstoned row
-  (e6) are distinct edges, both directions appear in both the included and excluded sets,
-  and e3 is a self-loop matching the purge predicate on both source and target:
-
-  | id | source → target   | namespace   | deleted_at | in visible/live walk | in purge set |
-  | -- | ----------------- | ----------- | ---------- | -------------------- | ------------ |
-  | e1 | R → X1            | `ns_a`      | live       | yes                  | yes          |
-  | e2 | X2 → R            | `ns_a`      | live       | yes                  | yes          |
-  | e3 | R → R (self-loop) | `ns_a`      | live       | yes                  | yes, once    |
-  | e4 | X3 → R            | `ns_b`      | live       | yes                  | yes          |
-  | e5 | R → X4            | `ns_hidden` | live       | no (namespace)       | yes          |
-  | e6 | X5 → R            | `ns_a`      | tombstoned | no (live filter)     | yes          |
-
-  The visible/live enumeration (cursor walk or listing surface) returns exactly
-  {e1, e2, e3, e4}. The in-transaction purge-predicate enumeration returns exactly
-  {e1, e2, e3, e4, e5, e6}, each id once — e3 appears once despite matching both the
-  source and target arms of the predicate (the predicate is evaluated per row, so the one
-  self-loop row matches once) — and reconciles with `COUNT(*)` = 6 under the same predicate
-  in the same transaction, the same count Decision 3 step 1 names. All six rows receive dispositions
-  before any plan is prepared, because the purge would delete all six. A migration
-  prepared from the four-row visible/live enumeration must be refused, and the refusal is
-  the asserted outcome, not a warning. e3 is a legacy self-loop and its asserted outcome is
-  REFUSE: preserving it would put the new record in both endpoint fields, and endpoint validation
-  rejects `source_id == target_id` for every relation as its first check, so the move is rejected
-  rather than written. A run that reports a successful PRESERVE for e3 has found a procedure
-  asserting an outcome its own authorities forbid, which is what this arm exists to catch. e3 is
-  still enumerated and still receives a written disposition; what it does not receive is a plan.
-
-  Because a REFUSE stops the whole migration, this matrix runs as two arms. The ENUMERATION arm
-  uses all six rows and asserts two things: the in-transaction enumeration returns exactly the six
-  ids with e3 counted once, and the migration then refuses on e3 before any plan is prepared, with
-  no row in the store changed. The OUTCOME arm drops e3 and uses the remaining five, so the
-  dispositions, the plan phases, and the post-plan verification below are reachable and asserted.
-  Stating both is what keeps the enumeration assertion and the outcome assertions from silently
-  trading places: a procedure that quietly skipped e3 would pass an outcome-only fixture.
-  For e6, the tombstone rule is the asserted outcome, and both of its outcomes are exercised:
-  e6 is never PRESERVEd; under RECREATE-TOMBSTONED its replacement row carries the same
-  `deleted_at` it had before, and under NAMED-DELETION the map records its named deletion with
-  the tombstone noted and the plan carries the explicit `DELETE` for it. A live row where e6's
-  fact used to be is a resurrection and a defect the fixture must catch, whichever outcome ran.
-  The NAMED-DELETION arm also asserts what produced the map entry: e6 carries no annotation, so
-  a procedure whose only named-deletion source is an annotation disposition cannot classify it,
-  and a fixture that reaches a map without an entry for e6 has found that defect.
-- Edge-as-endpoint coverage: the fixture includes an `annotates` edge whose TARGET is itself an
-  edge incident to the migrating record, a second-level chain — a note whose `annotates`
-  edge targets that first `annotates` edge — and a note-target chain: a further note whose
-  `annotates` edge targets a NOTE already in the closure (the second-level note), which an
-  edge-id-only walk never finds. The closure enumeration finds all three levels, and
-  after migration every annotation's target is asserted by the closure-substrate map's outcome
-  for its subject: a PRESERVEd subject keeps its original id and the annotation still points at
-  it; a recreated or re-expressed subject's annotation points at the mapped replacement id;
-  a deleted subject's annotation follows its recorded deletion-or-carrier disposition. No
-  annotation points at a purged edge id under any disposition mix. A migration
-  prepared from a one-level enumeration must be refused, for the same reason the four-row
-  visible/live enumeration above is refused.
-- Note subjects in the map: the note-target chain above is run three times, once per note
-  outcome, and each asserts the map entry as well as the resulting target. Retained under
-  re-anchor: the closure note carries an identity entry and the annotation targeting it is
-  unchanged, with no move planned for it. Deleted: the note carries a named deletion, and the
-  annotation targeting it is itself deleted or re-anchored to its named carrier, with the
-  explicit `DELETE` present in the plan because no cascade reaches a non-incident row. Retained
-  as free-standing under a delete disposition: the `annotates` edge below it is deleted while
-  the note carries an identity entry and reads back intact. A map missing an entry for any
-  enumerated note id is the defect this arm exists to catch — a per-edge map passes every other
-  assertion here.
-- Plan ordering across substrates: the fixture places a closure member whose subject is a
-  RECREATEd incident edge, so its mapped target does not exist until the recreation phase. The
-  asserted outcome is that its move executes after that recreation and its endpoint read-back
-  names the replacement id; a plan that moves it beside the incident PRESERVE moves fails,
-  because the target id names no row at that point. Every move in the plan, incident or closure,
-  asserts one affected row and its endpoint read-back.
-- Move ownership across roles: the fixture includes an `annotates` edge whose target IS the
-  migrating record and which is itself the subject of a second annotation, so the same edge is an
-  incident row and a closure subject at once. Run twice. When it is PRESERVEd, the asserted outcome
-  is one move in phase 2 onto the new record, no phase-5 move for that row, and the annotation
-  above it re-anchored in phase 5 to that same unchanged id. When it is RECREATEd, the asserted
-  outcome is that its replacement is created in phase 4 already carrying the new record as its
-  target and is excluded from phase 5, while the annotation above it re-anchors to the replacement.
-  Two moves planned against one field is the defect this arm catches, and the affected-row guard is
-  what reports it.
-- Tombstoned subject with a live annotation: the fixture soft-deletes an incident edge that still
-  carries a live annotation, which the runtime permits. Under RECREATE-TOMBSTONED, the asserted
-  outcome is that the annotation is deleted or moved to a named carrier and is NEVER re-anchored
-  onto the tombstoned replacement; a recorded re-anchor disposition on that annotation refuses the
-  migration before any plan is prepared. An annotation left pointing at a deleted edge is the
-  defect this arm catches.
-- Carrier resolution: two arms. A carrier naming a row inside the purge set whose map entry is a
-  named deletion refuses the migration before any plan is prepared. A carrier naming a row the map
-  sends to a replacement completes, and the post-plan verification asserts the annotation's target
-  equals that replacement's id, not the carrier's original id.
-- Conflicting note dispositions: one note is targeted by two annotations in the closure, one
-  carrying delete-with-note and one carrying re-anchor. The asserted outcome is that the note is
-  RETAINED with an identity entry and the deleting annotation's own edge is still deleted. An
-  outcome where the note is deleted while a surviving annotation still anchors it is the dangling
-  reference this whole procedure exists to prevent.
-- Closure work bound: a fixture whose annotation chain exceeds `max_closure_rows` refuses the
-  migration before any plan is prepared, reporting the bound and the count reached; no row in
-  the store changes. The paired arm raises the bound for the same fixture and completes, so the
-  refusal is attributable to the bound and not to the chain's shape. A third arm requests an
-  override above the hard ceiling and asserts the call is rejected as an invalid argument before
-  the walk starts — never clamped to the ceiling and run, which would look identical to success.
-- Disposition gate: a fixture edge with no legal expression under the new kind (for example
-  `Org contains <record>` migrating to `concept`) causes the migration to stop with a REFUSE
-  before any plan is prepared; no row in the store changes.
-- Atomicity and rollback: with the full plan prepared, a forced failure on a late statement (a
-  violated `AffectedRowGuard` on one of the recreations) rolls the whole plan back — the old
-  record row, every incident edge, and every annotating note read back unchanged afterward.
-- Traceability: after a successful migration, the new record's properties carry the old record's
-  id.
 
 ## Consequences
 
