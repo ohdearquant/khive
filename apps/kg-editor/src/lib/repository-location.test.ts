@@ -130,6 +130,36 @@ describe("repository investigation location", () => {
     expect(url.href).not.toContain("another-secret");
   });
 
+  it("strips a credential nested inside the repo value before writing history", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: "https://github.com/example/repo?access_token=super-secret",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.get("repo")).toBe("https://github.com/example/repo");
+    expect(url.href).not.toContain("super-secret");
+  });
+
+  it("strips a fragment nested inside the repo value before writing history", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: "https://github.com/example/repo#access_token=super-secret",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.get("repo")).toBe("https://github.com/example/repo");
+    expect(url.href).not.toContain("super-secret");
+  });
+
   it("drops a fragment-borne credential instead of preserving it", () => {
     const url = repositoryLocationUrl(
       new URL(

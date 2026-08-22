@@ -182,14 +182,25 @@ export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
 // URL that arrived with an unrelated query parameter or fragment — a
 // credential such as ?access_token=..., a fragment-borne secret, a tracker
 // value — is never copied forward: the URL is rebuilt from the origin and
-// path only, and every other parameter and the hash are discarded.
+// path only, and every other parameter and the hash are discarded. The same
+// guarantee extends to the repo VALUE itself: a credential nested inside it
+// (e.g. a raw, not-yet-validated `repo` param carrying its own
+// `?access_token=...`) is stripped before the value is written, so it can
+// never survive into history, a referrer header, or a copied link either.
+function historySafeRepositoryValue(value: string): string {
+  const delimiterIndex = value.search(/[?#]/u);
+  return delimiterIndex === -1 ? value : value.slice(0, delimiterIndex);
+}
+
 export function repositoryLocationUrl(
   base: URL,
   location: RepositoryLocation,
 ): URL {
   const url = new URL(base.origin + base.pathname);
   const values: Record<LocationParameter, string | null> = {
-    repo: location.repository,
+    repo: location.repository === null
+      ? null
+      : historySafeRepositoryValue(location.repository),
     at: location.snapshotSha,
     module: location.modulePath,
     view: location.view,
@@ -203,16 +214,15 @@ export function repositoryLocationUrl(
 
 /**
  * The shareable form of an investigation URL. `repositoryLocationUrl`
- * already discards every foreign query parameter and the fragment, but a
- * validated repository URL may legitimately carry a query string or
- * fragment of its OWN (deep-link support keeps those in-browser), so this
- * boundary also applies to the parameter VALUES, not just the parameter
- * names: the shared repository value is normalized to origin + pathname,
- * and a module path carrying a URL query or fragment delimiter is omitted
- * entirely rather than encoded into the value, because encoding preserves
- * — not redacts — whatever the delimiter introduced. `at` and `view` need
- * no value boundary: their parse contracts are a 40-hex SHA and a closed
- * id set.
+ * already discards every foreign query parameter and the fragment, and
+ * strips a repository value's own nested query/fragment before writing it
+ * to history. This share form applies the same value boundary more
+ * strictly still: the shared repository value is normalized to origin +
+ * pathname (not just truncated at the first delimiter), and a module path
+ * carrying a URL query or fragment delimiter is omitted entirely rather
+ * than encoded into the value, because encoding preserves — not redacts —
+ * whatever the delimiter introduced. `at` and `view` need no value
+ * boundary: their parse contracts are a 40-hex SHA and a closed id set.
  */
 export function investigationShareUrl(
   base: URL,

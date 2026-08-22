@@ -7,6 +7,7 @@ import {
   parseShowcaseAnalysisCatalog,
   SHOWCASE_CATALOG_MAX_BYTES,
   SHOWCASE_CATALOG_MAX_ENTRIES,
+  SHOWCASE_CATALOG_TIMEOUT_MS,
 } from "@/lib/adapters/showcase-analysis-catalog";
 import type { ShowcaseRegistryEntry } from "@/lib/showcase-registry";
 
@@ -32,6 +33,29 @@ function catalogResponse(
       ...headers,
     }),
     arrayBuffer: () => Promise.resolve(bytes.buffer as ArrayBuffer),
+    body: null,
+  };
+}
+
+function chunkedCatalogResponse(chunks: readonly Uint8Array<ArrayBuffer>[]) {
+  const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+  const arrayBuffer = vi.fn(async () => {
+    throw new Error("arrayBuffer() should not be used when a body stream is available");
+  });
+  return {
+    response: {
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      arrayBuffer,
+      body: stream,
+    },
+    arrayBuffer,
   };
 }
 
@@ -189,6 +213,7 @@ describe("showcase analysis catalog", () => {
         cache: "no-store",
         credentials: "same-origin",
         redirect: "error",
+        signal: expect.any(AbortSignal),
         headers: { authorization: "Bearer operator-secret" },
       });
     } finally {
@@ -203,6 +228,7 @@ describe("showcase analysis catalog", () => {
       cache: "no-store",
       credentials: "same-origin",
       redirect: "error",
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -219,6 +245,43 @@ describe("showcase analysis catalog", () => {
     await expect(loadShowcaseAnalysisCatalog(fetchCatalog)).resolves.toMatchObject({
       status: "degraded",
     });
+  });
+
+  it("rejects an oversized chunked body with no Content-Length before full materialization", async () => {
+    const chunk = new Uint8Array(64 * 1024).fill(0x20);
+    const { response, arrayBuffer } = chunkedCatalogResponse([
+      chunk,
+      chunk,
+      chunk,
+      chunk,
+      chunk,
+    ]);
+    const fetchCatalog = vi.fn(async () => response);
+
+    await expect(loadShowcaseAnalysisCatalog(fetchCatalog)).resolves.toEqual({
+      status: "degraded",
+      entries: [],
+      message: expect.stringMatching(/catalog.*unavailable/i),
+    });
+    expect(arrayBuffer).not.toHaveBeenCalled();
+  });
+
+  it("resolves to degraded within the timeout bound when the catalog fetch never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchCatalog = vi.fn(() => new Promise<never>(() => {}));
+      const resultPromise = loadShowcaseAnalysisCatalog(fetchCatalog);
+
+      await vi.advanceTimersByTimeAsync(SHOWCASE_CATALOG_TIMEOUT_MS);
+
+      await expect(resultPromise).resolves.toEqual({
+        status: "degraded",
+        entries: [],
+        message: expect.stringMatching(/catalog.*unavailable/i),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("merges dynamic and static entries by normalized URL", () => {

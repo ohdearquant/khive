@@ -226,6 +226,7 @@ describe("materialized repository lookup", () => {
       status: 200,
       headers: new Headers({ "content-length": String(body.byteLength) }),
       arrayBuffer: async () => body.buffer as ArrayBuffer,
+      body: null,
     }));
     mockedCatalog.mockImplementation(() =>
       actualCatalog.loadShowcaseAnalysisCatalog(fetchCatalog)
@@ -455,12 +456,13 @@ describe("materialized repository lookup", () => {
     expect([...url.searchParams.keys()]).toEqual(["repo"]);
   });
 
-  it("drops foreign query parameters and the fragment from history for a registry miss", async () => {
+  it("drops foreign query parameters, the fragment, and a credential nested inside the repo value from history for a registry miss", async () => {
     const repo = "https://github.com/example/not-catalog-registered";
+    const nestedCredentialRepo = `${repo}?access_token=SECRET`;
     window.history.replaceState(
       null,
       "",
-      `/?repo=${encodeURIComponent(repo)}&access_token=secret#fragment`,
+      `/?repo=${encodeURIComponent(nestedCredentialRepo)}&access_token=TOP#frag`,
     );
 
     render(<Showcase />);
@@ -469,9 +471,32 @@ describe("materialized repository lookup", () => {
       await screen.findByText("No curated showcase bundle matches this repository"),
     ).toBeVisible();
     const url = new URL(window.location.href);
+    // The repo value is preserved minus its own nested query/fragment —
+    // the credential inside it must not survive into history.
     expect(url.searchParams.get("repo")).toBe(repo);
     expect(url.searchParams.has("access_token")).toBe(false);
     expect(url.hash).toBe("");
+    expect(url.href).not.toContain("SECRET");
+    expect(url.href).not.toContain("TOP");
+    expect([...url.searchParams.keys()]).toEqual(["repo"]);
+  });
+
+  it("drops a credential nested inside the repo value from history on the invalid branch", async () => {
+    const nestedCredentialRepo = "ftp://example.com/owner/repo?access_token=SECRET";
+    window.history.replaceState(
+      null,
+      "",
+      `/?repo=${encodeURIComponent(nestedCredentialRepo)}&access_token=TOP#frag`,
+    );
+
+    render(<Showcase />);
+
+    expect(await screen.findByText("Repository lookup could not start")).toBeVisible();
+    const url = new URL(window.location.href);
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.hash).toBe("");
+    expect(url.href).not.toContain("SECRET");
+    expect(url.href).not.toContain("TOP");
     expect([...url.searchParams.keys()]).toEqual(["repo"]);
   });
 

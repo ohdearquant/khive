@@ -7,6 +7,7 @@ import {
 
 export const SHOWCASE_CATALOG_MAX_ENTRIES = 64;
 export const SHOWCASE_CATALOG_MAX_BYTES = 256 * 1024;
+export const SHOWCASE_CATALOG_TIMEOUT_MS = 5_000;
 
 const ANALYSIS_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const CATALOG_SCHEMA = "khive.showcase.catalog.v1";
@@ -31,7 +32,7 @@ export type ShowcaseAnalysisCatalogResult =
 export type ShowcaseCatalogFetch = (
   input: string,
   init?: RequestInit,
-) => Promise<Pick<Response, "ok" | "status" | "headers" | "arrayBuffer">>;
+) => Promise<Pick<Response, "ok" | "status" | "headers" | "arrayBuffer" | "body">>;
 
 function exactKeys(value: object, expected: readonly string[]): boolean {
   return Object.keys(value).sort().join(",") === [...expected].sort().join(",");
@@ -99,54 +100,123 @@ export function parseShowcaseAnalysisCatalog(
   return entries;
 }
 
+function abortRejection(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    const onAbort = () => reject(new Error("catalog request timed out"));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function readBoundedCatalogBody(
+  response: Pick<Response, "arrayBuffer" | "body">,
+  signal: AbortSignal,
+): Promise<Uint8Array> {
+  const body = response.body;
+  if (!body) {
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > SHOWCASE_CATALOG_MAX_BYTES) {
+      return invalidCatalog();
+    }
+    return new Uint8Array(buffer);
+  }
+
+  const reader = body.getReader();
+  const onAbort = () => void reader.cancel();
+  signal.addEventListener("abort", onAbort, { once: true });
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > SHOWCASE_CATALOG_MAX_BYTES) {
+        await reader.cancel();
+        return invalidCatalog();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+async function fetchCatalogResult(
+  fetchCatalog: ShowcaseCatalogFetch,
+  signal: AbortSignal,
+): Promise<ShowcaseAnalysisCatalogResult> {
+  const accessToken = readOperatorShowcaseAccessToken()?.trim();
+  const response = await fetchCatalog("/api/showcase/analyses", {
+    cache: "no-store",
+    credentials: "same-origin",
+    redirect: "error",
+    signal,
+    ...(accessToken
+      ? { headers: { authorization: `Bearer ${accessToken}` } }
+      : {}),
+  });
+  if (response.status === 404) {
+    return {
+      status: "static-only",
+      entries: [],
+      message: "The server analysis catalog is not configured; curated static repositories remain available.",
+    };
+  }
+  if (!response.ok) {
+    throw new Error(`catalog HTTP ${response.status}`);
+  }
+
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (
+    Number.isFinite(declaredLength) &&
+    declaredLength > SHOWCASE_CATALOG_MAX_BYTES
+  ) {
+    return invalidCatalog();
+  }
+  const bytes = await readBoundedCatalogBody(response, signal);
+  const json = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  const entries = parseShowcaseAnalysisCatalog(JSON.parse(json));
+  return {
+    status: "ready",
+    entries,
+    message: `${entries.length} configured repository ${entries.length === 1 ? "analysis" : "analyses"} discovered.`,
+  };
+}
+
 export async function loadShowcaseAnalysisCatalog(
   fetchCatalog: ShowcaseCatalogFetch = fetch,
 ): Promise<ShowcaseAnalysisCatalogResult> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    SHOWCASE_CATALOG_TIMEOUT_MS,
+  );
   try {
-    const accessToken = readOperatorShowcaseAccessToken()?.trim();
-    const response = await fetchCatalog("/api/showcase/analyses", {
-      cache: "no-store",
-      credentials: "same-origin",
-      redirect: "error",
-      ...(accessToken
-        ? { headers: { authorization: `Bearer ${accessToken}` } }
-        : {}),
-    });
-    if (response.status === 404) {
-      return {
-        status: "static-only",
-        entries: [],
-        message: "The server analysis catalog is not configured; curated static repositories remain available.",
-      };
-    }
-    if (!response.ok) {
-      throw new Error(`catalog HTTP ${response.status}`);
-    }
-
-    const declaredLength = Number(response.headers.get("content-length"));
-    if (
-      Number.isFinite(declaredLength) &&
-      declaredLength > SHOWCASE_CATALOG_MAX_BYTES
-    ) {
-      return invalidCatalog();
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > SHOWCASE_CATALOG_MAX_BYTES) {
-      return invalidCatalog();
-    }
-    const json = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    const entries = parseShowcaseAnalysisCatalog(JSON.parse(json));
-    return {
-      status: "ready",
-      entries,
-      message: `${entries.length} configured repository ${entries.length === 1 ? "analysis" : "analyses"} discovered.`,
-    };
+    return await Promise.race([
+      fetchCatalogResult(fetchCatalog, controller.signal),
+      abortRejection(controller.signal),
+    ]);
   } catch {
     return {
       status: "degraded",
       entries: [],
       message: "The server analysis catalog is unavailable; curated static repositories remain available.",
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
