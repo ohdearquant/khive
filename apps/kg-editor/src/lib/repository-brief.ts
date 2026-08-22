@@ -254,10 +254,10 @@ function pageMetric(
       ? "truncated"
       : "complete";
   const reason = page.disclosure.reason ??
-    (status === "truncated" && page.next_cursor != null
-      ? PAGE_CONTINUATION_REASON
-      : status !== "complete" && page.total_count.status === "unavailable"
+    (status !== "complete" && page.total_count.status === "unavailable"
       ? page.total_count.reason
+      : status === "truncated" && page.next_cursor != null
+      ? PAGE_CONTINUATION_REASON
       : null);
   const reasonSuffix = reason ? `; ${reason}` : "";
   const summary = status === "complete"

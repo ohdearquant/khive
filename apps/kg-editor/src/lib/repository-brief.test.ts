@@ -400,6 +400,28 @@ describe("repository triage model", () => {
     });
   });
 
+  it("keeps the unknown-total reason on a cursor-bearing page instead of the generic continuation text", () => {
+    const cursorUnknownTotal = structuredClone(bundle);
+    cursorUnknownTotal.aggregates.hidden_coupling.data.truncated = false;
+    cursorUnknownTotal.aggregates.hidden_coupling.data.disclosure = {
+      status: "complete",
+      reason: null,
+    };
+    cursorUnknownTotal.aggregates.hidden_coupling.data.next_cursor =
+      "offset:1000";
+    cursorUnknownTotal.aggregates.hidden_coupling.data.total_count = {
+      status: "unavailable",
+      reason: "total not computed for this export",
+    };
+
+    const target = buildRepositoryBrief(bundle).startHere[0];
+    const insight = buildModuleInsight(cursorUnknownTotal, target.moduleId);
+    expect(insight?.couplingState).toMatchObject({
+      status: "truncated",
+      reason: "total not computed for this export",
+    });
+  });
+
   it("finds a module by the path a user already knows", () => {
     const matches = findRepositoryModules(bundle, "pool.rs", 8);
     expect(matches.items.length).toBeGreaterThan(0);
