@@ -261,22 +261,24 @@ fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cach
     let repo_dir = root.join(&key);
     let cap = clone_max_bytes();
 
+    // Slots created before `clone` gained `--no-checkout` still carry a
+    // worktree, and nothing else on this path would ever remove it. Such a slot
+    // is replaced whole rather than stripped in place: the removal re-derives
+    // ownership from a descriptor it opens itself, so this change adds no new
+    // destructive traversal.
+    let mut migrated = false;
     if repo_dir.join(".git").exists() {
         if !is_owned_entry(&repo_dir) {
             return Err(CacheError::UnsafeToReplace(repo_dir));
         }
-        // Slots created before `clone` gained `--no-checkout` still carry a
-        // worktree, and nothing else on this path would ever remove it. Such a
-        // slot is replaced whole rather than stripped in place: the removal
-        // below re-derives ownership from a descriptor it opens itself, and
-        // after it `.git` is gone, so the fresh no-checkout installer in the
-        // `else` arm is what reinstates the slot.
-        if slot_carries_worktree(&repo_dir)? {
-            remove_owned_entry(root, &repo_dir)?;
-        }
+        migrated = migrate_legacy_slot(root, &repo_dir)?;
     }
 
-    if repo_dir.join(".git").exists() {
+    // `!migrated` and not a second `.git.exists()` read on its own. Asking the
+    // filesystem again would answer a question about whatever occupies that
+    // pathname NOW, which after a removal is not necessarily anything this
+    // process owns; the fetch arm below would then operate on it unchecked.
+    if !migrated && repo_dir.join(".git").exists() {
         fetch(&repo_dir)?;
         advance_to_fetched_tip(&repo_dir)?;
         // `repo_dir` was just fetched into and its ownership already
@@ -334,8 +336,7 @@ fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cac
     // that no slot carries a worktree, not that no slot acquires one. A fresh
     // install is already the repaired state this path was trying to reach, so
     // there is nothing left to refetch afterwards.
-    if slot_carries_worktree(&repo_dir)? {
-        remove_owned_entry(root, &repo_dir)?;
+    if migrate_legacy_slot(root, &repo_dir)? {
         install_fresh_clone(canonical_url, root, &repo_dir, cap)?;
         evict_lru(root, &repo_dir)?;
         return Ok(repo_dir);
@@ -870,6 +871,7 @@ fn advance_to_fetched_tip(repo: &Path) -> Result<(), CacheError> {
 /// reinstall of a slot that is about to be fetched anyway, and a false negative
 /// leaves the slot exactly as it was before this change. It never decides what
 /// gets deleted; the removal re-derives that from a descriptor it opens itself.
+#[cfg(unix)]
 fn slot_carries_worktree(repo: &Path) -> Result<bool, CacheError> {
     let entries = std::fs::read_dir(repo).map_err(|e| {
         CacheError::Git(format!(
@@ -886,6 +888,38 @@ fn slot_carries_worktree(repo: &Path) -> Result<bool, CacheError> {
         }
         return Ok(true);
     }
+    Ok(false)
+}
+
+/// Replace a legacy worktree-carrying slot, reporting whether it did.
+///
+/// Returns `true` when the slot was removed, which means the caller must treat
+/// the cache key as absent from that point on and must NOT re-derive that fact
+/// by asking the filesystem again: between the removal and any such re-check,
+/// an external writer can create a directory at the same pathname, and the
+/// caller would then fetch into, ref-update, and marker-touch a repository it
+/// never established ownership of. The per-key lock is same-process only, so it
+/// does not exclude that writer. The boolean is the state; the pathname is not.
+///
+/// Migration is Unix-only, and deliberately so rather than incidentally.
+/// Removal goes through `delete_verified_owned_entry`, whose non-Unix body is a
+/// pathname-based recursive delete with no ownership check at all. That body is
+/// pre-existing and reachable on Windows through the size-cap eviction path;
+/// what this function declines to do is widen its reach by adding a second
+/// caller. On a non-Unix target a legacy slot therefore keeps its worktree until
+/// ordinary LRU or cap eviction retires it, which is exactly the behaviour that
+/// target had before this change.
+#[cfg(unix)]
+fn migrate_legacy_slot(root: &Path, repo_dir: &Path) -> Result<bool, CacheError> {
+    if slot_carries_worktree(repo_dir)? {
+        remove_owned_entry(root, repo_dir)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn migrate_legacy_slot(_root: &Path, _repo_dir: &Path) -> Result<bool, CacheError> {
     Ok(false)
 }
 
@@ -1773,6 +1807,7 @@ mod tests {
     /// produced it: `reset --hard` is exactly what `advance_to_fetched_tip`
     /// used to do. That makes this a test against the real prior behaviour
     /// rather than against a hand-built approximation of it.
+    #[cfg(unix)] // migration is unix-only; see migrate_legacy_slot
     #[test]
     fn an_existing_slot_with_a_worktree_is_migrated_on_next_use() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -1836,6 +1871,7 @@ mod tests {
     /// the ensure-path test was written to catch, surviving in the path that
     /// test does not execute. Coverage of a migration belongs at every call
     /// site that can present the state, not once per migration.
+    #[cfg(unix)] // migration is unix-only; see migrate_legacy_slot
     #[test]
     fn a_legacy_slot_reached_by_the_repair_path_is_migrated_too() {
         let _guard = ENV_MUTEX.blocking_lock();
