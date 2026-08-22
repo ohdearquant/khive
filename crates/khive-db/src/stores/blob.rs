@@ -4264,6 +4264,27 @@ mod tests {
                 "the fixture database must actually be UTF-16le"
             );
             prepare_completed_v21_gc_fixture(writer.conn_mut());
+            // The fixture copies attachments from the (empty) entities table,
+            // so seed one valid canonical row into each scanned table — with
+            // no rows the probes measure nothing and a broken byte arm would
+            // still pass this test.
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO attachments \
+                     (record_uuid, substrate, role, content_ref, created_at) \
+                     VALUES ('utf16-valid-attachment', 'entity', 'content', ?1, 0)",
+                    rusqlite::params!["a".repeat(64)],
+                )
+                .unwrap();
+            writer
+                .conn_mut()
+                .execute(
+                    "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                     VALUES ('utf16-valid-claim-key', ?1, 0)",
+                    rusqlite::params!["b".repeat(64)],
+                )
+                .unwrap();
         }
 
         let sql = backend.sql();
