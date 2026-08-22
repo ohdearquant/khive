@@ -145,12 +145,18 @@ delete-and-recreate has to be a total function over the product of five independ
 substrate of each incident record (entity, note, event, or edge), the relation kind, the endpoint
 role the migrating record occupies in that relation, the liveness of the incident row (live or
 already tombstoned), and the namespace it lives in relative to the migrating caller's visibility.
-Context item 3 above demonstrates four of those five changing the correct answer — an edge that is
-itself an endpoint, an `annotates` edge whose destruction orphans a note, an already-tombstoned
-incident row, and a row outside the caller's visible namespaces — and the purge's own predicate
-ignores the last two entirely. A rule stated for the cases that have come up is not a specification
-of that function. It is a set of points on it, and the distance between the two is exactly where an
-edge gets destroyed without appearing in any enumeration that preceded it.
+Context item 3 above reaches each of them. Substrate: an edge is admitted as an endpoint, so an
+`annotates` edge may point at another edge rather than at a record. Relation kind: `annotates` is
+the relation whose destruction leaves a note without a subject. Endpoint role: every one of the 42
+measured annotations runs note → entity, so the migrating record occupies one role throughout and
+the measured outcome is that role's, while the purge predicate matches both roles without
+distinguishing them. Liveness: an already-soft-deleted incident row passes a live enumeration and
+is deleted anyway. Namespace: so does a row in a namespace the migrating caller cannot see, and the
+purge carries no predicate for either of those last two.
+
+A rule stated for the cases that have come up is not a specification of that function. It is a set
+of points on it, and the distance between the two is exactly where an edge gets destroyed without
+appearing in any enumeration that preceded it.
 
 **A successor ADR specifying that function is REQUIRED before any implementation may depend on kind
 migration.** Until such an ADR is accepted, kind remains immutable in practice: a misclassified
