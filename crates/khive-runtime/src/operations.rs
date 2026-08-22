@@ -747,6 +747,9 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("concept", EdgeRelation::IntroducedBy, "document"),
     ("concept", EdgeRelation::IntroducedBy, "person"),
     ("artifact", EdgeRelation::IntroducedBy, "document"),
+    // ADR-002 amendment (ADR-167): service provenance — the document that
+    // introduced a service (its ADR or design record).
+    ("service", EdgeRelation::IntroducedBy, "document"),
     ("document", EdgeRelation::IntroducedBy, "person"),
     ("document", EdgeRelation::IntroducedBy, "org"),
     ("concept", EdgeRelation::IntroducedBy, "org"),
