@@ -368,7 +368,47 @@ A mismatch is `ANALYSIS_INVALID`; neither URL nor a private path is reflected in
 error. Request-time clone, export, SQLite access, process execution, directory scanning,
 and arbitrary URL ingest remain forbidden.
 
-## Amendment 3 — Bearer-token authorization on the snapshot routes (2026-08-17)
+## Amendment 3 — Browser catalog consumer and fallback boundary (2026-08-14)
+
+The showcase browser discovers the operator catalog before it resolves either the
+default repository or a `repo=` deep link. Until discovery completes, repository
+selection and URL submission remain busy and cannot start a report request. The
+consumer accepts only the exact `khive.showcase.catalog.v1` envelope from Amendment 2,
+with at most 64 entries, exact entry fields, canonical URLs, unique IDs and normalized
+URLs, and deterministic ascending ID order. It also enforces a 256 KiB transport bound.
+An unknown envelope field, malformed or non-canonical entry, duplicate, out-of-order
+entry, invalid UTF-8/JSON, or exceeded bound invalidates the complete dynamic catalog.
+
+Catalog discovery has three explicit outcomes:
+
+- `200` with a valid envelope enables the configured entries;
+- the sanitized `404 NOT_CONFIGURED` outcome selects the curated static registry only;
+- transport failure, a non-404 error, or an invalid response degrades to that same
+  static registry while disclosing the degraded catalog state.
+
+The browser merges configured and curated entries by normalized repository URL. A
+configured entry for an existing curated URL supplies its analysis ID while retaining
+the curated asset as a narrowly scoped fallback. A configured URL absent from the
+curated registry is selectable and deep-linkable but has no static asset. URL input is
+resolved locally against this merged registry; it never becomes a server path, report
+path, process argument, clone target, or analysis endpoint parameter.
+
+For a configured entry, the browser requests the opaque ID route first. Only a `404`
+may fall back, and only when that same merged entry owns an approved curated asset.
+Server errors, malformed or oversized reports, missing or mismatched provenance
+headers, and repository-identity mismatches are hard failures and never fall back. A
+configured-only entry whose report returns `404` becomes an honest repository miss.
+Static-only entries load their approved same-origin asset directly.
+
+The selection surface is a labeled native repository selector paired with the public
+repository URL. It exposes catalog status, report-loading status, busy state, and the
+actual source (`khive DB snapshot` or `curated static fallback`) as visible and
+assistive-technology-readable state. Selecting another repository clears stale module,
+snapshot, and view investigation parameters; canonicalizing the initial deep link
+preserves them. These rules keep fallback useful without allowing a stale static bundle
+to conceal a configured report's integrity or availability failure.
+
+## Amendment 4 — Bearer-token authorization on the snapshot routes (2026-08-17)
 
 Amendments 1 and 2 kept the report and catalog server-private by never accepting
 browser-supplied paths, but neither route authenticated the caller: any network

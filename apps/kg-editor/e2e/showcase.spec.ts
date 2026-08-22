@@ -1,4 +1,66 @@
+import { readFileSync } from "node:fs";
+
 import { expect, test } from "@playwright/test";
+
+const goldenShowcase = JSON.parse(readFileSync(
+  new URL("../../../docs/schemas/examples/khive-repo-v1-khive.json", import.meta.url),
+  "utf8",
+)) as { meta: { repository: { canonical_url: string } } };
+
+test("discovers and switches to a configured DB-backed repository analysis", async ({ page }) => {
+  const analysisId = "dynamic-e2e";
+  const canonicalUrl = "https://github.com/example/dynamic-e2e";
+  const dynamicBundle = structuredClone(goldenShowcase);
+  dynamicBundle.meta.repository.canonical_url = canonicalUrl;
+  let releaseReport = () => {};
+  const reportGate = new Promise<void>((resolveReport) => {
+    releaseReport = resolveReport;
+  });
+
+  await page.route(/\/api\/showcase\/analyses\/?$/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        schema_version: "khive.showcase.catalog.v1",
+        entries: [{ analysis_id: analysisId, canonical_url: canonicalUrl }],
+      }),
+    });
+  });
+  await page.route(`**/api/showcase/analyses/${analysisId}`, async (route) => {
+    await reportGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: {
+        "x-khive-analysis-id": analysisId,
+        "x-khive-analysis-source": "khive-db-snapshot",
+      },
+      body: JSON.stringify(dynamicBundle),
+    });
+  });
+
+  await page.goto("/");
+  const selector = page.getByRole("combobox", { name: "Repository analysis" });
+  await expect(selector).toBeVisible();
+  await expect(page.getByRole("status", { name: "Repository catalog status" }))
+    .toHaveText("1 configured repository analysis discovered.");
+  await expect(page.getByLabel("Analysis source"))
+    .toHaveText("curated static fallback");
+
+  await selector.selectOption(`analysis:${analysisId}`);
+  await expect(selector).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator(".repo-result")).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByRole("status", { name: "Repository analysis status" }))
+    .toContainText(`Opening ${canonicalUrl}`);
+  releaseReport();
+
+  await expect(page.locator(".repo-overview")).toBeVisible();
+  await expect(selector).toHaveAttribute("aria-busy", "false");
+  await expect(page.getByLabel("Public repository URL")).toHaveValue(canonicalUrl);
+  await expect(page.getByLabel("Analysis source")).toHaveText("khive DB snapshot");
+  await expect(page).toHaveURL(new RegExp(`repo=${encodeURIComponent(canonicalUrl)}`));
+});
 
 test("dogfoods every repository analysis from the curated static bundle", async ({ page }) => {
   const consoleErrors: string[] = [];

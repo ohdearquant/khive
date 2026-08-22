@@ -1,4 +1,5 @@
 import type { ViewId } from "@/lib/repo-bundle";
+import { normalizeRepositoryUrl } from "@/lib/showcase-registry";
 
 export const REPOSITORY_VIEW_IDS = [
   "structure_graph",
@@ -103,9 +104,13 @@ function parseRepository(
   issues: RepositoryLocationIssue[],
 ): string | null {
   if (value == null) return null;
-  const message = publicRepositoryUrlIssue(value);
-  if (message) {
-    issues.push({ parameter: "repo", message });
+  if (value.length > REPOSITORY_URL_LIMIT) {
+    issues.push({ parameter: "repo", message: "The repository URL is too long." });
+    return null;
+  }
+  const normalized = normalizeRepositoryUrl(value);
+  if (!normalized.ok) {
+    issues.push({ parameter: "repo", message: normalized.reason });
     return null;
   }
   return value;
@@ -172,40 +177,42 @@ export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
   };
 }
 
+// Investigation URLs are copied to the clipboard and written to browser
+// history, so they carry ONLY the four parameters this app defines. A page
+// URL that arrived with an unrelated query parameter or fragment — a
+// credential such as ?access_token=..., a fragment-borne secret, a tracker
+// value — is never copied forward: the URL is rebuilt from the origin and
+// path only, and every other parameter and the hash are discarded.
 export function repositoryLocationUrl(
   base: URL,
   location: RepositoryLocation,
 ): URL {
-  const url = new URL(base);
+  const url = new URL(base.origin + base.pathname);
+  const values: Record<LocationParameter, string | null> = {
+    repo: location.repository,
+    at: location.snapshotSha,
+    module: location.modulePath,
+    view: location.view,
+  };
   for (const parameter of LOCATION_PARAMETERS) {
-    url.searchParams.delete(parameter);
+    const value = values[parameter];
+    if (value) url.searchParams.append(parameter, value);
   }
-  if (location.repository) url.searchParams.append("repo", location.repository);
-  if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
-  if (location.modulePath) {
-    url.searchParams.append("module", location.modulePath);
-  }
-  if (location.view) url.searchParams.append("view", location.view);
   return url;
 }
 
 /**
- * The shareable form of an investigation URL. A share link leaves the
- * browser, so it carries ONLY the investigation parameters: every foreign
- * query parameter and the URL fragment are dropped rather than copied,
- * because the current address bar can hold values that must not be
- * disclosed to a link recipient (tokens, authorization codes, tracker
- * state). `repositoryLocationUrl` stays the in-browser history form, which
- * preserves foreign parameters locally.
- *
- * The boundary also applies to the parameter VALUES, not just the
- * parameter names: a validated repository URL may legitimately carry a
- * query string or fragment (deep-link support keeps them in-browser), so
- * the shared copy is normalized to origin + pathname; a module path
- * carrying a URL query or fragment delimiter is omitted entirely rather
- * than encoded into the value, because encoding preserves — not redacts —
- * whatever the delimiter introduced. `at` and `view` need no value
- * boundary: their parse contracts are a 40-hex SHA and a closed id set.
+ * The shareable form of an investigation URL. `repositoryLocationUrl`
+ * already discards every foreign query parameter and the fragment, but a
+ * validated repository URL may legitimately carry a query string or
+ * fragment of its OWN (deep-link support keeps those in-browser), so this
+ * boundary also applies to the parameter VALUES, not just the parameter
+ * names: the shared repository value is normalized to origin + pathname,
+ * and a module path carrying a URL query or fragment delimiter is omitted
+ * entirely rather than encoded into the value, because encoding preserves
+ * — not redacts — whatever the delimiter introduced. `at` and `view` need
+ * no value boundary: their parse contracts are a 40-hex SHA and a closed
+ * id set.
  */
 export function investigationShareUrl(
   base: URL,

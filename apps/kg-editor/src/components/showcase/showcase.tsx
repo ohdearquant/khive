@@ -2,32 +2,63 @@
 
 import { ArrowRight, GitBranch, Search, ShieldCheck } from "@/icons";
 import Link from "next/link";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { DataState } from "@/components/data-state";
 import {
   loadPreferredShowcaseBundle,
   readOperatorShowcaseAccessToken,
+  ShowcaseAnalysisNotFoundError,
   type LoadedShowcaseBundle,
   type ShowcaseBundleSource,
 } from "@/lib/adapters/preferred-showcase-source";
+import {
+  loadShowcaseAnalysisCatalog,
+  mergeShowcaseRegistry,
+  type ShowcaseAnalysisCatalogResult,
+} from "@/lib/adapters/showcase-analysis-catalog";
 import type { RepoBundle } from "@/lib/repo-bundle";
 import {
   resolveShowcaseRepository,
-  SHOWCASE_REGISTRY,
   type ShowcaseRegistryEntry,
 } from "@/lib/showcase-registry";
-import { parseRepositoryLocation } from "@/lib/repository-location";
+import {
+  parseRepositoryLocation,
+  repositoryLocationUrl,
+  type RepositoryLocation,
+} from "@/lib/repository-location";
 
 type LoadState =
   | Readonly<{ status: "loading"; entry: ShowcaseRegistryEntry }>
   | Readonly<{ status: "ready"; entry: ShowcaseRegistryEntry; loaded: LoadedShowcaseBundle }>
-  | Readonly<{ status: "miss"; normalizedUrl: string }>
+  | Readonly<{
+      status: "miss";
+      normalizedUrl: string;
+      cause: "registry" | "analysis-not-found";
+    }>
   | Readonly<{ status: "invalid"; reason: string }>
   | Readonly<{ status: "error"; reason: string }>;
 
+type CatalogState = Readonly<{
+  status: "loading" | ShowcaseAnalysisCatalogResult["status"];
+  registry: readonly ShowcaseRegistryEntry[];
+  message: string;
+}>;
+
 const bundleCache = new Map<string, Promise<LoadedShowcaseBundle>>();
+const STATIC_SHOWCASE_REGISTRY = mergeShowcaseRegistry([]);
+const staticShowcaseEntry = STATIC_SHOWCASE_REGISTRY[0];
+if (!staticShowcaseEntry) {
+  throw new Error("The repository showcase requires one curated static entry.");
+}
+const DEFAULT_SHOWCASE_ENTRY = staticShowcaseEntry;
 
 function loadEntry(entry: ShowcaseRegistryEntry): Promise<LoadedShowcaseBundle> {
   // The cache must never outlive the authorization that filled it: the key
@@ -37,7 +68,12 @@ function loadEntry(entry: ShowcaseRegistryEntry): Promise<LoadedShowcaseBundle> 
   // token adds no exposure here: sessionStorage already holds it and both
   // are readable by the same origin's scripts.
   const accessToken = readOperatorShowcaseAccessToken();
-  const cacheKey = `${entry.id}\u0000${accessToken ?? ""}`;
+  const cacheKey = [
+    entry.id,
+    entry.analysisId ?? "static",
+    entry.assetPath ?? "no-asset",
+    accessToken ?? "",
+  ].join("|");
   const existing = bundleCache.get(cacheKey);
   if (existing) return existing;
   const pending = loadPreferredShowcaseBundle(entry, fetch, {
@@ -66,30 +102,86 @@ function replaceRepositoryQuery(
   repository?: string,
   clearInvestigation = true,
 ) {
-  const query = new URL(window.location.href);
-  if (repository) query.searchParams.set("repo", repository);
-  else query.searchParams.delete("repo");
-  if (clearInvestigation) {
-    query.searchParams.delete("at");
-    query.searchParams.delete("module");
-    query.searchParams.delete("view");
-  }
-  const search = query.searchParams.size ? `?${query.searchParams.toString()}` : "";
-  window.history.replaceState(null, "", `${query.pathname}${search}${query.hash}`);
+  const current = new URL(window.location.href);
+  const location: RepositoryLocation = {
+    repository: repository ?? null,
+    snapshotSha: clearInvestigation ? null : current.searchParams.get("at"),
+    modulePath: clearInvestigation
+      ? null
+      : current.searchParams.get("module"),
+    view: clearInvestigation
+      ? null
+      : (current.searchParams.get("view") as RepositoryLocation["view"]),
+  };
+  const url = repositoryLocationUrl(current, location);
+  window.history.replaceState(null, "", `${url.pathname}${url.search}`);
 }
 
 export function Showcase() {
-  const defaultEntry = SHOWCASE_REGISTRY[0];
-  const [input, setInput] = useState(defaultEntry.canonicalUrl);
-  const [state, setState] = useState<LoadState>({ status: "loading", entry: defaultEntry });
+  const [input, setInput] = useState(DEFAULT_SHOWCASE_ENTRY.canonicalUrl);
+  const [state, setState] = useState<LoadState>({
+    status: "loading",
+    entry: DEFAULT_SHOWCASE_ENTRY,
+  });
+  const [catalog, setCatalog] = useState<CatalogState>({
+    status: "loading",
+    registry: STATIC_SHOWCASE_REGISTRY,
+    message: "Discovering configured repository analyses.",
+  });
   const [labels, setLabels] = useState<RepoBundle["capability"]["labels"] | null>(null);
   const loadSequence = useRef(0);
 
+  const beginLoad = useCallback((
+    entry: ShowcaseRegistryEntry,
+    clearInvestigation = true,
+  ) => {
+    const sequence = ++loadSequence.current;
+    setInput(entry.canonicalUrl);
+    setState({ status: "loading", entry });
+    replaceRepositoryQuery(entry.canonicalUrl, clearInvestigation);
+    void loadEntry(entry)
+      .then((loaded) => {
+        if (loadSequence.current !== sequence) return;
+        setLabels(loaded.bundle.capability.labels);
+        setState({ status: "ready", entry, loaded });
+      })
+      .catch((error: unknown) => {
+        if (loadSequence.current !== sequence) return;
+        if (error instanceof ShowcaseAnalysisNotFoundError) {
+          setState({
+            status: "miss",
+            normalizedUrl: error.canonicalUrl,
+            cause: "analysis-not-found",
+          });
+          return;
+        }
+        setState({
+          status: "error",
+          reason: error instanceof Error
+            ? error.message
+            : "The showcase bundle could not be loaded.",
+        });
+      });
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
-    queueMicrotask(() => {
-      if (cancelled) return;
-      const parsed = parseRepositoryLocation(new URL(window.location.href));
+    const sequence = ++loadSequence.current;
+    const originalLocation = new URL(window.location.href);
+    replaceRepositoryQuery(
+      originalLocation.searchParams.get("repo") ?? undefined,
+      false,
+    );
+    void loadShowcaseAnalysisCatalog().then((catalogResult) => {
+      if (cancelled || loadSequence.current !== sequence) return;
+      const registry = mergeShowcaseRegistry(catalogResult.entries);
+      setCatalog({
+        status: catalogResult.status,
+        registry,
+        message: catalogResult.message,
+      });
+
+      const parsed = parseRepositoryLocation(originalLocation);
       const repositoryIssue = parsed.issues.find((issue) =>
         issue.parameter === "repo"
       );
@@ -99,101 +191,73 @@ export function Showcase() {
       }
 
       const requestedRepository = parsed.location.repository ??
-        defaultEntry.canonicalUrl;
-      const lookup = resolveShowcaseRepository(requestedRepository);
+        DEFAULT_SHOWCASE_ENTRY.canonicalUrl;
+      const lookup = resolveShowcaseRepository(requestedRepository, registry);
       setInput(requestedRepository);
       if (lookup.status === "invalid") {
         setState(lookup);
         return;
       }
       if (lookup.status === "miss") {
-        setState(lookup);
+        setState({ ...lookup, cause: "registry" });
         return;
       }
 
-      const sequence = ++loadSequence.current;
-      setInput(lookup.normalizedUrl);
-      setState({ status: "loading", entry: lookup.entry });
-      if (parsed.location.repository !== lookup.normalizedUrl) {
-        replaceRepositoryQuery(lookup.normalizedUrl, false);
-      }
-      void loadEntry(lookup.entry)
-        .then((loaded) => {
-          if (loadSequence.current === sequence) {
-            setLabels(loaded.bundle.capability.labels);
-            setState({ status: "ready", entry: lookup.entry, loaded });
-          }
-        })
-        .catch((error: unknown) => {
-          if (loadSequence.current === sequence) {
-            setState({
-              status: "error",
-              reason: error instanceof Error ? error.message : "The showcase bundle could not be loaded.",
-            });
-          }
-        });
+      beginLoad(lookup.entry, false);
     });
     return () => {
       cancelled = true;
+      loadSequence.current += 1;
     };
-  }, [defaultEntry]);
+  }, [beginLoad]);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const lookup = resolveShowcaseRepository(input);
-    const sequence = ++loadSequence.current;
+    if (catalog.status === "loading") return;
+    const lookup = resolveShowcaseRepository(input, catalog.registry);
 
     if (lookup.status === "invalid") {
+      loadSequence.current += 1;
       replaceRepositoryQuery();
       setState(lookup);
       return;
     }
     if (lookup.status === "miss") {
+      loadSequence.current += 1;
       replaceRepositoryQuery();
-      setState(lookup);
+      setState({ ...lookup, cause: "registry" });
       return;
     }
 
-    setState({ status: "loading", entry: lookup.entry });
-    replaceRepositoryQuery(lookup.normalizedUrl);
-    void loadEntry(lookup.entry)
-      .then((loaded) => {
-        if (loadSequence.current === sequence) {
-          setLabels(loaded.bundle.capability.labels);
-          setState({ status: "ready", entry: lookup.entry, loaded });
-        }
-      })
-      .catch((error: unknown) => {
-        if (loadSequence.current === sequence) {
-          setState({
-            status: "error",
-            reason: error instanceof Error ? error.message : "The showcase bundle could not be loaded.",
-          });
-        }
-      });
+    beginLoad(lookup.entry);
   }
 
   function openCuratedExample() {
-    const sequence = ++loadSequence.current;
-    setInput(defaultEntry.canonicalUrl);
-    setState({ status: "loading", entry: defaultEntry });
-    replaceRepositoryQuery(defaultEntry.canonicalUrl);
-    void loadEntry(defaultEntry)
-      .then((loaded) => {
-        if (loadSequence.current === sequence) {
-          setLabels(loaded.bundle.capability.labels);
-          setState({ status: "ready", entry: defaultEntry, loaded });
-        }
-      })
-      .catch((error: unknown) => {
-        if (loadSequence.current === sequence) {
-          setState({
-            status: "error",
-            reason: error instanceof Error ? error.message : "The showcase bundle could not be loaded.",
-          });
-        }
-      });
+    const curated = catalog.registry.find((entry) => entry.assetPath) ??
+      DEFAULT_SHOWCASE_ENTRY;
+    beginLoad(curated);
   }
+
+  const busy = catalog.status === "loading" || state.status === "loading";
+  const selectedEntryId = state.status === "loading" || state.status === "ready"
+    ? state.entry.id
+    : "";
+  const analysisSource = state.status === "ready"
+    ? sourceLabel(state.loaded.source)
+    : state.status === "loading"
+    ? "Pending"
+    : "Not loaded";
+  const analysisStatus = catalog.status === "loading"
+    ? "Discovering configured repository analyses."
+    : state.status === "loading"
+    ? `Opening ${state.entry.canonicalUrl}.`
+    : state.status === "ready"
+    ? `Loaded ${state.entry.canonicalUrl} from ${sourceLabel(state.loaded.source)}.`
+    : state.status === "miss"
+    ? `No repository analysis is available for ${state.normalizedUrl}.`
+    : state.status === "invalid"
+    ? `Repository URL is invalid: ${state.reason}`
+    : `Repository analysis failed: ${state.reason}`;
 
   return (
     <div className="repo-shell">
@@ -220,7 +284,29 @@ export function Showcase() {
               one precomputed, reproducible graph bundle.
             </p>
           </div>
-          <form className="repo-url-form" onSubmit={submit} noValidate>
+          <form className="repo-url-form" onSubmit={submit} noValidate aria-busy={busy}>
+            <label className="repo-analysis-picker" htmlFor="repository-analysis">
+              <span>Repository analysis</span>
+              <select
+                id="repository-analysis"
+                value={selectedEntryId}
+                disabled={catalog.status === "loading"}
+                aria-busy={busy}
+                onChange={(event) => {
+                  const entry = catalog.registry.find((candidate) =>
+                    candidate.id === event.target.value
+                  );
+                  if (entry) beginLoad(entry);
+                }}
+              >
+                {!selectedEntryId && <option value="">Select a repository analysis</option>}
+                {catalog.registry.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.canonicalUrl}
+                  </option>
+                ))}
+              </select>
+            </label>
             <label htmlFor="repository-url">Public repository URL</label>
             <div>
               <Search aria-hidden="true" />
@@ -232,8 +318,15 @@ export function Showcase() {
                 onChange={(event) => setInput(event.target.value)}
                 placeholder={labels?.input_placeholder ?? "https://github.com/owner/repository"}
               />
-              <button type="submit">{labels?.lookup_action ?? "…"} <ArrowRight aria-hidden="true" /></button>
+              <button type="submit" disabled={catalog.status === "loading"}>
+                {labels?.lookup_action ?? "Open analysis"} <ArrowRight aria-hidden="true" />
+              </button>
             </div>
+            <section className="repo-analysis-statuses" aria-label="Repository analysis state">
+              <span>Source <output aria-label="Analysis source">{analysisSource}</output></span>
+              <p role="status" aria-label="Repository catalog status">{catalog.message}</p>
+              <p role="status" aria-label="Repository analysis status">{analysisStatus}</p>
+            </section>
             <small>A configured server snapshot is built from khive history and code-map databases. The browser never clones, ingests, or opens SQLite.</small>
           </form>
         </section>
@@ -259,8 +352,12 @@ export function Showcase() {
             <DataState
               className="repo-state-card"
               state="empty"
-              title={labels?.miss_title ?? "No curated showcase bundle matches this repository"}
-              message={`${labels?.miss_body ?? "Curated repository showcase bundles belong here."} · ${state.normalizedUrl}`}
+              title={state.cause === "analysis-not-found"
+                ? "Configured repository analysis is unavailable"
+                : labels?.miss_title ?? "No curated showcase bundle matches this repository"}
+              message={state.cause === "analysis-not-found"
+                ? `The configured snapshot is no longer available and has no approved static fallback. · ${state.normalizedUrl}`
+                : `${labels?.miss_body ?? "Curated repository showcase bundles belong here."} · ${state.normalizedUrl}`}
               action={{ label: "Use the curated khive example", onClick: openCuratedExample }}
             />
           )}
@@ -272,7 +369,13 @@ export function Showcase() {
               message={state.reason}
             />
           )}
-          {state.status === "ready" && <RepoShowcase bundle={state.loaded.bundle} analysisSource={state.loaded.source} />}
+          {state.status === "ready" && (
+            <RepoShowcase
+              key={state.entry.id}
+              bundle={state.loaded.bundle}
+              analysisSource={state.loaded.source}
+            />
+          )}
         </div>
       </main>
     </div>
