@@ -63,7 +63,7 @@ type ViewProps = Readonly<{
   bundle: RepoBundle;
   moduleById: ModuleMap;
   selectedModuleId: string | null;
-  onSelectModule: (moduleId: string) => void;
+  onInspectModule: (moduleId: string) => void;
   onExploreStructure: () => void;
 }>;
 
@@ -132,6 +132,53 @@ function isKnownEmptyRepoPage<T>(page: RepoPage<T>): boolean {
     && page.disclosure.status === "complete"
     && !page.truncated
     && page.next_cursor == null;
+}
+
+function ModuleInspectionControl({
+  moduleId,
+  moduleById,
+  modulePage,
+  selectedModuleId,
+  onInspectModule,
+  className = "",
+}: {
+  moduleId: string;
+  moduleById: ModuleMap;
+  modulePage: RepoBundle["graph"]["modules"];
+  selectedModuleId: string | null;
+  onInspectModule: (moduleId: string) => void;
+  className?: string;
+}) {
+  const moduleNode = moduleById.get(moduleId);
+  if (!moduleNode) {
+    const reason = modulePage.disclosure.status === "unavailable"
+      ? `module page is unavailable${modulePage.disclosure.reason ? ` · ${modulePage.disclosure.reason}` : ""}`
+      : isIncompleteRepoPage(modulePage)
+      ? "outside the captured module page"
+      : "bundle integrity mismatch";
+    return (
+      <span
+        className="repo-module-reference-missing"
+        data-missing-module-id={moduleId}
+      >
+        <code>{moduleId}</code> · {reason}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className={`repo-module-action ${className}`.trim()}
+      data-module-id={moduleId}
+      aria-label={`Inspect ${moduleNode.source_path}`}
+      aria-controls="repository-module-inspector"
+      aria-pressed={selectedModuleId === moduleId}
+      onClick={() => onInspectModule(moduleId)}
+    >
+      <strong>{moduleNode.module_path}</strong>
+      <span>{moduleNode.source_path}</span>
+    </button>
+  );
 }
 
 function BoundDisclosure<T>({ page, labels }: { page: RepoPage<T>; labels: Labels }) {
@@ -308,8 +355,8 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
     displayedPackages,
     positions,
     selectablePackages,
-    subtreeModules,
-    subtreePackages,
+    subtreeModuleCount,
+    subtreePackageCount,
     visibleIds,
   } = useMemo(() => {
     const nextSubtreePackages = subtreeId === graph.repository.id
@@ -373,8 +420,8 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
       displayedPackages: nextDisplayedPackages,
       positions: nextPositions,
       selectablePackages: nextSelectablePackages,
-      subtreeModules: nextSubtreeModules,
-      subtreePackages: nextSubtreePackages,
+      subtreeModuleCount: nextSubtreeModules.length,
+      subtreePackageCount: nextSubtreePackages.length,
       visibleIds: nextVisibleIds,
     };
   }, [
@@ -552,8 +599,8 @@ function StructureGraph({ bundle }: { bundle: RepoBundle }) {
           ))}
         </ul>
         <LocalSliceDisclosure shown={displayedEdges.length} total={graph.structure_edges.items.length} label={capability.views.structure_graph.label} labels={labels} />
-        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackages.length} label={labels.node_types.package} labels={labels} />
-        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModules.length} label={labels.node_types.module} labels={labels} />
+        <LocalSliceDisclosure shown={displayedPackages.length} total={subtreePackageCount} label={labels.node_types.package} labels={labels} />
+        <LocalSliceDisclosure shown={displayedModules.length} total={subtreeModuleCount} label={labels.node_types.module} labels={labels} />
       </div>
       <BoundDisclosure page={graph.packages} labels={labels} />
       <BoundDisclosure page={graph.modules} labels={labels} />
@@ -632,7 +679,7 @@ function HistoryFacet({
 function HistoryStructure({
   bundle,
   selectedModuleId,
-  onSelectModule,
+  onInspectModule,
   onExploreStructure,
 }: ViewProps) {
   const { graph, capability } = bundle;
@@ -667,7 +714,7 @@ function HistoryStructure({
           <div className="repo-card-heading"><h3>{labels.node_types.module}</h3><p>{formatNumber(modules.length)}</p></div>
           <div className="repo-list">
             {modules.map((module) => (
-              <button type="button" data-module-id={module.id} aria-pressed={selectedModuleId === module.id} className={`repo-list-row ${selectedModuleId === module.id ? "selected" : ""}`} key={module.id} onClick={() => { onSelectModule(module.id); setCommitSelection({ moduleId: module.id, commitId: "" }); }}>
+              <button type="button" data-module-id={module.id} aria-label={`Inspect ${module.source_path}`} aria-controls="repository-module-inspector" aria-pressed={selectedModuleId === module.id} className={`repo-list-row ${selectedModuleId === module.id ? "selected" : ""}`} key={module.id} onClick={() => { onInspectModule(module.id); setCommitSelection({ moduleId: module.id, commitId: "" }); }}>
                 <Boxes aria-hidden="true" /><div><strong>{module.module_path}</strong><span>{module.source_path}</span></div>
               </button>
             ))}
@@ -769,7 +816,7 @@ function HistoryStructure({
   );
 }
 
-function DependencyTopology({ bundle, moduleById, onExploreStructure }: ViewProps) {
+function DependencyTopology({ bundle, moduleById, selectedModuleId, onInspectModule, onExploreStructure }: ViewProps) {
   const analysis = bundle.aggregates.dependency_topology;
   const labels = bundle.capability.labels;
   const moduleRows = analysis.modules.items.slice(0, UI_ROW_LIMIT);
@@ -779,14 +826,14 @@ function DependencyTopology({ bundle, moduleById, onExploreStructure }: ViewProp
       <section className="repo-card repo-table-wrap">
         <table className="repo-table">
           <thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.fan_in}</th><th>{labels.metrics.fan_out}</th><th>{labels.metrics.cycle_count}</th></tr></thead>
-          <tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong></td><td>{formatNumber(row.fan_in)}</td><td>{formatNumber(row.fan_out)}</td><td>{formatNumber(row.cycle_ids.length)}</td></tr>)}</tbody>
+          <tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td>{formatNumber(row.fan_in)}</td><td>{formatNumber(row.fan_out)}</td><td>{formatNumber(row.cycle_ids.length)}</td></tr>)}</tbody>
         </table>
         <LocalSliceDisclosure shown={moduleRows.length} total={analysis.modules.items.length} label={labels.node_types.module} labels={labels} />
         <BoundDisclosure page={analysis.modules} labels={labels} />
       </section>
       <section className="repo-card">
         <div className="repo-card-heading"><h3>{labels.metrics.cycle_count}</h3><p>{formatNumber(analysis.cycles.items.length)}</p></div>
-        <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>SCC members: {cycle.module_ids.map((id) => moduleName(moduleById, id)).join(" · ")}</span></div></div>)}</div>
+        <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span className="repo-cycle-members">SCC members: {cycle.module_ids.map((id, index) => <span key={id}><ModuleInspectionControl moduleId={id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} className="compact" />{index < cycle.module_ids.length - 1 ? " · " : ""}</span>)}</span></div></div>)}</div>
         {isKnownEmptyRepoPage(analysis.cycles) && <DataState className="repo-empty" state="empty" title="No dependency cycles in this bundle" message="Dependency cycles found by the captured topology analysis belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={cycleRows.length} total={analysis.cycles.items.length} label={labels.metrics.cycle_count} labels={labels} />
         <BoundDisclosure page={analysis.cycles} labels={labels} />
@@ -795,7 +842,7 @@ function DependencyTopology({ bundle, moduleById, onExploreStructure }: ViewProp
   );
 }
 
-function HotspotQuadrantView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function HotspotQuadrantView({ bundle, moduleById, selectedModuleId, onInspectModule }: ViewProps) {
   const analysis = bundle.aggregates.hotspot_quadrant;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
@@ -818,7 +865,7 @@ function HotspotQuadrantView({ bundle, moduleById }: { bundle: RepoBundle; modul
         </svg>
       </div>
       <section className="repo-card repo-table-wrap">
-        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.change_frequency}</th><th>{labels.metrics.fan_in}</th><th>{bundle.capability.views.hotspot_quadrant.label}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong></td><td>{row.commit_count}</td><td>{row.fan_in}</td><td>{labels.hotspot_quadrants[row.quadrant]}</td></tr>)}</tbody></table>
+        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.change_frequency}</th><th>{labels.metrics.fan_in}</th><th>{bundle.capability.views.hotspot_quadrant.label}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td>{row.commit_count}</td><td>{row.fan_in}</td><td>{labels.hotspot_quadrants[row.quadrant]}</td></tr>)}</tbody></table>
         <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.hotspot_quadrant.label} labels={labels} />
         <BoundDisclosure page={analysis.data} labels={labels} />
       </section>
@@ -826,14 +873,14 @@ function HotspotQuadrantView({ bundle, moduleById }: { bundle: RepoBundle; modul
   );
 }
 
-function HiddenCouplingView({ bundle, moduleById, onExploreStructure }: ViewProps) {
+function HiddenCouplingView({ bundle, moduleById, selectedModuleId, onInspectModule, onExploreStructure }: ViewProps) {
   const analysis = bundle.aggregates.hidden_coupling;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
   return (
     <div className="repo-view-body">
       <section className="repo-card repo-table-wrap">
-        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.node_types.module}</th><th>{labels.metrics.cochange_count}</th><th>{labels.metrics.support}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.left_module_id}-${row.right_module_id}`}><td><strong>{moduleName(moduleById, row.left_module_id)}</strong></td><td><strong>{moduleName(moduleById, row.right_module_id)}</strong></td><td>{formatNumber(row.cochange_count)}</td><td><div className="repo-bar violet" aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}><span style={{ width: `${Math.min(100, row.support * 100)}%` }} /></div></td></tr>)}</tbody></table>
+        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.node_types.module}</th><th>{labels.metrics.cochange_count}</th><th>{labels.metrics.support}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.left_module_id}-${row.right_module_id}`}><td><ModuleInspectionControl moduleId={row.left_module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td><ModuleInspectionControl moduleId={row.right_module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td>{formatNumber(row.cochange_count)}</td><td><div className="repo-bar violet" aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}><span style={{ width: `${Math.min(100, row.support * 100)}%` }} /></div></td></tr>)}</tbody></table>
         {isKnownEmptyRepoPage(analysis.data) && <DataState className="repo-empty" state="empty" title={`No ${bundle.capability.views.hidden_coupling.label.toLocaleLowerCase()} in this bundle`} message="Module pairs with captured co-change signals belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.hidden_coupling.label} labels={labels} />
         <BoundDisclosure page={analysis.data} labels={labels} />
@@ -842,7 +889,7 @@ function HiddenCouplingView({ bundle, moduleById, onExploreStructure }: ViewProp
   );
 }
 
-function TreemapView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function TreemapView({ bundle, moduleById, selectedModuleId, onInspectModule }: ViewProps) {
   const analysis = bundle.aggregates.structure_treemap;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_TREEMAP_LIMIT);
@@ -854,7 +901,8 @@ function TreemapView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: M
         {rows.map((row) => {
           const activity = row.recent_commit_count.status === "available" ? row.recent_commit_count.value : 0;
           const span = Math.min(6, Math.max(2, row.source_file_count));
-          return <div role="listitem" style={{ gridColumn: `span ${span}` }} key={row.module_id}><article className={activity > maxActivity * 0.55 ? "hot" : ""}><strong>{moduleName(moduleById, row.module_id)}</strong><span>{labels.metrics.source_files}: {row.source_file_count}</span><span>{labels.metrics.recent_activity}: {availabilityText(row.recent_commit_count, labels, formatNumber)}</span></article></div>;
+          const moduleNode = moduleById.get(row.module_id);
+          return <div role="listitem" style={{ gridColumn: `span ${span}` }} key={row.module_id}>{moduleNode ? <button type="button" className={`repo-treemap-module ${activity > maxActivity * 0.55 ? "hot" : ""}`} data-module-id={row.module_id} aria-label={`Inspect ${moduleNode.source_path}`} aria-controls="repository-module-inspector" aria-pressed={selectedModuleId === row.module_id} onClick={() => onInspectModule(row.module_id)}><strong>{moduleNode.module_path}</strong><span>{labels.metrics.source_files}: {row.source_file_count}</span><span>{labels.metrics.recent_activity}: {availabilityText(row.recent_commit_count, labels, formatNumber)}</span></button> : <ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} />}</div>;
         })}
       </div>
       <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.structure_treemap.label} labels={labels} />
@@ -924,7 +972,7 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
   );
 }
 
-function OwnershipView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function OwnershipView({ bundle, moduleById, selectedModuleId, onInspectModule }: ViewProps) {
   const analysis = bundle.aggregates.ownership;
   const labels = bundle.capability.labels;
   const moduleRows = analysis.modules.items.slice(0, UI_ROW_LIMIT);
@@ -949,7 +997,7 @@ function OwnershipView({ bundle, moduleById }: { bundle: RepoBundle; moduleById:
         </section>
       </div>
       <section className="repo-card repo-table-wrap">
-        {analysis.modules.disclosure.status === "unavailable" ? <DataState className="repo-empty" state="unavailable" title={`${labels.node_types.module} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.modules.disclosure.reason ?? "This bundle does not claim ownership modules."} /> : <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.commits}</th><th>{labels.metrics.author_concentration}</th><th>{labels.metrics.bus_factor}</th></tr></thead><tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong><div>{row.authors.items.slice(0, 8).map((author) => `${author.author} ${formatPercent(author.share)}`).join(" · ")}</div><InlineLocalSlice shown={Math.min(8, row.authors.items.length)} total={row.authors.items.length} labels={labels} /><InlinePageState page={row.authors} labels={labels} /></td><td>{row.commit_count}</td><td>{row.author_concentration.status === "available" ? <div className="repo-bar" aria-label={`${labels.metrics.author_concentration} ${formatPercent(row.author_concentration.value)}`}><span style={{ width: `${Math.min(100, row.author_concentration.value * 100)}%` }} /></div> : availabilityText(row.author_concentration, labels)}</td><td>{availabilityText(row.bus_factor, labels, formatNumber)}</td></tr>)}</tbody></table>}
+        {analysis.modules.disclosure.status === "unavailable" ? <DataState className="repo-empty" state="unavailable" title={`${labels.node_types.module} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.modules.disclosure.reason ?? "This bundle does not claim ownership modules."} /> : <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.commits}</th><th>{labels.metrics.author_concentration}</th><th>{labels.metrics.bus_factor}</th></tr></thead><tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /><div>{row.authors.items.slice(0, 8).map((author) => `${author.author} ${formatPercent(author.share)}`).join(" · ")}</div><InlineLocalSlice shown={Math.min(8, row.authors.items.length)} total={row.authors.items.length} labels={labels} /><InlinePageState page={row.authors} labels={labels} /></td><td>{row.commit_count}</td><td>{row.author_concentration.status === "available" ? <div className="repo-bar" aria-label={`${labels.metrics.author_concentration} ${formatPercent(row.author_concentration.value)}`}><span style={{ width: `${Math.min(100, row.author_concentration.value * 100)}%` }} /></div> : availabilityText(row.author_concentration, labels)}</td><td>{availabilityText(row.bus_factor, labels, formatNumber)}</td></tr>)}</tbody></table>}
         <LocalSliceDisclosure shown={moduleRows.length} total={analysis.modules.items.length} label={labels.node_types.module} labels={labels} />
         <BoundDisclosure page={analysis.modules} labels={labels} />
       </section>
@@ -957,13 +1005,13 @@ function OwnershipView({ bundle, moduleById }: { bundle: RepoBundle; moduleById:
   );
 }
 
-function ApiSurfaceView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function ApiSurfaceView({ bundle, moduleById, selectedModuleId, onInspectModule }: ViewProps) {
   const analysis = bundle.aggregates.api_surface;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
   const max = Math.max(1, ...rows.map((row) => row.dependent_count));
   return (
-    <div className="repo-view-body"><section className="repo-card repo-table-wrap"><table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.dependent_count}</th><th>{labels.metrics.dependent_count}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong></td><td>{formatNumber(row.dependent_count)}</td><td><div className="repo-bar"><span style={{ width: `${(row.dependent_count / max) * 100}%` }} /></div></td></tr>)}</tbody></table><LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.api_surface.label} labels={labels} /><BoundDisclosure page={analysis.data} labels={labels} /></section></div>
+    <div className="repo-view-body"><section className="repo-card repo-table-wrap"><table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.dependent_count}</th><th>{labels.metrics.dependent_count}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td>{formatNumber(row.dependent_count)}</td><td><div className="repo-bar"><span style={{ width: `${(row.dependent_count / max) * 100}%` }} /></div></td></tr>)}</tbody></table><LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.api_surface.label} labels={labels} /><BoundDisclosure page={analysis.data} labels={labels} /></section></div>
   );
 }
 
@@ -981,29 +1029,27 @@ function scoreLabel(labels: Labels, key: RepoBundle["aggregates"]["scorecard"]["
   return keys[key];
 }
 
-function scoreValue(field: RepoBundle["aggregates"]["scorecard"]["fields"][number], labels: Labels, moduleById: ModuleMap): string {
+function scoreValue(field: RepoBundle["aggregates"]["scorecard"]["fields"][number], labels: Labels): string {
   if (field.value.status === "unavailable") return labels.unavailable;
   const value = field.value.value;
   if (value.value_kind === "count") return formatNumber(value.value);
   if (value.value_kind === "ratio") return formatPercent(value.value);
   if (value.value_kind === "module_ids") {
-    return value.value.items.length === 0
-      ? "0"
-      : value.value.items.slice(0, 8).map((id) => moduleName(moduleById, id)).join(", ");
+    return formatNumber(value.value.items.length);
   }
   return value.value;
 }
 
-function ScorecardView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
+function ScorecardView({ bundle, moduleById, selectedModuleId, onInspectModule }: ViewProps) {
   const analysis = bundle.aggregates.scorecard;
   const labels = bundle.capability.labels;
   const fields = analysis.fields.slice(0, UI_ROW_LIMIT);
   return (
     <div className="repo-view-body">
       <div className="repo-score-grid">{fields.map((field) => {
-        const value = scoreValue(field, labels, moduleById);
+        const value = scoreValue(field, labels);
         const moduleIds = field.value.status === "available" && field.value.value.value_kind === "module_ids" ? field.value.value.value : null;
-        return <article className="repo-score-card" key={field.key}><span>{scoreLabel(labels, field.key)}</span><div className="repo-score-value">{field.value.status === "unavailable" ? <AlertTriangle aria-hidden="true" /> : <TrendingUp aria-hidden="true" />}<strong>{value}</strong></div>{field.value.status === "unavailable" && <p>{field.value.reason}</p>}{moduleIds && <><InlineLocalSlice shown={Math.min(8, moduleIds.items.length)} total={moduleIds.items.length} labels={labels} /><InlinePageState page={moduleIds} labels={labels} /></>}<div className="repo-score-tags"><i>{field.granularity}</i><i>{field.join}</i></div></article>;
+        return <article className="repo-score-card" key={field.key}><span>{scoreLabel(labels, field.key)}</span><div className="repo-score-value">{field.value.status === "unavailable" ? <AlertTriangle aria-hidden="true" /> : <TrendingUp aria-hidden="true" />}<strong>{value}</strong></div>{field.value.status === "unavailable" && <p>{field.value.reason}</p>}{moduleIds && <><div className="repo-score-modules">{moduleIds.items.slice(0, 8).map((moduleId) => <ModuleInspectionControl key={moduleId} moduleId={moduleId} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} className="compact" />)}</div><InlineLocalSlice shown={Math.min(8, moduleIds.items.length)} total={moduleIds.items.length} labels={labels} /><InlinePageState page={moduleIds} labels={labels} /></>}<div className="repo-score-tags"><i>{field.granularity}</i><i>{field.join}</i></div></article>;
       })}</div>
       <LocalSliceDisclosure shown={fields.length} total={analysis.fields.length} label={bundle.capability.views.scorecard.label} labels={labels} />
     </div>
@@ -1028,7 +1074,7 @@ function ActiveView({
   bundle,
   moduleById,
   selectedModuleId,
-  onSelectModule,
+  onInspectModule,
   onExploreStructure,
 }: ViewProps & { id: ViewId }) {
   const capability = bundle.capability.views[id];
@@ -1040,7 +1086,7 @@ function ActiveView({
         bundle={bundle}
         moduleById={moduleById}
         selectedModuleId={selectedModuleId}
-        onSelectModule={onSelectModule}
+        onInspectModule={onInspectModule}
         onExploreStructure={onExploreStructure}
       />
     </ViewFrame>
@@ -1081,7 +1127,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
   }> | null>(null);
   const [navigationStatus, setNavigationStatus] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
-  const overviewRef = useRef<HTMLElement>(null);
+  const moduleInspectorRef = useRef<HTMLElement>(null);
   const dashboardRef = useRef<HTMLDivElement>(null);
   const copyLinkRef = useRef<HTMLButtonElement>(null);
 
@@ -1091,10 +1137,12 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       const requestedPath = parsed.location.modulePath;
       let nextModuleId: string | null = defaultModuleId;
       let nextUnresolved: typeof unresolvedModule = null;
+      let resolvedModuleRestore = false;
       if (requestedPath) {
         const matches = modulesBySourcePath.get(requestedPath) ?? [];
         if (matches.length === 1) {
           nextModuleId = matches[0].id;
+          resolvedModuleRestore = true;
         } else {
           nextModuleId = null;
           nextUnresolved = {
@@ -1139,6 +1187,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         setNavigationStatus(
           `Restored ${capability.views[nextView].label} for ${moduleLabel}.`,
         );
+        if (resolvedModuleRestore) focusAndScrollInspector();
       }
 
       const canonical = repositoryLocationUrl(
@@ -1237,7 +1286,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
   }
 
   function recoverModule() {
-    if (defaultModuleId) selectModule(defaultModuleId);
+    if (defaultModuleId) inspectModule(defaultModuleId);
   }
 
   function normalizeCurrentLocation() {
@@ -1306,11 +1355,8 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     });
   }
 
-  function openModuleFromPalette(moduleId: string) {
-    selectModule(moduleId);
-    const inspector = overviewRef.current?.querySelector<HTMLElement>(
-      "[data-module-inspector]",
-    );
+  function focusAndScrollInspector() {
+    const inspector = moduleInspectorRef.current;
     if (!inspector) return;
     inspector.focus({ preventScroll: true });
     const reduceMotion = window.matchMedia?.(
@@ -1321,11 +1367,17 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       block: "start",
     });
   }
+
+  function inspectModule(moduleId: string) {
+    if (!moduleById.has(moduleId)) return;
+    selectModule(moduleId);
+    focusAndScrollInspector();
+  }
   return (
-    <article ref={overviewRef} className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
+    <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
       <header className="repo-overview-heading">
         <div className="repo-identity"><span className="repo-avatar"><Package aria-hidden="true" /></span><div><span>{repository.host} · {availabilityText(repository.default_branch, capability.labels)}</span><strong>{repository.owner}/{repository.name}</strong></div></div>
-        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span><RepositoryCommandPalette bundle={bundle} activeView={activeView} selectedModuleId={selectedModuleId} onSelectModule={openModuleFromPalette} onSelectView={openAnalysis} onCopyLink={copyInvestigationLink} /><button ref={copyLinkRef} type="button" className="repo-copy-link" onClick={copyInvestigationLink}><Copy aria-hidden="true" /> Copy investigation link</button>{copyStatus && <span role="status" className="repo-copy-status">{copyStatus}</span>}</div>
+        <div className="repo-meta-row"><span><GitCommitHorizontal aria-hidden="true" /><code>{shortSha(snapshot.head_sha)}</code></span><span><Clock3 aria-hidden="true" />{formatDate(snapshot.ingested_at)}</span><span><Code2 aria-hidden="true" />{producer.exporter}</span><span><Database aria-hidden="true" />{analysisSource === "khive-db-snapshot" ? "khive DB snapshot" : "curated static fallback"}</span><RepositoryCommandPalette bundle={bundle} activeView={activeView} selectedModuleId={selectedModuleId} onSelectModule={inspectModule} onSelectView={openAnalysis} onCopyLink={copyInvestigationLink} /><button ref={copyLinkRef} type="button" className="repo-copy-link" onClick={copyInvestigationLink}><Copy aria-hidden="true" /> Copy investigation link</button>{copyStatus && <span role="status" className="repo-copy-status">{copyStatus}</span>}</div>
       </header>
       <section className="repo-capability-strip" aria-label={capability.labels.product}>
         <div><ShieldCheck aria-hidden="true" /><div><strong>{capability.labels.product}</strong><span>{capability.mode}</span></div></div>
@@ -1356,8 +1408,9 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         key={snapshot.head_sha}
         bundle={bundle}
         selectedModuleId={selectedModuleId}
+        moduleInspectorRef={moduleInspectorRef}
         unresolvedModule={unresolvedModule}
-        onSelectModule={selectModule}
+        onInspectModule={inspectModule}
         onRecoverModule={recoverModule}
         canRecoverModule={defaultModuleId !== null}
         onOpenAnalysis={openAnalysis}
@@ -1380,7 +1433,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
           })}
         </nav>
         <section className="repo-view-panel" aria-label={capability.views[activeView].label}>
-          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} selectedModuleId={selectedModuleId} onSelectModule={selectModule} onExploreStructure={() => selectView("structure_graph")} />
+          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} selectedModuleId={selectedModuleId} onInspectModule={inspectModule} onExploreStructure={() => selectView("structure_graph")} />
         </section>
       </div>
     </article>

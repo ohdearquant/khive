@@ -18,7 +18,7 @@ import {
   Signpost,
   Users,
 } from "@/icons";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState, type RefObject } from "react";
 
 import { DataState } from "@/components/data-state";
 import {
@@ -36,7 +36,8 @@ export type RepositoryTriageProps = Readonly<{
   bundle: RepoBundle;
   onOpenAnalysis: (view: ViewId) => void;
   selectedModuleId: string | null;
-  onSelectModule: (moduleId: string) => void;
+  onInspectModule: (moduleId: string) => void;
+  moduleInspectorRef: RefObject<HTMLElement | null>;
   unresolvedModule: Readonly<{ path: string; reason: string }> | null;
   onRecoverModule: () => void;
   canRecoverModule: boolean;
@@ -169,7 +170,8 @@ export function RepositoryTriage({
   bundle,
   onOpenAnalysis,
   selectedModuleId,
-  onSelectModule,
+  onInspectModule,
+  moduleInspectorRef,
   unresolvedModule,
   onRecoverModule,
   canRecoverModule,
@@ -188,7 +190,6 @@ export function RepositoryTriage({
       new Map(bundle.graph.packages.items.map((item) => [item.id, item])),
     [bundle.graph.packages.items],
   );
-  const inspectorRef = useRef<HTMLElement>(null);
   const [query, setQuery] = useState("");
   const selectedInsight = useMemo(
     () =>
@@ -205,29 +206,11 @@ export function RepositoryTriage({
   const searchResults = searchMatches.items;
   const searchTruncated = searchMatches.total > searchResults.length;
 
-  function focusInspector() {
-    const inspector = inspectorRef.current;
-    if (!inspector) return;
-    inspector.focus({ preventScroll: true });
-    const reduceMotion = window.matchMedia?.(
-      "(prefers-reduced-motion: reduce)",
-    ).matches ?? false;
-    inspector.scrollIntoView?.({
-      behavior: reduceMotion ? "auto" : "smooth",
-      block: "start",
-    });
-  }
-
-  function selectModule(moduleId: string) {
-    onSelectModule(moduleId);
-    focusInspector();
-  }
-
   function selectSignal(signal: RepositorySignal) {
     const moduleId = signal.moduleIds.find((candidate) =>
       moduleById.has(candidate)
     );
-    if (moduleId) selectModule(moduleId);
+    if (moduleId) onInspectModule(moduleId);
   }
 
   return (
@@ -345,7 +328,7 @@ export function RepositoryTriage({
                           module={module}
                           selected={module.id === selectedModuleId}
                           detail={`${module.language} · ${module.module_path}`}
-                          onSelect={() => selectModule(module.id)}
+                          onSelect={() => onInspectModule(module.id)}
                         />
                       ))
                     )
@@ -385,7 +368,7 @@ export function RepositoryTriage({
                                 detail={`${bundle.capability.views.api_surface.label} · ${
                                   formatNumber(entry.dependentCount)
                                 } ${labels.metrics.dependent_count} · ${entry.modulePath}`}
-                                onSelect={() => selectModule(moduleNode.id)}
+                                onSelect={() => onInspectModule(moduleNode.id)}
                               />
                             </div>
                           );
@@ -527,7 +510,7 @@ export function RepositoryTriage({
         <aside
           className={styles.inspector}
           id="repository-module-inspector"
-          ref={inspectorRef}
+          ref={moduleInspectorRef}
           aria-label={`${moduleLabel} evidence`}
           data-module-inspector
           aria-live="polite"
@@ -637,7 +620,7 @@ export function RepositoryTriage({
                               <li key={module.id}>
                                 <button
                                   type="button"
-                                  onClick={() => selectModule(module.id)}
+                                  onClick={() => onInspectModule(module.id)}
                                 >
                                   {module.source_path}
                                 </button>
@@ -667,7 +650,7 @@ export function RepositoryTriage({
                                 <li key={module.id}>
                                   <button
                                     type="button"
-                                    onClick={() => selectModule(module.id)}
+                                    onClick={() => onInspectModule(module.id)}
                                   >
                                     {module.source_path}
                                   </button>
@@ -699,7 +682,7 @@ export function RepositoryTriage({
                               <span key={module.id}>
                                 <button
                                   type="button"
-                                  onClick={() => selectModule(module.id)}
+                                  onClick={() => onInspectModule(module.id)}
                                 >
                                   {module.source_path}
                                 </button>
@@ -731,7 +714,7 @@ export function RepositoryTriage({
                           <li key={coupling.module.id}>
                             <button
                               type="button"
-                              onClick={() => selectModule(coupling.module.id)}
+                              onClick={() => onInspectModule(coupling.module.id)}
                             >
                               {coupling.module.source_path}
                             </button>
@@ -845,10 +828,7 @@ export function RepositoryTriage({
                 message={unresolvedModule.reason}
                 action={{
                   label: "Open recommended module",
-                  onClick: () => {
-                    onRecoverModule();
-                    focusInspector();
-                  },
+                  onClick: onRecoverModule,
                 }}
               />
             )

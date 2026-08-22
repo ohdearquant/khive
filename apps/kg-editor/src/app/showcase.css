@@ -630,6 +630,33 @@ button.repo-list-row:hover,
 .repo-table td { border-top: 1px solid var(--repo-border); padding: 10px 11px; vertical-align: middle; }
 .repo-table td code { color: var(--repo-muted); font-size: var(--khive-type-sm); }
 .repo-table td strong { font-size: var(--khive-type-md); }
+.repo-module-action {
+  background: var(--khive-color-transparent);
+  border: 0;
+  border-radius: var(--khive-radius-sm);
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  font: inherit;
+  gap: 2px;
+  max-width: 100%;
+  padding: 3px 4px;
+  text-align: left;
+}
+.repo-module-action > strong,
+.repo-module-action > span { overflow: hidden; text-overflow: ellipsis; }
+.repo-module-action > span { color: var(--repo-muted); font-size: var(--khive-type-xs); }
+.repo-module-action:hover,
+.repo-module-action[aria-pressed="true"] { background: var(--khive-color-accent-soft); }
+.repo-module-action:focus-visible,
+.repo-treemap-module:focus-visible { outline: 2px solid var(--khive-color-accent); outline-offset: 2px; }
+.repo-module-action.compact { display: inline-flex; margin: 1px 2px; padding: 2px 4px; vertical-align: baseline; width: auto; }
+.repo-module-action.compact > strong { display: none; }
+.repo-module-action.compact > span { color: inherit; display: inline; font-size: inherit; }
+.repo-cycle-members { overflow: visible !important; text-overflow: clip !important; white-space: normal !important; }
+.repo-cycle-members > span { display: inline !important; overflow: visible !important; white-space: normal !important; }
+.repo-module-reference-missing { color: var(--khive-color-warning); display: inline; font-size: var(--khive-type-xs); overflow-wrap: anywhere; }
 .repo-inline-state { align-items: flex-start; color: var(--amber); display: inline-flex; font-size: var(--khive-type-xs); gap: 4px; margin-top: 4px; }
 .repo-inline-state > svg { flex: 0 0 auto; height: 10px; margin-top: 1px; width: 10px; }
 .repo-inline-state .data-state-copy { gap: 1px; }
@@ -677,11 +704,12 @@ button.repo-list-row:hover,
   grid-template-columns: repeat(12, 1fr);
   min-height: 420px;
 }
-.repo-treemap article {
+.repo-treemap-module {
   background: var(--khive-color-accent-soft);
   border: 1px solid var(--khive-color-border-strong);
   border-radius: var(--khive-radius-md);
   color: var(--khive-color-success);
+  font: inherit;
   min-height: 64px;
   overflow: hidden;
   padding: 9px;
@@ -689,11 +717,14 @@ button.repo-list-row:hover,
   width: 100%;
 }
 .repo-treemap > div { min-width: 0; }
-.repo-treemap article.hot { background: var(--khive-color-warning-soft); border-color: var(--khive-color-warning-soft); color: var(--khive-color-warning); }
-.repo-treemap article strong,
-.repo-treemap article span { display: block; overflow: hidden; text-overflow: ellipsis; }
-.repo-treemap article strong { font-size: var(--khive-type-md); white-space: nowrap; }
-.repo-treemap article span { font-size: var(--khive-type-xs); margin-top: 3px; }
+.repo-treemap-module { cursor: pointer; }
+.repo-treemap-module:hover,
+.repo-treemap-module[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--khive-color-accent); }
+.repo-treemap-module.hot { background: var(--khive-color-warning-soft); border-color: var(--khive-color-warning-soft); color: var(--khive-color-warning); }
+.repo-treemap-module strong,
+.repo-treemap-module span { display: block; overflow: hidden; text-overflow: ellipsis; }
+.repo-treemap-module strong { font-size: var(--khive-type-md); white-space: nowrap; }
+.repo-treemap-module span { font-size: var(--khive-type-xs); margin-top: 3px; }
 
 .repo-score-grid { display: grid; gap: 10px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .repo-score-card { background: var(--khive-color-surface-overlay); border: 1px solid var(--repo-border); border-radius: var(--khive-radius-lg); min-height: 126px; padding: 13px; }
@@ -702,6 +733,7 @@ button.repo-list-row:hover,
 .repo-score-value strong { color: var(--repo-navy); font-size: var(--khive-type-3xl); letter-spacing: -0.04em; overflow-wrap: anywhere; }
 .repo-score-value svg { color: var(--repo-green); height: 16px; width: 16px; }
 .repo-score-card p { color: var(--repo-muted); font-size: var(--khive-type-sm); line-height: 1.45; margin: 9px 0 0; }
+.repo-score-modules { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 8px; }
 .repo-score-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
 .repo-score-tags i { background: var(--khive-color-surface-raised); border-radius: var(--khive-radius-pill); color: var(--repo-muted); font-size: var(--khive-type-xs); font-style: normal; padding: 3px 5px; }
 

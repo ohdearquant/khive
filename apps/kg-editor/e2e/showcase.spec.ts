@@ -94,7 +94,8 @@ test("restores a shared investigation and follows browser back and forward", asy
   );
 
   await page.getByRole("searchbox", { name: "Find a module or path" }).fill(writer);
-  await page.getByRole("button", { name: `Inspect ${writer}` }).click();
+  await page.getByLabel("Module search results")
+    .getByRole("button", { name: `Inspect ${writer}` }).click();
   await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
   await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(writer)}`));
 
@@ -158,6 +159,52 @@ test("navigates from module to analysis using only the command palette", async (
   await expect(page).toHaveURL(/view=api_surface/);
   await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(writer)}`));
   await expect(page.locator("[data-repository-dashboard]")).toBeFocused();
+});
+
+test("drills from analysis results into the shared inspector and browser history", async ({ page }) => {
+  await page.goto("/");
+  const panel = page.locator(".repo-view-panel");
+  const inspector = page.locator("[data-module-inspector]");
+
+  await page.locator('[data-view-id="api_surface"]').click();
+  const apiResult = panel.locator(
+    'button[aria-label^="Inspect "][aria-pressed="false"]',
+  ).first();
+  const apiLabel = await apiResult.getAttribute("aria-label");
+  const apiPath = apiLabel?.replace(/^Inspect /, "");
+  expect(apiPath).toBeTruthy();
+  await apiResult.press("Enter");
+  await expect(inspector).toBeFocused();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(apiPath!);
+  await expect(page).toHaveURL(/view=api_surface/);
+  await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(apiPath!)}`));
+
+  await page.locator('[data-view-id="structure_treemap"]').click();
+  const treemapResult = panel.locator(
+    'button[aria-label^="Inspect "][aria-pressed="false"]',
+  ).first();
+  const treemapLabel = await treemapResult.getAttribute("aria-label");
+  const treemapPath = treemapLabel?.replace(/^Inspect /, "");
+  expect(treemapPath).toBeTruthy();
+  await treemapResult.press("Enter");
+  await expect(inspector).toBeFocused();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(
+    treemapPath!,
+  );
+  await expect(page).toHaveURL(/view=structure_treemap/);
+
+  await page.goBack();
+  await expect(page.locator('[data-view-id="structure_treemap"]')).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(apiPath!);
+  await page.goBack();
+  await expect(page.locator('[data-view-id="api_surface"]')).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(apiPath!);
 });
 
 test("a valid repository miss stays local and renders an honest state", async ({ page }) => {
