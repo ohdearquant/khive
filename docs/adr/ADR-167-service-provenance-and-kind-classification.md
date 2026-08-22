@@ -47,7 +47,9 @@ that path destroys edges under the only deletion mode that can actually free the
 Measured against the 19-service population: 16 carry at least one edge and 3 carry none. A
 HARD delete-and-recreate across the population would destroy **62 edges**, of which **42 are
 `annotates`** — the figure is stated for `DeleteMode::Hard` specifically, because soft deletion
-destroys none of them and instead strands all 62 on a deleted endpoint (Decision 3). Because `annotates` runs note → entity, each destroyed annotates
+destroys none of them and instead strands all 62 on a deleted endpoint (Decision 3). Because each of those 42 runs note → entity in the measured
+population (the contract itself admits edge targets for `annotates` as well — the closure
+requirement in Decision 3 exists for exactly that case), each destroyed annotates
 edge leaves a note whose subject no longer exists — the note survives, saying something about
 nothing, which is worse than either deleting it or keeping it attached.
 
@@ -211,9 +213,16 @@ window between the cascade and the last recreation is exactly where the edges ar
 **Edges whose triples become ILLEGAL under the new kind.** Recreation is not always available, and this
 is not an edge case: `Org contains Service` has no `Org contains Concept` counterpart in the endpoint
 matrix, so an org-contained service cannot simply be recreated as a concept. Every incident edge must
-therefore be classified against ADR-002's matrix BEFORE anything is deleted, into exactly three
+therefore be classified against ADR-002's matrix BEFORE anything is deleted, into exactly four
 dispositions, each of which must be written down per edge:
 
+- **PRESERVE** — the triple is legal under the new kind, and an id-preserving endpoint move
+  (ADR-113's `move_edge_endpoint`) is available in the running system and collision-free for this
+  edge. The edge moves onto the new record with its id intact, so every annotation targeting it —
+  however deep in the closure — stays valid with no re-anchoring. Preferred over RECREATE wherever
+  it qualifies. It exempts nothing: the edge still appears in the closure enumeration, its
+  disposition is still written down, and the move still executes inside the same atomic plan as
+  the rest of the correction.
 - **RECREATE** — the triple is legal under the new kind. Recreate and read back.
 - **RE-EXPRESS** — the triple is illegal but the fact survives under a different relation or a
   different endpoint. Name the replacement triple and why it carries the same claim.
@@ -253,22 +262,32 @@ With those settled, a kind correction:
    edge-targeting annotation is orphaned by recreation even when the record's own
    annotations were handled correctly. Every edge and note in the closure gets the same
    re-anchor-or-delete disposition as step 3.
-3. Classifies every enumerated edge as RECREATE, RE-EXPRESS or REFUSE against the endpoint matrix, and
-   names for each `annotates` edge whether the annotating note is re-anchored to the new record or
-   deleted with it. A note left pointing at a deleted subject is not an acceptable outcome. **Any
+3. Classifies every enumerated edge — incident edges and every closure member alike — as PRESERVE,
+   RECREATE, RE-EXPRESS or REFUSE against the endpoint matrix, and builds a per-edge replacement
+   map covering the whole set before anything is deleted: a PRESERVEd edge maps to itself, a
+   recreated or re-expressed edge maps to its planned replacement within the plan, a deleted edge
+   maps to a named deletion. Every `annotates` edge's re-anchor target is then read off that map,
+   never assumed: an annotation of the record itself re-anchors to the new record; an annotation
+   of a closure edge re-anchors to that edge's mapped replacement — the recreated edge, never the
+   new record; an annotation whose subject maps to a deletion is itself deleted or re-anchored to
+   a named carrier. A note left pointing at a deleted subject is not an acceptable outcome. **Any
    REFUSE stops here.**
 4. Prepares deletion and all recreations as ONE atomic plan, commits it, and reads back every recreated
    edge. A recreated edge is a new edge id, so anything that referenced the old id does not follow and
    must be re-pointed in the same plan.
 5. Records the old record's id in the new record's properties, so the discontinuity is traceable.
 
-Relation to ADR-113: ADR-113's `move_edge_endpoint` primitive preserves an edge id when a merge
-or split moves an endpoint between records, and with it the edge's annotations. A kind migration
-cannot use it for the migrating record's own incident edges — the record id itself is re-minted,
-so those edges are deleted and recreated, and the annotation closure above is what keeps their
-annotations from dangling. Where a specific edge qualifies for an id-preserving endpoint move
-under ADR-113's own rules, that disposition is preferred for that edge, since a preserved id
-needs no re-anchoring.
+Relation to ADR-113: ADR-113's `move_edge_endpoint` primitive preserves an edge id when an
+endpoint moves between records, and with it every annotation targeting the edge — and its split
+recipe composes exactly the shape a kind migration needs: create the new record, then move each
+qualifying edge onto it. The PRESERVE disposition above is that composition applied here. Three
+conditions gate it per edge, all from ADR-113's own contract: the resulting triple must be legal
+under the new kind (the primitive re-validates the endpoint contract), the move must not collide
+with an existing natural key (the primitive fails loud rather than dropping the edge), and the
+primitive must exist in the running system (ADR-113 is Proposed; a system without the operation
+takes the delete-and-recreate path for every edge). An edge failing any of the three falls
+through to RECREATE, RE-EXPRESS or REFUSE, and the annotation closure above is what keeps its
+annotations from dangling.
 
 If kind changes later become common enough that this procedure is being run routinely, that is the
 evidence that would justify the mechanism, and the count of times it has been run is what should
