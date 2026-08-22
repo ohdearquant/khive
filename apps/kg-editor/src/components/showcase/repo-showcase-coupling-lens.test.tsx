@@ -24,6 +24,23 @@ function golden(): RepoBundle {
   return parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
 }
 
+function captureNodePositions(
+  container: HTMLElement,
+): Map<string, { left: string; top: string }> {
+  const positions = new Map<string, { left: string; top: string }>();
+  for (
+    const node of container.querySelectorAll<HTMLElement>(
+      ".repo-graph-node[data-node-id]",
+    )
+  ) {
+    positions.set(node.dataset.nodeId!, {
+      left: node.style.left,
+      top: node.style.top,
+    });
+  }
+  return positions;
+}
+
 describe("repository showcase hidden-coupling lens", () => {
   beforeEach(() => {
     settleGraphLayoutSpy.mockClear();
@@ -56,6 +73,7 @@ describe("repository showcase hidden-coupling lens", () => {
       ".repo-graph-node[data-node-id]",
     )!;
     const kindHue = sampleNode.style.getPropertyValue("--ontology-kind-hue");
+    const positionsBeforeLens = captureNodePositions(container);
     await user.click(screen.getByRole("radio", {
       name: bundle.capability.views.hidden_coupling.label,
     }));
@@ -76,6 +94,7 @@ describe("repository showcase hidden-coupling lens", () => {
       kindHue,
     );
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+    expect(captureNodePositions(container)).toEqual(positionsBeforeLens);
 
     const focusButtons = screen.getAllByRole("button", {
       name: /Focus coupling candidate between/,
@@ -88,6 +107,7 @@ describe("repository showcase hidden-coupling lens", () => {
     expect(container.querySelectorAll("[data-coupling-overlay].selected"))
       .toHaveLength(1);
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
+    expect(captureNodePositions(container)).toEqual(positionsBeforeLens);
 
     const unrelatedNode = container.querySelector<HTMLButtonElement>(
       ".repo-graph-node.context-dimmed",

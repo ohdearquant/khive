@@ -14,6 +14,20 @@ function golden(): RepoBundle {
   return parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
 }
 
+function deterministicShuffle<T>(items: readonly T[]): T[] {
+  const shuffled = [...items];
+  let seed = 1;
+  for (let index = shuffled.length - 1; index > 0; index--) {
+    seed = (seed * 48271) % 2147483647;
+    const swapIndex = seed % (index + 1);
+    [shuffled[index], shuffled[swapIndex]] = [
+      shuffled[swapIndex],
+      shuffled[index],
+    ];
+  }
+  return shuffled;
+}
+
 function visibleModuleIds(
   bundle: RepoBundle,
   packageId: string | null,
@@ -52,16 +66,23 @@ describe("structure hidden-coupling lens", () => {
       item.name === "khive-db"
     );
     expect(databasePackage).toBeDefined();
-    const databaseLens = buildStructureCouplingLens({
-      pairPage: bundle.aggregates.hidden_coupling.data,
-      structureEdgePage: bundle.graph.structure_edges,
-      visibleModuleIds: visibleModuleIds(bundle, databasePackage!.id),
-      limit: 20,
-      analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
-      analysisUnavailableReason:
-        bundle.aggregates.hidden_coupling.meta.unavailable_reason,
-    });
+    const databaseVisibleModuleIds = visibleModuleIds(
+      bundle,
+      databasePackage!.id,
+    );
+    const basePairPage = bundle.aggregates.hidden_coupling.data;
+    const buildDatabaseLens = (pairPage: typeof basePairPage) =>
+      buildStructureCouplingLens({
+        pairPage,
+        structureEdgePage: bundle.graph.structure_edges,
+        visibleModuleIds: databaseVisibleModuleIds,
+        limit: 20,
+        analysisStatus: bundle.aggregates.hidden_coupling.meta.status,
+        analysisUnavailableReason:
+          bundle.aggregates.hidden_coupling.meta.unavailable_reason,
+      });
 
+    const databaseLens = buildDatabaseLens(basePairPage);
     expect(databaseLens.capturedVisiblePairCount).toBe(70);
     expect(databaseLens.pairs).toHaveLength(20);
     expect(databaseLens.pairs[0]).toMatchObject({
@@ -71,6 +92,24 @@ describe("structure hidden-coupling lens", () => {
     expect(databaseLens.capturedPairCount).toBe(1_000);
     expect(databaseLens.declaredPairCount).toBe(104_263);
     expect(databaseLens.coverage).toBe("truncated");
+
+    // The golden pair page arrives already sorted descending by
+    // cochange_count (producer order), and its visible slice contains
+    // several real cochange/support ties (e.g. ranks 4-5 at count 14,
+    // ranks 7-9 at count 12). Feeding the identical pair set reversed and
+    // shuffled must still select the exact same ordered slice, so the
+    // comparator (not incoming order) is what determines the result.
+    const reversedLens = buildDatabaseLens({
+      ...basePairPage,
+      items: [...basePairPage.items].reverse(),
+    });
+    const shuffledLens = buildDatabaseLens({
+      ...basePairPage,
+      items: deterministicShuffle(basePairPage.items),
+    });
+    const orderedKeys = databaseLens.pairs.map((pair) => pair.key);
+    expect(reversedLens.pairs.map((pair) => pair.key)).toEqual(orderedKeys);
+    expect(shuffledLens.pairs.map((pair) => pair.key)).toEqual(orderedKeys);
   });
 
   it("treats a continuation cursor as incomplete captured evidence", () => {
@@ -162,8 +201,8 @@ describe("structure hidden-coupling lens", () => {
       ...draft.graph.structure_edges,
       items: [{
         ...existingEdge,
-        source: pair.left_module_id,
-        target: pair.right_module_id,
+        source: pair.right_module_id,
+        target: pair.left_module_id,
         relation: "depends_on" as const,
       }],
       total_count: { status: "available", value: 1 },
