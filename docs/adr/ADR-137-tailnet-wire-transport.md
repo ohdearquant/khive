@@ -161,6 +161,140 @@ ADR-109's "Hard rules (not forked)" 1 (closed, explicit verb allowlist), 2 (pinn
 
 This amendment is limited to the gateway's process-boundary transport, ingress identity, and the corresponding dispatch integration. ADR-109 remains the authority for its capability declaration format, authentication resolution, and Phase B relationship (Forks (b), (c), and (d)), which this ADR does not amend. Source: ADR-109, "Decision" and "Resolutions". A future revision of ADR-109 should add a forward reference to this ADR under its "Fork (a): Process boundary" section, naming this ADR as the source of the process-boundary transport it left open.
 
+## Amendment 1: Wire-contract closure before the first consumer
+
+- **Status:** Proposed
+- **Date:** 2026-08-22
+
+### Scope and precedence
+
+The wire crate `khive-wire-protocol` implements framing, envelope grammar, and handshake
+sequencing decisions that this ADR left unstated or stated only in prose. Each such decision is
+an interoperability commitment: a second implementation written from the ADR alone would have no
+way to reproduce it, and would diverge silently rather than fail loudly. This amendment closes
+that gap by promoting each decision to specified behaviour, and, where the implemented behaviour
+is wrong for the contract, by specifying the correct behaviour and requiring the code to move.
+
+This amendment closes only the wire-level ambiguities enumerated below. It does not authorize a
+transport server, an identity mapping store, a deadline executor, or any other feature the parent
+ADR defers; those remain separately tracked. It precedes the first consumer of the crate: at the
+time of writing the crate has no in-tree consumer, so every behaviour named here can still be
+changed without a compatibility break.
+
+Each decision below is marked **RATIFIED** where the implemented behaviour is correct and this
+amendment records it as contract, or **CHANGED** where the contract differs from what the crate
+does today and the crate must move to match.
+
+### Framing and version
+
+1. **Initial version and floor — RATIFIED.** The initial protocol version is `1`. Version `0` is
+   not a valid protocol version and is rejected. Initial supported range is `[1, 1]`. A handshake
+   naming a version outside the receiver's supported range is rejected rather than negotiated
+   downward.
+
+2. **Frame ceiling and accounting — RATIFIED.** Frames are length-prefixed with a four-byte
+   big-endian payload length. The configurable size limit counts the serialized bytes of the JSON
+   payload only and excludes the four-byte prefix. The default limit is 8 MiB. An independent
+   absolute ceiling of `u32::MAX` bounds the prefix itself and is not configurable upward.
+
+### Envelope grammar
+
+3. **Operation identifiers — RATIFIED.** An operation id carried on the wire is a non-empty
+   string; the empty string is rejected at decode. The crate MAY retain unrestricted in-memory
+   constructors for test and internal use, provided a frame carrying an empty id is never
+   accepted from the wire.
+
+4. **Envelope member semantics — CHANGED.** The typed frame envelope rejects unknown members,
+   rejects duplicate members, and treats omission as the only representation of an absent optional
+   envelope field; an explicit `null` is rejected rather than read as absence. The crate currently
+   allows duplicate members to collapse under last-wins before field validation runs, which makes
+   acceptance depend on member order: two documents differing only in the order of two duplicate
+   `id` values can classify differently. Duplicate rejection must therefore happen before field
+   validation, so that decision 3 is deterministic across JSON parsers.
+
+   This rule governs the envelope only. The contents of opaque subvalues are exempt, per
+   decision 9.
+
+### Error and sequence semantics
+
+5. **Unknown error codes — CHANGED.** A frame carrying an unrecognized error code is surfaced
+   through a fallback that preserves the raw code string for diagnostics, and a fallback frame is
+   not re-encodable — it may be inspected but not relayed onward as though it were understood.
+   An unknown code arriving **without** an operation id is a malformed frame, not a
+   request-terminal error: there is no request for it to terminate. It follows decision 6's
+   id-less path and closes the connection.
+
+6. **Handshake sequence violations — RATIFIED.** A frame arriving before the handshake completes,
+   a handshake frame arriving after the handshake completes, and a frame arriving in the wrong
+   direction are each `malformed_frame` and each terminate the connection permanently. These are
+   connection-terminal and carry no operation id, because no operation is established.
+
+### Server-produced fields
+
+7. **Topic validation boundary — RATIFIED.** The codec accepts any string in a topic position.
+   Catalog authorization is enforced at the server boundary, not in the codec. Codec permissiveness
+   is not permission to produce arbitrary topics: a conforming server emits only catalog-valid
+   topics. Both halves are stated because acceptance of a string must not be mistaken for licence
+   to send one.
+
+8. **Event timestamp boundary — RATIFIED.** The codec accepts any string in `occurred_at`. A
+   conforming server emits RFC 3339. As with decision 7, decoder permissiveness and producer
+   obligation are separate, and an independent implementation must not infer the second from the
+   first.
+
+### Opaque payload fidelity
+
+9. **Opaque subvalue preservation — CHANGED.** The contents of `response.result` and
+   `event.payload` are opaque to this crate. A received opaque subvalue must be preserved
+   byte-exactly on relay, including member ordering and the original lexical form of numbers. The
+   crate currently documents and tests semantic rather than lexical preservation, so a relayed
+   payload can come out with members reordered and a number's lexeme changed. That is acceptable
+   for an endpoint that parses the value and wrong for a relay, and the transport's default must
+   serve the relay case because the fields are declared opaque and no consumer yet constrains
+   them.
+
+   This requirement is scoped to received opaque subvalues. It does not make envelope formatting
+   byte-stable, and it does not require the crate to relay whole frames verbatim.
+
+### Payload shape
+
+10. **`event.payload` must be a JSON object — CHANGED.** The parent ADR specifies `payload` as "a
+    topic-specific JSON object whose exact field-by-field shape this ADR delegates, by name, to
+    the implementation-phase topic catalog". The crate types the field as an arbitrary JSON value,
+    so a scalar, array, or `null` payload is accepted on the wire while an implementation written
+    from the ADR would reject it. The object requirement is retained and the crate must enforce
+    it at decode: "field-by-field" presupposes fields, and an object is the only shape a topic
+    catalog can extend compatibly, whereas a scalar payload cannot gain a field without a
+    breaking change.
+
+    This item was found while confirming the others and is recorded here rather than deferred,
+    because an amendment that claims to close the wire contract while leaving a known frame-shape
+    divergence open would misrepresent its own completeness.
+
+### Implementation fences
+
+- An implementation MAY retain unrestricted in-memory constructors, parsed convenience views over
+  opaque values, and server-side topic and timestamp validation, provided the wire behaviour
+  specified above remains observable from outside.
+- An implementation MAY NOT add frame kinds or error codes under this amendment, and MAY NOT fold
+  the separately tracked server, identity-mapping, or deadline work into it.
+- **No first consumer of `khive-wire-protocol` may merge while any decision marked CHANGED above
+  still implements the superseded behaviour.** Those are decisions 4, 5, 9, and 10. A consumer
+  merged against the old behaviour converts each of them from a free correction into a
+  compatibility break, which is precisely the cost this amendment exists to avoid.
+
+### Conformance
+
+This amendment is verified by a published vector matrix rather than by inspection. The matrix
+carries positive and negative vectors for every rule above: boundary frame lengths on both sides
+of the limit, version zero and out-of-range versions, empty operation ids, unknown and duplicate
+and explicitly-null envelope members, both id-bearing and id-less unknown error codes, each of the
+three handshake sequence violations, arbitrary topic and timestamp strings, opaque subvalues that
+round-trip byte-exactly, and non-object event payloads. Vectors are run through the Rust crate and
+through at least one independent JSON implementation, which must agree on accept/reject
+classification, on whether a rejection is request-terminal or connection-terminal, on consumed
+frame length, and on byte-exact opaque-subvalue round trip.
+
 ## Consequences
 
 The daemon gains a location-transparent wire transport while retaining one framing and dispatch contract. The shared crate makes version and frame-kind changes reviewable as protocol changes instead of client-specific conventions.
