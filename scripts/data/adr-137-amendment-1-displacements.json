@@ -24,7 +24,8 @@
           "gloss": "the versioning section restates the parent's compatibility rule in its unbounded form"
         }
       ],
-      "explicit": "no"
+      "explicit": "no",
+      "scope_note": "the compatibility rule itself is unaltered; what is displaced is its silent assumption that a prior version always exists, which at the floor of `1` makes the initial supported range `[1, 1]`"
     },
     {
       "n": 2,
@@ -88,7 +89,8 @@
         {
           "cite": "crates/khive-wire-protocol/src/lib.rs",
           "quotes": [
-            "an unrecognized code falls back to `internal`"
+            "an unrecognized code falls back to `internal`",
+            "a client that decodes a code it does not recognize treats it as `internal` (request-terminal) rather than inventing semantics for it"
           ],
           "gloss": "the module documentation's unknown-error-code paragraphs"
         },

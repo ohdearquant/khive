@@ -417,7 +417,9 @@ removes. **Where this amendment and the current crate documentation disagree, th
 governs, and the documentation is superseded in the following places:**
 
 - The versioning section restates the parent's compatibility rule in its unbounded form
-  (`crates/khive-wire-protocol/src/lib.rs`) — superseded by decision 1.
+  (`crates/khive-wire-protocol/src/lib.rs`) — superseded by decision 1. The displacement is bounded:
+  the compatibility rule itself is unaltered; what is displaced is its silent assumption that a
+  prior version always exists, which at the floor of `1` makes the initial supported range `[1, 1]`.
 - The module documentation's stated boundaries on optional-null equivalence and duplicate members
   (`crates/khive-wire-protocol/src/lib.rs`) — superseded by decision 4.
 - The module documentation's unknown-error-code paragraphs (`crates/khive-wire-protocol/src/lib.rs`)
@@ -438,8 +440,8 @@ governs, and the documentation is superseded in the following places:**
   The displacement is bounded: the per-field shape of a topic's payload remains the catalog's
   business; only the outermost type is displaced.
 
-Three of those entries are bounded rather than wholesale — decisions 5, 6, and 10 — and in each case
-the bound is the substance. Decision 10's is the one worth spelling out, because it displaces a
+Four of those entries are bounded rather than wholesale — decisions 1, 5, 6, and 10 — and in each
+case the bound is the substance. Decision 10's is the one worth spelling out, because it displaces a
 disclaimer rather than a statement: the crate documentation never says a non-object payload is
 acceptable, it says the shape of `event.payload` is not the crate's business. That is not a weaker
 form of the same thing. A document that disclaims ownership of a rule licenses the absence of that

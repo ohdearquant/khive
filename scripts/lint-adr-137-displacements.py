@@ -220,11 +220,12 @@ def precedence_passage(decisions: list[dict]) -> str:
     for d in displacing:
         sites = []
         for site in d["crate_displaced"]:
-            # The table carries line ranges; the ADR carries only the file. The
-            # decisions marked CHANGED require editing these very files, so a line
-            # range published here is stale by the time anyone acts on it. The
-            # passage name is what makes the citation findable either way.
-            path = site["cite"].split(":", 1)[0]
+            # The table carries a file path and quoted passages, never a line
+            # number: the decisions marked CHANGED require editing these very
+            # files, so a line published here is stale by the time anyone acts on
+            # it. check_citations rejects a cite carrying one and derives the
+            # current line from the quote at run time, for diagnostics only.
+            path = site["cite"]
             gloss = site.get("gloss") or f"the documentation in `{path}`"
             sites.append(f"{gloss} (`{path}`)")
         body = english_list(sites)
