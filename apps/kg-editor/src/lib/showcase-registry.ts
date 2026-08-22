@@ -31,6 +31,23 @@ export const SHOWCASE_REGISTRY: readonly ShowcaseRegistryEntry[] = [
 export function normalizeRepositoryUrl(input: string):
   | Readonly<{ ok: true; value: string }>
   | Readonly<{ ok: false; reason: string }> {
+  return normalizeRepositoryUrlImpl(input, true);
+}
+
+// verifyFixedPoint gates a single guarded re-entry: after building the
+// canonical value below, it re-normalizes that value (with
+// verifyFixedPoint=false, so the inner call cannot recurse again) and
+// requires the result to be ok and byte-identical. A value that is already
+// canonical settles in one step, so one re-entry is sufficient to prove the
+// emitted identity is closed rather than merely equal to a lossily-mutated
+// segment array (which is what let a doubled ".git.git" suffix through
+// before this check existed).
+function normalizeRepositoryUrlImpl(
+  input: string,
+  verifyFixedPoint: boolean,
+):
+  | Readonly<{ ok: true; value: string }>
+  | Readonly<{ ok: false; reason: string }> {
   const candidate = input.trim();
   if (!candidate) {
     return { ok: false, reason: "Enter a public repository URL." };
@@ -66,6 +83,15 @@ export function normalizeRepositoryUrl(input: string):
 
   const host = url.hostname.toLowerCase() === "www.github.com" ? "github.com" : url.hostname.toLowerCase();
   const authority = url.port ? `${host}:${url.port}` : host;
+  // This join is deliberately unencoded: it is what gives the round-trip
+  // check below its meaning (re-encoding the segments here would make the
+  // re-parse trivially match, silently reopening the decoded-slash /
+  // decoded-backslash / decoded-query-delimiter holes those checks exist
+  // to close). The consequence is that a literal "%" in a decoded path
+  // segment is genuinely ambiguous under this unencoded join, so it is
+  // refused by policy, not by accident. This is a behaviour change from
+  // the previous normalizer, which accepted a literal "%" in a repository
+  // name.
   const value = `https://${authority}/${segments.join("/")}`;
 
   if (value.length > REPOSITORY_URL_LIMIT) {
@@ -92,6 +118,21 @@ export function normalizeRepositoryUrl(input: string):
     reparsedSegments.some((segment, index) => segment !== segments[index])
   ) {
     return { ok: false, reason: "The repository URL contains invalid path encoding." };
+  }
+
+  // Runtime fixed-point invariant: the check above only proves the segment
+  // array survives a re-parse — it runs AFTER the terminal ".git" strip has
+  // already mutated that array, so it cannot see whether the canonical
+  // VALUE is closed under normalization (a doubled "repo.git.git" strips to
+  // "repo.git" here, which trivially round-trips as a segment array, but is
+  // not itself canonical). Re-normalizing the canonical value and requiring
+  // an identical result is what actually proves closure, on every input,
+  // not just the ones exercised by a test.
+  if (verifyFixedPoint) {
+    const reNormalized = normalizeRepositoryUrlImpl(value, false);
+    if (!reNormalized.ok || reNormalized.value !== value) {
+      return { ok: false, reason: "The repository URL contains invalid path encoding." };
+    }
   }
 
   return { ok: true, value };

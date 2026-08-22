@@ -91,6 +91,44 @@ describe("showcase registry", () => {
         expect(result.reason).toBe("Repository URLs cannot contain credentials.");
       }
     });
+
+    it("refuses a literal percent in a decoded repository name as deliberate policy, not a structural-character rejection", () => {
+      // This is NOT one of the six structural-character classes above: "%"
+      // followed by two hex digits decodes cleanly, so it never trips the
+      // re-parse round-trip on its own. It is refused because the fixed-point
+      // check below cannot be satisfied while the join stays unencoded — see
+      // the comment at the join site in showcase-registry.ts.
+      const result = normalizeRepositoryUrl("https://forge.example/owner/repo%25");
+      expect(result.ok).toBe(false);
+    });
+  });
+
+  it("refuses a doubled repository-name suffix that strips to a segment-level round-trip match but is not a fixed point of normalization", () => {
+    // normalizeRepositoryUrl("https://forge.example/owner/repo.git") is ok
+    // with value ".../owner/repo" — a single ".git" strip is itself a fixed
+    // point. Stripping a SECOND ".git" is not: it would land on
+    // ".../owner/repo.git", and normalizing that again strips again to
+    // ".../owner/repo". The runtime fixed-point check catches that and
+    // refuses the input outright, rather than accepting a non-canonical value.
+    const result = normalizeRepositoryUrl("https://forge.example/owner/repo.git.git");
+    expect(result.ok).toBe(false);
+  });
+
+  it("is a fixed point for every value produced by the curated-alias fixtures", () => {
+    const acceptFixtures = [
+      "https://github.com/ohdearquant/khive",
+      "https://github.com/ohdearquant/khive/",
+      "https://github.com/ohdearquant/khive.git",
+      "http://github.com/ohdearquant/khive.git",
+      "https://www.github.com/ohdearquant/khive?tab=readme#readme",
+    ];
+    for (const input of acceptFixtures) {
+      const once = normalizeRepositoryUrl(input);
+      expect(once.ok).toBe(true);
+      if (!once.ok) continue;
+      const twice = normalizeRepositoryUrl(once.value);
+      expect(twice).toEqual(once);
+    }
   });
 
   it("is idempotent: normalizing a canonical value again returns the same value", () => {
@@ -139,27 +177,46 @@ describe("showcase registry", () => {
       return out;
     }
 
-    function randomCandidate(rng: () => number): string {
+    // Forced onto the terminal segment: the character-by-character sampler
+    // above will essentially never assemble the exact literal ".git" run
+    // needed to exercise the doubled-suffix fixed-point defect (Fix 1), so
+    // without this the generator's property arm could never reach that
+    // class of input no matter how many iterations it runs.
+    const TERMINAL_GIT_SUFFIXES = [".git", ".git.git"];
+
+    function randomCandidate(rng: () => number): { url: string; hasTerminalGitSuffix: boolean } {
       const host = HOSTS[Math.floor(rng() * HOSTS.length)];
       const segmentCount = 2 + Math.floor(rng() * 3);
       const segments: string[] = [];
+      let hasTerminalGitSuffix = false;
       for (let i = 0; i < segmentCount; i++) {
-        const raw = randomSegmentContent(rng);
+        let raw = randomSegmentContent(rng);
+        if (i === segmentCount - 1 && rng() < 0.3) {
+          if (rng() < 0.34) {
+            raw = ".git";
+          } else {
+            const suffix = TERMINAL_GIT_SUFFIXES[Math.floor(rng() * TERMINAL_GIT_SUFFIXES.length)];
+            raw = `${raw}${suffix}`;
+          }
+          hasTerminalGitSuffix = true;
+        }
         // encodeURIComponent so the generated segment is well-formed
         // percent-encoding input (the whole point is to exercise
         // decode/re-encode boundaries, not to feed the parser garbage
         // it would reject before it ever reaches the invariant).
         segments.push(encodeURIComponent(raw));
       }
-      return `https://${host}/${segments.join("/")}`;
+      return { url: `https://${host}/${segments.join("/")}`, hasTerminalGitSuffix };
     }
 
     it("either refuses the input, or normalizing twice equals normalizing once — for 500 generated inputs", () => {
       const rng = makeRng(0xc0ffee);
       let refused = 0;
       let accepted = 0;
+      let sawTerminalGitSuffix = false;
       for (let i = 0; i < 500; i++) {
-        const candidate = randomCandidate(rng);
+        const { url: candidate, hasTerminalGitSuffix } = randomCandidate(rng);
+        if (hasTerminalGitSuffix) sawTerminalGitSuffix = true;
         const once = normalizeRepositoryUrl(candidate);
         if (!once.ok) {
           refused++;
@@ -173,6 +230,13 @@ describe("showcase registry", () => {
       // rather than trivially refusing or trivially accepting everything.
       expect(refused).toBeGreaterThan(0);
       expect(accepted).toBeGreaterThan(0);
+      // Coverage check, not a correctness check: this asserts the
+      // generator itself reaches the terminal-".git" shapes that Fix 1's
+      // defect lived in, so a future edit to the generator that stops
+      // producing them fails loudly here instead of silently weakening
+      // this test's ability to catch that defect class again.
+      expect(sawTerminalGitSuffix).toBe(true);
+      console.log(`round-trip idempotence generator: refused=${refused} accepted=${accepted}`);
     });
   });
 
