@@ -183,6 +183,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-164](ADR-164-event-sink-boundary.md)                               | Event Sink Boundary                                                                                        |
 | [ADR-165](ADR-165-read-path-performance-recovery.md)                    | Read-Path Performance Recovery                                                                             |
 | [ADR-166](ADR-166-hot-path-latency-regression-guard.md)                 | Hot-Path Latency Regression Guard                                                                          |
+| [ADR-167](ADR-167-service-provenance-and-kind-classification.md)        | Service Provenance, Service/Concept Classification, and Kind Migration                                     |
 | [ADR-168](ADR-168-event-retention-classes.md)                           | Event Retention Classes and Sealed Archival                                                                |
 
 <!-- END GENERATED ADR CATALOG -->

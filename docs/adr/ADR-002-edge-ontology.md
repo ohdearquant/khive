@@ -23,6 +23,10 @@ carry a relation-specific payload atomically with the delete, as specified in "C
 with a per-relation coherence classification for curation), records the existing self-loop
 rejection, and states the delete-then-relink direction rule. See "Reciprocal pairs,
 self-loops, and repricing" below. Motivated by issue #1667.
+**Amended 2026-08-21 ([ADR-167](ADR-167-service-provenance-and-kind-classification.md))**:
+base endpoint contract gains one derivation pair — `Service introduced_by Document` — so a
+service can record the specification, ADR, or paper that introduced it. See "Base endpoint
+contract" below.
 
 ## Context
 
@@ -59,12 +63,12 @@ classification ambiguity.
 
 ### Category 2: Derivation (intellectual lineage)
 
-| Relation        | Direction                              | When                                                                                       |
-| --------------- | -------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `extends`       | child → parent                         | Builds on, generalizes (FlashAttention-2 → FlashAttention)                                 |
-| `variant_of`    | variant → original                     | Modified version (QLoRA → LoRA)                                                            |
-| `introduced_by` | concept/document → document/person/org | First described in (LoRA → Hu et al. 2021); document authorship (paper → author/publisher) |
-| `supersedes`    | new → old                              | Replaces entirely; old stops being authoritative                                           |
+| Relation        | Direction                                                                           | When                                                                                       |
+| --------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `extends`       | child → parent                                                                      | Builds on, generalizes (FlashAttention-2 → FlashAttention)                                 |
+| `variant_of`    | variant → original                                                                  | Modified version (QLoRA → LoRA)                                                            |
+| `introduced_by` | concept → document/person/org · document → person/org · artifact/service → document | First described in (LoRA → Hu et al. 2021); document authorship (paper → author/publisher) |
+| `supersedes`    | new → old                                                                           | Replaces entirely; old stops being authoritative                                           |
 
 ### Category 3: Provenance (material/generative source lineage)
 
@@ -399,6 +403,7 @@ allowlist but cannot remove base rules.
 | `Document` | `introduced_by` | `Person`   |
 | `Document` | `introduced_by` | `Org`      |
 | `Concept`  | `introduced_by` | `Org`      |
+| `Service`  | `introduced_by` | `Document` |
 | `Concept`  | `supersedes`    | `Concept`  |
 | `Document` | `supersedes`    | `Document` |
 | `Artifact` | `supersedes`    | `Artifact` |
@@ -411,6 +416,15 @@ allowlist but cannot remove base rules.
 > or published it) or for a _concept originating from an org_ rather than a paper or person
 > (e.g. an architecture originated by a company). Direction is unchanged: source is the thing
 > whose origin is being recorded, target is the origin.
+
+> **Amended 2026-08-21 ([ADR-167](ADR-167-service-provenance-and-kind-classification.md))**:
+> added `Service introduced_by Document`. A service could supersede another service and be
+> contained by an org, but could not point at the specification or paper that introduced it;
+> its origin was being recorded as prose in notes, invisible to lineage traversal. This is
+> deliberately one pair: the measured refusals concern a service recording its own origin,
+> and the wider forms (`Service introduced_by Person`/`Org`, any `derived_from` pair
+> involving a service) were considered and rejected for lack of evidence. Direction is
+> unchanged: source is the thing whose origin is being recorded, target is the origin.
 
 #### Provenance relation
 

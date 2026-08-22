@@ -280,8 +280,10 @@ severity = "warning"
 
 [[edge_direction_conventions.relations]]
 relation = "introduced_by"
-forward_source_kinds = ["concept", "artifact"]
+forward_source_kinds = ["concept", "artifact", "service"]
 forward_target_kinds = ["document", "person"]
+# Illustrative, not the canonical endpoint allowlist: the runtime's endpoint
+# table is authoritative for which pairs a live write accepts.
 
 [dangling_refs]
 enabled = true

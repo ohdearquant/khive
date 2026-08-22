@@ -768,6 +768,9 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("concept", EdgeRelation::IntroducedBy, "document"),
     ("concept", EdgeRelation::IntroducedBy, "person"),
     ("artifact", EdgeRelation::IntroducedBy, "document"),
+    // ADR-002 amendment (ADR-167): service provenance — the document that
+    // introduced a service (its ADR or design record).
+    ("service", EdgeRelation::IntroducedBy, "document"),
     ("document", EdgeRelation::IntroducedBy, "person"),
     ("document", EdgeRelation::IntroducedBy, "org"),
     ("concept", EdgeRelation::IntroducedBy, "org"),
@@ -16037,6 +16040,138 @@ mod tests {
             result.is_err(),
             "org->document introduced_by must remain rejected; only \
              document->org is permitted, not the reverse; got {result:?}"
+        );
+    }
+
+    // ── Service provenance endpoint pair (ADR-167) ──────────────────────────
+    // service->document is the only introduced_by pair with a service
+    // endpoint: a service's provenance is stated by the document that
+    // introduced it. Neighboring pairs and the reverse stay rejected.
+
+    #[tokio::test]
+    async fn link_service_introduced_by_document_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let svc = rt
+            .create_entity(&tok, "service", None, "Search API", None, None, vec![])
+            .await
+            .unwrap();
+        let doc = rt
+            .create_entity(&tok, "document", None, "Design doc", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, svc.id, doc.id, EdgeRelation::IntroducedBy, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "service->document introduced_by must be allowed by the ADR-167 \
+             endpoint amendment; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_service_introduced_by_person_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let svc = rt
+            .create_entity(&tok, "service", None, "Search API", None, None, vec![])
+            .await
+            .unwrap();
+        let person = rt
+            .create_entity(&tok, "person", None, "Operator", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(
+                &tok,
+                svc.id,
+                person.id,
+                EdgeRelation::IntroducedBy,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "service->person introduced_by is not in the endpoint table and \
+             must be rejected; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_service_introduced_by_org_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let svc = rt
+            .create_entity(&tok, "service", None, "Search API", None, None, vec![])
+            .await
+            .unwrap();
+        let org = rt
+            .create_entity(&tok, "org", None, "Vendor", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, svc.id, org.id, EdgeRelation::IntroducedBy, 1.0, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "service->org introduced_by is not in the endpoint table and \
+             must be rejected; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_document_introduced_by_service_rejected_direction_matters() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let doc = rt
+            .create_entity(&tok, "document", None, "Design doc", None, None, vec![])
+            .await
+            .unwrap();
+        let svc = rt
+            .create_entity(&tok, "service", None, "Search API", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, doc.id, svc.id, EdgeRelation::IntroducedBy, 1.0, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "document->service introduced_by must remain rejected; only \
+             service->document is permitted, not the reverse; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_service_derived_from_document_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let svc = rt
+            .create_entity(&tok, "service", None, "Search API", None, None, vec![])
+            .await
+            .unwrap();
+        let doc = rt
+            .create_entity(&tok, "document", None, "Design doc", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, svc.id, doc.id, EdgeRelation::DerivedFrom, 1.0, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "service->document is permitted only for introduced_by; the same \
+             endpoints under derived_from must be rejected; got {result:?}"
         );
     }
 
