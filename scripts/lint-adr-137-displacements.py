@@ -46,6 +46,19 @@ WORDS = {
 }
 DECISION_HEADING = re.compile(r"^(\d+)\. \*\*(.+?) — (RATIFIED|CHANGED)", re.M)
 
+# A displacement is "bounded" when the parent rule survives and only its scope
+# moves. Membership is a CLOSED vocabulary, not the truthiness of a prose field:
+# the generated ADR publishes the count and the membership list, so deriving
+# them from whether someone wrote a free-form note means a later edit to that
+# note can silently move a published claim. `scope_note` stays, as the human
+# explanation; `scope_kind` is what the count is computed from.
+SCOPE_KINDS = {
+    "version_floor": "the rule holds, but not below the protocol version floor",
+    "idless_error": "the rule holds except for the case carrying no operation id",
+    "endpoint_role": "the rule holds; its scoping to one endpoint role is what moves",
+    "outermost_shape": "only the outermost type is displaced, not the per-field shape",
+}
+
 
 def wrap(text: str, bullet: bool = False) -> str:
     return textwrap.fill(
@@ -94,6 +107,46 @@ def check_labels(decisions: list[dict], adr_text: str) -> list[str]:
         if got is not None and got != d["label"]:
             complaints.append(
                 f"decision {d['n']}: table says {d['label']}, the ADR says {got}"
+            )
+    return complaints
+
+
+def check_scope_kinds(decisions: list[dict]) -> list[str]:
+    """`scope_kind` must be a known value, and must pair with `scope_note`.
+
+    The generated ADR publishes both a COUNT and a MEMBERSHIP LIST of bounded
+    displacements. Deriving those from a free-form field's truthiness is how a
+    published claim moves silently, which already happened once here: decision 1
+    was bounded in fact, carried no note, and was dropped from a count that read
+    as authoritative.
+
+    Both directions are checked, and the second is the one that matters. An
+    unknown `scope_kind` is loud and easy. A row that has a `scope_note` but no
+    `scope_kind` is the silent case: it reads to a human as bounded, and the
+    count omits it, with nothing anywhere disagreeing.
+    """
+    complaints = []
+    for d in decisions:
+        kind, note = d.get("scope_kind"), d.get("scope_note")
+        if kind is not None and kind not in SCOPE_KINDS:
+            complaints.append(
+                f"decision {d['n']}: scope_kind {kind!r} is not one of "
+                f"{sorted(SCOPE_KINDS)}"
+            )
+        if note and not kind:
+            complaints.append(
+                f"decision {d['n']}: has a scope_note but no scope_kind, so it "
+                f"reads as bounded but is excluded from the generated count"
+            )
+        if kind and not note:
+            complaints.append(
+                f"decision {d['n']}: has scope_kind {kind!r} but no scope_note "
+                f"explaining the bound to a reader"
+            )
+        if kind and not d["crate_displaced"]:
+            complaints.append(
+                f"decision {d['n']}: has scope_kind {kind!r} but displaces no "
+                f"crate passage, so it can never appear in the generated count"
             )
     return complaints
 
@@ -234,9 +287,11 @@ def precedence_passage(decisions: list[dict]) -> str:
             tail += f". The displacement is bounded: {d['scope_note']}"
         bullets.append(wrap(f"{body[0].upper() + body[1:]}{tail}.", bullet=True))
 
-    # The count of bounded entries is derived, not asserted: it moves whenever a
-    # scope note is added to or removed from the table.
-    bounded = [d for d in displacing if d.get("scope_note")]
+    # The count of bounded entries is derived, not asserted. It is computed from
+    # `scope_kind`, a closed vocabulary checked by check_scope_kinds, and NOT
+    # from whether a prose `scope_note` happens to be present — a published
+    # count must not move because someone reworded an explanation.
+    bounded = [d for d in displacing if d.get("scope_kind")]
     bounded_names = "decisions " + english_list([str(d["n"]) for d in bounded])
     closing = wrap(
         f"{WORDS[len(bounded)]} of those entries are bounded rather than wholesale — "
@@ -277,6 +332,13 @@ def main() -> int:
     if complaints:
         print("LABEL MISMATCH between the table and the ADR:", file=sys.stderr)
         for c in complaints:
+            print(f"  - {c}", file=sys.stderr)
+        return 2
+
+    scope_complaints = check_scope_kinds(decisions)
+    if scope_complaints:
+        print("SCOPE-KIND MISMATCH in the table:", file=sys.stderr)
+        for c in scope_complaints:
             print(f"  - {c}", file=sys.stderr)
         return 2
 
