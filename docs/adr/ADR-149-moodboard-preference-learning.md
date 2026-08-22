@@ -3,10 +3,11 @@
 **Status**: accepted\
 **Date**: 2026-08-08\
 **Authors**: khive maintainers\
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which moves the
-deterministic numerical core to `lattice-tune`, preserves feature/scope and byte/event identities,
-and anchors the existing FANN object under ADR-121 role `"fann-network"` with authenticated
-cross-checks on acceptance.
+**Amended by**: accepted [ADR-160](ADR-160-shared-pack-infrastructure.md), whose shared-hydration
+phase is implemented (preference bundle/network reads hydrate through the runtime seam); its
+remaining phases move the deterministic numerical core to `lattice-tune`, preserve feature/scope
+and byte/event identities, and anchor the existing FANN object under ADR-121 role `"fann-network"`
+with authenticated cross-checks.
 
 ## Context
 

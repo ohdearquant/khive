@@ -3,10 +3,11 @@
 **Status**: accepted\
 **Date**: 2026-08-08\
 **Authors**: khive maintainers\
-**Amended by**: [ADR-149](ADR-149-moodboard-preference-learning.md); proposed
-[ADR-160](ADR-160-shared-pack-infrastructure.md) converges attachment publication on ADR-121 and
-extracts shared hydration, complete embedding-space identity/lineage mapping, fusion,
-materialization, and checkpoint seams on acceptance.
+**Amended by**: [ADR-149](ADR-149-moodboard-preference-learning.md); accepted
+[ADR-160](ADR-160-shared-pack-infrastructure.md), whose shared-hydration phase is implemented
+(source-image and preference reads hydrate through the runtime seam) and whose remaining phases
+converge attachment publication on ADR-121 and extract the embedding-space identity/lineage
+mapping, fusion, materialization, and checkpoint seams.
 
 ## Context
 
@@ -176,8 +177,9 @@ is shared by the two runtime handles.
    visual vector row.
 
 The normalized PNG is derived cache input, not a persisted attachment in the current
-implementation. Proposed ADR-160 migrates the original visual and the preference bundle/network
-blob anchors to ADR-121 roles on acceptance without promoting this normalized cache input. A
+implementation. Accepted ADR-160 schedules migration of the original visual and the preference
+bundle/network blob anchors to ADR-121 roles in its attachment-convergence phase, without
+promoting this normalized cache input. A
 failure after blob publication may leave an orphan for ADR-111 grace-period GC. A
 failure after entity creation may leave an attached asset without the current descriptor row;
 retrying the same bytes reuses the entity and heals the vector. `created` reports whether this call
