@@ -5,7 +5,7 @@ Two sentences in the amendment state quantities and set memberships that a reade
 cannot check without redoing the audit: how many decisions displace the crate
 documentation, which ones they are, and which decisions carry the CHANGED label
 that the implementation fence turns on. Typing those is how they go wrong. This
-script derives all of them from `.khive/displacements.json`, and cross-checks the
+script derives all of them from the table (see TABLE below), and cross-checks the
 label of every decision against the ADR's own heading text so the table cannot
 drift from the document it describes without the check failing.
 
@@ -15,8 +15,14 @@ drift from the document it describes without the check failing.
 --check is the mode the pre-commit hook runs, so an edit to either the ADR or
 the table that leaves the two disagreeing fails before it can be committed.
 
-Exit status is nonzero if a label disagrees, or, under --check, if a generated
-passage is absent from the ADR.
+Three things are checked, because each was found unguarded by review:
+  * every quoted passage still exists in the file the row cites (citations),
+  * the table describes exactly the ADR's decision set, with no duplicate or
+    missing decision number (labels),
+  * the ADR contains the generated passages verbatim (--check).
+
+Exit status: 2 if the table and the ADR disagree about decisions or citations,
+1 if --check finds a generated passage absent from the ADR, 0 otherwise.
 """
 
 from __future__ import annotations
@@ -66,22 +72,134 @@ def labels_from_adr(text: str) -> dict[int, str]:
 
 
 def check_labels(decisions: list[dict], adr_text: str) -> list[str]:
-    """The table's labels must equal the ADR's own. Returns a list of complaints."""
+    """The table must describe exactly the ADR's decisions. Returns complaints."""
     from_adr = labels_from_adr(adr_text)
+    numbers = [d["n"] for d in decisions]
     complaints = []
-    if len(from_adr) != len(decisions):
-        complaints.append(
-            f"the ADR carries {len(from_adr)} numbered decisions, the table has {len(decisions)}"
-        )
+
+    # Compare the number SETS, not their sizes. `from_adr` is a dict and so
+    # collapses duplicates; `decisions` is a list and does not. A table that
+    # carries decision 4 twice and omits decision 7 therefore has the same
+    # length as a correct one, and the old size comparison passed it while
+    # every generated count and set membership silently went wrong.
+    for n in sorted({n for n in numbers if numbers.count(n) > 1}):
+        complaints.append(f"decision {n} appears {numbers.count(n)} times in the table")
+    for n in sorted(set(from_adr) - set(numbers)):
+        complaints.append(f"decision {n} is in the ADR but not in the table")
+    for n in sorted(set(numbers) - set(from_adr)):
+        complaints.append(f"decision {n} is in the table but not in the ADR")
+
     for d in decisions:
         got = from_adr.get(d["n"])
-        if got is None:
-            complaints.append(f"decision {d['n']} is in the table but not in the ADR")
-        elif got != d["label"]:
+        if got is not None and got != d["label"]:
             complaints.append(
                 f"decision {d['n']}: table says {d['label']}, the ADR says {got}"
             )
     return complaints
+
+
+def normalize(text: str) -> str:
+    """Strip doc-comment markers and collapse whitespace.
+
+    Canonicalization of a known syntax, not fuzzy matching. The cited crate
+    passages are `//!` doc comments that hard-wrap mid-sentence, so no quoted
+    phrase is a contiguous substring of the raw file; without this, a citation
+    check could only ever be tolerant, and a tolerant one is worse than none.
+    A lowercased quote in decision 2 matched an unrelated passage 93 lines from
+    the intended one, which is the failure this exactness exists to prevent.
+    """
+    return normalize_with_lines(text)[0]
+
+
+def normalize_with_lines(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Normalize, and return a map from offset in the result to source line.
+
+    The map is what lets a quote report the line it currently occupies. Deriving
+    the line at check time is the whole point: a stored one is invalidated by the
+    next edit to the cited file, which is exactly what happened here.
+    """
+    parts: list[str] = []
+    index: list[tuple[int, int]] = []
+    pos = 0
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        collapsed = re.sub(r"\s+", " ", re.sub(r"^[ \t]*//[/!] ?", "", raw)).strip()
+        if not collapsed:
+            continue
+        index.append((pos, lineno))
+        parts.append(collapsed)
+        pos += len(collapsed) + 1
+    return " ".join(parts), index
+
+
+def line_at(index: list[tuple[int, int]], offset: int) -> int:
+    """The source line containing the given offset in the normalized text."""
+    found = index[0][1] if index else 0
+    for start, lineno in index:
+        if start > offset:
+            break
+        found = lineno
+    return found
+
+
+def check_citations(decisions: list[dict], root: Path) -> tuple[list[str], list[str]]:
+    """Every quoted passage must still exist in the file its row cites.
+
+    Returns (complaints, resolved) where `resolved` reports the line each quote
+    currently occupies. Line numbers are derived here and never stored: the
+    amendment inserts into the very ADR the table cites, so a stored line is
+    invalidated by the edit that makes the citation worth checking.
+    """
+    complaints, resolved = [], []
+    bodies: dict[str, tuple[str, list[tuple[int, int]]]] = {}
+    for d in decisions:
+        for field in ("parent_displaced", "crate_displaced"):
+            for site in d.get(field, []):
+                path = site["cite"]
+                if ":" in path:
+                    complaints.append(
+                        f"decision {d['n']}: cite {path!r} carries a line number; "
+                        f"cite the file and let the quote locate the passage"
+                    )
+                    path = path.split(":", 1)[0]
+                if path not in bodies:
+                    target = root / path
+                    if target.exists():
+                        bodies[path] = normalize_with_lines(target.read_text())
+                    else:
+                        complaints.append(f"decision {d['n']}: cited file {path} does not exist")
+                        bodies[path] = ("", [])
+                body, index = bodies[path]
+                for quote in site["quotes"]:
+                    needle = normalize(quote)
+                    hits = body.count(needle) if needle else 0
+                    if not needle:
+                        complaints.append(f"decision {d['n']}: empty quote for {path}")
+                    elif hits == 1:
+                        line = line_at(index, body.index(needle))
+                        resolved.append(f"  decision {d['n']:<2} {path}:{line}")
+                    elif hits == 0:
+                        complaints.append(
+                            f"decision {d['n']}: {path} no longer contains {quote[:70]!r}"
+                        )
+                    else:
+                        # Ambiguity is fail-open here, not a cosmetic defect. The
+                        # amendment quotes the passages it displaces, in the file it
+                        # cites, so a short quote matches the amendment's own
+                        # quotation as readily as the parent sentence -- and would
+                        # keep matching after the parent sentence was deleted, which
+                        # is the one change this check exists to catch.
+                        lines = []
+                        start = 0
+                        for _ in range(hits):
+                            at = body.index(needle, start)
+                            lines.append(str(line_at(index, at)))
+                            start = at + 1
+                        complaints.append(
+                            f"decision {d['n']}: {path} contains {quote[:50]!r} "
+                            f"{hits} times (lines {', '.join(lines)}); lengthen the quote "
+                            f"until it names one passage"
+                        )
+    return complaints, resolved
 
 
 def precedence_passage(decisions: list[dict]) -> str:
@@ -160,6 +278,19 @@ def main() -> int:
         for c in complaints:
             print(f"  - {c}", file=sys.stderr)
         return 2
+
+    cite_complaints, resolved = check_citations(decisions, ROOT)
+    if cite_complaints:
+        print("CITATION MISMATCH between the table and the cited sources:", file=sys.stderr)
+        for c in cite_complaints:
+            print(f"  - {c}", file=sys.stderr)
+        return 2
+    if not resolved:
+        print("no citations were checked; the table carries no quotes", file=sys.stderr)
+        return 2
+    print(f"citations: {len(resolved)} quoted passages resolve in their cited files")
+    for r in resolved:
+        print(r)
 
     passages = {
         "precedence": precedence_passage(decisions),
