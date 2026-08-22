@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{
-    EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
-    VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
+    arm_prefix_resolve_fail_scoped, EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken,
+    ParamDef, RuntimeError, VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
+    Visibility,
 };
 use khive_storage::{Edge, EdgeRelation, Note, SqlStatement, SqlValue};
 use khive_types::Pack;
@@ -513,6 +514,40 @@ async fn get_nonexistent_id_returns_not_found() {
     assert!(
         matches!(err, RuntimeError::NotFound(_)),
         "get on nonexistent id must be NotFound, got: {err:?}"
+    );
+}
+
+// ---- `get` must distinguish a resolver storage failure from a genuine miss ----
+
+#[tokio::test]
+async fn get_prefix_resolver_storage_failure_is_not_reported_as_not_found() {
+    let pack = pack();
+    let prefix = "deadbeef";
+    let _arm = arm_prefix_resolve_fail_scoped(prefix);
+
+    let err = pack
+        .dispatch("get", json!({"id": prefix}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::Storage(_)),
+        "a storage failure during id resolution must surface as Storage, not be swallowed \
+         into a false not-found; got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_prefix_matching_nothing_with_no_fault_armed_is_not_found() {
+    let pack = pack();
+
+    let err = pack
+        .dispatch("get", json!({"id": "abadcafe"}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "a prefix matching no record, with no fault armed, must still be NotFound \
+         (proves the fix did not turn absence into an error); got: {err:?}"
     );
 }
 

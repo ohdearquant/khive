@@ -8,7 +8,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_runtime::{
-    hex_prefix_to_uuid_pattern, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
+    hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
 };
 use khive_storage::event::Event;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
@@ -38,19 +38,14 @@ impl KgPack {
         // rows — required both for `include_deleted=true` and for the
         // merged_into disclosure below (absorbed entities are soft-deleted, so
         // a live-only prefix scan would miss them before the hint could fire).
-        let id = if let Ok(id) = resolve_uuid_unfiltered(&p.id, &self.runtime, graph_token).await {
-            id
-        } else if let Ok(id) = resolve_uuid_unfiltered(&p.id, &self.runtime, token).await {
-            id
-        } else if let Ok(id) =
-            resolve_uuid_unfiltered_including_deleted(&p.id, &self.runtime, graph_token).await
-        {
-            id
-        } else {
-            if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
-                return Ok(payload_val);
+        let id = match resolve_id_through_arms(&p.id, &self.runtime, graph_token, token).await? {
+            Some(id) => id,
+            None => {
+                if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
+                    return Ok(payload_val);
+                }
+                return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
             }
-            return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
         };
 
         let include_deleted = p.include_deleted.unwrap_or(false);
@@ -395,6 +390,49 @@ impl KgPack {
         }
 
         Ok(Some(result))
+    }
+}
+
+/// Classifies a resolver-arm error as absence (the arm found no single id, so the next
+/// arm is still worth trying) versus failure (the lookup itself could not be performed,
+/// so it must reach the caller as-is instead of being swallowed into a false not-found).
+///
+/// `resolve_name_async` (in `common.rs`) constructs only `Storage`/`NotFound`/`Ambiguous`,
+/// and the only `InvalidInput` the prefix-resolution path can construct is a prefix-miss —
+/// so this list is exhaustive for "no id, keep trying" today. Any other variant
+/// (`Storage`, `Sqlite`, `Internal`, `AmbiguousPrefix`, …) is a failure and propagates.
+fn is_resolution_absence(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::NotFound(_) | RuntimeError::InvalidInput(_) | RuntimeError::Ambiguous(_)
+    )
+}
+
+/// Run `get`'s three-arm id-resolution fallback chain, distinguishing "every arm reported
+/// absence" (`Ok(None)`) from "an arm could not perform its lookup" (`Err`). `Ambiguous`
+/// stays in the absence bucket deliberately: the first two arms differ only in namespace
+/// token, and a name ambiguous in the graph namespace may still resolve uniquely in the
+/// local one — treating it as a failure would regress that cross-namespace disambiguation.
+async fn resolve_id_through_arms(
+    raw_id: &str,
+    runtime: &KhiveRuntime,
+    graph_token: &NamespaceToken,
+    token: &NamespaceToken,
+) -> Result<Option<Uuid>, RuntimeError> {
+    match resolve_uuid_unfiltered(raw_id, runtime, graph_token).await {
+        Ok(id) => return Ok(Some(id)),
+        Err(e) if !is_resolution_absence(&e) => return Err(e),
+        Err(_) => {}
+    }
+    match resolve_uuid_unfiltered(raw_id, runtime, token).await {
+        Ok(id) => return Ok(Some(id)),
+        Err(e) if !is_resolution_absence(&e) => return Err(e),
+        Err(_) => {}
+    }
+    match resolve_uuid_unfiltered_including_deleted(raw_id, runtime, graph_token).await {
+        Ok(id) => Ok(Some(id)),
+        Err(e) if !is_resolution_absence(&e) => Err(e),
+        Err(_) => Ok(None),
     }
 }
 

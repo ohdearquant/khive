@@ -83,6 +83,13 @@ static FTS_FAIL_MANY_NS: std::sync::LazyLock<FaultArmSet> =
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_MANY_PARTIAL_NS: std::sync::LazyLock<FaultArmSet> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// `resolve_prefix_inner` storage-failure injection, keyed by the scanned prefix string
+/// rather than a namespace (the `resolve_prefix_unfiltered*` entry points pass
+/// `namespaces: None` by contract, so there is no namespace to key on); see
+/// docs/operations.md#fault-injection-static-state.
+#[cfg(any(test, feature = "fault-injection"))]
+static PREFIX_RESOLVE_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Scoped ownership of a process-wide fault-injection arm.
 #[cfg(any(test, feature = "fault-injection"))]
@@ -220,6 +227,22 @@ pub fn arm_vector_fail_scoped(ns: &str) -> FaultInjectionArm {
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_entity_compensation_fail_scoped(ns: &str) -> FaultInjectionArm {
     arm_fault(&ENTITY_COMPENSATION_FAIL_NS, ns, MAX_FAULT_ARMS)
+}
+
+/// Arm a one-shot storage failure injection for `resolve_prefix_inner` targeting the
+/// exact `prefix` string.
+///
+/// The next `resolve_prefix`/`resolve_prefix_unfiltered`/`resolve_prefix_including_deleted`/
+/// `resolve_prefix_unfiltered_including_deleted` call scanning this `prefix` returns an
+/// injected `StorageError::Timeout` instead of performing the table scan, then disarms.
+/// Keyed by prefix rather than namespace because the unfiltered entry points pass no
+/// namespace at all.
+/// Keep the returned guard alive until the triggering call completes; dropping it
+/// disarms an unconsumed injection.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_prefix_resolve_fail_scoped(prefix: &str) -> FaultInjectionArm {
+    arm_fault(&PREFIX_RESOLVE_FAIL_NS, prefix, MAX_FAULT_ARMS)
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -4204,6 +4227,18 @@ impl KhiveRuntime {
         }
 
         let pattern = format!("{}%", hex_prefix_to_uuid_pattern(prefix));
+
+        // Injection: check PREFIX_RESOLVE_FAIL_NS (armed by
+        // `arm_prefix_resolve_fail_scoped(prefix)`), exercising the storage-failure path
+        // a genuine pool checkout timeout or WAL contention would take.
+        #[cfg(any(test, feature = "fault-injection"))]
+        if consume_fault(&PREFIX_RESOLVE_FAIL_NS, prefix) {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::Timeout {
+                    operation: "resolve_prefix".into(),
+                },
+            ));
+        }
 
         let tables = [
             ("entities", true),
