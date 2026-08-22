@@ -13,7 +13,7 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, Offset, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -543,25 +543,47 @@ fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<Da
         // The earlier one is the least instant whose local date is `date`.
         chrono::LocalResult::Ambiguous(earliest, _latest) => Some(earliest),
         // Spring-forward gap (or a larger jump): local midnight does not
-        // exist. Find the transition by probing a point on the previous
-        // calendar date guaranteed to fall outside any transition (noon),
-        // reading the offset in effect there, and using it to project
-        // `midnight` to the UTC instant it would have been under that
-        // still-prior offset. Because the local date is a monotonically
-        // non-decreasing function of UTC time, re-deriving the actual local
-        // time at that UTC instant (an unconditional, never-ambiguous
-        // UTC->local conversion) lands exactly on the first instant that
-        // exists on `date` — the moment the new offset regime begins.
+        // exist. Solve for the boundary directly rather than projecting to
+        // it. The local date is a monotonically non-decreasing function of
+        // UTC time, so the least instant whose local date is `date` is the
+        // bisection point on the UTC axis between "still the previous date"
+        // and "already this date".
+        //
+        // The earlier implementation instead read the offset in effect at
+        // noon on the previous calendar date and projected local midnight
+        // forward under it. That is correct only when the gap BEGINS at
+        // local midnight. It need not: for `America/Toronto` on 1919-03-31
+        // the clock jumped from 23:30 on the previous date to 00:30, so the
+        // first instant belonging to the date is 00:30 local (04:30Z), while
+        // the projection under the prior -05:00 offset returned 01:00 local
+        // (05:00Z) — thirty minutes late, and late in a way that still
+        // passed a same-date check. Six IANA zones share that transition.
+        //
+        // One-second granularity is required, not one-minute: historical
+        // LMT offsets are not whole minutes.
         chrono::LocalResult::None => {
-            let prev_noon = date.pred_opt()?.and_hms_opt(12, 0, 0)?;
-            let offset_before = match tz.offset_from_local_datetime(&prev_noon) {
-                chrono::LocalResult::Single(o) => o,
-                chrono::LocalResult::Ambiguous(o, _) => o,
-                chrono::LocalResult::None => return None,
-            };
-            let candidate_utc =
-                midnight - chrono::Duration::seconds(offset_before.fix().local_minus_utc() as i64);
-            let resolved = tz.from_utc_datetime(&candidate_utc);
+            let mut lo = midnight - chrono::Duration::hours(48);
+            let mut hi = midnight + chrono::Duration::hours(48);
+            // Guard the bisection invariant instead of assuming it. Real UTC
+            // offsets stay well inside +/-48h, so a violation here means the
+            // zone is outside anything this rule can answer for; fail closed.
+            if tz.from_utc_datetime(&lo).date_naive() >= date
+                || tz.from_utc_datetime(&hi).date_naive() < date
+            {
+                return None;
+            }
+            while hi - lo > chrono::Duration::seconds(1) {
+                let mid = lo + (hi - lo) / 2;
+                if tz.from_utc_datetime(&mid).date_naive() < date {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            // `hi` is now the least instant whose local date is >= `date`.
+            // It is > `date` exactly when the zone's local calendar skips
+            // the date entirely, which is the documented `None` case.
+            let resolved = tz.from_utc_datetime(&hi);
             (resolved.date_naive() == date).then_some(resolved)
         }
     }
@@ -613,6 +635,50 @@ mod parse_due_tests {
         assert!(
             parsed.time() > chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
             "got {result}"
+        );
+    }
+
+    // The two tests above assert only that the resolved time is after 00:00.
+    // That is too weak to separate "the first instant on this date" from "some
+    // instant on this date": both zones' gaps begin exactly at local midnight,
+    // so a projection under the previous offset and a true least-instant search
+    // agree there and either implementation passes. The test below uses a zone
+    // whose gap begins BEFORE midnight, where the two rules give different
+    // answers, and asserts the least-instant property itself.
+    #[test]
+    fn date_only_due_resolves_to_the_least_instant_when_the_gap_begins_before_midnight_toronto() {
+        let tz: Tz = "America/Toronto".parse().expect("known IANA zone");
+        // On 1919-03-31 the clock jumped from 23:30 on the previous date to
+        // 00:30, so local midnight never occurred and the first instant of the
+        // date is 00:30 -04:00 = 04:30Z. Reading the previous day's offset
+        // (-05:00) and projecting midnight forward gives 05:00Z instead, which
+        // is on the right date and thirty minutes late.
+        let result = parse_due("1919-03-31", tz)
+            .expect("a gap date must resolve to the first instant of that date (ADR-169 D1)");
+        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
+
+        assert_eq!(
+            parsed.to_utc(),
+            chrono::NaiveDate::from_ymd_opt(1919, 3, 31)
+                .unwrap()
+                .and_hms_opt(4, 30, 0)
+                .unwrap()
+                .and_utc(),
+            "must be the FIRST instant of the date (04:30Z), not the instant local midnight \
+             would have had under the previous offset (05:00Z); got {result}"
+        );
+
+        // The least-instant property, asserted directly rather than by
+        // comparing against a constant: one second earlier must already be a
+        // different local date. This is what fails for the projected answer,
+        // since 04:59:59Z is still 1919-03-31 locally.
+        let one_second_earlier = parsed.to_utc() - chrono::Duration::seconds(1);
+        assert_ne!(
+            tz.from_utc_datetime(&one_second_earlier.naive_utc())
+                .date_naive(),
+            chrono::NaiveDate::from_ymd_opt(1919, 3, 31).unwrap(),
+            "the instant one second before the resolved one must belong to a different local \
+             date, or the resolved instant was not the least one; got {result}"
         );
     }
 
