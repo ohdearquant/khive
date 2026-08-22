@@ -110,6 +110,10 @@ Wire-level errors are a closed set, distinct from verb-level DSL errors (ADR-016
 
 A connection-terminal error is followed by connection close; a request-terminal error terminates only the operation id it echoes — a request, subscribe, or unsubscribe id — and the connection stays usable. The set is closed within a protocol version: adding a code requires a protocol version bump, and a client that receives a code it does not recognize must treat it as `internal` — request-terminal, retriable only under the caller's own policy — rather than inventing semantics for it.
 
+> **Amended.** Amendment 1, decision 5, supersedes the unrecognized-code sentence above for a code
+> that arrives without an operation id. The rule as written holds for an id-bearing unknown code
+> and is wrong for an id-less one, because a request-terminal outcome needs a request to terminate.
+
 ### Limits and backpressure
 
 Every deployment configures a maximum frame size and a maximum number of in-flight requests per connection. A frame exceeding the configured size is rejected with `frame_too_large` and the connection is closed rather than partially buffered. A request arriving at the in-flight limit is rejected with `in_flight_limit_exceeded`; the connection stays open and the caller may retry after an earlier request completes. Each connection's outbound event queue is bounded; reaching that bound disconnects the subscriber with `subscriber_overflow` rather than growing server memory without limit.
@@ -188,9 +192,23 @@ does today and the crate must move to match.
 ### Framing and version
 
 1. **Initial version and floor — RATIFIED.** The initial protocol version is `1`. Version `0` is
-   not a valid protocol version and is rejected. Initial supported range is `[1, 1]`. A handshake
-   naming a version outside the receiver's supported range is rejected rather than negotiated
-   downward.
+   not a valid protocol version. Initial supported range is `[1, 1]`. A handshake naming a version
+   outside the receiver's supported range is rejected rather than negotiated downward.
+
+   **The rejection layer is stated normatively because two layers could plausibly own it.** A
+   version field carrying any non-negative integer, `0` included, is syntactically well-formed and
+   MUST decode: the decoder's job is grammar, and a receiver that rejected `0` as
+   `malformed_frame` would close the connection on a frame it could have answered. Admission is
+   where the range is enforced: a handshake naming a version outside the receiver's supported
+   range, `0` and `99` alike, is rejected at handshake admission with `unsupported_version`.
+   Version `0` is therefore not special-cased on the receive path; it is out of range like any
+   other unsupported value, and the floor of `1` is what makes it out of range.
+
+   Locally constructing a version-`0` frame is a separate matter from receiving one. An encoder
+   MUST NOT emit a handshake or handshake acknowledgment naming version `0`; that is a local
+   construction error, not a wire error, and it never reaches a peer. Requiring it keeps a
+   conforming encoder from producing a frame whose only possible outcome at the far end is
+   rejection.
 
 2. **Frame ceiling and accounting — RATIFIED.** Frames are length-prefixed with a four-byte
    big-endian payload length. The configurable size limit counts the serialized bytes of the JSON
@@ -217,12 +235,25 @@ does today and the crate must move to match.
 
 ### Error and sequence semantics
 
-5. **Unknown error codes — CHANGED.** A frame carrying an unrecognized error code is surfaced
-   through a fallback that preserves the raw code string for diagnostics, and a fallback frame is
-   not re-encodable — it may be inspected but not relayed onward as though it were understood.
-   An unknown code arriving **without** an operation id is a malformed frame, not a
-   request-terminal error: there is no request for it to terminate. It follows decision 6's
-   id-less path and closes the connection.
+5. **Unknown error codes — CHANGED. This decision supersedes the parent's unknown-code rule.**
+   The parent states under "Wire errors" that a client receiving a code it does not recognize
+   "must treat it as `internal` — request-terminal, retriable only under the caller's own policy".
+   That rule is correct for an unknown code that carries an operation id and wrong for one that
+   does not, because a request-terminal outcome needs a request to terminate. Where this decision
+   and the parent paragraph disagree, this amendment governs.
+
+   Both cases are decided at the decode boundary, so that acceptance never depends on what a
+   consumer does afterwards:
+
+   - **Unknown code WITH an operation id** — surfaced through a fallback that preserves the raw
+     code string for diagnostics, request-terminal against that id, connection stays usable. The
+     fallback frame is not re-encodable: it may be inspected but never relayed onward as though it
+     were understood. This is the parent's rule, kept.
+   - **Unknown code WITHOUT an operation id** — `malformed_frame`, connection-terminal, following
+     decision 6's id-less path. The parent's `internal` classification is superseded here.
+
+   The parent's "Wire errors" paragraph carries an inline note pointing here, so a reader who
+   lands on that paragraph and stops there does not walk away with the superseded rule.
 
 6. **Handshake sequence violations — RATIFIED.** A frame arriving before the handshake completes,
    a handshake frame arriving after the handshake completes, and a frame arriving in the wrong
@@ -245,22 +276,47 @@ does today and the crate must move to match.
 ### Opaque payload fidelity
 
 9. **Opaque subvalue preservation — CHANGED.** The contents of `response.result` and
-   `event.payload` are opaque to this crate. A received opaque subvalue must be preserved
-   byte-exactly on relay, including member ordering and the original lexical form of numbers. The
-   crate currently documents and tests semantic rather than lexical preservation, so a relayed
-   payload can come out with members reordered and a number's lexeme changed. That is acceptable
-   for an endpoint that parses the value and wrong for a relay, and the transport's default must
-   serve the relay case because the fields are declared opaque and no consumer yet constrains
-   them.
+   `event.payload` are opaque to this crate. The crate currently documents and tests semantic
+   rather than lexical preservation, so a value that is decoded and re-encoded can come out with
+   members reordered and a number's lexeme changed. That is acceptable for an endpoint that parses
+   the value and wrong for anything that forwards it, and the transport's default must serve the
+   forwarding case, because the fields are declared opaque and no consumer yet constrains them.
 
-   This requirement is scoped to received opaque subvalues. It does not make envelope formatting
-   byte-stable, and it does not require the crate to relay whole frames verbatim.
+   **The conformance operation is decode-then-encode over a single frame, and nothing else.** For
+   a frame decoded from bytes and re-encoded without the holder modifying that subvalue, the bytes
+   of `response.result` and `event.payload` in the output must be identical to the bytes occupying
+   that subvalue's span in the input. Stating the operation is load-bearing: this crate performs no
+   I/O and exposes no "relay", so a requirement phrased against relaying names an operation that
+   does not exist and cannot be tested. Decode-then-encode is the only operation the crate has, and
+   it is the one a forwarding consumer composes.
+
+   Scope of the preserved span, stated because each of these is otherwise implementation-defined:
+
+   - **Preserved:** member order, the original lexical form of numbers, string escape sequences as
+     written, and any duplicate members nested _inside_ the opaque subvalue. Duplicate rejection
+     under decision 4 governs the typed envelope only, and must not be applied recursively into an
+     opaque subvalue.
+   - **Not preserved and not required to be:** whitespace between the subvalue's own tokens, which
+     an implementation MAY normalize; envelope formatting outside the subvalue span; and any value
+     the holder constructed locally rather than receiving, which has no source bytes to preserve
+     and is encoded by the ordinary serializer.
+
+   **This requires a representation the current typed structs cannot provide.** `serde_json::Value`
+   discards member order and number lexemes at parse time, so satisfying this decision means
+   carrying the received subvalue as its source bytes (for example a raw-value representation
+   retained alongside, or in place of, the parsed view). An implementation MAY additionally expose
+   a parsed convenience view; it MAY NOT make the parsed view the only representation. This is the
+   concrete work decision 9 fences.
+
+   This requirement does not make envelope formatting byte-stable and does not require whole-frame
+   verbatim forwarding.
 
 ### Payload shape
 
 10. **`event.payload` must be a JSON object — CHANGED.** The parent ADR specifies `payload` as "a
     topic-specific JSON object whose exact field-by-field shape this ADR delegates, by name, to
-    the implementation-phase topic catalog". The crate types the field as an arbitrary JSON value,
+    the implementation-phase topic catalog below". The crate types the field as an arbitrary JSON
+    value,
     so a scalar, array, or `null` payload is accepted on the wire while an implementation written
     from the ADR would reject it. The object requirement is retained and the crate must enforce
     it at decode: "field-by-field" presupposes fields, and an object is the only shape a topic
@@ -285,15 +341,31 @@ does today and the crate must move to match.
 
 ### Conformance
 
-This amendment is verified by a published vector matrix rather than by inspection. The matrix
-carries positive and negative vectors for every rule above: boundary frame lengths on both sides
-of the limit, version zero and out-of-range versions, empty operation ids, unknown and duplicate
-and explicitly-null envelope members, both id-bearing and id-less unknown error codes, each of the
+**This is a requirement on ratification, not a description of what exists.** No vector matrix is
+checked in today. `crates/khive-wire-protocol/tests/` holds eleven golden hex fixtures, one
+well-formed frame per kind, and `golden_frames.rs`, which exercises those fixtures and a set of
+malformed-frame cases. That is a useful regression floor and it is not a conformance matrix: it
+carries no negative vectors for the rules this amendment changes, no independent implementation,
+and no agreement criterion between implementations. Saying so plainly is the point of this
+section. An amendment that asserted its own verification in the present tense would hand a reader
+an unlocatable artifact and make every normative claim above unreproducible.
+
+**This amendment MUST NOT be ratified until the matrix is checked in.** The artifact is a set of
+vectors under `crates/khive-wire-protocol/tests/`, each pairing input bytes with the expected
+classification, plus a runner that executes them against an implementation. Required coverage,
+positive and negative, is every rule above: boundary frame lengths on both sides of the limit,
+version zero and out-of-range versions, empty operation ids, unknown and duplicate and
+explicitly-null envelope members, both id-bearing and id-less unknown error codes, each of the
 three handshake sequence violations, arbitrary topic and timestamp strings, opaque subvalues that
-round-trip byte-exactly, and non-object event payloads. Vectors are run through the Rust crate and
-through at least one independent JSON implementation, which must agree on accept/reject
-classification, on whether a rejection is request-terminal or connection-terminal, on consumed
-frame length, and on byte-exact opaque-subvalue round trip.
+round-trip byte-exactly, and non-object event payloads.
+
+Vectors MUST be run through the Rust crate and through at least one independent JSON
+implementation, which must agree on four things: accept or reject classification, whether a
+rejection is request-terminal or connection-terminal, consumed frame length, and byte-exact
+opaque-subvalue round trip under the decode-then-encode operation defined in decision 9. The
+independent implementation is what makes the matrix a conformance artifact rather than a second
+copy of this crate's own assumptions, and it is why decision 9 had to name a concrete operation:
+a second implementation cannot be tested against a requirement phrased as an intention.
 
 ## Consequences
 
