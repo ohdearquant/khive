@@ -153,6 +153,10 @@ Protocol version numbers are monotonic; a server supports the current version an
 
 The exact numeric defaults for frame-size and in-flight-request limits, a golden-frame fixture suite, decoder fuzzing, cross-client conformance testing, and the exhaustive per-topic subscription payload catalog (the concrete list of topics and each topic's `payload` field schema, within the envelope this ADR defines above) are implementation-phase deliverables owned by the `khive-wire-protocol` crate maintainer. Enabling TCP subscriptions, or any inbound edge adapter, for any peer class is gated on that conformance suite passing, including conformance coverage of the published topic catalog; this ADR does not authorize enabling subscriptions before the gate is satisfied.
 
+> **Amended.** Amendment 1, decision 2, fixes the frame-size default at 8 MiB, so frame-size is no
+> longer among the deliverables listed above. The in-flight-request limit named in the same sentence
+> is unaffected and remains an implementation-phase deliverable.
+
 ### MCP placement
 
 MCP over stdio remains a boundary compatibility adapter for foreign agent runtimes reached through the outer ring defined above. It is not the internal fabric. An MCP adapter that reaches a remote endpoint uses this ADR's native frame protocol rather than defining a competing internal protocol.
@@ -219,10 +223,20 @@ does today and the crate must move to match.
    conforming encoder from producing a frame whose only possible outcome at the far end is
    rejection.
 
-2. **Frame ceiling and accounting — RATIFIED.** Frames are length-prefixed with a four-byte
-   big-endian payload length. The configurable size limit counts the serialized bytes of the JSON
-   payload only and excludes the four-byte prefix. The default limit is 8 MiB. An independent
-   absolute ceiling of `u32::MAX` bounds the prefix itself and is not configurable upward.
+2. **Frame ceiling and accounting — RATIFIED. This decision fixes the frame-size default that the
+   parent left deferred.** Frames are length-prefixed with a four-byte big-endian payload length.
+   The configurable size limit counts the serialized bytes of the JSON payload only and excludes the
+   four-byte prefix. The default limit is 8 MiB. An independent absolute ceiling of `u32::MAX`
+   bounds the prefix itself and is not configurable upward.
+
+   The parent lists "the exact numeric defaults for frame-size and in-flight-request limits" among
+   its implementation-phase deliverables, and its Consequences section repeats that "the numeric
+   limit defaults remain implementation-phase deliverables". Ratifying 8 MiB settles the first of
+   those and leaves the second standing: the in-flight-request limit is still an implementation-phase
+   deliverable, and this amendment names no value for it. Separating them is load-bearing rather
+   than tidy. A default left deferred is a default two implementations may choose differently, and a
+   frame that one accepts and the other rejects is an interoperability break with no wire error to
+   explain it. Both parent sentences carry an inline note pointing here.
 
 ### Envelope grammar
 
@@ -264,10 +278,28 @@ does today and the crate must move to match.
    The parent's "Wire errors" paragraph carries an inline note pointing here, so a reader who
    lands on that paragraph and stops there does not walk away with the superseded rule.
 
-6. **Handshake sequence violations — RATIFIED.** A frame arriving before the handshake completes,
-   a handshake frame arriving after the handshake completes, and a frame arriving in the wrong
-   direction are each `malformed_frame` and each terminate the connection permanently. These are
-   connection-terminal and carry no operation id, because no operation is established.
+6. **Handshake sequence violations — CHANGED, and the change is one of role coverage rather than
+   of the rule.** A frame arriving before the handshake completes, a handshake frame arriving after
+   the handshake completes, and a frame arriving in the wrong direction are each `malformed_frame`
+   and each terminate the connection permanently. These are connection-terminal and carry no
+   operation id, because no operation is established. That rule is the parent's and it stands
+   unaltered.
+
+   **What must move is that the crate enforces it for one endpoint role only.** The gate is a
+   server-side inbound gate: it admits the client-to-server kinds and treats a server-to-client kind
+   as a direction violation, which is correct for a server and is the exact mirror of what a client
+   needs. A client built on this crate has no gate at all, so a `request` frame arriving at a client
+   — a direction violation by the same rule — is rejected by nothing. The decode path cannot cover
+   the gap, because it is deliberately role-agnostic and state-agnostic: it reads the length prefix
+   and decodes the payload without a direction argument or a handshake state, and it is correct for
+   it to stay that way.
+
+   A conforming implementation MUST therefore enforce the sequence and direction rules on both
+   endpoint roles, with the admissible frame-kind set mirrored per role. Labelling this RATIFIED
+   would have been the more comfortable reading and it would have been false in a way that matters:
+   the implementation fence below turns on the CHANGED set being exactly right, and the conformance
+   matrix requires each vector to name the endpoint direction it is decoded at. A matrix with a
+   direction field, run against a crate that gates one direction, cannot execute half its own rows.
 
 ### Server-produced fields
 
@@ -355,6 +387,36 @@ does today and the crate must move to match.
     because an amendment that claims to close the wire contract while leaving a known frame-shape
     divergence open would misrepresent its own completeness.
 
+### Precedence over the crate documentation
+
+The parent states that the crate's own documentation "is the normative wire specification", which
+makes that documentation a second authority and not merely a description. Four decisions above
+contradict it as it stands today, so a second implementer reading the crate docs — exactly as the
+parent instructs — would build the behaviour this amendment removes. **Where this amendment and the
+current crate documentation disagree, this amendment governs, and the documentation is superseded
+in the following places:**
+
+- The module documentation's stated boundaries that an explicit `null` on an optional field is
+  equivalent to absence and that duplicate members are last-wins — superseded by decision 4.
+- The module documentation's "Opaque payload fidelity" section, which states that `response.result`
+  and `event.payload` are preserved as JSON values with semantic rather than byte equality, together
+  with the named codec test it cites as pinning that behaviour — superseded by decision 9.
+- The module documentation's unknown-error-code paragraph, which classifies an unrecognized code as
+  `internal` including where it carries no operation id — superseded by decision 5 for the id-less
+  case only, per that decision's own split.
+- The handshake gate's documentation, which describes the gate as the server-side inbound admission
+  point — superseded by decision 6, which requires the rule on both endpoint roles.
+
+Decision 10 is absent from this list deliberately: the crate documentation describes `event.payload`
+as JSON whose field-by-field shape is owned by the per-topic catalog, and never states that a
+non-object payload is acceptable, so there is nothing there to supersede. Naming that explicitly is
+the point of the list, because a precedence list with a silent omission reads as an oversight and
+invites a reader to supply the missing entry themselves.
+
+**This list is a debt, not a resolution.** The implementation that ratifies these decisions updates
+the crate documentation in the same change, at which point this section becomes redundant and
+should be deleted rather than left standing as a permanent second source of truth.
+
 ### Implementation fences
 
 - An implementation MAY retain unrestricted in-memory constructors, parsed convenience views over
@@ -363,9 +425,12 @@ does today and the crate must move to match.
 - An implementation MAY NOT add frame kinds or error codes under this amendment, and MAY NOT fold
   the separately tracked server, identity-mapping, or deadline work into it.
 - **No first consumer of `khive-wire-protocol` may merge while any decision marked CHANGED above
-  still implements the superseded behaviour.** Those are decisions 4, 5, 9, and 10. A consumer
+  still implements the superseded behaviour.** Those are decisions 4, 5, 6, 9, and 10. A consumer
   merged against the old behaviour converts each of them from a free correction into a
-  compatibility break, which is precisely the cost this amendment exists to avoid.
+  compatibility break, which is precisely the cost this amendment exists to avoid. Decision 6 is in
+  that set for a different reason than the others: its rule is not changing, its role coverage is,
+  and a consumer that ships a client without the mirrored gate is as hard to correct afterwards as
+  one that ships the wrong rule.
 
 ### Conformance
 
@@ -382,27 +447,45 @@ an unlocatable artifact and make every normative claim above unreproducible.
 vectors under `crates/khive-wire-protocol/tests/`, plus a runner that executes them against an
 implementation.
 
-**A vector is not a byte string paired with a verdict, because several rules above are stateful.**
-Whether a `handshake` frame is legal depends on whether the handshake has already completed, and
-whether a `response` frame is legal depends on which end received it — the same bytes classify
-differently in each case. A vector schema without that context cannot express decision 6 at all.
-Each vector therefore carries:
+**A vector is not a byte string paired with an outcome, because the rules above are stateful and
+they do not all live at the same stage.** Whether a `handshake` frame is legal depends on whether
+the handshake has already completed, and whether a `response` frame is legal depends on which end
+received it — the same bytes classify differently in each case. Two rules above are also split
+across stages on purpose: decision 1 requires version `0` to decode successfully and then be
+rejected at handshake admission, and decisions 1 and 10 both require an encoder to refuse a frame
+that has no wire representation at all. A schema with one outcome field cannot express either.
 
-- **Endpoint direction** — which side is decoding, since several frame kinds are legal inbound on
-  exactly one end.
-- **An ordered sequence of preceding frames**, or an explicit statement of the gate state the
-  vector begins from. A one-frame vector states "fresh connection, handshake not yet completed".
-- **The input bytes** of the frame under test.
-- **The expected classification**: accepted, or rejected with a named wire error code.
-- **The expected terminal scope** of a rejection: request-terminal or connection-terminal.
+**Every vector therefore names the stage it exercises**, one of `decode`, `admit`, or `encode`, and
+carries the fields that stage has:
 
-Required coverage, positive and negative, is every rule above: boundary frame lengths on both
-sides of the limit, version zero and out-of-range versions **and the `4294967296` overflow
-boundary from decision 1**, empty operation ids, unknown and duplicate and explicitly-null
-envelope members, both id-bearing and id-less unknown error codes, each of the three handshake
-sequence violations, arbitrary topic and timestamp strings, opaque subvalues that round-trip
-byte-exactly, and non-object event payloads **on both the decode and the encode side, per
-decision 10**.
+- **Stage `decode`** — endpoint direction, the input bytes, and an expected outcome of _accepted_
+  (yielding a frame) or _rejected_ with a named wire error code and its terminal scope. Grammar
+  only: a value the grammar admits is accepted here even when a later stage will refuse it.
+- **Stage `admit`** — endpoint direction, an ordered sequence of preceding frames or an explicit
+  statement of the gate state the vector begins from, the already-decoded frame under test, and an
+  expected outcome of _admitted_ or _rejected_ with a named wire error code and its terminal scope.
+  A one-frame vector states "fresh connection, handshake not yet completed".
+- **Stage `encode`** — the locally constructed frame under test and an expected outcome of _emitted_
+  (yielding bytes) or _refused as a local construction error_. A refusal at this stage carries no
+  wire error code and no terminal scope, because nothing reached a wire and no connection exists to
+  terminate. A vector that demanded one of an encode case would be unsatisfiable by construction.
+
+**A rule split across stages is covered by one vector per stage, and both are required.** Version
+`0` is the worked example: a `decode` vector asserting _accepted_, and an `admit` vector on the
+resulting frame asserting _rejected, `unsupported_version`, connection-terminal_. Either vector
+alone proves the opposite of decision 1 from the other stage's point of view, which is exactly the
+disagreement the decision was written to settle.
+
+Required coverage, positive and negative, is every rule above, each at the stage or stages that
+rule lives at: boundary frame lengths on both sides of the limit; version zero at both `decode` and
+`admit` per the split above, out-of-range versions at `admit`, and the `4294967296` overflow
+boundary from decision 1 at `decode`; empty operation ids; unknown and duplicate and
+explicitly-null envelope members; both id-bearing and id-less unknown error codes; each of the
+three handshake sequence violations from decision 6, **at `admit` and once per endpoint role**,
+since that decision's whole change is role coverage; arbitrary topic and timestamp strings; opaque
+subvalues that round-trip byte-exactly; a version-`0` handshake at `encode`, expected refused as a
+local construction error per decision 1; and non-object event payloads at both `decode` and
+`encode` per decision 10, the second expected refused as a local construction error.
 
 **Consumed frame length is an agreement criterion for accepted frames only.** A decode error in
 this crate deliberately carries no consumed count: once a frame fails to decode the stream
@@ -415,9 +498,13 @@ classification and the terminal scope; the length criterion does not apply.
 Vectors MUST be run through the Rust crate and through at least one independent JSON
 implementation, which must agree on:
 
-- accept or reject classification, for every vector;
-- the wire error code and terminal scope of each rejection;
-- consumed frame length, for accepted frames only, per the paragraph above;
+- the outcome of every vector, in that vector's stage vocabulary: accepted or rejected at `decode`,
+  admitted or rejected at `admit`, emitted or refused at `encode`;
+- the wire error code and terminal scope of each `decode` or `admit` rejection. An `encode` refusal
+  has neither, and the two implementations are required to agree only that the frame was refused —
+  how each reports a local construction error is its own business, and demanding a shared spelling
+  for it would export this crate's error type into the contract;
+- consumed frame length, for accepted `decode` vectors only, per the paragraph above;
 - byte-exact opaque-subvalue round trip under the decode-then-encode operation defined in
   decision 9.
 
@@ -432,6 +519,9 @@ The daemon gains a location-transparent wire transport while retaining one frami
 The server becomes responsible for remote identity proof, actor mapping, and peer-class admission. This increases operational responsibility for the mapping table and for availability of `tailscale whois`, but it prevents a remote caller from selecting an actor through frame content, and the one-node-one-boundary rule makes node placement of processes an explicit deployment decision rather than an implicit trust grant.
 
 Subscription delivery becomes part of the same authenticated connection as requests, using the topic namespace, payload envelope, ordering guarantee, and authorization hook this ADR defines in "Protocol contract completeness." Only the exhaustive per-topic payload catalog and the numeric limit defaults remain implementation-phase deliverables, gated on the conformance suite as specified there.
+
+> **Amended.** Amendment 1, decision 2, fixes the frame-size default at 8 MiB. "The numeric limit
+> defaults" in the sentence above now refers to the in-flight-request limit alone.
 
 Remote clients receive explicit endpoint failures rather than implicit local recovery. Deployments must therefore provision an endpoint selector, connection diagnostics, and operator remediation for unavailable remote services.
 
