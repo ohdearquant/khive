@@ -397,11 +397,16 @@ impl KgPack {
 /// arm is still worth trying) versus failure (the lookup itself could not be performed,
 /// so it must reach the caller as-is instead of being swallowed into a false not-found).
 ///
-/// `resolve_name_async` (in `common.rs`) constructs only `Storage`/`NotFound`/`Ambiguous`,
-/// and the only `InvalidInput` the prefix-resolution path can construct is a prefix-miss —
-/// so this list is exhaustive for "no id, keep trying" today. Any other variant
-/// (`Storage`, `Sqlite`, `Internal`, `Ambiguous`, `AmbiguousPrefix`, …) is a failure and
-/// propagates.
+/// The absence list is deliberately short rather than exhaustive over what the resolvers can
+/// return, because the classification is failure-by-default: an unenumerated variant is treated
+/// as a failure and propagates. That is the safe direction — a new variant can at worst be
+/// reported rather than silently converted into a missing record.
+///
+/// Of what the resolvers produce today, `resolve_name_async` (in `common.rs`) itself constructs
+/// `Storage`/`NotFound`/`Ambiguous`, and also propagates whatever `runtime.entities(token)?`
+/// yields, so it is not the sole author of its own error type. The only `InvalidInput` the
+/// prefix-resolution path constructs is a prefix-miss. Everything else — `Storage`, `Sqlite`,
+/// `Internal`, `Ambiguous`, `AmbiguousPrefix` — is a failure and reaches the caller as itself.
 ///
 /// Both ambiguity variants are failures, for the same reason: no later arm can resolve an
 /// ambiguity an earlier arm reported. `dispatch.rs` binds `graph_token = token`, so arms one

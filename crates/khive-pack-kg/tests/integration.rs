@@ -580,6 +580,12 @@ async fn get_ambiguous_name_reports_the_collision_not_a_false_not_found() {
     );
 }
 
+/// NON-DISCRIMINATING CONTROL. This passes on both sides of the error-classification change and
+/// is not regression coverage for it — the discriminating tests are the storage-failure and
+/// ambiguity cases above. It is kept deliberately: it is the arm that would redden if a future
+/// change to the absence/failure split started reporting a genuine miss as an error, which is the
+/// one direction the split must never move. Do not read a green result here as evidence the
+/// classifier works.
 #[tokio::test]
 async fn get_prefix_matching_nothing_with_no_fault_armed_is_not_found() {
     let pack = pack();
@@ -590,8 +596,7 @@ async fn get_prefix_matching_nothing_with_no_fault_armed_is_not_found() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::NotFound(_)),
-        "a prefix matching no record, with no fault armed, must still be NotFound \
-         (proves the fix did not turn absence into an error); got: {err:?}"
+        "a prefix matching no record, with no fault armed, must still be NotFound; got: {err:?}"
     );
 }
 
