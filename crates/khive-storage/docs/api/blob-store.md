@@ -55,59 +55,84 @@ raw store access is for metadata, mutation, and maintenance paths only.
 ## `BlobStore::delete` — concurrency hazard
 
 `delete` performs an unconditional physical removal with **no coordination
-against any entity that might reference `content_ref`**. It is safe to call
+against any record or attachment that might reference `content_ref`**. It is safe to call
 only when the caller has independently ensured — outside this trait,
-typically by quiescing whatever writer could attach a new `content_ref` to an
-entity — that nothing live references `content_ref` for the duration of the
-call. A caller that races an entity write against a `delete` can dangle a
+typically by quiescing every writer that could commit a new SQL liveness
+reference — that nothing live references `content_ref` for the duration of the
+call. A caller that races a reference write against a `delete` can dangle a
 live reference; this trait does not detect or prevent that.
 
-## `BlobStore::orphan_sweep` — concurrency hazard
+## `BlobStore::orphan_sweep` — concurrency hazard, disabled in this compatibility release
 
 The operator-side GC path (khive#292 deliverable 5) — an admin-side
 operation, not an MCP verb, mirroring `VectorStore::orphan_sweep`'s CLI-only
 precedent (ADR-044). `BlobStore` has no visibility into SQL substrates
 (ADR-005 constraint 4: a trait instance talks to exactly one backend), so it
-cannot itself discover which content refs are still referenced by, e.g., the
-`entities.content_ref` column — the caller assembles `BlobOrphanSweepConfig.live_refs`
+cannot itself discover which content refs are still referenced by the active
+SQL liveness authority — the caller assembles `BlobOrphanSweepConfig.live_refs`
 and passes it in.
 
 `live_refs` is a **snapshot** the caller assembled before the call.
 `orphan_sweep` has no way to detect a `content_ref` that becomes newly live
 between when that snapshot was taken and when the sweep runs; such a
-reference is deleted anyway (see `khive-db`'s
-`orphan_sweep_race_demonstrates_the_documented_quiescence_requirement` test,
-which reproduces exactly this). This trait provides no transactional
-coordination with an entity writer. **Callers MUST quiesce entity writes**
-(nothing may create a new `content_ref` reference) for the duration of
-snapshot-plus-sweep — a maintenance window, a single-writer admin CLI
-invocation with no live traffic, or equivalent.
+reference would be deleted anyway. This trait provides no transactional
+coordination with a reference writer, and — unlike
+`transactional_orphan_sweep` — it has no `SqlAccess` capability with which to
+prove a completed V21 attachment epoch either. **The filesystem
+implementation therefore returns typed `StorageError::Unsupported` for every
+call in this compatibility release, in both `dry_run` modes, regardless of
+`live_refs`.** A caller-assembled snapshot could otherwise delete an object a
+V20 SQL query cannot see as live (e.g. a moodboard FANN network), silently
+bypassing the epoch gate `transactional_orphan_sweep` enforces. Use
+`transactional_orphan_sweep` for all sweeps against a live database; there is
+currently no supported destructive path through `orphan_sweep`.
 
 A DB-coordinated sweep is available separately as
-`BlobStore::transactional_orphan_sweep`. The filesystem implementation acquires
-a database-scoped process mutex and `<database>.khive-blob-gc.lock` before the
-same root-local locks as `put`, captures the complete candidate set, and
-classifies file age before opening SQLite's writer transaction. Acquiring the
-database owner makes all pre-existing claims abandoned, including claims copied
-by a backup or left under a relocated root; validated abandoned rows are removed
-in batches of at most 128. Candidates then pass through bounded claim, physical
-delete, and cleanup batches of the same maximum size. Each short
-`SqlAccess::atomic_unit` anti-joins live entity references and commits durable
-`blob_gc_claims`; entity INSERT/UPDATE triggers reject a new live reference to a
-claimed digest. Physical deletion runs outside SQLite while both owner/root locks
-remain held, followed by a bounded SQL-only cleanup. A crash after claim commit
-leaves the fence durable and fail-closed; the next exclusive database owner
-rescans rather than resuming deletion blindly. A filesystem publisher in
-another process that begins while the sweep holds the advisory root lock waits;
-after release, `put` rechecks the target and republishes bytes removed as an
-orphan before returning the `ContentRef`. Direct filesystem mutation does not
-participate in the advisory-lock protocol. Backends that cannot provide both
-coordination boundaries return `Unsupported`.
+`BlobStore::transactional_orphan_sweep`. The Phase4a filesystem implementation
+first performs a read-only schema-epoch gate. Both `dry_run` and destructive
+calls are supported only when the database proves the named objects and epoch
+markers of the exact completed V21 attachment cutover: the complete marker and
+V21 ledger row, the attachment and claim tables/indexes, attachment
+INSERT/UPDATE claim fences, and no legacy entity content-ref
+column/index/triggers. V20, pending, incomplete, missing-required-object,
+retained-legacy, and ahead-of-V21 epochs return typed
+`StorageError::Unsupported` before waiting for the blob-root lock, walking
+files, or recovering abandoned claims.
 
-The original `orphan_sweep` remains an offline-maintenance API for callers that
-already have a trusted `live_refs` snapshot. It intentionally retains its
-quiescence requirement for compatibility; concurrent callers must use
-`transactional_orphan_sweep`.
+After that gate, the filesystem implementation acquires database ownership (the
+process-local guard plus the cross-process advisory lock) and revalidates the
+epoch immediately, before ever waiting on the root guard/lock or walking the
+filesystem — closing the gap if external maintenance changed the schema
+between the read-only preflight and ownership. Only once that recheck passes
+does it acquire root ownership, capture the complete candidate set, and
+classify file age outside SQLite's writer transaction, then validate every
+attachment and claim reference before the functional fence probe. Malformed
+stored evidence returns its validation error, and a malformed schema or
+nonfunctional named fence returns its storage or typed `Unsupported` error;
+every such path fails closed before claim recovery or deletion. The sweep then
+removes validated abandoned rows in batches of at most 128. Each short
+`SqlAccess::atomic_unit` anti-joins every `attachments.content_ref` role and
+commits durable `blob_gc_claims`; attachment INSERT/UPDATE triggers reject a new
+live reference to a claimed digest. Physical deletion runs outside SQLite while
+ownership remains held, followed by bounded SQL-only cleanup. A crash after
+claim commit leaves the fence durable and fail-closed; the next exclusive owner
+rescans rather than resuming deletion blindly. Direct filesystem mutation does
+not participate in the advisory-lock protocol. Backends that cannot provide the
+coordination and epoch guarantees return `Unsupported`.
+
+Phase4a changes only this GC reader/fence behavior. It does not create
+attachments, register or run V21, backfill data, drop `entities.content_ref`, or
+make Phase4a application serving compatible with a V21 database. The positive
+mixed-version guarantee is deliberately narrower: an already-running Phase4a
+GC implementation can interpret an exact completed V21 attachment epoch. The
+Phase4b cutover still requires every Phase4a application reader and writer to be
+quiesced first.
+
+The original caller-snapshot `orphan_sweep` is disabled on the filesystem
+backend in this compatibility release (see above); it is not an alternative
+path for callers who want to avoid the epoch gate. All sweeps against a live
+database must go through `transactional_orphan_sweep`.
 
 Default `orphan_sweep` implementation returns `StorageError::Unsupported`; the
-filesystem backend overrides it with a real directory walk. No silent no-op.
+filesystem backend currently returns the same typed refusal rather than
+performing a real directory walk. No silent no-op.
