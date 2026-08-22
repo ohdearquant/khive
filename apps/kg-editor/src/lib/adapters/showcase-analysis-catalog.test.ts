@@ -285,7 +285,7 @@ describe("showcase analysis catalog", () => {
     }
   });
 
-  it("never starts reading the body once the deadline has already fired, even when the fetch resolves late with a body that never completes (kills a writer that installs its abort listener only after the abort event already fired)", async () => {
+  it("never starts reading the body once the deadline has already fired, even when the fetch resolves late with a body that never completes", async () => {
     vi.useFakeTimers();
     try {
       let resolveFetch: (value: unknown) => void = () => {};
@@ -335,7 +335,7 @@ describe("showcase analysis catalog", () => {
     }
   });
 
-  it("attaches a handler to a rejecting reader.cancel() triggered by an in-flight abort, and still settles degraded (kills a writer that discards the cancel() promise with void, leaving it unhandled)", async () => {
+  it("attaches a handler to a rejecting reader.cancel() triggered by an in-flight abort, and still settles degraded", async () => {
     vi.useFakeTimers();
     try {
       const read = vi.fn(() => new Promise(() => {}));

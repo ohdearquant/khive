@@ -217,7 +217,7 @@ describe("repository investigation location", () => {
     expect(url.href).not.toContain("token-fragment");
   });
 
-  it("strips userinfo credentials nested inside the repo value before writing history (kills a writer that only strips literal ? and #)", () => {
+  it("omits the repo param instead of writing a value with authority credentials", () => {
     const url = repositoryLocationUrl(
       new URL("https://example.test/"),
       {
@@ -228,14 +228,12 @@ describe("repository investigation location", () => {
       },
     );
 
-    expect(url.searchParams.get("repo")).toBe(
-      "https://github.com/example/repo",
-    );
+    expect(url.searchParams.has("repo")).toBe(false);
     expect(url.href).not.toContain("SECRET");
     expect(url.href).not.toContain("user:SECRET@");
   });
 
-  it("strips a double-encoded query delimiter from the repo value before writing history (kills a writer whose regex only matches literal ?/#)", () => {
+  it("omits the repo param instead of writing a value with a double-encoded query delimiter", () => {
     const url = repositoryLocationUrl(
       new URL("https://example.test/"),
       {
@@ -247,18 +245,78 @@ describe("repository investigation location", () => {
       },
     );
 
-    expect(url.searchParams.get("repo")).toBe(
-      "https://github.com/example/repo",
-    );
+    expect(url.searchParams.has("repo")).toBe(false);
     expect(url.href).not.toContain("SECRET");
     expect(url.href).not.toContain("%253F");
   });
 
-  it("strips a percent-encoded fragment delimiter from the repo value before writing history (kills a writer whose regex only matches literal ?/#)", () => {
+  it("omits the repo param instead of writing a value with a triple-encoded query delimiter", () => {
     const url = repositoryLocationUrl(
       new URL("https://example.test/"),
       {
-        repository: "https://github.com/example/repo%23access_token=SECRET",
+        repository:
+          "https://github.com/example/repo%25253Faccess_token%25253DSECRET",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.has("repo")).toBe(false);
+    expect(url.href).not.toContain("SECRET");
+    expect(url.href).not.toContain("%25253F");
+  });
+
+  it("omits the repo param instead of writing a value with a percent-encoded userinfo delimiter", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: "https://user%40SECRET@github.com/example/repo",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.has("repo")).toBe(false);
+    expect(url.href).not.toContain("SECRET");
+  });
+
+  it("omits the repo param instead of writing a value with backslashes browsers normalize into authority credentials", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: "https:\\\\user:SECRET@github.com/example/repo",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.has("repo")).toBe(false);
+    expect(url.href).not.toContain("SECRET");
+  });
+
+  it("omits the repo param instead of writing a schemeless value", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: "github.com/example/repo?access_token=SECRET",
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.has("repo")).toBe(false);
+    expect(url.href).not.toContain("SECRET");
+  });
+
+  it("still round-trips a valid repository URL to its canonical form", () => {
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: "https://www.GitHub.com/Example/Repo.git",
         snapshotSha: null,
         modulePath: null,
         view: null,
@@ -266,10 +324,8 @@ describe("repository investigation location", () => {
     );
 
     expect(url.searchParams.get("repo")).toBe(
-      "https://github.com/example/repo",
+      "https://github.com/Example/Repo",
     );
-    expect(url.href).not.toContain("SECRET");
-    expect(url.href).not.toContain("%23");
   });
 
   it("share form omits a module path carrying a query or fragment delimiter", () => {

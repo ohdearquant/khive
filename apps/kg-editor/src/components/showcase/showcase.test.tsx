@@ -417,7 +417,7 @@ describe("materialized repository lookup", () => {
     const url = new URL(window.location.href);
     expect(url.searchParams.has("access_token")).toBe(false);
     expect(url.hash).toBe("");
-    expect([...url.searchParams.keys()]).toEqual(["repo"]);
+    expect([...url.searchParams.keys()]).toEqual([]);
   });
 
   it("treats an empty repo parameter as invalid instead of falling back to the default entry", async () => {
@@ -497,7 +497,7 @@ describe("materialized repository lookup", () => {
     expect(url.hash).toBe("");
     expect(url.href).not.toContain("SECRET");
     expect(url.href).not.toContain("TOP");
-    expect([...url.searchParams.keys()]).toEqual(["repo"]);
+    expect([...url.searchParams.keys()]).toEqual([]);
   });
 
   it("renders an honest miss when a dynamic-only analysis disappears", async () => {

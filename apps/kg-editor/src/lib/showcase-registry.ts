@@ -58,7 +58,12 @@ export function normalizeRepositoryUrl(input: string):
   } catch {
     return { ok: false, reason: "The repository URL contains invalid path encoding." };
   }
-  if (segments.length < 2 || segments.some((segment) => segment === "." || segment === "..")) {
+  if (
+    segments.length < 2 ||
+    segments.some((segment) =>
+      segment === "." || segment === ".." || /[%?#\\]/u.test(segment)
+    )
+  ) {
     return { ok: false, reason: "The URL must identify a repository owner and name." };
   }
 
