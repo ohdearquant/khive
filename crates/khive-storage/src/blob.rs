@@ -20,6 +20,13 @@ use crate::types::StorageResult;
 /// Number of hex characters in a BLAKE3-256 digest (32 bytes -> 64 hex chars).
 const CONTENT_REF_HEX_LEN: usize = 64;
 
+/// Portable v1 ceiling for a whole-buffer blob operation (64 MiB).
+///
+/// Callers needing larger objects require a future streaming contract. A
+/// [`BlobStore::get_bounded_verified`] request above this limit is invalid
+/// even when the selected backend could otherwise satisfy it.
+pub const MAX_BLOB_WHOLE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// An opaque, content-addressed reference to a stored blob.
 ///
 /// Backed by a lowercase-hex BLAKE3 digest of the blob's bytes: identical
@@ -163,6 +170,25 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// Returns `StorageError::NotFound` (capability `Blob`) if no object
     /// exists for this reference.
     async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>>;
+
+    /// Fetch at most `max_bytes` from `content_ref` and verify its BLAKE3
+    /// digest before returning any bytes.
+    ///
+    /// `max_bytes` may be zero (only an empty object can then succeed) and
+    /// must not exceed [`MAX_BLOB_WHOLE_BYTES`]. Implementations must enforce
+    /// the limit while reading the authoritative object, not by composing a
+    /// metadata-only [`Self::size`] check with the unbounded [`Self::get`]
+    /// compatibility method. A successful result is complete, no larger than
+    /// the declared maximum, metadata-size-consistent, and digest-matched to
+    /// `content_ref`.
+    ///
+    /// The unbounded `get` method remains temporarily while ADR-160's
+    /// consumers migrate and is removed with the final consumer in Phase 3.
+    async fn get_bounded_verified(
+        &self,
+        content_ref: &ContentRef,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>>;
 
     /// Whether an object currently exists for `content_ref`.
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool>;

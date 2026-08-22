@@ -789,10 +789,31 @@ standalone writer opens, and the third counts dequeued writer-task requests that
 dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
 executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
-process-wide best-effort audit appends whose storage error was logged and swallowed. Zero-wait
+process-wide best-effort audit appends whose storage error was logged and swallowed —
+pure-observability rows only. An obligation-bearing row's commit failure (a dispatch outcome, an
+unknown-verb row, a `git.digest` receipt, or a gate denial's own audit row) is never counted here:
+it instead fails the dispatch that produced it directly, or — for a denial whose dispatch already
+fails independent of the row — is tracked by a separate internal counter. `audit_append_failures`
+and `audit_batch_flush_failures` are therefore disjoint for that case; summing them does not
+double-count an obligation-bearing generation failure. Zero-wait
 checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
 connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
 and reused across ticks) do not inflate the write-traffic acquisition total.
+
+`writer_task_request_failures` counts dequeued writer-task requests whose processing at the
+writer seam terminated in error, regardless of the specific terminal state; a request that never
+reached the seam because an earlier request already closed the queue does not count.
+`writer_task_side_effects_unknown` is the subset of those failures whose terminal state left the
+request's side effects unprovable. Both are populated directly by `khive-db` and are therefore
+identical for a runtime caller and a direct `khive-db` caller — unlike the `audit_*` fields below,
+neither is ever `null`.
+
+`audit_batch_flush_failures`, `audit_degraded_rows`, and `audit_degraded` are additive fields
+supplied by the runtime's audit-batch control once one is registered: accepted batch generations
+that reached a terminal non-commit outcome after retry, pure-observability rows released without a
+commit, and a monotonic process-lifetime degradation flag, respectively. Each carries a matching
+`_unavailable_reason` field and reports `null` — never a fabricated `0`/`false` — for a direct
+`khive-db` caller or a runtime with no audit-batch control registered.
 
 `checkpoint_counters` reports checkpoint pressure without making its telemetry another source of
 WAL pressure. `checkpoint_pressure_elevated_ticks` and the episode start/recovery totals are
@@ -1533,7 +1554,13 @@ request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
 ### `comm.health` — Assertive
 
 Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
-every known channel, including `poll_interval_secs` and nullable advisory `stalled`.
+every known channel, including `poll_interval_secs`, nullable advisory `stalled`, and
+the live `quarantined_count`. Top-level `quarantined_count` covers the namespace-wide
+parked backlog; `unattributed_quarantined_count` reports legacy rows that lack a complete
+channel identity. Quarantine-only channel entries have nullable heartbeat fields and do
+not fabricate daemon ownership. The channel union is capped at 200: heartbeat rows take
+precedence, then quarantine-only identities fill remaining capacity in lexical channel
+identity order. Top-level quarantine totals remain namespace-wide when entries are omitted.
 For current rows with no known failure, `stalled` becomes true after three missed nominal
 intervals; it is null for legacy/malformed rows or active failure/backoff state. This is
 not a computed healthy or authoritative supervisor verdict. Health judgment belongs to
@@ -1543,6 +1570,13 @@ heartbeats to `local`; authorized per-tenant writers can write their own namespa
 response echoes the namespace actually read in a `namespace` field, so an empty
 `channels` array is scoped unambiguously. See the
 [communication guide](communication.md) for the full response contract.
+
+To recover, page `comm.inbox(status="all")`, inspect full rows for
+`properties.quarantined`, and fetch a selected row with `get(id=...)`.
+`delete(id=...)` removes it from the parked count; `delete(id=..., hard=true)`
+permanently purges it. There is deliberately no automatic "release as trusted" path.
+Generic message `create`/`update` mutations cannot set `channel_kind`, `channel_slug`, or
+`quarantined`; those transport-owned fields are established only by `comm.ingest`.
 
 No parameters.
 

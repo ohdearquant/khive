@@ -913,8 +913,9 @@ async fn run_writer_task(
         // Tokio blocking pool to writer-queue contention (#1849).
         let queue_wait = request.queue_wait();
         let origin = origin.clone();
-        let acquisition_counters = Arc::clone(&acquisition_counters);
+        let blocking_counters = Arc::clone(&acquisition_counters);
         let outcome = tokio::task::spawn_blocking(move || {
+            let acquisition_counters = blocking_counters;
             // A top-level request deliberately skips BEGIN, so it would
             // silently join any transaction leaked by an earlier request.
             // Refuse every request before dispatch if the connection is not
@@ -1006,6 +1007,10 @@ async fn run_writer_task(
         match outcome {
             Ok((returned_conn, None)) => conn = returned_conn,
             Ok((_returned_conn, Some(request_state))) => {
+                acquisition_counters.record_writer_task_request_failure();
+                if request_state == WriterTaskRequestState::SideEffectsUnknown {
+                    acquisition_counters.record_writer_task_side_effects_unknown();
+                }
                 tracing::error!(
                     request_state = %request_state,
                     "writer task reached a terminal request or connection state; closing and \
@@ -1019,6 +1024,7 @@ async fn run_writer_task(
                 return;
             }
             Err(join_err) => {
+                acquisition_counters.record_writer_task_request_failure();
                 tracing::error!(
                     error = %join_err,
                     "writer task blocking closure failed outside the request \
@@ -2642,5 +2648,124 @@ mod tests {
                 "the post-dequeue blocking-pool delay must not inflate queue_wait: {sample:?}"
             );
         });
+    }
+
+    // `#[serial(tx_registry)]`: the active request holds a registered
+    // `writer_task_tx` before its terminal failure, sharing the process-wide
+    // registry key with the other writer-task transaction tests.
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn writer_task_failure_counters_are_acquisition_site_exact() {
+        // Case 1: a request that reaches the seam, panics, and rolls back
+        // cleanly must move `writer_task_request_failures` by exactly one —
+        // never `writer_task_side_effects_unknown` — and the requests that
+        // never dequeued into the seam (failed only because the queue closed
+        // behind them) must move neither counter.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("writer_task_failure_counters_rollback.db");
+            let pool = file_pool(&path);
+            let handle = spawn(&pool, 8).expect("writer task should spawn");
+
+            let before = pool.writer_acquisition_snapshot();
+            assert_eq!(before.writer_task_request_failures, 0);
+            assert_eq!(before.writer_task_side_effects_unknown, 0);
+
+            let (started_tx, started_rx) = oneshot::channel::<()>();
+            let (release_tx, release_rx) = std_mpsc::channel::<()>();
+            let active = tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    handle
+                        .send(move |_conn| -> Result<(), StorageError> {
+                            let _ = started_tx.send(());
+                            release_rx.recv().expect("test must release active op");
+                            panic!("intentional rollback-clean panic for counter test");
+                        })
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("active request did not start")
+                .expect("active request dropped its start signal");
+
+            let queued = handle
+                .enqueue(|_conn| Ok::<(), StorageError>(()))
+                .await
+                .expect("second request must queue behind the active one");
+
+            release_tx.send(()).expect("release active op");
+            let active_result = tokio::time::timeout(Duration::from_secs(5), active)
+                .await
+                .expect("active caller hung after panic")
+                .expect("active caller task join");
+            assert_writer_task_terminal_state(
+                active_result,
+                WriterTaskRequestState::TransactionRolledBack,
+            );
+
+            let queued_result = queued.await.expect("terminal drain must reply");
+            assert_writer_task_terminal_state(queued_result, WriterTaskRequestState::NotStarted);
+
+            let after = pool.writer_acquisition_snapshot();
+            assert_eq!(
+                after.writer_task_request_failures, 1,
+                "only the request that actually reached the seam counts, not the ones \
+                 failed by the queue-close drain"
+            );
+            assert_eq!(
+                after.writer_task_side_effects_unknown, 0,
+                "a clean rollback must not be counted as an unknown-side-effects outcome"
+            );
+        }
+
+        // Case 2: a request whose rollback is itself refused (denied by an
+        // installed authorizer) terminates `SideEffectsUnknown` and must move
+        // both counters by exactly one.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("writer_task_failure_counters_unknown.db");
+            let pool = file_pool(&path);
+            let handle = spawn(&pool, 8).expect("writer task should spawn");
+
+            let before = pool.writer_acquisition_snapshot();
+
+            let active_result = handle
+                .send(|conn| -> Result<(), StorageError> {
+                    conn.authorizer(Some(deny_rollback))
+                        .map_err(|e| StorageError::Pool {
+                            operation: "test_install_authorizer".into(),
+                            message: e.to_string(),
+                        })?;
+                    Err(StorageError::Internal(
+                        "intentional operation failure before denied rollback".into(),
+                    ))
+                })
+                .await;
+            assert_writer_task_terminal_state(
+                active_result,
+                WriterTaskRequestState::SideEffectsUnknown,
+            );
+
+            // The reply above races the counter increment: `send` observes
+            // its reply before `run_writer_task` finishes its own await and
+            // updates the pool counters. A trailing request against the same
+            // (now-terminal) handle can only resolve once that update and the
+            // subsequent queue-close drain have both happened, so awaiting it
+            // orders the snapshot below strictly after the increment.
+            let sentinel_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
+            assert_writer_task_terminal_state(sentinel_result, WriterTaskRequestState::NotStarted);
+
+            let after = pool.writer_acquisition_snapshot();
+            assert_eq!(
+                after.writer_task_request_failures - before.writer_task_request_failures,
+                1
+            );
+            assert_eq!(
+                after.writer_task_side_effects_unknown - before.writer_task_side_effects_unknown,
+                1
+            );
+        }
     }
 }

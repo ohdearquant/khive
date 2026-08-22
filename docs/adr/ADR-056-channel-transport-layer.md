@@ -1,10 +1,11 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
+**Status**: Accepted (amended 2026-08-09 -- quarantine health and recovery; amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
 2026-07-17 -- iMessage channel over an SSH bridge; amended 2026-08-04 -- non-canonical thread
 identifiers in dedup acknowledgements; see
+[§Amendment 2026-08-09](#amendment-2026-08-09----quarantine-health-and-recovery),
 [§Amendment 2026-08-01](#amendment-2026-08-01----bounded-inbox-long-poll),
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
@@ -12,7 +13,7 @@ identifiers in dedup acknowledgements; see
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
 [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge),
 [§Amendment 2026-08-04](#amendment-2026-08-04----non-canonical-thread-identifiers-in-dedup-acknowledgements))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04)\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04, 2026-08-09)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -23,7 +24,56 @@ ADR-108 (Git Write Surface -- hardened shell-out argv pattern reused by this ame
 statement; its SessionStore design was not carried forward\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
-by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment)
+by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment),
+#1383 (quarantine health and recovery -- resolved by the 2026-08-09 amendment)
+
+## Amendment 2026-08-09 -- Quarantine health and recovery
+
+Quarantining is a successful terminal disposition for one transport item, not
+a channel-poll failure. A healthy adapter can therefore keep a fresh
+`last_success_at`, zero `consecutive_failures`, and a committed cursor while
+one or more unattributed messages remain parked. Liveness fields MUST retain
+that meaning; operators observe the independent backlog through additive
+quarantine counts.
+
+Every channel poller MUST pass both its `Channel::kind()` and exact
+`Channel::slug()` to `comm.ingest`. Those handler-owned properties take
+precedence over free-form adapter metadata. Generic `message` create and update
+paths MUST refuse caller-supplied `channel_kind`, `channel_slug`, and
+`quarantined`; only the trusted `comm.ingest` path establishes that transport
+provenance and disposition. A live `message` note is counted as quarantined
+when `properties.quarantined` is either JSON `true` or the string `"true"`.
+`comm.health(namespace=...)` counts only live rows in that authorized namespace
+and returns:
+
+- top-level `quarantined_count`, the total parked rows in scope;
+- top-level `unattributed_quarantined_count`, the subset lacking a complete
+  nonblank `(channel_kind, channel_slug)` identity; and
+- `quarantined_count` on every channel entry.
+
+The channel array is the union of heartbeat rows and exact channel identities
+found on quarantined messages, bounded to 200 entries. Heartbeat rows take the
+response budget first and retain their persisted order. Only remaining capacity
+is filled by quarantine-only identities, ordered by `(channel_kind,
+channel_slug)`; later identities are omitted without changing the unbounded
+top-level counts. This precedence means a heartbeat outside a full heartbeat
+page is omitted rather than re-emitted with fabricated quarantine-only
+liveness. When message data and operational heartbeats use different
+namespaces, a scoped health read of the message namespace returns a
+quarantine-only channel entry whose heartbeat-only fields — including
+`consecutive_failures` — are null. That evidence does not fabricate daemon
+ownership: `role` and `source` continue to derive solely from persisted
+heartbeat rows.
+
+Recovery uses existing supported record operations rather than inventing an
+unsafe re-attribution shortcut. An authorized recipient inspects full
+`comm.inbox(status="all")` rows and selects those whose
+`properties.quarantined` marker is true; `get(id=...)` retrieves the complete
+record. `delete(id=...)` releases it from the parked count by soft deletion;
+`delete(id=..., hard=true)` permanently purges it. Khive does not deliver or
+attribute a quarantined payload merely because an operator inspected it. A
+future release workflow would require a separate authenticated provenance
+decision.
 
 ## Amendment 2026-08-01 -- Bounded inbox long poll
 

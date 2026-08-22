@@ -219,7 +219,10 @@ impl PackRuntime for KgPack {
             "withdraw" => self.handle_withdraw(graph_token, params).await,
             "stats" => self.handle_stats(graph_token, params).await,
             "whoami" => self.handle_whoami(graph_token, params).await,
-            "db_diagnostics" => self.handle_db_diagnostics(graph_token, params).await,
+            "db_diagnostics" => {
+                self.handle_db_diagnostics(graph_token, params, registry)
+                    .await
+            }
             "resolve" => self.handle_resolve(graph_token, params, registry).await,
             "merge" => self.handle_merge(graph_token, params, registry).await,
             // UUID-based: entities/edges use graph token, notes/events use caller token.

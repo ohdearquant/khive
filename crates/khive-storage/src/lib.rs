@@ -19,7 +19,9 @@ pub mod usage;
 pub mod vectors;
 
 pub use agent::AgentStore;
-pub use blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};
+pub use blob::{
+    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES,
+};
 pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};
 pub use error::{StorageError, WriterTaskRequestState};

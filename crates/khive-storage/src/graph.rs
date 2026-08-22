@@ -95,6 +95,34 @@ pub trait GraphStore: Send + Sync + 'static {
         sort: Vec<SortOrder<EdgeSortField>>,
         page: PageRequest,
     ) -> StorageResult<Page<Edge>>;
+    /// Query edges across the given namespaces in one deterministic query
+    /// with real SQL paging. The multi-namespace analogue of
+    /// [`Self::query_edges`]: a single statement with `namespace IN (...)`
+    /// keeps `offset` continuation coherent, where fetching per-namespace
+    /// prefixes and slicing a client-side merge floats the window between
+    /// calls (silent duplicate/skip enumeration). Backends without batched
+    /// namespace support retain the single-namespace path and reject
+    /// multi-namespace requests explicitly.
+    async fn query_edges_in_namespaces(
+        &self,
+        namespaces: &[String],
+        filter: EdgeFilter,
+        sort: Vec<SortOrder<EdgeSortField>>,
+        page: PageRequest,
+    ) -> StorageResult<Page<Edge>> {
+        match namespaces.len() {
+            0 => Ok(Page {
+                items: Vec::new(),
+                total: Some(0),
+            }),
+            1 => self.query_edges(filter, sort, page).await,
+            _ => Err(StorageError::Unsupported {
+                capability: StorageCapability::Graph,
+                operation: "query_edges_in_namespaces".into(),
+                message: "this backend does not implement batched namespace edge queries".into(),
+            }),
+        }
+    }
     /// Count edges matching the given filter.
     async fn count_edges(&self, filter: EdgeFilter) -> StorageResult<u64>;
     /// Count edges across the given namespaces in one aggregate query.

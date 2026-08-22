@@ -349,6 +349,25 @@ fn note_snippet(note: &Note) -> Option<String> {
     text_preview(&note.content, 200)
 }
 
+/// Message properties established only by the trusted channel-ingest path.
+///
+/// Mirrors `khive-pack-comm`'s `TRANSPORT_OWNED_MESSAGE_PROPERTIES`. Duplicated
+/// here rather than imported because `khive-runtime` sits below `khive-pack-comm`
+/// in the dependency chain (`runtime → packs`); this list is the one place in
+/// the runtime layer that needs to know the shape of comm's trust boundary,
+/// guarding [`KhiveRuntime::try_create_note`]'s fast path.
+const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] =
+    &["quarantined", "channel_kind", "channel_slug"];
+
+fn transport_owned_message_property_named_in(
+    properties: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'static str> {
+    TRANSPORT_OWNED_MESSAGE_PROPERTIES
+        .iter()
+        .copied()
+        .find(|key| properties.contains_key(*key))
+}
+
 /// Result of resolving a UUID to its substrate kind.
 #[derive(Clone, Debug)]
 pub enum Resolved {
@@ -3161,6 +3180,14 @@ impl KhiveRuntime {
     /// This method is intentionally narrower than `create_note`: it skips
     /// salience/decay, annotates edges, and embedding-model selection, which
     /// are not needed for channel-ingest paths.
+    ///
+    /// Rejects `quarantined` / `channel_kind` / `channel_slug` on a `message`
+    /// note: those three properties are transport-owned evidence that
+    /// `comm.health` trusts at face value, and this fast path (unlike the
+    /// generic `create` verb funnel) is not covered by the
+    /// pack-installed note-write validator. Only the trusted channel-ingest
+    /// path may establish them — see
+    /// [`Self::try_create_note_as_trusted_ingest`].
     pub async fn try_create_note(
         &self,
         token: &NamespaceToken,
@@ -3168,6 +3195,48 @@ impl KhiveRuntime {
         name: Option<&str>,
         content: &str,
         properties: Option<serde_json::Value>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_impl(token, kind, name, content, properties, false)
+            .await
+    }
+
+    /// Like [`Self::try_create_note`] but permits the caller to establish the
+    /// transport-owned `message` properties (`quarantined`, `channel_kind`,
+    /// `channel_slug`).
+    ///
+    /// This is a deliberately named, separate entry point rather than a flag
+    /// on `try_create_note` so the trust decision is visible at every call
+    /// site: `comm.ingest` (`khive-pack-comm/src/handlers.rs`) is the sole
+    /// legitimate caller, because it is the only code that has just derived
+    /// quarantine disposition and channel provenance from the inbound
+    /// transport itself. The caller set is bounded by possession, not
+    /// documentation: the required [`crate::ChannelIngestCapability`] is
+    /// constructible only inside this crate and granted at pack registration
+    /// exclusively to channel-transport packs. Every other write path uses
+    /// `try_create_note`, which rejects those three properties
+    /// unconditionally.
+    pub async fn try_create_note_as_trusted_ingest(
+        &self,
+        _capability: &crate::pack::ChannelIngestCapability,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+    ) -> RuntimeResult<Option<Note>> {
+        self.try_create_note_impl(token, kind, name, content, properties, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_create_note_impl(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        properties: Option<serde_json::Value>,
+        allow_transport_owned_message_properties: bool,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -3177,6 +3246,19 @@ impl KhiveRuntime {
         }
         if let Some(ref p) = properties {
             crate::secret_gate::check_json(p)?;
+        }
+        if !allow_transport_owned_message_properties && kind == "message" {
+            if let Some(key) = properties
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .and_then(transport_owned_message_property_named_in)
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "`{key}` is transport-owned on a `message` note and cannot be supplied \
+                     through `try_create_note`; only the trusted channel-ingest path may \
+                     establish quarantine disposition and channel provenance"
+                )));
+            }
         }
 
         let ns = token.namespace().as_str();
@@ -3188,7 +3270,13 @@ impl KhiveRuntime {
             note = note.with_properties(p);
         }
 
-        let inserted = self.notes(token)?.try_insert_note(note.clone()).await?;
+        // Bypasses the `notes()` accessor's PolicyEnforcingNoteStore wrapper —
+        // the reserved-transport-property check above already enforces the
+        // identical policy, conditionally allowing the trusted-ingest path,
+        // so this reaches storage directly rather than duplicate the check
+        // through a wrapper that cannot see the trust decision this function
+        // just made.
+        let inserted = self.raw_notes(token)?.try_insert_note(note.clone()).await?;
         if !inserted {
             return Ok(None);
         }
@@ -5014,34 +5102,97 @@ impl KhiveRuntime {
             return Ok(page.items);
         }
 
-        // Multi-namespace visibility: `offset` must apply to the combined,
-        // deduplicated set rather than per-namespace pages, so fetch enough
-        // of each namespace's page to cover it, merge, then slice.
-        let fetch_limit = offset.saturating_add(limit);
-        let mut results = Vec::new();
-        for ns in visible {
-            let temp = NamespaceToken::for_namespace(ns.clone());
-            let page = self
-                .graph(&temp)?
-                .query_edges(
-                    filter.clone().into(),
-                    vec![SortOrder {
-                        field: EdgeSortField::CreatedAt,
-                        direction: khive_storage::types::SortDirection::Asc,
-                    }],
-                    PageRequest {
-                        offset: 0,
-                        limit: fetch_limit,
-                    },
-                )
-                .await?;
-            results.extend(page.items);
+        // Multi-namespace visibility: one deterministic query with
+        // `namespace IN (...)` and real SQL paging, mirroring
+        // `list_entities`. Fetching per-namespace prefixes and slicing a
+        // client-side merge re-sorted by UUID floats the offset window
+        // between calls — pages silently duplicate and skip rows, so
+        // enumeration never covers the set (#2088).
+        let ns_strs: Vec<String> = visible.iter().map(|ns| ns.as_str().to_owned()).collect();
+        let sort = vec![SortOrder {
+            field: EdgeSortField::CreatedAt,
+            direction: khive_storage::types::SortDirection::Asc,
+        }];
+        let graph = self.graph(token)?;
+        match graph
+            .query_edges_in_namespaces(
+                &ns_strs,
+                filter.clone().into(),
+                sort.clone(),
+                PageRequest {
+                    offset: offset.into(),
+                    limit,
+                },
+            )
+            .await
+        {
+            Ok(page) => Ok(page.items),
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "query_edges_in_namespaces" =>
+            {
+                // Backend exercises the trait default (no batched
+                // namespace query support): fall back to one `query_edges`
+                // call per namespace. Unlike the pre-image fix for #2088,
+                // this fetches an `offset + limit` prefix from every
+                // namespace and merges by the *same* `(created_at, id)` key
+                // each per-namespace fetch already orders by — the
+                // pre-image bug sorted the merged set by UUID alone, a key
+                // unrelated to the order each per-namespace prefix was cut
+                // at, which floated the offset window and silently
+                // duplicated/skipped rows across pages. Sorting by the
+                // fetch's own order key keeps the top `offset + limit` of
+                // the merge exactly equal to the true global prefix.
+                let fetch_limit = offset.saturating_add(limit);
+                let mut namespace_prefixes = Vec::new();
+                for ns in visible {
+                    let temp = NamespaceToken::for_namespace(ns.clone());
+                    let page = self
+                        .graph(&temp)?
+                        .query_edges(
+                            filter.clone().into(),
+                            sort.clone(),
+                            PageRequest {
+                                offset: 0,
+                                limit: fetch_limit,
+                            },
+                        )
+                        .await?;
+                    namespace_prefixes.push(page.items);
+                }
+                Ok(Self::merge_paged_namespace_edges(
+                    namespace_prefixes,
+                    offset,
+                    limit,
+                ))
+            }
+            Err(error) => Err(error.into()),
         }
-        results.sort_by_key(|e| Uuid::from(e.id));
-        results.dedup_by_key(|e| Uuid::from(e.id));
+    }
+
+    /// Merge per-namespace `(created_at, id)`-ordered edge prefixes (each
+    /// already fetched up to `offset + limit` from its own namespace, as
+    /// [`Self::list_edges`]'s trait-default fallback does) into one global
+    /// `[offset, offset + limit)` page.
+    ///
+    /// Sorting by the *same key each prefix was already cut at* is what
+    /// keeps this exact: the top `offset + limit` of the merged set is then
+    /// provably equal to the true global prefix (a standard k-way merge
+    /// argument — no element beyond position `offset + limit` in any single
+    /// namespace can appear before that position in the global order). The
+    /// pre-image #2088 bug instead re-sorted the merged set by UUID alone —
+    /// a key unrelated to the order each namespace's prefix was fetched in —
+    /// which floated the offset window and silently duplicated/skipped rows
+    /// across pages.
+    fn merge_paged_namespace_edges(
+        namespace_prefixes: Vec<Vec<Edge>>,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Edge> {
+        let mut results: Vec<Edge> = namespace_prefixes.into_iter().flatten().collect();
+        results.sort_by_key(|e| (e.created_at, Uuid::from(e.id)));
         let start = (offset as usize).min(results.len());
         let end = (start + limit as usize).min(results.len());
-        Ok(results[start..end].to_vec())
+        results[start..end].to_vec()
     }
 
     /// Keyset (seek) page of edges matching `filter`, ordered by immutable
@@ -6870,6 +7021,208 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
+    }
+
+    /// #2088 regression at the runtime seam; this fixture was rebuilt
+    /// deterministically for #2089 because the previous fixture created edges
+    /// through the normal `link()` path (random UUIDs, wall-clock
+    /// timestamps), so whether it exposed the pre-image bug — sorting the
+    /// per-namespace merge by UUID alone, a key unrelated to the
+    /// `created_at` order each per-namespace fetch was actually cut at —
+    /// depended on the RNG; it could pass against pre-image code by pure
+    /// luck.
+    ///
+    /// This fixture pins both: every `ns-a` edge gets a UUID numerically
+    /// greater than every `ns-b` edge, while `created_at` strictly
+    /// interleaves the two namespaces (a, b, a, b, a, b). A UUID-only sort
+    /// therefore reliably produces "every ns-b edge, then every ns-a edge"
+    /// — provably different from the true `created_at` interleaving — so
+    /// asserting this exact expected sequence (not just the resulting set)
+    /// is what a reverted pre-image implementation would fail to
+    /// reproduce.
+    #[tokio::test]
+    async fn list_edges_multi_namespace_offset_paging_enumerates_exactly() {
+        let rt = rt();
+        let ns_a = Namespace::parse("ns-a").unwrap();
+        let ns_b = Namespace::parse("ns-b").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+
+        let source = rt
+            .create_entity(&tok_a, "concept", None, "Source", None, None, vec![])
+            .await
+            .unwrap();
+        let mut targets = Vec::new();
+        for index in 0..6 {
+            targets.push(
+                rt.create_entity(
+                    &tok_a,
+                    "concept",
+                    None,
+                    &format!("Target{index}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        // Every `a_uuids` entry is numerically greater than every
+        // `b_uuids` entry (leading nibble `f` vs `0`).
+        let a_uuids = [
+            Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffff01").unwrap(),
+            Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffff02").unwrap(),
+            Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffff03").unwrap(),
+        ];
+        let b_uuids = [
+            Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+            Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap(),
+            Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap(),
+        ];
+
+        let graph_a = rt.graph(&tok_a).unwrap();
+        let graph_b = rt.graph(&tok_b).unwrap();
+        let mut expected_order: Vec<Uuid> = Vec::new();
+        for i in 0..3usize {
+            let a_created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
+                1_000_000 + (2 * i as i64) * 1_000_000,
+            )
+            .unwrap();
+            graph_a
+                .upsert_edge(Edge {
+                    id: a_uuids[i].into(),
+                    namespace: "ns-a".into(),
+                    source_id: source.id,
+                    target_id: targets[2 * i].id,
+                    relation: EdgeRelation::Extends,
+                    weight: 0.5,
+                    created_at: a_created_at,
+                    updated_at: a_created_at,
+                    deleted_at: None,
+                    metadata: None,
+                    target_backend: None,
+                })
+                .await
+                .unwrap();
+            expected_order.push(a_uuids[i]);
+
+            let b_created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
+                2_000_000 + (2 * i as i64) * 1_000_000,
+            )
+            .unwrap();
+            graph_b
+                .upsert_edge(Edge {
+                    id: b_uuids[i].into(),
+                    namespace: "ns-b".into(),
+                    source_id: source.id,
+                    target_id: targets[2 * i + 1].id,
+                    relation: EdgeRelation::Extends,
+                    weight: 0.5,
+                    created_at: b_created_at,
+                    updated_at: b_created_at,
+                    deleted_at: None,
+                    metadata: None,
+                    target_backend: None,
+                })
+                .await
+                .unwrap();
+            expected_order.push(b_uuids[i]);
+        }
+
+        let multi = NamespaceToken::mint_with_visibility(ns_a, vec![ns_b], ActorRef::anonymous());
+        let mut seen: Vec<Uuid> = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let page = rt
+                .list_edges(&multi, EdgeListFilter::default(), 2, offset)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            seen.extend(page.iter().map(|e| Uuid::from(e.id)));
+            offset += 2;
+        }
+
+        assert_eq!(
+            seen, expected_order,
+            "must enumerate in exact created_at order, not UUID order"
+        );
+        let distinct: std::collections::HashSet<Uuid> = seen.iter().copied().collect();
+        assert_eq!(distinct.len(), 6, "no duplicates across pages");
+        let expected_set: std::collections::HashSet<Uuid> =
+            expected_order.iter().copied().collect();
+        assert_eq!(
+            distinct, expected_set,
+            "enumerated set must equal the seeded set"
+        );
+    }
+
+    /// #2089: `list_edges`'s trait-default fallback
+    /// (taken when a `GraphStore` backend returns `Unsupported` from
+    /// `query_edges_in_namespaces` — i.e. it does not override the batched
+    /// namespace query, per [`khive_storage::GraphStore`]'s default) merges
+    /// independently-fetched per-namespace prefixes through
+    /// [`KhiveRuntime::merge_paged_namespace_edges`]. This exercises that
+    /// merge directly: `ns_a`'s edges all carry numerically-greater UUIDs
+    /// than every `ns_b` edge, while `created_at` interleaves the two
+    /// namespaces. Sorting the merge by UUID alone (the pre-image #2088 bug)
+    /// would put every `ns_b` edge before every `ns_a` edge regardless of
+    /// `created_at` — provably different from this fixture's expected
+    /// order — so an exact-sequence assertion here is sufficient to catch a
+    /// regression back to that bug.
+    #[test]
+    fn merge_paged_namespace_edges_orders_by_created_at_not_uuid() {
+        fn edge(id_hex_suffix: &str, created_at_micros: i64) -> Edge {
+            let created_at =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(created_at_micros).unwrap();
+            Edge {
+                id: Uuid::parse_str(&format!("00000000-0000-4000-8000-{id_hex_suffix}"))
+                    .unwrap()
+                    .into(),
+                namespace: "irrelevant".into(),
+                source_id: Uuid::nil(),
+                target_id: Uuid::nil(),
+                relation: EdgeRelation::Extends,
+                weight: 0.5,
+                created_at,
+                updated_at: created_at,
+                deleted_at: None,
+                metadata: None,
+                target_backend: None,
+            }
+        }
+
+        // Every `a*` UUID (leading nibble `f`) is numerically greater than
+        // every `b*` UUID (leading nibble `0`), but `created_at` interleaves
+        // them: a0 < b0 < a1 < b1.
+        let a0 = edge("ffffffffffff", 1_000_000);
+        let b0 = edge("000000000001", 2_000_000);
+        let a1 = edge("fffffffffffe", 3_000_000);
+        let b1 = edge("000000000002", 4_000_000);
+
+        let namespace_prefixes = vec![vec![a0.clone(), a1.clone()], vec![b0.clone(), b1.clone()]];
+
+        let full_page = KhiveRuntime::merge_paged_namespace_edges(namespace_prefixes.clone(), 0, 4);
+        let ids: Vec<Uuid> = full_page.iter().map(|e| Uuid::from(e.id)).collect();
+        assert_eq!(
+            ids,
+            vec![
+                Uuid::from(a0.id),
+                Uuid::from(b0.id),
+                Uuid::from(a1.id),
+                Uuid::from(b1.id)
+            ],
+            "must order the merge by created_at, not by UUID magnitude"
+        );
+
+        // Mid-window offset must slice the same globally-ordered sequence,
+        // not re-derive order per page.
+        let middle_page = KhiveRuntime::merge_paged_namespace_edges(namespace_prefixes, 1, 2);
+        let middle_ids: Vec<Uuid> = middle_page.iter().map(|e| Uuid::from(e.id)).collect();
+        assert_eq!(middle_ids, vec![Uuid::from(b0.id), Uuid::from(a1.id)]);
     }
 
     #[tokio::test]

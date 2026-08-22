@@ -44,9 +44,9 @@ going through the `MergeEngine` trait object.
 `MergeConflict` enumerates what `Auto` can detect: `NameConflict`, `KindConflict`,
 `PropertyMismatch`, `ModifyDelete` (one branch edited, the other deleted),
 `DuplicateAddition` (both branches added the same UUID with different content),
-`EdgeModifyDelete`, and `DanglingEdge` (a merged edge references an entity not in the
-merged set). `BranchSide::{Ours, Theirs}` identifies which branch a `ModifyDelete` /
-`EdgeModifyDelete` change came from.
+`EdgeModifyDelete`, `EdgeIdentityMismatch`, `EdgeIdentityCollision`, `EdgePropertyMismatch`, and `DanglingEdge`
+(a merged edge references an entity not in the merged set). `BranchSide::{Ours, Theirs}`
+identifies which branch a `ModifyDelete` / `EdgeModifyDelete` change came from.
 
 ## Invariants
 
@@ -56,8 +56,9 @@ merged set). `BranchSide::{Ours, Theirs}` identifies which branch a `ModifyDelet
   aborts with `MergeError::InvalidEdgeWeight`, never silently coerced.
 - **Deterministic output** — entities sort by UUID, edges by `(source, target, relation)`;
   repeated calls over equal inputs produce byte-identical `KgArchive` output.
-- **Edge identity preserved** — a merged edge keeps the `edge_id` of the originating
-  branch's edge rather than minting a fresh UUID.
+- **Complete edge changes preserved** — edge UUID, weight, properties, and the selected
+  branch's independent timestamps survive merge; timestamp-only rebuild drift does not
+  manufacture a semantic change.
 
 ## Where this sits
 

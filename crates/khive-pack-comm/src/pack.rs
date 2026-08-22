@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
+use khive_runtime::{
+    KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry,
+};
 use khive_types::{HandlerDef, Pack};
 
 use crate::handlers;
@@ -18,6 +20,16 @@ use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 pub struct CommPack {
     runtime: KhiveRuntime,
     inbox_signal: InboxSignal,
+    /// Instance-bound trusted channel-ingest grant (khive #1839 round 3).
+    ///
+    /// Previously a process-global `OnceLock` shared by every `CommPack`
+    /// instance the factory ever created, regardless of which runtime or
+    /// composition it belonged to — a grant to one instance leaked into
+    /// every other, and a direct `CommPack::new` composition (bypassing
+    /// `PackRegistry::register_packs`) could never receive it at all. Scoped
+    /// to `self` so each instance's grant reflects only what was explicitly
+    /// given to it.
+    channel_ingest: std::sync::OnceLock<khive_runtime::ChannelIngestCapability>,
 }
 
 impl Pack for CommPack {
@@ -30,14 +42,114 @@ impl Pack for CommPack {
 
 impl CommPack {
     /// Create a new `CommPack` bound to the given runtime.
+    ///
+    /// Holds no channel-ingest capability: `comm.ingest` fails closed with a
+    /// configuration/startup error until one is granted, either
+    /// automatically (registering through `PackRegistry::register_packs`
+    /// under the `comm` name) or explicitly (see
+    /// [`Self::new_with_channel_ingest_capability`] or
+    /// [`khive_runtime::PackRuntime::accept_channel_ingest_capability`]).
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self {
             runtime,
             inbox_signal: InboxSignal::new(),
+            channel_ingest: std::sync::OnceLock::new(),
         }
     }
+
+    /// Create a new `CommPack` with the trusted channel-ingest capability
+    /// already granted — for composition roots that construct packs
+    /// directly rather than going through `PackRegistry::register_packs`.
+    pub fn new_with_channel_ingest_capability(
+        runtime: KhiveRuntime,
+        capability: khive_runtime::ChannelIngestCapability,
+    ) -> Self {
+        let pack = Self::new(runtime);
+        let _ = pack.channel_ingest.set(capability);
+        pack
+    }
+
     pub(crate) fn runtime(&self) -> &KhiveRuntime {
         &self.runtime
+    }
+
+    pub(crate) fn channel_ingest_capability(
+        &self,
+    ) -> Option<&khive_runtime::ChannelIngestCapability> {
+        self.channel_ingest.get()
+    }
+}
+
+/// Message properties established only by the trusted channel-ingest path.
+///
+/// `comm.health` interprets these fields as transport evidence, so allowing a
+/// generic message create/update to supply them would turn ordinary caller
+/// metadata into a forged quarantine or channel attribution. `comm.ingest`
+/// writes through `try_create_note`, deliberately outside the generic write
+/// validator/hook seams, and therefore remains the sole legitimate writer.
+const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] =
+    &["quarantined", "channel_kind", "channel_slug"];
+
+fn transport_owned_message_property_named_in(
+    properties: &serde_json::Map<String, Value>,
+) -> Option<&'static str> {
+    TRANSPORT_OWNED_MESSAGE_PROPERTIES
+        .iter()
+        .copied()
+        .find(|key| properties.contains_key(*key))
+}
+
+fn refuse_transport_owned_message_property(key: &str) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "`{key}` is transport-owned on a `message` note and cannot be supplied by a generic \
+         record mutation; only `comm.ingest` may establish quarantine disposition and channel \
+         provenance"
+    ))
+}
+
+#[derive(Debug, Default)]
+struct MessageHook;
+
+#[async_trait]
+impl KindHook for MessageHook {
+    async fn prepare_create(
+        &self,
+        _runtime: &KhiveRuntime,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        if let Some(key) = args
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(transport_owned_message_property_named_in)
+        {
+            return Err(refuse_transport_owned_message_property(key));
+        }
+        Ok(())
+    }
+
+    async fn after_create(
+        &self,
+        _runtime: &KhiveRuntime,
+        _id: uuid::Uuid,
+        _args: &Value,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn validate_note_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &khive_storage::Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(key) = properties
+            .and_then(Value::as_object)
+            .and_then(transport_owned_message_property_named_in)
+        {
+            return Err(refuse_transport_owned_message_property(key));
+        }
+        Ok(())
     }
 }
 
@@ -52,12 +164,14 @@ impl CommPack {
 /// on the proposal-apply path that is the applying caller, not the proposer
 /// who composed the changeset.
 ///
-/// Only `from_actor` is derived. `direction` and `sent_at` are equally
-/// identity-bearing (they are preserved through `merge` and refused by
-/// `update`), but neither is a function of the token: `dual_write_message`
-/// writes an inbound copy with `direction="inbound"` under the sender's own
-/// token, and `comm.ingest` carries a transport-supplied `sent_at`. Deriving
-/// either here would overwrite a value a legitimate caller must set.
+/// `from_actor` is derived, while transport-owned quarantine disposition and
+/// channel provenance are refused on every covered generic/proposal write.
+/// `direction` and `sent_at` are equally identity-bearing (they are preserved
+/// through `merge` and refused by `update`), but neither is a function of the
+/// token: `dual_write_message` writes an inbound copy with
+/// `direction="inbound"` under the sender's own token, and `comm.ingest` carries
+/// a transport-supplied `sent_at`. Deriving either here would overwrite a value
+/// a legitimate caller must set.
 ///
 /// Kinds other than `message` — including comm's own `channel_health` — pass
 /// through untouched: the runtime holds one validator slot for all packs.
@@ -78,6 +192,9 @@ pub(crate) fn derive_message_identity(
         }
         None => serde_json::Map::new(),
     };
+    if let Some(key) = transport_owned_message_property_named_in(&props) {
+        return Err(refuse_transport_owned_message_property(key));
+    }
     props.insert(
         "from_actor".to_string(),
         Value::String(actor_id.to_string()),
@@ -115,8 +232,18 @@ impl PackRuntime for CommPack {
     fn handlers(&self) -> &'static [HandlerDef] {
         &COMM_HANDLERS
     }
+    fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn KindHook>> {
+        if kind == "message" {
+            Some(std::sync::Arc::new(MessageHook))
+        } else {
+            None
+        }
+    }
     fn register_note_write_validator(&self, runtime: &KhiveRuntime) {
         runtime.install_note_write_validator(std::sync::Arc::new(derive_message_identity));
+    }
+    fn accept_channel_ingest_capability(&self, capability: khive_runtime::ChannelIngestCapability) {
+        let _ = self.channel_ingest.set(capability);
     }
     fn requires(&self) -> &'static [&'static str] {
         <CommPack as Pack>::REQUIRES
@@ -152,7 +279,14 @@ impl PackRuntime for CommPack {
             }
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
             "comm.ingest" => {
-                handlers::handle_ingest(self.runtime(), &self.inbox_signal, token, params).await
+                handlers::handle_ingest(
+                    self.runtime(),
+                    &self.inbox_signal,
+                    self.channel_ingest_capability(),
+                    token,
+                    params,
+                )
+                .await
             }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
@@ -508,6 +642,10 @@ mod help_tests {
             "comm.ingest must declare correlation_external_id param for thread resolution"
         );
         assert!(
+            h.params.iter().any(|p| p.name == "channel_slug"),
+            "comm.ingest must declare channel_slug so quarantine health provenance is discoverable"
+        );
+        assert!(
             h.params.iter().any(|p| p.name == "wire_message_id"),
             "comm.ingest must declare wire_message_id param (IngestParams carries it; \
              metadata must stay in sync per issue #403)"
@@ -556,6 +694,46 @@ mod help_tests {
             assert!(
                 p.required,
                 "comm.ingest param '{required_name}' must be required"
+            );
+        }
+    }
+
+    #[test]
+    fn health_help_declares_bounded_heartbeat_priority_and_unknown_liveness() {
+        let description = find_handler("comm.health").description;
+        assert!(
+            description.contains("200"),
+            "health help must declare its bound"
+        );
+        assert!(
+            description.contains("Heartbeat rows take precedence"),
+            "health help must declare which evidence wins when the union is truncated"
+        );
+        assert!(
+            description.contains("consecutive_failures: null"),
+            "health help must not describe a fabricated zero for quarantine-only rows"
+        );
+    }
+}
+
+#[cfg(test)]
+mod message_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn note_write_validator_rejects_transport_owned_quarantine_properties() {
+        for (key, value) in [
+            ("quarantined", json!(true)),
+            ("channel_kind", json!("email")),
+            ("channel_slug", json!("victim-account")),
+        ] {
+            let error =
+                derive_message_identity("message", "lambda:caller", Some(json!({key: value})))
+                    .expect_err("covered generic/proposal writes must reject transport provenance");
+            assert!(
+                error.to_string().contains(key),
+                "error must name {key}: {error}"
             );
         }
     }

@@ -1,0 +1,36 @@
+{
+  "schema": "adr133-writer-census/v1",
+  "base_revision": "9b53aaff2f2260e68c0a0cbe2eeace77cb087a8e",
+  "final_revision": null,
+  "pack_set": [
+    "kg",
+    "gtd",
+    "memory",
+    "brain",
+    "comm",
+    "schedule",
+    "knowledge",
+    "session",
+    "git",
+    "code",
+    "workspace",
+    "blob"
+  ],
+  "positive_control": "comm.read",
+  "entries": [
+    {
+      "verb": "comm.read",
+      "classification": "WRITER",
+      "source_file": "crates/khive-pack-comm/src/handlers.rs",
+      "evidence_marker": "try_patch_note_property",
+      "note": "handle_read -> mark_read_target -> NoteStore::try_patch_note_property, a real UPDATE. Known-positive control per ADR-133: a scanner that misses this is void."
+    },
+    {
+      "verb": "git.push",
+      "classification": "UNKNOWN",
+      "source_file": "crates/khive-pack-git/src/write_handlers.rs",
+      "evidence_marker": "sql.writer(",
+      "note": "Shells to system git; no completed SQLite writer-acquisition trace found by this scanner. Fail-closed: absence of evidence is recorded as UNKNOWN, never NO-WRITER, per ADR-133 acceptance criterion 2."
+    }
+  ]
+}

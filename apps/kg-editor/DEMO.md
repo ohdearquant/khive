@@ -33,7 +33,10 @@ Before presenting, verify that the source badge says **khive DB snapshot**, not
 
 This setup requires the DB snapshot API route from the companion backend PR (or
 its merged equivalent). Without that route, this UI branch intentionally uses
-the curated static fallback.
+the curated static fallback. The DB-backed snapshot is always an optional
+enhancement over the bundled static asset: any failure on that path — network
+error, non-2xx status, an oversized or malformed body, or a provenance
+mismatch — falls back to the static asset rather than failing the page.
 
 ## Five-to-seven-minute flow
 

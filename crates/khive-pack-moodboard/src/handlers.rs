@@ -651,6 +651,19 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn get_bounded_verified(
+            &self,
+            content_ref: &ContentRef,
+            max_bytes: u64,
+        ) -> khive_storage::types::StorageResult<Vec<u8>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Err(khive_storage::StorageError::BlobTooLarge {
+                content_ref: content_ref.clone(),
+                max_bytes,
+                observed_at_least: MAX_OBJECT_BYTES as u64 + 1,
+            })
+        }
+
         async fn exists(
             &self,
             _content_ref: &ContentRef,
@@ -924,7 +937,9 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).unwrap());
-        runtime.install_blob_store(blob_store.clone());
+        runtime
+            .install_blob_store(blob_store.clone())
+            .expect("install blob store");
         let primary_ref = blob_store.put(b"primary".to_vec()).await.unwrap();
         let extra_ref = blob_store.put(b"extra".to_vec()).await.unwrap();
         let mut primary_entity =
@@ -987,7 +1002,9 @@ mod tests {
             .expect("authorize");
         let root = tempfile::tempdir().unwrap();
         let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).unwrap());
-        pack.runtime().install_blob_store(blob_store.clone());
+        pack.runtime()
+            .install_blob_store(blob_store.clone())
+            .expect("install blob store");
         let query_ref = blob_store
             .put(b"core query original".to_vec())
             .await
@@ -1096,7 +1113,9 @@ mod tests {
         let descriptor = DescriptorIdentity::fixture(4);
         let root = tempfile::tempdir().unwrap();
         let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).unwrap());
-        runtime.install_blob_store(blob_store.clone());
+        runtime
+            .install_blob_store(blob_store.clone())
+            .expect("install blob store");
         let live_ref = blob_store.put(b"live original".to_vec()).await.unwrap();
         let stale = Uuid::new_v4();
         let live = Entity::new(token.namespace().as_str(), "artifact", "live candidate")
@@ -1167,7 +1186,9 @@ mod tests {
         let token = runtime.authorize(Namespace::local()).expect("authorize");
         let root = tempfile::tempdir().unwrap();
         let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).unwrap());
-        runtime.install_blob_store(blob_store.clone());
+        runtime
+            .install_blob_store(blob_store.clone())
+            .expect("install blob store");
         let content_ref = blob_store
             .put(b"same original bytes".to_vec())
             .await

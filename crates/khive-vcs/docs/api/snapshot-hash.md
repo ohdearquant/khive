@@ -27,7 +27,7 @@ Sort order (ADR-020 §canonical NDJSON record shape and snapshot hash):
 
 1. Entities sorted by UUID string, case-insensitive ascending.
 2. Edges sorted by `(source, target, relation)` ascending.
-3. Property keys sorted alphabetically within each entity.
+3. Property keys sorted recursively within each entity and edge.
 4. Tags sorted lexicographically within each entity.
 
 Root object key order is alphabetical (`edges` before `entities`).
@@ -35,7 +35,8 @@ Root object key order is alphabetical (`edges` before `entities`).
 `VCS-AUD-003` tests confirm two entities differing only in `entity_type`
 produce different `SnapshotId` values. `exported_at`, `namespace`, `format`,
 and `version` are excluded from the hash; only entity and edge content
-contributes.
+contributes. Edge `properties` are included, so a metadata-only edge change
+produces a different `SnapshotId` while object key insertion order does not.
 
 Non-finite edge weights (`NaN`, `Infinity`) are rejected by
 `edge_to_canonical_value` with `VcsError::Internal` — a correctness gate on

@@ -5,8 +5,8 @@ records `khive kg import` validates and loads.
 
 An adapter is a pure, stateless transform: it reads a source and yields `EntityRecord`
 / `EdgeRecord` values. It writes no database state and generates no IDs beyond filling
-in a missing UUID. Fatal errors (missing required fields, unknown entity kind or edge
-relation, out-of-range weight) abort the corresponding iterator item; non-fatal issues
+in a missing UUID. Fatal errors (missing/blank required fields, ambiguous record shapes,
+malformed timestamps, unknown entity kind or edge relation, out-of-range weight) abort the corresponding iterator item; non-fatal issues
 accumulate as strings retrievable via `FormatAdapter::warnings`.
 
 ## Usage
@@ -32,9 +32,11 @@ assert!(adapter.warnings().is_empty());
 ```
 
 `JsonFormatAdapter::new` parses eagerly and dispatches each array element: an object
-carrying a `source`/`from` **and** `target`/`to` key (case-insensitive) becomes an
-`EdgeRecord`; every other object becomes an `EntityRecord`. Unknown keys fold into the
-record's `properties`.
+carrying canonical `source` **and** `target` keys (case-insensitive) becomes an
+`EdgeRecord`; every other object becomes an `EntityRecord`. `from`/`to` are ordinary
+entity metadata. A complete `kind`+`name` entity signature combined with a complete
+`source`+`target` edge signature is rejected as ambiguous. Unknown entity keys fold into
+the record's `properties`.
 
 ## Taxonomy validation
 
@@ -46,6 +48,8 @@ record's `properties`.
 - `EdgeRecord.weight` must be finite and in `[0.0, 1.0]`; deserialization enforces this
   at the JSON boundary as well as via the `JsonFormatAdapter`'s own `extract_weight`
   path. Absent, it defaults to `0.7`.
+- Present `created_at`/`updated_at` values must be RFC 3339 strings. Missing timestamps
+  remain optional; malformed values are never replaced with import time.
 
 ## Format support
 
@@ -58,8 +62,7 @@ Turtle/N-Triples, JSON-LD, GraphML, GEXF, Markdown) are tracked as deferred work
 
 ## Where this sits
 
-`khive-vcs-adapters` depends only on `khive-types` (for kind/relation validation) —
-it has no dependency on `khive-storage` or `khive-runtime`. Its output feeds the
+`khive-vcs-adapters` has no dependency on `khive-storage` or `khive-runtime`. Its output feeds the
 standard `khive kg import` pipeline, which is what performs validation and loading
 into `working.db`; the adapter itself never touches a database.
 

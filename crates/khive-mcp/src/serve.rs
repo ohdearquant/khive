@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use khive_runtime::{
     config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat, RuntimeConfig,
-    StorageBackend,
+    BackendKind, BlobHydrator, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat,
+    RuntimeConfig, StorageBackend,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -988,6 +988,7 @@ async fn channel_poll_loop(
                             "content": env.content.clone(),
                             "subject": env.subject.clone(),
                             "channel_kind": kind,
+                            "channel_slug": slug,
                             "external_id": env.external_id.clone(),
                             "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
                             "correlation_external_id": env.correlation_external_id.clone(),
@@ -1736,6 +1737,7 @@ async fn telegram_poll_loop(
         match telegram_channel.poll(Utc::now()).await {
             Ok(envelopes) => {
                 let kind = telegram_channel.kind();
+                let slug = telegram_channel.slug();
                 let batch_attempt_keys: Vec<String> = envelopes
                     .iter()
                     .filter_map(|env| channel_ingest_attempt_key(kind, env.external_id.as_deref()))
@@ -1748,6 +1750,7 @@ async fn telegram_poll_loop(
                         "to": env.to.clone(),
                         "content": env.content.clone(),
                         "channel_kind": kind,
+                        "channel_slug": &slug,
                         "external_id": env.external_id.clone(),
                         "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
                     });
@@ -2288,19 +2291,19 @@ fn build_registry_for_multi_backend_inner(
         cfg
     });
 
-    // ADR-111 Amendment 2: resolve the config-selected `BlobStore` once
-    // against the main backend and install it on every runtime handle this
-    // boot produces (`default_runtime` plus each per-pack runtime), so a
-    // pack that later reads `KhiveRuntime::blob_store()` sees the same
-    // selection regardless of which backend its own KG data lives on.
+    // ADR-160 D3: resolve the config-selected `BlobStore` once, pair it with
+    // exactly one aggregate hydration budget, and install the same immutable
+    // hydrator `Arc` on every runtime handle this boot produces. `core()`
+    // clones share each runtime's one-shot slot, so they see this same pair.
     let blob_store_runtime = per_pack_runtimes_local
         .get("blob")
         .unwrap_or(&default_runtime);
-    if let Some(store) =
+    if let Some(hydrator) =
         install_resolved_blob_store(blob_store_runtime, khive_cfg, main_backend.as_ref())?
     {
+        default_runtime.install_blob_hydrator(Arc::clone(&hydrator))?;
         for rt in per_pack_runtimes_local.values() {
-            rt.install_blob_store(store.clone());
+            rt.install_blob_hydrator(Arc::clone(&hydrator))?;
         }
     }
 
@@ -3004,8 +3007,9 @@ pub fn checkpoint_pool_for(main_backend: &StorageBackend) -> Option<Arc<Connecti
 /// Resolve `khive.toml`'s `[storage.blob]` selection against `backend` and
 /// install it on `rt` (ADR-111 Amendment 2's boot-wiring requirement).
 ///
-/// Returns the resolved store on success so multi-backend callers can also
-/// install it on every per-pack runtime without re-resolving it.
+/// Returns the resolved store/hydration pair on success so multi-backend
+/// callers can install the exact same aggregate budget on every runtime
+/// without re-resolving or reconstructing it.
 ///
 /// An **explicit** `[storage.blob]` section that fails to resolve (an `s3`
 /// backend with no AWS credentials in the environment, an invalid prefix,
@@ -3025,11 +3029,12 @@ pub fn install_resolved_blob_store(
     rt: &KhiveRuntime,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
-) -> anyhow::Result<Option<Arc<dyn khive_storage::BlobStore>>> {
+) -> anyhow::Result<Option<Arc<BlobHydrator>>> {
     match khive_runtime::resolve_blob_store_for_mode(khive_cfg, backend, rt.is_read_only()) {
         Ok(store) => {
-            rt.install_blob_store(store.clone());
-            Ok(Some(store))
+            let hydrator = Arc::new(BlobHydrator::new(store, rt.config().blob_hydration_bytes)?);
+            rt.install_blob_hydrator(Arc::clone(&hydrator))?;
+            Ok(Some(hydrator))
         }
         Err(e) if khive_cfg.storage.blob.is_none() => {
             tracing::debug!(
@@ -5499,6 +5504,103 @@ region = "us-east-1"
                 "pack {pack_name:?}: expected the installed store to be an S3BlobStore, got: {debug}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn multi_backend_boot_shares_one_hydrator_across_default_core_blob_and_moodboard() {
+        let blob_root = tempfile::tempdir().expect("blob root");
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.path().to_string_lossy().into_owned()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let mut base_cfg = base_runtime_config_for_multi_backend();
+        base_cfg.packs = vec!["kg".into(), "blob".into(), "moodboard".into()];
+        base_cfg.blob_hydration_bytes = khive_storage::MAX_BLOB_WHOLE_BYTES;
+
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build");
+        let expected = multi
+            .default_runtime
+            .blob_hydrator()
+            .expect("default runtime hydrator");
+        assert_eq!(expected.budget_bytes(), khive_storage::MAX_BLOB_WHOLE_BYTES);
+
+        for pack_name in ["kg", "blob", "moodboard"] {
+            let runtime = multi
+                .per_pack_runtimes
+                .get(pack_name)
+                .unwrap_or_else(|| panic!("missing {pack_name} runtime"));
+            let installed = runtime
+                .blob_hydrator()
+                .unwrap_or_else(|| panic!("missing {pack_name} hydrator"));
+            assert!(
+                Arc::ptr_eq(&installed, &expected),
+                "{pack_name} must share the default runtime's aggregate budget"
+            );
+            let core = runtime.core().blob_hydrator().expect("core hydrator");
+            assert!(
+                Arc::ptr_eq(&core, &expected),
+                "{pack_name}.core() must share the same aggregate budget"
+            );
+        }
+
+        let blob_runtime = multi.per_pack_runtimes.get("blob").expect("blob runtime");
+        let moodboard_runtime = multi
+            .per_pack_runtimes
+            .get("moodboard")
+            .expect("moodboard runtime");
+        let content_ref = blob_runtime
+            .blob_store()
+            .expect("raw store")
+            .put(vec![b'x'])
+            .await
+            .expect("publish contention fixture");
+
+        let held = blob_runtime
+            .core()
+            .blob_hydrator()
+            .expect("blob core hydrator")
+            .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+            .await
+            .expect("reserve the full shared budget");
+
+        let contender_hydrator = moodboard_runtime
+            .blob_hydrator()
+            .expect("moodboard hydrator");
+        let contender_ref = content_ref.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let mut contender = tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            contender_hydrator.hydrate_verified(&contender_ref, 1).await
+        });
+        entered_rx.await.expect("contender entered task");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut contender)
+                .await
+                .is_err(),
+            "moodboard hydration must wait while blob/core holds the shared budget"
+        );
+
+        drop(held);
+        let contender_blob = tokio::time::timeout(std::time::Duration::from_secs(1), contender)
+            .await
+            .expect("contender should wake when the shared lease drops")
+            .expect("contender task")
+            .expect("contender hydration");
+        assert_eq!(contender_blob.bytes(), b"x");
     }
 
     /// Guards the ADR-111 Amendment 2 fs-default promise (`docs/adr/ADR-111-blob-store.md:538-541`):
@@ -9012,8 +9114,12 @@ backend = "kg-backend"
         async fn record_heartbeat_success_is_visible_via_comm_health() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             record_channel_heartbeat(
@@ -9052,8 +9158,12 @@ backend = "kg-backend"
         async fn heartbeat_visible_via_health_regardless_of_configured_ingest_namespace() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             // Simulates `KHIVE_EMAIL_INGEST_NAMESPACE=lambda:mybot`: comm.ingest for
@@ -9172,8 +9282,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             // Drive exactly what the production poll loop does per tick: iterate
@@ -9795,6 +9909,43 @@ backend = "kg-backend"
             ) -> khive_storage::StorageResult<u64> {
                 Ok(self.events.lock().unwrap().len() as u64)
             }
+
+            fn preflight_event(
+                &self,
+                _event: &khive_storage::Event,
+            ) -> khive_storage::StorageResult<()> {
+                Ok(())
+            }
+
+            async fn append_events_idempotent(
+                &self,
+                events: Vec<khive_storage::Event>,
+            ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
+            {
+                let mut store = self.events.lock().unwrap();
+                let mut rows = Vec::with_capacity(events.len());
+                for event in events {
+                    if let Some(existing) = store.iter().find(|e| e.id == event.id) {
+                        if *existing == event {
+                            rows.push(
+                                khive_storage::event::EventAppendDisposition::AlreadyPresentIdentical,
+                            );
+                        } else {
+                            rows.push(
+                                khive_storage::event::EventAppendDisposition::IdentityConflict,
+                            );
+                        }
+                    } else {
+                        store.push(event);
+                        rows.push(khive_storage::event::EventAppendDisposition::Inserted);
+                    }
+                }
+                Ok(khive_storage::event::IdempotentEventBatchResult { rows })
+            }
+
+            fn supports_idempotent_audit_batch(&self) -> bool {
+                true
+            }
         }
 
         /// The ADR-094 lifecycle-event subsequence the sequencing test
@@ -9882,8 +10033,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let store = Arc::new(FakeEventStore::default());
             builder.with_event_store(store.clone());
             let registry = builder.build().expect("registry builds");
@@ -9932,8 +10087,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
             assert!(
                 registry.event_store().is_none(),
@@ -10068,14 +10227,18 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let task = tokio::spawn(channel_poll_loop(
                 Arc::new(ch_registry),
                 registry.clone(),
-                "test-ns".to_string(),
+                "local".to_string(),
                 "actor:test".to_string(),
             ));
 
@@ -10149,7 +10312,7 @@ backend = "kg-backend"
             let inbox = registry
                 .dispatch(
                     "list",
-                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                    json!({"namespace": "local", "kind": "message", "limit": 50}),
                 )
                 .await
                 .expect("list must succeed");
@@ -10230,8 +10393,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let task = tokio::spawn(channel_poll_loop(
@@ -10400,14 +10567,18 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let task = tokio::spawn(channel_poll_loop(
                 Arc::new(ch_registry),
                 registry.clone(),
-                "test-ns".to_string(),
+                "local".to_string(),
                 "actor:test".to_string(),
             ));
 
@@ -10437,7 +10608,7 @@ backend = "kg-backend"
             let inbox = registry
                 .dispatch(
                     "list",
-                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                    json!({"namespace": "local", "kind": "message", "limit": 50}),
                 )
                 .await
                 .expect("list must succeed");
@@ -10471,6 +10642,26 @@ backend = "kg-backend"
                 Some("missing-body"),
                 "the quarantine reason must survive comm.ingest: {props:?}"
             );
+            assert_eq!(
+                props.get("channel_slug").and_then(|v| v.as_str()),
+                Some("mock_quarantine"),
+                "the poll loop must persist the exact channel identity used by comm.health"
+            );
+
+            let health = registry
+                .dispatch("comm.health", json!({}))
+                .await
+                .expect("health succeeds after a quarantined poll");
+            let channel = health["channels"]
+                .as_array()
+                .expect("channels array")
+                .iter()
+                .find(|channel| channel["channel_slug"] == "mock_quarantine")
+                .expect("mock quarantine heartbeat");
+            assert_eq!(channel["consecutive_failures"].as_u64(), Some(0));
+            assert_eq!(channel["stalled"].as_bool(), Some(false));
+            assert_eq!(channel["quarantined_count"].as_u64(), Some(1));
+            assert_eq!(health["quarantined_count"].as_u64(), Some(1));
         }
 
         #[tokio::test(start_paused = true)]
@@ -10501,10 +10692,17 @@ backend = "kg-backend"
                 khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
                     .expect("fs blob store");
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            runtime.install_blob_store(Arc::new(blob_store));
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
             let mut builder = VerbRegistryBuilder::new();
             builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
             builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
             let registry = builder.build().expect("registry builds");
             ensure_channel_quarantine_storage(&registry)
@@ -10620,8 +10818,12 @@ backend = "kg-backend"
         async fn committed_cursor_round_trips_across_a_fresh_cursor_get() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             // Simulates a poll that crosses an IMAP UIDVALIDITY/date-window
@@ -10807,8 +11009,12 @@ backend = "kg-backend"
 
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             // Seed a valid row (also bootstraps the pack-owned schema), then
@@ -10927,8 +11133,12 @@ backend = "kg-backend"
         async fn quarantine_ingest_failure_blocking_first_commit_preserves_the_bootstrap_floor() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let control_calls = Arc::new(Mutex::new(Vec::new()));
@@ -11008,8 +11218,12 @@ backend = "kg-backend"
         async fn first_tick_uses_startup_time_not_post_sleep_time() {
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
             let registry = builder.build().expect("registry builds");
 
             let calls = Arc::new(Mutex::new(Vec::new()));

@@ -151,6 +151,28 @@ drained requests receive a typed error without invoking their closures.
 | Send begins after the receiver has closed                                  | `NotStarted`             | The request was not accepted and its operation closure is never invoked                        |
 | An accepted request loses its reply outside the contained request path     | `SideEffectsUnknown`     | The caller cannot prove whether the operation began or which side effects occurred             |
 
+### Failure counters (ADR-133 D8)
+
+`ConnectionPool::writer_acquisition_snapshot` carries two counters populated
+exclusively at the `run_writer_task` drain loop's outer match on the
+per-request outcome, so they stay correct without anyone re-classifying a
+verb by hand:
+
+| Counter | Population |
+| --- | --- |
+| `writer_task_request_failures` | Incremented once for every dequeued request whose processing at the writer seam terminated in error — every row of the table above except `NotStarted` outcomes for requests that never reached the seam, plus a request whose blocking closure fails to join outside the panic boundary. |
+| `writer_task_side_effects_unknown` | The subset of `writer_task_request_failures` whose `WriterTaskRequestState` was exactly `SideEffectsUnknown`. |
+
+A request that is only ever buffered behind another request's terminal
+failure (`NotStarted`, drained via `close_and_fail_queued_requests`) never
+reached the seam and moves neither counter — it was refused by the closed
+queue, not by its own execution.
+
+`crates/khive-db/src/diagnostics.rs` republishes both directly under
+`db_diagnostics.writer_contention` as plain `u64` fields — unlike the
+runtime-supplied `audit_*` fields, they come straight from the pool and are
+never `Option`.
+
 ### Bounded enqueue admission (#1382)
 
 Production store write paths and the SQL bridge's writer requests use

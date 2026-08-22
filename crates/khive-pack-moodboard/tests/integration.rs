@@ -253,7 +253,9 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
     let runtime = KhiveRuntime::memory().expect("memory runtime");
     let root = tempfile::tempdir().expect("blob root");
     let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).expect("blob store"));
-    runtime.install_blob_store(blob_store.clone());
+    runtime
+        .install_blob_store(blob_store.clone())
+        .expect("install blob store");
     let setup_token = runtime
         .authorize(Namespace::parse("moodboard-source").expect("source namespace"))
         .expect("setup token");
@@ -505,7 +507,9 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
     let (runtime, moodboard_runtime) = core_and_moodboard_runtimes();
     let root = tempfile::tempdir().expect("blob root");
     let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).expect("blob store"));
-    moodboard_runtime.install_blob_store(blob_store.clone());
+    moodboard_runtime
+        .install_blob_store(blob_store.clone())
+        .expect("install blob store");
     let setup_token = runtime.authorize(Namespace::local()).expect("setup token");
     let board_fingerprint = "a".repeat(64);
     let descriptor_fingerprint = "b".repeat(64);

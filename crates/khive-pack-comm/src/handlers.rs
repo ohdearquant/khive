@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
-use khive_storage::types::{PageRequest, SqlValue};
+use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
@@ -1840,11 +1840,12 @@ enum AfterCursor {
 pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
+    channel_ingest_capability: Option<&khive_runtime::ChannelIngestCapability>,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
     // Note: IngestParams does not use deny_unknown_fields.
-    let p: IngestParams = serde_json::from_value(params)
+    let mut p: IngestParams = serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("ingest: bad params: {e}")))?;
 
     if p.from.trim().is_empty() {
@@ -1861,6 +1862,29 @@ pub(crate) async fn handle_ingest(
         return Err(RuntimeError::InvalidInput(
             "ingest: `content` must not be empty".into(),
         ));
+    }
+    if let Some(raw) = p.channel_kind.as_deref() {
+        let normalized = raw.trim();
+        if normalized.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "ingest: `channel_kind` must not be empty when supplied".into(),
+            ));
+        }
+        p.channel_kind = Some(normalized.to_string());
+    }
+    if let Some(raw) = p.channel_slug.as_deref() {
+        let normalized = raw.trim();
+        if normalized.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "ingest: `channel_slug` must not be empty when supplied".into(),
+            ));
+        }
+        if p.channel_kind.is_none() {
+            return Err(RuntimeError::InvalidInput(
+                "ingest: `channel_slug` requires `channel_kind`".into(),
+            ));
+        }
+        p.channel_slug = Some(normalized.to_string());
     }
     // #479a: a non-empty malformed thread_id must fail closed, not silently get a
     // fresh UUID (which would split the message into the wrong conversation).
@@ -2063,6 +2087,9 @@ pub(crate) async fn handle_ingest(
     if let Some(ref kind) = p.channel_kind {
         props["channel_kind"] = json!(kind);
     }
+    if let Some(ref slug) = p.channel_slug {
+        props["channel_slug"] = json!(slug);
+    }
     // Metadata passthrough (#448): merged additively so it never clobbers a
     // field set above. Stable v1 names are reserved even when their optional
     // field is absent on an ingest (`subject`, `outbound_ref`,
@@ -2071,7 +2098,9 @@ pub(crate) async fn handle_ingest(
     if let Some(metadata) = p.metadata {
         if let Some(obj) = props.as_object_mut() {
             for (k, v) in metadata {
-                if COMM_STABLE_PROPERTY_KEYS.contains(&k.as_str()) {
+                if COMM_STABLE_PROPERTY_KEYS.contains(&k.as_str())
+                    || matches!(k.as_str(), "channel_kind" | "channel_slug")
+                {
                     continue;
                 }
                 obj.entry(k).or_insert(v);
@@ -2079,8 +2108,23 @@ pub(crate) async fn handle_ingest(
         }
     }
 
+    // Trusted-ingest entry point: comm.ingest is the sole legitimate writer of
+    // transport-owned quarantine disposition and channel provenance (`quarantined`,
+    // `channel_kind`, `channel_slug`), derived above from the inbound transport
+    // itself. Every other write path uses `try_create_note`, which refuses them.
+    // A missing grant is a composition/startup defect (this `CommPack` instance
+    // was never granted the capability), not a caller input error — classified
+    // as `Unconfigured` so it is not confused with a malformed request.
+    let capability = channel_ingest_capability.ok_or_else(|| {
+        RuntimeError::Unconfigured(
+            "comm pack instance holds no channel-ingest capability grant; refusing to \
+             establish transport-owned message properties"
+                .to_string(),
+        )
+    })?;
     let note = match runtime
-        .try_create_note(
+        .try_create_note_as_trusted_ingest(
+            capability,
             token,
             "message",
             p.subject.as_deref(),
@@ -2391,7 +2435,7 @@ fn channel_stalled(props: &Value, as_of: &DateTime<Utc>) -> Option<bool> {
 /// entry shape. Missing or malformed cadence/timestamp fields (including rows
 /// written before #1472) produce `stalled: null` rather than pretending the
 /// channel is current.
-fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>) -> Value {
+fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>, quarantined_count: u64) -> Value {
     let props = note.properties.clone().unwrap_or_else(|| json!({}));
     let poll_interval_secs = props
         .get("poll_interval_secs")
@@ -2408,14 +2452,116 @@ fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>) -> Value {
         "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
         "last_error": props.get("last_error").cloned().unwrap_or(Value::Null),
         "consecutive_failures": props.get("consecutive_failures").cloned().unwrap_or(json!(0)),
+        "quarantined_count": quarantined_count,
+    })
+}
+
+#[derive(Default)]
+struct QuarantineCounts {
+    total: u64,
+    unattributed: u64,
+    by_channel: HashMap<(String, String), u64>,
+}
+
+/// Count live quarantine dispositions in one authorized namespace. The
+/// generic marker accepts both the string spelling emitted by today's channel
+/// envelope metadata and a JSON boolean so future adapters do not need an
+/// email-specific encoding. Rows lacking a complete transport identity remain
+/// visible in `unattributed` and are never guessed onto a heartbeat.
+async fn load_quarantine_counts(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> Result<QuarantineCounts, RuntimeError> {
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .map_err(RuntimeError::Storage)?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT json_extract(properties, '$.channel_kind') AS channel_kind, \
+                         json_extract(properties, '$.channel_slug') AS channel_slug, \
+                         COUNT(*) AS quarantined_count \
+                  FROM notes \
+                  WHERE namespace = ?1 \
+                    AND kind = 'message' \
+                    AND deleted_at IS NULL \
+                    AND (json_extract(properties, '$.quarantined') = 'true' \
+                         OR json_type(properties, '$.quarantined') = 'true') \
+                  GROUP BY json_extract(properties, '$.channel_kind'), \
+                           json_extract(properties, '$.channel_slug') \
+                  ORDER BY channel_kind, channel_slug"
+                .into(),
+            params: vec![SqlValue::Text(token.namespace().as_str().to_string())],
+            label: Some("comm_health_quarantined_counts".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let mut counts = QuarantineCounts::default();
+    for row in rows {
+        let count = match row.get("quarantined_count") {
+            Some(SqlValue::Integer(count)) if *count >= 0 => *count as u64,
+            other => {
+                return Err(RuntimeError::Internal(format!(
+                    "comm.health: storage returned an invalid quarantine count: {other:?}"
+                )))
+            }
+        };
+        counts.total = counts.total.checked_add(count).ok_or_else(|| {
+            RuntimeError::Internal("comm.health: quarantine count overflow".into())
+        })?;
+
+        let kind = row.get("channel_kind").and_then(|value| match value {
+            SqlValue::Text(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+            _ => None,
+        });
+        let slug = row.get("channel_slug").and_then(|value| match value {
+            SqlValue::Text(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+            _ => None,
+        });
+        if let (Some(kind), Some(slug)) = (kind, slug) {
+            let channel_count = counts.by_channel.entry((kind, slug)).or_default();
+            *channel_count = channel_count.checked_add(count).ok_or_else(|| {
+                RuntimeError::Internal("comm.health: per-channel quarantine count overflow".into())
+            })?;
+        } else {
+            counts.unattributed = counts.unattributed.checked_add(count).ok_or_else(|| {
+                RuntimeError::Internal("comm.health: unattributed quarantine count overflow".into())
+            })?;
+        }
+    }
+
+    Ok(counts)
+}
+
+fn quarantine_only_channel_to_json(
+    channel_kind: String,
+    channel_slug: String,
+    quarantined_count: u64,
+) -> Value {
+    json!({
+        "channel_kind": channel_kind,
+        "channel_slug": channel_slug,
+        "poll_interval_secs": Value::Null,
+        "stalled": Value::Null,
+        "last_success_at": Value::Null,
+        "last_poll_attempt_at": Value::Null,
+        "last_failure_at": Value::Null,
+        "last_error": Value::Null,
+        "consecutive_failures": Value::Null,
+        "quarantined_count": quarantined_count,
     })
 }
 
 /// `health` — read-only per-channel health snapshot (khive #606). Reads
 /// `channel_health` rows from `token.namespace()` (khive #877 namespace
-/// scoping). The additive `stalled` schedule fact is deliberately narrower
-/// than a computed `healthy: bool`; overall health judgment still belongs to
-/// the caller. See crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
+/// scoping), then unions exact channel identities found on live quarantine
+/// notes in that same namespace (khive #1383). The additive `stalled`
+/// schedule fact is deliberately narrower than a computed `healthy: bool`;
+/// quarantine counts are an independent backlog observation, and overall
+/// health judgment still belongs to the caller. See
+/// crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
 /// for the `role`/`namespace`/`resource` field semantics (ADR-103 Stage 1).
 ///
 /// `resource` is a process-level self-report of this process's own CPU/RSS
@@ -2439,7 +2585,7 @@ pub(crate) async fn handle_health(
     }
 
     let store = runtime.notes(token)?;
-    const MAX_CHANNELS: u32 = 200;
+    const MAX_CHANNELS: usize = 200;
     let filter = NoteFilter {
         kind: Some("channel_health".to_string()),
         ..Default::default()
@@ -2449,29 +2595,68 @@ pub(crate) async fn handle_health(
             token.namespace().as_str(),
             &filter,
             PageRequest {
-                limit: MAX_CHANNELS,
+                limit: MAX_CHANNELS as u32,
                 offset: 0,
             },
         )
         .await?;
 
-    if page.items.len() == MAX_CHANNELS as usize {
+    if page.items.len() == MAX_CHANNELS {
         tracing::debug!(
             max_channels = MAX_CHANNELS,
             "comm.health: channel_health row count hit the page limit; \
-             results may be silently truncated"
+             heartbeat rows take the full response budget and later rows are omitted"
         );
     }
 
     let now = Utc::now();
-    let channels: Vec<Value> = page
+    let mut quarantine_counts = load_quarantine_counts(runtime, token).await?;
+    let has_heartbeat_state = !page.items.is_empty();
+    let mut channels: Vec<Value> = page
         .items
         .iter()
-        .map(|note| channel_health_to_json(note, &now))
+        .map(|note| {
+            let key = note.properties.as_ref().and_then(|props| {
+                Some((
+                    props.get("channel_kind")?.as_str()?.trim().to_string(),
+                    props.get("channel_slug")?.as_str()?.trim().to_string(),
+                ))
+            });
+            let quarantined_count = key
+                .and_then(|key| quarantine_counts.by_channel.remove(&key))
+                .unwrap_or(0);
+            channel_health_to_json(note, &now, quarantined_count)
+        })
         .collect();
+
+    // A message namespace can intentionally differ from the operational
+    // heartbeat namespace. Preserve those exact channel identities as
+    // quarantine-only entries instead of hiding them merely because this
+    // scoped read has no heartbeat row. Heartbeats consume the bounded response
+    // budget first: if their page is full, an identity whose heartbeat exists
+    // beyond that page is omitted rather than misclassified as quarantine-only.
+    // When heartbeat rows leave capacity, exact quarantine-only identities fill
+    // it in deterministic lexical order without changing heartbeat order.
+    let mut quarantine_only: Vec<_> = quarantine_counts.by_channel.into_iter().collect();
+    quarantine_only.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let quarantine_capacity = MAX_CHANNELS.saturating_sub(channels.len());
+    let omitted_quarantine_channels = quarantine_only.len().saturating_sub(quarantine_capacity);
+    channels.extend(quarantine_only.into_iter().take(quarantine_capacity).map(
+        |((channel_kind, channel_slug), count)| {
+            quarantine_only_channel_to_json(channel_kind, channel_slug, count)
+        },
+    ));
+    if omitted_quarantine_channels > 0 {
+        tracing::debug!(
+            max_channels = MAX_CHANNELS,
+            omitted_quarantine_channels,
+            "comm.health: quarantine-only channel identities exceeded the capacity left after \
+             heartbeat rows; later lexical identities are omitted"
+        );
+    }
     let as_of = now.to_rfc3339();
 
-    let (role, source) = if channels.is_empty() {
+    let (role, source) = if !has_heartbeat_state {
         ("client", None::<&str>)
     } else {
         ("daemon", Some("daemon-heartbeat"))
@@ -2489,6 +2674,8 @@ pub(crate) async fn handle_health(
         "source": source,
         "as_of": as_of,
         "namespace": token.namespace().as_str(),
+        "quarantined_count": quarantine_counts.total,
+        "unattributed_quarantined_count": quarantine_counts.unattributed,
         "channels": channels,
         "resource": resource,
     }))
@@ -3133,6 +3320,7 @@ mod tests {
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -3150,6 +3338,10 @@ mod tests {
             .expect("authorize");
         let signal = InboxSignal::new();
 
+        // handle_ingest fails closed without a channel-ingest grant; mint one
+        // directly rather than routing through a full pack registration.
+        let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+
         let body = json!({
             "from": "email:sender@example.com",
             "to": "local",
@@ -3157,9 +3349,10 @@ mod tests {
             "external_id": "imap:long-poll:dedup:1",
         });
 
-        let first = super::handle_ingest(&runtime, &signal, &token, body.clone())
-            .await
-            .expect("first ingest succeeds");
+        let first =
+            super::handle_ingest(&runtime, &signal, Some(&capability), &token, body.clone())
+                .await
+                .expect("first ingest succeeds");
         assert_eq!(first["deduplicated"].as_bool(), Some(false));
         let generation_after_commit = signal.snapshot();
         assert_ne!(
@@ -3167,7 +3360,7 @@ mod tests {
             "a newly committed ingest must publish a wake"
         );
 
-        let second = super::handle_ingest(&runtime, &signal, &token, body)
+        let second = super::handle_ingest(&runtime, &signal, Some(&capability), &token, body)
             .await
             .expect("deduplicated ingest succeeds");
         assert_eq!(second["deduplicated"].as_bool(), Some(true));
@@ -3653,6 +3846,7 @@ mod tests {
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -3768,6 +3962,7 @@ mod tests {
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
                 git_write: Default::default(),
                 db_path: None,
+                blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::parse(&ns).unwrap(),
                 embedding_model: None,
                 additional_embedding_models: vec![],

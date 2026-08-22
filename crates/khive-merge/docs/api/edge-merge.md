@@ -8,7 +8,9 @@ Edge merging treats `(source, target, relation)` as semantic identity while pres
 
 ## `diff_edges`
 
-Each semantic key is classified as `Added`, `Deleted`, `Unchanged`, or `WeightModified`. Weight equality uses an absolute difference below `f64::EPSILON`. Added changes retain the complete `ExportedEdge`, rather than only its weight, specifically so `edge_id` is not regenerated later. Weight modifications retain both weights for future diff display even though the current merge consumes the branch weight.
+Each semantic key is classified as `Added`, `Deleted`, `Unchanged`, or `Modified`. Added and modified changes retain the complete `ExportedEdge`, so one-sided changes pass through without regenerating identity or dropping properties and provenance.
+
+The semantic key already governs source, target, and relation. Within one key, durable `edge_id`, weight, and properties participate in change classification; weight equality uses an absolute difference below `f64::EPSILON`. `created_at` and `updated_at` do not create a change by themselves. This matches entity merge's timestamp policy and prevents deterministic archive rebuild times from creating false conflicts. When a branch wins a merge-relevant change, its complete independent timestamp pair is carried with the record.
 
 Keys are processed in source/target/relation order. Input archives are validated for duplicate keys by the top-level merge before this diff is used.
 
@@ -16,23 +18,32 @@ Keys are processed in source/target/relation order. Input archives are validated
 
 The edge pass applies the following policies:
 
-| Ours             | Theirs            | Result                             |
-| ---------------- | ----------------- | ---------------------------------- |
-| unchanged        | unchanged         | base edge                          |
-| added            | absent/unchanged  | added edge with branch ID          |
-| absent/unchanged | added             | added edge with branch ID          |
-| added            | added             | one edge, maximum weight, ours ID  |
-| deleted          | deleted/unchanged | omit                               |
-| unchanged        | deleted           | omit                               |
-| weight changed   | unchanged         | changed edge with ours ID          |
-| unchanged        | weight changed    | changed edge with theirs ID        |
-| weight changed   | weight changed    | maximum weight, preferring ours ID |
-| deleted          | weight changed    | `EdgeModifyDelete`                 |
-| weight changed   | deleted           | `EdgeModifyDelete`                 |
+| Ours             | Theirs            | Result                                                                 |
+| ---------------- | ----------------- | ---------------------------------------------------------------------- |
+| unchanged        | unchanged         | base edge                                                              |
+| added            | absent/unchanged  | complete added branch edge                                             |
+| absent/unchanged | added             | complete added branch edge                                             |
+| added            | added             | maximum weight and ours identity/timestamps; properties merge per key      |
+| deleted          | deleted/unchanged | omit                                                                   |
+| unchanged        | deleted           | omit                                                                   |
+| modified         | unchanged         | complete modified ours edge                                            |
+| unchanged        | modified          | complete modified theirs edge                                          |
+| modified         | modified          | field-level three-way reconciliation                                   |
+| deleted          | modified          | `EdgeModifyDelete`                                                     |
+| modified         | deleted           | `EdgeModifyDelete`                                                     |
 
-Maximum weight is the automatic last-write-wins policy for simultaneous weight changes. When rebuilding a modified edge, the implementation preserves an ID from the responsible branch; simultaneous changes prefer ours for deterministic identity. A fresh UUID is only a defensive fallback when no originating edge can be found.
+Double-modified records use these field policies:
 
-Relation reconstruction can return `MergeError::Internal` if the semantic key's relation string no longer parses as a governed relation.
+- A weight changed by only one branch is retained exactly, including a decrease. Simultaneous weight changes retain the established maximum-weight policy.
+- Object properties use base-aware three-way reconciliation per key, matching the existing entity-property policy: independent key changes are combined, a one-sided change or identical double change is retained, and divergent changes to the same key yield one payload-level `EdgePropertyMismatch` with ours as the provisional value for that key. `None` acts as an empty map; malformed legacy non-object payloads are reconciled atomically and conflict on divergent double changes.
+- `edge_id` uses the same three-way rule. Divergent replacements yield `EdgeIdentityMismatch`; independently added records have no common durable identity and continue to prefer ours.
+- Timestamps never trigger a modification or conflict. One-sided changes carry that branch's exact pair. A double-modified or double-added result deterministically carries ours' pair while reconciling the governed fields above.
+
+`SnapshotMergeStrategy::Ours` and `Theirs` are the explicit resolutions for property or identity conflicts and retain the selected branch's complete record.
+
+### Cross-key identity collisions
+
+Per-key reconciliation above decides each semantic edge's UUID independently, so a branch-chosen identity (an added edge, or a one-sided/double modification that changes `edge_id`) can coincide with a durable UUID already used by a *different* semantic edge in the merged set. `merge_edges` reserves every UUID inherited unchanged from base first, then resolves branch-chosen UUIDs against that reserved set in deterministic key order: an edge whose own identity did not change always keeps it; a colliding branch-chosen identity falls back to that key's own base UUID and reports `EdgeIdentityCollision`. That fallback UUID must itself still be unclaimed — a chained collision (the fallback target was already taken by an earlier-sorted edge) is checked the same way as the initial attempt. When there is no unclaimed identity to fall back to, whether because the key has no base UUID or because its base UUID was already claimed, the edge is dropped from the merged set rather than duplicating another edge's UUID; the `EdgeIdentityCollision` conflict is the record of the drop.
 
 ## `validate_dangling_edges`
 

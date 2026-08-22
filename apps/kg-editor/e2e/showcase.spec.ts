@@ -74,6 +74,92 @@ test("dogfoods every repository analysis from the curated static bundle", async 
   ]);
 });
 
+test("restores a shared investigation and follows browser back and forward", async ({ page }) => {
+  const snapshot = "c2979d2443738a075e55a170c772d1dc86cf0f91";
+  const pool = "crates/khive-db/src/pool.rs";
+  const writer = "crates/khive-db/src/writer_task.rs";
+  const query = new URLSearchParams({
+    repo: "https://github.com/ohdearquant/khive",
+    at: snapshot,
+    module: pool,
+    view: "dependency_topology",
+  });
+  await page.goto(`/?${query.toString()}`);
+
+  const inspector = page.locator("[data-module-inspector]");
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(pool);
+  await expect(page.locator('[data-view-id="dependency_topology"]')).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+
+  await page.getByRole("searchbox", { name: "Find a module or path" }).fill(writer);
+  await page.getByRole("button", { name: `Inspect ${writer}` }).click();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
+  await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(writer)}`));
+
+  await page.locator('[data-view-id="hidden_coupling"]').click();
+  await expect(page).toHaveURL(/view=hidden_coupling/);
+
+  await page.goBack();
+  await expect(page).toHaveURL(/view=dependency_topology/);
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
+
+  await page.goBack();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(pool);
+  await page.goForward();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
+});
+
+test("navigates from module to analysis using only the command palette", async ({ page }) => {
+  const writer = "crates/khive-db/src/writer_task.rs";
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Open command palette" }))
+    .toBeVisible();
+
+  await page.keyboard.press("Control+K");
+  const palette = page.getByRole("dialog", { name: "Repository commands" });
+  await expect(palette).toBeVisible();
+  const query = palette.getByRole("combobox", {
+    name: "Search repository commands",
+  });
+  await query.fill(writer);
+  await page.keyboard.press("Enter");
+
+  const inspector = page.locator("[data-module-inspector]");
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
+  await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(writer)}`));
+
+  await page.keyboard.press("Control+K");
+  const apiSurface = palette.getByRole("option", {
+    name: /De-facto API surface/i,
+  });
+  for (let step = 0; step < 8; step += 1) {
+    await page.keyboard.press("ArrowDown");
+  }
+  await expect(apiSurface).toHaveAttribute("aria-selected", "true");
+  const [optionBox, resultsBox] = await Promise.all([
+    apiSurface.boundingBox(),
+    palette.getByRole("listbox", {
+      name: "Repository command results",
+    }).boundingBox(),
+  ]);
+  expect(optionBox).not.toBeNull();
+  expect(resultsBox).not.toBeNull();
+  expect(optionBox!.y).toBeGreaterThanOrEqual(resultsBox!.y);
+  expect(optionBox!.y + optionBox!.height)
+    .toBeLessThanOrEqual(resultsBox!.y + resultsBox!.height);
+  await page.keyboard.press("Enter");
+
+  await expect(page.locator('[data-view-id="api_surface"]')).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(page).toHaveURL(/view=api_surface/);
+  await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(writer)}`));
+  await expect(page.locator("[data-repository-dashboard]")).toBeFocused();
+});
+
 test("a valid repository miss stays local and renders an honest state", async ({ page }) => {
   const requestedAfterSubmit: string[] = [];
   let observing = false;

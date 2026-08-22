@@ -929,6 +929,7 @@ mod tests {
         let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
             additional_embedding_models: vec![],

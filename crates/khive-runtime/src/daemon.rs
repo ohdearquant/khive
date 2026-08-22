@@ -838,7 +838,7 @@ struct BackgroundTaskGuard {
 impl Drop for BackgroundTaskGuard {
     fn drop(&mut self) {
         self.counter
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -852,7 +852,7 @@ pub fn track_background_task<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    background_tasks().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    background_tasks().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let guard = BackgroundTaskGuard {
         counter: background_tasks().clone(),
     };
@@ -865,7 +865,7 @@ where
 /// Current count of in-flight tasks started via [`track_background_task`].
 /// Exposed for tests; `drain()` reads the shared counter directly.
 pub fn background_task_count() -> usize {
-    background_tasks().load(std::sync::atomic::Ordering::Relaxed)
+    background_tasks().load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Process-wide daemon shutdown signal (ADR-119).
@@ -1272,7 +1272,7 @@ struct ActiveConnectionGuard {
 #[cfg(unix)]
 impl ActiveConnectionGuard {
     fn claim(active: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self { active }
     }
 }
@@ -1281,7 +1281,7 @@ impl ActiveConnectionGuard {
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.active
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2039,7 +2039,10 @@ async fn drain_with_timeout(
     timeout: std::time::Duration,
 ) -> bool {
     use std::sync::atomic::Ordering;
-    let remaining = || active.load(Ordering::Relaxed) + background_task_count();
+    // One sequentially-consistent order spans connection handoff and tracked
+    // task publication. Drain must not observe an ended connection and a
+    // stale pre-publication background count as two simultaneous zeroes.
+    let remaining = || active.load(Ordering::SeqCst) + background_task_count();
     if remaining() == 0 {
         return true;
     }
@@ -2047,7 +2050,7 @@ async fn drain_with_timeout(
     while remaining() > 0 {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
-                remaining_connections = active.load(Ordering::Relaxed),
+                remaining_connections = active.load(Ordering::SeqCst),
                 remaining_background_tasks = background_task_count(),
                 "drain timeout reached; forcing shutdown"
             );
@@ -2151,6 +2154,72 @@ mod khive_root_tests {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[derive(Debug)]
+    struct DrainBlockingBlobStore {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl khive_storage::BlobStore for DrainBlockingBlobStore {
+        async fn put(
+            &self,
+            _bytes: Vec<u8>,
+        ) -> khive_storage::StorageResult<khive_storage::ContentRef> {
+            panic!("put is not used by the hydration drain test")
+        }
+
+        async fn get(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<Vec<u8>> {
+            panic!("legacy get must not service hydration")
+        }
+
+        async fn get_bounded_verified(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+            _max_bytes: u64,
+        ) -> khive_storage::StorageResult<Vec<u8>> {
+            if let Some(started) = self
+                .started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = started.send(());
+            }
+            self.release
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test release semaphore remains open")
+                .forget();
+            Ok(b"late result".to_vec())
+        }
+
+        async fn exists(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<bool> {
+            panic!("exists is not used by the hydration drain test")
+        }
+
+        async fn size(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<Option<u64>> {
+            panic!("size is not used by the hydration drain test")
+        }
+
+        async fn delete(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<bool> {
+            panic!("delete is not used by the hydration drain test")
+        }
+    }
 
     struct AppendCompletionEventStore {
         inner: Arc<dyn khive_storage::EventStore>,
@@ -2610,6 +2679,57 @@ mod tests {
             done.is_ok(),
             "drain() must return once the tracked background task finishes"
         );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn drain_waits_for_hydration_after_its_last_request_waiter_is_cancelled() {
+        let before = background_task_count();
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let store = Arc::new(DrainBlockingBlobStore {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: Arc::clone(&release),
+        });
+        let hydrator = Arc::new(
+            crate::BlobHydrator::new(
+                store as Arc<dyn khive_storage::BlobStore>,
+                khive_storage::MAX_BLOB_WHOLE_BYTES,
+            )
+            .expect("minimum hydration budget is valid"),
+        );
+        let content_ref =
+            khive_storage::ContentRef::from_hex("a".repeat(64)).expect("fixture content ref");
+
+        let request_hydrator = Arc::clone(&hydrator);
+        let request = tokio::spawn(async move {
+            request_hydrator
+                .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+                .await
+        });
+        started_rx.await.expect("backend work must begin");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(background_task_count(), before + 1);
+
+        let draining = drain_with_timeout(&active, std::time::Duration::from_secs(5));
+        tokio::pin!(draining);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut draining)
+                .await
+                .is_err(),
+            "drain must remain pending while cancelled-request hydration still runs"
+        );
+
+        release.add_permits(1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), draining)
+                .await
+                .expect("drain should finish after native hydration ends"),
+            "hydration should finish inside the drain window"
+        );
+        assert_eq!(background_task_count(), before);
     }
 
     // See the `#[serial(background_tasks)]` note on

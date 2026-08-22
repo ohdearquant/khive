@@ -1630,6 +1630,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
         git_write: Default::default(),
         db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
         additional_embedding_models: vec![],
@@ -2305,6 +2306,7 @@ mod embed_failure_tests {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],
@@ -2491,6 +2493,7 @@ mod embed_failure_tests {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
@@ -2805,6 +2808,7 @@ mod ann_bypass_regression {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],
@@ -3402,6 +3406,7 @@ mod edit_inline_reembed {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],
@@ -3805,6 +3810,7 @@ mod ann_type_filter_regression {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],
@@ -4209,6 +4215,7 @@ mod compose_explain_sections {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],

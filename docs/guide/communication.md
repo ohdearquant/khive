@@ -179,7 +179,8 @@ projection vocabulary as `comm.inbox`; omission returns the full thread view.
 polling state, keyed by `(channel_kind, channel_slug)`. It never returns a
 computed `healthy` boolean. It does expose the nominal cadence and a narrower,
 nullable schedule-staleness advisory; overall health judgment stays with the
-caller.
+caller. Quarantine counts are orthogonal: a successful poll can remain current
+while one or more terminally parked messages require operator attention.
 
 ```
 request(ops="comm.health()")
@@ -187,17 +188,18 @@ request(ops="comm.health()")
 
 Each entry in the returned `channels` array carries:
 
-| Field                  | Notes                                                                                                                                                      |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `channel_kind`         | e.g. `"email"`.                                                                                                                                            |
-| `channel_slug`         | Per-credential identifier (the configured mailbox address for the email channel), so two accounts of the same `channel_kind` get distinct rows.            |
-| `poll_interval_secs`   | Positive nominal/minimum poll cadence, or `null` for a legacy/malformed heartbeat row.                                                                     |
-| `stalled`              | Advisory schedule staleness: `true` after three missed nominal intervals, `false` when current, or `null` when the facts are unknown or backoff is active. |
-| `last_success_at`      | Timestamp of the most recent successful poll attempt, or `null`.                                                                                           |
-| `last_failure_at`      | Timestamp of the most recent failed poll attempt, or `null`.                                                                                               |
-| `last_poll_attempt_at` | Timestamp of the most recent poll attempt regardless of outcome.                                                                                           |
-| `last_error`           | `{class, message, at}` of the most recent failure. `class` is one of `auth`, `transport`, `config` (an open enum; callers must tolerate unknown values).   |
-| `consecutive_failures` | Resets to 0 on success, increments on failure.                                                                                                             |
+| Field                  | Notes                                                                                                                                                            |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `channel_kind`         | e.g. `"email"`.                                                                                                                                                  |
+| `channel_slug`         | Per-credential identifier (the configured mailbox address for the email channel), so two accounts of the same `channel_kind` get distinct rows.                  |
+| `poll_interval_secs`   | Positive nominal/minimum poll cadence, or `null` for a legacy/malformed heartbeat row.                                                                           |
+| `stalled`              | Advisory schedule staleness: `true` after three missed nominal intervals, `false` when current, or `null` when the facts are unknown or backoff is active.       |
+| `last_success_at`      | Timestamp of the most recent successful poll attempt, or `null`.                                                                                                 |
+| `last_failure_at`      | Timestamp of the most recent failed poll attempt, or `null`.                                                                                                     |
+| `last_poll_attempt_at` | Timestamp of the most recent poll attempt regardless of outcome.                                                                                                 |
+| `last_error`           | `{class, message, at}` of the most recent failure, or `null` when none was observed. `class` is an open enum (`auth`, `transport`, `config`, or a future value). |
+| `consecutive_failures` | Resets to 0 on success, increments on failure, or `null` for a quarantine-only identity with no heartbeat evidence.                                              |
+| `quarantined_count`    | Live parked messages carrying this exact channel identity.                                                                                                       |
 
 `last_error` is retained after a later success: a success updates
 `last_success_at` and resets `consecutive_failures` to 0 but never clears
@@ -219,14 +221,26 @@ regardless of `KHIVE_EMAIL_INGEST_NAMESPACE`; an authorized per-tenant writer
 can instead write its own namespace. `comm.health` reads from the caller's
 injected namespace, the same `namespace=` escape / `"local"` default every
 other comm verb resolves. A scoped read never falls back to `"local"`. The
-response carries a `namespace` field naming the namespace actually read.
+response carries a `namespace` field naming the namespace actually read. It
+also carries namespace-wide `quarantined_count` and
+`unattributed_quarantined_count` totals. A quarantine identity with no
+heartbeat row in that namespace is included as a channel entry with nullable
+heartbeat fields.
 
 The `role` field is `"daemon"` (with `source: "daemon-heartbeat"`) whenever
 any persisted heartbeat row exists **in the namespace read**, and `"client"`
-with an empty `channels` array otherwise. This distinguishes who owns the
-channel loops, not which process answered the call: any persisted row means
-some daemon owns the loops, even when this particular call was served by a
-different, non-daemon process.
+otherwise. A client-role response can contain quarantine-only channel entries;
+those rows are message evidence, not fabricated daemon ownership. This
+distinguishes who owns the channel loops, not which process answered the call.
+
+Inspect parked rows with the full `comm.inbox(status="all")` view and the
+`properties.quarantined` marker, then use `get(id=...)` for detail.
+`delete(id=...)` removes one from the live parked count; `hard=true`
+permanently purges it. No automatic trusted release exists because quarantine
+means the attribution gate did not establish a sender identity.
+Generic message `create`/`update` cannot set or clear `quarantined`,
+`channel_kind`, or `channel_slug`; `comm.ingest` is the only supported writer
+for those transport-owned facts.
 
 **Known ambiguity:** an empty `channels` array cannot distinguish "no daemon
 has ever run" from "channels are configured but a poll has never completed."
@@ -235,13 +249,18 @@ The comm pack has no visibility into channel configuration (that lives in
 `channels` array means only "no daemon heartbeat state exists in the
 namespace read," not "nothing is configured." The `namespace` field
 disambiguates which namespace that is. A call scoped to a non-local
-`namespace=` returns `role: "client"` with empty `channels` until an authorized
-writer has produced heartbeat state there, even while the shipped local loop
-is actively heartbeating under `"local"` — check the response's `namespace`
-field before reading that as "no daemon running."
+`namespace=` returns `role: "client"` until an authorized writer has produced
+heartbeat state there, even while the shipped local loop is actively
+heartbeating under `"local"`; its `channels` array may still contain
+quarantine-only message evidence. Check the response's `namespace` field
+before reading that role as "no daemon running."
 
-Results are capped at 200 channels. A full page logs a `tracing::debug!`
-line noting that results may be silently truncated.
+Results are capped at 200 channels. Heartbeat rows take precedence and retain
+their persisted order; quarantine-only identities fill remaining capacity in
+lexical `(channel_kind, channel_slug)` order. Later identities are omitted, but
+the top-level quarantine totals remain namespace-wide. This ordering prevents
+a real heartbeat beyond a full heartbeat page from being presented as a
+synthetic unknown-liveness row.
 
 ## The email channel
 
@@ -284,10 +303,12 @@ correctly in native mail clients.
 A separate poll loop reads the IMAP mailbox every 5 seconds and, for each new
 message, calls the pack-internal `comm.ingest` subhandler (not callable
 directly over the MCP wire) with the parsed envelope: `from`, `to`, `content`,
-`subject`, `channel_kind`, `external_id` (an IMAP-derived dedup key of the
-form `imap:{host}:{uidvalidity}:{uid}`), `sent_at`, and the wire threading
-fields `wire_message_id` / `wire_references`. Duplicate `external_id` values
-are ignored, making re-delivery idempotent.
+`subject`, `channel_kind`, the exact per-credential `channel_slug`, `external_id`
+(an IMAP-derived dedup key of the form `imap:{host}:{uidvalidity}:{uid}`),
+`sent_at`, and the wire threading fields `wire_message_id` / `wire_references`.
+Every channel poller must supply both `Channel::kind()` and `Channel::slug()`;
+kind alone cannot distinguish two accounts using the same adapter. Duplicate
+`external_id` values are ignored, making re-delivery idempotent.
 
 ### Configuration
 
