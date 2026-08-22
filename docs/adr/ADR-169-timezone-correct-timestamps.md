@@ -15,10 +15,11 @@ by `micros_to_iso` (`crates/khive-runtime/src/presentation.rs:328`), which hard-
 Its doc comment describes it as "the single conversion point before any field reaches the MCP
 boundary."
 
-**Representation B — RFC 3339 strings stored inside note properties.** `due` (gtd),
-`completed_at` (gtd), `sent_at` and `delivered_at` (comm), `cancelled_at` (schedule), and
-`last_seen_at` (code) are each written into `properties` as an already-formatted string and
-echoed back to the caller verbatim. They never pass through `micros_to_iso`.
+**Representation B — RFC 3339 strings stored inside note properties.** `due`, `completed_at`,
+`sent_at`, `delivered_at`, `cancelled_at`, and `last_seen_at` are each written into `properties`
+as an already-formatted string and echoed back to the caller verbatim. They never pass through
+`micros_to_iso`. Their producing call sites are enumerated in the Mechanism section below, and
+they do not all live in the pack whose field the name suggests.
 
 So the doc comment quoted above is not an accurate description of the system, and the
 inaccuracy is load-bearing: it makes the rendering surface look like one function when it is
@@ -74,6 +75,26 @@ seam and believed complete.
 a view concern. Nothing in this ADR mutates rows that already exist. This is a forward-only
 change, and the window of values written under the previous anchoring stays as it was written.
 
+**D5. The anchored value is stored in offset spelling, and this is not timezone-dependent
+storage.** A date-only `2026-08-23` written by a caller anchored at UTC-4 is stored as
+`2026-08-23T00:00:00-04:00` rather than `2026-08-23T04:00:00Z`.
+
+The distinction matters and is easy to misread, so it is stated directly. **The stored value is
+still an absolute instant.** RFC 3339 with a numeric offset denotes exactly one point on the
+timeline; it is machine-comparable against any other RFC 3339 value, sorts correctly, and
+converts to UTC without loss. The offset is not a statement that storage now depends on a
+timezone setting. It is a record of the zone in which the date was anchored at parse time, and
+that information is genuinely part of what the caller expressed: a bare date is a day in some
+calendar, and which calendar was used is a fact about the value, not a rendering preference.
+
+The invariant this preserves is the one that matters: **display configuration never changes a
+stored value.** Changing `[display] timezone` after the fact re-renders existing timestamps and
+alters no byte of them. What D5 changes is the anchoring performed at write time on input that
+did not specify an instant at all.
+
+The practical consequence is that a stored value echoed back verbatim already reads as the date
+the caller wrote, so D1 closes the observed defect on its own, without waiting for D2.
+
 ## Rationale
 
 D1 before D2 is the whole point of the ordering. The defect the caller actually observes is
@@ -122,6 +143,55 @@ that wiring one function is sufficient.
 - Storage remains instant-based; nothing here changes the stored type or the column layout.
 - Callers that pass an explicit offset or `Z` see no change at all.
 
+## Mechanism: the rendering surface is two paths, not one
+
+This section exists for whoever implements D2. The display setting has a reach problem, and the
+codebase currently documents the opposite, so an implementation that trusts the documentation
+will ship believing it is complete.
+
+`micros_to_iso` (`crates/khive-runtime/src/presentation.rs:328`) describes itself as "the single
+conversion point before any field reaches the MCP boundary." It is not. It covers exactly one of
+two paths.
+
+**Path 1 — integer microseconds in entity and note columns.** These reach a caller through
+`micros_to_iso`, which is a single seam and can be made zone-aware in one place.
+
+**Path 2 — RFC 3339 strings already formatted and stored inside note `properties`.** These are
+written as strings at their producing site and returned to the caller unchanged. They never enter
+`micros_to_iso`. Each field below was located at source rather than inferred from the pack it
+conceptually belongs to, because the two do not always agree:
+
+| Field          | Written at                                                                                                               |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `due`          | `crates/khive-pack-gtd/src/task_create.rs:383` (via `parse_due`, defined in `crates/khive-pack-gtd/src/handlers.rs:499`) |
+| `completed_at` | `crates/khive-pack-gtd/src/handlers.rs:845,946`                                                                          |
+| `sent_at`      | `crates/khive-pack-comm/src/handlers.rs:337,1413`                                                                        |
+| `delivered_at` | `crates/khive-mcp/src/serve.rs:1562,1872`                                                                                |
+| `cancelled_at` | `crates/khive-pack-schedule/src/handlers.rs:1060`                                                                        |
+| `last_seen_at` | `crates/khive-pack-code/src/source_ingest.rs:739,869`                                                                    |
+
+Query results add a further producer: `SqlValue::Timestamp` is rendered at
+`crates/khive-pack-kg/src/handlers/common.rs:862`.
+
+Note that `sent_at` has two distinct producers with different roles: the comm handler sites above
+write the stored value, while `crates/khive-mcp/src/serve.rs:994,1756` render a `sent_at` into a
+response from an envelope. A field name is therefore not a reliable key for this work; the call
+site is.
+
+The observable proof is a single `gtd.tasks` response row, which returns `created_at` in
+presentation-layer form and `due` as a raw stored string. Two formats in one row means two paths.
+
+Consequences for D2:
+
+- Wiring the zone setting into `micros_to_iso` alone changes nothing about any Path 2 field. A
+  reviewer checking only that function will see a complete-looking change.
+- Path 2 fields are not all the same kind of value. Some are stored facts and some are rendered
+  ones, and the difference has to be decided per field rather than assumed uniform. That decision
+  is listed as implementation step 4 and is not settled here.
+- D5 is what keeps this from blocking the fix: because a date-only value is stored in offset
+  spelling, the Path 2 echo is already correct for the case that motivated this ADR, so D2's reach
+  problem does not have to be solved before the defect is closed.
+
 ## Implementation
 
 1. `[display]` section on the runtime config (`crates/khive-runtime/src/engine_config.rs`,
@@ -140,20 +210,6 @@ that wiring one function is sufficient.
 
 Sequencing: step 3 is the minimum that resolves the observed defect and can land before the
 rest. Steps 1 and 2 are its prerequisites.
-
-## Open question for review
-
-D1 leaves the spelling of the stored string undecided, and the choice is visible to callers
-because these values are echoed verbatim.
-
-- **Offset spelling** — store `2026-08-23T00:00:00-04:00`. The verbatim echo already reads as
-  the intended date, so the defect is resolved without any rendering work. Stored strings are
-  then no longer uniformly `Z`.
-- **`Z` spelling** — store `2026-08-23T04:00:00Z`. Stored strings stay uniform, but the
-  verbatim echo still shows the wrong-looking day until rendering is in place, which means the
-  observable fix waits on the larger half of the work.
-
-Both are the same instant. This ADR does not decide between them.
 
 ## References
 
