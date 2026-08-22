@@ -1,4 +1,5 @@
 export const SHOWCASE_ASSET_PREFIX = "/showcase/";
+export const REPOSITORY_URL_LIMIT = 2_048;
 
 export type ShowcaseRegistryEntry = Readonly<{
   id: string;
@@ -49,13 +50,8 @@ export function normalizeRepositoryUrl(input: string):
     return { ok: false, reason: "Repository URLs cannot contain credentials." };
   }
 
-  let segments: string[];
-  try {
-    segments = url.pathname
-      .split("/")
-      .filter(Boolean)
-      .map((segment) => decodeURIComponent(segment));
-  } catch {
+  const segments = decodedPathSegments(url);
+  if (!segments) {
     return { ok: false, reason: "The repository URL contains invalid path encoding." };
   }
   if (segments.length < 2 || segments.some((segment) => segment === "." || segment === "..")) {
@@ -70,7 +66,46 @@ export function normalizeRepositoryUrl(input: string):
 
   const host = url.hostname.toLowerCase() === "www.github.com" ? "github.com" : url.hostname.toLowerCase();
   const authority = url.port ? `${host}:${url.port}` : host;
-  return { ok: true, value: `https://${authority}/${segments.join("/")}` };
+  const value = `https://${authority}/${segments.join("/")}`;
+
+  if (value.length > REPOSITORY_URL_LIMIT) {
+    return { ok: false, reason: "The repository URL is too long." };
+  }
+
+  // The canonical value is built by joining DECODED segments back together
+  // with "/" — it is not re-encoded. Re-parsing it with the same parser and
+  // requiring the segments to come back unchanged is what catches any
+  // character that is structural in a URL path (a decoded "/", "?", "#",
+  // "\\", …): such a character would shift where a segment boundary falls
+  // on the next parse, so the round trip fails and the input is rejected.
+  // This subsumes any specific-character blacklist without enumerating one.
+  let reparsed: URL;
+  try {
+    reparsed = new URL(value);
+  } catch {
+    return { ok: false, reason: "The repository URL contains invalid path encoding." };
+  }
+  const reparsedSegments = decodedPathSegments(reparsed);
+  if (
+    !reparsedSegments ||
+    reparsedSegments.length !== segments.length ||
+    reparsedSegments.some((segment, index) => segment !== segments[index])
+  ) {
+    return { ok: false, reason: "The repository URL contains invalid path encoding." };
+  }
+
+  return { ok: true, value };
+}
+
+function decodedPathSegments(url: URL): string[] | null {
+  try {
+    return url.pathname
+      .split("/")
+      .filter(Boolean)
+      .map((segment) => decodeURIComponent(segment));
+  } catch {
+    return null;
+  }
 }
 
 export function resolveShowcaseRepository(

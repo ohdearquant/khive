@@ -77,7 +77,15 @@ describe("repository investigation location", () => {
     ["query string", `${repository}?tab=readme`],
     ["fragment", `${repository}#readme`],
   ])(
-    "accepts a curated repository URL carrying a %s",
+    // normalizeRepositoryUrl now returns the CANONICAL value (no query, no
+    // fragment) rather than the raw input — parseRepository stores that
+    // canonical value on the parsed location. A repo value carrying its
+    // own query string or fragment is still accepted, but the extras are
+    // dropped from the stored/round-tripped value; they never reach a
+    // rebuilt URL. This is an intended consequence of the round-trip
+    // invariant, not a regression: the canonical value is what
+    // `repositoryLocationUrl`/`investigationShareUrl` will emit anyway.
+    "accepts a curated repository URL carrying a %s, but canonicalizes away the extras",
     (_name, repositoryWithExtras) => {
       const parsed = parseRepositoryLocation(
         new URL(
@@ -86,7 +94,7 @@ describe("repository investigation location", () => {
       );
 
       expect(parsed.issues).toEqual([]);
-      expect(parsed.location.repository).toBe(repositoryWithExtras);
+      expect(parsed.location.repository).toBe(repository);
     },
   );
 

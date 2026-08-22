@@ -18,7 +18,6 @@ const LOCATION_PARAMETERS = ["repo", "at", "module", "view"] as const;
 const VIEW_IDS = new Set<string>(REPOSITORY_VIEW_IDS);
 const SNAPSHOT_SHA = /^[0-9a-f]{40}$/;
 const MODULE_PATH_LIMIT = 1_024;
-const REPOSITORY_URL_LIMIT = 2_048;
 
 type LocationParameter = (typeof LOCATION_PARAMETERS)[number];
 
@@ -40,22 +39,8 @@ export type ParsedRepositoryLocation = Readonly<{
 }>;
 
 export function publicRepositoryUrlIssue(value: string): string | null {
-  if (value.length > REPOSITORY_URL_LIMIT) {
-    return "The repository URL is too long.";
-  }
-  try {
-    const repository = new URL(value);
-    if (
-      (repository.protocol !== "https:" && repository.protocol !== "http:") ||
-      repository.username ||
-      repository.password
-    ) {
-      return "The repository must be a public HTTP or HTTPS URL.";
-    }
-  } catch {
-    return "The repository must be a public HTTP or HTTPS URL.";
-  }
-  return null;
+  const normalized = normalizeRepositoryUrl(value);
+  return normalized.ok ? null : normalized.reason;
 }
 
 export function addressableModulePathIssue(value: string): string | null {
@@ -104,16 +89,12 @@ function parseRepository(
   issues: RepositoryLocationIssue[],
 ): string | null {
   if (value == null) return null;
-  if (value.length > REPOSITORY_URL_LIMIT) {
-    issues.push({ parameter: "repo", message: "The repository URL is too long." });
-    return null;
-  }
   const normalized = normalizeRepositoryUrl(value);
   if (!normalized.ok) {
     issues.push({ parameter: "repo", message: normalized.reason });
     return null;
   }
-  return value;
+  return normalized.value;
 }
 
 function parseSnapshotSha(
@@ -189,7 +170,7 @@ export function repositoryLocationUrl(
 ): URL {
   const url = new URL(base.origin + base.pathname);
   const values: Record<LocationParameter, string | null> = {
-    repo: location.repository,
+    repo: location.repository ? repositoryOriginAndPathname(location.repository) : null,
     at: location.snapshotSha,
     module: location.modulePath,
     view: location.view,
@@ -220,7 +201,7 @@ export function investigationShareUrl(
 ): URL {
   const url = new URL(`${base.origin}${base.pathname}`);
   if (location.repository) {
-    const repository = shareSafeRepository(location.repository);
+    const repository = repositoryOriginAndPathname(location.repository);
     if (repository) url.searchParams.append("repo", repository);
   }
   if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
@@ -231,7 +212,7 @@ export function investigationShareUrl(
   return url;
 }
 
-function shareSafeRepository(value: string): string | null {
+function repositoryOriginAndPathname(value: string): string | null {
   try {
     const repository = new URL(value);
     return `${repository.origin}${repository.pathname}`;
