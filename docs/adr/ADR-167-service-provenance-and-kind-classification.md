@@ -226,10 +226,17 @@ instead — each of which must be written down per edge:
   against a tombstoned row is not refused downstream — only this check stops it. The
   edge keeps its id while the endpoint fields referencing the moved subject are updated (the
   primitive takes one or both fields): for an incident edge, every endpoint field referencing the
-  migrating record moves onto the new record — one field ordinarily, both for a self-loop; for a
+  migrating record moves onto the new record; for a
   closure member, the target moves to its annotated subject's mapped replacement — a closure
   member is never moved onto the new record. A closure
   member whose subject is itself preserved needs no move at all: its target id is still valid.
+  **A move whose RESULT would be a self-loop never qualifies.** Endpoint validation rejects
+  `source_id == target_id` for every relation as its first check, and ADR-113 re-validates the
+  resulting endpoints, so a legacy self-loop incident on the migrating record cannot be preserved
+  by moving both of its fields onto the new record: the result is rejected, not written. Such a
+  row is a REFUSE. This is not a gap in the procedure but the endpoint contract holding: a
+  self-loop is a below-seam or legacy row, and ADR-034's `no-self-loops` audit, not a kind
+  correction, is where it is resolved.
   Because the id survives, every annotation targeting a PRESERVEd edge stays valid with no
   re-anchoring. Preferred over RECREATE wherever it qualifies. It exempts nothing: the edge still
   appears in the closure enumeration, its disposition is still written down, and any move still
@@ -243,6 +250,14 @@ instead — each of which must be written down per edge:
 
 The default is REFUSE. A procedure whose failure mode is a silently dropped edge is the thing this
 ADR exists to prevent, so an unclassifiable edge stops the migration rather than being absorbed by it.
+
+**Determinacy, stated once so it need not be restated per rule.** Every row this procedure
+enumerates — each incident edge, each closure edge, each closure note, each named carrier — must
+resolve to exactly one outcome under the rules below, decided before any plan is prepared. A row
+with no outcome, with two outcomes that disagree, or with an outcome the endpoint contract would
+reject, is a REFUSE. The rules that follow name the determinate answer wherever one exists; where
+they do not, this clause is the answer, and it fails toward stopping the migration rather than
+toward a plan whose result nobody stated.
 
 Two rules sit beside the four dispositions and are written down with the same discipline:
 
@@ -265,6 +280,23 @@ carrying the NAMED-DELETION tombstone outcome below. A RE-EXPRESSed edge's origi
 deleted, but it appears in the map as the mapping to its replacement, not as a deletion entry.
 Nothing else in the procedure deletes a row outside the record's own purge cascade.
 
+**A note's outcome aggregates every annotation that targets it.** Dispositions are recorded per
+annotation, and a note may be the subject of several, so the map's single note entry is derived
+from all of them together: the note is deleted only when EVERY annotation in the closure targeting
+it carries a delete disposition that names the note; if any one of them retains the note —
+re-anchor, carrier, or a delete that names only the annotation edge — the note is retained and
+carries an identity entry, while the deleting annotations' own edges are still deleted. Deleting a
+note that another surviving annotation still anchors would manufacture the dangling reference this
+procedure exists to prevent, so the rule resolves toward retention by construction and needs no
+refusal.
+
+**A named carrier is resolved through the map like any other reference.** A carrier disposition
+names a record that must, at plan time, either be live and outside the purge set, or appear in the
+closure-substrate map with an entry resolving to a row that is live after the plan commits. A
+carrier naming a row that maps to a named deletion, or to a tombstoned replacement, cannot preserve
+the claim it was chosen to carry and is a REFUSE. The post-plan verification checks every carrier
+target the same way it checks every annotation target.
+
 **Tombstone rule.** The purge set includes tombstoned edges, so they receive dispositions like
 every other row, but no disposition changes their deletedness. A tombstoned edge is never
 PRESERVEd — the liveness precondition on that disposition is this ADR's, checked here, not a
@@ -280,7 +312,12 @@ therefore takes one of two recorded outcomes, or REFUSE if neither applies:
 
 NAMED-DELETION is available to tombstoned edges only; a live edge with no legal expression is a
 REFUSE, which stops the migration, never a deletion. An annotation targeting a tombstoned edge
-follows the map like any other.
+follows the map, with one restriction the map alone does not express: **a live annotation is never
+re-anchored onto a tombstoned replacement.** Endpoint validation admits only an undeleted row as an
+edge target, so re-anchoring there would write an edge the contract rejects, and a tombstoned
+replacement is by definition deleted. An annotation whose subject takes RECREATE-TOMBSTONED
+therefore has exactly two outcomes, delete or carrier, and a recorded re-anchor disposition on such
+an annotation is a REFUSE.
 
 With those settled, a kind correction:
 
@@ -313,8 +350,10 @@ With those settled, a kind correction:
    `max_closure_rows`, defined as the cardinality of the visited set — every distinct edge id
    and note id the closure holds, counted once each, incident edges included. Its default is
    10,000, a finite value chosen to sit far above any closure a normal correction produces
-   and far below a resource hazard; a caller may raise it per call, and no value disables the
-   bound. When the visited set would exceed it, the walk stops and the migration is refused
+   and far below a resource hazard; a caller may raise it per call up to a hard ceiling of
+   1,000,000 rows that the caller cannot raise or disable, and a requested override above that
+   ceiling is refused as an invalid argument before the walk starts rather than silently clamped.
+   When the visited set would exceed the effective bound, the walk stops and the migration is refused
    before any plan is prepared, reporting the bound and the count reached: annotation chains
    are caller-constructible, so an unbounded walk is a resource hazard, and the failure mode
    is a refused migration, never a truncated closure. All queries are
@@ -370,6 +409,18 @@ With those settled, a kind correction:
       replacement moves its target onto that replacement. These moves run last because their
       targets do not exist before phase 4. A closure member whose subject maps to itself — a
       PRESERVEd edge, or any retained note — needs no move and none is planned for it.
+
+   **Every endpoint field has exactly one owning phase, and the two owners are disjoint by
+   predicate.** Phase 2 owns every field whose stored value is the MIGRATING RECORD's id; phase 5
+   owns every annotation target field whose stored value is a CLOSURE SUBJECT's id that the map
+   sends to a replacement. No field satisfies both, because the migrating record is not a closure
+   subject: it is the record being replaced, and its own annotations re-anchor to the new record
+   under phase 2, not to a replacement under phase 5. An annotation of the migrating record that is
+   itself annotated is therefore a phase-2 move as an incident edge and a phase-5 SUBJECT for the
+   annotation above it, which are different rows and different fields. Where such an annotation is
+   RECREATEd rather than preserved, its replacement is created in phase 4 already carrying the new
+   record as its target, and it is excluded from phase 5, because a row created with the right
+   target has nothing to move.
 
    Every move statement in phases 2 and 5 carries two postconditions: an `AffectedRowGuard`
    requiring exactly one row changed, and an endpoint read-back asserting the moved field now
@@ -478,9 +529,20 @@ this ADR is complete when all of the following hold:
   in the same transaction, the same count Decision 3 step 1 names. All six rows receive dispositions
   before any plan is prepared, because the purge would delete all six. A migration
   prepared from the four-row visible/live enumeration must be refused, and the refusal is
-  the asserted outcome, not a warning. When e3's disposition is PRESERVE, the asserted
-  outcome is that both of its endpoint fields reference the new record and its edge id is
-  unchanged — a self-loop preserved by updating one field is a defect the fixture must catch.
+  the asserted outcome, not a warning. e3 is a legacy self-loop and its asserted outcome is
+  REFUSE: preserving it would put the new record in both endpoint fields, and endpoint validation
+  rejects `source_id == target_id` for every relation as its first check, so the move is rejected
+  rather than written. A run that reports a successful PRESERVE for e3 has found a procedure
+  asserting an outcome its own authorities forbid, which is what this arm exists to catch. e3 is
+  still enumerated and still receives a written disposition; what it does not receive is a plan.
+
+  Because a REFUSE stops the whole migration, this matrix runs as two arms. The ENUMERATION arm
+  uses all six rows and asserts two things: the in-transaction enumeration returns exactly the six
+  ids with e3 counted once, and the migration then refuses on e3 before any plan is prepared, with
+  no row in the store changed. The OUTCOME arm drops e3 and uses the remaining five, so the
+  dispositions, the plan phases, and the post-plan verification below are reachable and asserted.
+  Stating both is what keeps the enumeration assertion and the outcome assertions from silently
+  trading places: a procedure that quietly skipped e3 would pass an outcome-only fixture.
   For e6, the tombstone rule is the asserted outcome, and both of its outcomes are exercised:
   e6 is never PRESERVEd; under RECREATE-TOMBSTONED its replacement row carries the same
   `deleted_at` it had before, and under NAMED-DELETION the map records its named deletion with
@@ -517,10 +579,36 @@ this ADR is complete when all of the following hold:
   names the replacement id; a plan that moves it beside the incident PRESERVE moves fails,
   because the target id names no row at that point. Every move in the plan, incident or closure,
   asserts one affected row and its endpoint read-back.
+- Move ownership across roles: the fixture includes an `annotates` edge whose target IS the
+  migrating record and which is itself the subject of a second annotation, so the same edge is an
+  incident row and a closure subject at once. Run twice. When it is PRESERVEd, the asserted outcome
+  is one move in phase 2 onto the new record, no phase-5 move for that row, and the annotation
+  above it re-anchored in phase 5 to that same unchanged id. When it is RECREATEd, the asserted
+  outcome is that its replacement is created in phase 4 already carrying the new record as its
+  target and is excluded from phase 5, while the annotation above it re-anchors to the replacement.
+  Two moves planned against one field is the defect this arm catches, and the affected-row guard is
+  what reports it.
+- Tombstoned subject with a live annotation: the fixture soft-deletes an incident edge that still
+  carries a live annotation, which the runtime permits. Under RECREATE-TOMBSTONED, the asserted
+  outcome is that the annotation is deleted or moved to a named carrier and is NEVER re-anchored
+  onto the tombstoned replacement; a recorded re-anchor disposition on that annotation refuses the
+  migration before any plan is prepared. An annotation left pointing at a deleted edge is the
+  defect this arm catches.
+- Carrier resolution: two arms. A carrier naming a row inside the purge set whose map entry is a
+  named deletion refuses the migration before any plan is prepared. A carrier naming a row the map
+  sends to a replacement completes, and the post-plan verification asserts the annotation's target
+  equals that replacement's id, not the carrier's original id.
+- Conflicting note dispositions: one note is targeted by two annotations in the closure, one
+  carrying delete-with-note and one carrying re-anchor. The asserted outcome is that the note is
+  RETAINED with an identity entry and the deleting annotation's own edge is still deleted. An
+  outcome where the note is deleted while a surviving annotation still anchors it is the dangling
+  reference this whole procedure exists to prevent.
 - Closure work bound: a fixture whose annotation chain exceeds `max_closure_rows` refuses the
   migration before any plan is prepared, reporting the bound and the count reached; no row in
   the store changes. The paired arm raises the bound for the same fixture and completes, so the
-  refusal is attributable to the bound and not to the chain's shape.
+  refusal is attributable to the bound and not to the chain's shape. A third arm requests an
+  override above the hard ceiling and asserts the call is rejected as an invalid argument before
+  the walk starts — never clamped to the ceiling and run, which would look identical to success.
 - Disposition gate: a fixture edge with no legal expression under the new kind (for example
   `Org contains <record>` migrating to `concept`) causes the migration to stop with a REFUSE
   before any plan is prepared; no row in the store changes.
