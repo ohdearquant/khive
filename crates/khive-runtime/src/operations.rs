@@ -6935,8 +6935,8 @@ mod tests {
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
     }
 
-    /// #2088 regression at the runtime seam, rebuilt deterministic under
-    /// #2089: the previous fixture created edges
+    /// #2088 regression at the runtime seam; this fixture was rebuilt
+    /// deterministically for #2089 because the previous fixture created edges
     /// through the normal `link()` path (random UUIDs, wall-clock
     /// timestamps), so whether it exposed the pre-image bug — sorting the
     /// per-namespace merge by UUID alone, a key unrelated to the
