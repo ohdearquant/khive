@@ -114,6 +114,17 @@ both be unique; one invalid entry makes the entire catalog unavailable. The cata
 sorted by analysis ID and exposes only those two public fields. It does not scan the
 analysis root or read a report.
 
+A repository URL is normalized before it is compared or stored, and normalization is
+deliberately strict about what a path segment may contain. A segment must survive a
+re-parse of the canonical URL unchanged, which rejects any character that is structural
+in a URL path — an encoded `/`, `\`, `?` or `#` — however many layers of encoding it
+arrives under. As a consequence a **literal percent in a repository name is refused**,
+because the canonical form joins decoded segments without re-encoding them and a bare `%`
+is ambiguous under that join. No major forge permits `%` in a repository name, so this
+costs nothing in practice, and it keeps the rule statable: no literal percent. A URL that
+is validly encoded but does not normalize to a stable value — a doubled `.git` suffix, for
+instance — is refused separately, and says so.
+
 The default page consumes this catalog before resolving its initial `repo=` location.
 Configured entries appear in **Repository analysis** and resolve to their opaque report
 route. The browser accepts only the exact bounded v1 envelope. A catalog 404 means
