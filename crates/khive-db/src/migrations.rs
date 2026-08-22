@@ -472,16 +472,34 @@ fn require_legacy_attachment_fences(conn: &Connection) -> Result<(), SqliteError
     Ok(())
 }
 
+// length() and GLOB both stop scanning at an embedded NUL, so a value of 64
+// hex characters followed by a NUL and arbitrary trailing bytes would pass
+// both. Deriving the canonical byte width from the connection's own text
+// encoding (rather than assuming UTF-8) keeps this arm correct on a database
+// pinned to UTF-16 and fails closed if the probe returns something else,
+// matching the pattern already used by `validate_blob_gc_evidence`.
+fn canonical_content_ref_byte_width(conn: &Connection) -> Result<i64, SqliteError> {
+    let width: i64 = conn.query_row("SELECT length(CAST('x' AS BLOB))", [], |row| row.get(0))?;
+    if !(1..=4).contains(&width) {
+        return Err(SqliteError::InvalidData(format!(
+            "the text-encoding width probe returned {width}; refusing canonicality validation"
+        )));
+    }
+    Ok(width * 64)
+}
+
 fn validate_canonical_legacy_refs(conn: &Connection) -> Result<(), SqliteError> {
+    let canonical_bytes = canonical_content_ref_byte_width(conn)?;
     let invalid: Option<String> = conn
         .query_row(
             "SELECT id FROM entities \
              WHERE content_ref IS NOT NULL \
                AND (typeof(content_ref) <> 'text' \
                  OR length(content_ref) <> 64 \
+                 OR length(CAST(content_ref AS BLOB)) <> ?1 \
                  OR content_ref GLOB '*[^0-9a-f]*') \
              LIMIT 1",
-            [],
+            [canonical_bytes],
             |row| row.get(0),
         )
         .optional()?;
@@ -494,6 +512,7 @@ fn validate_canonical_legacy_refs(conn: &Connection) -> Result<(), SqliteError> 
 }
 
 fn validate_canonical_attachment_and_claim_refs(conn: &Connection) -> Result<(), SqliteError> {
+    let canonical_bytes = canonical_content_ref_byte_width(conn)?;
     for (table, identity) in [
         ("attachments", "record_uuid"),
         ("blob_gc_claims", "root_key"),
@@ -502,10 +521,13 @@ fn validate_canonical_attachment_and_claim_refs(conn: &Connection) -> Result<(),
             "SELECT {identity} FROM {table} \
              WHERE typeof(content_ref) <> 'text' \
                 OR length(content_ref) <> 64 \
+                OR length(CAST(content_ref AS BLOB)) <> ?1 \
                 OR content_ref GLOB '*[^0-9a-f]*' \
              LIMIT 1"
         );
-        let invalid: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).optional()?;
+        let invalid: Option<String> = conn
+            .query_row(&sql, [canonical_bytes], |row| row.get(0))
+            .optional()?;
         if let Some(owner) = invalid {
             return Err(SqliteError::InvalidData(format!(
                 "{table}.content_ref for {identity} {owner:?} is not canonical"

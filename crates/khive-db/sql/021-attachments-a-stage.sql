@@ -13,6 +13,14 @@ CREATE TABLE IF NOT EXISTS attachments (
         CHECK (
             length(content_ref) = 64
             AND content_ref NOT GLOB '*[^0-9a-f]*'
+            -- length() and GLOB both stop scanning at an embedded NUL, so a
+            -- value of 64 hex characters followed by a NUL and arbitrary
+            -- trailing bytes would otherwise satisfy both arms above. This
+            -- blob-cast comparison scales with the database's text encoding
+            -- (64 bytes in UTF-8, 128 in UTF-16) and a NUL-tailed value's
+            -- blob cast keeps its full byte tail, so it diverges and fails.
+            AND length(CAST(content_ref AS BLOB))
+                = length(CAST('0000000000000000000000000000000000000000000000000000000000000000' AS BLOB))
         ),
     media_type  TEXT,
     size_bytes  INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0),

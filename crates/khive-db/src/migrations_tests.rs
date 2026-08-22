@@ -5,6 +5,30 @@ fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")
 }
 
+/// SQLite fixes the text encoding when the database is first initialized;
+/// creating (and dropping) a table under the pragma leaves an initialized
+/// UTF-16LE database that every later statement on this connection inherits.
+fn open_memory_utf16le() -> Connection {
+    let conn = Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch(
+        "PRAGMA encoding = 'UTF-16le'; \
+         CREATE TABLE __encoding_pin (x INTEGER); \
+         DROP TABLE __encoding_pin;",
+    )
+    .expect("pin utf-16le encoding");
+    conn
+}
+
+/// `length()` and `GLOB` both stop scanning at an embedded NUL, so 64 hex
+/// characters followed by a NUL and trailing bytes passes the character-only
+/// arms while still being 66+ bytes on the wire.
+fn nul_embedded_canonical_ref() -> String {
+    let mut polluted = "a".repeat(64);
+    polluted.push('\0');
+    polluted.push_str("zz");
+    polluted
+}
+
 fn migrate_through(conn: &mut Connection, through_version: u32) {
     conn.execute_batch(MIGRATION_TRACKING_TABLE)
         .expect("create migration ledger");
@@ -2486,6 +2510,141 @@ fn v21_stage_rejects_invalid_refs_without_partial_schema_or_marker() {
     );
     assert!(!table_exists(&conn, "attachment_cutover_state"));
     assert!(column_exists(&conn, "entities", "content_ref"));
+}
+
+/// Reddens the `021-attachments-a-stage.sql` table CHECK if the byte-length
+/// arm is reverted: a 64-hex + NUL + tail value must still violate the CHECK
+/// on a direct INSERT into `attachments`.
+#[test]
+fn v21_attachments_check_rejects_a_nul_embedded_content_ref() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    stage_attachment_cutover(&mut conn).unwrap();
+
+    let error = conn
+        .execute(
+            "INSERT INTO attachments \
+             (record_uuid, substrate, role, content_ref, created_at) \
+             VALUES ('doc', 'entity', 'nul-probe', ?1, 1)",
+            rusqlite::params![nul_embedded_canonical_ref()],
+        )
+        .expect_err("a NUL-embedded content_ref must violate the attachments CHECK constraint");
+    assert!(
+        error.to_string().to_lowercase().contains("check"),
+        "expected a CHECK constraint violation, got {error}"
+    );
+}
+
+/// Reddens `validate_canonical_legacy_refs` if its byte-length arm is
+/// reverted: entities.content_ref carries no CHECK of its own, so a
+/// NUL-tailed value is only caught by the migration validator.
+#[test]
+fn v21_stage_rejects_a_nul_embedded_legacy_content_ref() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('bad', 'local', 'document', 'bad', '[]', 1, 1, ?1)",
+        rusqlite::params![nul_embedded_canonical_ref()],
+    )
+    .unwrap();
+
+    let error = stage_attachment_cutover(&mut conn)
+        .expect_err("a NUL-embedded legacy content_ref must fail the coordinated stage");
+    assert!(
+        error.to_string().contains("canonical"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(read_schema_version(&conn).unwrap(), 20);
+    assert!(
+        !table_exists(&conn, "attachments"),
+        "failed stage must roll back DDL"
+    );
+}
+
+/// Reddens `validate_canonical_attachment_and_claim_refs` if its byte-length
+/// arm is reverted: `blob_gc_claims` carries no CHECK of its own, so a
+/// NUL-tailed value is only caught by the migration validator.
+#[test]
+fn v21_stage_rejects_a_nul_embedded_blob_gc_claim_ref() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) VALUES ('abandoned', ?1, 1)",
+        rusqlite::params![nul_embedded_canonical_ref()],
+    )
+    .unwrap();
+
+    let error = stage_attachment_cutover(&mut conn)
+        .expect_err("a NUL-embedded blob_gc_claims ref must fail the coordinated stage");
+    let message = error.to_string();
+    assert!(
+        message.contains("blob_gc_claims") && message.contains("canonical"),
+        "unexpected error: {message}"
+    );
+    assert_eq!(read_schema_version(&conn).unwrap(), 20);
+}
+
+/// A fixed bytes=64 arm would reject every valid 64-char ref in a UTF-16LE
+/// database (128 bytes), so this proves the width-derived arm is
+/// encoding-neutral rather than a hardcoded 64.
+#[test]
+fn v21_stage_accepts_a_valid_ref_in_a_utf16le_database() {
+    let mut conn = open_memory_utf16le();
+    let encoding: String = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        encoding, "UTF-16le",
+        "the fixture database must actually be UTF-16le"
+    );
+
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('doc', 'local', 'document', 'doc', '[]', 1, 1, ?1)",
+        rusqlite::params!["a".repeat(64)],
+    )
+    .unwrap();
+
+    stage_attachment_cutover(&mut conn)
+        .expect("a valid canonical ref must pass the width-derived CHECK in a UTF-16LE database");
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Incomplete
+    );
+}
+
+/// The NUL arm must stay red in UTF-16 as well: 64 chars + NUL + tail is
+/// 130+ bytes against the expected 128.
+#[test]
+fn v21_stage_rejects_a_nul_embedded_ref_in_a_utf16le_database() {
+    let mut conn = open_memory_utf16le();
+    let encoding: String = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        encoding, "UTF-16le",
+        "the fixture database must actually be UTF-16le"
+    );
+
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('bad', 'local', 'document', 'bad', '[]', 1, 1, ?1)",
+        rusqlite::params![nul_embedded_canonical_ref()],
+    )
+    .unwrap();
+
+    let error = stage_attachment_cutover(&mut conn)
+        .expect_err("a NUL-embedded ref must stay rejected in a UTF-16LE database");
+    assert!(
+        error.to_string().contains("canonical"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

@@ -4296,6 +4296,14 @@ mod tests {
         {
             let mut writer = backend.pool().writer().unwrap();
             prepare_completed_v21_gc_fixture(writer.conn_mut());
+            // The table CHECK now rejects a NUL-embedded ref at admission
+            // time; bypass it to simulate a row that reached this state some
+            // other way (e.g. a pre-fix legacy row) and prove the validator
+            // is still defense-in-depth against it.
+            writer
+                .conn_mut()
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
             writer
                 .conn_mut()
                 .execute(
@@ -4304,7 +4312,11 @@ mod tests {
                      VALUES ('nul-attachment-id', 'entity', 'content', ?1, 0)",
                     rusqlite::params![nul_embedded_canonical_ref()],
                 )
-                .expect("the schema CHECK is NUL-blind, so this row must insert");
+                .expect("ignore_check_constraints must allow the corrupt row to insert");
+            writer
+                .conn_mut()
+                .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .unwrap();
         }
 
         let sql = backend.sql();
