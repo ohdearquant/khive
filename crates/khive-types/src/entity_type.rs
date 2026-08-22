@@ -18,8 +18,11 @@ use crate::entity::EntityKind;
 /// collapsed to a single `_` → leading/trailing `_` stripped.
 ///
 /// This implements the ADR-001:106 write-time normalisation step that precedes
-/// alias resolution.
-fn to_snake_case(s: &str) -> String {
+/// alias resolution. `pub` (not `pub(crate)`) so callers outside this crate —
+/// e.g. `khive-pack-kg`'s alias-substitution reporting — can compare a raw
+/// value against this SAME cosmetic normalisation instead of maintaining a
+/// separate, drift-prone copy of the rule.
+pub fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_sep = true; // treat start as separator so leading _ are stripped
     for ch in s.chars() {

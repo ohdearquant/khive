@@ -245,6 +245,150 @@ async fn create_entity_alias_paper_normalizes_to_document() {
     );
 }
 
+// entity_type alias resolution (e.g. the built-in `method` -> `function`
+// mapping, ADR-085) is deliberate — but it must never be invisible. A caller
+// who wrote `method` must see `function` come back, not silently get data
+// they didn't write.
+#[tokio::test]
+async fn create_entity_type_alias_method_normalizes_and_is_echoed() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Tokenizer.encode",
+                "entity_kind": "concept",
+                "entity_type": "method",
+            }),
+        )
+        .await
+        .expect("entity_type alias 'method' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("function"),
+        "stored entity_type must be the canonical 'function'; got: {result}"
+    );
+    let applied = result.get("entity_type_normalized").unwrap_or_else(|| {
+        panic!("response must echo the applied alias substitution; got: {result}")
+    });
+    assert_eq!(
+        applied.get("requested").and_then(Value::as_str),
+        Some("method"),
+        "echoed normalization must name what the caller requested; got: {applied}"
+    );
+    assert_eq!(
+        applied.get("stored").and_then(Value::as_str),
+        Some("function"),
+        "echoed normalization must name what was actually stored; got: {applied}"
+    );
+}
+
+// A cosmetic-only difference (case/hyphen/space folding to the SAME word)
+// must not be flagged as an alias substitution — only a genuine word
+// substitution (a different registered alias) counts.
+#[tokio::test]
+async fn create_entity_type_case_only_difference_is_not_flagged_as_normalized() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Some Algorithm",
+                "entity_kind": "concept",
+                "entity_type": "Algorithm",
+            }),
+        )
+        .await
+        .expect("entity_type 'Algorithm' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("algorithm")
+    );
+    assert!(
+        result.get("entity_type_normalized").is_none(),
+        "case-only folding must not be reported as an alias substitution; got: {result}"
+    );
+}
+
+// Repeated, leading, and trailing separators (space/hyphen/underscore) are
+// cosmetic — same word as the canonical registry entry once collapsed and
+// stripped — and must not be flagged as an alias substitution either. This
+// pins the fix for `normalize_for_comparison` diverging from the registry's
+// own `to_snake_case`: a naive space/hyphen-only substitution turns
+// "--Algorithm__" into "__algorithm__" (never collapsing or stripping), which
+// then compares unequal to the stored "algorithm" and misreports a purely
+// cosmetic normalization as a genuine alias substitution.
+#[tokio::test]
+async fn create_entity_type_repeated_leading_trailing_separators_are_not_flagged_as_normalized() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Some Other Algorithm",
+                "entity_kind": "concept",
+                "entity_type": "--Algorithm__",
+            }),
+        )
+        .await
+        .expect("entity_type '--Algorithm__' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("algorithm")
+    );
+    assert!(
+        result.get("entity_type_normalized").is_none(),
+        "repeated/leading/trailing separator folding must not be reported as an alias \
+         substitution; got: {result}"
+    );
+}
+
+// Bulk create must surface the same alias visibility even when `verbose` is
+// left at its default `false` — the atomic-path summary response is the
+// only place a non-verbose bulk caller ever sees the applied entity_type.
+#[tokio::test]
+async fn create_bulk_entity_type_alias_echoed_without_verbose() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "BulkMethod", "entity_type": "method"},
+                    {"kind": "concept", "name": "BulkPlain"},
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create must succeed");
+    assert_eq!(result.get("created").and_then(Value::as_u64), Some(2));
+    let normalized = result
+        .get("entity_type_normalized")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "bulk response must echo entity_type aliasing even without verbose; got: {result}"
+            )
+        });
+    assert_eq!(
+        normalized.len(),
+        1,
+        "only the 'method' item aliased; got: {result}"
+    );
+    assert_eq!(normalized[0].get("index").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        normalized[0].get("requested").and_then(Value::as_str),
+        Some("method")
+    );
+    assert_eq!(
+        normalized[0].get("stored").and_then(Value::as_str),
+        Some("function")
+    );
+}
+
 #[tokio::test]
 async fn create_entity_invalid_kind_gadget_returns_invalid_input_with_valid_list() {
     let pack = pack();
@@ -5238,6 +5382,7 @@ static FAKE_SUBHANDLER_HANDLERS: [HandlerDef; 2] = [
             param_type: "string",
             required: false,
             description: "Internal embedding input.",
+            resolution_mode: khive_types::IdResolutionMode::NotApplicable,
         }],
     },
 ];

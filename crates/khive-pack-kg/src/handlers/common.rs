@@ -91,6 +91,42 @@ pub(crate) fn validate_entity_type(
     Ok(resolved.entity_type)
 }
 
+/// Collapse case and separator-style differences (space/hyphen/underscore,
+/// including repeated and leading/trailing separators) so cosmetic
+/// formatting doesn't get flagged as an alias substitution below.
+///
+/// Delegates to the registry's own `to_snake_case` — the exact normalisation
+/// `validate_entity_type`'s `resolve()` call applies before alias lookup —
+/// instead of a hand-rolled copy that can drift from it (e.g. a naive
+/// space/hyphen substitution that doesn't collapse `--algorithm__` down to
+/// `algorithm`, which then misreports a purely cosmetic normalisation as an
+/// alias substitution).
+fn normalize_for_comparison(s: &str) -> String {
+    khive_types::to_snake_case(s.trim())
+}
+
+/// Describe an `entity_type` alias resolution when the resolved value is a
+/// genuinely different word than what the caller wrote (e.g. the built-in
+/// `method` -> `function` alias), as opposed to a mere case/separator
+/// normalization of the same word (e.g. `Blog-Post` -> `blog_post`).
+///
+/// `validate_entity_type`'s alias table is deliberate (ADR-085 code
+/// subtypes, model/model_family, etc.) — the defect this guards against is
+/// not that a substitution happens, but that it happened invisibly: a
+/// caller who wrote `method` and never saw `function` come back has no way
+/// to know their data was rewritten. Callers embed this in the `create`
+/// response so the applied substitution is always visible.
+pub(crate) fn describe_entity_type_normalization(
+    raw: Option<&str>,
+    resolved: Option<&str>,
+) -> Option<Value> {
+    let (raw, resolved) = (raw?, resolved?);
+    if normalize_for_comparison(raw) == resolved {
+        return None;
+    }
+    Some(json!({"requested": raw, "stored": resolved}))
+}
+
 // ---- Granular `kind` discriminator ----
 
 /// Resolved shape of a `kind` discriminator string: which substrate (entity, note,

@@ -4404,6 +4404,7 @@ mod tests {
                 param_type: "string",
                 required: true,
                 description: "distinguishes reports in one request group",
+                resolution_mode: khive_types::IdResolutionMode::NotApplicable,
             }],
         }];
     }

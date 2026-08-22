@@ -115,11 +115,11 @@ pub use operations::{
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
-    InterceptedDispatchResult, KindHook, NoteKindSpec, NoteLifecycleSpec, PackByIdResolver,
-    PackFactory, PackInstall, PackLoadError, PackRegistration, PackRegistry, PackRuntime,
-    PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity, SchemaPlan, VerbCategory,
-    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
-    AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
+    IdResolutionMode, InterceptedDispatchResult, KindHook, NoteKindSpec, NoteLifecycleSpec,
+    PackByIdResolver, PackFactory, PackInstall, PackLoadError, PackRegistration, PackRegistry,
+    PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity, SchemaPlan,
+    VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
+    Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};

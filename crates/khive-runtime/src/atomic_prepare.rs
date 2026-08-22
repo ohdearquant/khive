@@ -70,10 +70,28 @@ fn require_str<'a>(args: &'a Value, key: &str) -> RuntimeResult<&'a str> {
         .ok_or_else(|| RuntimeError::InvalidInput(format!("missing required field {key:?}")))
 }
 
+/// Parse `key` as a bare UUID — never a short hex prefix.
+///
+/// A short prefix is a *resolution*: an unfiltered search that applies no
+/// namespace predicate, so it can match nothing, match exactly one record
+/// across every namespace, or match ambiguously. That search already
+/// happened upstream, at the `kkernel` CLI boundary that has namespace
+/// context and calls `resolve_uuid_unfiltered` before handing args down to
+/// this module
+/// (`crates/kkernel/src/atomic_apply.rs::resolve_kg_ids_in_args`). By the
+/// time an id reaches this plan-preparation stage it must already name one
+/// specific, already-identified record — which is exactly what a full UUID
+/// demonstrates and a prefix does not.
 fn require_uuid(args: &Value, key: &str) -> RuntimeResult<Uuid> {
     let raw = require_str(args, key)?;
-    Uuid::parse_str(raw)
-        .map_err(|_| RuntimeError::InvalidInput(format!("{key} must be a full UUID; got {raw:?}")))
+    Uuid::parse_str(raw).map_err(|_| {
+        RuntimeError::InvalidInput(format!(
+            "{key} must be a full UUID; got {raw:?}. This atomic-plan stage consumes an \
+             already-resolved record and performs no namespace-scoped search of its own, so a \
+             short hex prefix cannot be resolved here — resolve it to a full UUID first (e.g. \
+             via `get`) and pass that."
+        ))
+    })
 }
 
 fn optional_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -1764,6 +1782,42 @@ mod tests {
             .await
             .expect("get_entity");
         assert_eq!(entity.name, "GapFourEntity-renamed");
+    }
+
+    /// The `--atomic` seam intentionally requires a full UUID (never a short
+    /// hex prefix) for its `id` fields — prefix resolution already happened
+    /// upstream, at the kkernel CLI boundary that has namespace context
+    /// (`resolve_kg_ids_in_args`). The rejection message must say *why* a
+    /// prefix cannot be resolved at this stage, not just restate that a full
+    /// UUID is required.
+    #[tokio::test]
+    async fn atomic_update_short_prefix_id_rejected_with_namespace_explanation() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": "deadbeef", "name": "whatever"}),
+            None,
+        )
+        .await
+        .expect_err("a short hex prefix must be rejected by the atomic-plan seam");
+        let msg = match err {
+            RuntimeError::InvalidInput(ref msg) => msg.clone(),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        };
+        assert!(
+            msg.contains("full UUID"),
+            "message must still state the rule; got: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("namespace"),
+            "message must explain the namespace-scoping consequence, not just restate the \
+             rule; got: {msg}"
+        );
     }
 
     /// Symmetric note-substrate case: `description` and `tags` are
