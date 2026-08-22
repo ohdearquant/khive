@@ -116,6 +116,29 @@ describe("repository showcase", () => {
     expect(pushState).toHaveBeenCalledTimes(2);
     await waitFor(() => expect(inspector).toHaveFocus());
     expect(scrollIntoView).toHaveBeenCalled();
+
+    // An unresolved history restore must not move focus or scroll: the inspector
+    // has no restored module to show, so yanking focus there would strand the user.
+    scrollIntoView.mockClear();
+    inspector.blur();
+    expect(inspector).not.toHaveFocus();
+    const unresolvedRestore = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: "crates/not-captured/src/missing.rs",
+      view: "dependency_topology",
+    });
+    window.history.replaceState(null, "", unresolvedRestore);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("status", { name: "Investigation navigation" }),
+      ).toHaveTextContent(
+        `Restored ${bundle.capability.views.dependency_topology.label} for unresolved module crates/not-captured/src/missing.rs.`,
+      )
+    );
+    expect(inspector).not.toHaveFocus();
+    expect(scrollIntoView).not.toHaveBeenCalled();
     // Measured ~1.1-2.2s locally for this golden-fixture, multi-navigation flow; full-suite
     // CPU contention pushed it past the default 5s timeout, so this needs headroom.
   }, 20_000);

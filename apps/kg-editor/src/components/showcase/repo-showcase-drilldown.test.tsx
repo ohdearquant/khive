@@ -257,17 +257,15 @@ describe("repository showcase analysis drilldown", () => {
       const panel = container.querySelector<HTMLElement>(".repo-view-panel")!;
       const missing = panel.querySelector<HTMLElement>(
         `[data-missing-module-id="${missingId}"]`,
-      );
+      )!;
       expect(missing).toHaveTextContent(expectedReason);
       expect(
         panel.querySelector(`[data-module-id="${missingId}"]`),
       ).not.toBeInTheDocument();
-      expect(within(panel).queryByRole("button", {
-        name: `Inspect ${missingId}`,
-      })).not.toBeInTheDocument();
-      expect(within(panel).queryByRole("link", {
-        name: `Inspect ${missingId}`,
-      })).not.toBeInTheDocument();
+      const missingRow = missing.closest("tr")!;
+      expect(missingRow).toBeInTheDocument();
+      expect(within(missingRow).queryAllByRole("button")).toHaveLength(0);
+      expect(within(missingRow).queryAllByRole("link")).toHaveLength(0);
     },
   );
 
