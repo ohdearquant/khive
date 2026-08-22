@@ -1,5 +1,5 @@
 import type { ViewId } from "@/lib/repo-bundle";
-import { normalizeRepositoryUrl } from "@/lib/showcase-registry";
+import { normalizeRepositoryUrl, REPOSITORY_URL_LIMIT } from "@/lib/showcase-registry";
 
 export const REPOSITORY_VIEW_IDS = [
   "structure_graph",
@@ -18,7 +18,6 @@ const LOCATION_PARAMETERS = ["repo", "at", "module", "view"] as const;
 const VIEW_IDS = new Set<string>(REPOSITORY_VIEW_IDS);
 const SNAPSHOT_SHA = /^[0-9a-f]{40}$/;
 const MODULE_PATH_LIMIT = 1_024;
-const REPOSITORY_URL_LIMIT = 2_048;
 
 type LocationParameter = (typeof LOCATION_PARAMETERS)[number];
 

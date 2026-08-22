@@ -139,6 +139,18 @@ describe("showcase analysis catalog", () => {
     })).toThrow(/catalog/i);
   });
 
+  it("rejects a single entry whose canonical URL exceeds the repository length limit", () => {
+    expect(() => parseShowcaseAnalysisCatalog({
+      schema_version: "khive.showcase.catalog.v1",
+      entries: [
+        {
+          analysis_id: "analysis-overlong",
+          canonical_url: `https://github.com/example/${"r".repeat(3000)}`,
+        },
+      ],
+    })).toThrow(/catalog/i);
+  });
+
   it("rejects an empty successful catalog instead of treating it as unconfigured", () => {
     expect(() => parseShowcaseAnalysisCatalog({
       schema_version: "khive.showcase.catalog.v1",

@@ -27,6 +27,8 @@ export const SHOWCASE_REGISTRY: readonly ShowcaseRegistryEntry[] = [
   },
 ] as const;
 
+export const REPOSITORY_URL_LIMIT = 2_048;
+
 export function normalizeRepositoryUrl(input: string):
   | Readonly<{ ok: true; value: string }>
   | Readonly<{ ok: false; reason: string }> {
@@ -75,7 +77,18 @@ export function normalizeRepositoryUrl(input: string):
 
   const host = url.hostname.toLowerCase() === "www.github.com" ? "github.com" : url.hostname.toLowerCase();
   const authority = url.port ? `${host}:${url.port}` : host;
-  return { ok: true, value: `https://${authority}/${segments.join("/")}` };
+  const value = `https://${authority}/${segments.join("/")}`;
+  // The bound is on the CANONICAL value rather than the input, because the
+  // canonical form is what every consumer stores: the browser history entry,
+  // the client catalog, and the server configuration. Bounding the input
+  // instead would reject a long-but-legitimate URL whose query and fragment
+  // are discarded here anyway. Callers that validate a value on the way IN
+  // apply this same limit, so the writer can no longer store a value the
+  // reader would refuse.
+  if (value.length > REPOSITORY_URL_LIMIT) {
+    return { ok: false, reason: "The repository URL is too long." };
+  }
+  return { ok: true, value };
 }
 
 export function resolveShowcaseRepository(

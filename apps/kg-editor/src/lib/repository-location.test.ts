@@ -312,6 +312,39 @@ describe("repository investigation location", () => {
     expect(url.href).not.toContain("SECRET");
   });
 
+  it("omits a repository value whose canonical form exceeds the length the reader enforces", () => {
+    const overlong = `https://github.com/example/${"r".repeat(3000)}`;
+    const url = repositoryLocationUrl(
+      new URL("https://example.test/"),
+      {
+        repository: overlong,
+        snapshotSha: null,
+        modulePath: null,
+        view: null,
+      },
+    );
+
+    expect(url.searchParams.has("repo")).toBe(false);
+    expect(url.href.length).toBeLessThan(overlong.length);
+  });
+
+  it("agrees with the reader about which repository values are too long", () => {
+    const overlong = `https://github.com/example/${"r".repeat(3000)}`;
+    const written = repositoryLocationUrl(new URL("https://example.test/"), {
+      repository: overlong,
+      snapshotSha: null,
+      modulePath: null,
+      view: null,
+    });
+    const read = parseRepositoryLocation(
+      new URL(`https://example.test/?repo=${encodeURIComponent(overlong)}`),
+    );
+
+    expect(written.searchParams.has("repo")).toBe(false);
+    expect(read.location.repository).toBeNull();
+    expect(read.issues.map((issue) => issue.parameter)).toContain("repo");
+  });
+
   it("still round-trips a valid repository URL to its canonical form", () => {
     const url = repositoryLocationUrl(
       new URL("https://example.test/"),
