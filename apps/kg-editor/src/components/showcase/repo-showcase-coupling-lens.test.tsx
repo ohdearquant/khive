@@ -69,6 +69,20 @@ describe("repository showcase hidden-coupling lens", () => {
     );
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(2);
 
+    const structureEdgeIds = new Set(
+      bundle.graph.structure_edges.items.map((edge) => edge.id),
+    );
+    for (const call of settleGraphLayoutSpy.mock.calls) {
+      const layoutEdges = call[1] as readonly { id: string }[];
+      expect(layoutEdges.length).toBeGreaterThan(0);
+      for (const edge of layoutEdges) {
+        expect(
+          edge.id.startsWith("contains-") || structureEdgeIds.has(edge.id),
+          `layout edge ${edge.id} is not a structure edge`,
+        ).toBe(true);
+      }
+    }
+
     const sampleNode = container.querySelector<HTMLElement>(
       ".repo-graph-node[data-node-id]",
     )!;
