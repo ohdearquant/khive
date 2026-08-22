@@ -3,6 +3,11 @@
 **Status**: accepted\
 **Date**: 2026-05-22\
 **Authors**: khive maintainers
+**Amended 2026-08-21 ([ADR-167](ADR-167-service-provenance-and-kind-classification.md))**:
+step 5 of the classification decision tree gains a record-observable service/concept
+sub-procedure with a mandatory split for records naming both a technique and a deployment
+of it, and step 9 gains a question-note requirement for records carrying deployment
+vocabulary without an instance identifier. See "Service/concept tie-break" below.
 
 ## Context
 
@@ -64,16 +69,16 @@ pub enum EntityKind {
 }
 ```
 
-| Kind         | What it covers                                                                  |
-| ------------ | ------------------------------------------------------------------------------- |
-| **Concept**  | Algorithms, techniques, architectures, theories, models, research gaps, metrics |
-| **Document** | Papers, preprints, reports, blog posts, books, specifications, theses           |
-| **Dataset**  | Benchmarks, corpora, evaluation sets, training sets                             |
-| **Project**  | Codebases, libraries, tools, frameworks, applications, repositories             |
-| **Person**   | Researchers, engineers, authors                                                 |
-| **Org**      | Labs, companies, institutions, consortia, standards bodies                      |
-| **Artifact** | Generated/versioned state: checkpoints, snapshots, profiles, embedding indexes  |
-| **Service**  | Running operational instances: inference engines, deployed APIs, MCP servers    |
+| Kind         | What it covers                                                                     |
+| ------------ | ---------------------------------------------------------------------------------- |
+| **Concept**  | Algorithms, techniques, architectures, theories, models, research gaps, metrics    |
+| **Document** | Papers, preprints, reports, blog posts, books, specifications, theses              |
+| **Dataset**  | Benchmarks, corpora, evaluation sets, training sets                                |
+| **Project**  | Codebases, libraries, tools, frameworks, applications, repositories                |
+| **Person**   | Researchers, engineers, authors                                                    |
+| **Org**      | Labs, companies, institutions, consortia, standards bodies                         |
+| **Artifact** | Generated/versioned state: checkpoints, snapshots, profiles, embedding indexes     |
+| **Service**  | Deployed or deployable operational instances: inference engines, APIs, MCP servers |
 
 `Concept` remains the default / residual bucket.
 
@@ -204,8 +209,10 @@ that accept a `kind` parameter.
 4. Is it a curated collection of examples/records for training, evaluation, or benchmarking?
    → Dataset
 
-5. Is it a running operational instance with endpoint, health, deployment state, or latency?
-   → Service
+5. Does the record identify a specific deployed or deployable instance (see the
+   service/concept tie-break below)?
+   → Service — or a mandatory two-record split when the record also names the
+     technique the instance embodies
 
 6. Is it a codebase, library, framework, tool, application, or repository?
    → Project
@@ -218,21 +225,90 @@ that accept a `kind` parameter.
    → Concept
 
 9. If still uncertain:
-   → Concept (with entity_type if known)
+   → Concept (with entity_type if known); if the record mentions deployment
+     vocabulary without an instance identifier, also record the open
+     classification question as a note annotating the record
 ```
+
+### Service/concept tie-break (2026-08-21 amendment, [ADR-167](ADR-167-service-provenance-and-kind-classification.md))
+
+Step 5 is evaluated as a sub-procedure over two predicates, each decidable from the record
+being written — its name, description, `entity_type`, and properties — with no reference to
+the writer's state of mind or to the world at write time:
+
+- **Instance evidence (D)**: the record identifies a specific deployed or deployable
+  instance — its fields name at least one instance identifier, each a concrete referent
+  stated in the record: an endpoint or address; a named deployment surface (a specific
+  host, region, or cluster); a named operator; or an operational state or state history
+  carried in the record's property fields and tied to a named instance referent. An
+  operational-state entry qualifies only when the referent it describes is named: either
+  the entry itself names the endpoint, deployment surface, or operator whose state it
+  records (an incident record naming the affected host, a dated transition naming the
+  endpoint that changed state), or the record carries one of those referents in another
+  field. Accepted operational-state properties are those describing run state — health,
+  availability, incidents, deployment transitions (keys such as `health`, `availability`,
+  `last_incident`, `deployed_at`); the discriminator is the named referent, not the key
+  spelling. A bare lifecycle `status` value drawn from the core status vocabulary
+  (`concept`, `researched`, `prototyped`, `implemented`, `shipped`, `deprecated`), or any
+  status field with no named instance referent beside it, records the maturity of a
+  codebase or idea, is not an instance identifier, and does not satisfy D. Bare
+  deployment or liveness vocabulary in name or description prose — `deployed`, `running`,
+  `live`, `in production`, `down` and the like, with no concrete referent beside it — is
+  likewise not an instance identifier and does not satisfy D; that is exactly the
+  question-note trigger's case below. Whether the instance is up at write
+  time is not consulted: a deployable system between deployments still satisfies D when
+  the record names such an identifier. Fields that identify only a codebase (repository,
+  package, crate, source language) are step 6 evidence, not instance identifiers — a
+  record carrying only codebase identity does not satisfy D and continues to step 6,
+  where it classifies `Project`.
+- **Technique identity (T)** — evaluated only when D holds: the record's own text names a
+  technique as its referent. T holds exactly when the record's `entity_type` is one of
+  `Concept`'s canonical subtypes (the "Initial canonical subtypes" table above), or its name or
+  description names the referent with one of step 8's own designators (`idea`, `method`,
+  `algorithm`, `theory`, `architecture`, `research gap`, `metric`) or with a `Concept`
+  canonical-subtype name — the designating word present in the record's text. Both arms
+  reuse vocabulary this ADR already owns; no new designator list is minted. T is a vocabulary-presence test on the record's own
+  fields — the same instrument as step 9's question-note trigger — never an inference about
+  what the prose "really" means.
+
+The sub-procedure:
+
+1. If D does not hold, step 5 does not fire; continue to step 6. A pure technique reaches
+   step 8 and classifies `Concept` exactly as before this amendment.
+2. If D holds and T does not, classify `Service`.
+3. If D and T both hold, **the split is mandatory**: create two records, a `Concept`
+   naming the technique and a `Service` naming the deployment, joined by
+   `Service instance_of Concept`. Classifying the single record as either kind alone is
+   out of contract; the record naming two things is the evidence that there are two things.
+
+The three arms are mutually exclusive by construction (they partition on D, then on T), so
+first-match ordering cannot mask an arm. Step 9's uncertainty default is unchanged; the
+amendment adds only the question-note requirement stated in the tree, whose trigger — the
+record mentions deployment vocabulary but carries no instance identifier — is likewise read
+off the record itself, so the classification stays revisitable instead of silently settled.
+
+Two boundary fixtures pin the narrowed operational-state disjunct:
+
+- A repository record carrying `status: "shipped"` alongside only codebase identity
+  (repository, crate, language) does not satisfy D — the status value names no instance
+  referent — so step 5 does not fire and the record classifies `Project` at step 6.
+- A record naming `api.example.com` as its endpoint, with `health: "down"` and
+  `last_incident: 2026-08-14` in its properties, satisfies D — operational state tied to
+  a named endpoint — and classifies `Service` even though the instance is down at write
+  time.
 
 ### Signal table
 
-| Kind         | Strong positive signals                                               | Do NOT use when                                              |
-| ------------ | --------------------------------------------------------------------- | ------------------------------------------------------------ |
-| **Concept**  | abstract idea, method, theory, algorithm, architecture, gap, metric   | concrete document, dataset, codebase, service, or gen. state |
-| **Document** | title, authors, DOI, arXiv, publication venue, spec, report           | generated state or raw dataset                               |
-| **Dataset**  | examples, records, benchmark, corpus, train/eval/test split           | vectorized/generated index or checkpoint                     |
-| **Project**  | repo, package, crate, library, framework, source code, language       | running endpoint or deployed instance                        |
-| **Artifact** | generated, checkpointed, exported, content-addressed, version lineage | curated example collection or authored document              |
-| **Service**  | endpoint, health, latency, deployment, live process, backend          | source code project or static artifact                       |
-| **Person**   | individual human                                                      | author role without standalone entity                        |
-| **Org**      | lab, company, university, institution, consortium                     | project team used only as metadata                           |
+| Kind         | Strong positive signals                                                                        | Do NOT use when                                                        |
+| ------------ | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **Concept**  | abstract idea, method, theory, algorithm, architecture, gap, metric                            | concrete document, dataset, codebase, service, or gen. state           |
+| **Document** | title, authors, DOI, arXiv, publication venue, spec, report                                    | generated state or raw dataset                                         |
+| **Dataset**  | examples, records, benchmark, corpus, train/eval/test split                                    | vectorized/generated index or checkpoint                               |
+| **Project**  | repo, package, crate, library, framework, source code, language                                | running endpoint or deployed instance                                  |
+| **Artifact** | generated, checkpointed, exported, content-addressed, version lineage                          | curated example collection or authored document                        |
+| **Service**  | named endpoint/address; named host/region/cluster/operator; run state tied to a named instance | source code project or static artifact; bare deployment/liveness words |
+| **Person**   | individual human                                                                               | author role without standalone entity                                  |
+| **Org**      | lab, company, university, institution, consortium                                              | project team used only as metadata                                     |
 
 ### Key distinctions
 
@@ -247,7 +323,8 @@ artifact is generated state — its identity is the process that produced it.
 | Model checkpoint trained on that corpus    | `Artifact` + `checkpoint`      |
 | Learned brain retrieval profile            | `Artifact` + `profile`         |
 
-**Service vs Project**: A project is source code. A service is the running thing.
+**Service vs Project**: A project is source code. A service is a deployed or deployable
+operational instance.
 
 | Thing                               | Classification                 |
 | ----------------------------------- | ------------------------------ |
@@ -261,6 +338,9 @@ artifact is generated state — its identity is the process that produced it.
 ## Edge endpoint rules for new kinds
 
 The following `(source, relation, target)` triples are allowed for `Artifact` and `Service`.
+These tables are a summary for classification writers;
+[ADR-002](ADR-002-edge-ontology.md)'s base endpoint contract is the endpoint authority, and on
+any disagreement ADR-002 governs.
 
 ### Artifact
 
@@ -285,19 +365,21 @@ is for "this checkpoint is an instance of this architecture."
 
 ### Service
 
-| Source    | Relation      | Target     | Meaning                                    |
-| --------- | ------------- | ---------- | ------------------------------------------ |
-| `Service` | `instance_of` | `Project`  | deployed/running instance of this codebase |
-| `Service` | `depends_on`  | `Project`  | runtime dependency on code/library         |
-| `Service` | `depends_on`  | `Service`  | service-to-service dependency              |
-| `Service` | `depends_on`  | `Artifact` | uses checkpoint, index, config, state      |
-| `Service` | `depends_on`  | `Dataset`  | uses raw data at runtime                   |
-| `Service` | `implements`  | `Concept`  | realizes an algorithm/protocol             |
-| `Service` | `enables`     | `Concept`  | makes a technique/workflow possible        |
-| `Service` | `precedes`    | `Service`  | earlier deployment/version                 |
-| `Service` | `supersedes`  | `Service`  | replacement service                        |
-| `Org`     | `contains`    | `Service`  | organization operates this service         |
-| `Note`    | `annotates`   | `Service`  | notes can annotate services                |
+| Source    | Relation        | Target     | Meaning                                                      |
+| --------- | --------------- | ---------- | ------------------------------------------------------------ |
+| `Service` | `instance_of`   | `Project`  | deployed/running instance of this codebase                   |
+| `Service` | `instance_of`   | `Concept`  | deployment of a technique (the amended step 5 split outcome) |
+| `Service` | `introduced_by` | `Document` | first described in a paper/spec (2026-08-21 amendment)       |
+| `Service` | `depends_on`    | `Project`  | runtime dependency on code/library                           |
+| `Service` | `depends_on`    | `Service`  | service-to-service dependency                                |
+| `Service` | `depends_on`    | `Artifact` | uses checkpoint, index, config, state                        |
+| `Service` | `depends_on`    | `Dataset`  | uses raw data at runtime                                     |
+| `Service` | `implements`    | `Concept`  | realizes an algorithm/protocol                               |
+| `Service` | `enables`       | `Concept`  | makes a technique/workflow possible                          |
+| `Service` | `precedes`      | `Service`  | earlier deployment/version                                   |
+| `Service` | `supersedes`    | `Service`  | replacement service                                          |
+| `Org`     | `contains`      | `Service`  | organization operates this service                           |
+| `Note`    | `annotates`     | `Service`  | notes can annotate services                                  |
 
 `Service -[instance_of]-> Project` is for "deployed from" semantics.
 `Service -[depends_on]-> Project` is for "requires at runtime."
@@ -386,7 +468,8 @@ They are generated, versioned, have derivation lineage, and no independent codeb
 
 Running inference engines, deployed APIs, and MCP servers fail the 5-test for `Project`:
 
-- A project is source code; a service is a running instance with health, latency, endpoints.
+- A project is source code; a service is a deployed or deployable operational instance with
+  health, latency, and endpoint semantics — running or between deployments.
 - `Project` cannot carry deployment state, endpoint URLs, or availability semantics.
 - "Show all running inference engines" requires `kind=Service`, not property filtering.
 
