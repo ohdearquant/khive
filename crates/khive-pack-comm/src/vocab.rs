@@ -386,8 +386,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 name: "thread_id",
                 param_type: "uuid",
                 required: false,
-                description: "Optional full internal thread UUID. A short prefix would require scoped resolution and is rejected because the thread root is an explicit stable reference. When absent, a new thread root is created.",
-                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+                description: "Optional full internal thread UUID. A short prefix would require scoped resolution and is rejected because the thread root is an explicit stable reference. The value is validated syntactically only — ingest performs no existence or namespace lookup on it. When absent, a new thread root is created.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "channel_kind",
