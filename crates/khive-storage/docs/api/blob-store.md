@@ -68,15 +68,15 @@ The operator-side GC path (khive#292 deliverable 5) — an admin-side
 operation, not an MCP verb, mirroring `VectorStore::orphan_sweep`'s CLI-only
 precedent (ADR-044). `BlobStore` has no visibility into SQL substrates
 (ADR-005 constraint 4: a trait instance talks to exactly one backend), so it
-cannot itself discover which content refs are still referenced by the active
-SQL liveness authority — the caller assembles `BlobOrphanSweepConfig.live_refs`
+cannot itself discover which content refs are still referenced by, e.g., the
+`attachments.content_ref` column — the caller assembles `BlobOrphanSweepConfig.live_refs`
 and passes it in.
 
 `live_refs` is a **snapshot** the caller assembled before the call.
 `orphan_sweep` has no way to detect a `content_ref` that becomes newly live
 between when that snapshot was taken and when the sweep runs; such a
 reference would be deleted anyway. This trait provides no transactional
-coordination with a reference writer, and — unlike
+coordination with an attachment writer, and — unlike
 `transactional_orphan_sweep` — it has no `SqlAccess` capability with which to
 prove a completed V21 attachment epoch either. **The filesystem
 implementation therefore returns typed `StorageError::Unsupported` for every

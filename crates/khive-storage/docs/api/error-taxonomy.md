@@ -86,6 +86,20 @@ and `BlobDigestMismatch` is evaluated only for a metadata-consistent complete
 body. None of these variants carries bytes or changes the existing flattened
 runtime/MCP error envelope.
 
+## Attachment capability source compatibility
+
+ADR-121/ADR-160 adds `StorageCapability::Attachments`. Because
+`StorageCapability` is a public closed enum, downstream exhaustive matches must
+add an `Attachments` arm. The new `AttachmentStore` trait does not change
+existing store implementers; `EntityStore::upsert_entity_with_attachments` has
+a conservative `Unsupported` default.
+
+Removing `Entity::with_content_ref` and runtime
+`create_entity_with_content_ref` is intentionally caller-source-breaking.
+`Entity.content_ref` itself remains for wire/read compatibility, but it is a
+read-only projection of attachment role `content`; ordinary entity upserts
+ignore it.
+
 ## Typed writer-pool checkout timeout source
 
 `khive-db` retains `SqliteError::WriterPoolCheckoutTimeout` as the typed source

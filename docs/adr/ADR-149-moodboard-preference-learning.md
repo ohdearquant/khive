@@ -226,7 +226,8 @@ containing:
 - exact `10 -> 1 Linear, bias=0` architecture; and
 - FANN blob reference and SHA-256.
 
-The bundle is a second BlobStore object attached to an `artifact/moodboard_model`; its SHA-256 is
+The bundle is a second BlobStore object attached to an `artifact/moodboard_model` under ADR-121
+role `"content"`; the FANN object is attached atomically under role `"fann-network"`. Its SHA-256 is
 the model fingerprint. The model is linked `derived_from` its board. A pack-only immutable
 `moodboard.model_record` `Audit` event binds actor, entity ID, bundle reference/fingerprint,
 network reference/digest, and full scope. Generic KG properties are display mirrors and cannot by
@@ -241,7 +242,15 @@ attributed bundle/event scope, both BlobStore BLAKE3 references, bundle and netw
 the model provenance event, support/calibration gates, FANN version, one-layer shape, Linear
 activation, finite parameters, and exactly zero bias. FANN's binary parser
 validates shape and exact length but accepts non-finite parameters, so the pack performs the
-additional finite-parameter walk. The bundle and FANN blobs are capped at 1 MiB each.
+additional finite-parameter walk. The authenticated bundle's network reference must equal the
+`"fann-network"` attachment before that object is hydrated. The bundle and FANN blobs are capped at
+1 MiB each.
+
+During V21 upgrade, the legacy bundle ref is backfilled as role `"content"`; role
+`"fann-network"` is reconstructed only after bounded hydration verifies that bundle, its exact
+immutable `moodboard.model_record` event, and the referenced FANN bytes. Mutable entity properties
+remain display mirrors and are never migration authority. Missing or conflicting evidence aborts
+the cutover rather than guessing, and both attachment rows participate in GC liveness.
 
 `Network::forward` reuses mutable activation buffers. Serving therefore keeps no shared mutable
 network instance: a validated network is cloned for each prediction. Concurrent calls use
@@ -314,3 +323,10 @@ identity, support failure, both labels, tie/abstain exclusion, deterministic tra
 FANN corrupt/wrong-shape/non-finite rejection, independent concurrent buffers, wrong scope/schema,
 uncalibrated rejection, BlobStore/entity/event round-trip across runtime restart, and the complete
 public `serve -> judge -> train_preference -> preference` path.
+
+ADR-160 Phase 4 additionally requires a real V20 database fixture to stage `content`, reconstruct
+`fann-network` only from the verified bundle plus exact immutable event, finalize V21, restart,
+and reproduce the prior exact prediction after attachment-only GC preserves both objects. The
+host migrator runs independently of active moodboard-pack selection. Corrupt, missing, or
+conflicting bundle/event/network evidence leaves the durable cutover incomplete and exposes no
+serving runtime.

@@ -8,7 +8,7 @@ use khive_runtime::{
     BackendId, KhiveRuntime, Namespace, PackRegistration, RuntimeConfig, VerbRegistry,
     VerbRegistryBuilder,
 };
-use khive_storage::{BlobStore, ContentRef};
+use khive_storage::{BlobStore, ContentRef, NewAttachment};
 use khive_types::{EntityKind, Pack};
 use sha2::{Digest, Sha256};
 
@@ -279,7 +279,7 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
     {
         let content_ref = blob_store.put(bytes.to_vec()).await.expect("asset blob");
         let asset = runtime
-            .create_entity_with_content_ref(
+            .create_entity_with_attachments(
                 &setup_token,
                 "artifact",
                 Some("visual_asset"),
@@ -287,7 +287,12 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
                 None,
                 Some(serde_json::json!({"schema_version": "fixture"})),
                 vec![],
-                &content_ref,
+                vec![NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: content_ref.clone(),
+                    media_type: Some("application/octet-stream".to_string()),
+                    size_bytes: Some(u64::try_from(bytes.len()).unwrap()),
+                }],
             )
             .await
             .expect("asset");
@@ -530,7 +535,7 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
         .await
         .expect("anchor blob");
     let anchor = runtime
-        .create_entity_with_content_ref(
+        .create_entity_with_attachments(
             &setup_token,
             "artifact",
             Some("visual_asset"),
@@ -538,7 +543,12 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
             None,
             Some(serde_json::json!({"schema_version": "fixture"})),
             vec![],
-            &anchor_ref,
+            vec![NewAttachment {
+                role: "content".to_string(),
+                content_ref: anchor_ref.clone(),
+                media_type: Some("application/octet-stream".to_string()),
+                size_bytes: Some(6),
+            }],
         )
         .await
         .expect("anchor asset");
@@ -565,6 +575,7 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
             break;
         }
         let bytes = format!("candidate-{candidate_index}").into_bytes();
+        let candidate_size = u64::try_from(bytes.len()).unwrap();
         let candidate_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
         let split = preference_pair_split(
             &board_fingerprint,
@@ -580,7 +591,7 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
         let stored_ref = blob_store.put(bytes).await.expect("candidate blob");
         assert_eq!(stored_ref, candidate_ref);
         let other = runtime
-            .create_entity_with_content_ref(
+            .create_entity_with_attachments(
                 &setup_token,
                 "artifact",
                 Some("visual_asset"),
@@ -588,7 +599,12 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
                 None,
                 Some(serde_json::json!({"schema_version": "fixture"})),
                 vec![],
-                &candidate_ref,
+                vec![NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: candidate_ref.clone(),
+                    media_type: Some("application/octet-stream".to_string()),
+                    size_bytes: Some(candidate_size),
+                }],
             )
             .await
             .expect("candidate asset");

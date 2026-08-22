@@ -140,10 +140,11 @@ and `rank` is one-based after self-exclusion.
 
 The runtime adds two consumer seams rather than exposing its backend:
 
-1. `create_entity_with_content_ref(..., &ContentRef)` is the typed publish-time attachment path.
-   It requires an installed `BlobStore` and verifies `exists(content_ref)` before any entity
-   mutation, then delegates to the same compensated entity-create implementation as `create_entity`, so an
-   FTS or text-vector failure cleans the entity row and every index touched by that call.
+1. `create_entity_with_attachments(..., Vec<NewAttachment>)` is the typed publish-time path.
+   Moodboard supplies the original under role `"content"`. The seam requires an installed
+   `BlobStore`, verifies every `ContentRef` before mutation, and commits the entity plus roles in
+   one transaction before the existing FTS/vector compensation path; compensation hard-deletes
+   the entity and attachment rows together.
 2. `vectors_for_named_identity(token, &NamedVectorIdentity)` returns a token-scoped vector store.
    `NamedVectorIdentity::new` rejects an empty/unsafe or over-128-byte model key, an empty or
    over-512-byte model name, zero dimension, and dimensions above 8192. The accessor validates the actual vec table's declared dimension
@@ -177,9 +178,8 @@ is shared by the two runtime handles.
    visual vector row.
 
 The normalized PNG is derived cache input, not a persisted attachment in the current
-implementation. Accepted ADR-160 schedules migration of the original visual and the preference
-bundle/network blob anchors to ADR-121 roles in its attachment-convergence phase, without
-promoting this normalized cache input. A
+implementation. ADR-160 Phase 4 migrates the original visual and the preference bundle/network
+blob anchors to ADR-121 roles without promoting this normalized cache input. A
 failure after blob publication may leave an orphan for ADR-111 grace-period GC. A
 failure after entity creation may leave an attached asset without the current descriptor row;
 retrying the same bytes reuses the entity and heals the vector. `created` reports whether this call
@@ -191,8 +191,9 @@ stored as mutable scalar asset properties; they belong to the immutable descript
 
 The lookup-before-create contract is retry-idempotent. A process-wide content-ref-striped critical
 section performs the lookup again before create, preventing duplicate first ingests within one
-Khive process without serializing unrelated content. Because `entities.content_ref` is indexed but
-not unique, separate Khive processes can still race and create duplicates. V1 discloses that
+Khive process without serializing unrelated content. Because attachment role `"content"` is indexed
+but not uniquely constrained across records, separate Khive processes can still race and create
+duplicates. V1 discloses that
 cross-process boundary rather than adding a uniqueness rule that would incorrectly apply to every
 entity kind or namespace.
 
@@ -374,4 +375,4 @@ before equivalent numerical claims may be made for 0.9.0.
 - [ADR-027](ADR-027-dynamic-pack-loading.md) — inventory registration and opt-in loading.
 - [ADR-095](ADR-095-verb-surface-consolidation.md) — CRUD consolidation.
 - [ADR-111](ADR-111-blob-store.md) — publish-then-reference CAS and orphan grace GC.
-- [ADR-121](ADR-121-attachments-first-class.md) — proposed multi-rendition attachment model.
+- [ADR-121](ADR-121-attachments-first-class.md) — accepted multi-rendition attachment model.

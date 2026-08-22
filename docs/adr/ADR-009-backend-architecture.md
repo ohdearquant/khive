@@ -2,12 +2,16 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: khive maintainers
+**Authors**: khive maintainers\
+**Amended by**: [ADR-111](ADR-111-blob-store.md) adds `BlobStore`; [ADR-121](ADR-121-attachments-first-class.md)
+and ADR-160 Phase 4 add `AttachmentStore`. References below to eight traits describe the original
+surface; the current public capability enum has ten variants.
 
 ## Context
 
 khive persists its knowledge graph in SQLite. The storage layer is split: `khive-storage`
-defines eight capability traits (ADR-005); `khive-db` implements SQLite storage traits,
+defines capability traits (the original eight in ADR-005, later extended by ADR-111/121);
+`khive-db` implements SQLite storage traits,
 including FTS5 `TextSearch` and the current sqlite-vec `VectorStore`. Separate retrieval
 crates (`khive-retrieval`, `khive-bm25`, `khive-hnsw`, `khive-vamana`, `khive-fusion`)
 ship in-process retrieval engines and fusion.
@@ -20,7 +24,7 @@ The backend architecture must satisfy:
 2. **Multi-file federation.** Different packs may use different SQLite files (hot KG vs cold
    corpus vs archive). This is multiple SQLite files in one process, not a distributed
    database.
-3. **Trait portability.** The eight storage traits (ADR-005) are the contract boundary.
+3. **Trait portability.** The storage traits (ADR-005 and amendments) are the contract boundary.
    A future non-SQLite backend must be possible without changing runtime or pack code.
 4. **Vector search.** The current `khive-db` VectorStore is sqlite-vec compatibility.
    In-process retrieval engines also ship as separate crates, and pack-specific paths may
@@ -33,7 +37,8 @@ The backend architecture must satisfy:
 
 khive's v1 backend is SQLite. The concrete backend crate is `khive-db`.
 
-`khive-db` implements the eight `khive-storage` capability traits (ADR-005):
+`khive-db` implements the original eight `khive-storage` capability traits (ADR-005), plus the
+later blob and attachment capabilities:
 
 - `SqlAccess` — raw SQL reader/writer/transaction
 - `EntityStore` — entity/node CRUD
@@ -43,6 +48,8 @@ khive's v1 backend is SQLite. The concrete backend crate is `khive-db`.
 - `VectorStore` — current dense vector storage/search via sqlite-vec compatibility
 - `SparseStore` — sparse vector storage
 - `TextSearch` — full-text search via FTS5 trigram
+- `BlobStore` — content-addressed object storage and transactional filesystem GC
+- `AttachmentStore` — role-keyed entity/note blob-reference metadata
 - Retrieval engines — BM25, HNSW, Vamana, and fusion live outside `khive-db`
 
 `khive-db` supports both file-backed and in-memory storage. In-memory mode is used for
@@ -67,7 +74,8 @@ Current: khive-db (SQLite)
 Future:  khive-db-postgres, khive-db-rocksdb, etc. (if approved by ADR)
 ```
 
-Each backend crate implements the same eight `khive-storage` traits. The runtime and
+Each backend crate implements the capabilities it advertises under the same `khive-storage`
+contracts. The runtime and
 packs depend on traits, not on any specific backend crate.
 
 ### v1 multi-backend: multiple SQLite files
@@ -168,7 +176,7 @@ version commitment in this ADR.
 If a non-SQLite engine is proposed, it requires:
 
 1. A new ADR justifying the engine against the embedded deployment constraint.
-2. Its own backend crate implementing the eight storage traits.
+2. Its own backend crate implementing the required storage traits.
 3. Backend contract test coverage matching `khive-db`.
 
 ### `StorageError::Unsupported` contract
@@ -184,7 +192,7 @@ implementing traits only to fail at every call.
 
 ### Backend contract tests
 
-Backend contract tests exercise the eight storage traits against `khive-db` (both
+Backend contract tests exercise the advertised storage traits against `khive-db` (both
 SQLite memory and SQLite file-backed). They validate that the backend correctly
 implements the trait contracts.
 
@@ -292,10 +300,10 @@ read-only mode.
 
 ## Implementation
 
-- `crates/khive-db/`: SQLite backend implementing eight storage traits.
+- `crates/khive-db/`: SQLite backend implementing the current storage traits.
 - `crates/khive-db/src/stores/`: one module per trait implementation (entity, graph,
   note, event, vector, sparse, text, sql).
 - `crates/khive-db/src/migrations.rs`: SQLite schema migrations (applied by `kkernel db migrate`, ADR-003).
 - `crates/khive-db/src/backend.rs`: `StorageBackend` — the concrete SQLite connection
   wrapper providing `Arc<dyn Trait>` accessors.
-- Backend contract tests: `khive-db/tests/contract/` exercising all eight traits.
+- Backend contract tests: trait-specific suites exercising the advertised capabilities.

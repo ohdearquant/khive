@@ -2,7 +2,7 @@
 
 Storage capability traits for khive's substrate: `SqlAccess`, `VectorStore`,
 `TextSearch`, `GraphStore`, `NoteStore`, `EntityStore`, `EventStore`,
-`SparseStore`. Zero implementations — only contracts
+`SparseStore`, `BlobStore`, and `AttachmentStore`. Zero implementations — only contracts
 ([ADR-005](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-005-storage-capability-traits.md)).
 A concrete backend (`khive-db`'s SQLite implementation, for example) implements
 these traits; the runtime and every pack depend only on this crate, never on a
@@ -17,13 +17,15 @@ specific backend.
 | `TextSearch`                               | FTS document upsert/search/stats, optional term-stats (IDF)                      |
 | `GraphStore`                               | edge CRUD, neighbor queries, multi-hop traversal, batched neighbor/edge fetch    |
 | `NoteStore` / `EntityStore` / `EventStore` | substrate-specific CRUD and filtered listing                                     |
+| `AttachmentStore`                          | role-keyed blob references owned by entity or note records                       |
+| `BlobStore`                                | content-addressed CRUD and bounded, digest-verified whole-object reads           |
 | `SparseStore`                              | sparse (BM25-style) vector storage                                               |
 
 Every method returns `StorageResult<T> = Result<T, StorageError>`.
 `StorageError` variants (`NotFound`, `AlreadyExists`, `Conflict`,
 `InvalidInput`, `Unsupported`, `Pool`, `Timeout`, `Transaction`, …) are tagged
 with the offending `StorageCapability`
-(`Sql | Notes | Entities | Graph | Events | Vectors | Sparse | Text`).
+(`Sql | Notes | Entities | Graph | Events | Vectors | Sparse | Text | Blob | Attachments`).
 
 ## Usage
 
@@ -58,6 +60,12 @@ compiles without overriding anything: `get_edges` loops `get_edge` per ID and
 `batch_neighbors` loops `neighbors` per source. Backends that support batched
 `IN (...)` queries or filter pushdown override the corresponding method and
 the trait's `capabilities()` accessor to advertise it.
+
+`EntityStore::upsert_entity_with_attachments` also has a conservative
+`Unsupported` default, so adding the atomic publication seam does not force an
+immediate implementation in third-party entity stores. `AttachmentStore`
+itself is a new required trait only for backends that advertise the
+`Attachments` capability.
 
 ## Where this sits
 

@@ -31,9 +31,14 @@ lifetime.
 
 ```rust
 use khive_mcp::server::KhiveMcpServer;
-use khive_runtime::{KhiveRuntime, RuntimeConfig};
+use khive_runtime::{KhiveConfig, RuntimeConfig};
 
-let runtime = KhiveRuntime::new(RuntimeConfig::default()).expect("valid config");
+let runtime = khive_mcp::serve::build_single_backend_runtime(
+    RuntimeConfig::default(),
+    &KhiveConfig::default(),
+)
+.await
+.expect("schema, attachment cutover, and runtime boot");
 let server = KhiveMcpServer::new(runtime).expect("known packs, deps satisfied");
 ```
 
@@ -42,6 +47,26 @@ an explicit pack list instead. Both fail fast with `PackRegError` (naming the un
 or missing dependency) rather than silently dropping packs. Once built, `serve_stdio(self)`
 consumes the server and serves over stdio — the path `StdioTransport::serve` and `kkernel
 mcp` both call.
+
+Production callers must obtain that runtime from the async host builders. They inventory
+secondaries, install the shared bounded hydrator, and finish the resumable V21 attachment/GC
+cutover before exposing a server. Direct `KhiveRuntime::from_backend` plus
+`KhiveMcpServer::new` is only for tests or a caller that has independently proved the backend is
+exact-current; it does not run the application-assisted migration.
+
+Those Phase-4b builders must not be deployed until the Phase-4a GC compatibility
+release has converged across every process sharing the database/blob root and
+all pre-Phase-4a processes are drained. Phase 4a makes no schema/data change; it
+only refuses transactional GC unless it sees an exact completed V21 epoch.
+Before cutover, every Phase-4a application-serving/read-write process must also
+be quiesced or unable to access the database. A GC-only worker's completed-V21
+compatibility is not general serving compatibility; start Phase-4b serving only
+after exact-current topology validation.
+
+The Phase-4b boot APIs are async source changes:
+`build_server{,_with_explicit_namespace}`,
+`build_registry_for_multi_backend{,_with_db_anchor}`, and
+`build_server_multi_backend{,_with_db_anchor}` must now be awaited.
 
 ## Where this sits
 

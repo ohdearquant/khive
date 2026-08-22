@@ -48,7 +48,9 @@ production database without a backup first: `kg status`, `kg validate` (no `--fi
 on their surface. The v1 implementation builds a synthetic single-backend registry from
 `RuntimeConfig::default()` and constructs a real `KhiveRuntime` over it (`main.rs:532-547`).
 `KhiveRuntime::new` creates the parent directory of the default DB path if missing, opens or
-creates the SQLite file, and runs all pending migrations (`khive-runtime/src/runtime.rs:80-106`).
+creates the SQLite file, and applies ordinary pending migrations. It may complete V21 only for an
+empty/fresh attachment state; a legacy V20 database requiring authenticated application backfill
+fails and must use the async MCP/kkernel host coordinator.
 So `kkernel backend list` (and `info`) can create/open/migrate the default runtime database
 (`~/.khive/khive.db`) today, on a machine where that file is absent or stale, purely as a side
 effect of listing backends.
@@ -569,15 +571,7 @@ that API is disabled outright in this release (typed `Unsupported` for every cal
 modes) because it has no way to prove a completed V21 epoch and cannot account for the moodboard
 FANN object missing from V20 SQL liveness.
 
-**What you can do today, right now, in this release:** back up, drain old binaries, and deploy
-Phase4a (steps 1-3 below). If a database's `attachment_cutover_state` marker is anything other than
-the exact completed V21 epoch — including "incomplete", missing, or partially applied — GC simply
-stays refused on both APIs, in both modes; the database and blob root are otherwise untouched.
-There is no restore, rollback, or marker-repair command shipped in this release, and none is
-required for the compatibility fence itself: an incomplete marker is not an error state to recover
-from, it is V20's normal, permanently-supported epoch as far as Phase4a GC is concerned.
-
-Use this rollout order for what Phase4a actually ships:
+Use this two-release rollout order:
 
 1. Back up the canonical main database and inventory every process that can open it or the shared
    blob root, including daemons, one-shot admin jobs, and independently supervised replicas.
@@ -586,39 +580,108 @@ Use this rollout order for what Phase4a actually ships:
 3. Deploy Phase4a everywhere while the database remains V20. A typed V20 GC refusal in either mode
    is the expected safe state. Phase4a `db migrate` still knows only the V20 prefix and does not
    perform the attachment cutover.
-
-The following is **future design, not a runnable procedure in this release.** No Phase4b
-migration/serving tooling, boot gate, or durable-marker completion path exists in the committed
-migration registry today (it ends at V20) — do not treat the steps below as operator instructions;
-they describe what a later Phase4b release must do, once it ships:
-
 4. Before introducing Phase4b, quiesce every Phase4a application reader and writer. Only the
    Phase4a GC implementation can interpret an exact completed V21 attachment epoch; its serving,
    pack, runtime, and ordinary migration paths remain V20 consumers. Do not perform a rolling
    Phase4a/Phase4b serving cutover against one database.
-5. Run the future Phase4b boot-gated migration only with Phase4b tooling, keep serving closed until
-   its durable marker is complete, and then admit only Phase4b-or-newer application processes.
+5. Run the Phase4b boot-gated migration only with Phase4b tooling, keep serving closed until its
+   durable marker is complete, and then admit only Phase4b-or-newer application processes.
 
-Phase4b migration/serving support is a follow-up and is not present in the Phase4a release. The
-positive completed-V21 Phase4a GC regression exists to prove the compatibility fence itself; it is
-not an operator command or authorization to keep Phase4a application traffic live during cutover.
+The positive completed-V21 Phase4a GC regression exists to prove the compatibility fence itself;
+it is not an operator command or authorization to keep Phase4a application traffic live during
+cutover. Steps 4-5 are the supported Phase4b cutover path — do not skip the quiescence step or run
+a rolling Phase4a/Phase4b serving mix against one database.
 
 ### `db migrate` / `db check`
 
 ```bash
-kkernel db migrate [--db <path>] [--backend <name>] [--dry-run] [--check] [--human]
-kkernel db check   [--db <path>] [--strict] [--human]
+kkernel db migrate [--config <path>] [--db <path>] [--backend <name>] [--dry-run] [--check] [--human]
+kkernel db check   [--config <path>] [--db <path>] [--backend <name>] [--strict] [--human]
 ```
 
-`db migrate` opens the database via `KhiveRuntime::new`, which applies any pending migrations as a
-side effect of construction; there is no separate "apply" step. `--dry-run`/`--check` on
+Both commands load an explicit `--config`/`KHIVE_CONFIG` or use normal config
+discovery. With declared `[[backends]]`, omission of `--backend` targets the
+configured topology and `--backend <name>` selects a declared backend. Migration
+deduplicates physical aliases, inventories and advances every distinct secondary
+before canonical `main`, then conditionally resolves bounded hydration when
+legacy V20 moodboard evidence must be authenticated and finalizes the resumable
+V21 attachment/GC cutover. Exact-current paths and migrations without legacy
+moodboard model evidence do not resolve a BlobStore. Selecting a non-main
+secondary advances only that empty-authority target; selecting `main` (or a
+physical alias of it) retains all secondary prerequisites. With no declared
+topology, `--db <path>`/`KHIVE_DB` or the default `~/.khive/khive.db` supplies
+the implicit `main`. A concrete DB override must agree with configured `main`
+rather than silently replacing the topology.
+
+The admin coordinator is core-only: it does not register packs, instantiate
+embedding models, or apply pack-auxiliary DDL. Blob configuration remains active
+because bounded hydration may be required to authenticate legacy V20 pack-owned
+evidence.
+
+`--dry-run`/`--check` on
 `migrate` redirect to `db check` instead of touching anything. `db check` is deliberately
 read-only: it inspects `_schema_migrations`' `MAX(version)` directly rather than opening a runtime
-(which would migrate-on-open and mask the very state the command exists to report,
-`main.rs:385-397`). A missing database file is reported as version 0 without being created.
-`--strict` turns "behind" or "ahead of the latest known migration" (a schema newer than this
-binary knows, or corresponding to a pre-consolidated-baseline version) into a nonzero exit via
-`anyhow::bail!` (`main.rs:433-445`).
+(which would migrate-on-open and mask the very state the command exists to report). A missing
+database file is reported as version 0 without being created.
+It reuses the migration target planner: checking `main` or a SQLite alias of
+`main` includes every configured secondary prerequisite, while checking an
+independent secondary includes only that target.
+Before either command opens a database, the planner validates the complete
+configured alias set and rejects physical SQLite aliases whose `read_only` modes
+disagree; a named selector cannot bypass that check. With `--db :memory:`, each
+configured backend name becomes a distinct ephemeral database, so only the
+literal name `main` carries main's prerequisite plan. Migration result rows mark
+`prerequisite` by physical backend identity: aliases of the selected main are
+targets, while physically distinct secondaries are prerequisites.
+
+`--strict` turns behind, ahead-of-build, or an invalid exact-current schema
+(including an inconsistent V21 marker/fence state) into a nonzero exit via
+`anyhow::bail!`.
+
+#### V21 two-release rollout (mandatory)
+
+V21 is a destructive, forward-only schema cutover. It must use two releases;
+shipping the GC gate and column drop as one fleet rollout is unsafe.
+
+1. Deploy the **Phase 4a GC compatibility epoch gate** to every process that can
+   share the database/blob root or invoke transactional blob GC. Phase 4a leaves
+   V20 schema and data untouched: it does not create attachments, backfill,
+   dual-read or dual-write, or record V21. Its transactional filesystem sweep
+   accepts only an exact completed V21 epoch; V20, pending, incomplete, and
+   malformed epochs refuse both dry-run and destructive sweep before filesystem
+   or claim mutation.
+2. Prove fleet convergence on the Phase-4a-or-newer binary, then drain every
+   pre-Phase-4a daemon, worker, admin process, and scheduled job that can touch
+   the same database or blob root. Prevent the supervisor from restarting an old
+   build. Treat this as a deployment gate, not an elapsed-time wait.
+3. Quiesce every Phase-4a application-serving/read-write process, or prove that
+   it cannot touch the database during cutover. Phase 4a does not make V20 entity
+   readers or writers compatible with the V21 column drop. A Phase-4a GC-only
+   worker may safely recognize an exact completed V21, but that narrow property
+   is not permission to keep a Phase-4a serving process online.
+4. Take a matched database/blob-root backup and inventory the topology with
+   `kkernel db check --config <path> --human`. Do not substitute the
+   caller-snapshot `orphan_sweep` or unconditional `delete` while transactional
+   GC is refusing V20; plan blob capacity for this intentional GC pause.
+5. Only after the convergence, drain, and service-quiescence evidence is
+   recorded, run the Phase-4b migration with
+   `kkernel db migrate --config <path>`. The coordinator checks distinct
+   secondaries first; any recoverable attachment authority there blocks main.
+   Main then stages/backfills, verifies pack-owned evidence, swaps liveness and
+   claim fences, drops `entities.content_ref`, and records V21 atomically at
+   finalization. A normal Phase-4b host boot can start the same migration, so
+   keep the serving fleet stopped and use the controlled admin path for cutover.
+6. Run `kkernel db check --config <path> --strict --human` and require every
+   planned target to report the exact current schema before starting the
+   Phase-4b serving fleet. A pending, incomplete, or malformed marker remains
+   fail-closed for serving and GC; curate the reported evidence and rerun the
+   coordinator rather than bypassing it.
+
+There is no down migration. Rollback after Phase 4b means stopping the new fleet,
+restoring the matched V20 database/blob snapshot, and returning to the Phase-4a
+compatibility build. Do not resume its application-serving/read-write processes
+until the V20 restore is complete; never point a pre-Phase-4a process at the
+cut-over database.
 
 ### `exec --save-file` / `exec --ops-file`: daemon coexistence
 

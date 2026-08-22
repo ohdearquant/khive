@@ -10,14 +10,16 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
-use khive_storage::blob::ContentRef;
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
     NeighborQuery, Page, PageRequest, SeekCursor, SortOrder, SqlRow, SqlStatement, SqlValue,
     TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
 };
-use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
+use khive_storage::{
+    Attachment, AttachmentSubstrate, Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter,
+    NewAttachment,
+};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, KhiveError, SubstrateKind};
 
 use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_statement};
@@ -1233,22 +1235,23 @@ impl KhiveRuntime {
                 description,
                 properties,
                 tags,
-                None,
+                Vec::new(),
             )
             .await?
             .0)
     }
 
-    /// Create an entity that references bytes already published to `BlobStore`.
+    /// Create an entity with role-keyed bytes already published to `BlobStore`.
     ///
-    /// The typed [`ContentRef`] prevents malformed references from entering the
-    /// substrate through this consumer seam. The entity row, FTS document, and
-    /// configured text-vector rows use the same compensated create path as
-    /// [`Self::create_entity`]. The caller remains responsible for publishing the
-    /// blob before this call; a later failure deliberately leaves those bytes for
-    /// the blob store's grace-period orphan collection.
+    /// Every [`NewAttachment`] carries a typed content reference, so malformed
+    /// references cannot enter through this consumer seam. Blob existence is
+    /// checked before the database write. The entity row and all attachment rows
+    /// then commit in one storage transaction; the FTS/vector compensation path
+    /// hard-deletes the entity and its attachments together if a later indexing
+    /// step fails. Published bytes remain recoverable by the BlobStore grace-period
+    /// orphan policy when any post-publication step fails.
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_entity_with_content_ref(
+    pub async fn create_entity_with_attachments(
         &self,
         token: &NamespaceToken,
         kind: &str,
@@ -1257,17 +1260,34 @@ impl KhiveRuntime {
         description: Option<&str>,
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
-        content_ref: &ContentRef,
+        attachments: Vec<NewAttachment>,
     ) -> RuntimeResult<Entity> {
+        // Attachment rows are the process-wide BlobStore's liveness authority.
+        // Validate placement before existence probes or any record write: pack
+        // runtimes bound to a secondary backend must explicitly call `core()`.
+        drop(self.attachments()?);
         let blob_store = self.blob_store().ok_or_else(|| {
             RuntimeError::Unconfigured(
-                "create_entity_with_content_ref requires an installed BlobStore".to_string(),
+                "create_entity_with_attachments requires an installed BlobStore".to_string(),
             )
         })?;
-        if !blob_store.exists(content_ref).await? {
-            return Err(RuntimeError::InvalidInput(format!(
-                "create_entity_with_content_ref requires a published blob; no object exists for {content_ref}"
-            )));
+        let mut roles = std::collections::HashSet::with_capacity(attachments.len());
+        for attachment in &attachments {
+            attachment.validate()?;
+            if !roles.insert(attachment.role.as_str()) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "duplicate attachment role {:?}",
+                    attachment.role
+                )));
+            }
+        }
+        for attachment in &attachments {
+            if !blob_store.exists(&attachment.content_ref).await? {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "create_entity_with_attachments requires a published blob; no object exists for {}",
+                    attachment.content_ref
+                )));
+            }
         }
         let validated_type = self.validate_entity_type_for_kind(kind, entity_type)?;
         Ok(self
@@ -1279,7 +1299,7 @@ impl KhiveRuntime {
                 description,
                 properties,
                 tags,
-                Some(content_ref),
+                attachments,
             )
             .await?
             .0)
@@ -1304,7 +1324,7 @@ impl KhiveRuntime {
             description,
             properties,
             tags,
-            None,
+            Vec::new(),
         )
         .await
     }
@@ -1319,7 +1339,7 @@ impl KhiveRuntime {
         description: Option<&str>,
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
-        content_ref: Option<&ContentRef>,
+        attachments: Vec<NewAttachment>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_entity_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -1343,10 +1363,25 @@ impl KhiveRuntime {
         if !tags.is_empty() {
             entity = entity.with_tags(tags);
         }
-        if let Some(content_ref) = content_ref {
-            entity = entity.with_content_ref(content_ref.to_string());
-        }
-        self.entities(token)?.upsert_entity(entity.clone()).await?;
+        let projected_content_ref = attachments
+            .iter()
+            .find(|attachment| attachment.role == "content")
+            .map(|attachment| attachment.content_ref.to_string());
+        let attachment_rows = attachments
+            .into_iter()
+            .map(|attachment| {
+                Attachment::from_new(
+                    entity.id,
+                    AttachmentSubstrate::Entity,
+                    attachment,
+                    entity.created_at,
+                )
+            })
+            .collect();
+        self.entities(token)?
+            .upsert_entity_with_attachments(entity.clone(), attachment_rows)
+            .await?;
+        entity.content_ref = projected_content_ref;
 
         let doc = entity_fts_document(&entity);
         let embed_body = doc.body.clone();
@@ -16604,5 +16639,73 @@ mod tests {
             found.is_empty(),
             "batch rejection must leave zero rows behind, found: {found:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_entity_with_attachments_commits_roles_and_projects_content() {
+        use khive_db::stores::blob::FsBlobStore;
+        use khive_storage::BlobStore as _;
+
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let blob_store =
+            Arc::new(FsBlobStore::new(blob_dir.path().to_path_buf(), 0).expect("blob store"));
+        let content_ref = blob_store
+            .put(b"bundle".to_vec())
+            .await
+            .expect("publish bundle");
+        let network_ref = blob_store
+            .put(b"network".to_vec())
+            .await
+            .expect("publish network");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+
+        let created = runtime
+            .create_entity_with_attachments(
+                &token,
+                "artifact",
+                None,
+                "role-keyed artifact",
+                None,
+                None,
+                vec![],
+                vec![
+                    NewAttachment {
+                        role: "content".to_string(),
+                        content_ref: content_ref.clone(),
+                        media_type: Some("application/json".to_string()),
+                        size_bytes: Some(6),
+                    },
+                    NewAttachment {
+                        role: "fann-network".to_string(),
+                        content_ref: network_ref.clone(),
+                        media_type: Some("application/octet-stream".to_string()),
+                        size_bytes: Some(7),
+                    },
+                ],
+            )
+            .await
+            .expect("atomic record + attachments publication");
+
+        assert_eq!(created.content_ref.as_deref(), Some(content_ref.as_str()));
+        let reloaded = runtime
+            .get_entity(&token, created.id)
+            .await
+            .expect("reload entity");
+        assert_eq!(reloaded.content_ref.as_deref(), Some(content_ref.as_str()));
+        let attachments = runtime
+            .attachments()
+            .expect("main attachment store")
+            .list_attachments(created.id)
+            .await
+            .expect("list attachments");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].role, "content");
+        assert_eq!(attachments[0].content_ref, content_ref);
+        assert_eq!(attachments[1].role, "fann-network");
+        assert_eq!(attachments[1].content_ref, network_ref);
     }
 }

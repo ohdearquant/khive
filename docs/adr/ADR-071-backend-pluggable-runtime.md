@@ -22,6 +22,10 @@ ADR-005 specifies the polystore design: `khive-storage` defines eight capability
 `SparseStore`, `TextSearch`) and every crate above depends only on those traits, never
 on the concrete `khive-db` SQLite backend. ADR-005 §consequences states:
 
+Those eight are the surface at this ADR's ratification. ADR-111 later adds `BlobStore`, and
+ADR-121/ADR-160 Phase 4 add placement-blind `AttachmentStore`; runtime still owns placement and
+routes attachment liveness to canonical main.
+
 > "Runtime, packs, and coordinator compile without `rusqlite` on the dependency tree."
 
 ADR-009 §architecture states:
@@ -327,8 +331,8 @@ for the sqlite-vec backend; it just must not appear in the trait default.
 
 ### Why `BackendHandle` over a single `Arc<dyn Backend>` supertrait
 
-A supertrait that extends all eight capability traits forces every backend implementation
-to implement all eight. An alternate backend that provides the relational core but no
+A supertrait that extends every capability trait forces every backend implementation
+to implement all of them. An alternate backend that provides the relational core but no
 semantic or lexical search (e.g., a secondary session backend that delegates shared-graph
 reads to the main backend via `core()`) would be forced to provide stub implementations of
 `VectorStore`, `SparseStore`, and `TextSearch`. `BackendHandle` holds individual handles
@@ -421,7 +425,7 @@ says.
 Convert `khive_db::StorageBackend` from a concrete struct into a trait, with
 `SqliteStorageBackend` implementing it. Keep `KhiveRuntime { backend: Arc<dyn StorageBackend> }`.
 
-Rejected. A `StorageBackend` trait that returns all eight `Arc<dyn CapabilityTrait>` handles
+Rejected. A `StorageBackend` trait that returns every `Arc<dyn CapabilityTrait>` handle
 is functionally equivalent to `BackendHandle`. The difference is that a named trait imposes
 a single-implementor contract on backends while `BackendHandle::from_parts` allows the
 flexible per-slot construction described in §1 rationale. `BackendHandle` is simpler and

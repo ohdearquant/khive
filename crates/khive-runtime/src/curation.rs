@@ -2064,7 +2064,10 @@ fn read_merge_entity(
     let id_str = id.to_string();
     let mut stmt = conn.prepare(
         "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-         created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref \
+         created_at, updated_at, deleted_at, merged_into, merge_event_id, \
+         (SELECT a.content_ref FROM attachments AS a \
+          WHERE a.record_uuid = entities.id AND a.substrate = 'entity' \
+            AND a.role = 'content') AS content_ref \
          FROM entities WHERE id = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -2502,8 +2505,9 @@ fn merge_entity_sql(
 
     if !dry_run {
         // UPDATE only the merged fields — a full-row INSERT OR REPLACE silently
-        // nulls any column missing from its list (entity_type and content_ref
-        // were lost this way; khive#1214).
+        // nulls any column missing from its list (entity_type and the former
+        // entity-owned content_ref were lost this way; khive#1214). Attachments
+        // now live in their own table and this targeted UPDATE leaves them alone.
         conn.execute(
             "UPDATE entities SET \
                  name = ?1, description = ?2, properties = ?3, tags = ?4, \
@@ -4986,7 +4990,7 @@ mod tests {
     }
 
     // The survivor row write must not null columns it doesn't merge —
-    // entity_type (and content_ref) were lost by the old full-row
+    // entity_type (and the old entity-owned content_ref) were lost by the old full-row
     // INSERT OR REPLACE.
     #[tokio::test]
     async fn merge_entity_preserves_survivor_entity_type() {
@@ -5034,11 +5038,21 @@ mod tests {
             .await
             .unwrap();
 
-        let content_ref = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+        let content_ref = khive_storage::ContentRef::from_hex("0".repeat(64)).unwrap();
         let store = rt.entities(&tok).unwrap();
-        let stored = store.get_entity(into.id).await.unwrap().unwrap();
-        store
-            .upsert_entity(stored.with_content_ref(content_ref))
+        rt.attachments()
+            .unwrap()
+            .upsert_attachment(khive_storage::Attachment::from_new(
+                into.id,
+                khive_storage::AttachmentSubstrate::Entity,
+                khive_storage::NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: content_ref.clone(),
+                    media_type: None,
+                    size_bytes: None,
+                },
+                into.created_at,
+            ))
             .await
             .unwrap();
 
@@ -5056,7 +5070,7 @@ mod tests {
         let got = store.get_entity(into.id).await.unwrap().unwrap();
         assert_eq!(
             got.content_ref.as_deref(),
-            Some(content_ref),
+            Some(content_ref.as_str()),
             "merge must not null the survivor's content_ref"
         );
     }

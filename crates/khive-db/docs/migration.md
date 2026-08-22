@@ -20,6 +20,24 @@ The `run_migrations` function:
    migration and leaves the DB at the prior version
 5. Records the applied version, name, and timestamp in `_schema_migrations`
 
+V21 is the one application-assisted exception in rollout Phase 4b.
+`run_migrations` may complete it atomically only when no legacy content refs
+exist. Otherwise it stops at V20;
+the async host acquires the database GC owner, records durable `Incomplete`,
+authenticates pack-owned blob roles, and records V21 only in the exclusive
+final transaction. Restart resumes this state before serving or GC.
+
+Phase 4b has an operational prerequisite that is not encoded in the V20 ledger.
+Phase 4a first ships only the transactional-GC epoch gate: it leaves V20 schema
+and data untouched, and refuses V20 or any incomplete/malformed V21 state in
+both sweep modes. After that binary converges fleet-wide, every pre-Phase-4a
+process sharing the database/blob root must be drained before any Phase-4b host
+or admin migration is allowed to start V21. Phase-4a application-serving and
+read/write processes must also be quiesced, or proven unable to access the
+database, during cutover; only a GC-only Phase-4a worker is compatible with
+exact completed V21. Phase-4b serving starts after exact-current topology
+validation.
+
 ## Version numbering
 
 Versions form a contiguous sequence: 1, 2, 3, ... Gaps are rejected at
@@ -64,6 +82,9 @@ V1 baseline at v0.2.8. The live post-consolidation sequence is:
 - **V18**: Adds ANN consumer-pending lifecycle metadata.
 - **V19**: Repairs divergent V13/V14 migration names and cursor-sequence rows.
 - **V20**: Adds bounded blob-GC claims and entity write-fence triggers.
+- **V21 (Phase 4b)**: Adds first-class attachments, backfills role `content`,
+  switches blob GC claim fences to attachment writes, and drops
+  `entities.content_ref` after verified application backfill.
 
 The historical pre-consolidation allocation table remains in ADR-015 for
 provenance; its version numbers do not describe the live migration array.

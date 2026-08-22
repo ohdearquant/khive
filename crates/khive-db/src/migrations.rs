@@ -6,9 +6,12 @@
 //! - **Versioned migrations** (`MIGRATIONS` / `run_migrations`): the forward-only
 //!   migration pipeline for the core tables.
 
-use rusqlite::Connection;
+use khive_storage::blob::ContentRef;
+use rusqlite::{Connection, OptionalExtension};
+use std::path::PathBuf;
 
 use crate::error::SqliteError;
+use crate::stores::blob::{try_acquire_database_gc_owner_for_path, DatabaseGcOwnerGuard};
 
 // =============================================================================
 // Legacy per-service migration API (preserved for backward compatibility)
@@ -141,6 +144,13 @@ const V19_UP: &str = include_str!("../sql/019-list-cursor-backfill-repair.sql");
 
 const V20_UP: &str = include_str!("../sql/020-blob-gc-claims.sql");
 
+const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
+
+const V21_ATTACHMENT_FENCES_UP: &str = include_str!("../sql/021-attachments-b-claim-fences.sql");
+
+/// Core schema version reserved for ADR-121's attachments-first cutover.
+pub const ATTACHMENT_CUTOVER_VERSION: u32 = 21;
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -171,7 +181,12 @@ pub const ANN_CONSUMER_PENDING_DDL: &str = include_str!("../sql/ann-consumer-pen
 /// the schema cannot silently diverge if the registry evolves.
 pub const EMBEDDING_MODELS_DDL: &str = include_str!("../sql/embedding-models-ddl.sql");
 
-/// All versioned migrations in ascending order, applied by `run_migrations`.
+/// Canonical versioned migration ledger in ascending order.
+///
+/// [`run_migrations`] applies the ordinary prefix and may complete V21 through
+/// its zero-legacy-reference fast path. A legacy V20 database records V21 only
+/// when [`finalize_attachment_cutover`] commits the application-assisted
+/// cutover.
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration {
         version: 1,
@@ -273,7 +288,538 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "blob_gc_claims",
         up: V20_UP,
     },
+    VersionedMigration {
+        version: ATTACHMENT_CUTOVER_VERSION,
+        name: "attachments_first_class",
+        // V21 is coordinated rather than an unconditional SQL migration.
+        // The runner special-cases it below; exposing the stage DDL here keeps
+        // the ledger entry self-describing for migration inspection tooling.
+        up: V21_STAGE_UP,
+    },
 ];
+
+/// Durable state of ADR-121's boot-gated, two-stage attachment cutover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentCutoverStatus {
+    /// V20 is current and no stage marker has been committed.
+    Pending,
+    /// Stage 1 committed; boot must finish verified pack-owned attachments.
+    Incomplete,
+    /// V21, the attachment fences, and the attachment-only schema committed.
+    Complete,
+}
+
+fn schema_object_exists(
+    conn: &Connection,
+    object_type: &str,
+    name: &str,
+) -> Result<bool, SqliteError> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = ?1 AND name = ?2",
+        rusqlite::params![object_type, name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn schema_column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, SqliteError> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+        rusqlite::params![table, column],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn require_attachment_schema_objects(
+    conn: &Connection,
+    objects: &[(&str, &str)],
+    phase: &str,
+) -> Result<(), SqliteError> {
+    for (object_type, name) in objects {
+        if !schema_object_exists(conn, object_type, name)? {
+            return Err(SqliteError::InvalidData(format!(
+                "attachment cutover {phase} state is missing {object_type} {name:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_incomplete_attachment_schema(conn: &Connection) -> Result<(), SqliteError> {
+    require_attachment_schema_objects(
+        conn,
+        &[
+            ("table", "attachments"),
+            ("index", "idx_attachments_content_ref"),
+        ],
+        "incomplete",
+    )?;
+    require_legacy_attachment_fences(conn)
+}
+
+fn validate_complete_attachment_schema(conn: &Connection) -> Result<(), SqliteError> {
+    require_attachment_schema_objects(
+        conn,
+        &[
+            ("table", "attachments"),
+            ("table", "blob_gc_claims"),
+            ("index", "idx_attachments_content_ref"),
+            ("index", "idx_blob_gc_claims_content_ref"),
+            ("trigger", "attachments_reject_claimed_blob_insert"),
+            ("trigger", "attachments_reject_claimed_blob_update"),
+        ],
+        "complete",
+    )?;
+    if schema_column_exists(conn, "entities", "content_ref")? {
+        return Err(SqliteError::InvalidData(
+            "attachment cutover is complete but entities.content_ref still exists".into(),
+        ));
+    }
+    for (object_type, name) in [
+        ("index", "idx_entities_content_ref"),
+        ("trigger", "entities_reject_claimed_blob_insert"),
+        ("trigger", "entities_reject_claimed_blob_update"),
+    ] {
+        if schema_object_exists(conn, object_type, name)? {
+            return Err(SqliteError::InvalidData(format!(
+                "attachment cutover is complete but legacy {object_type} {name:?} still exists"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Inspect the coordinated V21 state without mutating the connection.
+///
+/// The marker and migration ledger form one state machine. Impossible pairs
+/// fail closed instead of being guessed into a resumable state.
+pub fn attachment_cutover_status(
+    conn: &Connection,
+) -> Result<AttachmentCutoverStatus, SqliteError> {
+    let version = read_schema_version(conn)?;
+    let marker_table = schema_object_exists(conn, "table", "attachment_cutover_state")?;
+    if !marker_table {
+        if version >= ATTACHMENT_CUTOVER_VERSION {
+            return Err(SqliteError::InvalidData(format!(
+                "migration V{ATTACHMENT_CUTOVER_VERSION} is recorded but its attachment cutover marker is absent"
+            )));
+        }
+        if schema_object_exists(conn, "table", "attachments")? {
+            return Err(SqliteError::InvalidData(
+                "attachments table exists without the durable attachment cutover marker".into(),
+            ));
+        }
+        return Ok(AttachmentCutoverStatus::Pending);
+    }
+
+    let marker: Option<(String, Option<i64>)> = conn
+        .query_row(
+            "SELECT state, completed_at FROM attachment_cutover_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match marker {
+        Some((state, None)) if state == "incomplete" => {
+            if version >= ATTACHMENT_CUTOVER_VERSION {
+                Err(SqliteError::InvalidData(format!(
+                    "attachment cutover is incomplete but migration V{ATTACHMENT_CUTOVER_VERSION} is already recorded"
+                )))
+            } else {
+                validate_incomplete_attachment_schema(conn)?;
+                Ok(AttachmentCutoverStatus::Incomplete)
+            }
+        }
+        Some((state, Some(_))) if state == "complete" => {
+            if version == ATTACHMENT_CUTOVER_VERSION {
+                validate_complete_attachment_schema(conn)?;
+                Ok(AttachmentCutoverStatus::Complete)
+            } else {
+                Err(SqliteError::InvalidData(format!(
+                    "attachment cutover is complete but schema ledger is at V{version}, expected V{ATTACHMENT_CUTOVER_VERSION}"
+                )))
+            }
+        }
+        Some((state, completed_at)) => Err(SqliteError::InvalidData(format!(
+            "invalid attachment cutover marker state {state:?} with completed_at={completed_at:?}"
+        ))),
+        None => Err(SqliteError::InvalidData(
+            "attachment cutover marker table exists without its singleton row".into(),
+        )),
+    }
+}
+
+fn require_legacy_attachment_fences(conn: &Connection) -> Result<(), SqliteError> {
+    if !schema_column_exists(conn, "entities", "content_ref")? {
+        return Err(SqliteError::InvalidData(
+            "attachment cutover requires legacy entities.content_ref until finalization".into(),
+        ));
+    }
+    for (object_type, name) in [
+        ("table", "blob_gc_claims"),
+        ("index", "idx_blob_gc_claims_content_ref"),
+        ("index", "idx_entities_content_ref"),
+        ("trigger", "entities_reject_claimed_blob_insert"),
+        ("trigger", "entities_reject_claimed_blob_update"),
+    ] {
+        if !schema_object_exists(conn, object_type, name)? {
+            return Err(SqliteError::InvalidData(format!(
+                "attachment cutover requires legacy {object_type} {name:?} until finalization"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_canonical_legacy_refs(conn: &Connection) -> Result<(), SqliteError> {
+    let invalid: Option<String> = conn
+        .query_row(
+            "SELECT id FROM entities \
+             WHERE content_ref IS NOT NULL \
+               AND (typeof(content_ref) <> 'text' \
+                 OR length(content_ref) <> 64 \
+                 OR content_ref GLOB '*[^0-9a-f]*') \
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = invalid {
+        return Err(SqliteError::InvalidData(format!(
+            "entities.content_ref for record {id:?} is not a canonical 64-character lowercase hexadecimal ContentRef"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_canonical_attachment_and_claim_refs(conn: &Connection) -> Result<(), SqliteError> {
+    for (table, identity) in [
+        ("attachments", "record_uuid"),
+        ("blob_gc_claims", "root_key"),
+    ] {
+        let sql = format!(
+            "SELECT {identity} FROM {table} \
+             WHERE typeof(content_ref) <> 'text' \
+                OR length(content_ref) <> 64 \
+                OR content_ref GLOB '*[^0-9a-f]*' \
+             LIMIT 1"
+        );
+        let invalid: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).optional()?;
+        if let Some(owner) = invalid {
+            return Err(SqliteError::InvalidData(format!(
+                "{table}.content_ref for {identity} {owner:?} is not canonical"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_attachment_record_owners(conn: &Connection) -> Result<(), SqliteError> {
+    let dangling: Option<(String, String)> = conn
+        .query_row(
+            "SELECT record_uuid, substrate FROM attachments AS attachment \
+             WHERE (substrate = 'entity' AND NOT EXISTS ( \
+                       SELECT 1 FROM entities WHERE id = attachment.record_uuid \
+                   )) \
+                OR (substrate = 'note' AND NOT EXISTS ( \
+                       SELECT 1 FROM notes WHERE id = attachment.record_uuid \
+                   )) \
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((record_uuid, substrate)) = dangling {
+        return Err(SqliteError::InvalidData(format!(
+            "attachment role references absent {substrate} record {record_uuid:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_legacy_content_backfill(conn: &Connection) -> Result<(), SqliteError> {
+    let conflict: Option<String> = conn
+        .query_row(
+            "SELECT entity.id FROM entities AS entity \
+             LEFT JOIN attachments AS attachment \
+               ON attachment.record_uuid = entity.id AND attachment.role = 'content' \
+             WHERE entity.content_ref IS NOT NULL \
+               AND (attachment.record_uuid IS NULL \
+                 OR attachment.substrate <> 'entity' \
+                 OR attachment.content_ref <> entity.content_ref) \
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(record_uuid) = conflict {
+        return Err(SqliteError::InvalidData(format!(
+            "legacy content attachment for entity {record_uuid:?} is missing or conflicts with entities.content_ref"
+        )));
+    }
+    Ok(())
+}
+
+fn stage_attachment_cutover_on_connection(conn: &Connection, now: i64) -> Result<(), SqliteError> {
+    require_legacy_attachment_fences(conn)?;
+    conn.execute_batch(V21_STAGE_UP)?;
+    validate_canonical_legacy_refs(conn)?;
+    validate_canonical_attachment_and_claim_refs(conn)?;
+
+    let conflict: Option<String> = conn
+        .query_row(
+            "SELECT entity.id FROM entities AS entity \
+             JOIN attachments AS attachment \
+               ON attachment.record_uuid = entity.id AND attachment.role = 'content' \
+             WHERE entity.content_ref IS NOT NULL \
+               AND (attachment.substrate <> 'entity' \
+                 OR attachment.content_ref <> entity.content_ref) \
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(record_uuid) = conflict {
+        return Err(SqliteError::InvalidData(format!(
+            "existing content attachment for entity {record_uuid:?} conflicts with entities.content_ref"
+        )));
+    }
+
+    conn.execute(
+        "INSERT INTO attachments \
+         (record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at) \
+         SELECT id, 'entity', 'content', content_ref, NULL, NULL, created_at \
+         FROM entities WHERE content_ref IS NOT NULL \
+         ON CONFLICT(record_uuid, role) DO NOTHING",
+        [],
+    )?;
+    validate_legacy_content_backfill(conn)?;
+
+    // The caller holds the canonical database GC owner, so every preexisting
+    // claim is abandoned. Clearing happens before the durable incomplete
+    // marker is exposed and remains inside this one transaction.
+    conn.execute("DELETE FROM blob_gc_claims", [])?;
+    conn.execute(
+        "INSERT INTO attachment_cutover_state \
+         (singleton, state, started_at, completed_at) \
+         VALUES (1, 'incomplete', ?1, NULL) \
+         ON CONFLICT(singleton) DO NOTHING",
+        [now],
+    )?;
+    Ok(())
+}
+
+/// Commit stage 1 of the coordinated V21 migration.
+///
+/// The caller must hold [`crate::stores::blob::DatabaseGcOwnerGuard`] for the
+/// canonical database before entering this function and retain it through
+/// application backfill and finalization. This function owns one IMMEDIATE
+/// SQLite transaction; a failure leaves neither its DDL nor marker visible.
+pub fn stage_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteError> {
+    match attachment_cutover_status(conn)? {
+        AttachmentCutoverStatus::Complete => return Ok(()),
+        AttachmentCutoverStatus::Pending | AttachmentCutoverStatus::Incomplete => {}
+    }
+    if read_schema_version(conn)? != ATTACHMENT_CUTOVER_VERSION - 1 {
+        return Err(SqliteError::InvalidData(format!(
+            "attachment cutover stage requires canonical V{} schema",
+            ATTACHMENT_CUTOVER_VERSION - 1
+        )));
+    }
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let status = attachment_cutover_status(&tx)?;
+    if status == AttachmentCutoverStatus::Complete {
+        return Ok(());
+    }
+    stage_attachment_cutover_on_connection(&tx, chrono::Utc::now().timestamp_micros())?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Add one host-verified pack-owned attachment during V21 stage 2.
+///
+/// This helper is deliberately transaction-neutral: it neither begins nor
+/// commits a transaction. The boot coordinator can therefore apply the full
+/// verified vector in one caller-owned IMMEDIATE transaction while retaining
+/// the canonical database GC owner. Reapplying the same role and content is
+/// idempotent; a different substrate or digest for that role fails closed.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_generic_verified_attachment(
+    conn: &Connection,
+    record_uuid: &str,
+    substrate: &str,
+    role: &str,
+    content_ref: &ContentRef,
+    media_type: Option<&str>,
+    size_bytes: Option<u64>,
+    created_at: i64,
+) -> Result<(), SqliteError> {
+    if attachment_cutover_status(conn)? != AttachmentCutoverStatus::Incomplete {
+        return Err(SqliteError::InvalidData(
+            "verified application attachments may only be applied while V21 cutover is incomplete"
+                .into(),
+        ));
+    }
+    if role.is_empty() || role.chars().any(char::is_control) {
+        return Err(SqliteError::InvalidData(
+            "attachment role must be non-empty and contain no control characters".into(),
+        ));
+    }
+    let size_bytes = size_bytes.map(i64::try_from).transpose().map_err(|_| {
+        SqliteError::InvalidData("attachment size_bytes exceeds SQLite INTEGER".into())
+    })?;
+    let owner_table = match substrate {
+        "entity" => "entities",
+        "note" => "notes",
+        other => {
+            return Err(SqliteError::InvalidData(format!(
+                "attachment substrate must be 'entity' or 'note', got {other:?}"
+            )))
+        }
+    };
+    let owner_sql = format!("SELECT COUNT(*) > 0 FROM {owner_table} WHERE id = ?1");
+    let owner_exists: bool = conn.query_row(&owner_sql, [record_uuid], |row| row.get(0))?;
+    if !owner_exists {
+        return Err(SqliteError::InvalidData(format!(
+            "cannot attach role {role:?}: {substrate} record {record_uuid:?} does not exist"
+        )));
+    }
+    let claimed: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM blob_gc_claims WHERE content_ref = ?1",
+        [content_ref.as_str()],
+        |row| row.get(0),
+    )?;
+    if claimed {
+        return Err(SqliteError::InvalidData(format!(
+            "cannot attach claimed content_ref {} during V21 cutover",
+            content_ref.as_str()
+        )));
+    }
+
+    let changed = conn.execute(
+        "INSERT INTO attachments \
+         (record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(record_uuid, role) DO UPDATE SET \
+             media_type = excluded.media_type, \
+             size_bytes = excluded.size_bytes, \
+             created_at = excluded.created_at \
+         WHERE attachments.substrate = excluded.substrate \
+           AND attachments.content_ref = excluded.content_ref",
+        rusqlite::params![
+            record_uuid,
+            substrate,
+            role,
+            content_ref.as_str(),
+            media_type,
+            size_bytes,
+            created_at,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(SqliteError::InvalidData(format!(
+            "attachment role {role:?} for record {record_uuid:?} conflicts with an existing substrate or content_ref"
+        )));
+    }
+    Ok(())
+}
+
+fn finalize_attachment_cutover_on_connection(
+    conn: &Connection,
+    now: i64,
+) -> Result<(), SqliteError> {
+    require_legacy_attachment_fences(conn)?;
+    validate_canonical_legacy_refs(conn)?;
+    validate_canonical_attachment_and_claim_refs(conn)?;
+    validate_attachment_record_owners(conn)?;
+    validate_legacy_content_backfill(conn)?;
+
+    let remaining_claims: i64 =
+        conn.query_row("SELECT COUNT(*) FROM blob_gc_claims", [], |row| row.get(0))?;
+    if remaining_claims != 0 {
+        return Err(SqliteError::InvalidData(format!(
+            "attachment cutover cannot finalize while {remaining_claims} blob GC claim rows remain"
+        )));
+    }
+
+    let uncovered_model: Option<String> = conn
+        .query_row(
+            "SELECT model.id FROM entities AS model \
+             WHERE model.entity_type = 'moodboard_model' \
+               AND model.content_ref IS NOT NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM attachments AS attachment \
+                   WHERE attachment.record_uuid = model.id \
+                     AND attachment.substrate = 'entity' \
+                     AND attachment.role = 'fann-network' \
+               ) \
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(record_uuid) = uncovered_model {
+        return Err(SqliteError::InvalidData(format!(
+            "moodboard_model {record_uuid:?} has legacy content but no verified 'fann-network' attachment"
+        )));
+    }
+
+    conn.execute_batch(V21_ATTACHMENT_FENCES_UP)?;
+    conn.execute_batch(
+        "DROP TRIGGER entities_reject_claimed_blob_insert; \
+         DROP TRIGGER entities_reject_claimed_blob_update; \
+         DROP INDEX idx_entities_content_ref; \
+         ALTER TABLE entities DROP COLUMN content_ref;",
+    )?;
+    conn.execute(
+        "UPDATE attachment_cutover_state \
+         SET state = 'complete', completed_at = ?1 \
+         WHERE singleton = 1 AND state = 'incomplete'",
+        [now],
+    )?;
+    Ok(())
+}
+
+fn record_attachment_cutover_migration(conn: &Connection, now: i64) -> Result<(), SqliteError> {
+    let migration = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == ATTACHMENT_CUTOVER_VERSION)
+        .expect("V21 migration must be registered");
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![migration.version, migration.name, now],
+    )?;
+    Ok(())
+}
+
+/// Atomically switch an explicitly staged database to attachment-only V21.
+///
+/// The caller must still hold the canonical database GC owner. The exclusive
+/// transition revalidates every legacy and attachment reference, verifies
+/// moodboard model role coverage, replaces the claim fences, removes the old
+/// column, marks the cutover complete, and records V21 in one transaction.
+pub fn finalize_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteError> {
+    if attachment_cutover_status(conn)? == AttachmentCutoverStatus::Complete {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
+    match attachment_cutover_status(&tx)? {
+        AttachmentCutoverStatus::Complete => return Ok(()),
+        AttachmentCutoverStatus::Pending => {
+            return Err(SqliteError::InvalidData(
+                "attachment cutover must complete stage 1 before finalization".into(),
+            ))
+        }
+        AttachmentCutoverStatus::Incomplete => {}
+    }
+    let now = chrono::Utc::now().timestamp_micros();
+    finalize_attachment_cutover_on_connection(&tx, now)?;
+    record_attachment_cutover_migration(&tx, now)?;
+    tx.commit()?;
+    Ok(())
+}
 
 /// Read the ordered migration ledger prefix without interpreting its rows.
 fn read_applied_migration_ledger(
@@ -382,8 +928,6 @@ fn validate_applied_migration_ledger(
 
 const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
 
-/// Apply all unapplied migrations in order. Idempotent; each migration runs in its own transaction.
-/// Errors on non-contiguous version array or failed migration.
 /// Read the applied schema version from an open connection **without** running
 /// migrations. Returns 0 when the `_schema_migrations` ledger is absent (an
 /// un-migrated or empty database); any other failure (BUSY, IO) propagates —
@@ -412,6 +956,13 @@ pub fn read_schema_version(conn: &Connection) -> Result<u32, SqliteError> {
 pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError> {
     let conn = crate::pool::open_read_only_snapshot_connection(path)?;
     read_schema_version(&conn)
+}
+
+/// Open `path` read-only and require the exact canonical current ledger and
+/// physical cutover state, without creating files or applying migrations.
+pub fn inspect_schema_is_current(path: &std::path::Path) -> Result<u32, SqliteError> {
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
+    validate_schema_is_current(&conn)
 }
 
 /// Require an already-open database to match this build's latest core schema
@@ -449,6 +1000,13 @@ pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError>
     // must not accept a history that ordinary boot would reject merely because
     // it cannot repair it in place.
     validate_applied_migration_ledger(conn, current_version)?;
+    if current_version == ATTACHMENT_CUTOVER_VERSION
+        && attachment_cutover_status(conn)? != AttachmentCutoverStatus::Complete
+    {
+        return Err(SqliteError::InvalidData(
+            "read-only database has not completed the V21 attachment cutover".into(),
+        ));
+    }
 
     Ok(current_version)
 }
@@ -500,7 +1058,78 @@ pub(crate) mod test_sync {
     }
 }
 
+/// Apply the ordinary unapplied migration prefix in order.
+///
+/// The operation is idempotent and each ordinary migration runs in its own
+/// transaction. V21 is the application-assisted exception: a database with no
+/// legacy content references may complete V21 atomically here, while a legacy
+/// database stops successfully at V20 so the async host can stage, verify, and
+/// finalize the attachment cutover. Errors on a non-contiguous migration array,
+/// a non-canonical applied ledger, or a failed migration.
+fn canonical_connection_database_path(conn: &Connection) -> Result<Option<PathBuf>, SqliteError> {
+    let configured = conn.path().unwrap_or_default();
+    let raw_path = if configured.is_empty() {
+        conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?
+    } else {
+        configured.to_string()
+    };
+
+    if raw_path.is_empty() {
+        return Ok(None);
+    }
+    std::fs::canonicalize(&raw_path)
+        .map(Some)
+        .map_err(SqliteError::Io)
+}
+
+fn validate_database_gc_owner(
+    conn: &Connection,
+    owner: &DatabaseGcOwnerGuard,
+) -> Result<(), SqliteError> {
+    let connection_path = canonical_connection_database_path(conn)?;
+    if owner.database_path() != connection_path.as_deref() {
+        return Err(SqliteError::InvalidData(format!(
+            "database GC owner targets {:?}, but migration connection targets {:?}",
+            owner.database_path(),
+            connection_path.as_deref(),
+        )));
+    }
+    Ok(())
+}
+
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
+    let database_path = canonical_connection_database_path(conn)?;
+    if let Some(database_path) = database_path {
+        // This raw API may have been handed a connection behind an opaque pool
+        // writer guard. Never wait here and invert the canonical
+        // owner-before-writer order; fail closed and direct production callers
+        // to `StorageBackend::prepare_core_schema` instead.
+        let owner = try_acquire_database_gc_owner_for_path(database_path).map_err(|error| {
+            SqliteError::InvalidData(format!(
+                "failed to acquire database GC owner before schema migration: {error}"
+            ))
+        })?;
+        return run_migrations_with_database_gc_owner(conn, &owner);
+    }
+
+    // A raw in-memory connection has no durable/cross-process GC domain. The
+    // production in-memory backend still uses the owner-aware path below.
+    run_migrations_with_busy_timeout(conn)
+}
+
+pub(crate) fn run_migrations_with_database_gc_owner(
+    conn: &mut Connection,
+    owner: &DatabaseGcOwnerGuard,
+) -> Result<u32, SqliteError> {
+    validate_database_gc_owner(conn, owner)?;
+    run_migrations_with_busy_timeout(conn)
+}
+
+fn run_migrations_with_busy_timeout(conn: &mut Connection) -> Result<u32, SqliteError> {
     // Concurrent boots (multiple processes migrating the same file) contend on
     // the write lock below; a short hot-path busy_timeout cannot wait out a
     // sibling's migration. Raise-only to a 5s floor — never reduce a caller
@@ -647,11 +1276,56 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             continue;
         }
 
-        tx.execute_batch(migration.up)
-            .map_err(|e| SqliteError::Migration {
+        if migration.version == ATTACHMENT_CUTOVER_VERSION {
+            let status = attachment_cutover_status(&tx).map_err(|e| SqliteError::Migration {
                 version: migration.version,
                 error: e.to_string(),
             })?;
+            let legacy_refs: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM entities WHERE content_ref IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                })?;
+
+            // V21 belongs to the boot coordinator. Ordinary backend open may
+            // finish the degenerate zero-ref case atomically, but it must not
+            // expose a dual-source interval or eagerly stage a legacy DB.
+            if status == AttachmentCutoverStatus::Incomplete || legacy_refs != 0 {
+                drop(tx);
+                break;
+            }
+            if status != AttachmentCutoverStatus::Pending {
+                return Err(SqliteError::Migration {
+                    version: migration.version,
+                    error: format!("unexpected attachment cutover state {status:?}"),
+                });
+            }
+
+            let now = chrono::Utc::now().timestamp_micros();
+            stage_attachment_cutover_on_connection(&tx, now).map_err(|e| {
+                SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                }
+            })?;
+            finalize_attachment_cutover_on_connection(&tx, now).map_err(|e| {
+                SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                }
+            })?;
+        } else {
+            tx.execute_batch(migration.up)
+                .map_err(|e| SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                })?;
+        }
 
         // V19's repair contract includes normalizing the two known-divergent
         // recorded names. `_schema_migrations` is created and owned by this
