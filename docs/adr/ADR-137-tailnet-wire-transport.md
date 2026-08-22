@@ -149,6 +149,11 @@ Cursor scope is per topic; a cursor from one topic has no meaning for another. T
 
 Protocol version numbers are monotonic; a server supports the current version and at least the immediately prior version, and a breaking wire change — including a new frame kind or a new wire error code — is never introduced within a version number.
 
+> **Amended.** Amendment 1, decision 1, bounds the rule above at the version floor: the supported
+> range is `[max(1, current - 1), current]`, so at the current version of `1` there is no prior
+> version and the range is `[1, 1]`. Read without that bound, the sentence would require supporting
+> version `0`, which decision 1 declares invalid.
+
 ### Implementation-phase deliverables
 
 The exact numeric defaults for frame-size and in-flight-request limits, a golden-frame fixture suite, decoder fuzzing, cross-client conformance testing, and the exhaustive per-topic subscription payload catalog (the concrete list of topics and each topic's `payload` field schema, within the envelope this ADR defines above) are implementation-phase deliverables owned by the `khive-wire-protocol` crate maintainer. Enabling TCP subscriptions, or any inbound edge adapter, for any peer class is gated on that conformance suite passing, including conformance coverage of the published topic catalog; this ADR does not authorize enabling subscriptions before the gate is satisfied.
@@ -222,6 +227,21 @@ does today and the crate must move to match.
    construction error, not a wire error, and it never reaches a peer. Requiring it keeps a
    conforming encoder from producing a frame whose only possible outcome at the far end is
    rejection.
+
+   **This decision bounds the parent's compatibility rule at the floor, and the bound has to be
+   written down because the code already has it and the prose does not.** The parent states that a
+   server supports the current version and at least the immediately prior version. Read literally at
+   a current version of `1`, that sentence requires supporting version `0`, which the same decision
+   declares invalid. The supported range is therefore `[max(1, current - 1), current]`: the lower
+   bound saturates at the floor rather than descending below it, so at version `1` the range is
+   `[1, 1]` and there is no prior version to support. The parent sentence carries an inline note
+   pointing here, and the crate documentation restates the unbounded form in its own versioning
+   section, which the precedence list below names.
+
+   This is the quietest kind of divergence and worth stating for that reason. The implementation
+   already saturates correctly, so nothing fails and no test goes red; only the two prose statements
+   disagree with the decision, and an independent implementer working from either of them would
+   build a receiver that accepts a version the protocol does not define.
 
 2. **Frame ceiling and accounting — RATIFIED. This decision fixes the frame-size default that the
    parent left deferred.** Frames are length-prefixed with a four-byte big-endian payload length.
@@ -390,11 +410,12 @@ does today and the crate must move to match.
 ### Precedence over the crate documentation
 
 The parent states that the crate's own documentation "is the normative wire specification", which
-makes that documentation a second authority and not merely a description. Four decisions above
-contradict it as it stands today, so a second implementer reading the crate docs — exactly as the
-parent instructs — would build the behaviour this amendment removes. **Where this amendment and the
-current crate documentation disagree, this amendment governs, and the documentation is superseded
-in the following places:**
+makes that documentation a second authority and not merely a description. Six of the ten decisions
+above contradict it as it stands today — decisions 1, 4, 5, 6, 9, and 10 — so a second implementer
+reading the crate docs, exactly as the parent instructs, would build behaviour this amendment
+removes. The decisions are named rather than counted so that a reader can check the claim against
+the list instead of trusting the number. **Where this amendment and the current crate documentation
+disagree, this amendment governs, and the documentation is superseded in the following places:**
 
 - The module documentation's stated boundaries that an explicit `null` on an optional field is
   equivalent to absence and that duplicate members are last-wins — superseded by decision 4.
@@ -402,16 +423,32 @@ in the following places:**
   and `event.payload` are preserved as JSON values with semantic rather than byte equality, together
   with the named codec test it cites as pinning that behaviour — superseded by decision 9.
 - The module documentation's unknown-error-code paragraph, which classifies an unrecognized code as
-  `internal` including where it carries no operation id — superseded by decision 5 for the id-less
-  case only, per that decision's own split.
+  `internal` including where it carries no operation id, **and the wire-error module's own
+  documentation, which quotes the parent's superseded sentence verbatim and presents it as the
+  governing rule** — both superseded by decision 5 for the id-less case only, per that decision's
+  own split. The second site matters more than the first: a passage that quotes an authority is read
+  as reporting it rather than as making a claim of its own, so it survives a review that corrects the
+  passage beside it.
+- The module documentation's versioning section, which restates the parent's compatibility rule in
+  its unbounded form — superseded by decision 1's floor bound, on the same reasoning as the parent
+  sentence.
 - The handshake gate's documentation, which describes the gate as the server-side inbound admission
   point — superseded by decision 6, which requires the rule on both endpoint roles.
 
-Decision 10 is absent from this list deliberately: the crate documentation describes `event.payload`
-as JSON whose field-by-field shape is owned by the per-topic catalog, and never states that a
-non-object payload is acceptable, so there is nothing there to supersede. Naming that explicitly is
-the point of the list, because a precedence list with a silent omission reads as an oversight and
-invites a reader to supply the missing entry themselves.
+Decision 10's entry needs a distinction rather than an omission. The crate documentation calls the
+two opaque values "data, not grammar" and assigns their field-by-field shape to the verb result
+surface and the per-topic event catalog, "not by this crate". Decision 10 does not disturb the
+second half: which fields a given topic's payload carries is still the catalog's business and not
+this crate's. It does displace the first half at the envelope level, because requiring
+`event.payload` to be a JSON object makes its outermost type a grammar rule the crate enforces on
+both sides. **So the superseded passage is the "data, not grammar" characterization as it applies to
+the outermost type of `event.payload`, and nothing further.**
+
+That distinction is worth the sentence it costs. An earlier draft of this list recorded decision 10
+as displacing nothing at all, on the grounds that the crate documentation never says a non-object
+payload is acceptable. That is true and it is not the question: a document that disclaims ownership
+of a rule licenses the absence of that rule just as effectively as one that states the permissive
+version, and the reader who follows the disclaimer arrives at the same wrong implementation.
 
 **This list is a debt, not a resolution.** The implementation that ratifies these decisions updates
 the crate documentation in the same change, at which point this section becomes redundant and
