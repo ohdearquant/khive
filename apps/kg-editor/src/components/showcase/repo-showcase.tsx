@@ -1137,10 +1137,12 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       const requestedPath = parsed.location.modulePath;
       let nextModuleId: string | null = defaultModuleId;
       let nextUnresolved: typeof unresolvedModule = null;
+      let resolvedModuleRestore = false;
       if (requestedPath) {
         const matches = modulesBySourcePath.get(requestedPath) ?? [];
         if (matches.length === 1) {
           nextModuleId = matches[0].id;
+          resolvedModuleRestore = true;
         } else {
           nextModuleId = null;
           nextUnresolved = {
@@ -1185,6 +1187,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         setNavigationStatus(
           `Restored ${capability.views[nextView].label} for ${moduleLabel}.`,
         );
+        if (resolvedModuleRestore) focusAndScrollInspector();
       }
 
       const canonical = repositoryLocationUrl(
@@ -1352,9 +1355,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     });
   }
 
-  function inspectModule(moduleId: string) {
-    if (!moduleById.has(moduleId)) return;
-    selectModule(moduleId);
+  function focusAndScrollInspector() {
     const inspector = moduleInspectorRef.current;
     if (!inspector) return;
     inspector.focus({ preventScroll: true });
@@ -1365,6 +1366,12 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       behavior: reduceMotion ? "auto" : "smooth",
       block: "start",
     });
+  }
+
+  function inspectModule(moduleId: string) {
+    if (!moduleById.has(moduleId)) return;
+    selectModule(moduleId);
+    focusAndScrollInspector();
   }
   return (
     <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>

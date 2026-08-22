@@ -88,6 +88,14 @@ describe("repository showcase", () => {
     await user.click(hiddenCoupling);
     expect(pushState).toHaveBeenCalledTimes(2);
 
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(inspector, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    inspector.blur();
+    expect(inspector).not.toHaveFocus();
+
     window.history.replaceState(null, "", direct);
     window.dispatchEvent(new PopStateEvent("popstate"));
     await waitFor(() =>
@@ -106,6 +114,8 @@ describe("repository showcase", () => {
       `Restored ${bundle.capability.views.dependency_topology.label} for ${pool.source_path}.`,
     );
     expect(pushState).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(inspector).toHaveFocus());
+    expect(scrollIntoView).toHaveBeenCalled();
     // Measured ~1.1-2.2s locally for this golden-fixture, multi-navigation flow; full-suite
     // CPU contention pushed it past the default 5s timeout, so this needs headroom.
   }, 20_000);

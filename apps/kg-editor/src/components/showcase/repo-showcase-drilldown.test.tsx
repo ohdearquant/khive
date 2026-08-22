@@ -157,6 +157,9 @@ describe("repository showcase analysis drilldown", () => {
     const coupling = bundle.aggregates.hidden_coupling.data.items.find((row) =>
       row.left_module_id !== row.right_module_id
     )!;
+    const left = bundle.graph.modules.items.find((module) =>
+      module.id === coupling.left_module_id
+    )!;
     const right = bundle.graph.modules.items.find((module) =>
       module.id === coupling.right_module_id
     )!;
@@ -168,16 +171,43 @@ describe("repository showcase analysis drilldown", () => {
     )!;
     const user = userEvent.setup();
     const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
 
     await user.click(screen.getByRole("button", {
       name: bundle.capability.views.hidden_coupling.label,
     }));
     let panel = container.querySelector<HTMLElement>(".repo-view-panel")!;
-    await user.click(within(panel).getAllByRole("button", {
+    const couplingRow = within(panel).getAllByRole("button", {
       name: `Inspect ${right.source_path}`,
-    })[0]);
+    })
+      .map((button) => button.closest("tr")!)
+      .find((row) =>
+        within(row).queryByRole("button", {
+          name: `Inspect ${left.source_path}`,
+        })
+      )!;
+
+    await user.click(within(couplingRow).getByRole("button", {
+      name: `Inspect ${right.source_path}`,
+    }));
     expect(new URL(window.location.href).searchParams.get("module"))
       .toBe(right.source_path);
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 }))
+        .toHaveTextContent(right.source_path)
+    );
+
+    await user.click(within(couplingRow).getByRole("button", {
+      name: `Inspect ${left.source_path}`,
+    }));
+    expect(new URL(window.location.href).searchParams.get("module"))
+      .toBe(left.source_path);
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 }))
+        .toHaveTextContent(left.source_path)
+    );
 
     await user.click(screen.getByRole("button", {
       name: bundle.capability.views.dependency_topology.label,
@@ -229,7 +259,13 @@ describe("repository showcase analysis drilldown", () => {
         `[data-missing-module-id="${missingId}"]`,
       );
       expect(missing).toHaveTextContent(expectedReason);
+      expect(
+        panel.querySelector(`[data-module-id="${missingId}"]`),
+      ).not.toBeInTheDocument();
       expect(within(panel).queryByRole("button", {
+        name: `Inspect ${missingId}`,
+      })).not.toBeInTheDocument();
+      expect(within(panel).queryByRole("link", {
         name: `Inspect ${missingId}`,
       })).not.toBeInTheDocument();
     },
