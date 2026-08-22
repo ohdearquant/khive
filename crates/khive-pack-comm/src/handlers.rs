@@ -3319,6 +3319,7 @@ mod tests {
         let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
@@ -3845,6 +3846,7 @@ mod tests {
         let ns = format!("mark-read-cas-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
@@ -3961,6 +3963,7 @@ mod tests {
             let ns = format!("mark-read-non-object-{case}-{}", Uuid::new_v4().simple());
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
                 git_write: Default::default(),
+                display_timezone: khive_runtime::config::resolve_default_display_timezone(),
                 db_path: None,
                 blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::parse(&ns).unwrap(),

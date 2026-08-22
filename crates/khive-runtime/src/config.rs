@@ -310,6 +310,12 @@ pub struct RuntimeConfig {
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
+    /// Resolved rendering timezone (ADR-169), consumed today by date-only
+    /// `parse_due` anchoring. Populated from `[display] timezone` in
+    /// `khive.toml` by [`runtime_config_from_khive_config`]; when absent,
+    /// resolves once to the host's local IANA zone (falling back to UTC when
+    /// the host zone cannot be determined) via [`resolve_default_display_timezone`].
+    pub display_timezone: chrono_tz::Tz,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -339,6 +345,18 @@ fn ann_fresh_tail_enabled_from_value(value: Option<&str>) -> bool {
 pub fn ann_fresh_tail_enabled_from_env() -> bool {
     let value = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
     ann_fresh_tail_enabled_from_value(value.as_deref())
+}
+
+/// Resolve the host's local IANA zone name once, for [`RuntimeConfig`]'s
+/// default `display_timezone` (ADR-169). Falls back to UTC when the host
+/// zone cannot be determined (e.g. `TZ`/`/etc/localtime` unreadable) or does
+/// not parse as a known `chrono_tz::Tz` — this must never panic or block
+/// construction of a default `RuntimeConfig`.
+pub fn resolve_default_display_timezone() -> chrono_tz::Tz {
+    iana_time_zone::get_timezone()
+        .ok()
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Tz::UTC)
 }
 
 impl Default for RuntimeConfig {
@@ -382,6 +400,7 @@ impl Default for RuntimeConfig {
             allowed_outbound_namespaces: vec![],
             actor_id,
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
+            display_timezone: resolve_default_display_timezone(),
         }
     }
 }
@@ -719,6 +738,17 @@ pub fn runtime_config_from_khive_config(
         .blob_hydration_bytes
         .unwrap_or(base.blob_hydration_bytes);
 
+    // KhiveConfig::validate() guarantees a present timezone parses as a valid
+    // chrono_tz::Tz, so the fallback to base.display_timezone below is only
+    // reachable for an unvalidated caller-constructed KhiveConfig, not a
+    // config loaded via KhiveConfig::load.
+    let display_timezone = khive_cfg
+        .display
+        .timezone
+        .as_deref()
+        .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(base.display_timezone);
+
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
             default_namespace,
@@ -728,6 +758,7 @@ pub fn runtime_config_from_khive_config(
             actor_id,
             git_write,
             blob_hydration_bytes,
+            display_timezone,
             ..base
         };
     }
@@ -764,7 +795,21 @@ pub fn runtime_config_from_khive_config(
         actor_id,
         git_write,
         blob_hydration_bytes,
+        display_timezone,
         ..base
+    }
+}
+
+#[cfg(test)]
+mod display_timezone_tests {
+    use super::resolve_default_display_timezone;
+
+    // The host's actual zone is environment-dependent (CI runners are
+    // typically UTC), so this only asserts the resolver always produces some
+    // valid, non-panicking Tz — never that it matches a specific zone.
+    #[test]
+    fn resolve_default_display_timezone_never_panics() {
+        let _tz = resolve_default_display_timezone();
     }
 }
 

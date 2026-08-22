@@ -2173,6 +2173,7 @@ version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "chrono-tz",
  "criterion",
  "inventory",
  "khive-pack-kg",
@@ -2452,6 +2453,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "chrono-tz",
+ "iana-time-zone",
  "inventory",
  "khive-db",
  "khive-fold",

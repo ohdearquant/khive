@@ -21,6 +21,7 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
     };
     KhiveRuntime::new(RuntimeConfig {
         git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         db_path: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         embedding_model: None,
@@ -38,6 +39,7 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
 fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
         git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         db_path: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),

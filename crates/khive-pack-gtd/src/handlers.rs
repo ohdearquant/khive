@@ -13,7 +13,8 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Offset, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -492,30 +493,174 @@ pub fn render_task(note: &khive_storage::note::Note) -> Value {
 
 /// Parse a user-supplied due-date string as an ISO-8601 / RFC 3339 timestamp.
 ///
-/// Accepts full RFC 3339 (e.g. `2026-06-01T00:00:00Z`) or date-only
-/// (e.g. `2026-06-01`) by appending midnight UTC if necessary.
-/// Returns the canonical RFC 3339 string stored in `properties.due`.
-/// Shared with `hook.rs`.
-pub(crate) fn parse_due(value: &str) -> Result<String, RuntimeError> {
-    // Try full RFC 3339 / ISO-8601 with time zone first.
+/// Accepts full RFC 3339 (e.g. `2026-06-01T00:00:00Z`) — normalized to UTC and
+/// otherwise unaffected by `tz` — or date-only (e.g. `2026-06-01`), which
+/// resolves to the earliest instant that belongs to that calendar date in
+/// `tz` (ADR-169 D1). Returns the canonical RFC 3339 string stored in
+/// `properties.due`, in `tz`'s offset spelling for the date-only case
+/// (ADR-169 D5) — the value remains a single absolute instant; the offset
+/// records which calendar the date was anchored in.
+pub(crate) fn parse_due(value: &str, tz: Tz) -> Result<String, RuntimeError> {
+    // Try full RFC 3339 / ISO-8601 with time zone first. Already carries an
+    // explicit offset or `Z`, so it is unaffected by `tz` and keeps its
+    // existing UTC normalization.
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
         return Ok(dt.with_timezone(&Utc).to_rfc3339());
     }
-    // Fallback: try date-only "YYYY-MM-DD", treat as midnight UTC.
+    // Fallback: try date-only "YYYY-MM-DD".
     if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        let dt = date
-            .and_hms_opt(0, 0, 0)
-            .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+        return anchor_date_to_earliest_instant(date, tz)
+            .map(|dt| dt.to_rfc3339())
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(format!(
-                "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
-            ))
-            })?;
-        return Ok(dt.to_rfc3339());
+                    "due date {date} does not exist in the configured display timezone {tz} \
+                     (the zone's local calendar skips this date entirely); got {value:?}"
+                ))
+            });
     }
     Err(RuntimeError::InvalidInput(format!(
         "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
     )))
+}
+
+/// Resolve a calendar date to the earliest instant that belongs to it in
+/// `tz` (ADR-169 D1). Midnight is not a total function of date and zone: on a
+/// zone's own transition date local midnight can fail to exist (the clock
+/// jumps over it) or occur twice (the clock repeats it). Both are one rule —
+/// take the least instant whose local date, in `tz`, is `date` — not two
+/// exceptions to it; neither case may be resolved by unwrapping to UTC,
+/// which would silently reintroduce the defect ADR-169 exists to remove.
+///
+/// Returns `None` only when no instant at all maps to `date` in `tz` (the
+/// zone's local calendar skips the date entirely, e.g. a whole-day UTC-offset
+/// jump across the international date line) — a case ADR-169 does not name,
+/// since its own gap/ambiguity examples are ordinary sub-day transitions.
+fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<DateTime<Tz>> {
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    match tz.from_local_datetime(&midnight) {
+        chrono::LocalResult::Single(dt) => Some(dt),
+        // Fall-back overlap: two instants map to the same wall-clock time.
+        // The earlier one is the least instant whose local date is `date`.
+        chrono::LocalResult::Ambiguous(earliest, _latest) => Some(earliest),
+        // Spring-forward gap (or a larger jump): local midnight does not
+        // exist. Find the transition by probing a point on the previous
+        // calendar date guaranteed to fall outside any transition (noon),
+        // reading the offset in effect there, and using it to project
+        // `midnight` to the UTC instant it would have been under that
+        // still-prior offset. Because the local date is a monotonically
+        // non-decreasing function of UTC time, re-deriving the actual local
+        // time at that UTC instant (an unconditional, never-ambiguous
+        // UTC->local conversion) lands exactly on the first instant that
+        // exists on `date` — the moment the new offset regime begins.
+        chrono::LocalResult::None => {
+            let prev_noon = date.pred_opt()?.and_hms_opt(12, 0, 0)?;
+            let offset_before = match tz.offset_from_local_datetime(&prev_noon) {
+                chrono::LocalResult::Single(o) => o,
+                chrono::LocalResult::Ambiguous(o, _) => o,
+                chrono::LocalResult::None => return None,
+            };
+            let candidate_utc =
+                midnight - chrono::Duration::seconds(offset_before.fix().local_minus_utc() as i64);
+            let resolved = tz.from_utc_datetime(&candidate_utc);
+            (resolved.date_naive() == date).then_some(resolved)
+        }
+    }
+}
+
+#[cfg(test)]
+mod parse_due_tests {
+    use super::*;
+
+    // America/New_York (used for the west-of-UTC and general DST coverage in
+    // tests/assign.rs) never transitions at local midnight, so it cannot
+    // exercise LocalResult::None or ::Ambiguous — a "DST test" against it
+    // passes without touching the rule ADR-169 D1 actually specifies. The
+    // zones and dates below are ADR-169's own worked table (measured against
+    // the IANA database) of zones that DO transition at 00:00.
+
+    #[test]
+    fn date_only_due_resolves_to_first_instant_when_local_midnight_does_not_exist_havana() {
+        let tz: Tz = "America/Havana".parse().expect("known IANA zone");
+        let result = parse_due("2021-03-14", tz).expect(
+            "a gap date must resolve to the first instant of that date, not error (ADR-169 D1)",
+        );
+        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
+        assert_eq!(
+            parsed.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2021, 3, 14).unwrap(),
+            "got {result}"
+        );
+        assert!(
+            parsed.time() > chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            "local midnight does not exist on this date, so the resolved instant must be \
+             strictly after 00:00 — proving the gap was bridged forward, not unwrapped to UTC; \
+             got {result}"
+        );
+    }
+
+    #[test]
+    fn date_only_due_resolves_to_first_instant_when_local_midnight_does_not_exist_santiago() {
+        let tz: Tz = "America/Santiago".parse().expect("known IANA zone");
+        let result = parse_due("2021-09-05", tz).expect(
+            "a gap date must resolve to the first instant of that date, not error (ADR-169 D1)",
+        );
+        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
+        assert_eq!(
+            parsed.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2021, 9, 5).unwrap(),
+            "got {result}"
+        );
+        assert!(
+            parsed.time() > chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            "got {result}"
+        );
+    }
+
+    #[test]
+    fn date_only_due_picks_the_earlier_instant_when_local_midnight_occurs_twice_havana() {
+        let tz: Tz = "America/Havana".parse().expect("known IANA zone");
+        let date = chrono::NaiveDate::from_ymd_opt(2020, 11, 1).unwrap();
+        let midnight = date.and_hms_opt(0, 0, 0).unwrap();
+        // Derived directly from chrono_tz, independent of parse_due, so this
+        // is a cross-check against the library's own contract rather than a
+        // restatement of parse_due's internals.
+        let (earliest, latest) = match tz.from_local_datetime(&midnight) {
+            chrono::LocalResult::Ambiguous(a, b) => (a, b),
+            other => panic!(
+                "2020-11-01 in America/Havana must be ambiguous per ADR-169's worked table; \
+                 got {other:?}"
+            ),
+        };
+        assert!(
+            earliest < latest,
+            "sanity: chrono's `earliest` must be chronologically first"
+        );
+
+        let result =
+            parse_due("2020-11-01", tz).expect("an ambiguous date must resolve, not error");
+        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
+        assert_eq!(
+            parsed, earliest,
+            "parse_due must pick the earlier of the two midnight instants (ADR-169 D1); got {result}"
+        );
+    }
+
+    // Pacific/Apia jumped from UTC-11 to UTC+13 on 2011-12-30, skipping that
+    // calendar date entirely in local time — not a sub-day gap but a
+    // whole-day one, which ADR-169 D1's worked examples do not name. No
+    // instant anywhere maps to this date in this zone, so parse_due errors
+    // rather than silently resolving to a neighboring date under a
+    // mislabeled due-date.
+    #[test]
+    fn date_only_due_in_a_skipped_local_day_is_rejected() {
+        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
+        let err = parse_due("2011-12-30", tz).expect_err("2011-12-30 never existed in Apia");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2011-12-30"),
+            "error must name the unparseable due date; got: {msg}"
+        );
+    }
 }
 
 fn ts_to_rfc(micros: i64) -> String {

@@ -380,7 +380,10 @@ pub(crate) async fn prepare_task_create(
         obj.insert("assignee".into(), json!(assignee));
     }
     if let Some(ref due) = input.due {
-        obj.insert("due".into(), json!(parse_due(due)?));
+        obj.insert(
+            "due".into(),
+            json!(parse_due(due, runtime.config().display_timezone)?),
+        );
     }
     if let Some(ref start) = input.start {
         obj.insert("start".into(), json!(start));
