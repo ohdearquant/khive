@@ -1,4 +1,4 @@
-//! #2089 round-1 MEDIUM finding 2: any `GraphStore` backend that does not
+//! #2089: any `GraphStore` backend that does not
 //! override `query_edges_in_namespaces` (the trait default) must still
 //! behave correctly for the 0/1-namespace cases, and must reject a
 //! multi-namespace request with `StorageError::Unsupported { operation:
@@ -27,7 +27,7 @@ use khive_types::EdgeRelation;
 /// default (plus `query_edges`, needed for `query_edges_in_namespaces`'s
 /// 1-namespace delegation). It deliberately does NOT override
 /// `query_edges_in_namespaces` or `count_edges_in_namespaces` — exactly the
-/// "backend exercising the trait default" the round-1 review asked for.
+/// "backend exercising the trait default" this suite exists to cover.
 struct TraitDefaultOnlyGraphStore {
     edges: Mutex<Vec<Edge>>,
 }

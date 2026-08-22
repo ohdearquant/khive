@@ -555,7 +555,7 @@ async fn batched_namespace_edge_counts_exceed_sqlite_variable_limit() {
     );
 }
 
-/// #2089 round-1 HIGH finding: `query_edges_in_namespaces` used to bind one
+/// #2089: `query_edges_in_namespaces` used to bind one
 /// `?N` SQL variable per visible namespace, so a caller visible in ~998+
 /// namespaces would blow past `SQLITE_LIMIT_VARIABLE_NUMBER` (999 by
 /// default) before any filter parameter was even added — well within a
