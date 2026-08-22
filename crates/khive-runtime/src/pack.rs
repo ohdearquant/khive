@@ -6472,6 +6472,117 @@ pub(crate) mod tests {
         );
     }
 
+    /// An obligation-bearing audit row is written AFTER the handler returns, from the
+    /// handler's own return value, on its own writer acquisition. So when that row fails
+    /// to commit, `fold_audit_obligation` turns a would-be success into an error for a
+    /// dispatch whose effect has ALREADY happened and cannot be rolled back by it.
+    ///
+    /// The existing obligation test above proves the flip using `list`, a read, where the
+    /// distinction does not matter. This one pins the part that decides caller behaviour:
+    /// the write landed, and the caller was told it failed. A caller that treats this error
+    /// as "it did not run" and retries therefore applies the effect twice, which is what the
+    /// second half asserts.
+    #[tokio::test]
+    #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
+    async fn obligation_failure_reports_a_write_that_already_committed() {
+        #[derive(Debug)]
+        struct RecordingWritePack {
+            committed: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl Pack for RecordingWritePack {
+            const NAME: &'static str = "recording_write";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+                name: "create",
+                description: "record one committed write",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            }];
+        }
+
+        #[async_trait]
+        impl PackRuntime for RecordingWritePack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                // Stands in for a committed effect: by the time this returns, the write
+                // is done and nothing downstream can undo it.
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unnamed")
+                    .to_string();
+                self.committed
+                    .lock()
+                    .expect("committed lock")
+                    .push(name.clone());
+                Ok(serde_json::json!({ "created": name }))
+            }
+        }
+
+        let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failing_store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(RecordingWritePack {
+            committed: Arc::clone(&committed),
+        });
+        builder.with_event_store(failing_store);
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("create", serde_json::json!({"name": "first"}))
+            .await
+            .expect_err("an obligation commit failure must fail the dispatch");
+        assert!(
+            matches!(&err, RuntimeError::Internal(message)
+                if message.contains("audit obligation commit failed")),
+            "the error must name the obligation failure, since that string is what tells a \
+             caller the effect landed: {err}"
+        );
+
+        assert_eq!(
+            committed.lock().expect("committed lock").as_slice(),
+            &["first".to_string()],
+            "the handler's effect must already be committed when the caller is told the \
+             dispatch failed -- this is the whole property under test"
+        );
+
+        // What a caller does on a failure it believes means "did not run".
+        let _ = registry
+            .dispatch("create", serde_json::json!({"name": "first"}))
+            .await
+            .expect_err("the retry fails the same way");
+        assert_eq!(
+            committed.lock().expect("committed lock").as_slice(),
+            &["first".to_string(), "first".to_string()],
+            "retrying this error double-writes; a caller must re-derive state instead of \
+             resubmitting"
+        );
+    }
+
     #[tokio::test]
     #[serial(config_ledger)]
     #[serial(audit_append_failures)]
