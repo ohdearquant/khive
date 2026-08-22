@@ -49,10 +49,39 @@ correctness concern in query and filter paths rather than a presentation prefere
 ## Decision
 
 **D1. A date-only value is anchored to the configured display timezone, not to UTC.**
-`parse_due` and every other parser that accepts a bare `YYYY-MM-DD` resolves it to midnight in
-the configured zone. The stored value remains a single unambiguous instant; only the zone used
-to anchor it changes. A value that already carries an explicit offset or `Z` is unaffected and
-continues to be normalized as it is today.
+`parse_due` and every other parser that accepts a bare `YYYY-MM-DD` resolves it to **the earliest
+instant that belongs to that calendar date in the configured zone**. The stored value remains a
+single unambiguous instant; only the zone used to anchor it changes. A value that already carries
+an explicit offset or `Z` is unaffected and continues to be normalized as it is today.
+
+"The earliest instant of that date" rather than "midnight" because midnight is not a total
+function of date and zone, and the cases where it fails are exactly the cases a date-anchoring
+rule has to survive. Some zones transition at 00:00, so on a transition date local midnight can
+fail to exist or can occur twice:
+
+- **Midnight does not exist** (the clock jumps from 23:59:59 to 01:00:00). The anchor is the first
+  instant that exists on that date, which is the instant immediately after the gap.
+- **Midnight occurs twice** (the clock repeats the hour). The anchor is the earlier of the two.
+
+Both cases are the same rule, not two exceptions to one: take the least instant whose local date
+is the requested date. An implementation on `chrono` reads this directly off
+`from_local_datetime`, whose `LocalResult` is `None` in the first case and `Ambiguous` in the
+second; neither may be resolved by unwrapping to UTC, which would silently reintroduce the defect
+this ADR exists to remove.
+
+These are not hypothetical, and the distinction is easy to test against the wrong zone. Measured
+against the IANA database:
+
+| zone               | date       | local midnight                            |
+| ------------------ | ---------- | ----------------------------------------- |
+| `America/Havana`   | 2021-03-14 | does not exist                            |
+| `America/Santiago` | 2021-09-05 | does not exist                            |
+| `America/Havana`   | 2020-11-01 | occurs twice (offsets -04:00 then -05:00) |
+| `America/New_York` | any date   | always exists                             |
+
+A conformance test must therefore use a zone that actually transitions at 00:00. `America/New_York`
+observes DST and still cannot reach either case, so a test written against it passes without
+exercising the rule at all — which is the failure mode this table exists to prevent.
 
 **D2. A `[display]` configuration section sets the timezone used for rendering.**
 
@@ -91,6 +120,18 @@ The invariant this preserves is the one that matters: **display configuration ne
 stored value.** Changing `[display] timezone` after the fact re-renders existing timestamps and
 alters no byte of them. What D5 changes is the anchoring performed at write time on input that
 did not specify an instant at all.
+
+**Relationship to the originating directive.** The requirement this ADR implements was stated as
+"storage stays UTC". D5 preserves that requirement in the sense that carries the weight: a stored
+timestamp is still one absolute point on the timeline, still directly comparable and sortable
+against every other stored timestamp, and still convertible to UTC without loss. What D5 declines
+to preserve is the narrower reading in which the requirement governs the SPELLING of the stored
+string, so that `2026-08-23T00:00:00-04:00` would be disallowed in favour of
+`2026-08-23T04:00:00Z`. Those two denote the same instant. The offset-versus-`Z` fork was put
+directly and ruled on 2026-08-22 in favour of offset spelling, on the grounds that a bare date
+carries a calendar and which calendar was used is part of what the caller expressed. This
+paragraph exists so that a reader holding both the directive and this ADR does not have to
+reconcile them by inference.
 
 The practical consequence is that a stored value echoed back verbatim already reads as the date
 the caller wrote, so D1 closes the observed defect on its own, without waiting for D2.
@@ -199,10 +240,13 @@ Consequences for D2:
    `docs/khive-config-example.toml` and `docs/configuration.md`.
 2. Resolve the configured zone once and make it reachable from the parse sites and from
    `presentation.rs`.
-3. `parse_due` (`crates/khive-pack-gtd/src/handlers.rs:499-515`) anchors date-only input to
-   midnight in the configured zone. Tests must cover a zone west of UTC, a zone east of UTC,
-   and a DST transition date, and must assert the resulting calendar date rather than a fixed
-   offset string.
+3. `parse_due` (`crates/khive-pack-gtd/src/handlers.rs:499-515`) anchors date-only input to the
+   earliest instant of that date in the configured zone, per D1. Tests must cover a zone west of
+   UTC, a zone east of UTC, and both midnight-transition cases from D1 — a date whose local
+   midnight does not exist, and a date whose local midnight occurs twice — in a zone that
+   actually transitions at 00:00 rather than any zone that merely observes DST. Tests must assert
+   the resulting calendar date rather than a fixed offset string: a test hard-coding `-04:00`
+   passes in summer and fails in winter, which is the same class of defect this work removes.
 4. Audit the sites that write RFC 3339 strings into `properties` and decide, per field, whether
    the value is a stored fact or a rendered one. This audit is part of the work, not a
    precondition for it.
