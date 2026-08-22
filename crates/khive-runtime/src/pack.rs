@@ -5685,26 +5685,35 @@ pub(crate) mod tests {
     impl MemoryEventStore {
         /// Record a submission attempt. Call before any failure check.
         ///
-        /// The projection carries the verb and whether the row's resource has a
-        /// `cost_unit` key, not just kind and outcome. That key is the observable
-        /// consequence of the row having been built FROM the handler's return
-        /// value: `cost_unit::resource_payload` derives it from `ok_val`, while
-        /// the error path's `base_resource_payload` documents that it omits it.
-        /// Recording only the outcome would leave a submission that ignores
-        /// `ok_val` while still stamping `Success` indistinguishable from one
-        /// that sources it, and those are different implementations.
+        /// The projection carries the verb and the row's `resource.cost_unit`
+        /// value, not just kind and outcome, and not merely whether the key is
+        /// present.
+        ///
+        /// Presence alone is too weak to pin what it looks like it pins.
+        /// `cost_unit::resource_payload` inserts the key unconditionally, and
+        /// for most verbs `item_count` returns a constant `1` regardless of the
+        /// handler's return value, so a submission built from a static or null
+        /// `ok_val` still carries the key. Presence separates `resource_payload`
+        /// from the error path's `base_resource_payload`, which is a real
+        /// property but a different one.
+        ///
+        /// The value is what sources the return value, and only for a verb whose
+        /// `item_count` reads it. `knowledge.index` is that verb: `item_count`
+        /// takes `result["total"]`, so `cost_unit` is `total + 1` and moves with
+        /// what the handler returned. The fixture below uses that verb for
+        /// exactly this reason.
         fn trace_submission(&self, events: &[Event]) {
             if let Some(trace) = &self.trace {
                 let mut trace = trace.lock().expect("trace lock");
                 for event in events {
-                    let result_derived = event
+                    let cost_unit = event
                         .payload
                         .get("resource")
                         .and_then(|resource| resource.get("cost_unit"))
-                        .is_some();
+                        .map_or_else(|| "absent".to_string(), |v| v.to_string());
                     trace.push(format!(
                         "audit:{:?}:{:?}:{}:cost_unit={}",
-                        event.kind, event.outcome, event.verb, result_derived
+                        event.kind, event.outcome, event.verb, cost_unit
                     ));
                 }
             }
@@ -6549,6 +6558,12 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial(audit_append_failures)]
     #[serial(audit_obligation_append_failures)]
+    // The config ledger is process-global and an event-store dispatch drains its
+    // queue before invoking the pack, so a concurrent config_ledger test can land
+    // a submission ahead of this handler's effect and break the first-entry
+    // assertion below. That group is held for the position assertion, not for the
+    // audit counters the two groups above cover.
+    #[serial(config_ledger)]
     async fn obligation_failure_reports_a_write_that_already_committed() {
         #[derive(Debug)]
         struct RecordingWritePack {
@@ -6559,8 +6574,15 @@ pub(crate) mod tests {
             const NAME: &'static str = "recording_write";
             const NOTE_KINDS: &'static [&'static str] = &[];
             const ENTITY_KINDS: &'static [&'static str] = &[];
+            // `knowledge.index` rather than `create`, and the choice is
+            // load-bearing rather than incidental: it is the one verb whose
+            // `cost_unit` reads the handler's return value (`item_count` takes
+            // `result["total"]`). Under any other verb `item_count` is the
+            // constant `1`, so the recorded `cost_unit` would be the same
+            // whether the row was built from the result or from a static value,
+            // and the assertion below could not tell those apart.
             const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-                name: "create",
+                name: "knowledge.index",
                 description: "record one committed write",
                 visibility: Visibility::Verb,
                 category: VerbCategory::Commissive,
@@ -6602,7 +6624,11 @@ pub(crate) mod tests {
                     .lock()
                     .expect("committed lock")
                     .push(format!("effect:{name}"));
-                Ok(serde_json::json!({ "created": name }))
+                // `total` is what `cost_unit` is computed from, so this number
+                // is the test's handle on whether the audit row was built from
+                // the return value. 41 is arbitrary but distinctive: it makes
+                // the expected `cost_unit` 42, a value no default path produces.
+                Ok(serde_json::json!({ "created": name, "total": 41 }))
             }
         }
 
@@ -6620,7 +6646,7 @@ pub(crate) mod tests {
         let registry = builder.build().expect("registry builds");
 
         let err = registry
-            .dispatch("create", serde_json::json!({"name": "first"}))
+            .dispatch("knowledge.index", serde_json::json!({"name": "first"}))
             .await
             .expect_err("an obligation commit failure must fail the dispatch");
         assert!(
@@ -6656,14 +6682,18 @@ pub(crate) mod tests {
         assert!(
             audit_rows
                 .iter()
-                .any(|entry| entry.contains(":Success:create:cost_unit=true")),
+                .any(|entry| entry.contains(":Success:knowledge.index:cost_unit=42")),
             "the submitted row must be the SUCCESS row for THIS verb, carrying a resource \
-             built from the handler's return value. The outcome alone is not enough: an \
+             computed FROM the handler's return value. The outcome alone is not enough: an \
              implementation that stamps Success on a row built without `ok_val` would \
              satisfy an outcome-only assertion while breaking the contract this test \
-             exists for. `cost_unit` is the discriminator because `resource_payload` \
-             derives it from the result and `base_resource_payload` omits it. Trace was \
-             {first_pass:?}"
+             exists for. The exact value is the discriminator, not the key's presence: \
+             `resource_payload` inserts `cost_unit` unconditionally, so presence survives a \
+             static `ok_val`, while 42 is reachable only from the returned `total` of 41 \
+             (`base_weight` 1 + `item_count` 41 * `model_count` 1). Substituting a null or \
+             static result collapses it to 1, and the error path's `base_resource_payload` \
+             omits the key entirely, so all three implementations are distinguishable here. \
+             Trace was {first_pass:?}"
         );
         assert_eq!(
             first_pass
@@ -6676,7 +6706,7 @@ pub(crate) mod tests {
 
         // What a caller does on a failure it believes means "did not run".
         let _ = registry
-            .dispatch("create", serde_json::json!({"name": "first"}))
+            .dispatch("knowledge.index", serde_json::json!({"name": "first"}))
             .await
             .expect_err("the retry fails the same way");
         assert_eq!(
