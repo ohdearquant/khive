@@ -299,11 +299,21 @@ does today and the crate must move to match.
    lands on that paragraph and stops there does not walk away with the superseded rule.
 
 6. **Handshake sequence violations — CHANGED, and the change is one of role coverage rather than
-   of the rule.** A frame arriving before the handshake completes, a handshake frame arriving after
-   the handshake completes, and a frame arriving in the wrong direction are each `malformed_frame`
-   and each terminate the connection permanently. These are connection-terminal and carry no
-   operation id, because no operation is established. That rule is the parent's and it stands
-   unaltered.
+   of the rule.** A NON-HANDSHAKE frame arriving before the handshake completes, a handshake frame
+   arriving after the handshake completes, and a frame arriving in the wrong direction are each
+   `malformed_frame` and each terminate the connection permanently. These are connection-terminal
+   and carry no operation id, because no operation is established. That rule is the parent's and it
+   stands unaltered.
+
+   The `handshake` and `handshake_ack` frames are what carry the handshake to completion, so they
+   are necessarily among the frames arriving before it completes and cannot themselves be the
+   violation. The parent requires exactly this: the first application frame on every connection
+   must be a `handshake`, and decision 1 above requires a version-0 `handshake` to decode and reach
+   admission rather than being rejected at the frame grammar. An earlier wording of this decision
+   said "a frame arriving before the handshake completes" without the exclusion, which read
+   literally makes the prescribed handshake unperformable — a contradiction inside the normative
+   text, not an implementation question. The exclusion is stated here because restating a parent
+   rule is a fresh claim about it, and this restatement is where the defect entered.
 
    **What must move is that the crate enforces it for one endpoint role only.** The gate is a
    server-side inbound gate: it admits the client-to-server kinds and treats a server-to-client kind
