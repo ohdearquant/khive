@@ -56,7 +56,7 @@ test:
 # the resolver. Wired to CI on the manifests that carry that pin, so the
 # duty is triggered rather than remembered.
 tz-audit:
-	cd crates && $(CARGO) test -p khive-pack-gtd --lib tz_database_audit -- --ignored
+	cd crates && cargo test -p khive-pack-gtd --lib tz_database_audit -- --ignored
 
 contract-test:
 	cd crates && cargo build --release -p kkernel
