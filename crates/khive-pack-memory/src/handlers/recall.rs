@@ -110,6 +110,27 @@ impl MemoryPack {
         };
         let token = &effective_token;
 
+        let created_after_us = p
+            .created_after
+            .as_deref()
+            .map(|raw| super::common::parse_recall_bound("created_after", raw))
+            .transpose()?;
+        let created_before_us = p
+            .created_before
+            .as_deref()
+            .map(|raw| super::common::parse_recall_bound("created_before", raw))
+            .transpose()?;
+        if let (Some(after), Some(before)) = (created_after_us, created_before_us) {
+            if after >= before {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "memory.recall: created_after {:?} is not earlier than created_before {:?}; \
+                     the window is empty",
+                    p.created_after.as_deref().unwrap_or_default(),
+                    p.created_before.as_deref().unwrap_or_default(),
+                )));
+            }
+        }
+
         let prof = super::common::recall_profile_enabled();
         let call_id = if prof {
             let id = RECALL_CALL_ID.fetch_add(1, Ordering::Relaxed);
@@ -527,6 +548,16 @@ impl MemoryPack {
             }
             if let Some(filter_tags) = p.tags.as_ref().filter(|tags| !tags.is_empty()) {
                 if !note_matches_tags(note.properties.as_ref(), filter_tags, p.tag_mode) {
+                    continue;
+                }
+            }
+            if let Some(after) = created_after_us {
+                if note.created_at < after {
+                    continue;
+                }
+            }
+            if let Some(before) = created_before_us {
+                if note.created_at >= before {
                     continue;
                 }
             }
@@ -6433,6 +6464,149 @@ mod tests {
         assert_eq!(
             candidates, &selected,
             "candidates mirrors selected at this emission boundary"
+        );
+    }
+
+    /// created_after/created_before: half-open [after, before) window over
+    /// note.created_at, boundary pinned at one exact instant so the inclusive
+    /// and exclusive rules yield different results; plus the empty-window and
+    /// date-only-rejection error paths.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_created_at_window_filters_half_open() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        fn result_ids(v: &Value) -> Vec<String> {
+            let arr = v
+                .as_array()
+                .or_else(|| v.get("results").and_then(|r| r.as_array()))
+                .expect("array-shaped recall response");
+            arr.iter()
+                .map(|r| r["id"].as_str().expect("result id").to_string())
+                .collect()
+        }
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        let note_a = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "timewindow fixture alpha note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note a");
+        let note_b = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "timewindow fixture beta note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note b");
+
+        // Controlled instants, recent enough that decay does not zero the
+        // scores: T_A one hour before T_B, T_B one hour before now.
+        let t_b = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+        let t_a = t_b - 3_600_000_000;
+        let iso = |us: i64| {
+            chrono::DateTime::from_timestamp_micros(us)
+                .expect("valid micros")
+                .to_rfc3339()
+        };
+        {
+            let sql = rt.sql();
+            let mut writer = sql.writer().await.expect("writer");
+            for (id, us) in [(note_a.id, t_a), (note_b.id, t_b)] {
+                let changed = writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET created_at = ? WHERE id = ?".to_string(),
+                        params: vec![SqlValue::Integer(us), SqlValue::Text(id.to_string())],
+                        label: Some("test.recall_window.set_created_at".to_string()),
+                    })
+                    .await
+                    .expect("set created_at");
+                assert_eq!(changed, 1, "created_at UPDATE must hit exactly one row");
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let recall = |extra: Value| {
+            let registry = &registry;
+            async move {
+                let mut params = json!({
+                    "query": "timewindow fixture",
+                    "limit": 10
+                });
+                for (k, v) in extra.as_object().expect("extra params object") {
+                    params[k] = v.clone();
+                }
+                registry.dispatch("memory.recall", params).await
+            }
+        };
+
+        // Control: no window returns both.
+        let both = recall(json!({})).await.expect("no-window recall");
+        let both_ids = result_ids(&both);
+        assert!(
+            both_ids.contains(&note_a.id.to_string()) && both_ids.contains(&note_b.id.to_string()),
+            "control must return both fixtures, got {both_ids:?}"
+        );
+
+        // created_after at exactly T_B is INCLUSIVE: only B survives.
+        let after = recall(json!({ "created_after": iso(t_b) }))
+            .await
+            .expect("created_after recall");
+        assert_eq!(
+            result_ids(&after),
+            vec![note_b.id.to_string()],
+            "created_after=T_B must keep exactly the note created AT T_B"
+        );
+
+        // created_before at exactly T_B is EXCLUSIVE: only A survives.
+        let before = recall(json!({ "created_before": iso(t_b) }))
+            .await
+            .expect("created_before recall");
+        assert_eq!(
+            result_ids(&before),
+            vec![note_a.id.to_string()],
+            "created_before=T_B must drop the note created AT T_B"
+        );
+
+        // Empty window (after == before) is an input error, not a silent [].
+        let empty = recall(json!({
+            "created_after": iso(t_b),
+            "created_before": iso(t_b)
+        }))
+        .await;
+        let empty_err = empty.expect_err("empty window must error").to_string();
+        assert!(
+            empty_err.contains("window is empty"),
+            "empty-window error must say so, got: {empty_err}"
+        );
+
+        // Date-only bounds are rejected, naming the accepted format.
+        let date_only = recall(json!({ "created_after": "2026-08-20" })).await;
+        let date_err = date_only
+            .expect_err("date-only bound must be rejected")
+            .to_string();
+        assert!(
+            date_err.contains("RFC 3339"),
+            "date-only rejection must name RFC 3339, got: {date_err}"
         );
     }
 }
