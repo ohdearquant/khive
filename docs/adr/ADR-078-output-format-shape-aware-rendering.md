@@ -512,6 +512,59 @@ outer-envelope fields. This makes format and presentation misspellings explicit 
 errors instead of silent requests for the server defaults. It does not change the DSL's
 per-verb validation rules or the canonical handler result shape.
 
+## Amendment 2 (2026-08-23): render fidelity — table-only `auto`, sibling preservation, elision markers
+
+A 91-verb output audit of the shipped renderer found four fidelity losses in the `auto`
+path, one of them fail-open: an object envelope's sibling scalars were dropped when a
+record array was found (a `query` page losing `has_more` reads as complete); nested
+objects were stringified into truncated 120-character cells (truncated pseudo-JSON reads
+as data while silently missing fields); identity and decision fields were truncated like
+prose (a cut signature or title is unusable); and the kv-block renderer's truncation
+destroyed single-record payloads such as a compose briefing's `markdown` field, while its
+indentation could balloon deep objects past the daemon frame. This amendment revises §3
+so `auto` is safe to adopt as a surface default.
+
+**§3(b) is withdrawn.** The flat key-value block renderer is removed. `auto` recognizes
+exactly two shapes: a homogeneous record array renders as a markdown table; every other
+shape — single records, heterogeneous objects, scalars — renders as compact JSON,
+lossless by construction and identical to `format=json` for those shapes.
+
+**§3(a) qualifying condition simplified; per-cell elision replaces disqualification.**
+The original "mostly-scalar key set" condition is superseded: an array of two or more
+objects qualifies. Nested values are handled per cell instead of disqualifying the table
+— an object-valued cell renders the constant marker `{…}`, an array containing objects
+renders `[…]`, and an array of scalars renders as compact JSON. A majority-nested gate
+would push high-value listings (task queues whose rows carry a property bag) back to
+compact JSON and forfeit the measured 83–90% listing savings; per-cell elision keeps the
+table win while making elision explicit rather than disguising it as truncated data.
+Full content remains one `format=json` or `get` away.
+
+**Envelope siblings are preserved.** When the record array sits under an object key, the
+remaining top-level keys render as trailing `key: value` lines after the table — string
+values verbatim, other values as compact JSON, untruncated. Pagination and count fields
+(`has_more`, `offset`, `page_size`, `truncated`) must survive rendering; dropping them
+is a correctness defect, not a verbosity trade.
+
+**Cell truncation exempts identity and decision columns.** Columns named `id`, `kind`,
+`status`, `priority`, `relation`, `title`, `name`, `signature`, `slug`, `assignee`,
+`from`, `to`, `due`, and any column ending in `_id` or `_at` or starting with `due`
+render whole. `PresentationMode::Verbose` disables truncation entirely, as §3(a) already
+specified; the implementation now honors it.
+
+**§7 pre-pass gains a scalar hoist.** `trigger_at`, `due`, and `status` values found
+inside a record's `properties` object are hoisted to the top level when no top-level
+sibling of that name exists (never overwriting one), so the table renderer can surface
+them as columns. Without the hoist, a scheduled event's row cannot say when it fires or
+whether it is pending — those fields live only inside the nested bag, which renders as
+`{…}`. The hoist is view-only: `json` output and Verbose presentation are unaffected.
+
+**§6 consequence.** With the kv-block renderer removed, `table` and `auto` share the
+same dispatch; `table` remains as an explicit spelling of the same contract.
+
+The durable fix for listing verbosity remains per-verb response contracts (listings
+project selection fields, acknowledgements return acknowledgements); this amendment makes
+the view layer honest in the interim rather than lossy.
+
 ## References
 
 - ADR-016 (Request DSL) — short-UUID-prefix resolution; `$prev` chain semantics; `RequestParams`
