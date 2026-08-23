@@ -600,8 +600,24 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // Included unconditionally rather than only when non-default. The default
     // is the HOST's zone, not UTC, so "differs from the default" is itself a
     // host-dependent predicate and would make identity depend on where the
-    // fingerprint was computed. The cost is that every existing warm daemon
-    // takes a new identity once, which is a respawn, not a correctness event.
+    // fingerprint was computed.
+    //
+    // The cost, stated as it actually happens: a daemon already warm when this
+    // lands keeps the identity it computed at startup, so a client built from
+    // this code sends an ID that daemon does not recognise. The daemon answers
+    // `config_mismatch` and the client falls back to LOCAL dispatch. It does
+    // not respawn — `FallbackReason::ConfigMismatch` is classified
+    // `FallbackSeverity::Illegitimate`, and the kill-and-respawn path
+    // (#644/#539) governs the protocol/parse reasons, not this one. So until
+    // that daemon is restarted, every request pays a failed forwarding round
+    // trip and loses the daemon's warm indexes and embedders, and each one
+    // increments a counter documented as never expected on a correctly
+    // configured fleet.
+    //
+    // Spelled out because "the daemon takes a new identity" invites the reading
+    // that it restarts itself. It does not, and nothing here makes it: this is
+    // a one-time operational cost that ends when the daemon is restarted, by
+    // whoever restarts it.
     let base = format!(
         "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={};display_tz={}",
         packs.join(","),
@@ -4056,13 +4072,19 @@ mod tests {
     /// offset between the zones. Identity must separate them.
     #[test]
     fn config_id_differs_when_display_timezone_differs() {
+        // One base, cloned, for the reason spelled out on the test below — and
+        // it matters MORE here. This assertion is `assert_ne!`, so the shared
+        // environment racing between two constructor calls would make it pass
+        // by producing two different `db_path`s, which is a pass that would
+        // survive deleting the fix this test exists to hold.
+        let base = RuntimeConfig::no_embeddings();
         let utc = RuntimeConfig {
             display_timezone: "UTC".parse().expect("UTC is a known IANA zone"),
-            ..RuntimeConfig::no_embeddings()
+            ..base.clone()
         };
         let new_york = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
-            ..RuntimeConfig::no_embeddings()
+            ..base
         };
 
         assert_ne!(
@@ -4078,13 +4100,25 @@ mod tests {
     /// incidental reason: identical zones must still collapse to one identity.
     #[test]
     fn config_id_matches_when_display_timezone_matches() {
+        // ONE base, cloned — not two constructor calls. `RuntimeConfig::default`
+        // reads `HOME` to build `db_path`, and `db_path` is folded into the id,
+        // so two calls read that variable at two different instants. Other
+        // tests in this binary set and restore `HOME` around their own work
+        // (`config_id_matches_for_tilde_and_equivalent_absolute_db_override` is
+        // one, and it matches the same `config_id` filter), and tests run in
+        // parallel threads against one process-global environment. A mutation
+        // landing between the two calls gave the two configs different paths
+        // and reddened this test for a reason that has nothing to do with
+        // timezones. Cloning one base removes the window: whatever `HOME` is,
+        // both sides read the same one.
+        let base = RuntimeConfig::no_embeddings();
         let a = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
-            ..RuntimeConfig::no_embeddings()
+            ..base.clone()
         };
         let b = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
-            ..RuntimeConfig::no_embeddings()
+            ..base
         };
 
         assert_eq!(
