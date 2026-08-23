@@ -123,24 +123,15 @@ fn drop_record(value: Value) -> Value {
     }
 
     // Properties dedup: drop key-value pairs from `properties` that
-    // duplicate an identical top-level sibling. Scalar payload fields named
-    // in `PROPERTY_HOIST_FIELDS` are hoisted to the top level (when no
-    // top-level sibling of that name exists) so the table renderer can
-    // surface them as columns — a scheduled event's `trigger_at`/`status`
-    // live only inside `properties`, and a nested cell cannot show them.
+    // duplicate an identical top-level sibling. The scalar hoist for table
+    // columns lives in `hoist_table_scalars`, applied only on the table
+    // path: reshaping the compact-JSON fallback would move fields with no
+    // column to gain.
     let props_val = map.remove("properties");
     if let Some(Value::Object(props)) = props_val {
         let mut new_props = Map::new();
         for (k, v) in props {
             if map.get(&k) == Some(&v) {
-                continue;
-            }
-            if PROPERTY_HOIST_FIELDS.contains(&k.as_str())
-                && !v.is_object()
-                && !v.is_array()
-                && !map.contains_key(&k)
-            {
-                map.insert(k, v);
                 continue;
             }
             new_props.insert(k, v);
@@ -207,22 +198,60 @@ fn render_auto(value: Value, truncate: bool) -> String {
 /// 1. `value` itself is an array of 2+ objects.
 /// 2. `value` is an object with a key whose value is an array of 2+ objects.
 fn locate_record_array(value: &Value) -> Option<RecordArray> {
+    let build = |key: Option<String>, arr: &[Value]| {
+        let records: Vec<Value> = arr.iter().cloned().map(hoist_table_scalars).collect();
+        let columns = collect_keys(&records);
+        RecordArray {
+            key,
+            records,
+            columns,
+        }
+    };
     match value {
-        Value::Array(arr) if is_record_array(arr) => Some(RecordArray {
-            key: None,
-            records: arr.clone(),
-            columns: collect_keys(arr),
-        }),
+        Value::Array(arr) if is_record_array(arr) => Some(build(None, arr)),
         Value::Object(map) => map.iter().find_map(|(k, v)| match v {
-            Value::Array(arr) if is_record_array(arr) => Some(RecordArray {
-                key: Some(k.clone()),
-                records: arr.clone(),
-                columns: collect_keys(arr),
-            }),
+            Value::Array(arr) if is_record_array(arr) => Some(build(Some(k.clone()), arr)),
             _ => None,
         }),
         _ => None,
     }
+}
+
+/// Hoist `PROPERTY_HOIST_FIELDS` scalars out of a record's `properties` bag
+/// to the top level (never overwriting a top-level sibling), so the table
+/// renderer can surface them as columns — a scheduled event's
+/// `trigger_at`/`status` live only inside `properties`, and a nested cell
+/// renders as `{…}`. Table path only (ADR-078 Amendment 2): the compact-JSON
+/// fallback keeps its shape.
+fn hoist_table_scalars(record: Value) -> Value {
+    let Value::Object(mut map) = record else {
+        return record;
+    };
+    let mut props = match map.remove("properties") {
+        Some(Value::Object(props)) => props,
+        Some(other) => {
+            // Non-object `properties` is not a bag to hoist from — restore it.
+            map.insert("properties".to_string(), other);
+            return Value::Object(map);
+        }
+        None => return Value::Object(map),
+    };
+    for field in PROPERTY_HOIST_FIELDS {
+        if map.contains_key(*field) {
+            continue;
+        }
+        if props
+            .get(*field)
+            .is_some_and(|v| !v.is_object() && !v.is_array())
+        {
+            let v = props.remove(*field).expect("checked above");
+            map.insert((*field).to_string(), v);
+        }
+    }
+    if !props.is_empty() {
+        map.insert("properties".to_string(), Value::Object(props));
+    }
+    Value::Object(map)
 }
 
 /// An array of 2+ objects qualifies as a record array.
@@ -244,7 +273,10 @@ fn render_table_with_siblings(value: &Value, found: &RecordArray, truncate: bool
             continue;
         }
         let text = match v {
-            Value::String(s) => s.clone(),
+            // A newline-bearing string renders as its JSON literal (one line,
+            // lossless) so a stored value cannot fabricate a sibling line or
+            // table row (ADR-078 Amendment 2 escaping contract).
+            Value::String(s) if !s.contains(['\n', '\r']) => s.clone(),
             // Non-string scalars and nested values: compact JSON, untruncated
             // — sibling fidelity is the point of this path.
             other => serde_json::to_string(other).unwrap_or_default(),
@@ -1458,35 +1490,80 @@ mod tests {
     /// `status`) out of `properties` so they can surface as table columns —
     /// a scheduled event carries them only inside `properties`.
     #[test]
-    fn redundancy_drop_hoists_payload_scalars() {
+    fn table_path_hoists_payload_scalars_to_columns() {
+        // The hoist is table-path only (ADR-078 Amendment 2): two scheduled
+        // events whose trigger_at/status live inside `properties` must gain
+        // top-level columns in the rendered table.
+        let record = |n: u32| {
+            json!({
+                "id": format!("evt-{n}"),
+                "properties": {
+                    "trigger_at": "2026-09-01T14:00:00-04:00",
+                    "status": "pending",
+                    "dispatch_receipt": {"state": "succeeded"}
+                }
+            })
+        };
+        let out = render_format(
+            json!([record(1), record(2)]),
+            OutputFormat::Auto,
+            PresentationMode::Agent,
+        );
+        let header = out.lines().next().expect("table header");
+        assert!(
+            header.contains("trigger_at") && header.contains("status"),
+            "hoisted scalars must appear as table columns, got header: {header}"
+        );
+        assert!(
+            out.contains("2026-09-01T14:00:00-04:00") && out.contains("pending"),
+            "hoisted values must render in cells:\n{out}"
+        );
+    }
+
+    #[test]
+    fn redundancy_drop_no_longer_hoists_outside_tables() {
+        // Rule-separating control for the table-scoped hoist: the §7 pre-pass
+        // alone must leave the properties bag in place, so a single record's
+        // compact-JSON fallback keeps its shape.
         let v = json!({
             "id": "abc",
             "properties": {
                 "trigger_at": "2026-09-01T14:00:00-04:00",
-                "status": "pending",
-                "dispatch_receipt": {"state": "succeeded"}
+                "status": "pending"
             }
         });
         let reduced = apply_redundancy_drop(v);
-        assert_eq!(
-            reduced.get("trigger_at").and_then(Value::as_str),
-            Some("2026-09-01T14:00:00-04:00"),
-            "trigger_at must be hoisted to top level"
-        );
-        assert_eq!(
-            reduced.get("status").and_then(Value::as_str),
-            Some("pending"),
-            "status must be hoisted to top level"
+        assert!(
+            reduced.get("trigger_at").is_none() && reduced.get("status").is_none(),
+            "the pre-pass must not hoist; the hoist is table-path only"
         );
         let props = reduced.get("properties").expect("properties must remain");
+        assert_eq!(
+            props.get("status").and_then(Value::as_str),
+            Some("pending"),
+            "fallback shape keeps payload fields inside properties"
+        );
+    }
+
+    #[test]
+    fn sibling_string_with_newline_renders_as_json_literal() {
+        // Escaping contract: a newline-bearing sibling string must not be able
+        // to fabricate an additional `key: value` line.
+        let v = json!({
+            "items": [{"id": "a", "kind": "x"}, {"id": "b", "kind": "y"}],
+            "note": "line one\nforged_key: forged_value",
+            "has_more": true
+        });
+        let out = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
         assert!(
-            props.get("dispatch_receipt").is_some(),
-            "nested non-hoist fields stay in properties"
+            !out.contains("\nforged_key: forged_value"),
+            "raw newline from a sibling string must not start a new line:\n{out}"
         );
         assert!(
-            props.get("trigger_at").is_none(),
-            "hoisted field must not remain duplicated in properties"
+            out.contains(r#"note: "line one\nforged_key: forged_value""#),
+            "newline-bearing sibling renders as its JSON literal:\n{out}"
         );
+        assert!(out.contains("has_more: true"), "siblings still preserved");
     }
 
     /// The hoist never overwrites an existing top-level sibling.

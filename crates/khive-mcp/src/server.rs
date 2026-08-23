@@ -5338,7 +5338,11 @@ mod tests {
         // with disjoint key sets inflate quadratically. The fixture sits
         // where the compact envelope fits the budget but the rendered table
         // exceeds the daemon frame, which is exactly the fallback under test.
-        let records: Vec<Value> = (0..600)
+        // Sized to the smallest sparse array whose render exceeds the frame
+        // with margin: 400 rows × 8000 columns ≈ 3.2M cells at ~3 bytes of
+        // separator each ≈ 9.6MB rendered vs the 8MB frame. Larger fixtures
+        // (600×20 keys/row was 7.2M cells) only slow the suite.
+        let records: Vec<Value> = (0..400)
             .map(|record_index| {
                 let mut record = serde_json::Map::new();
                 for key_index in 0..20 {
