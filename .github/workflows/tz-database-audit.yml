@@ -27,6 +27,14 @@ on:
       - "crates/khive-pack-gtd/**"
       - ".github/workflows/tz-database-audit.yml"
 
+# Declared rather than inherited. With no `permissions:` block a workflow gets
+# the repository's default GITHUB_TOKEN scopes, so its actual authority is set
+# by a repository setting this file cannot see and does not track. This job
+# checks out, builds and runs one test; read access to the contents is the
+# whole of what it needs.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
