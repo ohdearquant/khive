@@ -13,7 +13,8 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -492,30 +493,431 @@ pub fn render_task(note: &khive_storage::note::Note) -> Value {
 
 /// Parse a user-supplied due-date string as an ISO-8601 / RFC 3339 timestamp.
 ///
-/// Accepts full RFC 3339 (e.g. `2026-06-01T00:00:00Z`) or date-only
-/// (e.g. `2026-06-01`) by appending midnight UTC if necessary.
-/// Returns the canonical RFC 3339 string stored in `properties.due`.
-/// Shared with `hook.rs`.
-pub(crate) fn parse_due(value: &str) -> Result<String, RuntimeError> {
-    // Try full RFC 3339 / ISO-8601 with time zone first.
+/// Accepts full RFC 3339 (e.g. `2026-06-01T00:00:00Z`) — normalized to UTC and
+/// otherwise unaffected by `tz` — or date-only (e.g. `2026-06-01`), which
+/// resolves to the earliest instant that belongs to that calendar date in
+/// `tz` (ADR-169 D1). Returns the canonical RFC 3339 string stored in
+/// `properties.due`, in `tz`'s offset spelling for the date-only case
+/// (ADR-169 D5) — the value remains a single absolute instant; the offset
+/// records which calendar the date was anchored in.
+pub(crate) fn parse_due(value: &str, tz: Tz) -> Result<String, RuntimeError> {
+    // Try full RFC 3339 / ISO-8601 with time zone first. Already carries an
+    // explicit offset or `Z`, so it is unaffected by `tz` and keeps its
+    // existing UTC normalization.
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
         return Ok(dt.with_timezone(&Utc).to_rfc3339());
     }
-    // Fallback: try date-only "YYYY-MM-DD", treat as midnight UTC.
+    // Fallback: try date-only "YYYY-MM-DD".
     if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        let dt = date
-            .and_hms_opt(0, 0, 0)
-            .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+        return anchor_date_to_earliest_instant(date, tz)
+            .map(|dt| dt.to_rfc3339())
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(format!(
-                "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
-            ))
-            })?;
-        return Ok(dt.to_rfc3339());
+                    "due date {date} does not exist in the configured display timezone {tz} \
+                     (the zone's local calendar skips this date entirely); got {value:?}"
+                ))
+            });
     }
     Err(RuntimeError::InvalidInput(format!(
         "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
     )))
+}
+
+/// Resolve a calendar date to the earliest instant that belongs to it in
+/// `tz` (ADR-169 D1). Midnight is not a total function of date and zone: on a
+/// zone's own transition date local midnight can fail to exist (the clock
+/// jumps over it) or occur twice (the clock repeats it). Both are one rule —
+/// take the least instant whose local date, in `tz`, is `date` — not two
+/// exceptions to it; neither case may be resolved by unwrapping to UTC,
+/// which would silently reintroduce the defect ADR-169 exists to remove.
+///
+/// Returns `None` only when no instant at all maps to `date` in `tz` (the
+/// zone's local calendar skips the date entirely, e.g. a whole-day UTC-offset
+/// jump across the international date line) — a case ADR-169 does not name,
+/// since its own gap/ambiguity examples are ordinary sub-day transitions.
+fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<DateTime<Tz>> {
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    match tz.from_local_datetime(&midnight) {
+        chrono::LocalResult::Single(dt) => Some(dt),
+        // Fall-back overlap: two instants map to the same wall-clock time.
+        // The earlier one is the least instant whose local date is `date`.
+        chrono::LocalResult::Ambiguous(earliest, _latest) => Some(earliest),
+        // Spring-forward gap (or a larger jump): local midnight does not
+        // exist. Solve for the boundary directly rather than projecting to
+        // it. Within the window searched below, the local date is a
+        // non-decreasing function of UTC time, so the least instant whose
+        // local date is `date` is the bisection point on the UTC axis
+        // between "still the previous date" and "already this date".
+        //
+        // That premise is SCOPED to this window on purpose: it is not true
+        // globally. Zones that crossed the international date line run the
+        // local calendar backwards at the crossing — `America/Adak` at
+        // 1867-10-19T00:31:13Z moves from local 1867-10-19 to 1867-10-18 as
+        // the offset goes from +12:13:22 to -11:46:38 — and the pinned
+        // chrono-tz table holds 107 such date-decreasing transitions. What
+        // makes the bisection sound is that none of them falls inside a
+        // window this branch searches.
+        //
+        // That is checked rather than argued, and it is checked as the
+        // CONCLUSION rather than the premise. `every_gap_date_resolves_to_the
+        // _least_instant` sweeps every zone in the pinned database over
+        // 1850-2100 and asserts directly that one second before the returned
+        // instant is a different local date — the least-instant property
+        // itself, which is what a monotonicity violation would cost. At the
+        // current pin it reports 597 zones over 91311 dates each, 4299 gap
+        // dates, 818 folds, 7 whole days a zone's calendar skips, and zero
+        // violations, in about three seconds. Those counts are printed by the
+        // test rather than asserted, because their magnitudes are the
+        // database's business and only their reaching zero would mean the
+        // sweep broke. Run it whenever the chrono-tz pin moves:
+        //
+        //   cargo test -p khive-pack-gtd --lib --release -- --ignored --nocapture
+        //
+        // It is ignored by default because it is an all-zone sweep, not
+        // because it is optional. A violation costs the LEAST-instant
+        // property only; the same-date check at the end of this branch keeps
+        // a wrong DATE from being returned regardless.
+        //
+        // The earlier implementation instead read the offset in effect at
+        // noon on the previous calendar date and projected local midnight
+        // forward under it. That is correct only when the gap BEGINS at
+        // local midnight. It need not: for `America/Toronto` on 1919-03-31
+        // the clock jumped from 23:30 on the previous date to 00:30, so the
+        // first instant belonging to the date is 00:30 local (04:30Z), while
+        // the projection under the prior -05:00 offset returned 01:00 local
+        // (05:00Z) — thirty minutes late, and late in a way that still
+        // passed a same-date check. Six IANA zones share that transition.
+        //
+        // One-second granularity is required, not one-minute: historical
+        // LMT offsets are not whole minutes.
+        chrono::LocalResult::None => {
+            let mut lo = midnight - chrono::Duration::hours(48);
+            let mut hi = midnight + chrono::Duration::hours(48);
+            // Guard the bisection invariant instead of assuming it. Real UTC
+            // offsets stay well inside +/-48h, so a violation here means the
+            // zone is outside anything this rule can answer for; fail closed.
+            if tz.from_utc_datetime(&lo).date_naive() >= date
+                || tz.from_utc_datetime(&hi).date_naive() < date
+            {
+                return None;
+            }
+            while hi - lo > chrono::Duration::seconds(1) {
+                let mid = lo + (hi - lo) / 2;
+                if tz.from_utc_datetime(&mid).date_naive() < date {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            // `hi` is now the least instant whose local date is >= `date`.
+            // It is > `date` exactly when the zone's local calendar skips
+            // the date entirely, which is the documented `None` case.
+            let resolved = tz.from_utc_datetime(&hi);
+            (resolved.date_naive() == date).then_some(resolved)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tz_database_audit {
+    use super::*;
+
+    /// Sweep every zone in the pinned `chrono-tz` over 1850-2100 and assert that
+    /// `anchor_date_to_earliest_instant` returns the LEAST instant of the requested local date.
+    ///
+    /// This is the re-derivation duty the gap branch's comment names, and it exists because the
+    /// comment used to assert a premise instead: that a local date is monotonically non-decreasing
+    /// in UTC time. That premise is false globally — zones that crossed the international date line
+    /// run the local calendar backwards, `America/Adak` at 1867-10-19T00:31:13Z being one — and a
+    /// true premise supporting a wrong inference reads as verified, so this checks the inference.
+    ///
+    /// The property asserted is direct and needs no transition table: for the returned instant `r`,
+    /// `r` has the requested local date and `r - 1s` does not. Anything less than the least instant
+    /// fails the first half; anything more fails the second.
+    ///
+    /// Ignored by default because it is an all-zone sweep, not because it is optional:
+    ///
+    ///   cargo test -p khive-pack-gtd --lib --release -- --ignored --nocapture
+    #[test]
+    #[ignore = "all-zone chrono-tz sweep; run on a pin bump (see the command in the doc comment)"]
+    fn every_gap_date_resolves_to_the_least_instant() {
+        let start = chrono::NaiveDate::from_ymd_opt(1850, 1, 1).expect("start date");
+        let end = chrono::NaiveDate::from_ymd_opt(2100, 1, 1).expect("end date");
+
+        let mut zones = 0usize;
+        let mut gaps = 0usize;
+        let mut folds = 0usize;
+        let mut skipped_days = 0usize;
+        let mut dates_examined = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
+        for tz in chrono_tz::TZ_VARIANTS.iter().copied() {
+            zones += 1;
+            let mut date = start;
+            while date < end {
+                dates_examined += 1;
+                let midnight = date.and_hms_opt(0, 0, 0).expect("midnight");
+                match tz.from_local_datetime(&midnight) {
+                    chrono::LocalResult::Single(_) => {}
+                    chrono::LocalResult::Ambiguous(_, _) => folds += 1,
+                    chrono::LocalResult::None => gaps += 1,
+                }
+
+                match anchor_date_to_earliest_instant(date, tz) {
+                    Some(resolved) => {
+                        let previous = resolved - chrono::Duration::seconds(1);
+                        if resolved.date_naive() != date {
+                            failures.push(format!(
+                                "{tz}: {date} resolved to {resolved}, whose local date is \
+                                 {}",
+                                resolved.date_naive()
+                            ));
+                        } else if tz.from_utc_datetime(&previous.naive_utc()).date_naive() == date {
+                            failures.push(format!(
+                                "{tz}: {date} resolved to {resolved}, but one second earlier is \
+                                 still {date} — not the least instant"
+                            ));
+                        }
+                    }
+                    // `None` is correct only for a date the zone's local calendar skips whole.
+                    // Verify that rather than accepting it: no instant in a generous window may
+                    // carry the requested local date.
+                    None => {
+                        skipped_days += 1;
+                        let base = midnight;
+                        let mut found = None;
+                        // ONE-SECOND steps, matching the granularity the implementation itself
+                        // searches at. A coarser step was here first and was wrong in the
+                        // reassuring direction: a local-date interval shorter than the step can
+                        // sit between two probes, so the search reports "no instant carries this
+                        // date" without having looked at the instants that would. The current
+                        // pinned table happens to contain no such interval, but that is a
+                        // property of today's data, and this test exists to be run against data
+                        // that has changed. The window is ~48h either side and skipped days are
+                        // rare (single digits across the whole sweep), so the finer step costs
+                        // nothing measurable.
+                        let mut probe = base - chrono::Duration::hours(48);
+                        while probe <= base + chrono::Duration::hours(48) {
+                            if tz.from_utc_datetime(&probe).date_naive() == date {
+                                found = Some(probe);
+                                break;
+                            }
+                            probe += chrono::Duration::seconds(1);
+                        }
+                        if let Some(hit) = found {
+                            failures.push(format!(
+                                "{tz}: {date} returned None, but {hit}Z has that local date"
+                            ));
+                        }
+                    }
+                }
+
+                date = date.succ_opt().expect("date in range has a successor");
+            }
+        }
+
+        println!(
+            "swept {zones} zones over {} dates each: {gaps} gaps, {folds} folds, \
+             {skipped_days} whole days skipped by a zone's calendar, {} violations",
+            (end - start).num_days(),
+            failures.len()
+        );
+
+        // The substantive result is asserted FIRST, deliberately. An earlier version put the
+        // population checks above this one and guessed their thresholds; one guess was wrong
+        // (it demanded thousands of fold dates against an actual 818), the test failed on the
+        // guess, and the property it exists to check never ran. A bound nobody measured is not
+        // a safety net, it is a second thing that can be wrong.
+        assert!(
+            failures.is_empty(),
+            "{} least-instant violations, first 10:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // Then assert the sweep actually examined something, so an audit that silently swept
+        // nothing cannot pass by finding nothing.
+        //
+        // TRAVERSAL counts are exact, because they are ours: the number of zones and the number
+        // of dates per zone are fixed by this test's own range and by the pinned table's length,
+        // so anything else means the loop did not run. A floor here would have accepted a
+        // 501-zone subset of 597 as "the full database".
+        //
+        // TRANSITION counts stay floors at zero per SHAPE. Those belong to the database, not to
+        // us, and this test exists to be run when the database changes; pinning 4299 gaps would
+        // make a legitimate pin bump fail for a reason that has nothing to do with the property
+        // under test. Zero for a shape means the traversal never reached that kind of date.
+        let expected_dates = (end - start).num_days() as usize;
+        assert_eq!(
+            zones,
+            chrono_tz::TZ_VARIANTS.len(),
+            "swept {zones} zones but the pinned table has {}",
+            chrono_tz::TZ_VARIANTS.len()
+        );
+        assert_eq!(
+            dates_examined,
+            zones * expected_dates,
+            "expected {zones} zones x {expected_dates} dates = {}, examined {dates_examined}",
+            zones * expected_dates
+        );
+        assert!(
+            gaps > 0,
+            "no gap dates found -- the sweep did not reach a transition"
+        );
+        assert!(
+            folds > 0,
+            "no fold dates found -- the sweep did not reach a transition"
+        );
+        assert!(
+            skipped_days > 0,
+            "no whole-day skips found -- the None-return path was never exercised"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_due_tests {
+    use super::*;
+
+    // America/New_York (used for the west-of-UTC and general DST coverage in
+    // tests/assign.rs) never transitions at local midnight, so it cannot
+    // exercise LocalResult::None or ::Ambiguous — a "DST test" against it
+    // passes without touching the rule ADR-169 D1 actually specifies. The
+    // zones and dates below are ADR-169's own worked table (measured against
+    // the IANA database) of zones that DO transition at 00:00.
+
+    #[test]
+    fn date_only_due_resolves_to_first_instant_when_local_midnight_does_not_exist_havana() {
+        let tz: Tz = "America/Havana".parse().expect("known IANA zone");
+        let result = parse_due("2021-03-14", tz).expect(
+            "a gap date must resolve to the first instant of that date, not error (ADR-169 D1)",
+        );
+        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
+        assert_eq!(
+            parsed.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2021, 3, 14).unwrap(),
+            "got {result}"
+        );
+        assert!(
+            parsed.time() > chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            "local midnight does not exist on this date, so the resolved instant must be \
+             strictly after 00:00 — proving the gap was bridged forward, not unwrapped to UTC; \
+             got {result}"
+        );
+    }
+
+    #[test]
+    fn date_only_due_resolves_to_first_instant_when_local_midnight_does_not_exist_santiago() {
+        let tz: Tz = "America/Santiago".parse().expect("known IANA zone");
+        let result = parse_due("2021-09-05", tz).expect(
+            "a gap date must resolve to the first instant of that date, not error (ADR-169 D1)",
+        );
+        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
+        assert_eq!(
+            parsed.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2021, 9, 5).unwrap(),
+            "got {result}"
+        );
+        assert!(
+            parsed.time() > chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            "got {result}"
+        );
+    }
+
+    // The two tests above assert only that the resolved time is after 00:00.
+    // That is too weak to separate "the first instant on this date" from "some
+    // instant on this date": both zones' gaps begin exactly at local midnight,
+    // so a projection under the previous offset and a true least-instant search
+    // agree there and either implementation passes. The test below uses a zone
+    // whose gap begins BEFORE midnight, where the two rules give different
+    // answers, and asserts the least-instant property itself.
+    #[test]
+    fn date_only_due_resolves_to_the_least_instant_when_the_gap_begins_before_midnight_toronto() {
+        let tz: Tz = "America/Toronto".parse().expect("known IANA zone");
+        // On 1919-03-31 the clock jumped from 23:30 on the previous date to
+        // 00:30, so local midnight never occurred and the first instant of the
+        // date is 00:30 -04:00 = 04:30Z. Reading the previous day's offset
+        // (-05:00) and projecting midnight forward gives 05:00Z instead, which
+        // is on the right date and thirty minutes late.
+        let result = parse_due("1919-03-31", tz)
+            .expect("a gap date must resolve to the first instant of that date (ADR-169 D1)");
+        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
+
+        assert_eq!(
+            parsed.to_utc(),
+            chrono::NaiveDate::from_ymd_opt(1919, 3, 31)
+                .unwrap()
+                .and_hms_opt(4, 30, 0)
+                .unwrap()
+                .and_utc(),
+            "must be the FIRST instant of the date (04:30Z), not the instant local midnight \
+             would have had under the previous offset (05:00Z); got {result}"
+        );
+
+        // The least-instant property, asserted directly rather than by
+        // comparing against a constant: one second earlier must already be a
+        // different local date. This is what fails for the projected answer,
+        // since 04:59:59Z is still 1919-03-31 locally.
+        let one_second_earlier = parsed.to_utc() - chrono::Duration::seconds(1);
+        assert_ne!(
+            tz.from_utc_datetime(&one_second_earlier.naive_utc())
+                .date_naive(),
+            chrono::NaiveDate::from_ymd_opt(1919, 3, 31).unwrap(),
+            "the instant one second before the resolved one must belong to a different local \
+             date, or the resolved instant was not the least one; got {result}"
+        );
+    }
+
+    #[test]
+    fn date_only_due_picks_the_earlier_instant_when_local_midnight_occurs_twice_havana() {
+        let tz: Tz = "America/Havana".parse().expect("known IANA zone");
+        let date = chrono::NaiveDate::from_ymd_opt(2020, 11, 1).unwrap();
+        let midnight = date.and_hms_opt(0, 0, 0).unwrap();
+        // Derived directly from chrono_tz, independent of parse_due, so this
+        // is a cross-check against the library's own contract rather than a
+        // restatement of parse_due's internals.
+        let (earliest, latest) = match tz.from_local_datetime(&midnight) {
+            chrono::LocalResult::Ambiguous(a, b) => (a, b),
+            other => panic!(
+                "2020-11-01 in America/Havana must be ambiguous per ADR-169's worked table; \
+                 got {other:?}"
+            ),
+        };
+        assert!(
+            earliest < latest,
+            "sanity: chrono's `earliest` must be chronologically first"
+        );
+
+        let result =
+            parse_due("2020-11-01", tz).expect("an ambiguous date must resolve, not error");
+        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
+        assert_eq!(
+            parsed, earliest,
+            "parse_due must pick the earlier of the two midnight instants (ADR-169 D1); got {result}"
+        );
+    }
+
+    // Pacific/Apia jumped from UTC-11 to UTC+13 on 2011-12-30, skipping that
+    // calendar date entirely in local time — not a sub-day gap but a
+    // whole-day one, which ADR-169 D1's worked examples do not name. No
+    // instant anywhere maps to this date in this zone, so parse_due errors
+    // rather than silently resolving to a neighboring date under a
+    // mislabeled due-date.
+    #[test]
+    fn date_only_due_in_a_skipped_local_day_is_rejected() {
+        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
+        let err = parse_due("2011-12-30", tz).expect_err("2011-12-30 never existed in Apia");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2011-12-30"),
+            "error must name the unparseable due date; got: {msg}"
+        );
+    }
 }
 
 fn ts_to_rfc(micros: i64) -> String {

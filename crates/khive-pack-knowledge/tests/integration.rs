@@ -1839,6 +1839,7 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
     let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
     let rt = KhiveRuntime::new(RuntimeConfig {
         git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         db_path: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
@@ -3996,6 +3997,7 @@ mod kg_blend {
     fn rt_with_marker_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -4625,6 +4627,7 @@ mod kg_blend {
     fn rt_with_failing_blend_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),

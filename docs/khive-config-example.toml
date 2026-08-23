@@ -21,6 +21,7 @@
 # Sections in this file:
 #   [actor]         default identity + namespace read/write scope
 #   [runtime]       brain profile + default output format
+#   [display]       rendering timezone (ADR-169)
 #   [gate]          reserved; rejected by this build (do not configure)
 #   [[engines]]     embedding engines (replaces the KHIVE_EMBEDDING_MODEL env pair)
 #   [[backends]]    named storage backends (ADR-028)
@@ -29,7 +30,7 @@
 #
 # ADR references: ADR-031 (multi-engine retrieval), ADR-035 (unified khive.toml),
 # ADR-028 (pack-scoped backends), ADR-007 (namespace / actor model), ADR-078 (output
-# format).
+# format), ADR-169 (timezone-correct timestamps).
 
 # ── [actor] — identity and namespace scope ──────────────────────────────────────
 #
@@ -86,6 +87,24 @@
 # (ADR-160). Default: 268435456 (256 MiB). Values below 67108864 (64 MiB)
 # are rejected because every valid portable blob request must be reservable.
 # blob_hydration_bytes = 268435456
+
+# ── [display] — rendering timezone (ADR-169) ──────────────────────────────────────
+#
+# The timezone khive anchors date-only input to. Absent → the host's local zone,
+# resolved once via the OS/`TZ` environment (falling back to UTC when it cannot be
+# determined). Storage stays instant-based either way: this setting controls the
+# CALENDAR used to interpret a bare `YYYY-MM-DD` at parse time (e.g. `gtd.assign`'s
+# `due` field), not how already-explicit timestamps are stored or rendered.
+#
+# A value that already carries an explicit offset or `Z` is unaffected by this
+# setting. As of this build, [display] governs date-only anchoring only — the
+# rendering-surface work described in ADR-169's Mechanism section (making every
+# timestamp field honor this zone on the way out) is tracked separately.
+
+[display]
+# IANA zone name. Validated at load time — an unrecognized name is a startup
+# error, not a silent fallback to the host zone.
+# timezone = "America/New_York"
 
 # ── [gate] — reserved authorization surface ───────────────────────────────────────
 #

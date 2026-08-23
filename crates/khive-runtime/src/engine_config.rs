@@ -85,6 +85,11 @@ pub enum ConfigError {
         "[gate] configuration is not supported by this build; refusing to start because the requested caller-enrollment policy would not be enforced"
     )]
     UnsupportedGateSection,
+
+    #[error(
+        "[display] timezone {timezone:?} is not a recognized IANA zone name (e.g. \"America/New_York\", \"UTC\")"
+    )]
+    InvalidDisplayTimezone { timezone: String },
 }
 
 // ---- Config structs ----
@@ -357,6 +362,7 @@ pub struct GitWriteSectionConfig {
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
+/// - `[display]`: rendering timezone (ADR-169)
 ///
 /// Unknown keys are silently ignored by serde for forward compatibility. The
 /// security-sensitive `[gate]` exception is detected by [`KhiveConfig::load`]
@@ -415,6 +421,12 @@ pub struct KhiveConfig {
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
     #[serde(default)]
     pub storage: StorageSectionConfig,
+
+    /// Rendering timezone configuration (ADR-169). Absent `timezone` resolves
+    /// to the host's local zone at [`RuntimeConfig`](crate::RuntimeConfig)
+    /// construction time.
+    #[serde(default)]
+    pub display: DisplaySectionConfig,
 }
 
 /// `[runtime]` section in `khive.toml`.
@@ -456,6 +468,24 @@ pub struct RuntimeSectionConfig {
     /// directly through `RuntimeConfig`).
     #[serde(default)]
     pub blob_hydration_bytes: Option<u64>,
+}
+
+/// `[display]` section in `khive.toml` — the timezone khive anchors date-only
+/// input to (ADR-169 Implementation step 1).
+///
+/// ```toml
+/// [display]
+/// timezone = "America/New_York"
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DisplaySectionConfig {
+    /// IANA zone name (e.g. `"America/New_York"`, `"Asia/Tokyo"`, `"UTC"`).
+    /// Validated at load time against `chrono_tz::Tz`'s zone table — an
+    /// unrecognized name is a startup error, not a silent fallback. Absent →
+    /// the host's local zone, resolved once via `iana-time-zone` and falling
+    /// back to UTC when the host zone cannot be determined.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 impl KhiveConfig {
@@ -784,6 +814,16 @@ impl KhiveConfig {
                         defined: defined.join(", "),
                     });
                 }
+            }
+        }
+
+        // Validate [display] timezone (ADR-169): an unrecognized IANA zone
+        // name is a startup error, not a silent fallback to the host zone.
+        if let Some(tz) = self.display.timezone.as_deref() {
+            if tz.trim().is_empty() || tz.parse::<chrono_tz::Tz>().is_err() {
+                return Err(ConfigError::InvalidDisplayTimezone {
+                    timezone: tz.to_string(),
+                });
             }
         }
 
@@ -2358,5 +2398,70 @@ backend = "gcs"
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("unknown backend must be rejected");
         assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+    }
+
+    // ── [display] section (ADR-169) ──────────────────────────────────────────
+
+    // No [display] section at all -> None, resolved to the host zone downstream.
+    #[test]
+    fn test_no_display_section_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "# no display section\n");
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert!(cfg.display.timezone.is_none());
+    }
+
+    #[test]
+    fn test_display_timezone_valid_iana_name_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[display]
+timezone = "America/New_York"
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert_eq!(cfg.display.timezone.as_deref(), Some("America/New_York"));
+    }
+
+    #[test]
+    fn test_display_timezone_unrecognized_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[display]
+timezone = "Mars/Olympus_Mons"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path))
+            .expect_err("an unrecognized IANA zone name must fail at load, not silently fall back");
+        assert!(
+            matches!(err, ConfigError::InvalidDisplayTimezone { ref timezone } if timezone == "Mars/Olympus_Mons"),
+            "expected InvalidDisplayTimezone, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_display_timezone_empty_string_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[display]
+timezone = ""
+"#,
+        );
+        let err =
+            KhiveConfig::load(Some(&path)).expect_err("an empty timezone string must be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidDisplayTimezone { .. }),
+            "expected InvalidDisplayTimezone, got {err:?}"
+        );
     }
 }

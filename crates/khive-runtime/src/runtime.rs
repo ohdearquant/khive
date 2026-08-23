@@ -1786,6 +1786,7 @@ mod tests {
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: Some(path),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1811,6 +1812,7 @@ mod tests {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1834,6 +1836,7 @@ mod tests {
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("test").unwrap(),
@@ -1861,6 +1864,7 @@ mod tests {
         let path = dir.path().join("read_only_runtime.db");
         let base = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1930,6 +1934,7 @@ mod tests {
         let path = dir.path().join("explicit_read_only_runtime.db");
         let config = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2012,6 +2017,7 @@ mod tests {
 
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
                 git_write: Default::default(),
+                display_timezone: chrono_tz::Tz::UTC,
                 db_path: Some(db_path),
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
@@ -2058,6 +2064,7 @@ mod tests {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2224,6 +2231,7 @@ mod tests {
         // asserts the write-routing invariant only.
         let base = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2250,6 +2258,7 @@ mod tests {
     fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
@@ -2284,6 +2293,7 @@ mod tests {
     fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
@@ -2310,6 +2320,7 @@ mod tests {
     fn runtime_config_from_khive_config_actor_id_with_engines() {
         let base = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2346,6 +2357,67 @@ mod tests {
              writes pin to local; engine config is still applied"
         );
         assert!(result.embedding_model.is_some());
+    }
+
+    // ---- [display] timezone (ADR-169) wiring tests ----
+
+    #[test]
+    fn runtime_config_from_khive_config_display_timezone_overrides_base() {
+        let base = RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
+            db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        let cfg = KhiveConfig {
+            display: crate::engine_config::DisplaySectionConfig {
+                timezone: Some("America/New_York".to_string()),
+            },
+            ..KhiveConfig::default()
+        };
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.display_timezone,
+            "America/New_York".parse::<chrono_tz::Tz>().unwrap(),
+            "[display] timezone in khive.toml must override base.display_timezone"
+        );
+    }
+
+    #[test]
+    fn runtime_config_from_khive_config_absent_display_timezone_keeps_base() {
+        let base = RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: "Asia/Tokyo".parse().unwrap(),
+            db_path: None,
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        let cfg = KhiveConfig::default(); // no [display] section
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.display_timezone,
+            "Asia/Tokyo".parse::<chrono_tz::Tz>().unwrap(),
+            "absent [display] timezone must preserve base.display_timezone unchanged"
+        );
     }
 
     // ---- base.actor_id (env-resolved actor) preservation tests ----
@@ -2471,6 +2543,7 @@ mod tests {
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2549,6 +2622,7 @@ mod tests {
 
         let main_config = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2687,6 +2761,7 @@ mod tests {
             backend,
             RuntimeConfig {
                 git_write: Default::default(),
+                display_timezone: chrono_tz::Tz::UTC,
                 db_path: None,
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),

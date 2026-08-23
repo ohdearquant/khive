@@ -1602,6 +1602,7 @@ mod tests {
     fn persistent_runtime_config(db_path: &Path, actor_id: &str) -> RuntimeConfig {
         RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             db_path: Some(db_path.to_path_buf()),
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
