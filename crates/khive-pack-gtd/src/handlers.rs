@@ -511,14 +511,12 @@ pub(crate) fn parse_due(value: &str, tz: Tz) -> Result<String, RuntimeError> {
     if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
         // `%Y` accepts the full signed year range chrono can represent, so a
         // caller can name a date whose anchor window runs off the end of
-        // `NaiveDateTime`. That is checked inside the resolver, on the one
-        // branch that needs the window, and NOT screened for here.
-        //
-        // Do not screen the date here. The resolver is total over every date
-        // `%Y` can produce, and it rejects only when the zone genuinely has no
-        // instant carrying the date. A caller-side range check would ask a
-        // question only one branch of the resolver needs, and so would reject
-        // dates the resolver answers correctly.
+        // `NaiveDateTime`. The resolver absorbs that by clamping, on the one
+        // branch that needs the window, and is total over every date `%Y` can
+        // produce; it declines only when the zone genuinely has no instant
+        // carrying the date. A range check here would ask a question only that
+        // one branch needs, and so would reject dates the resolver answers
+        // correctly.
         return anchor_date_to_earliest_instant(date, tz)
             .map(|dt| dt.to_rfc3339())
             .ok_or_else(|| {
@@ -534,8 +532,10 @@ pub(crate) fn parse_due(value: &str, tz: Tz) -> Result<String, RuntimeError> {
 }
 
 /// Half-width of the UTC window the skipped-midnight branch bisects. Real UTC
-/// offsets stay well inside this, so a date whose local midnight cannot carry
-/// the window is outside what this rule can answer for.
+/// offsets stay well inside this, so the window always contains the boundary
+/// the search is looking for. A date whose local midnight cannot carry the full
+/// width is still answered: the window clamps to the representable range rather
+/// than being abandoned.
 const ANCHOR_SEARCH_RADIUS_HOURS: i64 = 48;
 
 /// The `[midnight - radius, midnight + radius]` window the skipped-midnight
@@ -1083,11 +1083,12 @@ mod parse_due_tests {
             );
         }
 
-        // The minimum date resolves only where local midnight exists. In zones
-        // east of UTC it does not: converting it to UTC would run off the end
-        // of the range, and chrono-tz reports that as no valid local time, so
-        // the resolver takes the searching branch and correctly reports the
-        // window failure. UTC is the case that must still succeed.
+        // The minimum date takes the SEARCHING branch in zones east of UTC:
+        // converting its local midnight to UTC would run off the end of the
+        // range, and chrono-tz reports that as no valid local time. That case
+        // is asserted above, where it resolves to the least representable
+        // instant. The case here is UTC, where local midnight exists, so the
+        // direct branch must still succeed at the bottom of the range.
         let utc: Tz = "UTC".parse().expect("known IANA zone");
         let out = parse_due("-262143-01-01", utc)
             .expect("the minimum date must resolve in UTC, where its midnight exists");
