@@ -509,18 +509,81 @@ pub(crate) fn parse_due(value: &str, tz: Tz) -> Result<String, RuntimeError> {
     }
     // Fallback: try date-only "YYYY-MM-DD".
     if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        // `%Y` accepts the full signed year range chrono can represent, so a
+        // caller can name a date whose anchor window runs off the end of
+        // `NaiveDateTime`. The resolver absorbs that by clamping, on the one
+        // branch that needs the window, and is total over every date `%Y` can
+        // produce; it declines only when the zone genuinely has no instant
+        // carrying the date. A range check here would ask a question only that
+        // one branch needs, and so would reject dates the resolver answers
+        // correctly.
         return anchor_date_to_earliest_instant(date, tz)
             .map(|dt| dt.to_rfc3339())
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(format!(
                     "due date {date} does not exist in the configured display timezone {tz} \
-                     (the zone's local calendar skips this date entirely); got {value:?}"
+                     (no representable instant carries that local date); got {value:?}"
                 ))
             });
     }
     Err(RuntimeError::InvalidInput(format!(
         "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
     )))
+}
+
+/// Half-width of the UTC window the skipped-midnight branch bisects. Real UTC
+/// offsets stay well inside this, so the window always contains the boundary
+/// the search is looking for. A date whose local midnight cannot carry the full
+/// width is still answered: the window clamps to the representable range rather
+/// than being abandoned.
+const ANCHOR_SEARCH_RADIUS_HOURS: i64 = 48;
+
+/// The `[midnight - radius, midnight + radius]` window the skipped-midnight
+/// branch searches, clamped to the representable range.
+///
+/// Checked arithmetic, because chrono's `-` and `+` PANIC on overflow and
+/// `date` reaches here from a caller. Clamped rather than failing: near the
+/// ends of the range the window is truncated, not absent, and the instants
+/// that remain in it are exactly the ones a search could return anyway.
+fn anchor_search_window(date: chrono::NaiveDate) -> (chrono::NaiveDateTime, chrono::NaiveDateTime) {
+    let midnight = date
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time on every date");
+    let radius = chrono::Duration::hours(ANCHOR_SEARCH_RADIUS_HOURS);
+    (
+        midnight
+            .checked_sub_signed(radius)
+            .unwrap_or(chrono::NaiveDateTime::MIN),
+        midnight
+            .checked_add_signed(radius)
+            .unwrap_or(chrono::NaiveDateTime::MAX),
+    )
+}
+
+/// Order the local date at UTC instant `utc`, in `tz`, against `date`.
+///
+/// Total where the obvious spelling is not. `tz.from_utc_datetime(&utc)
+/// .date_naive()` PANICS when the zone's offset pushes the local wall clock
+/// outside `NaiveDateTime`'s range, and both ends are reachable once the search
+/// window is clamped: a positive-offset zone overflows at
+/// `NaiveDateTime::MAX`, a negative-offset zone underflows at `MIN`.
+///
+/// The overflow direction carries the answer. A local time past the top of the
+/// range is later than every representable date, and one below the bottom is
+/// earlier, so the sign of the offset decides the ordering without needing the
+/// date that cannot be built.
+fn local_date_cmp(
+    tz: Tz,
+    utc: chrono::NaiveDateTime,
+    date: chrono::NaiveDate,
+) -> std::cmp::Ordering {
+    use chrono::Offset;
+    let offset_seconds = tz.offset_from_utc_datetime(&utc).fix().local_minus_utc();
+    match utc.checked_add_signed(chrono::Duration::seconds(offset_seconds as i64)) {
+        Some(local) => local.date().cmp(&date),
+        None if offset_seconds > 0 => std::cmp::Ordering::Greater,
+        None => std::cmp::Ordering::Less,
+    }
 }
 
 /// Resolve a calendar date to the earliest instant that belongs to it in
@@ -531,12 +594,15 @@ pub(crate) fn parse_due(value: &str, tz: Tz) -> Result<String, RuntimeError> {
 /// exceptions to it; neither case may be resolved by unwrapping to UTC,
 /// which would silently reintroduce the defect ADR-169 exists to remove.
 ///
-/// Returns `None` only when no instant at all maps to `date` in `tz` (the
-/// zone's local calendar skips the date entirely, e.g. a whole-day UTC-offset
-/// jump across the international date line) — a case ADR-169 does not name,
-/// since its own gap/ambiguity examples are ordinary sub-day transitions.
+/// Returns `None` only when no representable instant carries `date` as its
+/// local date in `tz` — the zone's local calendar skips the date entirely, a
+/// case ADR-169 does not name since its own examples are ordinary sub-day
+/// transitions. The function is total over every date `%Y` can parse, so a
+/// caller never needs a range check of its own.
 fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<DateTime<Tz>> {
-    let midnight = date.and_hms_opt(0, 0, 0)?;
+    let midnight = date
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time on every date");
     match tz.from_local_datetime(&midnight) {
         chrono::LocalResult::Single(dt) => Some(dt),
         // Fall-back overlap: two instants map to the same wall-clock time.
@@ -591,19 +657,28 @@ fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<Da
         // One-second granularity is required, not one-minute: historical
         // LMT offsets are not whole minutes.
         chrono::LocalResult::None => {
-            let mut lo = midnight - chrono::Duration::hours(48);
-            let mut hi = midnight + chrono::Duration::hours(48);
+            let (mut lo, mut hi) = anchor_search_window(date);
+            // The window's lower bound can itself already carry `date`. At the
+            // bottom of the representable range a positive-offset zone has no
+            // representable local midnight, but later local times on that same
+            // date do exist: in `Pacific/Apia` the least representable instant
+            // is local 12:33:04 on chrono's minimum date. That instant IS the
+            // least one carrying the date, so return it rather than reporting
+            // the date as absent.
+            if local_date_cmp(tz, lo, date) == std::cmp::Ordering::Equal {
+                return Some(tz.from_utc_datetime(&lo));
+            }
             // Guard the bisection invariant instead of assuming it. Real UTC
             // offsets stay well inside +/-48h, so a violation here means the
             // zone is outside anything this rule can answer for; fail closed.
-            if tz.from_utc_datetime(&lo).date_naive() >= date
-                || tz.from_utc_datetime(&hi).date_naive() < date
+            if local_date_cmp(tz, lo, date) == std::cmp::Ordering::Greater
+                || local_date_cmp(tz, hi, date) == std::cmp::Ordering::Less
             {
                 return None;
             }
             while hi - lo > chrono::Duration::seconds(1) {
                 let mid = lo + (hi - lo) / 2;
-                if tz.from_utc_datetime(&mid).date_naive() < date {
+                if local_date_cmp(tz, mid, date) == std::cmp::Ordering::Less {
                     lo = mid;
                 } else {
                     hi = mid;
@@ -612,8 +687,8 @@ fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<Da
             // `hi` is now the least instant whose local date is >= `date`.
             // It is > `date` exactly when the zone's local calendar skips
             // the date entirely, which is the documented `None` case.
-            let resolved = tz.from_utc_datetime(&hi);
-            (resolved.date_naive() == date).then_some(resolved)
+            (local_date_cmp(tz, hi, date) == std::cmp::Ordering::Equal)
+                .then(|| tz.from_utc_datetime(&hi))
         }
     }
 }
@@ -641,19 +716,31 @@ mod tz_database_audit {
         chrono::Duration::seconds(1)
     }
 
+    /// Search a CLOSED WINDOW, not a centre and a radius.
+    ///
+    /// The caller supplies the bounds so the searched window has a single definition: the sweep
+    /// passes `anchor_search_window`, the same function the resolver uses, and a change to the
+    /// radius cannot leave this probe checking the old window while still reporting no violations.
+    /// Taking a centre and adding a radius here would recreate that second definition, and would
+    /// also reintroduce bare `-`/`+` on `NaiveDateTime`, which panics at the ends of the
+    /// representable range rather than returning `None`.
     fn find_instant_carrying_date(
-        base: chrono::NaiveDateTime,
-        radius: chrono::Duration,
+        lo: chrono::NaiveDateTime,
+        hi: chrono::NaiveDateTime,
         step: chrono::Duration,
         target: chrono::NaiveDate,
         local_date_at: impl Fn(chrono::NaiveDateTime) -> chrono::NaiveDate,
     ) -> Option<chrono::NaiveDateTime> {
-        let mut probe = base - radius;
-        while probe <= base + radius {
+        let mut probe = lo;
+        while probe <= hi {
             if local_date_at(probe) == target {
                 return Some(probe);
             }
-            probe += step;
+            // Checked, for the same reason the bounds are: stepping past the representable
+            // range must end the search, not abort the process. `?` is the whole behaviour
+            // here — the function already returns `Option`, so an overflow IS "no instant
+            // carries this date within the window".
+            probe = probe.checked_add_signed(step)?;
         }
         None
     }
@@ -701,17 +788,16 @@ mod tz_database_audit {
         // steps to base + 60s, straddling the window. That is why the coarse arm misses
         // deterministically rather than by luck, and the assertion below fails loudly if it ever
         // stops being true.
+        // `base` is a fixed ordinary date, so this arithmetic is provably in range; the helper
+        // takes bounds rather than a radius, so the window is stated once here.
         let radius = chrono::Duration::hours(48);
-        let coarse = find_instant_carrying_date(
-            base,
-            radius,
-            chrono::Duration::minutes(1),
-            target,
-            calendar,
-        );
+        let lo = base - radius;
+        let hi = base + radius;
+        let coarse =
+            find_instant_carrying_date(lo, hi, chrono::Duration::minutes(1), target, calendar);
         // The FINE arm reads the same `probe_step()` the sweep passes, so coarsening the sweep's
         // granularity reddens this test.
-        let fine = find_instant_carrying_date(base, radius, probe_step(), target, calendar);
+        let fine = find_instant_carrying_date(lo, hi, probe_step(), target, calendar);
 
         assert!(
             coarse.is_none(),
@@ -784,8 +870,8 @@ mod tz_database_audit {
                         }
                     }
                     // `None` is correct only for a date the zone's local calendar skips whole.
-                    // Verify that rather than accepting it: no instant in a generous window may
-                    // carry the requested local date.
+                    // Verify that rather than accepting it: no instant in the searched window
+                    // may carry the requested local date.
                     None => {
                         skipped_days += 1;
                         // ONE-SECOND steps, matching the granularity the implementation itself
@@ -793,21 +879,26 @@ mod tz_database_audit {
                         // reassuring direction: a local-date interval shorter than the step can
                         // sit between two probes, so the search reports "no instant carries this
                         // date" without having looked at the instants that would. The pinned table
-                        // happens to contain no such interval, which is exactly why the step size
-                        // is pinned by `a_sub_step_interval_is_missed_by_a_coarse_probe` against a
-                        // fabricated calendar rather than by this sweep. Skipped days are rare
-                        // (single digits across the whole sweep), so the finer step costs nothing
-                        // measurable.
-                        let found = find_instant_carrying_date(
-                            midnight,
-                            chrono::Duration::hours(48),
-                            probe_step(),
-                            date,
-                            |probe| tz.from_utc_datetime(&probe).date_naive(),
-                        );
+                        // happens to contain no such interval, but that is a property of today's
+                        // data and this test exists to be run against data that has changed, which
+                        // is exactly why the step size is pinned by
+                        // `a_sub_step_interval_is_missed_by_a_coarse_probe` against a fabricated
+                        // calendar rather than by this sweep. Skipped days are rare (single digits
+                        // across the whole sweep), so the finer step costs nothing measurable.
+                        //
+                        // The bounds come from `anchor_search_window`, not from a literal, so the
+                        // searched window has one definition. A second literal here would let a
+                        // change to `ANCHOR_SEARCH_RADIUS_HOURS` leave this sweep checking the old
+                        // window while still reporting zero violations.
+                        let (lo, hi) = anchor_search_window(date);
+                        let found =
+                            find_instant_carrying_date(lo, hi, probe_step(), date, |probe| {
+                                tz.from_utc_datetime(&probe).date_naive()
+                            });
                         if let Some(hit) = found {
                             failures.push(format!(
-                                "{tz}: {date} returned None, but {hit}Z has that local date"
+                                "{tz}: {date} was reported as carried by no instant, but {hit}Z \
+                                 has that local date"
                             ));
                         }
                     }
@@ -1017,6 +1108,175 @@ mod parse_due_tests {
         assert!(
             msg.contains("2011-12-30"),
             "error must name the unparseable due date; got: {msg}"
+        );
+    }
+
+    /// `%Y` accepts chrono's full signed year range, so a caller can name the
+    /// minimum date, whose ±48h anchor window runs off the end of
+    /// `NaiveDateTime`. chrono's `-` PANICS there, and the input arrives
+    /// through a public verb, so that was reachable availability denial.
+    ///
+    /// The right outcome is not a rejection. In a zone east of UTC the minimum
+    /// date has no representable local midnight, but later local times on it
+    /// do exist, so the date HAS a least representable instant and the
+    /// least-instant contract can be honoured. Assert that instant, which also
+    /// keeps this a panic regression test: bare arithmetic here still aborts.
+    #[test]
+    fn the_minimum_date_resolves_to_its_least_representable_instant_east_of_utc() {
+        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
+        let out = parse_due("-262143-01-01", tz)
+            .expect("the minimum date has representable instants in a positive-offset zone");
+        assert!(
+            out.starts_with("-262143-01-01T12:33:04"),
+            "must be the least representable instant carrying that local date, which is \
+             chrono's minimum instant seen through Apia's +12:33:04 offset; got: {out}"
+        );
+    }
+
+    /// The returned instant is not merely valid, it is chrono's minimum. That
+    /// is what makes it the LEAST instant carrying the date: the usual
+    /// one-second-earlier check cannot be written here, because one second
+    /// earlier does not exist.
+    #[test]
+    fn the_minimum_date_anchors_exactly_at_the_minimum_instant_east_of_utc() {
+        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
+        let resolved = super::anchor_date_to_earliest_instant(chrono::NaiveDate::MIN, tz)
+            .expect("the minimum date has representable instants east of UTC");
+        assert_eq!(
+            resolved.naive_utc(),
+            chrono::NaiveDateTime::MIN,
+            "no representable instant precedes this one, so it is the least"
+        );
+    }
+
+    /// The same boundary from the other side, and it takes a DIFFERENT path.
+    /// Zone names mislead here: `America/Adak` reads as west of UTC but its
+    /// earliest LMT is +12:13:22, because it crossed the date line. Zones that
+    /// are genuinely negative at the minimum instant have a representable
+    /// local midnight (UTC = midnight + |offset|), so they resolve through the
+    /// direct branch and never reach the lower-bound short-circuit. Offsets
+    /// measured at `NaiveDateTime::MIN`: New York -4:56:02, Los Angeles
+    /// -7:52:58, Honolulu -10:31:26.
+    #[test]
+    fn the_minimum_date_resolves_in_genuinely_negative_offset_zones() {
+        for name in [
+            "America/New_York",
+            "America/Los_Angeles",
+            "Pacific/Honolulu",
+        ] {
+            let tz: Tz = name.parse().expect("known IANA zone");
+            let out = parse_due("-262143-01-01", tz)
+                .unwrap_or_else(|e| panic!("{name}: minimum date must resolve, got {e}"));
+            assert!(
+                out.starts_with("-262143-01-01T00:00:00"),
+                "{name}: a representable local midnight anchors the date directly; got: {out}"
+            );
+        }
+    }
+
+    /// The guard this replaced asked "is the +/-48h window representable" of
+    /// EVERY date, but only the skipped-midnight branch searches that window.
+    /// So it rejected the extremes of the representable range even where local
+    /// midnight resolves directly to a single instant.
+    ///
+    /// Both ends, and zones on both sides of UTC: the offset's SIGN decides
+    /// which end is at risk, so a single-zone test would confirm one direction
+    /// and infer the other. `Pacific/Apia` is east of UTC, `America/Adak` west.
+    #[test]
+    fn the_extremes_of_the_representable_range_resolve_when_local_midnight_exists() {
+        for name in ["UTC", "Pacific/Apia", "Pacific/Midway", "America/Adak"] {
+            let tz: Tz = name.parse().expect("known IANA zone");
+            let out = parse_due("+262142-12-31", tz)
+                .unwrap_or_else(|e| panic!("{name}: the maximum date must resolve, got {e}"));
+            assert!(
+                out.starts_with("+262142-12-31T00:00:00"),
+                "{name}: the maximum date anchors to its own local midnight; got: {out}"
+            );
+        }
+
+        // The minimum date takes the SEARCHING branch in zones east of UTC:
+        // converting its local midnight to UTC would run off the end of the
+        // range, and chrono-tz reports that as no valid local time. That case
+        // is asserted above, where it resolves to the least representable
+        // instant. The case here is UTC, where local midnight exists, so the
+        // direct branch must still succeed at the bottom of the range.
+        let utc: Tz = "UTC".parse().expect("known IANA zone");
+        let out = parse_due("-262143-01-01", utc)
+            .expect("the minimum date must resolve in UTC, where its midnight exists");
+        assert!(
+            out.starts_with("-262143-01-01T00:00:00"),
+            "the minimum date anchors to its own local midnight in UTC; got: {out}"
+        );
+    }
+
+    /// The must-not-fire half. Without it the assertion above could pass
+    /// against a resolver that rejected every date.
+    #[test]
+    fn an_ordinary_date_still_resolves() {
+        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
+        let out = parse_due("2026-08-23", tz).expect("an ordinary date must still resolve");
+        assert!(
+            out.starts_with("2026-08-23T00:00:00"),
+            "ordinary dates keep anchoring to local midnight; got: {out}"
+        );
+    }
+
+    /// The boundary is a property of the window, not of a magic year, so pin
+    /// it against `anchor_search_window` itself rather than a literal. Every
+    /// place that needs the searched window — the resolver and the all-zone
+    /// sweep — calls this one function, so this is the single definition.
+    #[test]
+    fn the_search_window_clamps_at_the_bounds_and_is_exact_elsewhere() {
+        let (lo, hi) = super::anchor_search_window(chrono::NaiveDate::MIN);
+        assert_eq!(
+            lo,
+            chrono::NaiveDateTime::MIN,
+            "the minimum date cannot carry a full -48h window, so the bound clamps \
+             rather than vanishing"
+        );
+        assert!(
+            hi > chrono::NaiveDateTime::MIN,
+            "the upper bound is exact here"
+        );
+
+        let (_, hi_max) = super::anchor_search_window(chrono::NaiveDate::MAX);
+        assert_eq!(
+            hi_max,
+            chrono::NaiveDateTime::MAX,
+            "and symmetrically at the top of the range"
+        );
+
+        // The must-not-fire half: away from the bounds the window is the real
+        // +/-48h, so the clamp cannot be silently swallowing ordinary dates.
+        let ordinary = chrono::NaiveDate::from_ymd_opt(2026, 8, 23).expect("valid date");
+        let midnight = ordinary.and_hms_opt(0, 0, 0).expect("midnight");
+        let radius = chrono::Duration::hours(super::ANCHOR_SEARCH_RADIUS_HOURS);
+        assert_eq!(
+            super::anchor_search_window(ordinary),
+            (midnight - radius, midnight + radius),
+            "an ordinary date gets the exact window"
+        );
+    }
+
+    /// `local_date_cmp` exists because `date_naive()` PANICS at the bounds.
+    /// Exercise exactly those two spellings' disagreement, or the helper looks
+    /// like ceremony to the next reader.
+    #[test]
+    fn local_date_cmp_is_total_where_date_naive_panics() {
+        let east: Tz = "Pacific/Apia".parse().expect("known IANA zone");
+        assert_eq!(
+            super::local_date_cmp(east, chrono::NaiveDateTime::MAX, chrono::NaiveDate::MAX),
+            std::cmp::Ordering::Greater,
+            "east of UTC the top of the range maps past the last representable date"
+        );
+        // NOT `America/Adak`, whose earliest LMT is +12:13:22 because it
+        // crossed the date line; a zone is chosen here by its MEASURED offset
+        // at the instant under test, never by what its name suggests.
+        let west: Tz = "America/New_York".parse().expect("known IANA zone");
+        assert_eq!(
+            super::local_date_cmp(west, chrono::NaiveDateTime::MIN, chrono::NaiveDate::MIN),
+            std::cmp::Ordering::Less,
+            "west of UTC the bottom of the range maps before the first representable date"
         );
     }
 }
