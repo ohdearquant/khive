@@ -50,6 +50,14 @@ clippy:
 test:
 	cd crates && cargo test --workspace
 
+# The all-zone chrono-tz sweep. Ignored by default because it walks every
+# zone in the bundled database and costs ~50s; it exists to be RUN when the
+# chrono-tz pin moves, which is when the bundled zone data can change under
+# the resolver. Wired to CI on the manifests that carry that pin, so the
+# duty is triggered rather than remembered.
+tz-audit:
+	cd crates && $(CARGO) test -p khive-pack-gtd --lib tz_database_audit -- --ignored
+
 contract-test:
 	cd crates && cargo build --release -p kkernel
 	python3 tests/contract_test.py
