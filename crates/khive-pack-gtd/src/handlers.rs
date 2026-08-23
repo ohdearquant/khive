@@ -622,6 +622,110 @@ fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<Da
 mod tz_database_audit {
     use super::*;
 
+    /// Search a window around `base` at `step` granularity for any instant whose local date is
+    /// `target`, returning the first hit.
+    ///
+    /// Generic over the date lookup rather than over `TimeZone`, and that is the whole point. The
+    /// only thing `step` decides is whether a local-date interval SHORTER THAN THE STEP can hide
+    /// between two probes, and the pinned `chrono-tz` table contains no such interval — so the real
+    /// database cannot exercise the one property this function's granularity governs. Taking the
+    /// lookup as a closure lets a fabricated calendar do it instead, which is why
+    /// `a_sub_step_interval_is_missed_by_a_coarse_probe` below can go red against a coarse step and
+    /// green against a fine one without touching the pinned data or the production signature.
+    /// The probe granularity, as a function rather than a literal at the call site, so that the
+    /// sweep below and the synthetic arm read the SAME value. Inline the literal in both places and
+    /// the arm pins only itself: someone coarsening the sweep would leave the arm green while
+    /// reintroducing exactly the defect it exists to catch. Coarsen this and
+    /// `a_sub_step_interval_is_missed_by_a_coarse_probe` goes red.
+    fn probe_step() -> chrono::Duration {
+        chrono::Duration::seconds(1)
+    }
+
+    fn find_instant_carrying_date(
+        base: chrono::NaiveDateTime,
+        radius: chrono::Duration,
+        step: chrono::Duration,
+        target: chrono::NaiveDate,
+        local_date_at: impl Fn(chrono::NaiveDateTime) -> chrono::NaiveDate,
+    ) -> Option<chrono::NaiveDateTime> {
+        let mut probe = base - radius;
+        while probe <= base + radius {
+            if local_date_at(probe) == target {
+                return Some(probe);
+            }
+            probe += step;
+        }
+        None
+    }
+
+    /// The discriminating arm for the probe granularity.
+    ///
+    /// A fabricated calendar in which one local date exists for THIRTY SECONDS. A one-minute probe
+    /// steps straight over it and reports that no instant carries that date, which is the failure
+    /// this granularity exists to prevent and is invisible against the real table. A one-second
+    /// probe finds it. Synthetic data is the correct fixture here precisely because the pinned
+    /// database has no transition of this shape: an assertion that cannot be made to fail is not an
+    /// assertion, and the alternative was shipping the finer step on argument alone.
+    #[test]
+    fn a_sub_step_interval_is_missed_by_a_coarse_probe() {
+        let base = chrono::NaiveDate::from_ymd_opt(2000, 1, 2)
+            .expect("base date")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight");
+        let target = chrono::NaiveDate::from_ymd_opt(2000, 1, 2).expect("target date");
+        let before = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("previous date");
+        let after = chrono::NaiveDate::from_ymd_opt(2000, 1, 3).expect("next date");
+
+        // `target` occupies [base + 10s, base + 40s) and nothing else does. The window is offset
+        // from every whole minute in the search so a coarse probe lands either side of it.
+        let window_start = base + chrono::Duration::seconds(10);
+        let window_end = base + chrono::Duration::seconds(40);
+        let calendar = move |probe: chrono::NaiveDateTime| {
+            if probe >= window_start && probe < window_end {
+                target
+            } else if probe < window_start {
+                before
+            } else {
+                after
+            }
+        };
+
+        // Guard the fixture itself: the interval must actually be shorter than the coarse step,
+        // otherwise this test would pass for a reason that has nothing to do with granularity.
+        assert!(
+            window_end - window_start < chrono::Duration::minutes(1),
+            "fixture is not sub-step: the interval must be shorter than the coarse probe"
+        );
+
+        // The radius is a whole number of minutes, so a one-minute probe lands on base exactly and
+        // steps to base + 60s, straddling the window. That is why the coarse arm misses
+        // deterministically rather than by luck, and the assertion below fails loudly if it ever
+        // stops being true.
+        let radius = chrono::Duration::hours(48);
+        let coarse = find_instant_carrying_date(
+            base,
+            radius,
+            chrono::Duration::minutes(1),
+            target,
+            calendar,
+        );
+        // The FINE arm reads the same `probe_step()` the sweep passes, so coarsening the sweep's
+        // granularity reddens this test.
+        let fine = find_instant_carrying_date(base, radius, probe_step(), target, calendar);
+
+        assert!(
+            coarse.is_none(),
+            "the one-minute probe found {coarse:?}, so this fixture does not discriminate and \
+             the arm proves nothing"
+        );
+        let hit = fine.expect("the one-second probe must find the 30-second window");
+        assert_eq!(
+            calendar(hit),
+            target,
+            "the one-second probe returned {hit}, whose local date is not the target"
+        );
+    }
+
     /// Sweep every zone in the pinned `chrono-tz` over 1850-2100 and assert that
     /// `anchor_date_to_earliest_instant` returns the LEAST instant of the requested local date.
     ///
@@ -684,26 +788,23 @@ mod tz_database_audit {
                     // carry the requested local date.
                     None => {
                         skipped_days += 1;
-                        let base = midnight;
-                        let mut found = None;
                         // ONE-SECOND steps, matching the granularity the implementation itself
                         // searches at. A coarser step was here first and was wrong in the
                         // reassuring direction: a local-date interval shorter than the step can
                         // sit between two probes, so the search reports "no instant carries this
-                        // date" without having looked at the instants that would. The current
-                        // pinned table happens to contain no such interval, but that is a
-                        // property of today's data, and this test exists to be run against data
-                        // that has changed. The window is ~48h either side and skipped days are
-                        // rare (single digits across the whole sweep), so the finer step costs
-                        // nothing measurable.
-                        let mut probe = base - chrono::Duration::hours(48);
-                        while probe <= base + chrono::Duration::hours(48) {
-                            if tz.from_utc_datetime(&probe).date_naive() == date {
-                                found = Some(probe);
-                                break;
-                            }
-                            probe += chrono::Duration::seconds(1);
-                        }
+                        // date" without having looked at the instants that would. The pinned table
+                        // happens to contain no such interval, which is exactly why the step size
+                        // is pinned by `a_sub_step_interval_is_missed_by_a_coarse_probe` against a
+                        // fabricated calendar rather than by this sweep. Skipped days are rare
+                        // (single digits across the whole sweep), so the finer step costs nothing
+                        // measurable.
+                        let found = find_instant_carrying_date(
+                            midnight,
+                            chrono::Duration::hours(48),
+                            probe_step(),
+                            date,
+                            |probe| tz.from_utc_datetime(&probe).date_naive(),
+                        );
                         if let Some(hit) = found {
                             failures.push(format!(
                                 "{tz}: {date} returned None, but {hit}Z has that local date"
