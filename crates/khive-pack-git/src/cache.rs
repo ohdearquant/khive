@@ -261,39 +261,62 @@ fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cach
     let repo_dir = root.join(&key);
     let cap = clone_max_bytes();
 
-    // Slots created before `clone` gained `--no-checkout` still carry a
-    // worktree, and nothing else on this path would ever remove it. Such a slot
-    // is replaced whole rather than stripped in place: the removal re-derives
-    // ownership from a descriptor it opens itself, so this change adds no new
-    // destructive traversal.
-    let mut migrated = false;
-    if repo_dir.join(".git").exists() {
+    // Slot state is decided exactly once, in the same breath as the
+    // ownership check; the arms below key on this decision and never ask
+    // the filesystem again. A second `.git` read would answer a question
+    // about whatever occupies that pathname NOW — after our own removal,
+    // or after a foreign process's write in a shared scratch root, that is
+    // not necessarily anything this process owns, and the fetch arm would
+    // then mutate an unowned repository (refs and ownership marker).
+    // `slot_lock` is in-process only, so a foreign writer is not excluded.
+    enum SlotState {
+        /// `.git` present at the decision point, ownership verified,
+        /// no legacy worktree.
+        Owned,
+        /// Legacy slot (pre-`--no-checkout` worktree) replaced whole by our
+        /// own act; the pathname is vacant as far as this process is
+        /// concerned. The removal re-derives ownership from a descriptor it
+        /// opens itself, so migration adds no new destructive traversal.
+        Replaced,
+        /// No slot at the decision point.
+        Absent,
+    }
+    let slot = if repo_dir.join(".git").exists() {
         if !is_owned_entry(&repo_dir) {
             return Err(CacheError::UnsafeToReplace(repo_dir));
         }
-        migrated = migrate_legacy_slot(root, &repo_dir)?;
-    }
-
-    // `!migrated` and not a second `.git.exists()` read on its own. Asking the
-    // filesystem again would answer a question about whatever occupies that
-    // pathname NOW, which after a removal is not necessarily anything this
-    // process owns; the fetch arm below would then operate on it unchecked.
-    if !migrated && repo_dir.join(".git").exists() {
-        fetch(&repo_dir)?;
-        advance_to_fetched_tip(&repo_dir)?;
-        // `repo_dir` was just fetched into and its ownership already
-        // confirmed above; it vanishing here is a real problem (`slot_lock`
-        // excludes a concurrent `ensure_clone`/`refetch_clone`/`reclone` on
-        // this same key, so nothing else in this crate should be touching
-        // it), not a maybe-absent slot, so propagate rather than swallow.
-        let size = dir_size(&repo_dir)?;
-        if size > cap {
-            remove_owned_entry(root, &repo_dir)?;
-            return Err(CacheError::CloneTooLarge { bytes: size, cap });
+        if migrate_legacy_slot(root, &repo_dir)? {
+            SlotState::Replaced
+        } else {
+            SlotState::Owned
         }
-        touch(&repo_dir)?;
     } else {
-        install_fresh_clone(canonical_url, root, &repo_dir, cap)?;
+        SlotState::Absent
+    };
+
+    match slot {
+        SlotState::Owned => {
+            fetch(&repo_dir)?;
+            advance_to_fetched_tip(&repo_dir)?;
+            // `repo_dir` was just fetched into and its ownership already
+            // confirmed above; it vanishing here is a real problem (`slot_lock`
+            // excludes a concurrent `ensure_clone`/`refetch_clone`/`reclone` on
+            // this same key, so nothing else in this crate should be touching
+            // it), not a maybe-absent slot, so propagate rather than swallow.
+            let size = dir_size(&repo_dir)?;
+            if size > cap {
+                remove_owned_entry(root, &repo_dir)?;
+                return Err(CacheError::CloneTooLarge { bytes: size, cap });
+            }
+            touch(&repo_dir)?;
+        }
+        // If a foreign directory appears at the pathname after this decision,
+        // `install_fresh_clone` fails closed: it stages into a private
+        // namespace and installs with a single `rename`, which refuses a
+        // non-empty destination rather than overwriting it.
+        SlotState::Replaced | SlotState::Absent => {
+            install_fresh_clone(canonical_url, root, &repo_dir, cap)?;
+        }
     }
 
     evict_lru(root, &repo_dir)?;
@@ -2118,6 +2141,57 @@ mod tests {
 
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
+    }
+
+    /// The install path must fail closed when a foreign (unowned) directory
+    /// occupies the slot pathname: staging plus a single `rename` refuses a
+    /// non-empty destination, so the foreign bytes survive and no ownership
+    /// marker is written. This is the second half of `ensure_clone_locked`'s
+    /// no-re-read guarantee: once the slot state is decided `Absent`, a
+    /// foreign directory appearing at the pathname must not be fetched
+    /// into, overwritten, or claimed.
+    #[test]
+    fn install_fresh_clone_refuses_a_foreign_occupied_slot() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
+
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        test_git(&upstream, &["init", "-q"]);
+        test_git(&upstream, &["config", "user.email", "t@example.com"]);
+        test_git(&upstream, &["config", "user.name", "T"]);
+        std::fs::write(upstream.join("tracked.md"), "content\n").unwrap();
+        test_git(&upstream, &["add", "tracked.md"]);
+        test_git(&upstream, &["commit", "-q", "-m", "commit A"]);
+        let url = upstream.to_str().expect("utf8 path");
+
+        // A foreign process's directory at the slot pathname: it has a
+        // `.git` but no ownership marker, plus a sentinel byte the
+        // assertions below prove survives.
+        let root = scratch_root();
+        prepare_cache_root(&root).expect("cache root");
+        let repo_dir = root.join(cache_key(url));
+        std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
+        std::fs::write(repo_dir.join("foreign.txt"), "foreign\n").unwrap();
+        assert!(
+            !is_owned_entry(&repo_dir),
+            "fixture control: the occupying directory must be unowned"
+        );
+
+        install_fresh_clone(url, &root, &repo_dir, clone_max_bytes())
+            .expect_err("install into an occupied foreign pathname must fail");
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("foreign.txt")).expect("sentinel readable"),
+            "foreign\n",
+            "foreign bytes must survive a refused install"
+        );
+        assert!(
+            !repo_dir.join(MARKER_FILE).exists(),
+            "a refused install must never write the ownership marker"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
     #[test]
