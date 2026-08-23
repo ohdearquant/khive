@@ -5656,6 +5656,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// One entry in the interleaved submission trace. Typed so assertions
+    /// match on fields instead of parsing a formatted string; both sides of
+    /// the ordering land on ONE vector so their relative order is observable
+    /// rather than assumed.
+    #[derive(Debug, Clone, PartialEq)]
+    enum TraceEntry {
+        /// A handler effect that has committed (nothing downstream undoes it).
+        Effect { name: String },
+        /// An audit row submitted to the event store, carrying exactly the
+        /// fields the obligation test discriminates on.
+        Audit {
+            kind: EventKind,
+            outcome: EventOutcome,
+            verb: String,
+            /// The row's `resource.cost_unit`, `None` when the payload omits
+            /// it (the error path's `base_resource_payload` does).
+            cost_unit: Option<Value>,
+        },
+    }
+
     /// In-memory EventStore for unit tests — avoids file-backed SQLite.
     #[derive(Default, Debug)]
     struct MemoryEventStore {
@@ -5679,7 +5699,7 @@ pub(crate) mod tests {
         /// handler also gets the ordering between the handler's effect and
         /// the audit submission, which is the only way to observe that the
         /// audit row is written after the handler rather than before it.
-        trace: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+        trace: Option<Arc<std::sync::Mutex<Vec<TraceEntry>>>>,
     }
 
     impl MemoryEventStore {
@@ -5710,11 +5730,13 @@ pub(crate) mod tests {
                         .payload
                         .get("resource")
                         .and_then(|resource| resource.get("cost_unit"))
-                        .map_or_else(|| "absent".to_string(), |v| v.to_string());
-                    trace.push(format!(
-                        "audit:{:?}:{:?}:{}:cost_unit={}",
-                        event.kind, event.outcome, event.verb, cost_unit
-                    ));
+                        .cloned();
+                    trace.push(TraceEntry::Audit {
+                        kind: event.kind,
+                        outcome: event.outcome,
+                        verb: event.verb.clone(),
+                        cost_unit,
+                    });
                 }
             }
         }
@@ -6565,9 +6587,16 @@ pub(crate) mod tests {
     // audit counters the two groups above cover.
     #[serial(config_ledger)]
     async fn obligation_failure_reports_a_write_that_already_committed() {
+        /// `total` is what `cost_unit` is computed from, so this number is the
+        /// test's handle on whether the audit row was built from the return
+        /// value. 41 is arbitrary but distinctive: it makes the expected
+        /// `cost_unit` 42 (`base_weight` 1 + `item_count` 41 * `model_count`
+        /// 1), a value no default path produces.
+        const RETURNED_TOTAL: u64 = 41;
+
         #[derive(Debug)]
         struct RecordingWritePack {
-            committed: Arc<std::sync::Mutex<Vec<String>>>,
+            committed: Arc<std::sync::Mutex<Vec<TraceEntry>>>,
         }
 
         impl Pack for RecordingWritePack {
@@ -6623,12 +6652,8 @@ pub(crate) mod tests {
                 self.committed
                     .lock()
                     .expect("committed lock")
-                    .push(format!("effect:{name}"));
-                // `total` is what `cost_unit` is computed from, so this number
-                // is the test's handle on whether the audit row was built from
-                // the return value. 41 is arbitrary but distinctive: it makes
-                // the expected `cost_unit` 42, a value no default path produces.
-                Ok(serde_json::json!({ "created": name, "total": 41 }))
+                    .push(TraceEntry::Effect { name: name.clone() });
+                Ok(serde_json::json!({ "created": name, "total": RETURNED_TOTAL }))
             }
         }
 
@@ -6662,15 +6687,18 @@ pub(crate) mod tests {
         // from the successful result, which is what makes it the obligation row and
         // not an error row.
         let first_pass = committed.lock().expect("committed lock").clone();
+        let first_effect = TraceEntry::Effect {
+            name: "first".to_string(),
+        };
         assert_eq!(
-            first_pass.first().map(String::as_str),
-            Some("effect:first"),
+            first_pass.first(),
+            Some(&first_effect),
             "the handler's effect must land FIRST: an implementation that submitted the \
              audit row before dispatching would satisfy every other assertion here"
         );
-        let audit_rows: Vec<&String> = first_pass
+        let audit_rows: Vec<&TraceEntry> = first_pass
             .iter()
-            .filter(|entry| entry.starts_with("audit:"))
+            .filter(|entry| matches!(entry, TraceEntry::Audit { .. }))
             .collect();
         assert!(
             !audit_rows.is_empty(),
@@ -6679,26 +6707,34 @@ pub(crate) mod tests {
              builds a row at all, which is a different defect wearing the same error \
              string. Trace was {first_pass:?}"
         );
+        let expected_cost_unit = serde_json::json!(RETURNED_TOTAL + 1);
         assert!(
-            audit_rows
-                .iter()
-                .any(|entry| entry.contains(":Success:knowledge.index:cost_unit=42")),
+            audit_rows.iter().any(|entry| matches!(
+                entry,
+                TraceEntry::Audit {
+                    outcome: EventOutcome::Success,
+                    verb,
+                    cost_unit: Some(cost_unit),
+                    ..
+                } if verb.as_str() == "knowledge.index" && *cost_unit == expected_cost_unit
+            )),
             "the submitted row must be the SUCCESS row for THIS verb, carrying a resource \
              computed FROM the handler's return value. The outcome alone is not enough: an \
              implementation that stamps Success on a row built without `ok_val` would \
              satisfy an outcome-only assertion while breaking the contract this test \
              exists for. The exact value is the discriminator, not the key's presence: \
              `resource_payload` inserts `cost_unit` unconditionally, so presence survives a \
-             static `ok_val`, while 42 is reachable only from the returned `total` of 41 \
-             (`base_weight` 1 + `item_count` 41 * `model_count` 1). Substituting a null or \
-             static result collapses it to 1, and the error path's `base_resource_payload` \
-             omits the key entirely, so all three implementations are distinguishable here. \
-             Trace was {first_pass:?}"
+             static `ok_val`, while {expected_cost_unit} is reachable only from the \
+             returned `total` of {RETURNED_TOTAL} (`base_weight` 1 + `item_count` \
+             {RETURNED_TOTAL} * `model_count` 1). Substituting a null or static result \
+             collapses it to 1, and the error path's `base_resource_payload` omits the key \
+             entirely (`cost_unit: None` here), so all three implementations are \
+             distinguishable. Trace was {first_pass:?}"
         );
         assert_eq!(
             first_pass
                 .iter()
-                .filter(|entry| entry.as_str() == "effect:first")
+                .filter(|entry| **entry == first_effect)
                 .count(),
             1,
             "exactly one effect on the first pass"
@@ -6714,7 +6750,7 @@ pub(crate) mod tests {
                 .lock()
                 .expect("committed lock")
                 .iter()
-                .filter(|entry| entry.as_str() == "effect:first")
+                .filter(|entry| **entry == first_effect)
                 .count(),
             2,
             "retrying this error double-writes; a caller must re-derive state instead of \
