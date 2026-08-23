@@ -1,0 +1,187 @@
+{
+  "_source": "Which sentences of ADR-137 and of the khive-wire-protocol crate documentation each Amendment 1 decision displaces. The derived passages of the amendment's 'Precedence over the crate documentation' and 'Implementation fences' sections are generated from this table by scripts/lint-adr-137-displacements.py, which also cross-checks every decision's label against the ADR's own heading text. Rows are established by reading the cited sources directly; a field name is not a reliable key for this work, the call site is.",
+  "_scope_kinds": "A displacement is bounded when the parent rule survives and only its scope moves. `scope_kind` is a CLOSED vocabulary and is what the generated count and membership list are derived from; `scope_note` is the prose explanation for a reader and is never counted. They were one field until 2026-08-22, when decision 1 turned out to be bounded in fact while carrying no note, so a published count silently omitted it. The checker rejects an unknown kind, a note without a kind, a kind without a note, and a kind on a row that displaces no crate passage.",
+  "_citations": "A cite names a FILE and never a line number. Line numbers were carried here until 2026-08-22 and were measured wrong in two rows: the amendment's own 388 inserted lines moved the ADR under its own table, which is self-invalidating by construction, and nothing consumed the numbers so nothing kept them honest. The locator is now the quote. Every string in `quotes` must appear VERBATIM in the cited file after doc-comment markers are stripped and whitespace is collapsed, and the check resolves each one to a current line number at run time. That normalization is canonicalization of a known syntax, not fuzzy matching: the comparison after it is still exact, because a tolerant match is what let a lowercased quote in decision 2 resolve to an unrelated passage 93 lines away.",
+  "_row6_note": "Decision 6 is recorded against the amendment text as it now stands, in which the decision requires the sequence and direction rules on BOTH endpoint roles. An earlier draft of the decision covered the server role only, and under that reading the crate documentation displaced nothing, because the crate already documents a server-side gate. Under the current reading the two statements that scope the gate to the server are exactly what is displaced. The row is stated here so that a reader can see the crate documentation changed status because the decision widened, not because the crate changed.",
+  "decisions": [
+    {
+      "n": 1,
+      "label": "RATIFIED",
+      "subject": "Initial version and floor",
+      "parent_displaced": [
+        {
+          "cite": "docs/adr/ADR-137-tailnet-wire-transport.md",
+          "quotes": [
+            "Protocol version numbers are monotonic; a server supports the current version and at least the immediately prior version"
+          ]
+        }
+      ],
+      "crate_displaced": [
+        {
+          "cite": "crates/khive-wire-protocol/src/lib.rs",
+          "quotes": [
+            "A server supports the current version and at least the immediately prior version"
+          ],
+          "gloss": "the versioning section restates the parent's compatibility rule in its unbounded form"
+        }
+      ],
+      "explicit": "no",
+      "scope_kind": "version_floor",
+      "scope_note": "the compatibility rule itself is unaltered; what is displaced is its silent assumption that a prior version always exists, which at the floor of `1` makes the initial supported range `[1, 1]`"
+    },
+    {
+      "n": 2,
+      "label": "RATIFIED",
+      "subject": "Frame ceiling and accounting",
+      "parent_displaced": [
+        {
+          "cite": "docs/adr/ADR-137-tailnet-wire-transport.md",
+          "quotes": [
+            "The exact numeric defaults for frame-size and in-flight-request limits"
+          ]
+        },
+        {
+          "cite": "docs/adr/ADR-137-tailnet-wire-transport.md",
+          "quotes": [
+            "Only the exhaustive per-topic payload catalog and the numeric limit defaults remain implementation-phase deliverables"
+          ]
+        }
+      ],
+      "crate_displaced": [],
+      "explicit": "no"
+    },
+    {
+      "n": 3,
+      "label": "RATIFIED",
+      "subject": "Operation identifiers",
+      "parent_displaced": [],
+      "crate_displaced": [],
+      "explicit": "n-a"
+    },
+    {
+      "n": 4,
+      "label": "CHANGED",
+      "subject": "Envelope member semantics",
+      "parent_displaced": [],
+      "crate_displaced": [
+        {
+          "cite": "crates/khive-wire-protocol/src/lib.rs",
+          "quotes": [
+            "Explicit `null` on an optional field is equivalent to absence.",
+            "Duplicate members are last-wins, not rejected."
+          ],
+          "gloss": "the module documentation's stated boundaries on optional-null equivalence and duplicate members"
+        }
+      ],
+      "explicit": "no"
+    },
+    {
+      "n": 5,
+      "label": "CHANGED",
+      "subject": "Unknown error codes",
+      "parent_displaced": [
+        {
+          "cite": "docs/adr/ADR-137-tailnet-wire-transport.md",
+          "quotes": [
+            "a client that receives a code it does not recognize must treat it as `internal` — request-terminal"
+          ]
+        }
+      ],
+      "crate_displaced": [
+        {
+          "cite": "crates/khive-wire-protocol/src/lib.rs",
+          "quotes": [
+            "an unrecognized code falls back to `internal`",
+            "a client that decodes a code it does not recognize treats it as `internal` (request-terminal) rather than inventing semantics for it"
+          ],
+          "gloss": "the module documentation's unknown-error-code paragraphs"
+        },
+        {
+          "cite": "crates/khive-wire-protocol/src/error.rs",
+          "quotes": [
+            "its true scope is unknown to this protocol version, and ADR-137 directs the client to treat it as `internal` rather than reject the frame."
+          ],
+          "gloss": "the wire-error module's own documentation, which quotes the parent's superseded sentence verbatim and presents it as the governing rule"
+        }
+      ],
+      "explicit": "yes",
+      "scope_kind": "idless_error",
+      "scope_note": "for the id-less case only, per that decision's own split"
+    },
+    {
+      "n": 6,
+      "label": "CHANGED",
+      "subject": "Handshake sequence violations",
+      "parent_displaced": [],
+      "crate_displaced": [
+        {
+          "cite": "crates/khive-wire-protocol/src/lib.rs",
+          "quotes": [
+            "implements the server side of this sequence as a type"
+          ],
+          "gloss": "the handshake gate's documentation, which presents a server-side-only gate as the implementation of the sequence rule"
+        },
+        {
+          "cite": "crates/khive-wire-protocol/src/handshake.rs",
+          "quotes": [
+            "The server-side handshake state machine"
+          ],
+          "gloss": "the handshake module's own scope statement"
+        }
+      ],
+      "explicit": "yes",
+      "scope_kind": "endpoint_role",
+      "scope_note": "the rule is unaltered; what is displaced is its scoping to one endpoint role"
+    },
+    {
+      "n": 7,
+      "label": "RATIFIED",
+      "subject": "Topic validation boundary",
+      "parent_displaced": [],
+      "crate_displaced": [],
+      "explicit": "n-a"
+    },
+    {
+      "n": 8,
+      "label": "RATIFIED",
+      "subject": "Event timestamp boundary",
+      "parent_displaced": [],
+      "crate_displaced": [],
+      "explicit": "n-a"
+    },
+    {
+      "n": 9,
+      "label": "CHANGED",
+      "subject": "Opaque subvalue preservation",
+      "parent_displaced": [],
+      "crate_displaced": [
+        {
+          "cite": "crates/khive-wire-protocol/src/lib.rs",
+          "quotes": [
+            "semantic equality, not byte-for-byte"
+          ],
+          "gloss": "the module documentation's opaque-payload-fidelity section, together with the named codec test it cites as pinning that behaviour"
+        }
+      ],
+      "explicit": "no"
+    },
+    {
+      "n": 10,
+      "label": "CHANGED",
+      "subject": "`event.payload` must be a JSON object",
+      "parent_displaced": [],
+      "crate_displaced": [
+        {
+          "cite": "crates/khive-wire-protocol/src/lib.rs",
+          "quotes": [
+            "data, not grammar"
+          ],
+          "gloss": "the characterization of `event.payload` as data whose shape the crate does not own, as it applies to the outermost type only"
+        }
+      ],
+      "explicit": "no",
+      "scope_kind": "outermost_shape",
+      "scope_note": "the per-field shape of a topic's payload remains the catalog's business; only the outermost type is displaced"
+    }
+  ]
+}

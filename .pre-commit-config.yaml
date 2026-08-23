@@ -60,6 +60,12 @@ repos:
         language: system
         files: ^(docs/.*\.md|crates/(.*/docs/.*\.md|.*/design[^/]*\.md))$
         pass_filenames: false
+      - id: lint-adr-137-displacements
+        name: ADR-137 amendment 1 derived passages match their table
+        entry: uv run scripts/lint-adr-137-displacements.py --check
+        language: system
+        files: ^(docs/adr/ADR-137-.*\.md|scripts/data/adr-137-amendment-1-displacements\.json|scripts/lint-adr-137-displacements\.py)$
+        pass_filenames: false
 
   # TypeScript / Next.js: eslint + prettier (run via pnpm)
   - repo: local
