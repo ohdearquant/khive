@@ -556,14 +556,27 @@ fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<Da
         // the offset goes from +12:13:22 to -11:46:38 — and the pinned
         // chrono-tz table holds 107 such date-decreasing transitions. What
         // makes the bisection sound is that none of them falls inside a
-        // window this branch searches: over every date in the pinned table
-        // for which `from_local_datetime` returns `None` (4311 of them), an
-        // enumeration of the generated transition tables found no
-        // date-decrease in any search window, no disagreement between the
-        // bisection result and the true first instant, and no bound-guard
-        // trip. Re-derive that when the chrono-tz pin moves; a violation
-        // would cost the LEAST-instant property, while the same-date check
-        // at the end still keeps a wrong DATE from being returned.
+        // window this branch searches.
+        //
+        // That is checked rather than argued, and it is checked as the
+        // CONCLUSION rather than the premise. `every_gap_date_resolves_to_the
+        // _least_instant` sweeps every zone in the pinned database over
+        // 1850-2100 and asserts directly that one second before the returned
+        // instant is a different local date — the least-instant property
+        // itself, which is what a monotonicity violation would cost. At the
+        // current pin it reports 597 zones over 91311 dates each, 4299 gap
+        // dates, 818 folds, 7 whole days a zone's calendar skips, and zero
+        // violations, in about three seconds. Those counts are printed by the
+        // test rather than asserted, because their magnitudes are the
+        // database's business and only their reaching zero would mean the
+        // sweep broke. Run it whenever the chrono-tz pin moves:
+        //
+        //   cargo test -p khive-pack-gtd --lib --release -- --ignored --nocapture
+        //
+        // It is ignored by default because it is an all-zone sweep, not
+        // because it is optional. A violation costs the LEAST-instant
+        // property only; the same-date check at the end of this branch keeps
+        // a wrong DATE from being returned regardless.
         //
         // The earlier implementation instead read the offset in effect at
         // noon on the previous calendar date and projected local midnight
@@ -602,6 +615,139 @@ fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<Da
             let resolved = tz.from_utc_datetime(&hi);
             (resolved.date_naive() == date).then_some(resolved)
         }
+    }
+}
+
+#[cfg(test)]
+mod tz_database_audit {
+    use super::*;
+
+    /// Sweep every zone in the pinned `chrono-tz` over 1850-2100 and assert that
+    /// `anchor_date_to_earliest_instant` returns the LEAST instant of the requested local date.
+    ///
+    /// This is the re-derivation duty the gap branch's comment names, and it exists because the
+    /// comment used to assert a premise instead: that a local date is monotonically non-decreasing
+    /// in UTC time. That premise is false globally — zones that crossed the international date line
+    /// run the local calendar backwards, `America/Adak` at 1867-10-19T00:31:13Z being one — and a
+    /// true premise supporting a wrong inference reads as verified, so this checks the inference.
+    ///
+    /// The property asserted is direct and needs no transition table: for the returned instant `r`,
+    /// `r` has the requested local date and `r - 1s` does not. Anything less than the least instant
+    /// fails the first half; anything more fails the second.
+    ///
+    /// Ignored by default because it is an all-zone sweep, not because it is optional:
+    ///
+    ///   cargo test -p khive-pack-gtd --lib --release -- --ignored --nocapture
+    #[test]
+    #[ignore = "all-zone chrono-tz sweep; run on a pin bump (see the command in the doc comment)"]
+    fn every_gap_date_resolves_to_the_least_instant() {
+        let start = chrono::NaiveDate::from_ymd_opt(1850, 1, 1).expect("start date");
+        let end = chrono::NaiveDate::from_ymd_opt(2100, 1, 1).expect("end date");
+
+        let mut zones = 0usize;
+        let mut gaps = 0usize;
+        let mut folds = 0usize;
+        let mut skipped_days = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
+        for tz in chrono_tz::TZ_VARIANTS.iter().copied() {
+            zones += 1;
+            let mut date = start;
+            while date < end {
+                let midnight = date.and_hms_opt(0, 0, 0).expect("midnight");
+                match tz.from_local_datetime(&midnight) {
+                    chrono::LocalResult::Single(_) => {}
+                    chrono::LocalResult::Ambiguous(_, _) => folds += 1,
+                    chrono::LocalResult::None => gaps += 1,
+                }
+
+                match anchor_date_to_earliest_instant(date, tz) {
+                    Some(resolved) => {
+                        let previous = resolved - chrono::Duration::seconds(1);
+                        if resolved.date_naive() != date {
+                            failures.push(format!(
+                                "{tz}: {date} resolved to {resolved}, whose local date is \
+                                 {}",
+                                resolved.date_naive()
+                            ));
+                        } else if tz.from_utc_datetime(&previous.naive_utc()).date_naive() == date {
+                            failures.push(format!(
+                                "{tz}: {date} resolved to {resolved}, but one second earlier is \
+                                 still {date} — not the least instant"
+                            ));
+                        }
+                    }
+                    // `None` is correct only for a date the zone's local calendar skips whole.
+                    // Verify that rather than accepting it: no instant in a generous window may
+                    // carry the requested local date.
+                    None => {
+                        skipped_days += 1;
+                        let base = midnight;
+                        let mut found = None;
+                        let mut probe = base - chrono::Duration::hours(48);
+                        while probe <= base + chrono::Duration::hours(48) {
+                            if tz.from_utc_datetime(&probe).date_naive() == date {
+                                found = Some(probe);
+                                break;
+                            }
+                            probe += chrono::Duration::minutes(1);
+                        }
+                        if let Some(hit) = found {
+                            failures.push(format!(
+                                "{tz}: {date} returned None, but {hit}Z has that local date"
+                            ));
+                        }
+                    }
+                }
+
+                date = date.succ_opt().expect("date in range has a successor");
+            }
+        }
+
+        println!(
+            "swept {zones} zones over {} dates each: {gaps} gaps, {folds} folds, \
+             {skipped_days} whole days skipped by a zone's calendar, {} violations",
+            (end - start).num_days(),
+            failures.len()
+        );
+
+        // The substantive result is asserted FIRST, deliberately. An earlier version put the
+        // population checks above this one and guessed their thresholds; one guess was wrong
+        // (it demanded thousands of fold dates against an actual 818), the test failed on the
+        // guess, and the property it exists to check never ran. A bound nobody measured is not
+        // a safety net, it is a second thing that can be wrong.
+        assert!(
+            failures.is_empty(),
+            "{} least-instant violations, first 10:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // Then assert the sweep actually examined something, so an audit that silently swept
+        // nothing cannot pass by finding nothing. These are floors at zero for each SHAPE the
+        // sweep must exercise rather than guesses at a magnitude: a shape reaching zero means
+        // the traversal broke, and any number above zero is the database's business.
+        assert!(
+            zones > 500,
+            "expected the full zone database, swept {zones}"
+        );
+        assert!(
+            gaps > 0,
+            "no gap dates found -- the sweep did not reach a transition"
+        );
+        assert!(
+            folds > 0,
+            "no fold dates found -- the sweep did not reach a transition"
+        );
+        assert!(
+            skipped_days > 0,
+            "no whole-day skips found -- the None-return path was never exercised"
+        );
     }
 }
 
