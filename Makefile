@@ -39,7 +39,7 @@ override CARGO_VALUE := $(value CARGO)
 unexport CARGO
 export CARGO_VALUE
 
-.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check tz-audit
 
 check:
 	cd crates && cargo check --workspace
@@ -51,7 +51,11 @@ test:
 	cd crates && cargo test --workspace
 
 # The all-zone chrono-tz sweep. Ignored by default because it walks every
-# zone in the bundled database and costs ~50s; it exists to be RUN when the
+# zone in the bundled database and costs 48.28s in the debug profile, against
+# 3.08s with --release (both measured 2026-08-23). Debug is kept because the
+# occasion to run this is a chrono-tz pin move, which invalidates the build
+# cache, so an optimized run would pay a cold rebuild to save 45s. It exists
+# to be RUN when the
 # chrono-tz pin moves, which is when the bundled zone data can change under
 # the resolver. Wired to CI on the manifests that carry that pin, so the
 # duty is triggered rather than remembered.

@@ -8,11 +8,15 @@ name: Timezone Database Audit
 # where a gap begins.
 #
 # The all-zone sweep exists to re-derive that. It is `#[ignore]`d because it
-# walks every zone and costs ~50s, which is the wrong trade on every ordinary
-# PR and the right one exactly when the pin moves. This workflow supplies the
-# trigger, so the duty is enforced rather than remembered: it runs on any PR
-# touching a manifest or lockfile that can carry a chrono-tz version, and on
-# the gtd pack that holds both the resolver and the sweep.
+# walks every zone and costs 48.28s in the debug profile CI uses (measured
+# 2026-08-23; the same sweep is 3.08s with --release, and the job still runs
+# debug because the trigger is a lockfile change, which invalidates the build
+# cache, so a release run would pay a cold optimized rebuild to save 45s of
+# sweep). That is the wrong trade on every ordinary PR and the right one
+# exactly when the pin moves. This workflow supplies the trigger, so the duty
+# is enforced rather than remembered: it runs on any PR touching a manifest or
+# lockfile that can carry a chrono-tz version, and on the source of the gtd
+# pack, which holds both the resolver and the sweep.
 #
 # What this does NOT gate: ordinary correctness of the resolver, which the
 # crate's normal (non-ignored) tests cover on every PR through the main CI job.
@@ -24,7 +28,11 @@ on:
       - "crates/Cargo.lock"
       - "crates/khive-merge/Cargo.lock"
       - "crates/khive-runtime/Cargo.toml"
-      - "crates/khive-pack-gtd/**"
+      # Source only. The resolver and the sweep both live under src/, so a
+      # README, a bench, or a doc change in this crate cannot affect the
+      # result and should not pay for the run.
+      - "crates/khive-pack-gtd/src/**"
+      - "crates/khive-pack-gtd/Cargo.toml"
       - ".github/workflows/tz-database-audit.yml"
 
 # Declared rather than inherited. With no `permissions:` block a workflow gets
@@ -49,6 +57,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The next steps build and run code from the pull request, so the
+          # checkout must not leave a usable token behind for them to read.
+          # The trigger is `pull_request` and the job declares `contents: read`
+          # on a public repository, so what a leak would yield is small; that
+          # bounds the damage, it does not make persisting the credential
+          # correct. Matches unlocked-dependencies.yml, which does the same.
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
