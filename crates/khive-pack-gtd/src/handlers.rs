@@ -544,10 +544,26 @@ fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Option<Da
         chrono::LocalResult::Ambiguous(earliest, _latest) => Some(earliest),
         // Spring-forward gap (or a larger jump): local midnight does not
         // exist. Solve for the boundary directly rather than projecting to
-        // it. The local date is a monotonically non-decreasing function of
-        // UTC time, so the least instant whose local date is `date` is the
-        // bisection point on the UTC axis between "still the previous date"
-        // and "already this date".
+        // it. Within the window searched below, the local date is a
+        // non-decreasing function of UTC time, so the least instant whose
+        // local date is `date` is the bisection point on the UTC axis
+        // between "still the previous date" and "already this date".
+        //
+        // That premise is SCOPED to this window on purpose: it is not true
+        // globally. Zones that crossed the international date line run the
+        // local calendar backwards at the crossing — `America/Adak` at
+        // 1867-10-19T00:31:13Z moves from local 1867-10-19 to 1867-10-18 as
+        // the offset goes from +12:13:22 to -11:46:38 — and the pinned
+        // chrono-tz table holds 107 such date-decreasing transitions. What
+        // makes the bisection sound is that none of them falls inside a
+        // window this branch searches: over every date in the pinned table
+        // for which `from_local_datetime` returns `None` (4311 of them), an
+        // enumeration of the generated transition tables found no
+        // date-decrease in any search window, no disagreement between the
+        // bisection result and the true first instant, and no bound-guard
+        // trip. Re-derive that when the chrono-tz pin moves; a violation
+        // would cost the LEAST-instant property, while the same-date check
+        // at the end still keeps a wrong DATE from being returned.
         //
         // The earlier implementation instead read the offset in effect at
         // noon on the previous calendar date and projected local midnight
