@@ -5331,20 +5331,41 @@ mod tests {
 
     #[test]
     fn auto_rendered_batch_stays_within_daemon_frame_cap() {
-        let mut leaves = serde_json::Map::new();
-        for index in 0..80_000 {
-            leaves.insert(format!("k{index}"), json!(0));
-        }
-        let result = nest_object(60, Value::Object(leaves));
+        // Auto renders a single record as compact JSON, so a lone object can
+        // no longer balloon past its compact form (the kv-block renderer is
+        // gone). The remaining inflation mode is a sparse record array: the
+        // table materializes the full column set for every row, so records
+        // with disjoint key sets inflate quadratically. The fixture sits
+        // where the compact envelope fits the budget but the rendered table
+        // exceeds the daemon frame, which is exactly the fallback under test.
+        let records: Vec<Value> = (0..600)
+            .map(|record_index| {
+                let mut record = serde_json::Map::new();
+                for key_index in 0..20 {
+                    record.insert(format!("r{record_index}k{key_index}"), json!(1));
+                }
+                Value::Object(record)
+            })
+            .collect();
+        let result = json!({ "items": records });
         let envelope = parallel_batch_envelope(vec![json!({
             "ok": true,
             "tool": "probe",
-            "result": result,
+            "result": result.clone(),
         })]);
         let compact_bytes = serde_json::to_vec(&envelope)
             .expect("compact envelope")
             .len();
         assert!(compact_bytes < BATCH_RESPONSE_BUDGET_BYTES);
+        // Precondition: the rendered form alone must exceed the daemon frame,
+        // otherwise this fixture no longer exercises the fallback.
+        let rendered_probe_bytes =
+            render_format(result, OutputFormat::Auto, PresentationMode::Agent).len();
+        assert!(
+            rendered_probe_bytes > khive_runtime::daemon::MAX_FRAME_BYTES,
+            "fixture drifted: rendered entry ({rendered_probe_bytes} bytes) \
+             no longer exceeds the daemon frame"
+        );
 
         let rendered = render_result(
             envelope,

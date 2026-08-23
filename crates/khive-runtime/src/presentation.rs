@@ -34,15 +34,25 @@ pub enum OutputFormat {
     /// Compact JSON (`serde_json::to_string`). Lossless machine contract. Default.
     #[default]
     Json,
-    /// Shape-aware: markdown table for homogeneous record arrays,
-    /// flat key-value block for single records, compact-JSON fallback.
+    /// Shape-aware: markdown table for homogeneous record arrays (with
+    /// envelope siblings preserved as trailing `key: value` lines),
+    /// compact-JSON fallback for every other shape.
     Auto,
     /// Force the markdown-table renderer regardless of detected shape.
+    /// Since the kv-block renderer was removed (ADR-078 §3 amendment),
+    /// `Table` and `Auto` share the same dispatch.
     Table,
 }
 
 /// Cell truncation limit for markdown-table rendering (ADR-078 §3a).
 const CELL_TRUNCATE: usize = 120;
+
+/// Scalar payload fields hoisted from `properties` to the top level in the
+/// auto/table pre-pass, when no top-level sibling of that name exists.
+/// View-only (never applied to `json`): without the hoist, a table row for a
+/// scheduled event cannot say when it fires or whether it is pending —
+/// those fields exist only inside the nested `properties` bag.
+const PROPERTY_HOIST_FIELDS: &[&str] = &["trigger_at", "due", "status"];
 
 // ── Public render entry point ────────────────────────────────────────────────
 
@@ -57,23 +67,21 @@ const CELL_TRUNCATE: usize = 120;
 /// When `format` is [`OutputFormat::Json`], returns compact JSON (`serde_json::to_string`).
 /// When `format` is [`OutputFormat::Auto`] or [`OutputFormat::Table`], applies the
 /// redundancy-reduction pre-pass (§7) — unless `presentation` is [`PresentationMode::Verbose`]
-/// — then dispatches to the shape-aware renderer.
+/// — then dispatches to the shape-aware renderer. Verbose also disables cell
+/// truncation in the table renderer (§3a).
 pub fn render_format(value: Value, format: OutputFormat, presentation: PresentationMode) -> String {
     match format {
         OutputFormat::Json => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
         OutputFormat::Auto | OutputFormat::Table => {
             // Skip the redundancy-reduction pre-pass in Verbose mode: full
             // canonical shape must pass through unchanged.
-            let reduced = if presentation == PresentationMode::Verbose {
+            let verbose = presentation == PresentationMode::Verbose;
+            let reduced = if verbose {
                 value
             } else {
                 apply_redundancy_drop(value)
             };
-            match format {
-                OutputFormat::Auto => render_auto(reduced),
-                OutputFormat::Table => render_table_forced(reduced),
-                OutputFormat::Json => unreachable!(),
-            }
+            render_auto(reduced, !verbose)
         }
     }
 }
@@ -115,14 +123,27 @@ fn drop_record(value: Value) -> Value {
     }
 
     // Properties dedup: drop key-value pairs from `properties` that
-    // duplicate an identical top-level sibling.
+    // duplicate an identical top-level sibling. Scalar payload fields named
+    // in `PROPERTY_HOIST_FIELDS` are hoisted to the top level (when no
+    // top-level sibling of that name exists) so the table renderer can
+    // surface them as columns — a scheduled event's `trigger_at`/`status`
+    // live only inside `properties`, and a nested cell cannot show them.
     let props_val = map.remove("properties");
     if let Some(Value::Object(props)) = props_val {
         let mut new_props = Map::new();
         for (k, v) in props {
-            if map.get(&k) != Some(&v) {
-                new_props.insert(k, v);
+            if map.get(&k) == Some(&v) {
+                continue;
             }
+            if PROPERTY_HOIST_FIELDS.contains(&k.as_str())
+                && !v.is_object()
+                && !v.is_array()
+                && !map.contains_key(&k)
+            {
+                map.insert(k, v);
+                continue;
+            }
+            new_props.insert(k, v);
         }
         if !new_props.is_empty() {
             map.insert("properties".to_string(), Value::Object(new_props));
@@ -157,27 +178,27 @@ fn drop_record(value: Value) -> Value {
 
 // ── Shape-aware rendering (`auto`) ──────────────────────────────────────────
 
-/// Render a value using shape-aware dispatch (ADR-078 §3).
-fn render_auto(value: Value) -> String {
-    // Shape (a): homogeneous record array.
-    if let Some((records, keys)) = find_record_array(&value) {
-        return render_table(&records, &keys);
-    }
-    // Shape (b): single record / heterogeneous object.
-    if value.is_object() {
-        return render_kv_block(&value, 0);
-    }
-    // Shape (c): compact-JSON fallback.
-    serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+/// A record array located inside a value: the records, their ordered column
+/// keys, and — when the array sat under an object key — that key's name, so
+/// the caller can enumerate the remaining (sibling) keys.
+struct RecordArray {
+    key: Option<String>,
+    records: Vec<Value>,
+    columns: Vec<String>,
 }
 
-/// Force the markdown-table renderer regardless of detected shape (ADR-078 §6).
-fn render_table_forced(value: Value) -> String {
-    if let Some((records, keys)) = find_record_array(&value) {
-        return render_table(&records, &keys);
+/// Render a value using shape-aware dispatch (ADR-078 §3, as amended).
+///
+/// Shape (a): homogeneous record array → markdown table, with any envelope
+/// siblings preserved as trailing `key: value` lines.
+/// Every other shape → compact JSON, lossless by construction. The former
+/// kv-block renderer for single records is removed: its truncation destroyed
+/// single-record payloads (e.g. a compose briefing's `markdown` field).
+fn render_auto(value: Value, truncate: bool) -> String {
+    match locate_record_array(&value) {
+        Some(found) => render_table_with_siblings(&value, &found, truncate),
+        None => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
     }
-    // No record array detected: fall back to compact JSON.
-    serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
 }
 
 /// Find the first homogeneous record array in `value`.
@@ -185,27 +206,52 @@ fn render_table_forced(value: Value) -> String {
 /// Checks:
 /// 1. `value` itself is an array of 2+ objects.
 /// 2. `value` is an object with a key whose value is an array of 2+ objects.
-///
-/// Returns `(records_cloned, ordered_column_keys)` when found.
-fn find_record_array(value: &Value) -> Option<(Vec<Value>, Vec<String>)> {
+fn locate_record_array(value: &Value) -> Option<RecordArray> {
     match value {
-        Value::Array(arr) if arr.len() >= 2 && arr.iter().all(Value::is_object) => {
-            let keys = collect_keys(arr);
-            Some((arr.clone(), keys))
-        }
-        Value::Object(map) => {
-            for v in map.values() {
-                if let Value::Array(arr) = v {
-                    if arr.len() >= 2 && arr.iter().all(Value::is_object) {
-                        let keys = collect_keys(arr);
-                        return Some((arr.clone(), keys));
-                    }
-                }
-            }
-            None
-        }
+        Value::Array(arr) if is_record_array(arr) => Some(RecordArray {
+            key: None,
+            records: arr.clone(),
+            columns: collect_keys(arr),
+        }),
+        Value::Object(map) => map.iter().find_map(|(k, v)| match v {
+            Value::Array(arr) if is_record_array(arr) => Some(RecordArray {
+                key: Some(k.clone()),
+                records: arr.clone(),
+                columns: collect_keys(arr),
+            }),
+            _ => None,
+        }),
         _ => None,
     }
+}
+
+/// An array of 2+ objects qualifies as a record array.
+fn is_record_array(arr: &[Value]) -> bool {
+    arr.len() >= 2 && arr.iter().all(Value::is_object)
+}
+
+/// Render the located record array as a table, then append one `key: value`
+/// line per remaining top-level key. Envelope fields (`has_more`, `offset`,
+/// counts) must survive rendering: dropping them made a truncated `query`
+/// page read as complete.
+fn render_table_with_siblings(value: &Value, found: &RecordArray, truncate: bool) -> String {
+    let mut out = render_table(&found.records, &found.columns, truncate);
+    let (Value::Object(map), Some(array_key)) = (value, &found.key) else {
+        return out;
+    };
+    for (k, v) in map {
+        if k == array_key {
+            continue;
+        }
+        let text = match v {
+            Value::String(s) => s.clone(),
+            // Non-string scalars and nested values: compact JSON, untruncated
+            // — sibling fidelity is the point of this path.
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        out.push_str(&format!("{k}: {text}\n"));
+    }
+    out
 }
 
 /// Collect column names in first-seen order across all records.
@@ -227,7 +273,7 @@ fn collect_keys(records: &[Value]) -> Vec<String> {
 // ── Markdown table renderer (ADR-078 §3a) ───────────────────────────────────
 
 /// Render a record array as a GitHub-Flavored Markdown table.
-fn render_table(records: &[Value], keys: &[String]) -> String {
+fn render_table(records: &[Value], keys: &[String], truncate: bool) -> String {
     let mut out = String::new();
 
     out.push('|');
@@ -248,7 +294,7 @@ fn render_table(records: &[Value], keys: &[String]) -> String {
         out.push('|');
         for k in keys {
             let cell = record.get(k).unwrap_or(&Value::Null);
-            let text = cell_text(cell);
+            let text = cell_text(k, cell, truncate);
             out.push(' ');
             out.push_str(&text);
             out.push_str(" |");
@@ -259,19 +305,57 @@ fn render_table(records: &[Value], keys: &[String]) -> String {
     out
 }
 
-/// Format a cell value: escape `|`, collapse newlines, truncate to ~120 chars.
-fn cell_text(value: &Value) -> String {
+/// Column names exempt from cell truncation: identity and decision fields
+/// must arrive whole — a truncated id cannot be resolved and a truncated
+/// title cannot be selected on.
+fn truncation_exempt(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "kind"
+            | "status"
+            | "priority"
+            | "relation"
+            | "title"
+            | "name"
+            | "signature"
+            | "slug"
+            | "assignee"
+            | "from"
+            | "to"
+            | "due"
+    ) || key.ends_with("_id")
+        || key.ends_with("_at")
+        || key.starts_with("due")
+}
+
+/// Format a cell value: escape `|`, collapse newlines, truncate to ~120 chars
+/// unless `truncate` is off or the column is identity/decision-bearing.
+///
+/// Nested values are elided to a constant marker (`{…}` / `[…]`) rather than
+/// stringified and cut mid-JSON: truncated pseudo-JSON reads as data while
+/// silently missing fields. Full content is one `format=json` or `get` away.
+fn cell_text(key: &str, value: &Value, truncate: bool) -> String {
     let raw = match value {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
-        // Arrays and nested objects use compact JSON in the cell.
-        other => serde_json::to_string(other).unwrap_or_default(),
+        Value::Object(_) => return "{…}".to_string(),
+        Value::Array(arr) => {
+            if arr.iter().any(|v| v.is_object() || v.is_array()) {
+                return "[…]".to_string();
+            }
+            // Arrays of scalars (tags, ids) stay compact JSON.
+            serde_json::to_string(value).unwrap_or_default()
+        }
     };
 
     // Escape literal `|` and collapse embedded newlines to a space.
     let escaped = raw.replace('|', "\\|").replace(['\n', '\r'], " ");
+
+    if !truncate || truncation_exempt(key) {
+        return escaped;
+    }
 
     // Truncate to approximately CELL_TRUNCATE *characters* (char boundary,
     // not byte index — slicing on a byte offset can panic on multi-byte chars).
@@ -281,41 +365,6 @@ fn cell_text(value: &Value) -> String {
         format!("{truncated}...")
     } else {
         escaped
-    }
-}
-
-// ── Flat key-value block renderer (ADR-078 §3b) ─────────────────────────────
-
-/// Render a single record or heterogeneous object as a flat key-value block.
-fn render_kv_block(value: &Value, depth: usize) -> String {
-    let indent = "  ".repeat(depth);
-    match value {
-        Value::Object(map) => {
-            let mut out = String::new();
-            for (k, v) in map {
-                match v {
-                    Value::Object(_) => {
-                        out.push_str(&format!("{}{}:\n", indent, k));
-                        out.push_str(&render_kv_block(v, depth + 1));
-                    }
-                    Value::Array(arr) if arr.iter().any(Value::is_object) => {
-                        out.push_str(&format!("{}{}:\n", indent, k));
-                        for item in arr {
-                            if item.is_object() {
-                                out.push_str(&render_kv_block(item, depth + 1));
-                            } else {
-                                out.push_str(&format!("{}  - {}\n", indent, cell_text(item)));
-                            }
-                        }
-                    }
-                    _ => {
-                        out.push_str(&format!("{}{}: {}\n", indent, k, cell_text(v)));
-                    }
-                }
-            }
-            out
-        }
-        other => format!("{}{}\n", indent, cell_text(other)),
     }
 }
 
@@ -1245,14 +1294,11 @@ mod tests {
             Some("local")
         );
         // Auto mode elides namespace=local and drops full_id.
-        // The value itself is a single record → rendered as kv block.
-        assert!(
-            !auto_rendered.contains("full_id"),
-            "auto kv block must drop full_id"
-        );
+        // The value itself is a single record → rendered as compact JSON.
+        assert!(!auto_rendered.contains("full_id"), "auto must drop full_id");
         assert!(
             !auto_rendered.contains("namespace"),
-            "auto kv block must elide namespace=local"
+            "auto must elide namespace=local"
         );
     }
 
@@ -1275,21 +1321,195 @@ mod tests {
         assert!(rendered.contains("Second"), "must have second row data");
     }
 
-    /// (b2) single record → flat kv block.
+    /// (b2) single record → compact JSON, lossless (kv-block renderer removed).
     #[test]
-    fn format_auto_single_record_renders_kv_block() {
+    fn format_auto_single_record_renders_compact_json() {
         let v = json!({"id": "abc", "title": "Hello World"});
-        let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
-        // kv block uses "key: value\n" format.
-        assert!(rendered.contains("id: abc"), "must have id: abc");
-        assert!(
-            rendered.contains("title: Hello World"),
-            "must have title line"
-        );
-        // Must NOT contain markdown table markers.
+        let rendered = render_format(v.clone(), OutputFormat::Auto, PresentationMode::Agent);
+        let parsed: Value = serde_json::from_str(&rendered).expect("must be valid JSON");
+        assert_eq!(parsed, v, "single record must round-trip losslessly");
         assert!(
             !rendered.starts_with('|'),
             "single record must not be a markdown table"
+        );
+    }
+
+    /// (b2-lossless) a single record with a large payload field (a compose
+    /// briefing's `markdown`) arrives whole — the former kv-block renderer
+    /// truncated it.
+    #[test]
+    fn format_auto_single_record_large_payload_survives_whole() {
+        let briefing = "line one\nline two\n".repeat(500); // ~9KB, newlines included
+        let v = json!({"id": "abc", "markdown": briefing.clone()});
+        let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
+        let parsed: Value = serde_json::from_str(&rendered).expect("must be valid JSON");
+        assert_eq!(
+            parsed.get("markdown").and_then(Value::as_str),
+            Some(briefing.as_str()),
+            "large payload field must survive untruncated"
+        );
+    }
+
+    /// Envelope siblings survive table rendering: a `query`-style page whose
+    /// `has_more` is dropped reads as complete — fail-open.
+    #[test]
+    fn format_auto_table_preserves_sibling_scalars() {
+        let v = json!({
+            "results": [
+                {"id": "abc", "title": "First"},
+                {"id": "def", "title": "Second"}
+            ],
+            "has_more": true,
+            "offset": 20,
+            "page_size": 2,
+            "truncated": false
+        });
+        let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
+        assert!(rendered.contains("| id"), "records must render as a table");
+        assert!(
+            rendered.contains("has_more: true"),
+            "has_more sibling must survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("offset: 20"),
+            "offset sibling must survive"
+        );
+        assert!(
+            rendered.contains("page_size: 2"),
+            "page_size sibling must survive"
+        );
+        assert!(
+            rendered.contains("truncated: false"),
+            "truncated sibling must survive"
+        );
+    }
+
+    /// Nested table cells render a constant elision marker, never
+    /// truncated pseudo-JSON that reads as data while missing fields.
+    #[test]
+    fn format_auto_nested_cell_renders_elision_marker() {
+        let big_nested: Value = json!({"k": "v".repeat(300), "other": {"deep": true}});
+        let v = json!([
+            {"id": "abc", "properties": big_nested},
+            {"id": "def", "properties": {"x": 1}}
+        ]);
+        let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
+        assert!(
+            rendered.contains("{…}"),
+            "nested object cell must render the elision marker: {rendered}"
+        );
+        assert!(
+            !rendered.contains("..."),
+            "no truncated pseudo-JSON in nested cells"
+        );
+    }
+
+    /// Arrays of scalars (tags) still render as compact JSON in cells.
+    #[test]
+    fn format_auto_scalar_array_cell_renders_compact_json() {
+        let v = json!([
+            {"id": "abc", "tags": ["lesson", "khive"]},
+            {"id": "def", "tags": ["adr"]}
+        ]);
+        let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
+        assert!(
+            rendered.contains(r#"["lesson","khive"]"#),
+            "scalar array cell must be compact JSON: {rendered}"
+        );
+    }
+
+    /// Identity/decision columns are exempt from truncation: a truncated
+    /// title cannot be selected on, a truncated signature is unusable.
+    #[test]
+    fn format_auto_identity_columns_not_truncated() {
+        let long_title = "T".repeat(300);
+        let long_note = "N".repeat(300);
+        let v = json!([
+            {"id": "abc", "title": long_title.clone(), "note": long_note.clone()},
+            {"id": "def", "title": "short", "note": "short"}
+        ]);
+        let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
+        assert!(
+            rendered.contains(&long_title),
+            "title column must not be truncated"
+        );
+        assert!(
+            !rendered.contains(&long_note),
+            "non-exempt column must still truncate"
+        );
+    }
+
+    /// Verbose presentation disables cell truncation entirely (ADR-078 §3a).
+    #[test]
+    fn format_auto_verbose_disables_truncation() {
+        let long_note = "N".repeat(300);
+        let v = json!([
+            {"id": "abc", "note": long_note.clone()},
+            {"id": "def", "note": "short"}
+        ]);
+        let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Verbose);
+        assert!(
+            rendered.contains(&long_note),
+            "verbose must render full cell content"
+        );
+    }
+
+    /// The pre-pass hoists named scalar payload fields (`trigger_at`, `due`,
+    /// `status`) out of `properties` so they can surface as table columns —
+    /// a scheduled event carries them only inside `properties`.
+    #[test]
+    fn redundancy_drop_hoists_payload_scalars() {
+        let v = json!({
+            "id": "abc",
+            "properties": {
+                "trigger_at": "2026-09-01T14:00:00-04:00",
+                "status": "pending",
+                "dispatch_receipt": {"state": "succeeded"}
+            }
+        });
+        let reduced = apply_redundancy_drop(v);
+        assert_eq!(
+            reduced.get("trigger_at").and_then(Value::as_str),
+            Some("2026-09-01T14:00:00-04:00"),
+            "trigger_at must be hoisted to top level"
+        );
+        assert_eq!(
+            reduced.get("status").and_then(Value::as_str),
+            Some("pending"),
+            "status must be hoisted to top level"
+        );
+        let props = reduced.get("properties").expect("properties must remain");
+        assert!(
+            props.get("dispatch_receipt").is_some(),
+            "nested non-hoist fields stay in properties"
+        );
+        assert!(
+            props.get("trigger_at").is_none(),
+            "hoisted field must not remain duplicated in properties"
+        );
+    }
+
+    /// The hoist never overwrites an existing top-level sibling.
+    #[test]
+    fn redundancy_drop_hoist_does_not_overwrite_top_level() {
+        let v = json!({
+            "id": "abc",
+            "status": "active",
+            "properties": {"status": "pending"}
+        });
+        let reduced = apply_redundancy_drop(v);
+        assert_eq!(
+            reduced.get("status").and_then(Value::as_str),
+            Some("active"),
+            "existing top-level status must win"
+        );
+        assert_eq!(
+            reduced
+                .get("properties")
+                .and_then(|p| p.get("status"))
+                .and_then(Value::as_str),
+            Some("pending"),
+            "conflicting properties value must stay where it was"
         );
     }
 
@@ -1338,7 +1558,7 @@ mod tests {
             "title": "test"
         });
         // In Verbose mode, redundancy drop must be skipped.
-        // The value is a single object → kv block, but full_id and namespace stay.
+        // The value is a single object → compact JSON; full_id and namespace stay.
         let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Verbose);
         assert!(
             rendered.contains("full_id"),
