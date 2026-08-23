@@ -309,11 +309,9 @@ does today and the crate must move to match.
    are necessarily among the frames arriving before it completes and cannot themselves be the
    violation. The parent requires exactly this: the first application frame on every connection
    must be a `handshake`, and decision 1 above requires a version-0 `handshake` to decode and reach
-   admission rather than being rejected at the frame grammar. An earlier wording of this decision
-   said "a frame arriving before the handshake completes" without the exclusion, which read
-   literally makes the prescribed handshake unperformable — a contradiction inside the normative
-   text, not an implementation question. The exclusion is stated here because restating a parent
-   rule is a fresh claim about it, and this restatement is where the defect entered.
+   admission rather than being rejected at the frame grammar. The exclusion is stated rather than
+   left to the reader because restating a parent rule is a fresh claim about it; see correction 1
+   below, which is where that claim first went wrong.
 
    **What must move is that the crate enforces it for one endpoint role only.** The gate is a
    server-side inbound gate: it admits the client-to-server kinds and treats a server-to-client kind
@@ -557,6 +555,22 @@ implementation, which must agree on:
 The independent implementation is what makes the matrix a conformance artifact rather than a
 second copy of this crate's own assumptions, and it is why decision 9 had to name a concrete
 operation: a second implementation cannot be tested against a requirement phrased as an intention.
+
+### Corrections to this amendment
+
+Normative text that has been published is corrected here rather than quietly rewritten in place. A
+reader who saw the earlier wording can tell that it was displaced rather than that they misread it,
+and a reader who never saw it can tell that the decision above has been touched since it landed.
+
+1. **Decision 6, the pre-handshake rule — corrected 2026-08-22.** As landed, the decision said "a
+   frame arriving before the handshake completes" is `malformed_frame` and connection-terminal. It
+   now says "a NON-HANDSHAKE frame". Read as written, the earlier form classified the `handshake`
+   frame itself as a violation, because that frame arrives before the handshake completes by
+   definition. That contradicted the parent's requirement that the first application frame on every
+   connection be a `handshake`, and decision 1's requirement that a version-0 `handshake` decode
+   and reach admission rather than be rejected at the frame grammar: decision 1 requires the frame
+   that decision 6 forbade. No behaviour is intended to change; the correction states what the
+   decision was always understood to mean.
 
 ## Consequences
 
