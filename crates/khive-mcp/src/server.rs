@@ -590,8 +590,20 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     } else {
         format!("{:?}", config.backend_id)
     };
+    // `display_timezone` is part of daemon identity, not merely of rendering
+    // (ADR-169). `gtd.assign` anchors a date-only `due` through
+    // `config.display_timezone` and PERSISTS the resulting instant, so two
+    // runtimes differing only in this field are not interchangeable: a warm
+    // daemon reused across them writes an instant that is wrong by the offset
+    // between the zones, silently and durably.
+    //
+    // Included unconditionally rather than only when non-default. The default
+    // is the HOST's zone, not UTC, so "differs from the default" is itself a
+    // host-dependent predicate and would make identity depend on where the
+    // fingerprint was computed. The cost is that every existing warm daemon
+    // takes a new identity once, which is a respawn, not a correctness event.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -601,6 +613,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         backend,
         outbound.join(","),
         git_write,
+        config.display_timezone.name(),
     );
 
     // Fold backend topology when non-empty so two configs differing only in
@@ -4034,6 +4047,50 @@ mod tests {
             compute_config_id_with_ann_fresh_tail(&config, None, true),
             compute_config_id_with_ann_fresh_tail(&config, None, false),
             "opposite fresh-tail policies must not share one warm daemon"
+        );
+    }
+
+    /// `gtd.assign` anchors a date-only `due` through `display_timezone` and
+    /// PERSISTS the resulting instant, so a warm daemon reused across two
+    /// runtimes differing only in that field writes an instant wrong by the
+    /// offset between the zones. Identity must separate them.
+    #[test]
+    fn config_id_differs_when_display_timezone_differs() {
+        let utc = RuntimeConfig {
+            display_timezone: "UTC".parse().expect("UTC is a known IANA zone"),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let new_york = RuntimeConfig {
+            display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        assert_ne!(
+            compute_config_id_with_runtime_policies(&utc, None, true, false),
+            compute_config_id_with_runtime_policies(&new_york, None, true, false),
+            "runtimes differing only in display_timezone must not share one warm daemon: \
+             a reused daemon would anchor date-only due values in the wrong zone and \
+             persist the wrong instant"
+        );
+    }
+
+    /// The other direction, so the assertion above cannot pass for an
+    /// incidental reason: identical zones must still collapse to one identity.
+    #[test]
+    fn config_id_matches_when_display_timezone_matches() {
+        let a = RuntimeConfig {
+            display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let b = RuntimeConfig {
+            display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        assert_eq!(
+            compute_config_id_with_runtime_policies(&a, None, true, false),
+            compute_config_id_with_runtime_policies(&b, None, true, false),
+            "identical runtimes must share one warm daemon"
         );
     }
 
