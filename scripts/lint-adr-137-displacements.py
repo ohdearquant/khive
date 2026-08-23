@@ -320,6 +320,12 @@ def check_citations(decisions: list[dict], root: Path) -> tuple[list[str], list[
 
 def precedence_passage(decisions: list[dict]) -> str:
     displacing = [d for d in decisions if d["crate_displaced"]]
+    if not displacing:
+        raise SystemExit(
+            "generator: no decision displaces crate documentation, so the "
+            "precedence passage's premise is false. Rewrite the section by hand; "
+            "this generator only knows the displacing form."
+        )
     numbers = english_list([str(d["n"]) for d in displacing])
 
     lead = (
@@ -380,6 +386,24 @@ def precedence_passage(decisions: list[dict]) -> str:
             f"example and rewrite the sentence to match what it displaces; do not "
             f"just change the number."
         )
+    # Membership is not the whole claim: the closing characterizes WHAT the
+    # example displaces (the event.payload "data, not grammar" disclaimer), so
+    # that characterization is checked against the data row too.
+    example = next(d for d in bounded if str(d["n"]) == SPELLED_OUT_EXAMPLE)
+    example_quotes = [
+        q for c in example.get("crate_displaced", []) for q in c.get("quotes", [])
+    ]
+    if (
+        "event.payload" not in example.get("subject", "")
+        or "data, not grammar" not in example_quotes
+    ):
+        raise SystemExit(
+            f"generator: the precedence closing describes decision "
+            f"{SPELLED_OUT_EXAMPLE} as displacing the event.payload "
+            f"'data, not grammar' disclaimer, but the data row no longer says "
+            f"that. Rewrite the closing to match what the decision now "
+            f"displaces; do not just keep the prose."
+        )
     bounded_names = "decisions " + english_list([str(d["n"]) for d in bounded])
     closing = wrap(
         f"{WORDS[len(bounded)]} of those entries are bounded rather than wholesale — "
@@ -399,6 +423,12 @@ def precedence_passage(decisions: list[dict]) -> str:
 
 def fence_passage(decisions: list[dict]) -> str:
     changed = [d for d in decisions if d["label"] == "CHANGED"]
+    if not changed:
+        raise SystemExit(
+            "generator: no decision is marked CHANGED, so the merge-fence "
+            "passage has nothing to fence. Rewrite or drop the section by hand; "
+            "this generator only knows the fencing form."
+        )
     numbers = english_list([str(d["n"]) for d in changed])
     return wrap(
         f"**No first consumer of `khive-wire-protocol` may merge while any decision marked "

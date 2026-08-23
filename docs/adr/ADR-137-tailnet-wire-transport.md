@@ -331,6 +331,14 @@ does today and the crate must move to match.
      theoretical: version `0` decodes and reaches admission, so "the version field was parseable"
      is not evidence that it was negotiated. An accepted `handshake_ack` fixes the version the
      connection speaks; accepting one the client never proposed hands that choice to the peer.
+     The rejection takes this family's classification: a `handshake_ack` whose `version` the
+     client did not offer is `malformed_frame`, connection-terminal, carrying no operation id —
+     an answer naming terms the question never contained is an answer to a question that was
+     not asked, exactly as the unsolicited ack above. It is not `unsupported_version`, which is
+     the server's word for rejecting a client's offer and travels the other direction. The case
+     is a required conformance vector, decoded at the client with a handshake outstanding:
+     version A offered, `handshake_ack` naming version B, asserting `malformed_frame` and
+     permanent termination.
 
    The frames carrying the handshake to completion are necessarily among the frames arriving before
    it completes, so a rule with no exception for them makes the handshake it prescribes
