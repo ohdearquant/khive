@@ -533,7 +533,7 @@ lossless by construction and identical to `format=json` for those shapes.
 The original "mostly-scalar key set" condition is superseded: an array of two or more
 objects qualifies. Nested values are handled per cell instead of disqualifying the table
 — an object-valued cell renders the constant marker `{…}`, an array containing objects
-renders `[…]`, and an array of scalars renders as compact JSON. A majority-nested gate
+or arrays renders `[…]`, and an array of scalars renders as compact JSON. A majority-nested gate
 would push high-value listings (task queues whose rows carry a property bag) back to
 compact JSON and forfeit the measured 83–90% listing savings; per-cell elision keeps the
 table win while making elision explicit rather than disguising it as truncated data.
@@ -549,7 +549,10 @@ is a correctness defect, not a verbosity trade.
 `status`, `priority`, `relation`, `title`, `name`, `signature`, `slug`, `assignee`,
 `from`, `to`, `due`, and any column ending in `_id` or `_at` or starting with `due`
 render whole. `PresentationMode::Verbose` disables truncation entirely, as §3(a) already
-specified; the implementation now honors it.
+specified; the implementation now honors it. The `full=true` request parameter that
+§3(a) also named as a truncation override is withdrawn: no request path ever implemented
+it (`RequestParams` carries no such field), and Verbose is the sole override — the same
+phantom-override class Amendment 1 withdrew for `include_full_id`.
 
 **§7 pre-pass gains a scalar hoist.** `trigger_at`, `due`, and `status` values found
 inside a record's `properties` object are hoisted to the top level when no top-level
