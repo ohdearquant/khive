@@ -52,12 +52,22 @@ DECISION_HEADING = re.compile(r"^(\d+)\. \*\*(.+?) — (RATIFIED|CHANGED)", re.M
 # them from whether someone wrote a free-form note means a later edit to that
 # note can silently move a published claim. `scope_note` stays, as the human
 # explanation; `scope_kind` is what the count is computed from.
-SCOPE_KINDS = {
+BOUNDED_KINDS = {
     "version_floor": "the rule holds, but not below the protocol version floor",
     "idless_error": "the rule holds except for the case carrying no operation id",
     "endpoint_role": "the rule holds; its scoping to one endpoint role is what moves",
     "outermost_shape": "only the outermost type is displaced, not the per-field shape",
 }
+
+# The other half of the classification, and it must be WRITTEN DOWN rather than
+# inferred from the absence of a bounded kind. A row that declares nothing reads
+# to a human as unremarkable and lands in the wholesale count with nothing
+# anywhere disagreeing, which is the same fail-open the closed vocabulary was
+# introduced to close — moved one field to the left. Every displacing row now
+# classifies itself, so "the author had not decided yet" is a state the table
+# can represent and the check can reject.
+WHOLESALE = "wholesale"
+SCOPE_KINDS = {**BOUNDED_KINDS, WHOLESALE: "the displaced passage does not survive in any form"}
 
 
 def wrap(text: str, bullet: bool = False) -> str:
@@ -80,23 +90,41 @@ def english_list(items: list[str]) -> str:
     return ", ".join(items[:-1]) + f", and {items[-1]}"
 
 
-def labels_from_adr(text: str) -> dict[int, str]:
-    return {int(n): label for n, _subject, label in DECISION_HEADING.findall(text)}
+def labels_from_adr(text: str) -> list[tuple[int, str]]:
+    """Every decision heading, IN ORDER and WITH REPEATS.
+
+    Returning a dict here was itself a defect: it keyed on the decision number,
+    so an ADR carrying two `6.` headings kept whichever came last and discarded
+    the other, silently. The duplicate side of the comparison was guarded on the
+    table and unguarded on the document, and the two headings need not even agree
+    on their label for the collapse to go unnoticed. The caller is what decides
+    duplicates are an error, so this function must not decide it by data type.
+    """
+    return [(int(n), label) for n, _subject, label in DECISION_HEADING.findall(text)]
 
 
 def check_labels(decisions: list[dict], adr_text: str) -> list[str]:
     """The table must describe exactly the ADR's decisions. Returns complaints."""
-    from_adr = labels_from_adr(adr_text)
+    adr_headings = labels_from_adr(adr_text)
+    adr_numbers = [n for n, _ in adr_headings]
+    from_adr = dict(adr_headings)
     numbers = [d["n"] for d in decisions]
     complaints = []
 
-    # Compare the number SETS, not their sizes. `from_adr` is a dict and so
-    # collapses duplicates; `decisions` is a list and does not. A table that
-    # carries decision 4 twice and omits decision 7 therefore has the same
-    # length as a correct one, and the old size comparison passed it while
-    # every generated count and set membership silently went wrong.
+    # Compare the number SETS, not their sizes, and check BOTH sides for
+    # repeats. A table that carries decision 4 twice and omits decision 7 has the
+    # same length as a correct one, and the old size comparison passed it while
+    # every generated count and set membership silently went wrong. The ADR can
+    # carry the same duplicate for the same reason — headings are hand-written —
+    # and a second `6.` is exactly what an editor adds when splitting a decision.
     for n in sorted({n for n in numbers if numbers.count(n) > 1}):
         complaints.append(f"decision {n} appears {numbers.count(n)} times in the table")
+    for n in sorted({n for n in adr_numbers if adr_numbers.count(n) > 1}):
+        labels = [lab for num, lab in adr_headings if num == n]
+        complaints.append(
+            f"decision {n} appears {adr_numbers.count(n)} times in the ADR "
+            f"(labels {', '.join(labels)}); numbers must be unique"
+        )
     for n in sorted(set(from_adr) - set(numbers)):
         complaints.append(f"decision {n} is in the ADR but not in the table")
     for n in sorted(set(numbers) - set(from_adr)):
@@ -112,7 +140,7 @@ def check_labels(decisions: list[dict], adr_text: str) -> list[str]:
 
 
 def check_scope_kinds(decisions: list[dict]) -> list[str]:
-    """`scope_kind` must be a known value, and must pair with `scope_note`.
+    """Every displacing row classifies itself, and the classification is closed.
 
     The generated ADR publishes both a COUNT and a MEMBERSHIP LIST of bounded
     displacements. Deriving those from a free-form field's truthiness is how a
@@ -120,10 +148,15 @@ def check_scope_kinds(decisions: list[dict]) -> list[str]:
     was bounded in fact, carried no note, and was dropped from a count that read
     as authoritative.
 
-    Both directions are checked, and the second is the one that matters. An
-    unknown `scope_kind` is loud and easy. A row that has a `scope_note` but no
-    `scope_kind` is the silent case: it reads to a human as bounded, and the
-    count omits it, with nothing anywhere disagreeing.
+    The classification is EXHAUSTIVE, which is the part an earlier version of
+    this function got wrong. It rejected a row declaring a `scope_note` without a
+    `scope_kind`, and a row declaring a `scope_kind` without a note, and left the
+    row that declares NEITHER passing in silence. That row is the original defect
+    wearing different clothes: it is counted as wholesale by omission, so a
+    bounded displacement whose author simply had not filled the field in yet
+    publishes as wholesale, and the only thing that would ever contradict it is
+    someone re-reading the decision. `wholesale` is now a value a row must state,
+    so an unfilled row is a rejected row rather than a wholesale one.
     """
     complaints = []
     for d in decisions:
@@ -133,15 +166,27 @@ def check_scope_kinds(decisions: list[dict]) -> list[str]:
                 f"decision {d['n']}: scope_kind {kind!r} is not one of "
                 f"{sorted(SCOPE_KINDS)}"
             )
-        if note and not kind:
+        if d["crate_displaced"] and kind is None:
             complaints.append(
-                f"decision {d['n']}: has a scope_note but no scope_kind, so it "
-                f"reads as bounded but is excluded from the generated count"
+                f"decision {d['n']}: displaces a crate passage but declares no "
+                f"scope_kind; state {WHOLESALE!r} or one of "
+                f"{sorted(BOUNDED_KINDS)} — an unclassified row publishes as "
+                f"wholesale by omission"
             )
-        if kind and not note:
+        if kind in BOUNDED_KINDS and not note:
             complaints.append(
                 f"decision {d['n']}: has scope_kind {kind!r} but no scope_note "
                 f"explaining the bound to a reader"
+            )
+        if kind == WHOLESALE and note:
+            complaints.append(
+                f"decision {d['n']}: is {WHOLESALE} but carries a scope_note; a "
+                f"note reads as a bound and this row publishes without one"
+            )
+        if note and kind is None:
+            complaints.append(
+                f"decision {d['n']}: has a scope_note but no scope_kind, so it "
+                f"reads as bounded but is excluded from the generated count"
             )
         if kind and not d["crate_displaced"]:
             complaints.append(
@@ -283,7 +328,11 @@ def precedence_passage(decisions: list[dict]) -> str:
             sites.append(f"{gloss} (`{path}`)")
         body = english_list(sites)
         tail = f" — superseded by decision {d['n']}"
-        if d.get("scope_note"):
+        # Keyed on `scope_kind`, the closed field, for the same reason the count
+        # below is: "the displacement is bounded" is a normative sentence, and a
+        # normative sentence must not appear or vanish because someone added or
+        # removed a prose explanation.
+        if d.get("scope_kind") in BOUNDED_KINDS:
             tail += f". The displacement is bounded: {d['scope_note']}"
         bullets.append(wrap(f"{body[0].upper() + body[1:]}{tail}.", bullet=True))
 
@@ -291,7 +340,7 @@ def precedence_passage(decisions: list[dict]) -> str:
     # `scope_kind`, a closed vocabulary checked by check_scope_kinds, and NOT
     # from whether a prose `scope_note` happens to be present — a published
     # count must not move because someone reworded an explanation.
-    bounded = [d for d in displacing if d.get("scope_kind")]
+    bounded = [d for d in displacing if d.get("scope_kind") in BOUNDED_KINDS]
     bounded_names = "decisions " + english_list([str(d["n"]) for d in bounded])
     closing = wrap(
         f"{WORDS[len(bounded)]} of those entries are bounded rather than wholesale — "

@@ -73,7 +73,8 @@
           "gloss": "the module documentation's stated boundaries on optional-null equivalence and duplicate members"
         }
       ],
-      "explicit": "no"
+      "explicit": "no",
+      "scope_kind": "wholesale"
     },
     {
       "n": 5,
@@ -83,7 +84,7 @@
         {
           "cite": "docs/adr/ADR-137-tailnet-wire-transport.md",
           "quotes": [
-            "a client that receives a code it does not recognize must treat it as `internal` — request-terminal"
+            "a client that receives a code it does not recognize must treat it as `internal` \u2014 request-terminal"
           ]
         }
       ],
@@ -163,7 +164,8 @@
           "gloss": "the module documentation's opaque-payload-fidelity section, together with the named codec test it cites as pinning that behaviour"
         }
       ],
-      "explicit": "no"
+      "explicit": "no",
+      "scope_kind": "wholesale"
     },
     {
       "n": 10,
