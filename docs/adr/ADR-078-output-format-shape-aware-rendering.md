@@ -522,12 +522,17 @@ as data while silently missing fields); identity and decision fields were trunca
 prose (a cut signature or title is unusable); and the kv-block renderer's truncation
 destroyed single-record payloads such as a compose briefing's `markdown` field, while its
 indentation could balloon deep objects past the daemon frame. This amendment revises §3
-so `auto` is safe to adopt as a surface default.
+so `auto` is safe to adopt as a surface default. The amendment is the governing contract
+from its merge; the renderer change implementing it lands as a companion change gated on
+this text, so the shipped renderer may lag the contract in the interim.
 
 **§3(b) is withdrawn.** The flat key-value block renderer is removed. `auto` recognizes
 exactly two shapes: a homogeneous record array renders as a markdown table; every other
-shape — single records, heterogeneous objects, scalars — renders as compact JSON,
-lossless by construction and identical to `format=json` for those shapes.
+shape — single records, heterogeneous objects, scalars — renders as compact JSON of the
+§7-reduced value. The §7 view reductions (`full_id` suppression, namespace elision,
+`properties` dedup) still apply, as they always have in `auto`; beyond those enumerated
+reductions the fallback is lossless by construction — no truncation, no elision, no
+reformatting. Byte-exact output remains `format=json`'s contract (§4).
 
 **§3(a) qualifying condition simplified; per-cell elision replaces disqualification.**
 The original "mostly-scalar key set" condition is superseded: an array of two or more
@@ -545,21 +550,39 @@ values verbatim, other values as compact JSON, untruncated. Pagination and count
 (`has_more`, `offset`, `page_size`, `truncated`) must survive rendering; dropping them
 is a correctness defect, not a verbosity trade.
 
+**Escaping preserves the structure/data boundary.** Stored content is untrusted input
+and the rendered view has structure of its own, so the renderer must keep the two
+separable. In table cells, `|` is escaped and newlines collapse to spaces, so no cell
+value can terminate its cell, add a row, or add a table. In sibling lines, a string
+value containing a newline or carriage return renders as its JSON string literal (one
+line, lossless) instead of verbatim, so no value can fabricate an additional
+`key: value` line or table row. Rendering never interprets content: a value that looks
+like markup, a directive, or an instruction is emitted as data under these rules, and
+consumers must treat it as data. Escaping is a table/sibling concern only — the
+compact-JSON fallback and `format=json` are already closed to injection by JSON string
+encoding.
+
 **Cell truncation exempts identity and decision columns.** Columns named `id`, `kind`,
 `status`, `priority`, `relation`, `title`, `name`, `signature`, `slug`, `assignee`,
 `from`, `to`, `due`, and any column ending in `_id` or `_at` or starting with `due`
-render whole. `PresentationMode::Verbose` disables truncation entirely, as §3(a) already
-specified; the implementation now honors it. The `full=true` request parameter that
+render whole — a cut signature or title is unusable, so these columns trade bytes for
+usability. The exemption is bounded: the daemon's frame cap remains the outer bound on
+total response size, so an exempt column can spend the frame but not exceed it.
+`PresentationMode::Verbose` disables truncation entirely, as §3(a) already
+specified; the implementation must honor it. The `full=true` request parameter that
 §3(a) also named as a truncation override is withdrawn: no request path ever implemented
 it (`RequestParams` carries no such field), and Verbose is the sole override — the same
 phantom-override class Amendment 1 withdrew for `include_full_id`.
 
-**§7 pre-pass gains a scalar hoist.** `trigger_at`, `due`, and `status` values found
+**The table path gains a scalar hoist.** `trigger_at`, `due`, and `status` values found
 inside a record's `properties` object are hoisted to the top level when no top-level
 sibling of that name exists (never overwriting one), so the table renderer can surface
 them as columns. Without the hoist, a scheduled event's row cannot say when it fires or
 whether it is pending — those fields live only inside the nested bag, which renders as
-`{…}`. The hoist is view-only: `json` output and Verbose presentation are unaffected.
+`{…}`. The hoist applies only when the table shape is selected, before column
+enumeration: its sole rationale is table columns, and reshaping a single record's
+compact-JSON fallback would move fields with no column to gain. It is view-only:
+`json` output and Verbose presentation are unaffected.
 
 **§6 consequence.** With the kv-block renderer removed, `table` and `auto` share the
 same dispatch; `table` remains as an explicit spelling of the same contract.
