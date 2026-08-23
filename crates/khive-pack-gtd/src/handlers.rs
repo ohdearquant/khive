@@ -648,12 +648,14 @@ mod tz_database_audit {
         let mut gaps = 0usize;
         let mut folds = 0usize;
         let mut skipped_days = 0usize;
+        let mut dates_examined = 0usize;
         let mut failures: Vec<String> = Vec::new();
 
         for tz in chrono_tz::TZ_VARIANTS.iter().copied() {
             zones += 1;
             let mut date = start;
             while date < end {
+                dates_examined += 1;
                 let midnight = date.and_hms_opt(0, 0, 0).expect("midnight");
                 match tz.from_local_datetime(&midnight) {
                     chrono::LocalResult::Single(_) => {}
@@ -684,13 +686,23 @@ mod tz_database_audit {
                         skipped_days += 1;
                         let base = midnight;
                         let mut found = None;
+                        // ONE-SECOND steps, matching the granularity the implementation itself
+                        // searches at. A coarser step was here first and was wrong in the
+                        // reassuring direction: a local-date interval shorter than the step can
+                        // sit between two probes, so the search reports "no instant carries this
+                        // date" without having looked at the instants that would. The current
+                        // pinned table happens to contain no such interval, but that is a
+                        // property of today's data, and this test exists to be run against data
+                        // that has changed. The window is ~48h either side and skipped days are
+                        // rare (single digits across the whole sweep), so the finer step costs
+                        // nothing measurable.
                         let mut probe = base - chrono::Duration::hours(48);
                         while probe <= base + chrono::Duration::hours(48) {
                             if tz.from_utc_datetime(&probe).date_naive() == date {
                                 found = Some(probe);
                                 break;
                             }
-                            probe += chrono::Duration::minutes(1);
+                            probe += chrono::Duration::seconds(1);
                         }
                         if let Some(hit) = found {
                             failures.push(format!(
@@ -729,12 +741,29 @@ mod tz_database_audit {
         );
 
         // Then assert the sweep actually examined something, so an audit that silently swept
-        // nothing cannot pass by finding nothing. These are floors at zero for each SHAPE the
-        // sweep must exercise rather than guesses at a magnitude: a shape reaching zero means
-        // the traversal broke, and any number above zero is the database's business.
-        assert!(
-            zones > 500,
-            "expected the full zone database, swept {zones}"
+        // nothing cannot pass by finding nothing.
+        //
+        // TRAVERSAL counts are exact, because they are ours: the number of zones and the number
+        // of dates per zone are fixed by this test's own range and by the pinned table's length,
+        // so anything else means the loop did not run. A floor here would have accepted a
+        // 501-zone subset of 597 as "the full database".
+        //
+        // TRANSITION counts stay floors at zero per SHAPE. Those belong to the database, not to
+        // us, and this test exists to be run when the database changes; pinning 4299 gaps would
+        // make a legitimate pin bump fail for a reason that has nothing to do with the property
+        // under test. Zero for a shape means the traversal never reached that kind of date.
+        let expected_dates = (end - start).num_days() as usize;
+        assert_eq!(
+            zones,
+            chrono_tz::TZ_VARIANTS.len(),
+            "swept {zones} zones but the pinned table has {}",
+            chrono_tz::TZ_VARIANTS.len()
+        );
+        assert_eq!(
+            dates_examined,
+            zones * expected_dates,
+            "expected {zones} zones x {expected_dates} dates = {}, examined {dates_examined}",
+            zones * expected_dates
         );
         assert!(
             gaps > 0,
