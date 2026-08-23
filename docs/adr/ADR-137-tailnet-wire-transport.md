@@ -299,19 +299,34 @@ does today and the crate must move to match.
    lands on that paragraph and stops there does not walk away with the superseded rule.
 
 6. **Handshake sequence violations — CHANGED, and the change is one of role coverage rather than
-   of the rule.** A NON-HANDSHAKE frame arriving before the handshake completes, a handshake frame
-   arriving after the handshake completes, and a frame arriving in the wrong direction are each
-   `malformed_frame` and each terminate the connection permanently. These are connection-terminal
-   and carry no operation id, because no operation is established. That rule is the parent's and it
-   stands unaltered.
+   of the rule.** A frame arriving before the handshake completes that is not admissible at the
+   receiving role before completion, a handshake frame arriving after the handshake completes, and
+   a frame arriving in the wrong direction are each `malformed_frame` and each terminate the
+   connection permanently. These are connection-terminal and carry no operation id, because no
+   operation is established. That rule is the parent's and it stands unaltered.
 
-   The `handshake` and `handshake_ack` frames are what carry the handshake to completion, so they
-   are necessarily among the frames arriving before it completes and cannot themselves be the
-   violation. The parent requires exactly this: the first application frame on every connection
-   must be a `handshake`, and decision 1 above requires a version-0 `handshake` to decode and reach
-   admission rather than being rejected at the frame grammar. The exclusion is stated rather than
-   left to the reader because restating a parent rule is a fresh claim about it; see correction 1
-   below, which is where that claim first went wrong.
+   **The pre-completion admissible set is per ROLE, and stating it as a single role-blind set is
+   what makes the rule self-contradictory.** Before the handshake completes:
+
+   - **At a server**, inbound `handshake` is admissible. Every other kind is a violation, including
+     `handshake_ack`, which travels server-to-client and is therefore also a direction violation at
+     a server. The two classifications agree; both are `malformed_frame`.
+   - **At a client**, inbound `handshake_ack` is admissible, and so is a connection-terminal
+     `error`, because that is how the parent's `unsupported_version` rejection arrives: the parent
+     requires the server to answer a handshake either with `handshake_ack` or with
+     `unsupported_version` followed by close, and requires the client to surface that rejection
+     without fallback. A client that classified it `malformed_frame` could not surface it. Every
+     other kind is a violation, including `handshake`, which travels client-to-server.
+
+   The frames carrying the handshake to completion are necessarily among the frames arriving before
+   it completes, so a rule with no exception for them makes the handshake it prescribes
+   unperformable: the parent requires the first application frame on every connection to be a
+   `handshake`, and decision 1 above requires a version-0 `handshake` to decode and reach admission
+   rather than being rejected at the frame grammar. The exception is stated per role rather than as
+   a blanket carve-out because a blanket one re-creates the contradiction on the other side, making
+   `handshake_ack` at a server both a direction violation and not a violation. See correction 1
+   below, which is where this claim first went wrong, and correction 2, which is where the first
+   repair was still role-blind.
 
    **What must move is that the crate enforces it for one endpoint role only.** The gate is a
    server-side inbound gate: it admits the client-to-server kinds and treats a server-to-client kind
@@ -563,14 +578,31 @@ reader who saw the earlier wording can tell that it was displaced rather than th
 and a reader who never saw it can tell that the decision above has been touched since it landed.
 
 1. **Decision 6, the pre-handshake rule — corrected 2026-08-22.** As landed, the decision said "a
-   frame arriving before the handshake completes" is `malformed_frame` and connection-terminal. It
-   now says "a NON-HANDSHAKE frame". Read as written, the earlier form classified the `handshake`
-   frame itself as a violation, because that frame arrives before the handshake completes by
-   definition. That contradicted the parent's requirement that the first application frame on every
-   connection be a `handshake`, and decision 1's requirement that a version-0 `handshake` decode
-   and reach admission rather than be rejected at the frame grammar: decision 1 requires the frame
-   that decision 6 forbade. No behaviour is intended to change; the correction states what the
-   decision was always understood to mean.
+   frame arriving before the handshake completes" is `malformed_frame` and connection-terminal.
+   Read as written, that classified the `handshake` frame itself as a violation, because that frame
+   arrives before the handshake completes by definition. It contradicted the parent's requirement
+   that the first application frame on every connection be a `handshake`, and decision 1's
+   requirement that a version-0 `handshake` decode and reach admission rather than be rejected at
+   the frame grammar: decision 1 required the frame decision 6 forbade.
+
+2. **Decision 6, the pre-handshake rule again — corrected 2026-08-22, superseding correction 1's
+   repair.** Correction 1 changed the rule to "a NON-HANDSHAKE frame arriving before the handshake
+   completes", excluding `handshake` and `handshake_ack` from being the violation. That exclusion
+   was role-blind, and the decision it sits in is entirely about role coverage, so it moved the
+   contradiction rather than removing it. `handshake_ack` travels server-to-client, so at a server
+   it is a direction violation by the same decision's third clause while the exclusion said it
+   could not be a violation at all. The unqualified form also had no exception for the parent's
+   `unsupported_version` rejection, which reaches a client as a connection-terminal `error` before
+   any handshake completes and which the parent requires the client to surface without fallback.
+
+   The rule now names the admissible set per receiving role: `handshake` at a server,
+   `handshake_ack` or a connection-terminal `error` at a client, everything else a violation on
+   both sides. No behaviour is intended to change relative to what the parent already required; the
+   correction states which frames each role must accept before completion, which neither the
+   original wording nor correction 1 did.
+
+   Recorded as a second correction rather than folded into the first because correction 1 was
+   published, and a repair that itself needed repair is the more useful thing for a reader to see.
 
 ## Consequences
 
