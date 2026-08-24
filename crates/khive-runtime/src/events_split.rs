@@ -1124,6 +1124,85 @@ mod tests {
         assert_eq!(seen, expected);
     }
 
+    /// Mechanized co-residency guard: the amendment's load-bearing claim is
+    /// that every class a raw-SQL consumer of the legacy `events` table
+    /// depends on still LANDS in that table. Two of the three enumerated
+    /// consumers (kg projection guard, graph-query union) fail silently if
+    /// the classification drifts, so the classification is guarded here by
+    /// the consumers' own access pattern — a raw SQL read against the legacy
+    /// backend — rather than by enumeration. Arm 1 reddens if plain appends
+    /// (the provenance/domain class) ever stop reaching the legacy table.
+    /// Arm 2 is the boundary's other face and doubles as the positive
+    /// control for the instrument: the same query DOES find lane-routed rows
+    /// on the lane's own backend, so an empty arm-1 result could not be a
+    /// broken query.
+    #[tokio::test]
+    async fn raw_sql_consumers_of_the_legacy_events_table_still_see_plain_appends() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy_backend =
+            direct_backend_for(&dir.path().join("legacy-guard.db")).expect("legacy backend");
+        let lane_backend =
+            direct_backend_for(&dir.path().join("lane-guard.db")).expect("lane backend");
+        let split = SplitEventStore::new(
+            legacy_backend
+                .events_for_namespace("local")
+                .expect("legacy store"),
+            lane_backend
+                .events_for_namespace("local")
+                .expect("lane store"),
+        );
+
+        // The schedule pack's creator-provenance write is a plain append; the
+        // audit flusher's write is an idempotent batch. Route one of each.
+        let provenance = test_event("local");
+        let provenance_id = provenance.id;
+        split.append_event(provenance).await.expect("plain append");
+        let audit = test_event("local");
+        let audit_id = audit.id;
+        split
+            .append_events_idempotent(vec![audit])
+            .await
+            .expect("idempotent append");
+
+        let count_by_raw_sql = |backend: Arc<StorageBackend>, id: Uuid| async move {
+            let mut reader = backend.sql().reader().await.expect("sql reader");
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: "SELECT actor FROM events WHERE id = ?1".to_string(),
+                    params: vec![SqlValue::Text(id.to_string())],
+                    label: None,
+                })
+                .await
+                .expect("raw events query");
+            rows.len()
+        };
+
+        // Arm 1: the co-residency contract. A raw-SQL consumer of the legacy
+        // table finds the plain-append row there.
+        assert_eq!(
+            count_by_raw_sql(Arc::clone(&legacy_backend), provenance_id).await,
+            1,
+            "plain appends must stay visible to raw-SQL consumers of the legacy events table"
+        );
+        // Arm 2a: the moved class is genuinely gone from the legacy table —
+        // this is the silent-failure face of the boundary, held visible.
+        assert_eq!(
+            count_by_raw_sql(Arc::clone(&legacy_backend), audit_id).await,
+            0,
+            "audit-lane rows must not land in the legacy events table"
+        );
+        // Arm 2b: positive control for the instrument — the identical query
+        // finds the moved row on the lane backend, so arm 2a's zero (and any
+        // future arm-1 zero) is a routing fact, not a dead query.
+        assert_eq!(
+            count_by_raw_sql(Arc::clone(&lane_backend), audit_id).await,
+            1,
+            "the raw query must prove it can find rows where they actually live"
+        );
+    }
+
     /// End to end over the real socket: the idempotent lane returns true
     /// dispositions, and the row is readable back through the same store.
     #[tokio::test]
