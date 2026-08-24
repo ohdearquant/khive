@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -299,9 +299,9 @@ fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cach
             // Ownership was proven at the decision point by pathname; prove it
             // again from a descriptor immediately before mutating. See
             // `revalidate_owned_slot` for the two-layer TOCTOU story.
-            revalidate_owned_slot(&repo_dir)?;
-            fetch(&repo_dir)?;
-            advance_to_fetched_tip(&repo_dir)?;
+            let validated = revalidate_owned_slot(&repo_dir)?;
+            fetch(&repo_dir, &validated)?;
+            advance_to_fetched_tip(&repo_dir, &validated)?;
             // `repo_dir` was just fetched into and its ownership already
             // confirmed above; it vanishing here is a real problem (`slot_lock`
             // excludes a concurrent `ensure_clone`/`refetch_clone`/`reclone` on
@@ -373,9 +373,9 @@ fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cac
     // check above (and the migration between it and here) leave a window a
     // shared-root writer can use — re-prove ownership from a descriptor
     // immediately before the mutation.
-    revalidate_owned_slot(&repo_dir)?;
-    fetch_refetch(&repo_dir)?;
-    advance_to_fetched_tip(&repo_dir)?;
+    let validated = revalidate_owned_slot(&repo_dir)?;
+    fetch_refetch(&repo_dir, &validated)?;
+    advance_to_fetched_tip(&repo_dir, &validated)?;
 
     let size = dir_size(&repo_dir)?;
     if size > cap {
@@ -588,33 +588,95 @@ fn delete_verified_owned_entry(_root: &Path, repo_dir: &Path) -> Result<(), Cach
     remove_dir_all_retrying(repo_dir).map_err(CacheError::Io)
 }
 
+/// A slot the caller just revalidated. On unix it carries the validated
+/// directory descriptor, and every mutating git command is bound to that
+/// descriptor (`fchdir` before exec, relative `--git-dir .git`), so the
+/// command operates on the validated directory OBJECT: a pathname swapped
+/// after validation — including a symlink pointed at an ancestor repository,
+/// which an absolute `--git-dir` would happily follow — is never re-resolved.
+/// Non-unix carries no descriptor and keeps the pathname `--git-dir` form
+/// (weaker; documented at `revalidate_owned_slot`).
+struct ValidatedSlot {
+    #[cfg(unix)]
+    dir: std::fs::File,
+}
+
+#[cfg(unix)]
+impl ValidatedSlot {
+    /// Test-only: bind to a directory WITHOUT the ownership check, so tests
+    /// can prove what a bound command does against a hostile slot shape.
+    #[cfg(test)]
+    fn for_test(dir: &Path) -> Self {
+        Self {
+            dir: unix_fd::open_dir_nofollow(dir).expect("open test slot dir"),
+        }
+    }
+}
+
+/// Start a `git` invocation addressed at the validated slot. Unix: the child
+/// `fchdir`s to the validated descriptor before exec and uses a RELATIVE
+/// `--git-dir .git`. Non-unix: absolute `--git-dir` on the pathname.
+/// Callers that only read the exit status must null stdout themselves — git
+/// ref chatter ("origin/HEAD is unchanged...") otherwise interleaves with
+/// the process's own stdout protocol stream. (Not nulled here: `.output()`
+/// callers need stdout captured, and an explicit null would empty it.)
+fn git_at_slot(repo: &Path, slot: &ValidatedSlot) -> Command {
+    let mut cmd = Command::new("git");
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let fd = slot.dir.as_raw_fd();
+        // SAFETY: `fchdir` is async-signal-safe, and the descriptor outlives
+        // the child's pre-exec window because every caller holds `slot`
+        // across the synchronous wait on the command.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fchdir(fd) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        cmd.arg("--git-dir").arg(".git");
+        let _ = repo;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = slot;
+        cmd.arg("--git-dir").arg(repo.join(".git"));
+    }
+    cmd
+}
+
 /// TOCTOU guard for mutating an Owned slot: re-derive ownership from a
 /// descriptor opened NOW, immediately before the mutation, rather than
 /// trusting the pathname check made at the decision point. A shared-root
-/// writer that swapped the slot (e.g. for an empty directory) between the
-/// decision and the fetch fails this check. The residual pathname window is
-/// closed by the second layer: every mutating git command addresses the slot
-/// with an explicit `--git-dir`, so a vanished slot is a loud error on that
-/// exact path and never an upward discovery into an ancestor repository.
+/// writer that swapped the slot (e.g. for an empty directory, or a symlink)
+/// between the decision and the fetch fails this check (`O_NOFOLLOW` refuses
+/// the symlink outright). The returned handle carries the validated
+/// descriptor so the subsequent git commands stay bound to the same object —
+/// see `ValidatedSlot` and `git_at_slot`.
 #[cfg(unix)]
-fn revalidate_owned_slot(repo_dir: &Path) -> Result<(), CacheError> {
+fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
     let fd = unix_fd::open_dir_nofollow(repo_dir)
         .map_err(|_| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
     if !is_owned_entry_via_fd(&fd) {
         return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
     }
-    Ok(())
+    Ok(ValidatedSlot { dir: fd })
 }
 
 /// Non-unix fallback: pathname re-check at the same call site. Weaker than
-/// the fd-bound form, but the `--git-dir` layer still prevents ancestor
-/// discovery.
+/// the fd-bound form — the explicit `--git-dir` layer still prevents upward
+/// discovery, though not a symlink swapped in after this check.
 #[cfg(not(unix))]
-fn revalidate_owned_slot(repo_dir: &Path) -> Result<(), CacheError> {
+fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
     if !is_owned_entry(repo_dir) {
         return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
     }
-    Ok(())
+    Ok(ValidatedSlot {})
 }
 
 /// fd-relative mirror of `is_owned_entry`: proves ownership against an
@@ -810,6 +872,7 @@ fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
         .arg(url)
         .arg(dest)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::null())
         .status()
         .map_err(|e| CacheError::Git(format!("spawning git clone: {e}")))?;
     if !status.success() {
@@ -838,18 +901,19 @@ fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
 ///
 /// Failing to advance is a hard error, not a warning: proceeding would
 /// reintroduce the stale-walk defect silently.
-fn advance_to_fetched_tip(repo: &Path) -> Result<(), CacheError> {
+fn advance_to_fetched_tip(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
     // `origin/HEAD` is created by `git clone`; repair it first in case an
     // older slot predates it or the remote's default branch moved. Best
     // effort — the ref update below is the step that must succeed.
-    // `--git-dir`, not `-C`, throughout this function — see `fetch` for the
-    // discovery hazard: these commands mutate refs and must never resolve to
-    // an ancestor repository if the slot vanishes mid-sequence.
-    let _ = Command::new("git")
-        .arg("--git-dir")
-        .arg(repo.join(".git"))
+    // Descriptor-bound `--git-dir` throughout this function — see `fetch`:
+    // these commands mutate refs and must never resolve to an ancestor
+    // repository if the slot vanishes or is symlink-swapped mid-sequence.
+    // (`set-head` also prints "origin/HEAD is unchanged..." to stdout, which
+    // `git_at_slot` nulls so it cannot corrupt the caller's stdout stream.)
+    let _ = git_at_slot(repo, slot)
         .args(["remote", "set-head", "origin", "--auto"])
         .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::null())
         .status();
 
     // A fresh slot's HEAD is a symref to the default branch, so the branch is
@@ -858,19 +922,15 @@ fn advance_to_fetched_tip(repo: &Path) -> Result<(), CacheError> {
     // the HEAD file itself is the target. Both shapes occur: the first is
     // what `git clone` produces, the second is reachable through repair paths
     // and through slots older than this code.
-    let symref = Command::new("git")
-        .arg("--git-dir")
-        .arg(repo.join(".git"))
+    let symref = git_at_slot(repo, slot)
         .args(["symbolic-ref", "-q", "HEAD"])
         .output()
         .map_err(|e| CacheError::Git(format!("spawning git symbolic-ref: {e}")))?;
     let branch = String::from_utf8_lossy(&symref.stdout).trim().to_string();
 
-    let mut cmd = Command::new("git");
+    let mut cmd = git_at_slot(repo, slot);
     cmd.arg("-c")
         .arg("core.hooksPath=/dev/null")
-        .arg("--git-dir")
-        .arg(repo.join(".git"))
         .arg("update-ref");
     if symref.status.success() && !branch.is_empty() {
         cmd.arg(&branch);
@@ -879,6 +939,7 @@ fn advance_to_fetched_tip(repo: &Path) -> Result<(), CacheError> {
     }
     let status = cmd
         .arg("refs/remotes/origin/HEAD")
+        .stdout(Stdio::null())
         .status()
         .map_err(|e| CacheError::Git(format!("spawning git update-ref: {e}")))?;
     if !status.success() {
@@ -987,22 +1048,23 @@ fn migrate_legacy_slot(_root: &Path, _repo_dir: &Path) -> Result<bool, CacheErro
     Ok(false)
 }
 
-fn fetch(repo: &Path) -> Result<(), CacheError> {
-    // `--git-dir` (not `-C`): `-C` runs repository DISCOVERY, which walks
-    // upward when the slot has vanished and can land on an ancestor
-    // repository. An explicit git-dir fails loudly on the exact path instead.
-    let status = Command::new("git")
+fn fetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
+    // Descriptor-bound `--git-dir` (never `-C`): `-C` runs repository
+    // DISCOVERY, which walks upward when the slot has vanished and can land
+    // on an ancestor repository, and an absolute `--git-dir` still follows a
+    // symlink swapped in after revalidation. `git_at_slot` binds the command
+    // to the validated directory object itself.
+    let status = git_at_slot(repo, slot)
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
         .arg("gc.auto=0")
         .arg("-c")
         .arg("maintenance.auto=false")
-        .arg("--git-dir")
-        .arg(repo.join(".git"))
         .arg("fetch")
         .arg("--prune")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::null())
         .status()
         .map_err(|e| CacheError::Git(format!("spawning git fetch: {e}")))?;
     if !status.success() {
@@ -1017,21 +1079,20 @@ fn fetch(repo: &Path) -> Result<(), CacheError> {
 /// Issue #765 repair primitive: `git fetch --refetch origin` obtains a
 /// complete fresh filtered packfile instead of incrementally trusting the
 /// existing object store.
-fn fetch_refetch(repo: &Path) -> Result<(), CacheError> {
-    let status = Command::new("git")
+fn fetch_refetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
+    // Descriptor-bound — see `fetch` for the discovery and symlink hazards.
+    let status = git_at_slot(repo, slot)
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
         .arg("gc.auto=0")
         .arg("-c")
         .arg("maintenance.auto=false")
-        // `--git-dir`, not `-C` — see `fetch` for the discovery hazard.
-        .arg("--git-dir")
-        .arg(repo.join(".git"))
         .arg("fetch")
         .arg("--refetch")
         .arg("origin")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::null())
         .status()
         .map_err(|e| CacheError::Git(format!("spawning git fetch --refetch: {e}")))?;
     if !status.success() {
@@ -2262,15 +2323,77 @@ mod tests {
             "an empty directory at the slot pathname must fail revalidation"
         );
 
-        // (b) the fetch itself is bound to the exact git-dir: it errors
-        // instead of walking up to the ancestor.
-        assert!(
-            fetch(&slot).is_err(),
-            "fetch against a vanished slot must fail loudly"
-        );
+        // (b) even a command bound to the hostile directory itself (the
+        // test-only constructor skips the ownership check layer (a) proves)
+        // errors on the missing relative `.git` instead of discovering
+        // upward into the ancestor.
+        #[cfg(unix)]
+        {
+            assert!(
+                fetch(&slot, &ValidatedSlot::for_test(&slot)).is_err(),
+                "fetch against a vanished slot must fail loudly"
+            );
+        }
         assert!(
             !ancestor.join(".git").join("FETCH_HEAD").exists(),
             "the ancestor repository must be untouched by the failed fetch"
+        );
+    }
+
+    /// The descriptor layer binds the git command to the directory OBJECT
+    /// validated by `revalidate_owned_slot`, not to the pathname: after
+    /// validation, the slot pathname is swapped for a symlink pointing at an
+    /// ancestor repository — the shape an absolute `--git-dir` would follow.
+    /// The bound fetch must land in the validated (renamed-aside) directory
+    /// and never touch the ancestor.
+    #[cfg(unix)]
+    #[test]
+    fn a_bound_command_follows_the_validated_object_not_the_swapped_pathname() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        test_git(&upstream, &["init", "-q"]);
+        test_git(&upstream, &["config", "user.email", "t@example.com"]);
+        test_git(&upstream, &["config", "user.name", "T"]);
+        std::fs::write(upstream.join("tracked.md"), "content\n").unwrap();
+        test_git(&upstream, &["add", "tracked.md"]);
+        test_git(&upstream, &["commit", "-q", "-m", "commit A"]);
+        let url = upstream.to_str().expect("utf8");
+
+        // Ancestor repository with the same fetchable origin, so that a
+        // symlink-following fetch would SUCCEED into it — without it the
+        // broken form fails for the wrong reason.
+        let ancestor = dir.path().join("ancestor");
+        std::fs::create_dir_all(&ancestor).unwrap();
+        test_git(&ancestor, &["init", "-q"]);
+        test_git(&ancestor, &["remote", "add", "origin", url]);
+        let root = ancestor.join("cache-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let _scratch = ScratchRootGuard::set(&root);
+
+        // A genuine owned slot.
+        let slot = root.join("owned-slot");
+        clone(url, &slot).expect("clone slot");
+        std::fs::write(slot.join(MARKER_FILE), b"").expect("marker");
+
+        let validated = revalidate_owned_slot(&slot).expect("owned slot validates");
+
+        // Post-validation swap: the pathname now points at the ancestor.
+        let moved = root.join("owned-slot-moved");
+        std::fs::rename(&slot, &moved).expect("move validated dir aside");
+        std::os::unix::fs::symlink(&ancestor, &slot).expect("symlink swap");
+
+        fetch(&slot, &validated).expect("bound fetch follows the validated object");
+
+        assert!(
+            !ancestor.join(".git").join("FETCH_HEAD").exists(),
+            "the ancestor repository must never receive the fetch"
+        );
+        assert!(
+            moved.join(".git").join("FETCH_HEAD").exists(),
+            "the fetch must land in the directory that was validated"
         );
     }
 
