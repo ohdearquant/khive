@@ -714,6 +714,123 @@ async fn upsert_atoms_rejects_empty_slug() {
 }
 
 #[tokio::test]
+async fn upsert_atoms_validation_failure_does_not_commit_valid_prefix() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [
+                {
+                    "slug": "valid-prefix",
+                    "name": "Valid Prefix",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                },
+                {
+                    "slug": "invalid-suffix",
+                    "name": "Invalid Suffix",
+                    "content": "too short"
+                }
+            ] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("20 words"), "got: {err}");
+
+    let persisted = f
+        .dispatch("knowledge.get", json!({ "id": "valid-prefix" }))
+        .await;
+    assert!(
+        persisted.is_err(),
+        "validation failure must not commit an earlier valid atom: {persisted:?}"
+    );
+}
+
+#[tokio::test]
+async fn upsert_atoms_domain_collision_does_not_commit_valid_prefix() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{
+            "slug": "protected-domain",
+            "name": "Protected Domain",
+            "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("seed domain");
+
+    let err = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [
+                {
+                    "slug": "domain-prefix",
+                    "name": "Domain Prefix",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                },
+                {
+                    "slug": "protected-domain",
+                    "name": "Collision",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }
+            ] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("domain mirror"), "got: {err}");
+    assert!(
+        f.dispatch("knowledge.get", json!({ "id": "domain-prefix" }))
+            .await
+            .is_err(),
+        "domain collision must not commit an earlier valid atom"
+    );
+}
+
+#[tokio::test]
+async fn upsert_atoms_tombstone_collision_does_not_commit_valid_prefix() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "retired-atom",
+            "name": "Retired Atom",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("seed atom");
+    f.dispatch("knowledge.delete_atoms", json!({ "ids": ["retired-atom"] }))
+        .await
+        .expect("delete atom");
+
+    let err = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [
+                {
+                    "slug": "tombstone-prefix",
+                    "name": "Tombstone Prefix",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                },
+                {
+                    "slug": "retired-atom",
+                    "name": "Retired Atom Again",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }
+            ] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("previously deleted"), "got: {err}");
+    assert!(
+        f.dispatch("knowledge.get", json!({ "id": "tombstone-prefix" }))
+            .await
+            .is_err(),
+        "tombstone collision must not commit an earlier valid atom"
+    );
+}
+
+#[tokio::test]
 async fn upsert_atoms_rejects_reserved_secret_gate_property_key() {
     let f = pack(rt());
     let err = f

@@ -1,5 +1,7 @@
 //! CRUD handlers: upsert_atoms, upsert_domains, get, list, delete_atoms, stats.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -64,8 +66,6 @@ impl KnowledgeHandlers {
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
         let now = now_us();
-        let mut created = 0usize;
-        let mut updated = 0usize;
 
         for atom_in in &p.atoms {
             let slug = atom_in.slug.trim().to_string();
@@ -102,27 +102,21 @@ impl KnowledgeHandlers {
             if let Some(ref st) = atom_in.source_type {
                 khive_runtime::secret_gate::check(st)?;
             }
+        }
 
-            let tags_json = tags_to_json(atom_in.tags.as_ref());
-            let props_json = atom_in
-                .properties
-                .as_ref()
-                .map(|v| serde_json::to_string(v).unwrap_or_default());
-            let source_uri = atom_in
-                .source_uri
-                .as_ref()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-            let source_type = atom_in
-                .source_type
-                .as_ref()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
+        let mut reader = sql
+            .reader()
+            .await
+            .map_err(|e| sql_err("upsert_atoms reader", e))?;
+        let mut ids_by_slug: HashMap<String, String> = HashMap::new();
+        let mut operations = Vec::with_capacity(p.atoms.len());
+        for atom_in in &p.atoms {
+            let slug = atom_in.slug.trim().to_string();
+            if let Some(id) = ids_by_slug.get(&slug) {
+                operations.push((id.clone(), false));
+                continue;
+            }
 
-            let mut reader = sql
-                .reader()
-                .await
-                .map_err(|e| sql_err("upsert_atoms reader", e))?;
             // Look up by slug WITHOUT the deleted_at filter so a tombstoned row that
             // still owns the (namespace, slug) unique index is detected before the
             // insert path runs — otherwise SQLite raises a raw unique-constraint
@@ -153,46 +147,50 @@ impl KnowledgeHandlers {
                 }
             }
 
-            let mut writer = sql
-                .writer()
-                .await
-                .map_err(|e| sql_err("upsert_atoms writer", e))?;
-            if let Some(row) = existing {
-                let id = row_str(&row, "id").ok_or_else(|| {
-                    RuntimeError::Internal("missing id in existing atom row".into())
-                })?;
-                writer
-                    .execute(SqlStatement {
-                        // Promote draft -> reviewed when this upsert finalizes the atom.
-                        // Never demote an already reviewed row, and leave status
-                        // untouched when not finalizing. finalized=COALESCE(?7, finalized)
-                        // preserves the existing flag when the caller omits it; SQLite's
-                        // `NULL = 1` evaluates to NULL (falsy), so an omitted field also
-                        // leaves the status CASE on its ELSE branch. source_uri/source_type
-                        // use the same COALESCE shape so an omitted field preserves the
-                        // existing attribution instead of clobbering it with NULL.
-                        sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=COALESCE(?5, source_uri), source_type=COALESCE(?6, source_type), finalized=COALESCE(?7, finalized), status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
-                        params: vec![
-                            SqlValue::Text(atom_in.name.clone()),
-                            SqlValue::Text(content.clone()),
-                            SqlValue::Text(tags_json.clone()),
-                            props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
-                            source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            atom_in.finalized.map_or(SqlValue::Null, |f| SqlValue::Integer(f as i64)),
-                            SqlValue::Integer(now),
-                            SqlValue::Text(id),
-                            SqlValue::Text(ns.clone()),
-                        ],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("upsert_atoms update", e))?;
-                updated += 1;
+            let (id, insert) = if let Some(row) = existing {
+                (
+                    row_str(&row, "id").ok_or_else(|| {
+                        RuntimeError::Internal("missing id in existing atom row".into())
+                    })?,
+                    false,
+                )
             } else {
-                let id = new_id();
-                writer
-                    .execute(SqlStatement {
+                (new_id(), true)
+            };
+            ids_by_slug.insert(slug, id.clone());
+            operations.push((id, insert));
+        }
+        drop(reader);
+
+        let mut created = 0usize;
+        let mut updated = 0usize;
+        let mut statements = Vec::with_capacity(p.atoms.len());
+        for (atom_in, (id, insert)) in p.atoms.iter().zip(operations) {
+            let slug = atom_in.slug.trim().to_string();
+            let raw_content = atom_in.content.as_deref().unwrap_or("");
+            let content = if preserve_content_whitespace {
+                raw_content.to_string()
+            } else {
+                raw_content.trim().to_string()
+            };
+            let tags_json = tags_to_json(atom_in.tags.as_ref());
+            let props_json = atom_in
+                .properties
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default());
+            let source_uri = atom_in
+                .source_uri
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let source_type = atom_in
+                .source_type
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+
+            if insert {
+                statements.push(SqlStatement {
                         sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, source_uri, source_type, status, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)".into(),
                         params: vec![
                             SqlValue::Text(id),
@@ -212,12 +210,47 @@ impl KnowledgeHandlers {
                             SqlValue::Integer(now),
                         ],
                         label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("upsert_atoms insert", e))?;
+                    });
                 created += 1;
+            } else {
+                statements.push(SqlStatement {
+                    // Promote draft -> reviewed when this upsert finalizes the atom.
+                    // Never demote an already reviewed row, and leave status
+                    // untouched when not finalizing. finalized=COALESCE(?7, finalized)
+                    // preserves the existing flag when the caller omits it; SQLite's
+                    // `NULL = 1` evaluates to NULL (falsy), so an omitted field also
+                    // leaves the status CASE on its ELSE branch. source_uri/source_type
+                    // use the same COALESCE shape so an omitted field preserves the
+                    // existing attribution instead of clobbering it with NULL.
+                    sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=COALESCE(?5, source_uri), source_type=COALESCE(?6, source_type), finalized=COALESCE(?7, finalized), status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
+                    params: vec![
+                        SqlValue::Text(atom_in.name.clone()),
+                        SqlValue::Text(content),
+                        SqlValue::Text(tags_json),
+                        props_json.map_or(SqlValue::Null, SqlValue::Text),
+                        source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        atom_in
+                            .finalized
+                            .map_or(SqlValue::Null, |f| SqlValue::Integer(f as i64)),
+                        SqlValue::Integer(now),
+                        SqlValue::Text(id),
+                        SqlValue::Text(ns.clone()),
+                    ],
+                    label: None,
+                });
+                updated += 1;
             }
         }
+
+        let mut writer = sql
+            .writer()
+            .await
+            .map_err(|e| sql_err("upsert_atoms writer", e))?;
+        writer
+            .execute_batch(statements)
+            .await
+            .map_err(|e| sql_err("upsert_atoms batch", e))?;
 
         Ok(json!({
             "created": created,
