@@ -622,7 +622,7 @@ impl KhiveRuntime {
     ///
     /// When the events-daemon split (ADR-170) is configured, the store routes
     /// by append class: the ADR-133 idempotent audit-batch lane — the
-    /// measured bulk of event write volume — persists to `events.db`
+    /// measured bulk of event write volume — persists to the events database
     /// (forwarded over the events daemon socket in daemon deployments, or
     /// opened directly in embedded/one-shot contexts), while plain appends
     /// stay on this runtime's backend, keeping every raw-SQL consumer of the
@@ -638,12 +638,33 @@ impl KhiveRuntime {
             None => Ok(legacy),
             Some(split) => {
                 let lane: Arc<dyn EventStore> = match &split.socket_path {
+                    #[cfg(unix)]
                     Some(socket) => {
                         let client = crate::events_split::client_for(socket)?;
                         Arc::new(crate::events_split::ForwardingEventStore::new(
                             token.namespace().as_str(),
                             client,
                         ))
+                    }
+                    #[cfg(not(unix))]
+                    Some(_socket) => {
+                        return Err(RuntimeError::InvalidInput(
+                            "events-daemon socket forwarding requires a Unix platform; \
+                             configure the events split in direct mode here"
+                                .to_string(),
+                        ));
+                    }
+                    None if self.backend.is_read_only() => {
+                        // A read-only runtime must not create or
+                        // schema-initialize an events database. No events.db
+                        // on disk means no lane rows exist — serve the legacy
+                        // store alone rather than minting the file to read
+                        // nothing from it.
+                        if !split.db_path.exists() {
+                            return Ok(legacy);
+                        }
+                        crate::events_split::direct_backend_read_only_for(&split.db_path)?
+                            .events_for_namespace(token.namespace().as_str())?
                     }
                     None => crate::events_split::direct_backend_for(&split.db_path)?
                         .events_for_namespace(token.namespace().as_str())?,

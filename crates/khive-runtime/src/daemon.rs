@@ -1371,7 +1371,7 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
 /// umask-default 0755 stays acceptable; shared sticky directories like
 /// `/tmp` do not.
 #[cfg(unix)]
-fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
     // SAFETY: `geteuid` is always successful and takes no arguments.
     let daemon_euid = unsafe { libc::geteuid() } as u32;
 

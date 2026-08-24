@@ -94,9 +94,10 @@ enum Command {
     Mcp(khive_mcp::args::Args),
 
     /// Serve the dedicated events daemon (ADR-170): the resident writer of
-    /// `events.db`, receiving observational events over its own Unix socket
-    /// so telemetry never queues on the domain store's writer lane. Normally
-    /// spawned and supervised by `kkernel mcp --daemon`, not run by hand.
+    /// the events database, receiving observational events over its own Unix
+    /// socket so telemetry never queues on the domain store's writer lane.
+    /// Normally spawned and supervised by `kkernel mcp --daemon`, not run by
+    /// hand.
     EventsDaemon(EventsDaemonArgs),
 
     /// Inspect registered backends.
@@ -119,14 +120,14 @@ enum Command {
 /// Arguments for the dedicated events daemon (ADR-170).
 #[derive(clap::Parser, Debug)]
 struct EventsDaemonArgs {
-    /// Events database file. Defaults to `events.db` beside the resolved main
-    /// database (`--db`/`KHIVE_DB` resolution applies to the MAIN database;
-    /// this flag names the events file itself).
+    /// Events database file. Defaults to `<main-stem>.events.db` beside the
+    /// resolved main database (`--db`/`KHIVE_DB` resolution applies to the
+    /// MAIN database; this flag names the events file itself).
     #[arg(long)]
     db: Option<PathBuf>,
 
-    /// Unix socket path to bind. Defaults to `khive-events.sock` beside the
-    /// main daemon socket.
+    /// Unix socket path to bind. Defaults to the events database path with a
+    /// `.sock` extension, beside that database.
     #[arg(long)]
     socket: Option<PathBuf>,
 }
@@ -310,14 +311,15 @@ pub async fn cli_main() -> Result<()> {
             }
             result
         }
+        #[cfg(unix)]
         Command::EventsDaemon(a) => {
             let db = match a.db {
                 Some(db) => db,
                 None => {
                     let main_db = khive_runtime::resolve_db_anchor(None).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "events-daemon: no main database resolvable to anchor events.db; \
-                             pass --db explicitly"
+                            "events-daemon: no main database resolvable to anchor the events \
+                             database; pass --db explicitly"
                         )
                     })?;
                     khive_runtime::events_split::events_db_path_beside(&main_db)
@@ -327,6 +329,10 @@ pub async fn cli_main() -> Result<()> {
                 .socket
                 .unwrap_or_else(|| khive_runtime::events_split::events_socket_path_beside(&db));
             khive_runtime::events_split::run_events_daemon(&db, &socket).await
+        }
+        #[cfg(not(unix))]
+        Command::EventsDaemon(_) => {
+            anyhow::bail!("the events daemon requires a Unix platform (Unix-socket transport)")
         }
         Command::Mcp(a) => {
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();

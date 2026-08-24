@@ -58,10 +58,11 @@ recall/search/feedback, pack provenance) are low-volume domain-adjacent facts
 that stay put.
 
 1. **Events daemon.** A new subcommand of the same binary runs an events daemon
-   that owns `events.db` beside the main store, writes to it through the existing
+   that owns the events database (`<main-stem>.events.db`, named after the main
+   database file it sits beside), writes to it through the existing
    `SqlEventStore`, and binds its own Unix socket using the same framing and
    peer-uid admission as the existing daemon socket. It is the only **resident**
-   writer of `events.db`; the sole exception is the daemonless embedded mode of
+   writer of that file; the sole exception is the daemonless embedded mode of
    point 4, whose short direct appends SQLite's per-file cross-process exclusion
    already serializes.
 
@@ -106,7 +107,7 @@ that stay put.
    reading exactly the rows that never moved.
 
 4. **Embedded mode.** One-shot CLI and test contexts without a daemon use the
-   in-process `SqlEventStore` against `events.db` directly for the lane side.
+   in-process `SqlEventStore` against the events database directly for the lane side.
    SQLite's per-file cross-process exclusion covers the rare overlap with a
    running events daemon; every event transaction is a short append. The
    shared config resolver emits this socket-less mode for every file-backed
@@ -121,7 +122,7 @@ that stay put.
    events loudly (counter + log), and attempts respawn with backoff. Domain
    availability never depends on events-daemon liveness.
 
-6. **Cutover.** New audit-lane rows go to `events.db` from the first boot of
+6. **Cutover.** New audit-lane rows go to the events database from the first boot of
    this code; the plain-append classes keep writing the domain store, so
    nothing that reads them observes a cutover at all. Audit rows written
    before the cutover remain in the main store; because trait-level reads
@@ -177,7 +178,7 @@ this daemon's drop policy.
   consumers of the stream need.
 - **Central broker for the event stream.** Rejected: re-centralizes what this
   change decomposes; consumers can tail the events store directly.
-- **Multi-process direct writes to `events.db` (no daemon).** Rejected for the
+- **Multi-process direct writes to the events database (no daemon).** Rejected for the
   hot path: reintroduces cross-process writer contention on the busiest file.
   Retained only for the rare embedded mode.
 

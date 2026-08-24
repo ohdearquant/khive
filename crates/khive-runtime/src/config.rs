@@ -317,7 +317,7 @@ pub struct RuntimeConfig {
     /// the host zone cannot be determined) via [`resolve_default_display_timezone`].
     pub display_timezone: chrono_tz::Tz,
     /// Events-daemon split (ADR-170). `None` = legacy behavior: events persist
-    /// in the main store. `Some` routes event persistence to `events.db` —
+    /// in the main store. `Some` routes event persistence to the events database —
     /// forwarded over the events daemon socket in daemon deployments, opened
     /// directly in embedded/one-shot contexts. Populated by the transport
     /// hosts (khive-mcp serve, kkernel exec); tests and in-memory runtimes

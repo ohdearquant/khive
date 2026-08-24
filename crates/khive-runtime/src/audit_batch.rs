@@ -363,6 +363,13 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         StorageError::WriteQueueFull { .. } | StorageError::WriterTaskBusy { .. } => {
             RetryDecision::Retry
         }
+        // Transient availability conditions, not judgments on the batch. The
+        // events-daemon forwarding lane (ADR-170) reports an unreachable or
+        // stalled daemon as `Pool`/`Timeout`; the direct SQL path reports
+        // acquisition pressure the same way. Both are exactly what the
+        // configured bounded retries exist for — treating them as terminal
+        // would abandon a generation on the first blip of a daemon restart.
+        StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
         StorageError::WriterTaskTerminated { request_state } => match request_state {
             WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
                 RetryDecision::Retry

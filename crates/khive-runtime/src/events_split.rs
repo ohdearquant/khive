@@ -3,8 +3,8 @@
 //! The ADR-133 idempotent audit batch is the measured bulk of event write
 //! volume, and in a single-store deployment its rows queue on the same SQLite
 //! writer lane as domain mutations. This module moves that lane into a
-//! dedicated events daemon that owns `events.db`, reachable over a Unix
-//! socket with the same length-prefixed framing and peer-uid admission the
+//! dedicated events daemon that owns the events database, reachable over a
+//! Unix socket with the same length-prefixed framing and peer-uid admission the
 //! main daemon socket uses. Plain event appends stay on the domain store —
 //! the legacy `events` table has raw-SQL consumers (schedule provenance, kg
 //! projection guards, graph-query substrate unions) whose correctness
@@ -13,8 +13,8 @@
 //! Cooperating pieces:
 //!
 //! - [`run_events_daemon`] — the server loop the `events-daemon` subcommand
-//!   runs: binds the events socket, owns the only resident writer of
-//!   `events.db`, and serves append/read requests through the ordinary
+//!   runs: binds the events socket, owns the only resident writer of the
+//!   events database, and serves append/read requests through the ordinary
 //!   `SqlEventStore`.
 //! - [`EventsSplitClient`] — one per domain process. Plain appends ride a
 //!   bounded in-memory queue drained by a background forwarder
@@ -38,8 +38,10 @@
 //! synchronous lanes) instead of blocking the caller.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,9 +53,11 @@ use khive_storage::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
+#[cfg(unix)]
 use crate::daemon::{read_frame, write_frame};
 
 /// Bump whenever the request or response frame shape changes incompatibly.
@@ -64,34 +68,49 @@ pub const EVENTS_PROTOCOL_VERSION: u32 = 1;
 /// Default bound on the fire-and-forget append queue, in batches. The loss
 /// window on overflow is this depth times the batch size in flight; the value
 /// is deliberately generous because entries are pointers, not rows.
+#[cfg(unix)]
 pub const DEFAULT_APPEND_QUEUE_BATCHES: usize = 4096;
 
 /// Timeout for one synchronous round-trip (idempotent appends, reads).
+/// Covers the WHOLE attempt — connect, peer verification, write, read —
+/// because each round-trip owns its connection (no shared lock to wait on
+/// outside the clock).
+#[cfg(unix)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reconnect backoff for the background forwarder after a failed connect.
+#[cfg(unix)]
 const FORWARDER_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Default events database file, beside the main database file.
+///
+/// The name is derived from the main database's file stem (`khive.db` →
+/// `khive.events.db`), never a fixed name in the parent directory: two
+/// independent databases that happen to share a directory (`a.db`, `b.db`)
+/// must each get their own event plane, not silently share one.
 pub fn events_db_path_beside(main_db: &Path) -> PathBuf {
-    main_db
-        .parent()
-        .map(|dir| dir.join("events.db"))
-        .unwrap_or_else(|| PathBuf::from("events.db"))
+    let mut name = main_db
+        .file_stem()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("khive"));
+    name.push(".events.db");
+    match main_db.parent() {
+        Some(dir) => dir.join(&name),
+        None => PathBuf::from(name),
+    }
 }
 
 /// Events daemon socket path, beside the events database it serves.
 ///
-/// Derived from the db path (not a process-global location) so every events
-/// database gets its own daemon and socket: a global socket would route
-/// events from any second database (another seat, a test tempdir) to
-/// whichever daemon happens to own it, persisting them beside the wrong
-/// main store.
+/// Derived from the events db path (not a process-global location, not a
+/// fixed name in the parent directory) so every events database gets its own
+/// daemon and socket: a shared socket would route events from any second
+/// database (another seat, a test tempdir) to whichever daemon happens to
+/// own it, persisting them beside the wrong main store. `khive.events.db`
+/// yields `khive.events.sock`; the daemon's advisory lock is the same path
+/// with a `.lock` extension.
 pub fn events_socket_path_beside(events_db: &Path) -> PathBuf {
-    events_db
-        .parent()
-        .map(|dir| dir.join("khive-events.sock"))
-        .unwrap_or_else(|| PathBuf::from("khive-events.sock"))
+    events_db.with_extension("sock")
 }
 
 /// How a runtime reaches event storage when the split is configured.
@@ -115,9 +134,14 @@ pub struct EventsSplitConfig {
 // process-global state. Keyed by path so tests exercising two distinct paths
 // in one process stay isolated.
 
+#[cfg(unix)]
 type ClientMap = std::collections::HashMap<PathBuf, Arc<EventsSplitClient>>;
-type BackendMap = std::collections::HashMap<PathBuf, Arc<StorageBackend>>;
+/// Keyed by (path, read_only): a read-only open and a writable open of the
+/// same file are different pools with different guarantees and must never be
+/// handed out interchangeably.
+type BackendMap = std::collections::HashMap<(PathBuf, bool), Arc<StorageBackend>>;
 
+#[cfg(unix)]
 fn client_registry() -> &'static std::sync::Mutex<ClientMap> {
     static REGISTRY: std::sync::OnceLock<std::sync::Mutex<ClientMap>> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -130,6 +154,7 @@ fn direct_backend_registry() -> &'static std::sync::Mutex<BackendMap> {
 
 /// The process-wide client for `socket_path`, created (and its forwarder
 /// spawned) on first use. Requires a tokio runtime context on first call.
+#[cfg(unix)]
 pub fn client_for(socket_path: &Path) -> crate::error::RuntimeResult<Arc<EventsSplitClient>> {
     let mut registry = client_registry()
         .lock()
@@ -145,19 +170,42 @@ pub fn client_for(socket_path: &Path) -> crate::error::RuntimeResult<Arc<EventsS
 /// The process-wide direct (embedded-mode) backend for `db_path`, opened
 /// read-write on first use.
 pub fn direct_backend_for(db_path: &Path) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
+    direct_backend(db_path, false)
+}
+
+/// The process-wide direct backend for `db_path`, opened READ-ONLY on first
+/// use. The file must already exist — this constructor never creates or
+/// schema-initializes an events database, which is what a read-only runtime's
+/// no-DB-creation contract requires of its event lane.
+pub fn direct_backend_read_only_for(
+    db_path: &Path,
+) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
+    direct_backend(db_path, true)
+}
+
+fn direct_backend(
+    db_path: &Path,
+    read_only: bool,
+) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
     let mut registry = direct_backend_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = registry.get(db_path) {
+    let key = (db_path.to_path_buf(), read_only);
+    if let Some(existing) = registry.get(&key) {
         return Ok(Arc::clone(existing));
     }
-    let backend = Arc::new(StorageBackend::sqlite(db_path)?);
-    registry.insert(db_path.to_path_buf(), Arc::clone(&backend));
+    let backend = Arc::new(if read_only {
+        StorageBackend::sqlite_read_only(db_path)?
+    } else {
+        StorageBackend::sqlite(db_path)?
+    });
+    registry.insert(key, Arc::clone(&backend));
     Ok(backend)
 }
 
 /// Forwarding metrics for the process-wide client at `socket_path`, if one
 /// exists. `None` means the split never initialized in this process.
+#[cfg(unix)]
 pub fn forwarding_metrics(socket_path: &Path) -> Option<EventsForwardingMetrics> {
     let registry = client_registry()
         .lock()
@@ -271,12 +319,14 @@ pub enum EventsResponse {
 /// Advisory lock guaranteeing at most one events daemon per socket path.
 /// Held for the daemon's lifetime; a second daemon exits instead of stealing
 /// the socket path from the live one.
+#[cfg(unix)]
 pub struct EventsDaemonGuard {
     _file: std::fs::File,
 }
 
 /// Try to become the events daemon for `socket_path`. `None` = another
 /// events daemon already holds the lock.
+#[cfg(unix)]
 pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemonGuard> {
     let lock_path = socket_path.with_extension("lock");
     if let Some(parent) = lock_path.parent() {
@@ -306,12 +356,56 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
 /// re-invoked as `events-daemon --db <db> --socket <socket>` — the subcommand
 /// the kernel binary registers for [`run_events_daemon`]. The child holds the
 /// per-socket advisory lock, so a probe/spawn race resolves to one survivor.
+///
+/// Lifecycle: the loop observes the process-wide daemon shutdown token, so
+/// `drain()` never waits on it forever, and it retains the handle of the
+/// child it spawned — reaping it with `try_wait` on every probe (no zombie
+/// accumulation during a persistent startup failure) and never stacking a
+/// second spawn on a still-live child. On shutdown, a child this supervisor
+/// spawned is killed and reaped; a pre-existing events daemon it never
+/// spawned is left alone.
+///
+/// The reachability probe uses the peer-verified connect: a socket answered
+/// by a foreign-uid process is treated as UNREACHABLE (and logged loudly),
+/// so a pre-bound spoof socket triggers a real-daemon spawn instead of being
+/// reported healthy.
+#[cfg(unix)]
 pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
     const PROBE_INTERVAL: Duration = Duration::from_secs(15);
+    let shutdown = crate::daemon::daemon_shutdown_token();
+    let mut child: Option<std::process::Child> = None;
     let mut respawns: u64 = 0;
     loop {
-        let reachable = UnixStream::connect(&socket_path).await.is_ok();
-        if !reachable {
+        // Reap first: a child that exited (crashed, lost the advisory lock
+        // race, refused an untrusted directory) must not linger as a zombie,
+        // and clearing the slot is what re-arms the spawn below.
+        if let Some(c) = child.as_mut() {
+            match c.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::info!(%status, "events daemon child exited");
+                    child = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "cannot poll events daemon child; dropping handle");
+                    child = None;
+                }
+            }
+        }
+
+        let reachable = match connect_verified(&socket_path).await {
+            Ok(_stream) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(
+                    socket = %socket_path.display(),
+                    error = %error,
+                    "events socket answered by a foreign uid; treating as unreachable"
+                );
+                false
+            }
+            Err(_) => false,
+        };
+        if !reachable && child.is_none() {
             match std::env::current_exe() {
                 Ok(exe) => {
                     let spawned = std::process::Command::new(exe)
@@ -325,14 +419,15 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
                         .stderr(std::process::Stdio::null())
                         .spawn();
                     match spawned {
-                        Ok(child) => {
+                        Ok(spawned_child) => {
                             respawns += 1;
                             tracing::info!(
-                                pid = child.id(),
+                                pid = spawned_child.id(),
                                 respawns,
                                 socket = %socket_path.display(),
                                 "spawned events daemon"
                             );
+                            child = Some(spawned_child);
                         }
                         Err(error) => {
                             tracing::warn!(error = %error, "failed to spawn events daemon");
@@ -344,7 +439,18 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
                 }
             }
         }
-        tokio::time::sleep(PROBE_INTERVAL).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+        }
+    }
+    if let Some(mut c) = child.take() {
+        // Our child, our cleanup: the events daemon holds no volatile queue
+        // state (SQLite is the durability), and the next daemon host's
+        // supervisor respawns it.
+        let _ = c.kill();
+        let _ = c.wait();
+        tracing::info!("events daemon child stopped with supervisor shutdown");
     }
 }
 
@@ -356,6 +462,14 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
 /// the peer disconnects. All storage goes through `SqlEventStore` on a
 /// backend opened read-write against `db_path`; the events schema is ensured
 /// once at boot.
+///
+/// Bind-path trust mirrors the main daemon socket: the socket directory must
+/// pass the same ownership/mode/swap-resistance validation, and the bound
+/// socket entry is chmod'd 0600 fail-closed. Pathname reachability is not
+/// identity — clients additionally verify the peer uid on every connect —
+/// but a hardened bind path is what keeps the *bind* itself out of another
+/// user's hands.
+#[cfg(unix)]
 pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Result<()> {
     let Some(_guard) = try_acquire_events_daemon_guard(socket_path) else {
         tracing::info!(
@@ -368,13 +482,31 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // Ensure the schema once, loudly, before accepting traffic.
     backend.events()?;
 
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        crate::daemon::ensure_socket_dir_is_trusted(parent)?;
+    }
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
     }
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let listener = UnixListener::bind(socket_path)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Fail closed, same contract as the main daemon socket: if the entry
+        // cannot be made owner-only, drop the listener and remove it rather
+        // than serve a world-reachable socket the design never covered.
+        if let Err(e) =
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        {
+            drop(listener);
+            let _ = std::fs::remove_file(socket_path);
+            anyhow::bail!(
+                "refusing to serve events: cannot chmod 0600 {}: {e}. The events socket must \
+                 be owner-only.",
+                socket_path.display()
+            );
+        }
+    }
     let daemon_euid = unsafe { libc::geteuid() };
     tracing::info!(
         socket = %socket_path.display(),
@@ -408,6 +540,7 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     }
 }
 
+#[cfg(unix)]
 async fn serve_events_conn(mut stream: UnixStream, backend: Arc<StorageBackend>) {
     loop {
         let payload = match read_frame(&mut stream).await {
@@ -435,6 +568,7 @@ async fn serve_events_conn(mut stream: UnixStream, backend: Arc<StorageBackend>)
     }
 }
 
+#[cfg(unix)]
 async fn dispatch_events_request(
     request: EventsRequest,
     backend: &StorageBackend,
@@ -486,6 +620,7 @@ async fn dispatch_events_request(
     }
 }
 
+#[cfg(unix)]
 fn storage_error_response(error: &StorageError) -> EventsResponse {
     EventsResponse::Error {
         message: error.to_string(),
@@ -502,9 +637,35 @@ fn storage_error_response(error: &StorageError) -> EventsResponse {
 // Client side
 // ---------------------------------------------------------------------------
 
+/// Connect to the events socket and verify who answered. Pathname
+/// reachability is not identity: any process that can write the directory can
+/// pre-bind the path. The kernel-reported peer uid is the one identity the
+/// far side cannot choose, so every client connect — round-trips, the
+/// forwarder, the supervisor probe — refuses a socket answered by a foreign
+/// uid before a single frame is written.
+#[cfg(unix)]
+async fn connect_verified(socket_path: &Path) -> std::io::Result<UnixStream> {
+    let stream = UnixStream::connect(socket_path).await?;
+    // SAFETY: `geteuid` is always successful and takes no arguments.
+    let own_euid = unsafe { libc::geteuid() } as u32;
+    let peer = crate::daemon::peer_uid(&stream)?;
+    if !crate::daemon::uid_is_permitted(peer, own_euid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "events socket {} answered by uid {peer}, not this process's uid {own_euid}; \
+                 refusing to exchange event frames with an unowned daemon",
+                socket_path.display()
+            ),
+        ));
+    }
+    Ok(stream)
+}
+
 /// Counters describing the fire-and-forget lane's degradation. Zero drops is
 /// the healthy state; any non-zero `dropped_batches` means the loss-tolerant
 /// contract was exercised and says so.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct EventsForwardingMetrics {
     pub forwarded_batches: u64,
@@ -513,6 +674,7 @@ pub struct EventsForwardingMetrics {
     pub dropped_events: u64,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Default)]
 struct ForwardingCounters {
     forwarded_batches: AtomicU64,
@@ -523,6 +685,12 @@ struct ForwardingCounters {
 
 /// One per domain process: the connection to the events daemon plus the
 /// bounded fire-and-forget append queue.
+///
+/// Synchronous round-trips each own a fresh connection: there is no shared
+/// request connection and no lock in front of one, so concurrent reads and
+/// audit flushes never queue behind a single stalled call, and the round-trip
+/// timeout bounds each caller's whole attempt.
+#[cfg(unix)]
 pub struct EventsSplitClient {
     socket_path: PathBuf,
     append_tx: tokio::sync::mpsc::Sender<(String, Vec<Event>)>,
@@ -530,12 +698,11 @@ pub struct EventsSplitClient {
     /// Flipped by the forwarder while the daemon is unreachable so the drop
     /// log fires once per outage, not once per batch.
     outage_logged: Arc<AtomicBool>,
-    /// Serializes synchronous round-trips over one persistent connection.
-    request_conn: tokio::sync::Mutex<Option<UnixStream>>,
     /// In-memory validator backing `preflight_event` without I/O.
     preflight_store: Arc<dyn EventStore>,
 }
 
+#[cfg(unix)]
 impl std::fmt::Debug for EventsSplitClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventsSplitClient")
@@ -544,6 +711,7 @@ impl std::fmt::Debug for EventsSplitClient {
     }
 }
 
+#[cfg(unix)]
 impl EventsSplitClient {
     /// Build the client and spawn its background forwarder.
     pub fn new(socket_path: PathBuf) -> crate::error::RuntimeResult<Arc<Self>> {
@@ -571,7 +739,6 @@ impl EventsSplitClient {
             append_tx,
             counters: Arc::clone(&counters),
             outage_logged: Arc::clone(&outage_logged),
-            request_conn: tokio::sync::Mutex::new(None),
             preflight_store,
         });
 
@@ -617,8 +784,10 @@ impl EventsSplitClient {
         }
     }
 
-    /// One synchronous framed round-trip with a bounded timeout, reusing (or
-    /// re-establishing) the persistent request connection.
+    /// One synchronous framed round-trip with a bounded timeout, on its own
+    /// fresh connection. No connection is shared between concurrent callers,
+    /// so no caller ever waits on another's stall, and `REQUEST_TIMEOUT`
+    /// bounds the whole attempt — connect, peer verification, write, read.
     async fn round_trip(&self, request: &EventsRequest) -> StorageResult<EventsResponse> {
         let op = "events daemon round-trip";
         let payload = serde_json::to_vec(request).map_err(|error| StorageError::Serialization {
@@ -626,21 +795,15 @@ impl EventsSplitClient {
             message: format!("events request serialization failed: {error}"),
         })?;
 
-        let mut guard = self.request_conn.lock().await;
         let attempt = async {
-            if guard.is_none() {
-                *guard = Some(UnixStream::connect(&self.socket_path).await?);
-            }
-            let stream = guard.as_mut().expect("connection populated above");
-            write_frame(stream, &payload).await?;
-            let bytes = read_frame(stream).await?;
+            let mut stream = connect_verified(&self.socket_path).await?;
+            write_frame(&mut stream, &payload).await?;
+            let bytes = read_frame(&mut stream).await?;
             std::io::Result::Ok(bytes)
         };
         let bytes = match tokio::time::timeout(REQUEST_TIMEOUT, attempt).await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
-                // Dead connection: forget it so the next call reconnects.
-                *guard = None;
                 return Err(StorageError::Pool {
                     operation: op.into(),
                     message: format!(
@@ -650,13 +813,11 @@ impl EventsSplitClient {
                 });
             }
             Err(_elapsed) => {
-                *guard = None;
                 return Err(StorageError::Timeout {
                     operation: op.into(),
                 });
             }
         };
-        drop(guard);
 
         serde_json::from_slice::<EventsResponse>(&bytes).map_err(|error| {
             StorageError::Serialization {
@@ -671,6 +832,7 @@ impl EventsSplitClient {
 /// framed appends on its own connection, reconnecting with backoff. A batch
 /// that cannot be delivered is dropped and counted — never retried, never
 /// blocking the queue behind it.
+#[cfg(unix)]
 async fn run_forwarder(
     socket_path: PathBuf,
     mut rx: tokio::sync::mpsc::Receiver<(String, Vec<Event>)>,
@@ -720,10 +882,13 @@ async fn run_forwarder(
 
 /// Try to deliver one framed append over the forwarder connection,
 /// (re)connecting at most once. Returns whether the daemon acknowledged.
+/// Connections are peer-verified: a socket answered by a foreign uid is a
+/// failed connect, never a delivery target.
+#[cfg(unix)]
 async fn deliver_batch(socket_path: &Path, conn: &mut Option<UnixStream>, payload: &[u8]) -> bool {
     for _attempt in 0..2u8 {
         if conn.is_none() {
-            match UnixStream::connect(socket_path).await {
+            match connect_verified(socket_path).await {
                 Ok(stream) => *conn = Some(stream),
                 Err(_) => return false,
             }
@@ -760,12 +925,14 @@ async fn deliver_batch(socket_path: &Path, conn: &mut Option<UnixStream>, payloa
 /// runs in daemon mode. Appends are fire-and-forget through the client's
 /// bounded queue; the ADR-133 idempotent lane and all reads are synchronous
 /// round-trips to the events daemon.
+#[cfg(unix)]
 #[derive(Debug)]
 pub struct ForwardingEventStore {
     namespace: String,
     client: Arc<EventsSplitClient>,
 }
 
+#[cfg(unix)]
 impl ForwardingEventStore {
     pub fn new(namespace: impl Into<String>, client: Arc<EventsSplitClient>) -> Self {
         Self {
@@ -798,6 +965,7 @@ impl ForwardingEventStore {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl EventStore for ForwardingEventStore {
     async fn append_event(&self, event: Event) -> StorageResult<()> {
@@ -889,7 +1057,7 @@ impl EventStore for ForwardingEventStore {
 ///
 /// - The ADR-133 idempotent audit-batch lane — the measured bulk of event
 ///   write volume (verb-dispatch audit plus the config-lock rows that ride
-///   the same flusher) — goes to the events lane (`events.db`, forwarded or
+///   the same flusher) — goes to the events lane (the events database, forwarded or
 ///   direct).
 /// - Plain appends stay on the legacy store, because the legacy `events`
 ///   table has raw-SQL consumers whose correctness depends on finding those
@@ -1016,6 +1184,7 @@ mod tests {
     }
 
     /// Boot a real events daemon on temp paths, poll until its socket accepts.
+    #[cfg(unix)]
     async fn boot_daemon(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
         let db = dir.path().join("events.db");
         let socket = dir.path().join("events.sock");
@@ -1205,6 +1374,7 @@ mod tests {
 
     /// End to end over the real socket: the idempotent lane returns true
     /// dispositions, and the row is readable back through the same store.
+    #[cfg(unix)]
     #[tokio::test]
     async fn idempotent_append_round_trips_through_the_daemon() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1242,6 +1412,7 @@ mod tests {
 
     /// The fire-and-forget lane delivers to the daemon store: enqueue returns
     /// immediately and the row becomes visible to a subsequent count.
+    #[cfg(unix)]
     #[tokio::test]
     async fn fire_and_forget_append_lands_in_the_daemon_store() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1278,6 +1449,7 @@ mod tests {
     /// R4 overflow arm: with the daemon dead, appends beyond the queue bound
     /// are DROPPED and counted while every append still returns Ok — the
     /// domain path proceeds. The drop counter is the loss-tolerance contract.
+    #[cfg(unix)]
     #[tokio::test]
     async fn queue_overflow_drops_and_counts_but_never_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1301,6 +1473,7 @@ mod tests {
     /// R4 dead-socket arm: synchronous lanes fail with a typed retryable
     /// storage error (never hang, never a generic panic), and the offline
     /// preflight validator keeps working with zero I/O.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dead_socket_reads_fail_typed_and_preflight_stays_local() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1327,6 +1500,7 @@ mod tests {
 
     /// Version-skew arm: a frame carrying an unknown protocol version gets a
     /// typed non-retryable refusal, not a deserialization failure.
+    #[cfg(unix)]
     #[tokio::test]
     async fn protocol_version_skew_is_a_typed_refusal() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1354,6 +1528,7 @@ mod tests {
     /// The per-socket daemon guard is exclusive while held and reusable after
     /// release — the mechanism that keeps a supervisor respawn race down to
     /// one surviving daemon.
+    #[cfg(unix)]
     #[test]
     fn events_daemon_guard_is_exclusive_then_reusable() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1368,6 +1543,130 @@ mod tests {
             try_acquire_events_daemon_guard(&socket).is_some(),
             "acquire must succeed again after the guard is released"
         );
+    }
+
+    /// Issue-8-class control: sidecar paths derive from the MAIN database's
+    /// own filename, so two independent databases sharing one directory get
+    /// disjoint event planes and sockets instead of silently cross-wiring.
+    #[test]
+    fn sidecar_paths_derive_from_the_main_db_name() {
+        let a = events_db_path_beside(Path::new("/tmp/a.db"));
+        let b = events_db_path_beside(Path::new("/tmp/b.db"));
+        assert_eq!(a, PathBuf::from("/tmp/a.events.db"));
+        assert_eq!(b, PathBuf::from("/tmp/b.events.db"));
+        assert_ne!(a, b, "independent databases must not share an events db");
+        let sock_a = events_socket_path_beside(&a);
+        let sock_b = events_socket_path_beside(&b);
+        assert_eq!(sock_a, PathBuf::from("/tmp/a.events.sock"));
+        assert_ne!(
+            sock_a, sock_b,
+            "independent databases must not share an events socket"
+        );
+    }
+
+    /// A read-only file-backed runtime with the split configured must never
+    /// create or schema-initialize an events database. Missing events db →
+    /// `events()` serves the legacy store alone and leaves the filesystem
+    /// untouched; a pre-existing events db (minted by an earlier writable
+    /// host) is opened read-only and its rows merge into reads.
+    /// (unix-gated for the sidecar-freeze harness step only.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_runtime_never_creates_an_events_db() {
+        use crate::{KhiveRuntime, Namespace, RuntimeConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main_db = dir.path().join("main.db");
+        // Materialize + migrate the main database with a writable runtime.
+        drop(
+            KhiveRuntime::new(RuntimeConfig {
+                db_path: Some(main_db.clone()),
+                ..RuntimeConfig::no_embeddings()
+            })
+            .expect("create main db"),
+        );
+        let events_db = events_db_path_beside(&main_db);
+        assert!(!events_db.exists(), "precondition: no events db yet");
+
+        // Freeze the WAL sidecars the writable runtime left behind — the
+        // read-only opener refuses a snapshot with a writable -shm.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = main_db.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = main_db.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+
+        let split_config = |db: PathBuf| RuntimeConfig {
+            db_path: Some(main_db.clone()),
+            events_split: Some(EventsSplitConfig {
+                db_path: db,
+                socket_path: None,
+            }),
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        // Arm 1: read-only runtime, no events db on disk. Reads work through
+        // the legacy store and nothing is minted.
+        let ro =
+            KhiveRuntime::new_readonly(split_config(events_db.clone())).expect("read-only runtime");
+        let token = ro.authorize(Namespace::local()).expect("token");
+        let store = ro.events(&token).expect("events store");
+        let count = store
+            .count_events(EventFilter::default())
+            .await
+            .expect("count through legacy-only plane");
+        assert_eq!(count, 0);
+        assert!(
+            !events_db.exists(),
+            "a read-only runtime must not mint the events database"
+        );
+
+        // Arm 2: a writable host mints the events db and lands a lane row;
+        // the read-only runtime then opens it read-only and merges the row.
+        // The writer is scoped (not the process-global registry) and its WAL
+        // sidecars frozen after drop — the read-only opener rightly refuses a
+        // snapshot with a live writer, and that refusal is not this test's
+        // subject.
+        {
+            let lane_backend = StorageBackend::sqlite(&events_db).expect("writable lane");
+            lane_backend
+                .events_for_namespace("local")
+                .expect("lane store")
+                .append_event(test_event("local"))
+                .await
+                .expect("seed lane row");
+        }
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = events_db.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = events_db.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+        let store = ro.events(&token).expect("events store with lane present");
+        let count = store
+            .count_events(EventFilter::default())
+            .await
+            .expect("merged count");
+        assert_eq!(count, 1, "the pre-existing lane row must merge into reads");
     }
 
     /// Embedded (direct) mode: the process-global backend writes and reads

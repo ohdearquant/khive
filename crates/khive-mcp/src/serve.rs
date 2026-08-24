@@ -3946,7 +3946,7 @@ pub fn resolve_runtime_config_with_db_anchor(
     };
 
     // ADR-170: events-daemon split. Every file-backed resolution routes event
-    // persistence to `events.db` beside the main store, in DIRECT (embedded)
+    // persistence to the events database beside the main store, in DIRECT
     // mode: this resolver serves one-shot hosts (`kkernel exec`, `reindex`,
     // ingest) and tests, which have no events daemon to talk to. Resident
     // daemon hosts upgrade the resolved config to socket forwarding
@@ -4372,7 +4372,7 @@ mod tests {
             .events_split
             .as_ref()
             .expect("file-backed resolution must configure the events split");
-        assert_eq!(split.db_path, dir.path().join("events.db"));
+        assert_eq!(split.db_path, dir.path().join("khive.events.db"));
         assert_eq!(
             split.socket_path, None,
             "the shared resolver must emit direct mode; only daemon hosts upgrade"
@@ -4382,7 +4382,7 @@ mod tests {
         let split = resolved.events_split.as_ref().expect("split still set");
         assert_eq!(
             split.socket_path.as_deref(),
-            Some(dir.path().join("khive-events.sock").as_path()),
+            Some(dir.path().join("khive.events.sock").as_path()),
             "daemon upgrade must derive the socket beside the events db, not globally"
         );
 
