@@ -1,4 +1,4 @@
-# ADR-170: Dedicated events daemon — observational writes leave the domain store
+# ADR-170: Dedicated events daemon — the audit lane leaves the domain store
 
 - Status: Proposed
 - Date: 2026-08-24
@@ -35,7 +35,27 @@ brain pack's readers on the same trait.
 ## Decision
 
 Split event persistence into a dedicated events daemon that owns a separate
-SQLite file. Observational writes leave the domain store entirely.
+SQLite file, routed **by append class** rather than moving the whole event
+plane.
+
+**Why not the whole plane.** The legacy `events` table is not a pure
+observational sink: it has raw-SQL consumers whose correctness depends on
+event rows being co-resident with domain state in one file. Enumerated during
+implementation: the schedule drain's creator-provenance fence (a raw query
+that fail-closes dispatch when the provenance event is absent), the kg
+projection worker's guarded `INSERT INTO events … SELECT … WHERE` (a
+single-statement write whose guard reads main-store state), and the graph
+query compiler's cross-substrate UNION (`entities`/`notes`/`events`/
+`graph_edges` in one SQL statement, including event rows reachable as graph
+endpoints). Moving every event to another file breaks each of these by
+construction — the first one was caught as a hard test failure, the others
+would have failed silently. The write classes divide cleanly instead: the
+ADR-133 idempotent audit-batch lane (verb-dispatch audit rows plus the
+config-lock records that ride the same flusher — ~62,600 of the ~76,600
+measured rows, ~82%) has none of these consumers, while the plain-append
+classes (channel lifecycle, embedder lifecycle, phase/checkpoint,
+recall/search/feedback, pack provenance) are low-volume domain-adjacent facts
+that stay put.
 
 1. **Events daemon.** A new subcommand of the same binary runs an events daemon
    that owns `events.db` beside the main store, writes to it through the existing
@@ -45,39 +65,56 @@ SQLite file. Observational writes leave the domain store entirely.
    point 4, whose short direct appends SQLite's per-file cross-process exclusion
    already serializes.
 
-2. **Forwarding event store (writes).** In the domain process, a
-   socket-forwarding implementation of `EventStore` replaces the local one for
-   appends: events enter a bounded in-memory queue drained by a background
-   forwarder that ships framed batches to the events daemon. The hand-off is
-   fire-and-forget. On queue overflow or a dead socket the append is **dropped**,
-   a degradation counter increments, and the drop reason is logged. The domain
-   request path never blocks on, and shares no lock with, event persistence.
+2. **Split event store (writes).** In the domain process, the `EventStore`
+   the runtime hands out routes by append class. The idempotent audit-batch
+   surface (`append_events_idempotent`, ADR-133) goes to the events lane as a
+   synchronous framed round-trip, preserving the batch's per-row idempotency
+   dispositions; the flusher already batches and already runs off the request
+   path, so the round-trip amortizes across the batch. Plain appends
+   (`append_event`/`append_events`) stay on the domain store unchanged. A
+   fire-and-forget path to the events daemon also ships — a bounded in-memory
+   queue drained by a background forwarder; on queue overflow or a dead
+   socket the append is **dropped**, a degradation counter increments, and
+   the drop reason is logged — for producers that later opt their telemetry
+   class into the lane explicitly (channel lifecycle is the first candidate).
    The bounded-queue drop policy is the loss-tolerant durability class made
    concrete: the loss window is the queue depth plus the flush interval, both
-   configuration with defaults stated in code.
+   configuration with defaults stated in code. The domain request path never
+   shares a writer lock with the audit lane.
 
-3. **Reads.** `query_events`, `count_events`, and `get_event` open `events.db`
-   read-only from the reading process. SQLite WAL supports one writer process and
-   many reader processes natively. Read connections are short-lived so they do
-   not pin WAL checkpoints.
+3. **Reads.** Trait-level reads (`query_events`, `count_events`, `get_event`)
+   merge both stores, so consumers on the trait observe one event plane
+   whichever side holds a row; windowed queries re-sort the merged prefix in
+   the stores' shared order before applying the requested window. The lane
+   side of a read is a framed round-trip in daemon deployments and a direct
+   open in embedded mode. Raw-SQL readers of the legacy `events` table keep
+   reading exactly the rows that never moved.
 
 4. **Embedded mode.** One-shot CLI and test contexts without a daemon use the
-   in-process `SqlEventStore` against `events.db` directly. SQLite's per-file
-   cross-process exclusion covers the rare overlap with a running events daemon;
-   every event transaction is a short append.
+   in-process `SqlEventStore` against `events.db` directly for the lane side.
+   SQLite's per-file cross-process exclusion covers the rare overlap with a
+   running events daemon; every event transaction is a short append. The
+   shared config resolver emits this socket-less mode for every file-backed
+   resolution; only resident daemon hosts upgrade the resolved config to
+   socket forwarding, because only they supervise an events daemon. The
+   socket path is derived beside the events database it serves — a
+   process-global socket location would route a second database's events to
+   whichever daemon owned it.
 
 5. **Lifecycle.** The domain daemon spawns and supervises the events daemon at
    startup. If the events daemon dies, the domain daemon keeps serving, drops
    events loudly (counter + log), and attempts respawn with backoff. Domain
    availability never depends on events-daemon liveness.
 
-6. **Cutover.** New events go to `events.db` from the first boot of this code.
-   Rows written before the cutover remain in the main store and are not unioned
-   into windowed event queries; recent-window queries converge on the new store
-   immediately, and the orphaned history ages out of query windows. This is
-   acceptable for the telemetry durability class and is stated here rather than
-   hidden. A backfill tool can follow if history proves needed. Storage tenure
-   of the legacy rows is likewise explicit: they age in place in the main store
+6. **Cutover.** New audit-lane rows go to `events.db` from the first boot of
+   this code; the plain-append classes keep writing the domain store, so
+   nothing that reads them observes a cutover at all. Audit rows written
+   before the cutover remain in the main store; because trait-level reads
+   merge both stores, windowed queries still see them until they age out of
+   query windows. Raw-SQL consumers of the main `events` table lose sight of
+   post-cutover audit rows — acceptable for the telemetry durability class
+   and stated here rather than hidden. Storage tenure of the legacy audit
+   rows is likewise explicit: they age in place in the main store
    indefinitely — nothing deletes them as part of this change — until an
    operator runs a purge or backfill tool, which ships separately if wanted.
 
@@ -86,8 +123,10 @@ SQLite file. Observational writes leave the domain store entirely.
 **Positive.**
 
 - Effective writer lanes double: SQLite's single-writer constraint is per file,
-  so the ~96% observational share of write traffic stops competing with domain
-  mutations at all.
+  so the audit lane — ~82% of measured event rows, and the one-per-dispatch
+  class that scales with load — stops competing with domain mutations at all.
+  The remaining plain-append classes (~14,000 rows/day measured) stay on the
+  domain store and can migrate later by explicit producer-side opt-in.
 - Failure domains separate: an events-side stall (index build, checkpoint, disk
   pressure on the events file) can no longer time out a domain write, and vice
   versa.
