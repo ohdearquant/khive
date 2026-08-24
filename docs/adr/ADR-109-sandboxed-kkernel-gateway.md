@@ -377,6 +377,104 @@ the gateway path.
    appear in any sandboxed contract. Revisited only via a new ADR once the write surface
    ships with demonstrated need. See the resolution under Fork (d) above.
 
+## Amendment 1 (2026-08-24): Phased implementation — the read-only connection tier
+
+**Status of amendment**: Proposed (implements a subset of this ADR; the full sandboxed
+gateway of the base decision remains Proposed and deferred as stated below).
+
+The base ADR specs one caller class — a fully sandboxed, untrusted caller — and resolves its
+process boundary to a structural one (Fork (a), A1: a thin gateway binary, never the
+unconstrained dispatch entry point). That is the right shape for an untrusted caller and it is
+a nontrivial new build. This amendment separates the caller classes by **input provenance** and
+commits to building the smaller, lower-risk one first, on machinery that already ships, while
+keeping the base ADR's structural boundary as the untrusted-tier answer.
+
+### Caller classes by input provenance
+
+The trust question is not _which_ process connects, it is _what input that process has already
+consumed_ by the time it calls a verb:
+
+- **Tier A — trusted.** A caller operating only on operator-directed or first-party
+  instructions. Full verb catalog, subject to whatever `Gate` the deployment installs (status
+  quo; `AllowAllGate` by default).
+- **Tier B — semi-trusted, read-scoped.** A caller trusted to _read_ the graph but which should
+  not _mutate_ it, and whose inputs are first-party (it has not consumed attacker-influenced
+  content). The motivating case is an observer process that reads first-party state to make a
+  decision and must not write back. This amendment builds the control for this tier.
+- **Tier C — untrusted.** A caller that has consumed content it does not control (a fetched
+  page, a third-party document, an external tool result) and could therefore be steered into
+  calling verbs the operator did not intend. This is the base ADR's caller class.
+
+### What this amendment builds: the Tier-B read-only connection
+
+A **read-only connection mode**: a per-process khive connection whose `Gate` denies every
+mutating verb and permits only the read-verb set, enforced at the dispatch seam the runtime
+already consults on every verb. All of it reuses shipped machinery:
+
+1. **Enforcement seam already exists.** `VerbRegistry` dispatch already builds a `GateRequest`
+   carrying the _actual_ verb and calls `Gate::check` before the pack handler runs; a `Deny`
+   returns `PermissionDenied` with a reason (ADR-018, as amended fail-closed by ADR-129). No new
+   dispatch path is introduced — this is the same seam the base ADR's rule names.
+2. **The policy is a default-deny Rego policy** naming a closed read-verb allowlist, loaded by
+   the existing `RegoGate` (`from_dir` / `from_policy_str`). This is the base ADR's Fork (c)
+   resolution (constrained Rego on the existing engine, a required default-deny template, and a
+   validation lint that rejects any policy lacking a closed allowlist) applied to the read-only
+   case. Every verb outside the allowlist — every mutating verb — is denied by the default rule,
+   so a verb added to a future pack is denied until explicitly listed, not permitted by omission.
+3. **A launch flag installs it.** `kkernel mcp` gains a flag that sets the process `Gate` to the
+   read-only `RegoGate` instead of `AllowAllGate` for that process's lifetime. This is the base
+   ADR's A2 (mode-flag) process boundary, **not** A1 — see the honest-scope note below.
+4. **Refusal is loud and attributable.** The `Deny` reason states that the verb was refused
+   because the connection is read-only, and the MCP surface returns it as a typed refusal the
+   client can distinguish from an outage — so a client running against a restricted connection
+   reports the restriction rather than misreading it as khive being down.
+
+### Honest scope: what this does NOT serve
+
+The base ADR **rejected A2 (a launch-flag/config process boundary) outright** for the untrusted
+caller, because a silent misconfiguration (flag omitted, or a bug in flag handling) reverts to
+the full surface, and for an untrusted caller that is an unacceptable failure mode. That
+rejection stands. This amendment uses A2 **only for Tier B**, where the threat being defended
+against is _the operator's own misconfiguration of a trusted-to-read process_, not an adversary
+probing for an escape. For Tier B a launch-flag boundary is proportionate; for Tier C it is not,
+and this amendment does not offer it as one.
+
+Concretely, the read-only connection is **not** a containment for a Tier-C untrusted caller:
+
+- A read-only connection still exposes the read verbs, and read verbs are an exfiltration
+  surface (the base ADR's "Exfiltration via verbs" threat). An untrusted caller should not hold
+  even read access to arbitrary graph state.
+- The control for a Tier-C caller is therefore **absence of a khive connection at all**, decided
+  at the orchestration/deployment layer, not a read-only policy. A caller that has consumed
+  untrusted input is given no khive surface.
+- The one future case where a Tier-C caller legitimately needs _live read_ access is exactly
+  what the base ADR's A1 structural gateway (thin proxy binary, namespace pinning, enforced
+  rate/budget caps) is for. That build stays deferred until such a caller is real; the rate-cap
+  enforcement (base ADR rule 5) is a later phase and is **not** part of this amendment.
+
+### Implementation plan (Tier-B phase)
+
+- A bundled default-deny read-only Rego policy naming the closed read-verb allowlist, plus the
+  read/mutating classification of the current verb catalog it rests on.
+- The `kkernel mcp` launch flag that installs the read-only `RegoGate`.
+- The validation lint (base ADR Fork (c)) that rejects a read-only policy which is not
+  default-deny or does not declare a closed allowlist.
+- Confirmation that the `Deny` reason and the MCP-surface refusal are typed and attributable per
+  point 4, with a test that a denied mutating verb returns the read-only refusal (not a generic
+  error) and that an allowed read verb still dispatches.
+
+### Consequences of this amendment
+
+- **Positive.** Ships a real server-side read-only boundary now, on shipped machinery, closing
+  the gap where a process's read-only-ness depended on client-side configuration alone. Keeps
+  the base ADR's structural boundary honest for the untrusted tier rather than quietly
+  substituting the weaker A2 form for it.
+- **Negative.** A2's failure mode (a misconfigured launch reverts to the installed base `Gate`)
+  is real; this amendment accepts it _only_ for Tier B and says so in the flag's own
+  documentation. The read/mutating verb classification must be maintained as the catalog grows —
+  the default-deny posture makes an unclassified new verb fail safe (denied), which is the
+  correct direction, but a read verb wrongly omitted is a false denial to fix, not a hole.
+
 ## References
 
 - ADR-018 - Authorization Gate; `Gate`, `GateRequest`, `GateDecision`, `Obligation`,
