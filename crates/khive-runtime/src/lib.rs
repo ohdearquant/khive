@@ -124,7 +124,8 @@ pub use pack::{
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{
-    apply_redundancy_drop, micros_to_iso, present, render_format, OutputFormat, PresentationMode,
+    apply_redundancy_drop, micros_to_iso, present, render_format, rfc3339_to_utc_micros,
+    OutputFormat, PresentationMode,
 };
 pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceResolution};
 pub use reference_ring::{ReferenceRing, RingEntry};

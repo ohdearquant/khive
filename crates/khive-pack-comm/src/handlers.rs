@@ -61,13 +61,11 @@ fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), Runt
 }
 
 fn parse_inbox_timestamp(field: &str, raw: &str) -> Result<i64, RuntimeError> {
-    DateTime::parse_from_rfc3339(raw.trim())
-        .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
-        .map_err(|e| {
-            RuntimeError::InvalidInput(format!(
-                "inbox: `{field}` must be a valid RFC 3339 timestamp, got {raw:?}: {e}"
-            ))
-        })
+    khive_runtime::rfc3339_to_utc_micros(raw).map_err(|e| {
+        RuntimeError::InvalidInput(format!(
+            "inbox: `{field}` must be a valid RFC 3339 timestamp, got {raw:?}: {e}"
+        ))
+    })
 }
 
 /// Parse a caller- or transport-supplied thread root and return the one wire
@@ -1759,14 +1757,12 @@ pub(crate) async fn handle_thread(
                     full_id: cursor_note.id,
                 })
             } else {
-                let micros = chrono::DateTime::parse_from_rfc3339(raw.trim())
-                    .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
-                    .map_err(|e| {
-                        RuntimeError::InvalidInput(format!(
-                            "thread: `after` cursor {raw:?} is neither a resolvable message id \
+                let micros = khive_runtime::rfc3339_to_utc_micros(raw).map_err(|e| {
+                    RuntimeError::InvalidInput(format!(
+                        "thread: `after` cursor {raw:?} is neither a resolvable message id \
                              nor a valid RFC 3339 timestamp: {e}"
-                        ))
-                    })?;
+                    ))
+                })?;
                 Some(AfterCursor::Timestamp { micros })
             }
         }

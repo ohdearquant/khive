@@ -350,14 +350,12 @@ pub(super) struct RecallParams {
 /// anchoring a bare date to an instant is timezone semantics this surface
 /// does not own.
 pub(super) fn parse_recall_bound(field: &str, raw: &str) -> Result<i64, RuntimeError> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.timestamp_micros())
-        .map_err(|e| {
-            RuntimeError::InvalidInput(format!(
+    khive_runtime::rfc3339_to_utc_micros(raw).map_err(|e| {
+        RuntimeError::InvalidInput(format!(
                 "memory.recall: {field} must be a full RFC 3339 timestamp with offset \
                  (e.g. \"2026-08-20T00:00:00-04:00\" or \"2026-08-20T04:00:00Z\"); got {raw:?}: {e}"
             ))
-        })
+    })
 }
 
 impl RecallParams {

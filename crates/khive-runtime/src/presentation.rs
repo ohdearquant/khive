@@ -331,6 +331,17 @@ pub fn micros_to_iso(micros: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
+/// Parse an RFC 3339 timestamp (offset required) into microsecond epoch
+/// `i64` — the inverse of [`micros_to_iso`], and the single parse point for
+/// caller-supplied instants entering storage comparisons.
+///
+/// Leading/trailing whitespace is tolerated. Date-only and offset-less forms
+/// are rejected; callers own the verb-specific error context around the
+/// returned `ParseError`.
+pub fn rfc3339_to_utc_micros(raw: &str) -> Result<i64, chrono::ParseError> {
+    chrono::DateTime::parse_from_rfc3339(raw.trim()).map(|dt| dt.timestamp_micros())
+}
+
 /// How the response envelope is presented to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -809,6 +820,20 @@ mod tests {
 
     /// A fixed "now" for deterministic tests: 2026-05-23T16:18:00Z ≈ 1748016480.
     const NOW: i64 = 1_748_016_480;
+
+    #[test]
+    fn rfc3339_to_utc_micros_round_trips_and_rejects_partial_forms() {
+        let micros = 1_748_016_480_000_000_i64;
+        assert_eq!(rfc3339_to_utc_micros(&micros_to_iso(micros)), Ok(micros));
+        // Offset spellings resolve to the same instant; whitespace tolerated.
+        // (NOW's epoch value is 2025-05-23T16:08:00Z despite its comment.)
+        assert_eq!(
+            rfc3339_to_utc_micros(" 2025-05-23T12:08:00-04:00 "),
+            Ok(micros)
+        );
+        assert!(rfc3339_to_utc_micros("2026-05-23").is_err());
+        assert!(rfc3339_to_utc_micros("2026-05-23T16:18:00").is_err());
+    }
 
     fn agent(v: Value) -> Value {
         present(v, PresentationMode::Agent, NOW)
