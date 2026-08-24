@@ -82,6 +82,21 @@ that stay put.
    configuration with defaults stated in code. The domain request path never
    shares a writer lock with the audit lane.
 
+   Outage semantics for the synchronous audit lane are bounded at both ends,
+   stated here because an unstated retry policy is either a silent drop or an
+   unbounded buffer. On a failed round-trip the audit flusher retries a
+   generation up to its configured attempt cap with a short backoff
+   (defaults: 3 attempts, 20ms), then fails that generation terminally — its
+   rows are dropped with a terminal reason surfaced to submitters, not
+   retried forever. The flusher's pending buffer is hard-capped
+   (default 4096 rows); at the cap new submissions are refused with an
+   explicit admission-exhausted outcome rather than growing without bound.
+   So during an events-daemon outage the loss is: in-flight generations after
+   retry exhaustion, plus refused admissions at the cap — the same
+   loss-tolerant durability class as the fire-and-forget queue, reached by a
+   different mechanism — and the supervisor's respawn probe bounds how long
+   an outage lasts.
+
 3. **Reads.** Trait-level reads (`query_events`, `count_events`, `get_event`)
    merge both stores, so consumers on the trait observe one event plane
    whichever side holds a row; windowed queries re-sort the merged prefix in
@@ -116,7 +131,11 @@ that stay put.
    and stated here rather than hidden. Storage tenure of the legacy audit
    rows is likewise explicit: they age in place in the main store
    indefinitely — nothing deletes them as part of this change — until an
-   operator runs a purge or backfill tool, which ships separately if wanted.
+   operator runs a purge tool, which ships separately. That follow-up is
+   worth scheduling rather than optional: at the measured audit rate
+   (~55,000 rows/day historically) the accumulated legacy audit tonnage is a
+   material share of main-store size, and reclaiming it is the second half
+   of this ADR's contention-and-size argument.
 
 ## Consequences
 
