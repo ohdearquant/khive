@@ -24,12 +24,20 @@ kill-switch. This ADR is the follow-up its Forward section names.
 Two seam facts, verified in-tree, make this decomposition cleaner than the
 events one:
 
-- **The brain tables are pack-internal.** A workspace enumeration of raw-SQL
-  consumers (`grep -rl` over `brain_event_log`, `brain_profile_snapshots`,
-  `brain_implicit_mass`) finds them referenced only inside `khive-pack-brain`
-  (`persist.rs`, `fold_gate.rs`). Unlike the legacy `events` table (ADR-170's
-  amendment), no external raw-SQL consumer depends on co-residency, so the
-  whole state can move.
+- **The brain tables are pack-internal at runtime.** A workspace enumeration
+  of raw-SQL consumers (`grep -rl` over `brain_event_log`,
+  `brain_profile_snapshots`, `brain_implicit_mass`) finds four files:
+  `khive-pack-brain/src/persist.rs` and `fold_gate.rs` (the runtime
+  consumers), `khive-pack-brain/src/tests.rs`, and
+  `khive-db/src/migrations_tests.rs` — the last because the tables' DDL
+  lives in `khive-db`'s migration set today. No consumer outside the brain
+  pack touches these tables at runtime, so unlike the legacy `events` table
+  (ADR-170's amendment) the whole state can move; the migration home is a
+  schema-ownership question this ADR decides in point 5. Implementation
+  carries a mechanized guard in the shape ADR-170's amendment established:
+  a test that reddens if a raw-SQL reference to a brain table ever appears
+  outside the brain daemon's own code path, so pack-internality is held by
+  a test, not a survey.
 - **Consumers reach brain state through verbs, not memory.** The recall path
   loads profile coefficients by dispatching `brain.profile` through the verb
   registry (`khive-pack-memory/src/handlers/recall.rs::load_brain_profile`),
@@ -50,12 +58,22 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
    resident writer of `brain.db`.
 
 2. **Event feed, not a push stream.** The brain daemon consumes the event
-   plane by tailing the ADR-170 events lane with short-lived read-only opens
-   (WAL one-writer-many-readers), folding feedback and serve events into
-   posterior state on its own schedule and checkpointing its read cursor in
-   `brain.db`. No new streaming protocol and no producer-side coupling: an
-   events-lane row is folded whether the brain daemon was up when it landed
-   or not.
+   plane by tailing it with short-lived read-only opens (WAL
+   one-writer-many-readers), folding feedback and serve events into
+   posterior state on its own schedule. Which file it tails is fixed by
+   ADR-170's routing, not by this ADR: feedback, recall, and serve events
+   are plain-append classes and land in the **domain store's** `events`
+   table (they must — serve/selection events are reachable as graph-query
+   endpoints there, one of the co-residency consumers ADR-170's amendment
+   enumerates), while the audit lane lands in `events.db`. The brain daemon
+   therefore tails **both files, each under its own monotone checkpoint
+   cursor persisted in `brain.db`** — per-store cursors, deliberately not
+   one merged cursor, because the two writers share no ordering and a
+   merged high-water mark over unsynchronized clocks can skip late-landing
+   rows. No cross-store fold ordering is claimed; posterior accumulation is
+   evidence-summing and tolerates cross-store interleave. No new streaming
+   protocol and no producer-side coupling: a row is folded whether the
+   brain daemon was up when it landed or not.
 
 3. **Coefficient queries.** The brain verbs (`brain.profile` and the other
    profile lifecycle/read verbs) are served in the domain process by a thin
@@ -67,17 +85,32 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
    proceeds un-reweighted (hybrid ranking without the profile terms), stamps
    no serving profile, increments a degradation counter, and logs the reason
    once per outage. A recall must never block on, or fail because of,
-   profile-state liveness. Feedback during an outage is not lost: it rides
-   the events lane (point 2), so the daemon folds it on return.
+   profile-state liveness. Feedback during an outage is not lost: it lands
+   in the domain store's event plane as it does today (point 2), with that
+   store's durability, and the daemon folds it from the cursor on return.
+   The attribution consequence of fail-soft is stated rather than implied:
+   feedback on an un-stamped recall carries no serving-profile id, so the
+   fold gate cannot credit a profile with it — such events are **retained
+   in the event plane but refused for profile folds**, and the daemon
+   counts them, so the posterior-evidence cost of an outage window is
+   measurable instead of silently absorbed.
 
-5. **Lifecycle, embedded mode, cutover.** The domain daemon supervises the
-   brain daemon exactly as it supervises the events daemon. One-shot
-   embedded hosts open `brain.db` directly, covered by SQLite's per-file
-   cross-process exclusion. State migrates by snapshot: on first boot the
-   brain daemon imports the existing snapshots and replays newer feedback
-   from the event plane; the legacy rows in the main store age in place until
-   the operator purge tool (ADR-170 point 6) covers them too. A kill-switch
-   environment variable restores legacy in-process behavior.
+5. **Lifecycle, embedded mode, schema ownership, cutover.** The domain
+   daemon supervises the brain daemon exactly as it supervises the events
+   daemon. One-shot embedded hosts open `brain.db` directly, covered by
+   SQLite's per-file cross-process exclusion. Schema ownership moves with
+   the state: the brain daemon creates and migrates `brain.db`'s DDL on its
+   own boot path; `khive-db`'s migration set stops creating the brain
+   tables in new main stores, and existing main-store copies age in place
+   under the same tenure language as ADR-170's legacy rows, covered by the
+   same operator purge tool. State migrates by snapshot: on first boot the
+   brain daemon imports the existing snapshots and initializes each
+   per-store replay cursor from the snapshot's high-water mark, then
+   replays newer feedback from the event plane. The cutover carries a test
+   arm that reddens on double-fold or gap: fold a known event sequence with
+   a mid-sequence snapshot-and-restart, and require the resulting posterior
+   to equal the uninterrupted single-pass fold of the same sequence. A
+   kill-switch environment variable restores legacy in-process behavior.
 
 ## Consequences
 
