@@ -1630,6 +1630,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
         db_path: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
@@ -2307,6 +2308,7 @@ mod embed_failure_tests {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2495,6 +2497,7 @@ mod embed_failure_tests {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2811,6 +2814,7 @@ mod ann_bypass_regression {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -3410,6 +3414,7 @@ mod edit_inline_reembed {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -3815,6 +3820,7 @@ mod ann_type_filter_regression {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -4221,6 +4227,7 @@ mod compose_explain_sections {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
