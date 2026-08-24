@@ -580,7 +580,7 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
             } else {
                 None
             };
-            (bad, "name, description, tags, properties")
+            (bad, "name, description, tags, properties, entity_type")
         }
         "note" => {
             let bad = if present("description") {
@@ -591,6 +591,8 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
                 Some("relation")
             } else if present("weight") {
                 Some("weight")
+            } else if present("entity_type") {
+                Some("entity_type")
             } else {
                 None
             };
@@ -614,6 +616,8 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
                 Some("salience")
             } else if present("decay_factor") {
                 Some("decay_factor")
+            } else if present("entity_type") {
+                Some("entity_type")
             } else {
                 None
             };
@@ -803,6 +807,7 @@ pub async fn prepare_update(
             let description = optional_string_patch(args, "description")?;
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
+            let entity_type = optional_create_string(args, "entity_type")?;
 
             prepare_update_entity_plan(
                 runtime,
@@ -813,6 +818,7 @@ pub async fn prepare_update(
                     description,
                     properties,
                     tags,
+                    entity_type,
                 },
             )
             .await
@@ -857,7 +863,7 @@ pub async fn prepare_update_entity_plan(
     id: Uuid,
     patch: crate::curation::EntityPatch,
 ) -> RuntimeResult<AtomicOpPlan> {
-    let (entity, text_changed, changed_fields) =
+    let (entity, reindex_required, changed_fields) =
         runtime.prepare_update_entity(token, id, patch).await?;
     let mut statements = vec![PlanStatement {
         statement: entity_upsert_statement(&entity),
@@ -875,7 +881,7 @@ pub async fn prepare_update_entity_plan(
             "changed_fields": changed_fields,
         }),
     )?);
-    let post_commit = if text_changed {
+    let post_commit = if reindex_required {
         PostCommitEffect::ReindexEntity { entity_id: id }
     } else {
         PostCommitEffect::None
@@ -1783,6 +1789,72 @@ mod tests {
             .await
             .expect("get_entity");
         assert_eq!(entity.name, "GapFourEntity-renamed");
+    }
+
+    #[tokio::test]
+    async fn atomic_update_entity_type_persists_patch_and_schedules_reindex() {
+        let runtime = scratch_runtime();
+        runtime.install_entity_type_validator(std::sync::Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            let normalized = raw.trim().to_ascii_lowercase();
+            if kind == "concept" && normalized == "algorithm" {
+                Ok(Some(normalized))
+            } else {
+                Err(RuntimeError::InvalidInput(format!(
+                    "unknown entity_type {raw:?} for {kind:?}; valid: algorithm"
+                )))
+            }
+        }));
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut entity = khive_storage::Entity::new("local", "concept", "AtomicHistorical");
+        entity.description = Some("keep description".to_string());
+        entity.properties = Some(json!({"type": "algorithm", "keep": true}));
+        entity.tags = vec!["keep-tag".to_string()];
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": entity_id.to_string(), "entity_type": " Algorithm "}),
+            None,
+        )
+        .await
+        .expect("atomic prepare must accept a registered entity_type");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("atomic update must run");
+        let post_commit = match outcome {
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        assert_eq!(
+            post_commit.as_slice(),
+            &[PostCommitEffect::ReindexEntity { entity_id }],
+            "entity_type patch must schedule the normal entity reindex path"
+        );
+
+        let updated = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("read updated entity");
+        assert_eq!(updated.entity_type.as_deref(), Some("algorithm"));
+        assert_eq!(updated.name, "AtomicHistorical");
+        assert_eq!(updated.description.as_deref(), Some("keep description"));
+        assert_eq!(
+            updated.properties,
+            Some(json!({"type": "algorithm", "keep": true}))
+        );
+        assert_eq!(updated.tags, vec!["keep-tag"]);
     }
 
     /// Symmetric note-substrate case: `description` and `tags` are

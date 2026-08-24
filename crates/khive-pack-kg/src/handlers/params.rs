@@ -120,6 +120,7 @@ pub struct UpdateParams {
     pub(crate) decay_factor: Option<Option<f64>>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
+    pub(crate) entity_type: Option<String>,
     pub(crate) relation: Option<String>,
     pub(crate) weight: Option<f64>,
     pub(crate) entity_kind: Option<Value>,

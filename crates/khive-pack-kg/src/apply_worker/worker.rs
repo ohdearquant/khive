@@ -396,6 +396,7 @@ impl ProposalApplyWorker {
                             description: patch.description.clone(),
                             properties: patch.properties.clone(),
                             tags: patch.tags.clone(),
+                            entity_type: None,
                         },
                     )
                     .await?;

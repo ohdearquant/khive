@@ -85,12 +85,16 @@ impl EmbeddingModelPlan {
 /// For `tags` — replace semantics: `Some(vec)` sets tags to exactly `vec`. To add
 /// a tag without losing existing tags, read the entity first, push the new tag,
 /// and pass the full list back.
+///
+/// For `entity_type` — `Some(value)` validates and normalizes `value` through the
+/// installed entity-type registry. `None` leaves the current type unchanged.
 #[derive(Clone, Debug, Default)]
 pub struct EntityPatch {
     pub name: Option<String>,
     pub description: Option<Option<String>>,
     pub properties: Option<Value>,
     pub tags: Option<Vec<String>>,
+    pub entity_type: Option<String>,
 }
 
 /// Policy used when deduplicating two entities.
@@ -816,11 +820,12 @@ impl KhiveRuntime {
     /// Patch-style entity update.
     ///
     /// Only fields set to `Some(_)` are changed. Re-indexes FTS5 (and vectors if configured)
-    /// when `name` or `description` changes; skips re-indexing for property/tag-only patches.
+    /// when `name`, `description`, or `entity_type` changes; skips re-indexing for
+    /// property/tag-only patches.
     ///
     /// Returns `RuntimeError::NotFound` if the entity does not exist or belongs to a different
     /// namespace. Namespace isolation is enforced at the runtime layer.
-    /// Computes the patched `Entity`, `text_changed`, and `changed_fields` without
+    /// Computes the patched `Entity`, `reindex_required`, and `changed_fields` without
     /// writing anything, so both the normal write path and the atomic-prepare path
     /// share one source of truth for what a patched entity looks like.
     pub(crate) async fn prepare_update_entity(
@@ -848,16 +853,21 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
 
-        let mut text_changed = false;
+        let validated_entity_type = match patch.entity_type.as_deref() {
+            Some(raw) => Some(self.validate_entity_type_for_kind(&entity.kind, Some(raw))?),
+            None => None,
+        };
+
+        let mut reindex_required = false;
         let mut changed_fields: Vec<&'static str> = Vec::new();
 
         if let Some(name) = patch.name {
-            text_changed |= entity.name != name;
+            reindex_required |= entity.name != name;
             entity.name = name;
             changed_fields.push("name");
         }
         if let Some(desc_patch) = patch.description {
-            text_changed |= entity.description != desc_patch;
+            reindex_required |= entity.description != desc_patch;
             entity.description = desc_patch;
             changed_fields.push("description");
         }
@@ -874,9 +884,14 @@ impl KhiveRuntime {
             entity.tags = tags;
             changed_fields.push("tags");
         }
+        if let Some(entity_type) = validated_entity_type {
+            reindex_required |= entity.entity_type != entity_type;
+            entity.entity_type = entity_type;
+            changed_fields.push("entity_type");
+        }
 
         entity.updated_at = chrono::Utc::now().timestamp_micros();
-        Ok((entity, text_changed, changed_fields))
+        Ok((entity, reindex_required, changed_fields))
     }
 
     pub async fn update_entity(
@@ -897,13 +912,13 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
-        let (entity, text_changed, changed_fields) =
+        let (entity, reindex_required, changed_fields) =
             self.prepare_update_entity(token, id, patch).await?;
 
         let store = self.entities(token)?;
         store.upsert_entity(entity.clone()).await?;
 
-        let embedding_report = if text_changed {
+        let embedding_report = if reindex_required {
             self.reindex_entity(token, &entity).await?
         } else {
             crate::retrieval::EmbeddingTruncationReport::default()
@@ -3961,6 +3976,76 @@ mod tests {
         assert_eq!(updated.name, "OriginalName");
         assert_eq!(updated.description.as_deref(), Some("new desc"));
         assert_eq!(updated.properties, Some(serde_json::json!({"k":"v"})));
+    }
+
+    #[tokio::test]
+    async fn update_entity_type_patch_validates_preserves_fields_and_requires_reindex() {
+        let rt = rt();
+        rt.install_entity_type_validator(std::sync::Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            let normalized = raw.trim().to_ascii_lowercase();
+            if kind == "concept" && normalized == "algorithm" {
+                Ok(Some(normalized))
+            } else {
+                Err(RuntimeError::InvalidInput(format!(
+                    "unknown entity_type {raw:?} for {kind:?}; valid: algorithm"
+                )))
+            }
+        }));
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "HistoricalAlgorithm",
+                Some("keep description"),
+                Some(serde_json::json!({"type": "algorithm", "keep": true})),
+                vec!["keep-tag".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let (prepared, reindex_required, changed_fields) = rt
+            .prepare_update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    entity_type: Some(" Algorithm ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("registered entity_type must validate");
+
+        assert_eq!(prepared.entity_type.as_deref(), Some("algorithm"));
+        assert_eq!(prepared.name, "HistoricalAlgorithm");
+        assert_eq!(prepared.description.as_deref(), Some("keep description"));
+        assert_eq!(
+            prepared.properties,
+            Some(serde_json::json!({"type": "algorithm", "keep": true}))
+        );
+        assert_eq!(prepared.tags, vec!["keep-tag"]);
+        assert!(
+            reindex_required,
+            "changing entity_type must request the normal entity reindex path"
+        );
+        assert_eq!(changed_fields, vec!["entity_type"]);
+
+        let err = rt
+            .prepare_update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    entity_type: Some("not_registered".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("unregistered entity_type must be rejected");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
     }
 
     #[tokio::test]
