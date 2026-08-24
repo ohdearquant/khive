@@ -515,7 +515,7 @@ already consults on every verb. All of it reuses shipped machinery:
 
    ```json
    {
-     "class": "read_only" | "policy" | "gate_error",
+     "class": "read_only" | "denied",
      "verb": "<the refused verb, as dispatched>",
      "mode": "read_only",
      "effect": "read" | "mutating" | "unclassified"
@@ -527,24 +527,26 @@ already consults on every verb. All of it reuses shipped machinery:
    writer, `unclassified` = fail-closed default). Clients match on `class`, never on the
    `error` string, which remains presentation-only.
 
-   **Class mapping.** The three deny paths the shipped gate contract actually produces map
-   to the three classes and are never conflated:
+   **Class mapping.** `class` is decided by WHICH gate refused, in dispatch order, so every
+   refusal lands in exactly one class by construction:
 
-   - Canonical-set membership failure (the verb is `mutating` or `unclassified`) →
-     `class: "read_only"`. The connection is healthy; the verb is out of contract for this
-     mode. This is the common case and the only class a correctly configured deployment
-     emits.
-   - Policy narrowing (the verb is in the canonical read set — `effect: "read"` — but the
-     installed policy's allowlist excludes it) → `class: "policy"`. Distinguishable from
-     `read_only` so an operator can tell a mode boundary from their own policy choice.
-   - Gate evaluation failure at dispatch → `class: "gate_error"`. Per the authorization-gate
-     ADR's shipped contract, policy-load failures are construction time — a broken policy
-     never reaches dispatch because the process refuses to construct the gate — and
-     dispatch-time evaluation uncertainty is already converted by the Rego gate into an
-     explicit deny with a diagnostic reason; only pre-evaluation failures (gate-request
-     serialization) surface as gate errors, and fail-closed (ADR-129) they deny. This class
-     is therefore rare by construction, and no "retryable infrastructure outage" refusal
-     state exists to represent: there is no `gate_unavailable`.
+   - `class: "read_only"` — the process-mode check this amendment adds refused the verb
+     (its `effect` is `mutating` or `unclassified`). The mode check runs before the
+     authorization gate and is this amendment's own code, so it can attribute itself
+     deterministically. The connection is healthy; the verb is out of contract for this
+     mode.
+   - `class: "denied"` — the authorization gate refused a verb the mode admitted
+     (`effect: "read"`). This class deliberately claims no finer provenance, because the
+     shipped gate seam carries none: the gate returns a deny decision with a diagnostic
+     reason string for policy narrowing and for fail-closed evaluation outcomes alike
+     (dispatch-time evaluation uncertainty is converted to an explicit deny per the
+     authorization-gate ADR, and policy-load failures never reach dispatch — a broken
+     policy fails gate construction). A wire class that promised to distinguish "your
+     policy said no" from "the gate errored" would be asserting provenance the deny
+     decision does not carry. Splitting `denied` is deferred work, gated on the gate seam
+     itself growing typed deny provenance; until then the diagnostic reason string is the
+     only finer signal and remains presentation-only. No "retryable infrastructure outage"
+     refusal state exists to represent: there is no `gate_unavailable`.
 
    Ordinary runtime errors on a permitted read verb are untouched — no `refusal` field, and
    a read-only connection reports storage timeouts, not-found, and validation errors exactly
@@ -607,7 +609,7 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
   normative schema and class mapping above with the string `error` field unchanged, with
   tests that a denied mutating verb returns `class: "read_only"` naming the refused verb,
   that an incidental writer such as a mark-read verb is denied, that a policy-narrowed read
-  verb returns `class: "policy"` with `effect: "read"`, and that an allowed read verb still
+  verb returns `class: "denied"` with `effect: "read"`, and that an allowed read verb still
   dispatches with its ordinary result and errors untouched (no `refusal` field).
 
 ### Consequences of this amendment
