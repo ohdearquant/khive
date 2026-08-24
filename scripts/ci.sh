@@ -42,6 +42,9 @@ phase_lint() {
 
     echo "=== Writer Census Contract Tests ==="
     python3 "$SCRIPT_DIR/tests/test_writer_census.py"
+
+    echo "=== CI Workflow Contract Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_ci_workflows.py"
 }
 
 phase_no_stubs_scan() {
