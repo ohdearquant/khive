@@ -415,19 +415,49 @@ already consults on every verb. All of it reuses shipped machinery:
    carrying the _actual_ verb and calls `Gate::check` before the pack handler runs; a `Deny`
    returns `PermissionDenied` with a reason (ADR-018, as amended fail-closed by ADR-129). No new
    dispatch path is introduced — this is the same seam the base ADR's rule names.
-2. **The policy is a default-deny Rego policy** naming a closed read-verb allowlist, loaded by
-   the existing `RegoGate` (`from_dir` / `from_policy_str`). This is the base ADR's Fork (c)
+2. **The enforcement invariant is a closed read-verb set held in code, intersected with
+   policy.** Read-only mode installs a composite gate: a verb dispatches only if it is a member
+   of the canonical read-verb set — a closed, machine-checkable list shipped in code — **and**
+   the installed policy allows it. The default-deny Rego policy of the base ADR's Fork (c)
    resolution (constrained Rego on the existing engine, a required default-deny template, and a
-   validation lint that rejects any policy lacking a closed allowlist) applied to the read-only
-   case. Every verb outside the allowlist — every mutating verb — is denied by the default rule,
-   so a verb added to a future pack is denied until explicitly listed, not permitted by omission.
-3. **A launch flag installs it.** `kkernel mcp` gains a flag that sets the process `Gate` to the
-   read-only `RegoGate` instead of `AllowAllGate` for that process's lifetime. This is the base
+   validation lint) is retained as the configurable layer, and it can only _narrow_ the surface
+   further, never widen it: the in-code set membership check runs regardless of what the policy
+   engine returns, so a policy bug, a permissive branch, or an errant allow path cannot
+   authorize a mutation. The validation lint rejects a read-only policy that is not default-deny,
+   that lacks a closed allowlist, or whose allowlist names any verb outside the canonical read
+   set. A verb added by a future pack is denied until explicitly classified and listed, not
+   permitted by omission.
+3. **Membership of the read set is decided by effect, not by name.** The authoritative source
+   is a per-verb effect classification declared where verbs register — registry-level metadata
+   the read-only gate consults at dispatch, not prose documentation (the existing verb-category
+   metadata is documentation-only and does not qualify as an enforcement source). A verb
+   qualifies as read only if its handler performs no persistent state change of any kind.
+   Incidental writes count as mutation: a verb with read-shaped naming that updates state as a
+   side effect — the mark-read class of communication verbs, which the durable-audit ADR already
+   classifies as writers — is a mutating verb for this tier and is excluded from the read set.
+   Any verb without a declared effect classification is treated as mutating (fail-closed), so
+   the writer census cannot rot open as the catalog grows.
+4. **The mode binds to the process boundary it enforces at.** `kkernel mcp` gains a flag that
+   sets the process `Gate` to the composite read-only gate instead of `AllowAllGate` for that
+   process's lifetime. Binding is local by construction: a read-only process dispatches every
+   verb in the process that parsed the flag, and it never forwards verbs to — and never
+   auto-spawns — a shared resident daemon, because a forwarded verb would be checked by the
+   daemon's own gate rather than this one, and the daemon connection protocol carries no gate
+   identity today. Read verbs tolerate this: a read-only connection performs no writes at all
+   (the gate denies mutations before any handler runs), so local dispatch never contends for
+   the resident daemon's writer lane. Extending gate identity into daemon connection admission
+   and spawn configuration — so a restricted client could safely attach to a shared daemon —
+   is structural-gateway work and stays deferred with the untrusted tier. This is the base
    ADR's A2 (mode-flag) process boundary, **not** A1 — see the honest-scope note below.
-4. **Refusal is loud and attributable.** The `Deny` reason states that the verb was refused
-   because the connection is read-only, and the MCP surface returns it as a typed refusal the
-   client can distinguish from an outage — so a client running against a restricted connection
-   reports the restriction rather than misreading it as khive being down.
+5. **Refusal is loud, attributable, and typed on the wire.** The `Deny` reason states that the
+   verb was refused because the connection is read-only, and the MCP surface carries it as a
+   structured refusal object — a machine-readable field naming the refusal class (read-only
+   denial, as distinct from gate-unavailable and from ordinary runtime errors) and the refused
+   verb — never a flat serialized error string a client must parse. Today's wire path
+   serializes authorization refusals into ordinary error strings, so the structured refusal
+   field is in-scope wire work for this amendment, not an existing property being restated. A
+   client running against a restricted connection can therefore report the restriction rather
+   than misreading it as khive being down, without string matching.
 
 ### Honest scope: what this does NOT serve
 
@@ -454,14 +484,23 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
 
 ### Implementation plan (Tier-B phase)
 
-- A bundled default-deny read-only Rego policy naming the closed read-verb allowlist, plus the
-  read/mutating classification of the current verb catalog it rests on.
-- The `kkernel mcp` launch flag that installs the read-only `RegoGate`.
+- The per-verb effect classification at the verb-registration seam (point 3), with a
+  completeness lint: every registered verb carries a classification, an unclassified verb is
+  mutating by default, and the mark-read class of incidental writers is classified as mutating
+  with a test pinning that classification.
+- The composite read-only gate (point 2): in-code canonical read-set membership intersected
+  with the policy decision, plus a test that a policy hand-crafted with an extra allow branch
+  for a mutating verb is still denied by the composite gate.
+- A bundled default-deny read-only Rego policy naming the closed read-verb allowlist.
 - The validation lint (base ADR Fork (c)) that rejects a read-only policy which is not
-  default-deny or does not declare a closed allowlist.
-- Confirmation that the `Deny` reason and the MCP-surface refusal are typed and attributable per
-  point 4, with a test that a denied mutating verb returns the read-only refusal (not a generic
-  error) and that an allowed read verb still dispatches.
+  default-deny, does not declare a closed allowlist, or names an allowlist entry outside the
+  canonical read set.
+- The `kkernel mcp` launch flag that installs the composite gate and pins dispatch local
+  (point 4): with the flag set, daemon forwarding and daemon auto-spawn are disabled, with a
+  test asserting a read-only process never opens the daemon connection path.
+- The structured refusal field on the MCP wire (point 5), with tests that a denied mutating
+  verb returns the typed read-only refusal (not a generic error string), that an incidental
+  writer such as a mark-read verb is denied, and that an allowed read verb still dispatches.
 
 ### Consequences of this amendment
 
@@ -471,9 +510,13 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
   substituting the weaker A2 form for it.
 - **Negative.** A2's failure mode (a misconfigured launch reverts to the installed base `Gate`)
   is real; this amendment accepts it _only_ for Tier B and says so in the flag's own
-  documentation. The read/mutating verb classification must be maintained as the catalog grows —
-  the default-deny posture makes an unclassified new verb fail safe (denied), which is the
-  correct direction, but a read verb wrongly omitted is a false denial to fix, not a hole.
+  documentation. The effect classification must be maintained as the catalog grows — the
+  fail-closed default (unclassified means mutating) makes a new verb fail safe (denied), which
+  is the correct direction, but a read verb wrongly left unclassified is a false denial to fix,
+  not a hole. Pinning dispatch local means a read-only process forgoes the resident daemon's
+  warm caches and shares the store only through concurrent-reader semantics; acceptable for the
+  observer-shaped Tier-B caller, and revisited only when gate identity reaches the daemon
+  connection protocol.
 
 ## References
 
