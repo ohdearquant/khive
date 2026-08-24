@@ -427,37 +427,105 @@ already consults on every verb. All of it reuses shipped machinery:
    that lacks a closed allowlist, or whose allowlist names any verb outside the canonical read
    set. A verb added by a future pack is denied until explicitly classified and listed, not
    permitted by omission.
-3. **Membership of the read set is decided by effect, not by name.** The authoritative source
-   is a per-verb effect classification declared where verbs register — registry-level metadata
-   the read-only gate consults at dispatch, not prose documentation (the existing verb-category
+3. **Membership of the read set is decided by effect, not by name — and effect is judged over
+   the whole dispatch lifecycle, not the handler alone.** The authoritative source is a
+   per-verb effect classification declared where verbs register — registry-level metadata the
+   read-only gate consults at dispatch, not prose documentation (the existing verb-category
    metadata is documentation-only and does not qualify as an enforcement source). A verb
-   qualifies as read only if its handler performs no persistent state change of any kind.
-   Incidental writes count as mutation: a verb with read-shaped naming that updates state as a
-   side effect — the mark-read class of communication verbs, which the durable-audit ADR already
-   classifies as writers — is a mutating verb for this tier and is excluded from the read set.
-   Any verb without a declared effect classification is treated as mutating (fail-closed), so
-   the writer census cannot rot open as the catalog grows.
+   qualifies as read only if **its entire dispatch closure** — the handler, every nested
+   operation the handler invokes, and every dispatch-lifecycle hook that fires for it —
+   performs no persistent domain-state change. The lifecycle write classes are enumerated and
+   each has a defined disposition under read-only mode:
+
+   - **Domain writes** (rows in domain stores: records, edges, notes, messages, profiles,
+     grades, schedule state). Any domain write anywhere in the closure classifies the verb as
+     mutating. Incidental writes count: a verb with read-shaped naming that updates state as a
+     side effect — the mark-read class of communication verbs, which the durable-audit ADR
+     already classifies as writers — is a mutating verb for this tier and is excluded from the
+     read set.
+   - **Adaptive dispatch hooks** (the recall-scoring hooks that fold implicit signals into
+     scoring state when read verbs execute). These are domain-state writes triggered by reads.
+     Under read-only mode they are **suppressed**: the read verb dispatches and returns its
+     result, and the hook's fold is skipped for that dispatch. Suppression is the mode's
+     obligation, not the classification's — a read verb stays classified read, and the mode
+     guarantees its dispatch writes nothing.
+   - **Audit-plane appends** (the runtime's own record of what was dispatched, permitted, or
+     refused). These are **retained** under read-only mode by contract: a restricted
+     connection whose activity left no audit trail would be less observable than an
+     unrestricted one, which is the wrong direction for a security tier. Audit retention is a
+     runtime-plane exemption, named here so it cannot be read as a hole: it records dispatch
+     outcomes and is not reachable as a domain write by any argument the caller controls.
+   - **Non-durable telemetry** (in-memory counters, metrics). Out of scope; no durable state.
+
+   The **canonical read set** is the in-code closed list this classification produces: exactly
+   the registered verbs whose dispatch closure performs no domain write and requires no
+   suppressed hook beyond the adaptive-scoring class above. The code constant is the normative
+   artifact; the bundled read-only policy's allowlist is generated from it and validated
+   against it, so the two cannot drift. Any verb without a declared effect classification is
+   treated as mutating (fail-closed), so the writer census cannot rot open as the catalog
+   grows — and the classification is verified behaviorally, not by declaration alone: the
+   completeness lint gains a census arm that dispatches every read-classified verb against an
+   instrumented store and asserts zero domain writes (audit-plane appends excepted per the
+   taxonomy above).
 4. **The mode binds to the process boundary it enforces at.** `kkernel mcp` gains a flag that
    sets the process `Gate` to the composite read-only gate instead of `AllowAllGate` for that
    process's lifetime. Binding is local by construction: a read-only process dispatches every
    verb in the process that parsed the flag, and it never forwards verbs to — and never
    auto-spawns — a shared resident daemon, because a forwarded verb would be checked by the
    daemon's own gate rather than this one, and the daemon connection protocol carries no gate
-   identity today. Read verbs tolerate this: a read-only connection performs no writes at all
-   (the gate denies mutations before any handler runs), so local dispatch never contends for
-   the resident daemon's writer lane. Extending gate identity into daemon connection admission
+   identity today. Read verbs tolerate this: a read-only connection performs no domain writes
+   (the gate denies mutations before any handler runs, and the adaptive hooks are suppressed
+   per point 3), so local dispatch never contends for the resident daemon's writer lane beyond
+   its own audit-plane appends. Extending gate identity into daemon connection admission
    and spawn configuration — so a restricted client could safely attach to a shared daemon —
    is structural-gateway work and stays deferred with the untrusted tier. This is the base
    ADR's A2 (mode-flag) process boundary, **not** A1 — see the honest-scope note below.
 5. **Refusal is loud, attributable, and typed on the wire.** The `Deny` reason states that the
    verb was refused because the connection is read-only, and the MCP surface carries it as a
-   structured refusal object — a machine-readable field naming the refusal class (read-only
-   denial, as distinct from gate-unavailable and from ordinary runtime errors) and the refused
-   verb — never a flat serialized error string a client must parse. Today's wire path
-   serializes authorization refusals into ordinary error strings, so the structured refusal
-   field is in-scope wire work for this amendment, not an existing property being restated. A
-   client running against a restricted connection can therefore report the restriction rather
-   than misreading it as khive being down, without string matching.
+   structured refusal object, never a flat serialized error string a client must parse.
+   Today's wire path serializes authorization refusals into ordinary error strings, so the
+   structured refusal is in-scope wire work for this amendment, not an existing property being
+   restated. The wire contract is normative:
+
+   **Placement.** The refusal is the per-operation `error` object in the request envelope —
+   the same position where operation failures already carry `code` and `retryable` — so a
+   batch refusing one op reports it beside its siblings' results, and a single-op request
+   carries it as that op's error.
+
+   **Schema.** The refusal error object carries exactly these fields:
+
+   ```json
+   {
+     "code": "read_only_refused",
+     "kind": "permission_denied",
+     "verb": "<the refused verb, as dispatched>",
+     "mode": "read_only",
+     "effect": "mutating" | "unclassified",
+     "retryable": false,
+     "message": "<human-readable refusal, non-normative>"
+   }
+   ```
+
+   `code` is the machine-matching key; `effect` reports why the verb failed set membership
+   (`mutating` = classified as a writer, `unclassified` = fail-closed default); `message` is
+   presentation only and carries no contract. Clients match on `code`, never on `message`.
+
+   **Error mapping.** Three refusal-adjacent conditions map to three distinct wire codes and
+   are never conflated:
+
+   - `PermissionDenied` from the composite gate's membership/policy check →
+     `code: "read_only_refused"`, `retryable: false`. The connection is healthy; the verb is
+     out of contract for this mode.
+   - Gate infrastructure failure (policy engine unavailable, policy failed to load or
+     validate) → `code: "gate_unavailable"`, `kind: "permission_denied"`, `retryable: true`.
+     Fail-closed per the base ADR: the verb is refused, but the client learns the refusal is
+     an infrastructure condition that may clear, not a contract boundary.
+   - Ordinary runtime errors on a permitted read verb keep their existing codes untouched —
+     a read-only connection reports storage timeouts, not-found, and validation errors exactly
+     as an unrestricted one does.
+
+   A client running against a restricted connection can therefore report the restriction
+   rather than misreading it as khive being down, without string matching.
 
 ### Honest scope: what this does NOT serve
 
@@ -488,19 +556,29 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
   completeness lint: every registered verb carries a classification, an unclassified verb is
   mutating by default, and the mark-read class of incidental writers is classified as mutating
   with a test pinning that classification.
+- The lifecycle census arm of that lint (point 3): every read-classified verb is dispatched
+  against an instrumented store and asserted to perform zero domain writes, with audit-plane
+  appends excepted per the write-class taxonomy.
+- Adaptive-hook suppression under read-only mode (point 3): a test that a read verb which
+  normally triggers the scoring-fold hook dispatches with the fold skipped, and that the same
+  dispatch outside read-only mode still folds.
 - The composite read-only gate (point 2): in-code canonical read-set membership intersected
   with the policy decision, plus a test that a policy hand-crafted with an extra allow branch
   for a mutating verb is still denied by the composite gate.
-- A bundled default-deny read-only Rego policy naming the closed read-verb allowlist.
+- A bundled default-deny read-only Rego policy whose allowlist is generated from the canonical
+  read-set constant and validated against it.
 - The validation lint (base ADR Fork (c)) that rejects a read-only policy which is not
   default-deny, does not declare a closed allowlist, or names an allowlist entry outside the
   canonical read set.
 - The `kkernel mcp` launch flag that installs the composite gate and pins dispatch local
   (point 4): with the flag set, daemon forwarding and daemon auto-spawn are disabled, with a
   test asserting a read-only process never opens the daemon connection path.
-- The structured refusal field on the MCP wire (point 5), with tests that a denied mutating
-  verb returns the typed read-only refusal (not a generic error string), that an incidental
-  writer such as a mark-read verb is denied, and that an allowed read verb still dispatches.
+- The structured refusal object on the MCP wire (point 5), carrying the normative schema and
+  error mapping above, with tests that a denied mutating verb returns
+  `code: "read_only_refused"` with the refused verb named (not a generic error string), that
+  an incidental writer such as a mark-read verb is denied, that a gate-infrastructure failure
+  returns `code: "gate_unavailable"` with `retryable: true`, and that an allowed read verb
+  still dispatches with its ordinary result and error codes untouched.
 
 ### Consequences of this amendment
 
