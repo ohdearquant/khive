@@ -11,6 +11,7 @@ pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod audit_batch;
 pub mod blob;
+pub mod brain_split;
 pub mod build_info;
 pub mod config;
 pub mod config_ledger;

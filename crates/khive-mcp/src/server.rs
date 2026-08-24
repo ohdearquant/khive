@@ -4080,10 +4080,12 @@ mod tests {
         let base = RuntimeConfig::no_embeddings();
         let utc = RuntimeConfig {
             display_timezone: "UTC".parse().expect("UTC is a known IANA zone"),
+            brain_split: None,
             ..base.clone()
         };
         let new_york = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            brain_split: None,
             ..base
         };
 
@@ -4114,10 +4116,12 @@ mod tests {
         let base = RuntimeConfig::no_embeddings();
         let a = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            brain_split: None,
             ..base.clone()
         };
         let b = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            brain_split: None,
             ..base
         };
 

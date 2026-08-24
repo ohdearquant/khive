@@ -1787,6 +1787,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: Some(path),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1813,6 +1814,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1837,6 +1839,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("test").unwrap(),
@@ -1865,6 +1868,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1935,6 +1939,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2018,6 +2023,7 @@ mod tests {
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
+                brain_split: None,
                 db_path: Some(db_path),
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
@@ -2065,6 +2071,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2232,6 +2239,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2259,6 +2267,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
@@ -2294,6 +2303,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
@@ -2321,6 +2331,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2366,6 +2377,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2398,6 +2410,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: "Asia/Tokyo".parse().unwrap(),
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2544,6 +2557,7 @@ mod tests {
         RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2623,6 +2637,7 @@ mod tests {
         let main_config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            brain_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2762,6 +2777,7 @@ mod tests {
             RuntimeConfig {
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
+                brain_split: None,
                 db_path: None,
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),

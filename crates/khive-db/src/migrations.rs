@@ -148,6 +148,8 @@ const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
 const V21_ATTACHMENT_FENCES_UP: &str = include_str!("../sql/021-attachments-b-claim-fences.sql");
 
+const V22_UP: &str = include_str!("../sql/022-brain-fold-cursor.sql");
+
 /// Core schema version reserved for ADR-121's attachments-first cutover.
 pub const ATTACHMENT_CUTOVER_VERSION: u32 = 21;
 
@@ -303,6 +305,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         // The runner special-cases it below; exposing the stage DDL here keeps
         // the ledger entry self-describing for migration inspection tooling.
         up: V21_STAGE_UP,
+    },
+    VersionedMigration {
+        version: 22,
+        name: "brain_fold_cursor",
+        up: V22_UP,
     },
 ];
 

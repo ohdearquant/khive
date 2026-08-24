@@ -316,6 +316,13 @@ pub struct RuntimeConfig {
     /// resolves once to the host's local IANA zone (falling back to UTC when
     /// the host zone cannot be determined) via [`resolve_default_display_timezone`].
     pub display_timezone: chrono_tz::Tz,
+    /// Brain fold decoupling (ADR-171 phase 1). `None` = legacy behavior:
+    /// the feedback fold runs synchronously inside verb dispatch. `Some`
+    /// routes feedback through the event plane, folded asynchronously by the
+    /// brain pack's fold worker under a durable cursor. Populated by the
+    /// transport hosts' resolver (kill-switch `KHIVE_BRAIN_SPLIT=0`); tests
+    /// and in-memory runtimes leave it `None`.
+    pub brain_split: Option<crate::brain_split::BrainSplitConfig>,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -401,6 +408,7 @@ impl Default for RuntimeConfig {
             actor_id,
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             display_timezone: resolve_default_display_timezone(),
+            brain_split: None,
         }
     }
 }
