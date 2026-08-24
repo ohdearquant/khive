@@ -2321,7 +2321,22 @@ pub(crate) async fn handle_heartbeat(
         .map_err(|e| RuntimeError::Internal(format!("heartbeat: get_note: {e}")))?;
 
     let now = Utc::now();
-    let at = p.at.clone().unwrap_or_else(|| now.to_rfc3339());
+    // A supplied `at` must resolve to an instant before it is stored: the
+    // staleness reader parses `last_poll_attempt_at` inside an Option chain,
+    // so an unparseable stored value makes staleness silently unknown and the
+    // channel can never read as stale — failing toward looking healthy. Same
+    // rule as ingest's `sent_at` (`canonicalize_ingest_sent_at`).
+    let at = match p.at.as_deref() {
+        Some(raw) => {
+            DateTime::parse_from_rfc3339(raw.trim()).map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "heartbeat: `at` must be a valid RFC 3339 timestamp, got {raw:?}: {error}"
+                ))
+            })?;
+            raw.trim().to_string()
+        }
+        None => now.to_rfc3339(),
+    };
 
     // `HeartbeatParams` (khive-pack-comm/src/params.rs) carries no free-form
     // `properties` field — every key assigned below is a fixed literal, so no
