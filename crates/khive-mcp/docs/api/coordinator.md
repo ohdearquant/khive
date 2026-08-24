@@ -42,7 +42,7 @@ operation is successful but its operation envelope also carries:
   "missing_backends": ["archive"],
   "backend_errors": {
     "archive": {
-      "kind": "backend_error",
+      "kind": "timeout",
       "message": "backend search timed out after 5000ms"
     }
   }
@@ -60,6 +60,12 @@ through `backend_errors_truncated` and `backend_errors_omitted`. Backend ids and
 messages are credential-masked before exposure; changed backend ids carry a
 stable hash suffix and `backend_id_masked: true`, ids are capped at 256 Unicode
 scalar values, and messages are capped at 1,024 Unicode scalar values.
+Each retained cause is typed as `timeout` for coordinator and typed runtime
+deadline failures, or `backend_error` otherwise. A degraded-empty
+`search_incomplete` error reports `retryable: true` only when every failed leg
+is a timeout; any mixed or non-timeout failure keeps it false. This policy is
+computed before diagnostic truncation, so an omitted cause cannot change the
+classification. Callers remain responsible for backoff and retry admission.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::Namespace as RuntimeNamespace;
 use khive_runtime::{
-    BackendId, KhiveRuntime, NoteSearchHit, PackRegistry, SearchHit, SearchSource,
+    BackendId, KhiveRuntime, NoteSearchHit, PackRegistry, RuntimeError, SearchHit, SearchSource,
     VerbRegistryBuilder,
 };
 use khive_score::DeterministicScore;
@@ -17,7 +17,10 @@ use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
 
 use super::dispatch::bounded_backend_cause_for_log;
-use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordinatorService};
+use super::{
+    BackendRegistry, BackendSearchFailure, BackendSearchFailureKind, LocatorCache,
+    SubstrateCoordinator, SubstrateCoordinatorService,
+};
 
 fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
@@ -524,6 +527,27 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
 
 // ---- MAJ-2: per-backend fan-out search timeout ----
 
+#[test]
+fn backend_search_failure_classifies_typed_runtime_timeouts_without_message_matching() {
+    let storage_timeout = BackendSearchFailure::from_runtime_error(RuntimeError::Storage(
+        khive_storage::StorageError::Timeout {
+            operation: "fts_search".into(),
+        },
+    ));
+    let deadline = BackendSearchFailure::from_runtime_error(RuntimeError::DeadlineExceeded {
+        operation: "search".to_string(),
+        budget_ms: 5_000,
+        elapsed_ms: 5_001,
+    });
+    let internal = BackendSearchFailure::from_runtime_error(RuntimeError::Internal(
+        "backend search timed out after 5000ms".to_string(),
+    ));
+
+    assert_eq!(storage_timeout.kind, BackendSearchFailureKind::Timeout);
+    assert_eq!(deadline.kind, BackendSearchFailureKind::Timeout);
+    assert_eq!(internal.kind, BackendSearchFailureKind::BackendError);
+}
+
 /// A hung backend's search task must not block the fan-out from returning a
 /// healthy sibling's results, and must surface a timeout-specific error for
 /// itself in its `BackendSearchResult`.
@@ -574,10 +598,11 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
         .expect("hung backend must have a report entry");
     let err = hung_report
         .error
-        .as_deref()
+        .as_ref()
         .expect("hung backend must carry an error");
+    assert_eq!(err.kind, BackendSearchFailureKind::Timeout);
     assert!(
-        err.contains("timed out"),
+        err.message.contains("timed out"),
         "hung backend error must be timeout-specific, got: {err:?}"
     );
 
@@ -623,8 +648,9 @@ async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
     assert_eq!(per_backend.len(), 3);
     assert!(per_backend.iter().all(|entry| entry
         .error
-        .as_deref()
-        .is_some_and(|error| error.contains("timed out"))));
+        .as_ref()
+        .is_some_and(|error| error.kind == BackendSearchFailureKind::Timeout
+            && error.message.contains("timed out"))));
     let elapsed = started.elapsed();
     assert!(
         elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
@@ -663,8 +689,9 @@ async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() 
         assert!(
             report
                 .error
-                .as_deref()
-                .is_some_and(|error| error.contains("timed out")),
+                .as_ref()
+                .is_some_and(|error| error.kind == BackendSearchFailureKind::Timeout
+                    && error.message.contains("timed out")),
             "{backend} completed outside the absolute deadline but was accepted: {:?}",
             report.error
         );
@@ -713,10 +740,11 @@ async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate()
     assert_eq!(report.backend_id.as_str(), "hung");
     let err = report
         .error
-        .as_deref()
+        .as_ref()
         .expect("hung single backend must carry an error");
+    assert_eq!(err.kind, BackendSearchFailureKind::Timeout);
     assert!(
-        err.contains("timed out"),
+        err.message.contains("timed out"),
         "single-backend timeout error must be timeout-specific, got: {err:?}"
     );
 }
@@ -809,8 +837,8 @@ async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() 
     assert!(
         per_backend[0]
             .error
-            .as_deref()
-            .is_some_and(|error| error.contains("sk_live_")),
+            .as_ref()
+            .is_some_and(|error| error.message.contains("sk_live_")),
         "internal result should retain the raw cause until the MCP sanitizer"
     );
     assert!(
@@ -854,10 +882,11 @@ async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
     assert_eq!(report.backend_id.as_str(), "hung");
     let err = report
         .error
-        .as_deref()
+        .as_ref()
         .expect("hung single backend must carry an error");
+    assert_eq!(err.kind, BackendSearchFailureKind::Timeout);
     assert!(
-        err.contains("timed out"),
+        err.message.contains("timed out"),
         "single-backend timeout error must be timeout-specific, got: {err:?}"
     );
 }
@@ -1370,10 +1399,11 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
         .expect("panicked backend remains identified");
     let error = panicked
         .error
-        .as_deref()
+        .as_ref()
         .expect("panicked backend carries an explicit error");
+    assert_eq!(error.kind, BackendSearchFailureKind::BackendError);
     assert!(
-        error.contains("join failed") && error.contains("panic"),
+        error.message.contains("join failed") && error.message.contains("panic"),
         "join error should identify the task panic, got {error:?}"
     );
     assert!(logs.contains("backend search task failed"));
@@ -3008,6 +3038,34 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
 
 // ---- MIN-1: SubstrateCoordinatorService hydration seam ----
 
+#[tokio::test(start_paused = true)]
+async fn coordinator_service_preserves_timeout_failure_kind() {
+    use khive_mcp::coordinator::{
+        BackendSearchFailureKind as CoordFailureKind, CoordinatorService,
+    };
+
+    let mut backend_reg = BackendRegistry::new();
+    backend_reg.register(BackendId::new("hung"), memory_runtime());
+    let service = SubstrateCoordinatorService::new(
+        SubstrateCoordinator::new(backend_reg).with_hanging_backend("hung"),
+    );
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "typed timeout seam",
+        "limit": 10,
+    }));
+
+    let result = service
+        .fan_out_search(&request, &Namespace::local(), &[])
+        .await;
+
+    let failure = result.per_backend[0]
+        .error
+        .as_ref()
+        .expect("hung backend must carry a typed failure");
+    assert_eq!(failure.kind, CoordFailureKind::Timeout);
+}
+
 /// The `khive-mcp` row-shape parity test drives `MockCoordinator` with
 /// pre-populated `entity_kinds`/`note_kinds`/etc. maps, so it never runs
 /// `SubstrateCoordinatorService`'s own hydration — the per-hit
@@ -3062,7 +3120,7 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
     let entity_errors: Vec<&str> = entity_result
         .per_backend
         .iter()
-        .filter_map(|r| r.error.as_deref())
+        .filter_map(|r| r.error.as_ref().map(|error| error.message.as_str()))
         .collect();
     assert!(
         entity_errors.is_empty(),
@@ -3100,7 +3158,7 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
     let note_errors: Vec<&str> = note_result
         .per_backend
         .iter()
-        .filter_map(|r| r.error.as_deref())
+        .filter_map(|r| r.error.as_ref().map(|error| error.message.as_str()))
         .collect();
     assert!(
         note_errors.is_empty(),

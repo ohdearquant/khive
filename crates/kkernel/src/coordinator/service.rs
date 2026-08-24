@@ -8,15 +8,16 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use khive_mcp::coordinator::{
-    BackendSearchResult as CoordBackendResult, CoordError, CoordLinkResult, CoordSearchResult,
-    CoordinatorService,
+    BackendSearchFailure as CoordBackendFailure,
+    BackendSearchFailureKind as CoordBackendFailureKind, BackendSearchResult as CoordBackendResult,
+    CoordError, CoordLinkResult, CoordSearchResult, CoordinatorService,
 };
 use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::BackendId;
 use khive_runtime::Namespace;
 use khive_storage::EdgeRelation;
 
-use super::dispatch::SubstrateCoordinator;
+use super::dispatch::{BackendSearchFailureKind, SubstrateCoordinator};
 
 /// `CoordinatorService` wrapper around a [`SubstrateCoordinator`].
 ///
@@ -162,7 +163,15 @@ impl CoordinatorService for SubstrateCoordinatorService {
                 backend_id: r.backend_id,
                 entity_hits: r.hits,
                 note_hits: r.note_hits,
-                error: r.error,
+                error: r.error.map(|failure| CoordBackendFailure {
+                    kind: match failure.kind {
+                        BackendSearchFailureKind::BackendError => {
+                            CoordBackendFailureKind::BackendError
+                        }
+                        BackendSearchFailureKind::Timeout => CoordBackendFailureKind::Timeout,
+                    },
+                    message: failure.message,
+                }),
             })
             .collect();
 
