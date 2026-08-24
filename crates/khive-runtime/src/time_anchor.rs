@@ -104,7 +104,7 @@ pub fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Optio
         // That is checked rather than argued, and it is checked as the
         // CONCLUSION rather than the premise. `every_gap_date_resolves_to_the
         // _least_instant` sweeps every zone in the pinned database over
-        // 1850-2100 and asserts directly that one second before the returned
+        // 1850-2100 and asserts directly that one nanosecond before the returned
         // instant is a different local date — the least-instant property
         // itself, which is what a monotonicity violation would cost. At the
         // current pin it reports 597 zones over 91311 dates each, 4299 gap
@@ -112,7 +112,8 @@ pub fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Optio
         // violations, in about three seconds. Those counts are printed by the
         // test rather than asserted, because their magnitudes are the
         // database's business and only their reaching zero would mean the
-        // sweep broke. Run it whenever the chrono-tz pin moves:
+        // sweep broke. The sweep is re-derived on a chrono-tz pin bump by the
+        // command:
         //
         //   cargo test -p khive-runtime --lib --release -- --ignored --nocapture
         //
@@ -131,8 +132,16 @@ pub fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Optio
         // (05:00Z) — thirty minutes late, and late in a way that still
         // passed a same-date check. Six IANA zones share that transition.
         //
-        // One-second granularity is required, not one-minute: historical
-        // LMT offsets are not whole minutes.
+        // Bisect to nanosecond resolution, chrono's finest. The branch returns
+        // `hi`, the upper end of the final interval, so any coarser floor leaves
+        // `hi` strictly later than the transition whenever the boundary does not
+        // land on the search grid — an overshoot up to the floor width, which
+        // makes `hi` not the least instant. A one-second floor was not enough:
+        // the 96-hour window bisects to grid points that are dyadic fractions of
+        // its span, and a historical transition second (e.g. America/Havana's
+        // midnight spring-forward, whose UTC instant sits at 53/96 of the
+        // window) is not one of them, so the search stopped a fraction of a
+        // second past the boundary and returned a late, non-round instant.
         chrono::LocalResult::None => {
             let (mut lo, mut hi) = anchor_search_window(date);
             // The window's lower bound can itself already carry `date`. At the
@@ -153,7 +162,7 @@ pub fn anchor_date_to_earliest_instant(date: chrono::NaiveDate, tz: Tz) -> Optio
             {
                 return None;
             }
-            while hi - lo > chrono::Duration::seconds(1) {
+            while hi - lo > chrono::Duration::nanoseconds(1) {
                 let mid = lo + (hi - lo) / 2;
                 if local_date_cmp(tz, mid, date) == std::cmp::Ordering::Less {
                     lo = mid;
@@ -289,6 +298,63 @@ mod tz_database_audit {
         );
     }
 
+    /// Regression for the skipped-midnight bisection's resolution, on the boundary
+    /// the review named. America/Havana springs forward AT local midnight on its
+    /// DST-start dates: 00:00 does not exist, so `anchor_date_to_earliest_instant`
+    /// takes the gap branch and must return the transition instant itself — the
+    /// least instant carrying the date.
+    ///
+    /// The pre-fix bisection stopped at a one-second interval and returned its
+    /// upper end, which is strictly later than the transition whenever that
+    /// transition's UTC second is not a dyadic fraction of the 96-hour search
+    /// window — it is not: a midnight spring-forward under Cuba's -05:00 standard
+    /// offset lands at 05:00Z, i.e. 53/96 of the window. The overshoot is
+    /// sub-second, so a one-second check (the all-zone sweep's old granularity)
+    /// was blind to it. This asserts the least-instant property at NANOSECOND
+    /// resolution: one nanosecond before the returned instant is a different,
+    /// earlier local date. It reddens against the one-second floor and greens
+    /// against the nanosecond floor.
+    #[test]
+    fn havana_skipped_midnight_resolves_to_the_true_least_instant() {
+        let tz = chrono_tz::America::Havana;
+        let start = chrono::NaiveDate::from_ymd_opt(1928, 1, 1).expect("start date");
+        let end = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).expect("end date");
+
+        let mut gap_dates = 0usize;
+        let mut date = start;
+        while date < end {
+            let midnight = date.and_hms_opt(0, 0, 0).expect("midnight");
+            if matches!(tz.from_local_datetime(&midnight), chrono::LocalResult::None) {
+                gap_dates += 1;
+                let resolved = anchor_date_to_earliest_instant(date, tz)
+                    .expect("Havana carries this date at the post-gap local time");
+                assert_eq!(
+                    resolved.date_naive(),
+                    date,
+                    "{date}: resolved instant {resolved} is not on the requested date"
+                );
+                let just_before = resolved - chrono::Duration::nanoseconds(1);
+                assert_ne!(
+                    just_before.date_naive(),
+                    date,
+                    "{date}: resolved to {resolved}, but one nanosecond earlier is still on \
+                     the date — the bisection overshot the transition and did not return the \
+                     least instant"
+                );
+            }
+            date = date.succ_opt().expect("date in range has a successor");
+        }
+
+        // Only meaningful if Havana actually skips some local midnights in the
+        // range; a zero means the fixture stopped exercising the gap branch and
+        // the test would pass vacuously.
+        assert!(
+            gap_dates > 0,
+            "expected America/Havana to skip local midnight on at least one date in \
+             {start}..{end}; found none, so this regression exercises nothing"
+        );
+    }
+
     /// Sweep every zone in the pinned `chrono-tz` over 1850-2100 and assert that
     /// `anchor_date_to_earliest_instant` returns the LEAST instant of the requested local date.
     ///
@@ -299,8 +365,11 @@ mod tz_database_audit {
     /// true premise supporting a wrong inference reads as verified, so this checks the inference.
     ///
     /// The property asserted is direct and needs no transition table: for the returned instant `r`,
-    /// `r` has the requested local date and `r - 1s` does not. Anything less than the least instant
-    /// fails the first half; anything more fails the second.
+    /// `r` has the requested local date and `r - 1ns` does not. Anything less than the least instant
+    /// fails the first half; anything more fails the second. The step is one NANOSECOND, chrono's
+    /// finest, not one second: a search that stopped a fraction of a second past the boundary
+    /// returned an `r` whose second-earlier neighbour was still on the date, so a one-second check
+    /// was blind to exactly the sub-second overshoot this sweep exists to catch.
     ///
     /// Ignored by default because it is an all-zone sweep, not because it is optional:
     ///
@@ -332,7 +401,7 @@ mod tz_database_audit {
 
                 match anchor_date_to_earliest_instant(date, tz) {
                     Some(resolved) => {
-                        let previous = resolved - chrono::Duration::seconds(1);
+                        let previous = resolved - chrono::Duration::nanoseconds(1);
                         if resolved.date_naive() != date {
                             failures.push(format!(
                                 "{tz}: {date} resolved to {resolved}, whose local date is \
@@ -341,8 +410,8 @@ mod tz_database_audit {
                             ));
                         } else if tz.from_utc_datetime(&previous.naive_utc()).date_naive() == date {
                             failures.push(format!(
-                                "{tz}: {date} resolved to {resolved}, but one second earlier is \
-                                 still {date} — not the least instant"
+                                "{tz}: {date} resolved to {resolved}, but one nanosecond earlier \
+                                 is still {date} — not the least instant"
                             ));
                         }
                     }
